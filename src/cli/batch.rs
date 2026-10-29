@@ -3660,6 +3660,7 @@ mod tests {
         };
         let mut compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "t".to_string(),
             version: "1".to_string(),
@@ -3684,6 +3685,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         compiled.states.insert("s".to_string(), state.clone());
         assert!(!state_has_materialize_children(&compiled, "s"));
@@ -3799,6 +3801,7 @@ mod tests {
         }
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3847,6 +3850,7 @@ mod tests {
 
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3990,6 +3994,7 @@ mod tests {
         on_disk.insert("B".to_string(), snap("failed", true, true, false));
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -4038,6 +4043,7 @@ mod tests {
         on_disk.insert("a".to_string(), snap("work", false, false, false));
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -4077,6 +4083,7 @@ mod tests {
         on_disk.insert("A".to_string(), snap("failed", true, true, false));
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -4478,6 +4485,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -4669,6 +4677,7 @@ mod tests {
             variables: BTreeMap::new(),
             states,
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
         };
         let child = |name: &str, outcome: &str| serde_json::json!({"name": name, "state": "x", "complete": true, "outcome": outcome});
         let view = serde_json::json!({
@@ -5267,6 +5276,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5315,6 +5325,7 @@ mod tests {
         states.insert("converge".to_string(), converge);
         let template = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "parent".to_string(),
             version: "1".to_string(),
@@ -5398,6 +5409,7 @@ mod tests {
         states.insert("converge".to_string(), converge);
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: parent.to_string(),
             version: "1".to_string(),
@@ -5436,6 +5448,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5591,6 +5604,7 @@ mod tests {
         states.insert("wait".to_string(), TemplateState::default());
         let template = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -5649,6 +5663,7 @@ mod tests {
             variables: BTreeMap::new(),
             states,
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
         };
         let gate_entry = |records: &[(EventPayload, String)]| {
             let tmp = TempDir::new().unwrap();
@@ -5706,6 +5721,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5829,6 +5845,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5953,6 +5970,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -6776,6 +6794,7 @@ mod tests {
                 fields: HashMap::new(),
                 submitter_cwd: cwd.map(PathBuf::from),
                 source: source.map(str::to_string),
+                exported_fields: None,
             },
             idempotency_hash: None,
         };

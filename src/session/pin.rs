@@ -1177,6 +1177,11 @@ pub enum Removal {
     Removed,
     /// The guard kept the session; nothing was deleted.
     Kept(Guard),
+    /// The pin guard was clear, but the continues relation's last check
+    /// found a later session the judgment didn't see, under the cloud
+    /// backend; nothing was deleted. Only a removal by rule
+    /// ([`remove_by_rule`], [`remove_by_rule_with`]) makes that check.
+    KeptByRelation(crate::session::hierarchy::RelationVerdict),
 }
 
 /// How long [`remove_guarded`] waits for a session's lock.
@@ -1195,6 +1200,26 @@ const REMOVAL_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// accepts. A name whose state file is gone is guarded and cleaned up
 /// without the lock, as `cleanup` always was idempotent.
 pub fn remove_guarded(backend: &dyn SessionBackend, name: &str) -> anyhow::Result<Removal> {
+    remove_guarded_as(backend, name, false)
+}
+
+/// [`remove_guarded`] for a removal by rule (the terminal tick, the parent
+/// sweep, the same-name replace): once the pin guard is clear, the
+/// continues relation's last check
+/// ([`crate::session::continues_bucket::final_guard`]) walks any
+/// back-reference beside the session the judgment didn't see, and a later
+/// session with standing keeps it ([`Removal::KeptByRelation`]). An
+/// explicit removal (`koto session cleanup`) uses [`remove_guarded`],
+/// which the relation never stops.
+pub fn remove_by_rule(backend: &dyn SessionBackend, name: &str) -> anyhow::Result<Removal> {
+    remove_guarded_as(backend, name, true)
+}
+
+fn remove_guarded_as(
+    backend: &dyn SessionBackend,
+    name: &str,
+    by_rule: bool,
+) -> anyhow::Result<Removal> {
     let started = Instant::now();
     let lock = loop {
         match backend.lock_state_file(name) {
@@ -1210,6 +1235,12 @@ pub fn remove_guarded(backend: &dyn SessionBackend, name: &str) -> anyhow::Resul
     let guard = guard_removal(backend, name);
     if guard.keeps() {
         return Ok(Removal::Kept(guard));
+    }
+    if by_rule {
+        let related = crate::session::continues_bucket::final_guard(backend, name);
+        if related.keeps() {
+            return Ok(Removal::KeptByRelation(related));
+        }
     }
     backend.cleanup(name)?;
     drop(lock);
@@ -1228,6 +1259,26 @@ pub fn remove_guarded_with<E>(
     let guard = guard_removal(backend, name);
     if guard.keeps() {
         return Ok(Removal::Kept(guard));
+    }
+    delete()?;
+    Ok(Removal::Removed)
+}
+
+/// [`remove_guarded_with`] for a removal by rule: after the pin guard, the
+/// continues relation's last check, as [`remove_by_rule`] makes it.
+pub fn remove_by_rule_with<E>(
+    backend: &dyn SessionBackend,
+    name: &str,
+    _held: &SessionLock,
+    delete: impl FnOnce() -> Result<(), E>,
+) -> Result<Removal, E> {
+    let guard = guard_removal(backend, name);
+    if guard.keeps() {
+        return Ok(Removal::Kept(guard));
+    }
+    let related = crate::session::continues_bucket::final_guard(backend, name);
+    if related.keeps() {
+        return Ok(Removal::KeptByRelation(related));
     }
     delete()?;
     Ok(Removal::Removed)

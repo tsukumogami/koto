@@ -29,11 +29,23 @@
 //!   `koto session hierarchy` prints as `hierarchy`. A close session whose
 //!   anchor stays in the store is kept by h too: it goes only with its
 //!   anchor.
+//! - r: a later session continuing it (`koto/links/continues/<name>`, or
+//!   one continuing that one, and so on) has standing of its own: a pin,
+//!   alive, or within its own retention; or a relation naming it can't be
+//!   judged. The detail names each keeper (`kept: continued by <keeper>
+//!   (<standing>) via <path>`), and the entry carries `kept_by_relation`,
+//!   `relation_keepers` and `relation_unreadable`. An entry kept by p, a or
+//!   h that the relation keeps too carries the same fields.
 //! - d: its `chain/parent` context key is malformed.
 //! - e: it is bound to a request leg that is still waiting, or whose
 //!   pointer or request can't be read.
-//! - f: it is a coordinator's session (`coordinate-`).
 //! - g: under the cloud backend, its remote copy may be newer.
+//!
+//! Letter f is retired: a session's name keeps nothing. A coordinator's
+//! finished session stays while a later session continues it, which rule r
+//! judges like any other. The letter isn't reused and g isn't renumbered,
+//! since the letters are the `rule` field of the JSON a caller reads, as b
+//! and c were before them.
 //!
 //! The filters narrow which sessions are candidates, never which count as
 //! members of a hierarchy, and `--older-than` measures a session's age from
@@ -60,6 +72,7 @@ use crate::cli::session_inventory::{
     TemplateCache,
 };
 use crate::session::cloud::RemoteCopy;
+use crate::session::continues_bucket::relation_at_removal;
 use crate::session::finished::{self, FinishedRecord};
 use crate::session::hierarchy::{
     self, Graph, Judge, Judgment, MemberKind, RetentionSettings, Scope, Verdict as Hierarchy,
@@ -101,11 +114,12 @@ pub struct PruneArgs<'a> {
     pub confirm_short_retention: bool,
     /// Marker mode: the source workspace whose migration markers to judge.
     pub migrated_from: Option<&'a str>,
-    /// Marker mode: the source host is gone, so a present target's marker is
-    /// removable inside the retention bound too.
+    /// Marker mode: `--source-retired`, accepted but no longer deciding
+    /// removal; a run that passes it reports it `ignored`.
     pub source_retired: bool,
-    /// Marker mode: `session.cloud.marker_retain_days`.
-    pub marker_retain_days: u64,
+    /// Marker mode: `session.cloud.marker_retain_days` when a config file
+    /// sets it, which no longer decides removal either; `None` when unset.
+    pub marker_retain_days: Option<u64>,
 }
 
 /// One session the prune would remove, as the preview prints it and the
@@ -182,6 +196,12 @@ pub struct KeptEntry {
     /// absent from the JSON, for every other entry.
     #[serde(flatten)]
     pub pin: serde_json::Map<String, serde_json::Value>,
+    /// For a session the continues relation keeps, whatever rule keeps it:
+    /// `kept_by_relation`, `relation_keepers` and `relation_unreadable`
+    /// (`hierarchy::relation_json`). Empty, and absent from the JSON, for
+    /// every other entry.
+    #[serde(flatten)]
+    pub relation: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The `mode` a session-mode stored plan records. Marker plans record
@@ -327,6 +347,10 @@ fn first_rule(
     base: &Path,
     backend: &Backend,
 ) -> Option<KeptEntry> {
+    // What the continues relation says, carried by whichever rule keeps
+    // the session: one kept for its own standing and by the relation
+    // carries both reports.
+    let relation = hierarchy::relation_json(judgment.relation_of(name));
     // Rule p: the session's own pin, before anything else; it keeps this
     // session only, so it never reaches the hierarchy rules of the others.
     // A hierarchy kept besides (a live anchor, the retention not yet
@@ -341,6 +365,7 @@ fn first_rule(
                 .is_kept()
                 .then(|| hierarchy::to_json(judgment, settings)),
             pin: hierarchy::pin_fields(judgment.pin_of(name), judgment.pin_source),
+            relation,
         });
     }
     if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
@@ -359,6 +384,7 @@ fn first_rule(
                 detail,
                 hierarchy,
                 pin: Default::default(),
+                relation,
             });
         }
         return Some(KeptEntry {
@@ -367,6 +393,20 @@ fn first_rule(
             detail: hierarchy::reason_text(&judgment.verdict),
             hierarchy,
             pin: Default::default(),
+            relation,
+        });
+    }
+    // Rule r: a later member's standing, locally or, under the cloud
+    // backend, in the bucket.
+    let related = relation_at_removal(backend, judgment, name);
+    if related.keeps() {
+        return Some(KeptEntry {
+            name: name.to_string(),
+            rule: 'r',
+            detail: hierarchy::relation_text(&related).join("; "),
+            hierarchy: None,
+            pin: Default::default(),
+            relation: hierarchy::relation_json(&related),
         });
     }
     later_rule(name, &session.chain_parent, base, backend).map(|(rule, detail, fields)| KeptEntry {
@@ -375,10 +415,11 @@ fn first_rule(
         detail,
         hierarchy: None,
         pin: fields,
+        relation: Default::default(),
     })
 }
 
-/// Rules d to g: what keeps a session whose hierarchy is released, with
+/// Rules d, e and g: what keeps a session whose hierarchy is released, with
 /// the fields its entry carries besides: `bucket_unchecked` when rule g's
 /// listing of the bucket failed, since that listing would have found a pin
 /// too (R23). Empty otherwise.
@@ -397,9 +438,6 @@ fn later_rule(
     }
     if let Some(detail) = leg_keeps(&base.join(name)) {
         return plain('e', detail);
-    }
-    if name.starts_with("coordinate-") {
-        return plain('f', "a coordinator's session".to_string());
     }
     if let Backend::Cloud(cloud) = backend {
         match cloud.remote_copy_check(name) {
@@ -532,6 +570,7 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
                     detail: format!("kept: its hierarchy can't be judged: {e:#}"),
                     hierarchy: None,
                     pin: Default::default(),
+                    relation: Default::default(),
                 });
                 continue;
             }
@@ -605,6 +644,7 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
                     ),
                     hierarchy: hierarchies.get(&e.name).cloned(),
                     pin: Default::default(),
+                    relation: Default::default(),
                 });
                 false
             }
@@ -971,6 +1011,7 @@ fn keep_bucket_pinned(
             detail: guard.text().unwrap_or_default(),
             hierarchy: None,
             pin: guard.fields(),
+            relation: Default::default(),
         });
     }
     verdict.remove = remove;
@@ -1012,6 +1053,9 @@ fn apply(
     verdict: &Verdict,
     outcome: &mut Outcome,
 ) {
+    // The judgments below read the bucket again for the continues
+    // relation, rather than the preview's answers.
+    crate::session::continues_bucket::begin_pass(backend);
     let mut grouping = engine.judge();
     let mut components: BTreeMap<String, Vec<&RemoveEntry>> = BTreeMap::new();
     let mut others = Vec::new();
@@ -1093,7 +1137,8 @@ fn record_result(
 /// Remove the entries of one hierarchy. Every member is locked first, so
 /// no koto command ticks one while it is judged; then the hierarchy is
 /// judged again as a unit, reading each member afresh, and only a released
-/// hierarchy loses members. Children go before their parents, anchors
+/// hierarchy loses members, each only when neither its own pin nor the
+/// continues relation keeps it. Children go before their parents, anchors
 /// before their close sessions, and a close session whose anchor is still
 /// there afterwards stays.
 fn apply_component(
@@ -1122,17 +1167,13 @@ fn apply_component(
         return;
     };
     let mut judge = engine.judge();
-    // The component gate asks the component's verdict; a pin never keeps
-    // the whole component, only its own member, which is asked below.
+    // Judged again as a unit, then each member asked on its own what keeps
+    // it: the component's verdict keeps every member, a pin only its own
+    // member, and the continues relation only the members a later session
+    // keeps. There is no group gate beyond the verdict: one member kept by
+    // its pin or the relation never keeps the others.
     let judgment = match judge.judge(&first.name, &Scope::Whole) {
-        Ok(j) if !j.verdict.is_kept() => j,
-        Ok(j) => {
-            let reason = format!("now kept by rule h: {}", hierarchy::reason_text(&j.verdict));
-            for (entry, _) in &locked {
-                record_result(outcome, entry, Err(Refusal::Skipped(reason.clone())));
-            }
-            return;
-        }
+        Ok(j) => j,
         Err(e) => {
             let reason = format!("its hierarchy can't be judged again: {e:#}");
             for (entry, _) in &locked {
@@ -1144,7 +1185,16 @@ fn apply_component(
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
     for (entry, lock) in &locked {
-        let result = if judgment.keeps(&entry.name) {
+        // The local relation here; the bucket's answer comes at the delete,
+        // after the pin guard, whose fresh listing it reads
+        // (`remove_by_rule_with`), so the apply lists nothing twice.
+        let related = judgment.relation_of(&entry.name).clone();
+        let result = if judgment.verdict.is_kept() {
+            Err(Refusal::Skipped(format!(
+                "now kept by rule h: {}",
+                hierarchy::reason_text(&judgment.verdict)
+            )))
+        } else if judgment.pin_of(&entry.name).is_pinned() {
             Err(Refusal::Pinned(crate::session::pin::Guard::of(
                 judgment.pin_of(&entry.name).clone(),
                 engine
@@ -1152,6 +1202,14 @@ fn apply_component(
                     .facts(&entry.name)
                     .map_or(crate::session::pin::SOURCE_LOCAL, |f| f.pin_source()),
             )))
+        } else if related.keeps() {
+            Err(Refusal::SkippedWith(
+                format!(
+                    "now kept by rule r: {}",
+                    hierarchy::relation_text(&related).join("; ")
+                ),
+                hierarchy::relation_json(&related),
+            ))
         } else {
             remove_member(
                 backend,
@@ -1270,14 +1328,21 @@ fn remove_member(
         ));
     }
     // The pin guard, under the session's lock, the last thing before the
-    // delete: a pin set since the scan keeps the session.
-    let removal = crate::session::pin::remove_guarded_with(backend, name, held, || {
+    // delete: a pin set since the scan keeps the session, and, under the
+    // cloud backend, so does a later session continuing it whose
+    // back-reference the judgment didn't see.
+    let removal = crate::session::pin::remove_by_rule_with(backend, name, held, || {
         // The remote copy goes first, so a failure leaves the local copy
-        // for a later prune to retry.
+        // for a later prune to retry. A bucket copy under the session's home
+        // that is another session's leaves both copies, and the session is
+        // skipped.
         if let Backend::Cloud(cloud) = backend {
-            cloud
-                .delete_remote_session_checked(name)
-                .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
+            cloud.delete_remote_session_checked(name).map_err(|e| {
+                match e.downcast_ref::<crate::session::cloud::CopyNotOwn>() {
+                    Some(not_own) => Refusal::Skipped(not_own.to_string()),
+                    None => Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")),
+                }
+            })?;
         }
         std::fs::remove_dir_all(base.join(name))
             .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))
@@ -1285,6 +1350,13 @@ fn remove_member(
     match removal {
         crate::session::pin::Removal::Removed => Ok(()),
         crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard)),
+        crate::session::pin::Removal::KeptByRelation(related) => Err(Refusal::SkippedWith(
+            format!(
+                "now kept by rule r: {}",
+                hierarchy::relation_text(&related).join("; ")
+            ),
+            hierarchy::relation_json(&related),
+        )),
     }
 }
 

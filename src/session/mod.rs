@@ -3,6 +3,7 @@ pub mod batch;
 pub mod cloud;
 pub mod context;
 pub mod context_log;
+pub mod continues_bucket;
 pub mod duration;
 pub mod finished;
 pub mod hierarchy;
@@ -10,9 +11,12 @@ pub mod import_links;
 pub mod inventory;
 pub mod links;
 pub mod local;
+pub mod needed;
 pub mod pin;
 pub mod read_spool;
+pub mod rebind_fence;
 pub mod recover;
+pub mod state_log;
 pub mod sync;
 pub mod sync_stamp;
 pub mod validate;
@@ -137,50 +141,231 @@ impl fmt::Display for SessionMigrated {
 
 impl std::error::Error for SessionMigrated {}
 
-/// A cloud read refused because the session belongs to another directory.
+/// Where a session's own copy lives in the bucket: the prefix every key of
+/// the session is built under, from
+/// [`crate::session::cloud::CloudBackend::home_prefix`].
 ///
-/// The cloud backend finds a session in the bucket under a prefix derived
-/// from the directory the command runs in, while every workspace on a host
-/// shares one local store. A command naming a session from another
-/// directory would sync that shared copy against another workspace's prefix
-/// and could return an older copy that prefix holds under the same name
-/// (koto#457). [`crate::session::cloud::CloudBackend::check_bound_here`]
-/// returns this instead, naming the directory to run from.
-///
-/// The message begins with the error code, `session_bound_elsewhere`, as
-/// [`SessionMigrated`]'s does.
+/// A session's own copy is the one under the prefix recorded when it was
+/// created (`origin.store.prefix`), whichever directory a command runs in.
+/// The local backend has no prefix: every session is in its own workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionBoundElsewhere {
-    /// The session that was named.
-    pub name: String,
-    /// The directory the session is bound to: its execution anchor, when
-    /// its local copy records one.
-    pub anchor: Option<String>,
+pub struct Home {
+    /// The bucket prefix of the session's own copy; empty on the local
+    /// backend.
+    pub prefix: String,
+    /// Whether `prefix` is the prefix of the directory the command runs in.
+    /// Never for a [`HomeSource::Located`] home, whatever its prefix.
+    /// A copy found any other way is read and written strictly: a failed
+    /// bucket request is an error, never a fall-back to the local copy, and
+    /// a push never replaces another session's copy there.
+    pub own_workspace: bool,
+    /// How the prefix was found.
+    pub via: HomeSource,
 }
 
-impl fmt::Display for SessionBoundElsewhere {
+/// How a session's [`Home`] was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeSource {
+    /// The `origin.store.prefix` its local header records.
+    Recorded,
+    /// The prefix of the directory the command runs in: the local backend,
+    /// a session with no local copy on this host, or one recording no
+    /// prefix whose own directory this is.
+    Caller,
+    /// The one candidate holding a copy of a session that records no
+    /// prefix, read from outside its own directory: its anchor's prefix or
+    /// the prefix this host's sync stamp names. The copy is taken as the
+    /// session's own only when it carries the local header's `session_id`,
+    /// which the first pull checks.
+    Located,
+}
+
+/// A command refused because koto can't tell which bucket copy is the
+/// named session's own, so it reads and writes neither.
+///
+/// The message begins with the error code, `session_unlocated`, as
+/// [`SessionMigrated`]'s does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unlocated {
+    /// The session that was named.
+    pub session: String,
+    /// Why no copy could be taken as its own.
+    pub reason: UnlocatedReason,
+}
+
+/// Why a session is [`Unlocated`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnlocatedReason {
+    /// This host has no copy of the session, and the bucket holds none
+    /// under the prefix of the directory the command runs in, while another
+    /// directory's prefix holds one.
+    NoLocalCopy {
+        /// The prefix that was asked.
+        prefix: String,
+    },
+    /// The session was created before koto recorded its prefix, the
+    /// command runs outside the directory its records name, and its
+    /// candidate copies didn't locate it ([`Fallback`]).
+    NoRecordedPrefix {
+        /// The directory the session is bound to, when its header names one.
+        anchor: Option<String>,
+        /// Why the candidates didn't locate it.
+        fallback: Fallback,
+    },
+    /// The copy under the recorded prefix is missing, or is another
+    /// session's (another `session_id`).
+    RecordedCopyMismatch {
+        /// The recorded prefix.
+        prefix: String,
+        /// The `session_id` the copy there carries; `None` when it is
+        /// missing.
+        found: Option<String>,
+    },
+}
+
+/// Why the candidate copies of a session that records no prefix didn't
+/// locate it. The candidates are its anchor's prefix and the prefix this
+/// host's sync stamp names, listed once each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fallback {
+    /// No candidate holds a copy of the session.
+    NoCopy {
+        /// The prefixes listed, in the order they were asked.
+        candidates: Vec<String>,
+    },
+    /// Both candidates hold a copy, so neither can be taken as its own.
+    Ambiguous {
+        /// The two prefixes.
+        prefixes: Vec<String>,
+    },
+    /// The one candidate's copy carries another `session_id`, or one side
+    /// carries none to confirm it by.
+    Mismatch {
+        /// The candidate.
+        prefix: String,
+        /// The `session_id` the copy there carries, when it carries one.
+        found: Option<String>,
+    },
+    /// A candidate's listing failed, so koto can't tell what it holds.
+    Unreadable {
+        /// The candidate.
+        prefix: String,
+        /// What the bucket answered.
+        error: String,
+    },
+}
+
+impl UnlocatedReason {
+    /// The reason as the error JSON's `reason` field carries it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnlocatedReason::NoLocalCopy { .. } => "no_local_copy",
+            UnlocatedReason::RecordedCopyMismatch { .. } => "recorded_copy_mismatch",
+            UnlocatedReason::NoRecordedPrefix { fallback, .. } => match fallback {
+                Fallback::NoCopy { .. } => "no_candidate_copy",
+                Fallback::Ambiguous { .. } => "ambiguous_copies",
+                Fallback::Mismatch { .. } => "candidate_copy_mismatch",
+                Fallback::Unreadable { .. } => "candidate_unreadable",
+            },
+        }
+    }
+
+    /// The bucket prefixes the reason names, for the error JSON's
+    /// `locations` field.
+    pub fn locations(&self) -> Vec<String> {
+        match self {
+            UnlocatedReason::NoLocalCopy { prefix }
+            | UnlocatedReason::RecordedCopyMismatch { prefix, .. } => vec![prefix.clone()],
+            UnlocatedReason::NoRecordedPrefix { fallback, .. } => match fallback {
+                Fallback::NoCopy { candidates } => candidates.clone(),
+                Fallback::Ambiguous { prefixes } => prefixes.clone(),
+                Fallback::Mismatch { prefix, .. } | Fallback::Unreadable { prefix, .. } => {
+                    vec![prefix.clone()]
+                }
+            },
+        }
+    }
+}
+
+impl fmt::Display for Unlocated {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.anchor {
-            Some(anchor) => write!(
+        let name = &self.session;
+        match &self.reason {
+            UnlocatedReason::NoLocalCopy { prefix } => write!(
                 f,
-                "session_bound_elsewhere: session '{}' is bound to {}, not to the directory \
-                 this command ran in; under the cloud backend a session is read only from \
-                 its own workspace, so run the command from {}",
-                self.name, anchor, anchor
+                "session_unlocated: session '{name}' has no copy on this host and the bucket \
+                 holds none under this directory's prefix {prefix}, so nothing was read; run \
+                 the command from the directory the session was started in"
             ),
-            None => write!(
+            UnlocatedReason::NoRecordedPrefix { anchor, fallback } => {
+                write!(
+                    f,
+                    "session_unlocated: session '{name}' records no prefix for its own copy, "
+                )?;
+                match fallback {
+                    Fallback::NoCopy { candidates } => write!(
+                        f,
+                        "and the bucket holds no copy of it under {}",
+                        candidates.join(" or ")
+                    )?,
+                    Fallback::Ambiguous { prefixes } => write!(
+                        f,
+                        "and the bucket holds a copy of it under both {}, and koto can't tell \
+                         which is its own",
+                        prefixes.join(" and ")
+                    )?,
+                    Fallback::Mismatch {
+                        prefix,
+                        found: Some(id),
+                    } => write!(
+                        f,
+                        "and the copy under prefix {prefix} is another session's (session_id \
+                         {id})"
+                    )?,
+                    Fallback::Mismatch {
+                        prefix,
+                        found: None,
+                    } => write!(
+                        f,
+                        "and the copy under prefix {prefix} can't be confirmed as its own, \
+                         since one side carries no session_id"
+                    )?,
+                    Fallback::Unreadable { prefix, error } => write!(
+                        f,
+                        "and listing its copy under prefix {prefix} failed ({error})"
+                    )?,
+                }
+                let at = anchor
+                    .as_deref()
+                    .unwrap_or("the directory the session was started in");
+                write!(
+                    f,
+                    ", so nothing was read or written; run the command from {at}, where it reads \
+                     as before"
+                )
+            }
+            UnlocatedReason::RecordedCopyMismatch {
+                prefix,
+                found: None,
+            } => write!(
                 f,
-                "session_bound_elsewhere: session '{}' belongs to another workspace, not to \
-                 the directory this command ran in; under the cloud backend a session is \
-                 read only from its own workspace, so run the command from the directory \
-                 the session was started in",
-                self.name
+                "session_unlocated: session '{name}' records its copy under prefix {prefix}, \
+                 but the bucket holds no copy of it there, so nothing was read or written"
+            ),
+            UnlocatedReason::RecordedCopyMismatch {
+                prefix,
+                found: Some(id),
+            } => write!(
+                f,
+                "session_unlocated: session '{name}' records its copy under prefix {prefix}, \
+                 but the copy there is another session's (session_id {id}), so nothing was \
+                 read or written"
             ),
         }
     }
 }
 
-impl std::error::Error for SessionBoundElsewhere {}
+impl std::error::Error for Unlocated {}
 
 /// A bounded prefix read of one context key's local content, from
 /// [`Backend::read_context_prefix`].
@@ -400,9 +585,8 @@ pub trait SessionBackend: Send + Sync {
         -> anyhow::Result<()>;
 
     /// Append a `context_read` that its reader already judged to be `id`'s
-    /// own (the CLI's `read_log_target` answered `Session`: the
-    /// reader's anchor is `id` or holds it, or the read ran in `id`'s own
-    /// tick) to `id`'s log.
+    /// own (the CLI's `read_log_target` answered `Session`: the read ran in
+    /// `id`'s own tick) to `id`'s log.
     ///
     /// [`SessionBackend::append_event`] on the cloud backend keeps a read
     /// made outside `id`'s own tick out of the log, in the read spool, since
@@ -644,6 +828,63 @@ pub trait SessionBackend: Send + Sync {
 
     /// # Stability: additive-only
     ///
+    /// What the store's remote half holds beside `id` that the continues
+    /// relation's check of a removal reads
+    /// ([`crate::session::continues_bucket`]): the session's `ctx/koto/`
+    /// listing, shared with [`SessionBackend::bucket_pin`] when the pin guard
+    /// just made one (the pin and release keys and sizes, and the
+    /// validated back-references its successors keep there), one delimiter
+    /// listing of the session's prefix (a migration marker, the state
+    /// object's ETag), and the same `ctx/koto/` listing under the session's
+    /// `origin.store.prefix` when that differs.
+    ///
+    /// The default, for a backend with no remote half, is `None`.
+    fn bucket_removal_facts(
+        &self,
+        _id: &str,
+    ) -> Option<crate::session::continues_bucket::BucketRemovalFacts> {
+        None
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// The cloud backend this is, for the continues relation's bucket walk;
+    /// `None` for a backend with no bucket.
+    fn as_cloud(&self) -> Option<&cloud::CloudBackend> {
+        None
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// Where `id`'s own copy lives, asked of the local copy alone with no
+    /// request: its [`Home`], or [`Unlocated`] when no copy can be taken as
+    /// its own.
+    ///
+    /// The default, for a backend with no remote half, is the caller's own
+    /// workspace for every session.
+    fn home_of(&self, _id: &str) -> Result<Home, Unlocated> {
+        Ok(Home {
+            prefix: String::new(),
+            own_workspace: true,
+            via: HomeSource::Caller,
+        })
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// After `old` moved to `new` for good (the same-name replace's
+    /// move-aside, once every rename and push went through): carry the
+    /// back-references `old`'s successors keep beside it to `new`, and take
+    /// back the one `new`'s own relation named under its old name. Returns
+    /// what wasn't carried or taken back, for the caller to report.
+    ///
+    /// The default, for a backend with no remote half, does nothing.
+    fn repoint_after_move(&self, _old: &str, _new: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// # Stability: additive-only
+    ///
     /// Whether `id` is a migrated source: `koto session import` moved it to
     /// another workspace and left a migration marker under its prefix. Its
     /// pin is inert, since the moved copy holds it. Answered the way a write
@@ -720,7 +961,9 @@ pub trait SessionBackend: Send + Sync {
 ///
 /// This enum allows `build_backend()` to return a single concrete type
 /// that implements both `SessionBackend` and `ContextStore`, regardless
-/// of which backend is selected.
+/// of which backend is selected. One `Backend` is built per command, so the
+/// size of the cloud variant costs nothing worth boxing it for.
+#[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Local(LocalBackend),
     Cloud(cloud::CloudBackend),
@@ -750,6 +993,18 @@ impl Backend {
         }
     }
 
+    /// Before a command writes or pushes `id` under the cloud backend: PUT
+    /// the back-reference its continues relation calls for when one is owed
+    /// (a relation recorded under the local backend, or by an earlier
+    /// build, or under another name). A failure warns and keeps the
+    /// relation out of the session's pushes. The local backend writes no
+    /// back-reference.
+    pub fn ensure_backref(&self, id: &str) {
+        if let Backend::Cloud(b) = self {
+            b.ensure_backref(id);
+        }
+    }
+
     /// Push the writes the commands of a tick on `id` deferred
     /// ([`batch`]); `koto next` calls it before it exits. The local backend
     /// has no remote half and nothing to push.
@@ -757,6 +1012,16 @@ impl Backend {
         match self {
             Backend::Local(_) => Ok(()),
             Backend::Cloud(b) => b.flush_pending(id),
+        }
+    }
+
+    /// Close a write window on `id` (`koto session flush`): push the writes
+    /// it deferred ([`batch`]) and say whether there were any. The local
+    /// backend writes nothing it defers, so it has nothing to push.
+    pub fn flush_window(&self, id: &str) -> anyhow::Result<bool> {
+        match self {
+            Backend::Local(_) => Ok(false),
+            Backend::Cloud(b) => b.flush_window(id),
         }
     }
 
@@ -785,6 +1050,16 @@ impl Backend {
         }
     }
 
+    /// [`Backend::check_not_migrated`] for a command about to write `id`:
+    /// the answer comes from a listing this process made, never one another
+    /// process shared. Always `Ok` on the local backend.
+    pub fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_not_migrated_to_write(id),
+        }
+    }
+
     /// Refuse with [`SessionMigrated`] when `id` was imported into another
     /// workspace. Always `Ok` on the local backend, which has no remote
     /// copy to import from and makes no request.
@@ -795,13 +1070,13 @@ impl Backend {
         }
     }
 
-    /// Refuse with [`SessionBoundElsewhere`] when `id` belongs to another
-    /// directory's workspace. Always `Ok` on the local backend, whose one
-    /// store answers a name the same from every directory.
-    pub fn check_bound_here(&self, id: &str) -> anyhow::Result<()> {
+    /// Refuse with [`Unlocated`] when koto can't tell which bucket copy is
+    /// `id`'s own. Always `Ok` on the local backend, whose one store answers
+    /// a name the same from every directory.
+    pub fn check_located(&self, id: &str) -> anyhow::Result<()> {
         match self {
             Backend::Local(_) => Ok(()),
-            Backend::Cloud(b) => b.check_bound_here(id),
+            Backend::Cloud(b) => b.check_located(id),
         }
     }
 
@@ -1000,6 +1275,37 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.is_migrated_source(id),
             Backend::Cloud(b) => b.is_migrated_source(id),
+        }
+    }
+
+    fn bucket_removal_facts(
+        &self,
+        id: &str,
+    ) -> Option<crate::session::continues_bucket::BucketRemovalFacts> {
+        match self {
+            Backend::Local(b) => b.bucket_removal_facts(id),
+            Backend::Cloud(b) => b.bucket_removal_facts(id),
+        }
+    }
+
+    fn as_cloud(&self) -> Option<&cloud::CloudBackend> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Cloud(b) => Some(b),
+        }
+    }
+
+    fn home_of(&self, id: &str) -> Result<Home, Unlocated> {
+        match self {
+            Backend::Local(b) => b.home_of(id),
+            Backend::Cloud(b) => b.home_of(id),
+        }
+    }
+
+    fn repoint_after_move(&self, old: &str, new: &str) -> Vec<String> {
+        match self {
+            Backend::Local(b) => b.repoint_after_move(old, new),
+            Backend::Cloud(b) => b.repoint_after_move(old, new),
         }
     }
 

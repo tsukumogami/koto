@@ -178,22 +178,39 @@ fn action_failure_conditions(
         FailureKind::TimedOut => GateOutcome::TimedOut,
         FailureKind::SpawnFailed | FailureKind::WaitFailed => GateOutcome::Error,
     };
-    action_condition(
-        state,
-        command,
-        failure_kind.as_str(),
-        outcome,
-        (failure_kind == FailureKind::NonzeroExit).then_some(exit_code),
-        stdout,
-        stderr,
-        truncated,
-        None,
-        build_failure(
-            ACTION_CONDITION_NAME,
-            Some(check),
-            &crate::gate::command_outcome_sentence(failure_kind, exit_code),
+    let markers = check.markers.clone();
+    with_markers(
+        action_condition(
+            state,
+            command,
+            failure_kind.as_str(),
+            outcome,
+            (failure_kind == FailureKind::NonzeroExit).then_some(exit_code),
+            stdout,
+            stderr,
+            truncated,
+            None,
+            build_failure(
+                ACTION_CONDITION_NAME,
+                Some(check),
+                &crate::gate::command_outcome_sentence(failure_kind, exit_code),
+            ),
         ),
+        markers,
     )
+}
+
+/// `conditions` with `markers` on its `__action__` condition: the telemetry
+/// markers the action's command printed, which `build_failure` doesn't
+/// carry.
+fn with_markers(
+    mut conditions: BTreeMap<String, StructuredGateResult>,
+    markers: crate::findings::CheckMarkers,
+) -> BTreeMap<String, StructuredGateResult> {
+    if let Some(result) = conditions.get_mut(ACTION_CONDITION_NAME) {
+        result.markers = markers;
+    }
+    conditions
 }
 
 /// Build the `__action__` condition map for a capture that could not be
@@ -218,17 +235,21 @@ fn capture_failure_conditions(
         "command exited 0 but its output could not be delivered as {}",
         error.key()
     );
-    action_condition(
-        state,
-        command,
-        CAPTURE_FAILED_KIND,
-        GateOutcome::Failed,
-        None,
-        stdout,
-        stderr,
-        truncated,
-        Some(error.to_json()),
-        build_failure(ACTION_CONDITION_NAME, Some(check), &sentence),
+    let markers = check.markers.clone();
+    with_markers(
+        action_condition(
+            state,
+            command,
+            CAPTURE_FAILED_KIND,
+            GateOutcome::Failed,
+            None,
+            stdout,
+            stderr,
+            truncated,
+            Some(error.to_json()),
+            build_failure(ACTION_CONDITION_NAME, Some(check), &sentence),
+        ),
+        markers,
     )
 }
 
@@ -274,6 +295,7 @@ fn action_condition(
         poll: None,
         decider_checks: Vec::new(),
         decider_fallbacks: Vec::new(),
+        markers: Default::default(),
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -439,6 +461,8 @@ fn action_event(
 ) -> EventPayload {
     let mut check = check_fields(result, ACTION_CONDITION_NAME, stamp, events, run.state);
     check.duration_ms = Some(run.duration_ms);
+    // Rule deliveries are recorded for command gates only.
+    check.rules_delivered.clear();
     EventPayload::DefaultActionExecuted {
         state: run.state.to_string(),
         command: run.command.to_string(),
@@ -476,10 +500,16 @@ fn record_successful_action<F>(
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
 {
-    let capture = action
-        .capture_stdout_as
-        .as_ref()
-        .map(|key| (key, prepare_capture(key, run.stdout)));
+    let capture = action.capture_stdout_as.as_ref().map(|key| {
+        // `capture_allow_empty` turns only the empty case into a value:
+        // the empty string passes the allowlist and renders as nothing.
+        // Anything else still takes every check below.
+        if action.capture_allow_empty && run.stdout.trim().is_empty() {
+            (key, Ok(String::new()))
+        } else {
+            (key, prepare_capture(key, run.stdout))
+        }
+    });
     if let Some((_, Err(error))) = &capture {
         let mut conditions = capture_failure_conditions(
             run.state,
@@ -504,6 +534,7 @@ where
         outcome: GateOutcome::Passed,
         findings: check.findings,
         duration_ms: Some(run.duration_ms),
+        markers: check.markers,
         ..Default::default()
     };
     fill_effect_landed(result.all_findings_mut(), true);
@@ -859,6 +890,46 @@ fn check_fields(
         rule_counts,
         rule_counts_truncated,
         duration_ms: result.duration_ms,
+        reason: check_reason(result).map(str::to_string),
+        not_ready: result.markers.not_ready,
+        fallback_logged: result.outcome != GateOutcome::Passed && result.fallback().is_some(),
+        rules_delivered: result.markers.rules_delivered.clone(),
+    }
+}
+
+/// Why a judged check didn't pass, one of
+/// [`CHECK_REASONS`](crate::engine::types::CHECK_REASONS), or `None` for a
+/// check that passed or is still pending. Read from the outcome, the
+/// command's `failure_kind` and exit code, and whether the check printed an
+/// `error` finding of its own; the result is logged for telemetry and
+/// nothing routes on it.
+pub(crate) fn check_reason(result: &StructuredGateResult) -> Option<&'static str> {
+    match result.outcome {
+        GateOutcome::Passed | GateOutcome::Pending => None,
+        GateOutcome::TimedOut => Some("timed_out"),
+        GateOutcome::Error => {
+            let kind = result.output.get("failure_kind").and_then(|k| k.as_str());
+            if kind == Some(FailureKind::SpawnFailed.as_str()) {
+                Some("spawn_failed")
+            } else {
+                Some("error")
+            }
+        }
+        GateOutcome::Failed => {
+            // The parsed findings, uncapped: koto's fallback sits apart from
+            // them, so any `error` here is the check's own.
+            if result
+                .findings
+                .iter()
+                .any(|f| f.level == FindingLevel::Error)
+            {
+                Some("rule_failed")
+            } else if result.output.get("exit_code").and_then(|c| c.as_i64()) == Some(2) {
+                Some("undecided")
+            } else {
+                Some("no_finding")
+            }
+        }
     }
 }
 
@@ -2666,6 +2737,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         }
     }
 
@@ -2719,6 +2791,7 @@ mod tests {
         }
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0.0".to_string(),
@@ -3238,6 +3311,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 idempotency_hash: None,
             },
@@ -3254,6 +3328,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 idempotency_hash: None,
             },
@@ -3279,6 +3354,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 idempotency_hash: None,
             },
@@ -3295,6 +3371,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 idempotency_hash: None,
             },
@@ -3352,6 +3429,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3371,6 +3449,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3393,6 +3472,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3412,6 +3492,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -3468,6 +3549,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -3488,6 +3570,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3563,6 +3646,7 @@ mod tests {
                         skip_if: None,
                         result: None,
                         clear_on_entry: Vec::new(),
+                        directive_rules: Vec::new(),
                     },
                 ),
                 (
@@ -3582,6 +3666,7 @@ mod tests {
                         skip_if: None,
                         result: None,
                         clear_on_entry: Vec::new(),
+                        directive_rules: Vec::new(),
                     },
                 ),
             ])
@@ -3661,6 +3746,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3712,6 +3798,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3767,6 +3854,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -3790,6 +3878,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3870,6 +3959,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -3900,6 +3990,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3919,6 +4010,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3938,6 +4030,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4006,6 +4099,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -4036,6 +4130,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4055,6 +4150,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4074,6 +4170,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4143,6 +4240,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -4171,6 +4269,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4190,6 +4289,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4264,6 +4364,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -4285,6 +4386,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4304,6 +4406,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4478,6 +4581,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4497,6 +4601,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4549,6 +4654,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -4608,6 +4714,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ));
         }
@@ -4629,6 +4736,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         ));
 
@@ -4673,6 +4781,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -4718,6 +4827,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4737,6 +4847,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4756,6 +4867,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4805,6 +4917,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4824,6 +4937,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4843,6 +4957,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4887,6 +5002,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         }
     }
 
@@ -5005,6 +5121,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )])
     }
@@ -5097,6 +5214,73 @@ mod tests {
         assert!(overlay.is_empty(), "a failed capture writes nothing");
     }
 
+    /// Run `capturing_template("NOTE")` with `capture_allow_empty` set, its
+    /// action printing `stdout`; returns the stop, the overlay's `NOTE` and
+    /// the appended events.
+    fn run_allow_empty(stdout: &'static str) -> (AdvanceResult, Option<String>, Vec<EventPayload>) {
+        let mut template = capturing_template("NOTE");
+        template
+            .states
+            .get_mut("detect")
+            .unwrap()
+            .default_action
+            .as_mut()
+            .unwrap()
+            .capture_allow_empty = true;
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+        let overlay = VariableOverlay::new();
+        let action = move |_: &str, _: &ActionDecl, _: bool| executed(stdout);
+        let result = advance_until_stop(
+            "detect",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &shutdown,
+        )
+        .unwrap();
+        let note = overlay.get("NOTE");
+        (result, note, appended.into_inner())
+    }
+
+    #[test]
+    fn capture_allow_empty_delivers_empty_output_as_the_empty_string() {
+        let (result, note, appended) = run_allow_empty(" \n\t ");
+        assert!(
+            !matches!(result.stop_reason, StopReason::GateBlocked(_)),
+            "an allowed empty capture doesn't fail the tick: {:?}",
+            result.stop_reason
+        );
+        assert_eq!(note.as_deref(), Some(""));
+        assert!(appended.iter().any(|p| matches!(
+            p,
+            EventPayload::VariableCaptured { key, value } if key == "NOTE" && value.is_empty()
+        )));
+    }
+
+    #[test]
+    fn capture_allow_empty_still_checks_a_non_empty_output() {
+        let (_, note, _) = run_allow_empty("  ready\n");
+        assert_eq!(note.as_deref(), Some("ready"));
+
+        let (result, note, _) = run_allow_empty("a;b\n");
+        let StopReason::GateBlocked(conditions) = result.stop_reason else {
+            panic!("expected a gate-blocked stop, got {:?}", result.stop_reason);
+        };
+        let output = &conditions[ACTION_CONDITION_NAME].output;
+        assert_eq!(output["capture_error"]["case"], "disallowed_character");
+        assert_eq!(note, None);
+    }
+
     #[test]
     fn a_state_without_a_capture_name_writes_no_overlay_entry() {
         let template = make_template(vec![(
@@ -5119,6 +5303,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -5177,6 +5362,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5239,6 +5425,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5286,6 +5473,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5379,6 +5567,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5398,6 +5587,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ])
@@ -5496,6 +5686,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -5537,6 +5728,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -5672,6 +5864,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -5692,6 +5885,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5758,6 +5952,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5777,6 +5972,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -5843,6 +6039,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5862,6 +6059,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -5924,6 +6122,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5987,6 +6186,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6006,6 +6206,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6084,6 +6285,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6103,6 +6305,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6358,6 +6561,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6386,6 +6590,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6475,6 +6680,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6503,6 +6709,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6555,6 +6762,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -6576,6 +6784,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6595,6 +6804,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6690,6 +6900,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -6711,6 +6922,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6730,6 +6942,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6800,6 +7013,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -6821,6 +7035,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6840,6 +7055,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6937,6 +7153,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -6959,6 +7176,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("complete", {
@@ -7032,6 +7250,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -7057,6 +7276,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("complete", {
@@ -7438,6 +7658,7 @@ mod tests {
                     },
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -7457,6 +7678,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -7554,6 +7776,7 @@ mod tests {
                     },
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -7573,6 +7796,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -7937,6 +8161,127 @@ mod tests {
             poll: None,
             decider_checks: Vec::new(),
             decider_fallbacks: Vec::new(),
+            markers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn check_reason_names_why_a_judged_check_did_not_pass() {
+        let with = |outcome: GateOutcome, output: serde_json::Value, findings: Vec<Finding>| {
+            let mut r = failing_gate_result("g", findings);
+            r.outcome = outcome;
+            r.output = output;
+            r
+        };
+        let exit = |code: i64| serde_json::json!({"exit_code": code, "error": ""});
+        let kind = |k: &str| serde_json::json!({"exit_code": -1, "error": "x", "failure_kind": k});
+        let cases = [
+            (
+                with(
+                    GateOutcome::Failed,
+                    exit(1),
+                    vec![finding("E1", FindingLevel::Error)],
+                ),
+                Some("rule_failed"),
+            ),
+            (
+                with(
+                    GateOutcome::Failed,
+                    exit(2),
+                    vec![finding("E1", FindingLevel::Error)],
+                ),
+                Some("rule_failed"),
+            ),
+            (
+                with(
+                    GateOutcome::Failed,
+                    exit(2),
+                    vec![finding("W1", FindingLevel::Warning)],
+                ),
+                Some("undecided"),
+            ),
+            (
+                with(GateOutcome::Failed, exit(2), vec![]),
+                Some("undecided"),
+            ),
+            (
+                with(GateOutcome::Failed, exit(1), vec![]),
+                Some("no_finding"),
+            ),
+            (
+                with(GateOutcome::Failed, exit(127), vec![]),
+                Some("no_finding"),
+            ),
+            (
+                with(
+                    GateOutcome::Failed,
+                    serde_json::json!({"exists": false, "error": ""}),
+                    vec![],
+                ),
+                Some("no_finding"),
+            ),
+            (
+                with(GateOutcome::TimedOut, kind("timed_out"), vec![]),
+                Some("timed_out"),
+            ),
+            (
+                with(GateOutcome::Error, kind("spawn_failed"), vec![]),
+                Some("spawn_failed"),
+            ),
+            (
+                with(GateOutcome::Error, kind("wait_failed"), vec![]),
+                Some("error"),
+            ),
+            (
+                with(
+                    GateOutcome::Error,
+                    serde_json::json!({"error": "decider down"}),
+                    vec![],
+                ),
+                Some("error"),
+            ),
+            (with(GateOutcome::Passed, exit(0), vec![]), None),
+            (with(GateOutcome::Pending, exit(75), vec![]), None),
+        ];
+        for (i, (result, want)) in cases.iter().enumerate() {
+            assert_eq!(check_reason(result), *want, "case {i}");
+        }
+    }
+
+    #[test]
+    fn check_fields_log_the_reason_readiness_and_whether_the_fallback_is_among_the_findings() {
+        let stamp = AttemptStamp {
+            attempt: 1,
+            visit_attempt: 1,
+        };
+        let mut no_finding = failing_gate_result("g", vec![]);
+        no_finding.markers.not_ready = true;
+        let fields = check_fields(&no_finding, "g", stamp, &[], "s");
+        assert_eq!(fields.reason.as_deref(), Some("no_finding"));
+        assert!(fields.not_ready);
+        assert!(fields.fallback_logged);
+        assert!(fields
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "g" && f.level == FindingLevel::Error));
+
+        let own = failing_gate_result("g", vec![finding("E1", FindingLevel::Error)]);
+        let fields = check_fields(&own, "g", stamp, &[], "s");
+        assert_eq!(fields.reason.as_deref(), Some("rule_failed"));
+        assert!(!fields.not_ready);
+        assert!(!fields.fallback_logged);
+
+        // The new fields serialize only when set, so a passing check's
+        // event is logged as before.
+        let passed = StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+            ..Default::default()
+        };
+        let fields = check_fields(&passed, "g", stamp, &[], "s");
+        let json = serde_json::to_value(&fields).unwrap();
+        for absent in ["reason", "not_ready", "fallback_logged"] {
+            assert!(json.get(absent).is_none(), "{absent}: {json}");
         }
     }
 
@@ -7951,6 +8296,7 @@ mod tests {
             rule_ref: None,
             effect_landed: None,
             message_source: crate::findings::MessageSource::Check,
+            unit: None,
         }
     }
 
@@ -7973,6 +8319,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         }
     }
 

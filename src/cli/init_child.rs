@@ -372,6 +372,7 @@ pub fn init_child_from_parent(
         None,
         None,
         false,
+        None,
     )
     .map(|_| ())
 }
@@ -406,6 +407,37 @@ pub fn init_child_from_parent_at(
         None,
         execution_dir,
         legacy_environment,
+        None,
+    )
+}
+
+/// [`init_child_from_parent_at`] for a top-level session whose header
+/// `session_id` the caller chose beforehand: `koto init --supersede` mints
+/// the successor's id before it fences the predecessor, which records it.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+pub(crate) fn init_session_with_id(
+    backend: &dyn SessionBackend,
+    name: &str,
+    template_path: &Path,
+    vars: &[String],
+    cache: &mut TemplateCompileCache,
+    execution_dir: Option<&Path>,
+    legacy_environment: bool,
+    session_id: &str,
+) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
+    init_child_core(
+        backend,
+        None,
+        name,
+        template_path,
+        vars,
+        cache,
+        None,
+        None,
+        execution_dir,
+        legacy_environment,
+        Some(session_id),
     )
 }
 
@@ -444,6 +476,7 @@ pub fn init_child_as_skip_marker_from_parent(
         Some(skipped_state_name),
         None,
         false,
+        None,
     )
     .map(|_| ())
 }
@@ -637,12 +670,15 @@ pub(crate) fn origin_record(
     Some(crate::engine::types::SessionOrigin {
         anchor: anchor?.to_path_buf(),
         store: backend.store_identity()?,
+        anchor_epoch: 0,
+        retired_anchors: Vec::new(),
     })
 }
 
 /// Shared implementation. When `override_initial_state` is `Some`, the
 /// first `Transitioned` event routes to that state instead of the
 /// template's `initial_state`; this is the skip-marker spawn path.
+/// `session_id`, when given, is the header's id instead of a fresh one.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 fn init_child_core(
@@ -656,6 +692,7 @@ fn init_child_core(
     override_initial_state: Option<&str>,
     execution_dir_override: Option<&Path>,
     legacy_environment: bool,
+    session_id: Option<&str>,
 ) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
@@ -760,7 +797,7 @@ fn init_child_core(
         // base canonicalizes to the same form a later caller computes.
         origin: None,
         execution_dir,
-        session_id: generate_session_id(),
+        session_id: session_id.map_or_else(generate_session_id, str::to_string),
         intent: None,
         template_name: if cached.compiled.name.is_empty() {
             None

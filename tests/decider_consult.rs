@@ -493,7 +493,18 @@ fn the_lock_fails_fast_and_the_loser_records_nothing() {
     let resp = json_out(&second);
     assert_eq!(resp["action"], "evidence_required");
     assert_eq!(resp["state"], "review");
-    assert_eq!(h.raw_log(), log_before, "the loser appended to the log");
+    // The loser records nothing of its own beyond the
+    // `instructions_delivered` every printed directive appends.
+    let after = h.raw_log();
+    let appended = after
+        .strip_prefix(log_before.as_str())
+        .expect("the loser rewrote the log");
+    assert!(
+        appended
+            .lines()
+            .all(|l| l.contains(r#""type":"instructions_delivered""#)),
+        "the loser appended to the log: {appended}"
+    );
 
     let first = first.wait_with_output().unwrap();
     assert!(first.status.success(), "{}", describe(&first));
@@ -565,9 +576,11 @@ fn a_submission_during_the_call_wins_and_the_answer_is_not_applied() {
         vec![
             ("evidence_submitted".to_string(), String::new()),
             ("transitioned".to_string(), "rethink".to_string()),
+            ("instructions_delivered".to_string(), String::new()),
             // The consultation's context input read, logged just before it.
             ("context_read".to_string(), String::new()),
             ("decider_consulted".to_string(), String::new()),
+            ("instructions_delivered".to_string(), String::new()),
         ],
         "{}",
         h.raw_log()
@@ -801,7 +814,12 @@ fn auto_applies_and_advances_with_the_ordinary_response_shape() {
         .collect();
     assert_eq!(
         tail,
-        vec!["decider_consulted", "evidence_submitted", "transitioned"]
+        vec![
+            "decider_consulted",
+            "evidence_submitted",
+            "transitioned",
+            "instructions_delivered"
+        ]
     );
     let c = h.consultations();
     assert_eq!(c[0]["outcome"], "applied");

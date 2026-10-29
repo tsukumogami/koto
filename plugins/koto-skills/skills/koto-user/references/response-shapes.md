@@ -521,7 +521,11 @@ agents encounter today for any state that uses `integration:`.
   "reason": "hierarchy"}` (the session has a
   link or lineage: a dispatcher, a koto parent, a `chain/parent`, or another
   session naming it; kept with or without `--no-cleanup` until `koto session
-  prune` finds its hierarchy released), or `{"retained": true, "reason":
+  prune` finds its hierarchy released; a session a later session continues
+  adds `relation_keepers`, each `{keeper, standing, path}`, naming the later
+  sessions whose standing keeps it, which under the cloud backend may be
+  sessions only the bucket holds, and `bucket_unchecked` when the bucket
+  couldn't be checked for one), or `{"retained": true, "reason":
   "no_cleanup"}` (a lone session kept because the tick passed `--no-cleanup`). A
   parent kept for `hierarchy` also carries `kept_children`, beside `retention`:
   each terminal child it would once have removed, as `{"name", "reason",
@@ -783,6 +787,7 @@ Each finding:
 | `path` | optional | The file the finding is about. |
 | `line`, `column` | optional | 1-based location; `line` only with `path`, `column` only with `line`. |
 | `rule_ref` | optional | A pointer to the rule's full text, often a URL. Opaque to koto. |
+| `unit` | optional | A decider check in unit mode only: the unit the finding is about, `{"key", "document", "section"}` with `document` and `section` present when the extraction printed them. |
 
 When a failed check reports no finding at level `error`, koto adds one last: its
 `rule_id` is koto's default -- the gate's name, or `__action__` -- not an id from any rule
@@ -846,6 +851,58 @@ it only when you need the rule's full text and the link is one you'd follow anyw
 Known credentials never appear here. koto replaces each with `[REDACTED:<source>]` before
 the response is built, where `source` names the variable or setting it came from. The
 marker isn't the failure; don't try to recover the value.
+
+### A decider check's `units` and `rules`
+
+A `decider-check` blocking condition's `output` lists criteria by outcome:
+`failed`, `unanswered`, `awaiting` (waiting on your answer) and
+`agent_answered`. A check that grades units one at a time (`units: jsonl` in the
+template) adds `output.units`, one entry per unit its extraction printed, in
+print order, and a failing veto criterion that declares its rule adds `rules`
+beside `output`:
+
+```json
+{
+  "name": "acceptance",
+  "type": "decider-check",
+  "status": "failed",
+  "category": "corrective",
+  "agent_actionable": true,
+  "output": {
+    "failed": ["ac_binary"],
+    "unanswered": ["ac_binary"],
+    "awaiting": ["ac_binary"],
+    "agent_answered": [],
+    "error": "",
+    "units": [
+      {"key": "ac-1", "failed": ["ac_binary"], "awaiting": [], "agent_answered": []},
+      {"key": "ac-2", "failed": [], "awaiting": ["ac_binary"], "agent_answered": []}
+    ]
+  },
+  "rules": [
+    {"rule_id": "ac_binary", "level": "summary", "text": "State one observable outcome per criterion.", "units": ["ac-1"]}
+  ],
+  "failure": {"findings": [
+    {"rule_id": "ac_binary", "level": "error", "unit": {"key": "ac-1"}, "message": "...", "message_source": "decider", "effect_landed": false},
+    {"rule_id": "ac_binary", "level": "warning", "unit": {"key": "ac-2"}, "message": "... `koto decider answer wf --gate acceptance --criterion ac_binary --unit ac-2 --answer <pass|fail|unclear>` ...", "message_source": "koto", "effect_landed": false}
+  ], "findings_truncated": false}
+}
+```
+
+- `units[].failed` names the criteria that unit failed, `awaiting` the ones
+  waiting on your answer for that unit, and `agent_answered` the ones you
+  answered. A criterion is listed at the top level when any unit lists it.
+  Absent on a check that grades one slice.
+- Each failing unit has its own `error` finding and each waiting unit its own
+  `warning` finding, with `unit.key` naming it. Fix the units the error
+  findings name, and answer each waiting unit with the `--unit` command its
+  finding gives.
+- `rules` holds one entry per failing veto criterion that declares a rule
+  text: `rule_id`, `level`, `text`, and in unit mode `units`, the keys of the
+  units that failed it. `level` is `summary` on the first failing evaluation of
+  that check and rule in the visit and `full` (the whole rule) on every later
+  one; a new visit starts at `summary` again. Fix the work against `text`. The
+  key is absent when no failing criterion declares a rule.
 
 ### `advisories`
 

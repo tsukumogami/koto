@@ -29,6 +29,25 @@ to `0.9.x`).
   its release record, with no log event. They are listed with koto's other
   cross-session writers in
   [koto#445](https://github.com/tsukumogami/koto/issues/445).
+- **`koto session import` keeps its source as a read-only predecessor.
+  v0.32.0 is the first release that honours the relation it leaves.** The
+  copy gets `koto/links/continues/<source>` and the source a back-reference,
+  both written before the copy is pushed, and the migration marker follows
+  the push. In the source's own workspace, `koto next`, `koto context add` and
+  `remove`, `rewind`, `cancel`, `decisions record`, `overrides record`,
+  `session link`, `session rebind`, `resolve`, `update`, `pin` and `unpin`
+  still exit 2 with `session_migrated`; `koto status`, `koto context get`,
+  `exists` and `list`, `koto decisions list` and `koto overrides list` now
+  exit 0 and answer from its last pushed bucket copy, changing nothing. A
+  re-run on a copy that holds a relation naming another session exits 2 with
+  `relation_conflict`. `koto session prune --migrated-from` removes the
+  marker and source only once the copy and any later member have no standing
+  (reason `released`), so `session.cloud.marker_retain_days` and
+  `--source-retired` are accepted but ignored; a run that uses either lists it
+  under `ignored`. Older releases fall short in three ways: their local prunes
+  over-keep a chain; under the cloud backend they can delete a predecessor
+  whose successor they never pulled; and their import still retires its
+  source.
 
 - **Anchorless context reads are no longer written to the read session's
   log.** `koto context get` and `koto context exists` run with no reader
@@ -50,6 +69,74 @@ to `0.9.x`).
 
 ### Added
 
+- **Rules a directive carries, recorded as telemetry.** A state's new
+  `directive_rules` list names the rules its directive hands the agent
+  (`rule_id`, `check`, `extent` and `when_set`). Each time `koto next`
+  prints that directive, it appends one `rule_delivered` event per entry
+  whose `when_set` variable or capture is non-empty, after the response
+  prints, with the new `via` value `directive` and `delivery: printed`.
+  `koto status` records nothing, and the response is unchanged. The
+  compiler checks each entry (`E-DIRECTIVE-RULE-*`).
+- **`capture_allow_empty` on a `default_action`.** Beside
+  `capture_stdout_as`, it delivers an empty output as the empty string
+  instead of failing the tick, so a directive that interpolates it renders
+  nothing. Without it an empty output fails as before. A template that uses
+  neither new field compiles to the same bytes and hash; one that uses
+  either needs this koto.
+- **Check and evidence telemetry in the run journal.** `check_evaluated`
+  gains `koto.check.reason` (why a check didn't pass: `rule_failed`,
+  `undecided`, `no_finding`, `timed_out`, `spawn_failed` or `error`),
+  `koto.check.not_ready` and `koto.check.pre_directive`, and
+  `check_finding` gains `koto.finding.source` (`check` or `fallback`). A
+  check says "not ready" by printing a line that starts with
+  `::koto-not-ready::`, or, on a command gate, by exiting with a code the
+  new optional `not_ready_exit_codes` field lists; it is telemetry only and
+  changes no outcome, route or fallback finding. A new `evidence_field`
+  record carries each enum or boolean field of the agent's evidence (a
+  declared value, its digest, `other`, or `true`/`false`), never string or
+  number values. In the session log, `instructions_delivered` is now
+  appended for every printed directive with an additive
+  `details_included`, which details suppression reads, and
+  `evidence_submitted` gains an additive `exported_fields` map.
+- **Command checks report rule deliveries.** A command gate's check that
+  prints a line starting with `::koto-rule-delivered::` and holding a JSON
+  object with exactly `rule_id`, `extent` (`summary` or `full`) and
+  `delivery` (`printed` or `refused`) has it kept on `gate_evaluated` as
+  `rules_delivered`, and `koto next` appends a `rule_delivered` event per
+  line after its response prints. The event and its run-journal record gain
+  `via` (`check_output`) and `delivery`, as `koto.rule.via` and
+  `koto.rule.delivery`; a decider check's delivery carries neither.
+  Malformed lines are ordinary output, and nothing routes on the record.
+- **`koto review record` records document reviews as telemetry.** Four
+  subcommands, `round-started`, `verdicts --file`, `decision` and
+  `doc-checks --file`, append `review_round_started`,
+  `review_verdict_recorded` (one per entry), `review_decision_recorded` and
+  `doc_check_recorded` (one per entry) to a non-terminal session, and the
+  run journal relays them as `review_round`, `review_verdict`,
+  `review_decision` and `doc_checked`. Every value is checked first and
+  stored in koto's words: closed sets for document type, verdict, decision
+  and check outcome, a schema bucket, validated rule ids, positive counts,
+  and seats and sections the template declares in the new optional
+  `review_vocabulary` field (anything else is `other`). A batch holds at
+  most 200 entries and a session 2,000 review events; one invalid entry
+  refuses the whole batch, and errors never repeat a value the caller gave.
+  Nothing routes on the events.
+- **`koto review record` records a document's drafting as telemetry.**
+  Three more subcommands: `rule-checks --doc-format --moment --file` (each
+  check-held rule's outcome, `pass`, `fail`, `not_ready` or `error`, at
+  `pre_jury`, `post_fix` or `post_create`), `section-written --doc-format
+  --section --write first|rewrite`, and `fix --doc-format --answers
+  jury_fail|check_fail [--round 1-50] --file` (entries of rule, section and
+  the check rule that decides it, or `none`). Each call appends one event,
+  `doc_rule_checks_recorded`, `doc_section_recorded` or `doc_fix_recorded`,
+  and the run journal relays one `doc_rule_checked`, `doc_section_written`
+  or `doc_fix_applied` record per entry, every record of a call under its
+  `koto.seq` and carrying the session's state and `koto.doc.format`.
+  `round-started`, `verdicts` and `decision` take an optional
+  `--doc-format`, which adds `koto.doc.format` and accepts `vision`,
+  `strategy` and `roadmap`, for which `koto.doc.type` is left out. The
+  session cap of 2,000 now counts review entries, one per entry of a batch
+  call. Checks and refusals work as for the four review events.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root

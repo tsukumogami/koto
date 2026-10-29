@@ -135,6 +135,9 @@ events:
         type: string
         required: false
         nullable: true
+      exported_fields:
+        type: object
+        required: false
 
   workflow_cancelled:
     tier: 1
@@ -269,6 +272,9 @@ events:
       state:
         type: string
         required: true
+      details_included:
+        type: boolean
+        required: false
 
   default_action_executed:
     tier: 2
@@ -311,6 +317,16 @@ events:
         required: false
       duration_ms:
         type: integer
+        required: false
+      reason:
+        type: string
+        required: false
+        enum: ["rule_failed", "undecided", "no_finding", "timed_out", "spawn_failed", "error"]
+      not_ready:
+        type: boolean
+        required: false
+      fallback_logged:
+        type: boolean
         required: false
 
   decision_recorded:
@@ -378,6 +394,19 @@ events:
         required: false
       poll:
         type: object
+        required: false
+      reason:
+        type: string
+        required: false
+        enum: ["rule_failed", "undecided", "no_finding", "timed_out", "spawn_failed", "error"]
+      not_ready:
+        type: boolean
+        required: false
+      fallback_logged:
+        type: boolean
+        required: false
+      rules_delivered:
+        type: array
         required: false
 
   child_completed:
@@ -600,6 +629,12 @@ events:
       endpoint_origin:
         type: string
         required: false
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
 
   decider_fallback:
     tier: 2
@@ -632,6 +667,12 @@ events:
       input_bytes:
         type: integer
         required: false
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
 
   decider_check_answered:
     tier: 2
@@ -661,6 +702,40 @@ events:
       fallback_seq:
         type: integer
         required: true
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
+
+  rule_delivered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      level:
+        type: string
+        required: true
+        enum: ["summary", "full"]
+      unit_count:
+        type: integer
+        required: false
+      via:
+        type: string
+        required: false
+        enum: ["check_output", "directive"]
+      delivery:
+        type: string
+        required: false
+        enum: ["printed", "refused"]
 
   finding_disputed:
     tier: 2
@@ -686,6 +761,162 @@ events:
       visit_attempt:
         type: integer
         required: false
+
+  review_round_started:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      seat_count:
+        type: integer
+        required: true
+      fallback:
+        type: boolean
+        required: true
+
+  review_verdict_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      seat:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      section:
+        type: string
+        required: true
+      verdict:
+        type: string
+        required: true
+        enum: ["pass", "fail"]
+
+  review_decision_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      decision:
+        type: string
+        required: true
+        enum: ["rerun", "fix_and_proceed", "loop_back", "proceed", "stop"]
+
+  doc_check_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      rule_id:
+        type: string
+        required: true
+      outcome:
+        type: string
+        required: true
+        enum: ["passed", "failed", "error"]
+
+  doc_rule_checks_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      moment:
+        type: string
+        required: true
+        enum: ["pre_jury", "post_fix", "post_create"]
+      entries:
+        type: array
+        required: true
+
+  doc_section_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      section:
+        type: string
+        required: true
+      write:
+        type: string
+        required: true
+        enum: ["first", "rewrite"]
+
+  doc_fix_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      answers:
+        type: string
+        required: true
+        enum: ["jury_fail", "check_fail"]
+      round:
+        type: integer
+        required: false
+      entries:
+        type: array
+        required: true
 
   anchor_started:
     tier: 3
@@ -982,7 +1213,8 @@ reading the log.
 
 The event is the durable record of an assignment: the values ride the same
 append as the transition, and the context store is written from them right
-after. If that write doesn't land, the next read repairs the store from the
+after. If that write doesn't land, a read answers the value from the log
+without storing it, and the session's next tick repairs the store from the
 log. A later `context_added` or `context_removed` for the same key supersedes
 an assignment, so a consumer reconstructing context folds all three in `seq`
 order, last write wins.
@@ -1056,6 +1288,7 @@ Records what an agent submitted for a state.
 | `fields` | object | Yes | Agent-provided key-value evidence. Values are arbitrary JSON. |
 | `submitter_cwd` | string | No | Working directory of the submitting process. Used internally by the batch scheduler. Consumers MAY ignore this field. |
 | `source` | string | No | Who produced the evidence when it wasn't the agent. `"decider"` marks an answer koto applied from an opted-in decider; absent means the agent submitted it. Only koto sets it: a `source` key in `--with-data` lands in `fields`. Consumers MUST tolerate values they don't recognize. |
+| `exported_fields` | object | No | The submission's enum and boolean fields as telemetry may carry them, keyed by field name: an enum value the state's `accepts` declares (its digest when it isn't name-shaped), `other` for one it doesn't, and `true` or `false` for a boolean. String, number and task-list fields have no entry. Written by `koto next --with-data` when there is at least one entry; the run journal relays each entry as an `evidence_field` record. |
 
 ---
 
@@ -1394,13 +1627,14 @@ environment:
 | Reader's anchor | Where the `context_read` goes |
 |---|---|
 | Any, when the command runs inside the read session's own tick (a gate script or default action reading its own session) | The session read, as above. |
-| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | The session read, as above. |
+| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | No log: the reading host's read spool, as the last row. The read is the session's own agent session's, but it runs outside the session's tick, so the session read stays byte-identical. |
 | Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
 | Unset, or names no anchor in the local store | No log: the reading host's read spool, `context-reads.jsonl` beside the read session's local copy. The session read stays byte-identical. |
 
-The table holds under both backends. The last row closes the cross-session
-writer koto#412 tracked, where a read from a shell with no anchor appended
-to the session it read. A spooled read is the same `context_read` payload,
+The table holds under both backends. Only the first row writes into the
+session read, so a read outside the session's own tick never does. The last
+row closes the cross-session writer koto#412 tracked, where a read from a
+shell with no anchor appended to the session it read. A spooled read is the same `context_read` payload,
 with no `session` field, on a line of its own with its `timestamp`; the spool
 isn't part of the feed, and koto reads it back only through its one reader,
 for the run journal. Under the cloud backend, a `context_read` some other
@@ -1434,8 +1668,8 @@ The consumers handle these reads this way:
 
 #### `instructions_delivered`
 
-Records that a `koto next` response carried a phase's instructions to whoever
-called it. A phase's delivery window runs from the state-entry event by which the
+Records that a `koto next` response printed a phase's directive, and whether
+it also carried the phase's instructions (`details`). A phase's delivery window runs from the state-entry event by which the
 workflow *arrived* at it — an entry recording a different source phase, an entry
 recording no source at all, as `koto init`'s does, or any rewind — to the end of
 the log. With no such entry anywhere in the log, every event is in scope. A delivery recorded inside that window is what
@@ -1447,26 +1681,35 @@ self-transition, or a directed transition into the phase the workflow already
 occupies — closes the epoch but does not open a delivery window, so an agent
 going around a loop it is already in is not re-sent instructions it holds.
 
-Both `koto next` response-construction paths append this event, after the
-response has been printed. The ordering is deliberate: a crash between printing
-and appending re-delivers on the next tick, which is the benign direction.
+Both `koto next` response-construction paths append this event for every
+response that prints a non-terminal directive, after the response has been
+printed. The ordering is deliberate: a crash between printing and appending
+re-delivers on the next tick, which is the benign direction. Only an event whose
+`details_included` is `true`, or absent (as on every event written before the
+field existed, when koto appended one only for a response that carried the
+details), counts as a delivery of the instructions; one whose value is `false`
+records a directive printed with its details left out. The run journal reads
+any of them as "the directive was shown in this visit" (its
+`koto.check.pre_directive`).
 
 Nothing else in the feed can stand in for it. A non-advancing tick on a phase
-that is only waiting for evidence appends nothing at all, so two sessions
-differing only in whether the instructions went out produce identical feeds.
+that is only waiting for evidence appends nothing else, so two sessions
+differing only in whether the instructions went out differ only here.
 
 ```json
 {
   "type": "instructions_delivered",
   "payload": {
-    "state": "implement"
+    "state": "implement",
+    "details_included": true
   }
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `state` | string | Yes | The phase whose instructions the response carried. |
+| `state` | string | Yes | The phase whose directive the response printed. |
+| `details_included` | boolean | No | Whether the response also carried the phase's `details`. Absent on events written before the field existed, which a reader treats as `true`. |
 
 The phase is named rather than left implicit because a tick can advance through
 several phases at once, and a reader has to be able to tell a record left by a
@@ -1511,6 +1754,9 @@ Records when a state's automatic shell command ran.
 | `rule_counts` | object | No | On a failed action: per-rule attempt counts for the rules it reported at `error`, under the check name `__action__`. At most 50 keys. |
 | `rule_counts_truncated` | boolean | No | `true` when the action reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |
 | `duration_ms` | integer | No | The command's wall-clock run time in milliseconds. For an action with `polling:`, it covers the whole polling loop. |
+| `reason` | string | No | Why a judged check didn't pass: `rule_failed` (it printed an `error` finding of its own), `undecided` (exit 2 with none), `no_finding` (any other failure with none), `timed_out`, `spawn_failed` or `error`. Absent when it passed or is pending. Telemetry only; nothing routes on it. |
+| `not_ready` | boolean | No | `true` when the check said its input wasn't ready to judge: it printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. Telemetry only: the outcome, routing and fallback finding are unchanged. Absent means `false`. |
+| `fallback_logged` | boolean | No | `true` when `findings` holds koto's fallback finding, which is then the one `error` finding whose `rule_id` is the check's name. Absent means `false`. |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on
@@ -1629,6 +1875,10 @@ same gate in the same state (e.g., during a polling sequence).
 | `stdout_truncated` | boolean | No | `true` when `stdout` holds less than the command printed, whether koto's 64 KiB capture bound or the 4,096-byte log cut removed it. Absent means `false`. |
 | `stderr_truncated` | boolean | No | The same for `stderr`. |
 | `poll` | object | No | On a polling gate's evaluation: where the poll stood. See [Polling gates](#polling-gates). |
+| `reason` | string | No | Why a judged check didn't pass: `rule_failed` (it printed an `error` finding of its own), `undecided` (exit 2 with none), `no_finding` (any other failure with none), `timed_out`, `spawn_failed` or `error`. Absent when it passed or is pending. Telemetry only; nothing routes on it. |
+| `not_ready` | boolean | No | `true` when the check said its input wasn't ready to judge: it printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. Telemetry only: the outcome, routing and fallback finding are unchanged. Absent means `false`. |
+| `fallback_logged` | boolean | No | `true` when `findings` holds koto's fallback finding, which is then the one `error` finding whose `rule_id` is the check's name. Absent means `false`. |
+| `rules_delivered` | array | No | On a command gate: one `{rule_id, extent, delivery}` object per line the check printed starting with `::koto-rule-delivered::` and holding exactly those keys, `extent` `summary` or `full` and `delivery` `printed` or `refused`, at most 50. `koto next` appends a `rule_delivered` event per entry once its response prints. Telemetry only. Absent when the check printed none. |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on
@@ -1751,7 +2001,7 @@ only the in-memory view of the same write.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `key` | string | Yes | The name the state declared in `capture_stdout_as`. Later states reference it as `{{BRANCH}}` for a key of `BRANCH`. |
-| `value` | string | Yes | The command's stdout, already trimmed and checked against the variable allowlist. A value that reached the log is one substitution can use. |
+| `value` | string | Yes | The command's stdout, already trimmed and checked against the variable allowlist. A value that reached the log is one substitution can use. Empty only when the action sets `capture_allow_empty: true` and printed nothing but whitespace. |
 
 Consumers fold these in event order: re-entering the producing state means the
 later value wins. A rewind past that state leaves the value in place — the log is
@@ -1760,7 +2010,10 @@ never truncated — so a captured name outlives the state that produced it.
 The event appears only on a successful delivery. A command that ran but whose
 output could not be delivered (empty, over 4096 bytes, or holding a character
 the allowlist forbids) appends no `variable_captured`; the tick stops instead,
-and the reason reaches the caller on the response.
+and the reason reaches the caller on the response. With
+`capture_allow_empty: true` an empty output is delivered: the event carries
+the empty string and a directive that interpolates the name renders nothing
+in its place.
 
 A capture is delivered on a tick that stops for confirmation as well as on one
 that advances, so this event does not imply the workflow moved. It has to work
@@ -2090,6 +2343,8 @@ appends none.
 | `latency_ms` | integer | Yes | Wall time of the attempts, summed. |
 | `error_class` | string | No | How the last attempt failed, when it did: the routing decider's closed vocabulary (`timeout`, `connect`, `http_status`, `malformed`, `mismatched`). Consumers MUST tolerate values they don't recognize. |
 | `endpoint_origin` | string | No | Which configuration layer supplied the endpoint: `"default"`, `"user"` or `"env"`. A label, never a URL, host, query string or credential. |
+| `unit` | object | No | For a check in unit mode (`units: jsonl`), the unit graded, as its extraction printed it: `key`, and `document` and `section` when printed, each a name-shaped string. Absent for a check that grades one slice, and for a unit-mode check whose extraction failed or printed no unit. |
+| `unit_labels` | object | No | Beside `unit`, the names the check declares for its units: `document` (its `unit_document`) and `section` (its `unit_section`), each present only when declared. Absent when the check declares neither. They are what the run journal exports in place of the printed values. |
 
 **Not graded and escape** are both "not checkable" and stay distinct: `not_graded` means
 the slice was empty or only whitespace, so nothing was asked and nothing sent; `escape` means the
@@ -2145,6 +2400,8 @@ another.
 | `reason` | string | Yes | Why no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. Consumers MUST tolerate other values; every value is a fixed identifier, never a message, path or instruction text. |
 | `input_sha256` | string | No | The slice's hash, as for `decider_checked`. Absent with `extraction_failed`, which has no slice. An answer binds to it. |
 | `input_bytes` | integer | No | Byte length of the redacted slice as captured. Present with `input_sha256`. Capture stops at 64 KiB, so 65,536 means at least that many. |
+| `unit` | object | No | For a check in unit mode, the unit handed back, as for `decider_checked`. An answer binds to it. |
+| `unit_labels` | object | No | The check's declared unit labels, as for `decider_checked`. |
 
 #### `decider_check_answered`
 
@@ -2180,10 +2437,61 @@ visit; the latest answer for a slice wins.
 | `input_sha256` | string | No | Copied from the fallback answered; absent when it had none. |
 | `answer` | string | Yes | `pass`, `fail` or `unclear` (the criterion's escape). |
 | `fallback_seq` | integer | Yes | The `seq` of the `decider_fallback` event answered. |
+| `unit` | object | No | Copied from the fallback answered, for a check in unit mode: the answer applies to that unit only. |
+| `unit_labels` | object | No | Copied from the fallback answered. |
 
 Neither event carries the slice, a question, a description, or anything the
 agent wrote beyond its one-word answer. An agent answer is never a decider
 verdict: it appends no `decider_checked` and no ledger line.
+
+#### `rule_delivered`
+
+Records that a `koto next` response handed back a failed criterion's rule:
+one event per entry in a blocking condition's `rules` list, appended after the
+response has printed. A crash between the two loses the record, never the
+delivery. A criterion that declares neither a `summary` nor a `rule_text`, and
+a shadow criterion, deliver nothing.
+
+```json
+{
+  "type": "rule_delivered",
+  "payload": {
+    "state": "review",
+    "gate": "ac_binary",
+    "rule_id": "ac_binary",
+    "level": "summary",
+    "unit_count": 2
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state whose check failed, or whose directive carried the rule. |
+| `gate` | string | Yes | The decider check's name, the command gate's name, or a directive rule's declared `check`. |
+| `rule_id` | string | Yes | The failed criterion's id, the id the check printed, or a directive rule's declared `rule_id`. |
+| `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. For a command check or a directive rule, the declared or printed extent. |
+| `unit_count` | integer | No | How many units the rule was handed back for. Present only for a check in unit mode. |
+| `via` | string | No | `check_output` when a command gate's check reported the delivery by printing a `::koto-rule-delivered::` line (see `gate_evaluated`'s `rules_delivered`); `directive` when the state's `directive_rules` declared it and its directive was printed. Absent on a decider check's delivery. |
+| `delivery` | string | No | Beside `via`: `printed` when the check printed the rule's text, `refused` when it declined to release it. Always `printed` for `directive`. |
+
+A command gate's reported delivery is appended the same way, one event per
+entry of its `gate_evaluated`'s `rules_delivered`, after the response prints
+and after any decider check's deliveries. Its `level` is the `extent` the
+check printed, and it never carries `unit_count`.
+
+A state that declares `directive_rules` records its rules the same way, as
+telemetry: each time `koto next` prints that state's directive (on an advance
+or a `--to` move), one event per entry whose `when_set` variable or capture
+holds a non-empty value, with `via: directive`, `delivery: printed` and the entry's
+`rule_id`, `check` (as `gate`) and `extent` (as `level`). They are appended
+after the response prints and after any check's deliveries. An entry whose
+value is empty records nothing, every print records again (a second tick that
+re-prints the directive, a rewind back into the state), `koto status` records
+nothing, and `unit_count` is never present.
+
+The event never carries the rule's text: that lives in the compiled template
+and the printed response only.
 
 #### `finding_disputed`
 
@@ -2222,6 +2530,92 @@ The [run journal](run-journal.md#check_disputed) relays each one as a
 `check_disputed` record, with the gate as `koto.check.name` and the two
 attempt numbers, without the reason. Additive: an older koto lands
 the event in its unknown-event bucket and reads the rest of the log.
+
+#### Review events
+
+`koto review record` appends four events that record a document review as
+telemetry: `review_round_started`, `review_verdict_recorded` (one per entry
+of a `verdicts` batch), `review_decision_recorded` and `doc_check_recorded`
+(one per entry of a `doc-checks` batch). Like a dispute, each is recorded,
+not obeyed: nothing that decides a gate outcome, a route or the current state
+reads them, and the next `koto next` responds as it would have without
+them. The verb refuses a session at a terminal state or cancelled.
+
+Every value is koto's own word for it by the time it is stored, so nothing
+the caller wrote reaches the log unchecked:
+
+| Field | Type | Events | Description |
+|-------|------|--------|-------------|
+| `doc_type` | string | all four | `brief`, `prd`, `design` or `plan`. Left out of the first three when `doc_format` is `vision`, `strategy` or `roadmap`. |
+| `doc_format` | string | all but `doc_check_recorded`, when the call gave `--doc-format` | `brief`, `prd`, `design`, `plan`, `vision`, `strategy` or `roadmap`. Given with `--doc-type`, both must name the same document; `round-started` and `decision` need one of the two, and a `verdicts` entry may leave out `doc_type` under `--doc-format`. |
+| `schema` | string | all four | The document's schema value, bucketed: `brief/v1`, `prd/v1`, `design/v1`, `plan/v1` or `plan/v2` as given (surrounding whitespace ignored), `absent` for no value or an empty one, `other` for anything else. |
+| `round` | integer | all but `doc_check_recorded` | The round's number, at least 1. |
+| `seat_count` | integer | `review_round_started` | How many seats the round spawned, at least 1. |
+| `fallback` | boolean | `review_round_started` | Whether the round is a fallback round. |
+| `seat` | string | `review_verdict_recorded` | The seat as given when the session's template declares it in `review_vocabulary.seats`, `other` otherwise, and always `other` when the template declares no vocabulary. |
+| `section` | string | `review_verdict_recorded` | The section, under the same rule with `review_vocabulary.sections`. |
+| `rule_id` | string | `review_verdict_recorded`, `doc_check_recorded` | The rule's id: 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`. |
+| `verdict` | string | `review_verdict_recorded` | `pass` or `fail`. |
+| `decision` | string | `review_decision_recorded` | `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`. |
+| `outcome` | string | `doc_check_recorded` | `passed`, `failed` or `error`. |
+
+```json
+{
+  "type": "review_verdict_recorded",
+  "payload": {
+    "doc_type": "prd",
+    "schema": "prd/v1",
+    "round": 1,
+    "seat": "clarity",
+    "rule_id": "rs-012",
+    "section": "goals",
+    "verdict": "fail"
+  }
+}
+```
+
+The [run journal](run-journal.md#review-records) relays each as one record:
+`review_round`, `review_verdict`, `review_decision` and `doc_checked`.
+Additive: an older koto lands the events in its unknown-event bucket and
+reads the rest of the log.
+
+Three more record a document while it is drafted, recorded the same way and
+under the same checks: `doc_rule_checks_recorded` (a `rule-checks` call),
+`doc_section_recorded` (a `section-written` call) and `doc_fix_recorded` (a
+`fix` call). A `rule-checks` or `fix` call appends one event holding every
+entry of its batch, so the journal's records of one call share its `seq`.
+Each entry counts against the session's cap of 2,000 review entries, as
+each event of the four above does.
+
+| Field | Type | Events | Description |
+|-------|------|--------|-------------|
+| `state` | string | all three | The state the session was in when the call was made. |
+| `doc_format` | string | all three | `brief`, `prd`, `design`, `plan`, `vision`, `strategy` or `roadmap`. |
+| `moment` | string | `doc_rule_checks_recorded` | When the checks ran: `pre_jury`, `post_fix` or `post_create`. |
+| `entries` | array | `doc_rule_checks_recorded`, `doc_fix_recorded` | One object per entry of the batch, at most 200. A rule check's is `{"rule_id", "outcome"}`, `outcome` one of `pass`, `fail`, `not_ready` or `error`; a fix's is `{"rule_id", "section", "check_rule"}`, `check_rule` a rule id or `none`. Rule ids are bound as `rule_id` above, and `section` as on `doc_section_recorded`. |
+| `section` | string | `doc_section_recorded` | The section as given when the session's template declares it in `review_vocabulary.sections`, `other` otherwise, and always `other` when the template declares no vocabulary. |
+| `write` | string | `doc_section_recorded` | `first` or `rewrite`. |
+| `answers` | string | `doc_fix_recorded` | What the fix answers: `jury_fail` or `check_fail`. |
+| `round` | integer | `doc_fix_recorded` | The jury round a `jury_fail` fix answers, 1 to 50, when the call gave `--round`. A `check_fail` fix takes no round. |
+
+```json
+{
+  "type": "doc_fix_recorded",
+  "payload": {
+    "state": "draft",
+    "doc_format": "design",
+    "answers": "jury_fail",
+    "round": 2,
+    "entries": [
+      {"rule_id": "rs-004", "section": "decisions", "check_rule": "doc-required-sections"},
+      {"rule_id": "rs-009", "section": "other", "check_rule": "none"}
+    ]
+  }
+}
+```
+
+The run journal relays `doc_rule_checked` and `doc_fix_applied` records,
+one per entry, and one `doc_section_written` record per section event.
 
 ---
 

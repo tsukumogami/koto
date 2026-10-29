@@ -126,7 +126,15 @@ pub fn fetch_remote_manifest(
 ///
 /// Every manifest koto uploads from a local store goes through this, so no
 /// manifest koto pushes names a host-local key or a pin record.
-pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+///
+/// `withheld` names keys the push leaves out besides: a continues relation
+/// whose back-reference beside its predecessor isn't confirmed yet
+/// ([`crate::session::continues_bucket::unpushable_keys`]), which reaches
+/// the bucket only once the pointer does.
+pub fn bucket_manifest_bytes(
+    path: &std::path::Path,
+    withheld: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context;
     let data = match std::fs::read(path) {
         Ok(data) => data,
@@ -137,12 +145,22 @@ pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Ve
         return Ok(Some(data));
     };
     let host_local = manifest.drop_host_local();
-    if !manifest.drop_pin_records() && !host_local {
+    let before = manifest.keys.len();
+    manifest.keys.retain(|key, _| !withheld.contains(key));
+    let withheld_any = manifest.keys.len() != before;
+    if !manifest.drop_pin_records() && !host_local && !withheld_any {
         return Ok(Some(data));
     }
     Ok(Some(
         serde_json::to_vec_pretty(&manifest).context("failed to serialize manifest")?,
     ))
+}
+
+/// The keys a push of `session` leaves out of the bucket for now: its
+/// continues relation while the back-reference it calls for isn't
+/// confirmed.
+pub fn withheld_keys(local: &LocalBackend, prefix: &str, session: &str) -> Vec<String> {
+    crate::session::continues_bucket::unpushable_keys(&local.session_dir(session), prefix, session)
 }
 
 /// Push a single context key and the manifest to S3.
@@ -157,64 +175,180 @@ pub fn push_context_key(
     key: &str,
     cache: &ManifestCache,
 ) {
+    let withheld = withheld_keys(local, prefix, session);
+    match try_push_context_key(local, bucket, prefix, session, key, &withheld) {
+        Ok(()) => cache.invalidate(),
+        Err(e) => eprintln!("warning: {e:#}"),
+    }
+}
+
+/// [`push_context_key`] for a caller that must know the bucket took the
+/// key and the manifest: the first upload that fails is returned. A key
+/// the push leaves out (host-local, a pin record, or in `withheld`), or
+/// one with no content file, pushes nothing and succeeds. The caller
+/// invalidates the manifest cache.
+pub fn try_push_context_key(
+    local: &LocalBackend,
+    bucket: &Bucket,
+    prefix: &str,
+    session: &str,
+    key: &str,
+    withheld: &[String],
+) -> anyhow::Result<()> {
     if crate::session::context::is_host_local_key(key)
         || crate::session::context::is_pin_record_key(key)
+        || withheld.iter().any(|w| w == key)
     {
-        return;
+        return Ok(());
     }
     let ctx_dir = local.session_dir(session).join("ctx");
 
     // Upload the content file.
     let content_path = ctx_dir.join(key);
     if !content_path.exists() {
-        return;
+        return Ok(());
     }
-    let data = match std::fs::read(&content_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "warning: cloud sync: failed to read context key '{}': {}",
-                key, e
-            );
-            return;
-        }
-    };
+    let data = std::fs::read(&content_path)
+        .map_err(|e| anyhow::anyhow!("cloud sync: failed to read context key '{}': {}", key, e))?;
     let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
-    if let Err(e) = bucket.put_object(&s3_key, &data) {
-        eprintln!(
-            "warning: cloud sync failed for context upload '{}': {}",
-            key, e
-        );
-        return;
-    }
+    bucket.put_object(&s3_key, &data).map_err(|e| {
+        anyhow::anyhow!(
+            "cloud sync failed for context upload '{}': {}",
+            key,
+            crate::session::cloud::without_url_userinfo(&e.to_string())
+        )
+    })?;
 
     // Upload the manifest.
-    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json")) {
-        Ok(Some(d)) => d,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("warning: cloud sync: failed to read manifest: {:#}", e);
-            return;
-        }
+    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json"), withheld)
+        .map_err(|e| anyhow::anyhow!("cloud sync: failed to read manifest: {:#}", e))?
+    {
+        Some(d) => d,
+        None => return Ok(()),
     };
     let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
-    if let Err(e) = bucket.put_object(&manifest_s3_key, &manifest_data) {
-        eprintln!("warning: cloud sync failed for manifest upload: {}", e);
-        return;
-    }
+    bucket
+        .put_object(&manifest_s3_key, &manifest_data)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cloud sync failed for manifest upload: {}",
+                crate::session::cloud::without_url_userinfo(&e.to_string())
+            )
+        })?;
+    crate::session::sync_stamp::note_synced(
+        &local.session_dir(session),
+        prefix,
+        [(key, crate::session::sync_stamp::sha256_hex(&data).as_str())],
+    );
+    Ok(())
+}
 
-    // Invalidate the cache since we just changed the remote manifest.
-    cache.invalidate();
+/// What [`pull_context_if_newer`] did with a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pull {
+    /// The local copy stands and matches what the bucket has, or the bucket
+    /// has nothing to give.
+    Unchanged,
+    /// The bucket's copy was written over the local one.
+    Wrote,
+    /// The copies differ and the local one is the newer
+    /// ([`newer_locally`]), so it stands and the bucket lacks it (koto#520).
+    LocalNewer,
+    /// The home's manifest doesn't list the key, and this host never synced
+    /// the copy it holds with the home, so the copy stands and the home
+    /// lacks it (koto#524).
+    LocalOnly,
+}
+
+/// What the session's listing said of the home's manifest, for a pull whose
+/// fetch of it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// The listing showed a manifest.
+    Shows,
+    /// The listing worked and showed no manifest: the home lists no key.
+    Lacks,
+    /// No listing to go by (the bucket unreachable, say).
+    Unknown,
+}
+
+/// Whether this host's copy of a key, `local`, is the newer of two that
+/// differ, against the home's copy `remote`. `synced` is the hash this host
+/// last knew the home to hold ([`crate::session::sync_stamp::SyncedKeys`]).
+/// A local copy still at it hasn't changed here, so the home's moved on; a
+/// home still at it hasn't changed there, so this host's copy moved on.
+/// Neither depends on the hosts' clocks. Only when both moved, or this host
+/// never synced the key with this home, are the copies' stamps compared
+/// ([`written_later`]).
+pub(crate) fn newer_locally(
+    local: &crate::session::context::KeyMeta,
+    remote: &crate::session::context::KeyMeta,
+    synced: Option<&str>,
+) -> bool {
+    match synced {
+        Some(hash) if hash == local.hash => false,
+        Some(hash) if hash == remote.hash => true,
+        _ => written_later(&local.created_at, &remote.created_at),
+    }
+}
+
+/// Whether `local` was written later than `remote`, both timestamps in the
+/// form koto writes them (`YYYY-MM-DDTHH:MM:SS.mmmZ`, or without the
+/// milliseconds). A timestamp in any other form never counts as later, so
+/// the pull goes ahead as it did before.
+///
+/// The stamps come from the clocks of the hosts that wrote them (a pull
+/// stamps the time it pulled), so two writes made on different hosts within
+/// their clocks' skew can sort the wrong way round: [`newer_locally`] asks
+/// this only when the synced hashes can't say.
+fn written_later(local: &str, remote: &str) -> bool {
+    match (sortable_timestamp(local), sortable_timestamp(remote)) {
+        (Some(local), Some(remote)) => local > remote,
+        _ => false,
+    }
+}
+
+/// `ts` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, which sorts as text, or `None` when
+/// it is in neither form koto writes.
+fn sortable_timestamp(ts: &str) -> Option<String> {
+    if !ts.is_ascii() {
+        return None;
+    }
+    let ts = match ts.len() {
+        20 => format!("{}.000Z", &ts[..19]),
+        24 => ts.to_string(),
+        _ => return None,
+    };
+    let b = ts.as_bytes();
+    let well_formed = b.iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        10 => *c == b'T',
+        13 | 16 => *c == b':',
+        19 => *c == b'.',
+        23 => *c == b'Z',
+        _ => c.is_ascii_digit(),
+    });
+    well_formed.then_some(ts)
 }
 
 /// Pull a context key from S3 if the remote version differs from local.
 ///
 /// Compares the hash in the remote manifest against the local manifest.
 /// If they differ (or the key is missing locally), downloads the content
-/// and writes it locally with writer `sync`.
+/// and writes it locally with writer `sync` -- unless the local copy is the
+/// newer ([`newer_locally`]), which then stands untouched
+/// ([`Pull::LocalNewer`]). A session whose home moved can find an older
+/// copy under its new home than the one it holds (koto#520); a write from
+/// another host after this one's still comes down, whatever either host's
+/// clock says (koto#524). A key the home's manifest doesn't list stands
+/// too, and is [`Pull::LocalOnly`] unless this host synced that very copy
+/// with the home, which then lacks it because it was removed there since.
 ///
-/// Returns whether it wrote the local store, so the caller can log the
-/// write (a `context_added` with `writer: "sync"`).
+/// Every outcome that finds the copies equal, or pulls, records the home's
+/// hash as synced.
+///
+/// Returns [`Pull::Wrote`] when it wrote the local store, so the caller can
+/// log the write (a `context_added` with `writer: "sync"`).
 ///
 /// `before_download` runs once a download is due and before it starts, and
 /// nothing is written after its error.
@@ -222,11 +356,12 @@ pub fn push_context_key(
 /// Once the bucket has said its copy of the key may differ from this host's,
 /// a step that fails is an error, never a fall-back to the local copy, which
 /// may be stale (koto#457): a manifest the session's listing showed
-/// (`manifest_listed`) that can't be fetched, a key whose hash differs and
+/// ([`Listing::Shows`]) that can't be fetched, a key whose hash differs and
 /// whose object can't be fetched (a 404 from an object the manifest names
 /// but the bucket lacks, say), or downloaded bytes that can't be written. A
-/// manifest the listing didn't show, or no listing at all (an unreachable
-/// bucket), leaves the local copy standing, `Ok(false)`, as before.
+/// listing that worked and showed no manifest ([`Listing::Lacks`]) is a
+/// home that lists no key; no listing at all (an unreachable bucket) leaves
+/// the local copy standing, [`Pull::Unchanged`], as before.
 #[allow(clippy::too_many_arguments)]
 pub fn pull_context_if_newer(
     local: &LocalBackend,
@@ -235,31 +370,56 @@ pub fn pull_context_if_newer(
     session: &str,
     key: &str,
     cache: &ManifestCache,
-    manifest_listed: bool,
+    listing: Listing,
     before_download: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Pull> {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
-        None if manifest_listed => anyhow::bail!(
+        None if listing == Listing::Shows => anyhow::bail!(
             "cloud sync: the bucket lists a context manifest for session '{}' but fetching it \
              failed, so the local copy of '{}' may be stale; run the command again",
             session,
             key
         ),
-        None => return Ok(false),
+        None if listing == Listing::Lacks => Manifest::default(),
+        None => return Ok(Pull::Unchanged),
     };
 
-    let remote_meta = match remote_manifest.keys.get(key) {
-        Some(m) => m,
-        None => return Ok(false), // Key doesn't exist remotely.
+    let dir = local.session_dir(session);
+    let synced = crate::session::sync_stamp::SyncedKeys::load(&dir, prefix);
+    let local_manifest = local.read_manifest(session).unwrap_or_default();
+    let Some(remote_meta) = remote_manifest.keys.get(key) else {
+        // The home lists no such key. A copy this host synced with it was
+        // removed there since; any other copy the home never had, unless
+        // it is one a push leaves out.
+        let lacking = local_manifest.keys.get(key).is_some_and(|meta| {
+            synced.hash(key) != Some(meta.hash.as_str())
+                && !crate::session::context::is_pin_record_key(key)
+                && dir.join("ctx").join(key).is_file()
+                && !withheld_keys(local, prefix, session)
+                    .iter()
+                    .any(|w| w == key)
+        });
+        return Ok(if lacking {
+            Pull::LocalOnly
+        } else {
+            Pull::Unchanged
+        });
     };
 
     // Check if local hash matches remote hash.
-    let local_manifest = local.read_manifest(session).unwrap_or_default();
     if let Some(local_meta) = local_manifest.keys.get(key) {
         if local_meta.hash == remote_meta.hash {
-            return Ok(false); // Hashes match, no download needed.
+            crate::session::sync_stamp::note_synced(
+                &dir,
+                prefix,
+                [(key, local_meta.hash.as_str())],
+            );
+            return Ok(Pull::Unchanged); // Hashes match, no download needed.
+        }
+        if newer_locally(local_meta, remote_meta, synced.hash(key)) {
+            return Ok(Pull::LocalNewer);
         }
     }
     before_download()?;
@@ -302,7 +462,15 @@ pub fn pull_context_if_newer(
                 e
             )
         })?;
-    Ok(true)
+    crate::session::sync_stamp::note_synced(
+        &dir,
+        prefix,
+        [(
+            key,
+            crate::session::sync_stamp::sha256_hex(response.bytes()).as_str(),
+        )],
+    );
+    Ok(Pull::Wrote)
 }
 
 /// The remote manifest's metadata for `key`, if the remote store has it.
@@ -339,7 +507,8 @@ pub fn delete_context_key(
 
     // Upload the updated manifest (the local remove already happened).
     let manifest_path = local.session_dir(session).join("ctx").join("manifest.json");
-    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path) {
+    let withheld = withheld_keys(local, prefix, session);
+    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path, &withheld) {
         let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
         if let Err(e) = bucket.put_object(&manifest_s3_key, &data) {
             eprintln!("warning: cloud sync failed for manifest upload: {}", e);
@@ -394,13 +563,13 @@ mod tests {
     fn bucket_manifest_bytes_drops_only_host_local_keys() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("manifest.json");
-        assert!(bucket_manifest_bytes(&path).unwrap().is_none());
+        assert!(bucket_manifest_bytes(&path, &[]).unwrap().is_none());
 
         let entry = r#"{"created_at":"t","size":1,"hash":"h"}"#;
         let plain = format!(r#"{{"keys":{{"notes.md":{entry}}}}}"#);
         std::fs::write(&path, &plain).unwrap();
         assert_eq!(
-            bucket_manifest_bytes(&path).unwrap().unwrap(),
+            bucket_manifest_bytes(&path, &[]).unwrap().unwrap(),
             plain.as_bytes()
         );
 
@@ -408,7 +577,7 @@ mod tests {
             format!(r#"{{"keys":{{"notes.md":{entry},"workflows/publish-location":{entry}}}}}"#);
         std::fs::write(&path, &with_location).unwrap();
         let pushed: Manifest =
-            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+            serde_json::from_slice(&bucket_manifest_bytes(&path, &[]).unwrap().unwrap()).unwrap();
         assert_eq!(pushed.keys.keys().collect::<Vec<_>>(), ["notes.md"]);
     }
 
@@ -428,11 +597,65 @@ mod tests {
         )
         .unwrap();
         let pushed: Manifest =
-            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+            serde_json::from_slice(&bucket_manifest_bytes(&path, &[]).unwrap().unwrap()).unwrap();
         assert_eq!(
             pushed.keys.keys().collect::<Vec<_>>(),
             ["koto/links/held-by/a", "notes.md"]
         );
+    }
+
+    /// A local copy counts as later only when both timestamps are in a form
+    /// koto writes; anything else lets the pull go ahead.
+    #[test]
+    fn written_later_compares_koto_timestamps() {
+        assert!(written_later(
+            "2026-10-28T17:49:00.001Z",
+            "2026-10-26T09:00:00.000Z"
+        ));
+        assert!(!written_later(
+            "2026-10-26T09:00:00.000Z",
+            "2026-10-28T17:49:00.001Z"
+        ));
+        assert!(!written_later(
+            "2026-10-28T17:49:00.000Z",
+            "2026-10-28T17:49:00.000Z"
+        ));
+        // Without milliseconds, as older manifests carry it.
+        assert!(written_later(
+            "2026-10-28T17:49:00.500Z",
+            "2026-10-28T17:49:00Z"
+        ));
+        assert!(!written_later(
+            "2026-10-28T17:49:00Z",
+            "2026-10-28T17:49:00.500Z"
+        ));
+        assert!(!written_later("t", "2026-10-28T17:49:00.000Z"));
+        assert!(!written_later("2026-10-28T17:49:00.000Z", ""));
+        assert!(!written_later(
+            "2026-10-28 17:49:00.000Z",
+            "2026-01-01T00:00:00.000Z"
+        ));
+    }
+
+    /// The synced hash says which copy moved whatever the stamps say; the
+    /// stamps decide only when it can't.
+    #[test]
+    fn newer_locally_asks_the_synced_hash_before_the_clocks() {
+        let meta = |hash: &str, created_at: &str| crate::session::context::KeyMeta {
+            created_at: created_at.to_string(),
+            size: 1,
+            hash: hash.to_string(),
+            writer: None,
+        };
+        // This host's clock runs ahead: its stamp is the later one.
+        let local = meta("mine", "2999-01-01T00:00:00.000Z");
+        let remote = meta("theirs", "2030-01-01T00:00:00.000Z");
+        assert!(!newer_locally(&local, &remote, Some("mine")));
+        assert!(newer_locally(&remote, &local, Some("mine")));
+        // Both moved, or never synced here: the stamps.
+        assert!(newer_locally(&local, &remote, Some("other")));
+        assert!(newer_locally(&local, &remote, None));
+        assert!(!newer_locally(&remote, &local, None));
     }
 
     #[test]

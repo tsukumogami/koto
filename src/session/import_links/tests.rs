@@ -175,6 +175,7 @@ fn settle(s: &Store, importer: Option<&str>, manifest: &mut Manifest) -> Settled
         target: "copy",
         from_session: "src",
         from_session_id: "src-id",
+        relation: None,
     }
     .apply(&s.ctx, manifest)
     .unwrap()
@@ -212,6 +213,7 @@ fn the_reserved_keys_an_import_leaves_behind() {
         "koto/anchor/authority",
         "koto/anchor-close",
         "koto/links/closes/anchor-x",
+        "koto/links/continues/v1",
         "koto/imported-from",
         "KOTO/links/held-by/anchor-x",
         "Koto/anchor/observed",
@@ -435,6 +437,7 @@ fn an_import_of_the_importers_own_anchor_never_links_it_to_itself() {
         target: "copy",
         from_session: "src",
         from_session_id: "src-id",
+        relation: None,
     }
     .apply(&s.ctx, &mut manifest)
     .unwrap();
@@ -485,5 +488,53 @@ fn a_closed_or_migrated_importer_anchor_takes_over_no_held_by_link() {
         vec![("anchor-gone".to_string(), "anchor-imp".to_string())]
     );
     assert!(manifest.keys.contains_key("koto/links/held-by/anchor-imp"));
+    assert_consistent(&s.ctx, &manifest);
+}
+
+/// The copy's one relation names the source with every field
+/// `--continues` records, and is listed in the manifest as written by koto.
+#[test]
+fn the_copy_holds_one_relation_naming_the_source() {
+    let s = store();
+    let mut manifest = staged(&s.ctx, &[("notes.md", b"n")]);
+    let relation = ImportRelation {
+        source: "src",
+        source_session_id: "00000001-0000-4000-8000-000000000000",
+        source_workspace: "/work/w1",
+        source_prefix: "0123456789abcdef",
+        holder_session_id: "00000002-0000-4000-8000-000000000000",
+    };
+    Settlement {
+        local_base: &s.base,
+        importer_anchor: None,
+        target: "copy",
+        from_session: "src",
+        from_session_id: "00000001-0000-4000-8000-000000000000",
+        relation: Some(relation),
+    }
+    .apply(&s.ctx, &mut manifest)
+    .unwrap();
+    assert_eq!(
+        manifest.keys.keys().collect::<Vec<_>>(),
+        ["koto/imported-from", "koto/links/continues/src", "notes.md"]
+    );
+    assert_eq!(relation.key(), "koto/links/continues/src");
+    let bytes = std::fs::read(s.ctx.join("koto/links/continues/src")).unwrap();
+    let parsed = validate_link("koto/links/continues/src", &bytes).unwrap();
+    assert_eq!(parsed.session, "src");
+    assert_eq!(
+        parsed.session_id.as_deref(),
+        Some("00000001-0000-4000-8000-000000000000")
+    );
+    assert_eq!(parsed.workspace.as_deref(), Some("/work/w1"));
+    assert_eq!(parsed.prefix.value(), Some("0123456789abcdef"));
+    assert_eq!(
+        parsed.holder_session_id.as_deref(),
+        Some("00000002-0000-4000-8000-000000000000")
+    );
+    assert_eq!(
+        manifest.keys["koto/links/continues/src"].writer.as_deref(),
+        Some("koto")
+    );
     assert_consistent(&s.ctx, &manifest);
 }

@@ -466,8 +466,7 @@ fn check_origin(
                 format!(
                     "session '{name}' has no origin record: it was created before koto recorded \
                  where a session was started, so it can't be confirmed as this caller's; finish \
-                 it with the koto version that started it, or remove it with `koto session \
-                 cleanup {name}`"
+                 it with the koto version that started it, or use another session name"
                 ),
                 2,
             )
@@ -481,13 +480,22 @@ fn check_origin(
     let requested = caller
         .map(describe_origin)
         .unwrap_or_else(|| "(unknown)".to_string());
+    // The way forward removes nothing: the caller goes to where the session
+    // belongs. Same anchor means only the store differs, so name the store.
+    let belongs = if caller.is_some_and(|caller| caller.anchor == recorded.anchor) {
+        "run the command against the session store it was started in".to_string()
+    } else {
+        format!(
+            "run the command from {}, where the session belongs",
+            recorded.anchor.display()
+        )
+    };
     Err(Box::new(
         Refusal::new(
             Some("origin_mismatch"),
             format!(
                 "session '{name}' belongs to another worktree or session store: it was started in \
-             {}, and this invocation runs in {requested}; use another session name, or remove \
-             it with `koto session cleanup {name}`",
+             {}, and this invocation runs in {requested}; use another session name, or {belongs}",
                 describe_origin(recorded)
             ),
             2,
@@ -520,6 +528,8 @@ pub(crate) struct InitArgs<'a> {
     pub intent: Option<&'a str>,
     /// `--dispatched-by`, already validated.
     pub dispatched_by: Option<&'a str>,
+    /// `--continues`, already checked.
+    pub continues: Option<&'a crate::cli::session::ContinuesTarget>,
     pub execution_dir: Option<&'a Path>,
     pub legacy_environment: bool,
 }
@@ -638,6 +648,13 @@ enum Disposition {
         reason: String,
         fields: serde_json::Map<String, serde_json::Value>,
     },
+    /// A later session continuing it has standing: it moves aside with its
+    /// session id, which its successors' relations resolve by, and the
+    /// answer carries the relation's `fields`.
+    Related {
+        reason: String,
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 impl Disposition {
@@ -678,7 +695,20 @@ fn predecessor_disposition(backend: &Backend, name: &str) -> Disposition {
         Ok(j) if j.verdict.is_kept() => Disposition::Keep {
             reason: reason_text(&j.verdict),
         },
-        Ok(_) => Disposition::Release,
+        // A later session continuing it has standing: it moves aside with
+        // its session id, so the relation, which resolves by that id, still
+        // names the moved session and keeps it.
+        Ok(j) => {
+            let related = crate::session::continues_bucket::relation_at_removal(backend, &j, name);
+            if related.keeps() {
+                Disposition::Related {
+                    reason: crate::session::hierarchy::relation_text(&related).join("; "),
+                    fields: crate::session::hierarchy::relation_json(&related),
+                }
+            } else {
+                Disposition::Release
+            }
+        }
         Err(e) => keep(format!("its hierarchy can't be judged: {e:#}")),
     }
 }
@@ -749,10 +779,18 @@ fn create(
             // lost. A pin set on the old run since it was judged keeps it,
             // and it moves aside instead.
             kept_pinned = super::workspace::sweep_terminal_descendants(backend, backend, name);
-            match crate::session::pin::remove_guarded(backend, name) {
+            match crate::session::pin::remove_by_rule(backend, name) {
                 Ok(crate::session::pin::Removal::Removed) => {}
                 Ok(crate::session::pin::Removal::Kept(guard)) => {
                     disposition = Disposition::pinned(&guard);
+                }
+                // A later session continuing it, whose back-reference was
+                // written since it was judged: it moves aside instead.
+                Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                    disposition = Disposition::Related {
+                        reason: crate::session::hierarchy::relation_text(&related).join("; "),
+                        fields: crate::session::hierarchy::relation_json(&related),
+                    };
                 }
                 Err(e) => refuse(
                     entry,
@@ -768,6 +806,9 @@ fn create(
             Disposition::Release => (None, "", Default::default()),
             Disposition::Keep { reason } => (Some(reason), "by its hierarchy", Default::default()),
             Disposition::Pinned { reason, fields } => (Some(reason), "by its pin", fields),
+            Disposition::Related { reason, fields } => {
+                (Some(reason), "by the continues relation", fields)
+            }
         };
         if let Some(reason) = reason {
             match super::move_aside::move_aside(backend, name) {
@@ -870,6 +911,9 @@ fn create(
 
     // The links come last, into this session only: `--dispatched-by`, and a
     // leg-bound session's requester once the leg is its own.
+    if let Some(target) = args.continues {
+        crate::cli::session::record_continues_at_init(backend, name, target);
+    }
     if let Some(dispatcher) = args.dispatched_by {
         crate::cli::session::record_dispatched_by(backend, name, dispatcher);
     }
@@ -895,7 +939,8 @@ fn create(
     if let Some((m, reason, pin)) = moved {
         out["moved_to"] = m.moved_to.into();
         out["moved_reason"] = reason.into();
-        // The moved run's pin, when its pin is what kept it.
+        // The moved run's pin, when its pin is what kept it, or the
+        // relation's report, when a later session continuing it did.
         for (k, v) in pin {
             out[k] = v;
         }
@@ -1112,6 +1157,9 @@ fn attach(
         );
     }
 
+    if let Some(target) = args.continues {
+        crate::cli::session::record_continues_at_init(backend, name, target);
+    }
     if let Some(dispatcher) = args.dispatched_by {
         crate::cli::session::record_dispatched_by(backend, name, dispatcher);
     }
@@ -1223,11 +1271,15 @@ mod tests {
                 bucket: None,
                 prefix: None,
             },
+            anchor_epoch: 0,
+            retired_anchors: Vec::new(),
         };
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
         let msg = r.body["error"].as_str().unwrap();
         assert!(msg.contains("no origin record"), "{msg}");
-        assert!(msg.contains("koto session cleanup s"), "{msg}");
+        assert!(msg.contains("koto version that started it"), "{msg}");
+        assert!(msg.contains("another session name"), "{msg}");
+        assert_names_no_removal(msg);
         assert_eq!(r.reason, "origin-mismatch");
 
         let mut other = caller.clone();
@@ -1237,10 +1289,40 @@ mod tests {
             .unwrap();
         let msg = r.body["error"].as_str().unwrap();
         assert!(!msg.contains("no origin record"), "{msg}");
+        assert!(msg.contains("another session name"), "{msg}");
+        assert!(
+            msg.contains("run the command from /elsewhere, where the session belongs"),
+            "{msg}"
+        );
+        assert_names_no_removal(msg);
+
+        // Only the store differs: the anchor is the caller's own, so the
+        // message names the store instead of a directory to move to.
+        let mut other = caller.clone();
+        other.store.base = "/other-sessions".into();
+        let r = check_origin("s", Some(&other), Some(&caller))
+            .err()
+            .unwrap();
+        let msg = r.body["error"].as_str().unwrap();
+        assert!(msg.contains("/other-sessions"), "{msg}");
+        assert!(msg.contains("the session store it was started in"), "{msg}");
+        assert_names_no_removal(msg);
         assert_eq!(
             check_origin("s", Some(&caller), Some(&caller)).ok(),
             Some(OriginMatch::Same)
         );
+    }
+
+    /// Neither `origin_mismatch` message names a removal as the way forward.
+    fn assert_names_no_removal(msg: &str) {
+        for removal in [
+            "session cleanup",
+            "--cleanup",
+            "session prune",
+            "workspace prune",
+        ] {
+            assert!(!msg.contains(removal), "names {removal}: {msg}");
+        }
     }
 
     fn origin(kind: &str, anchor: &str, base: &str, bucket: Option<&str>) -> SessionOrigin {
@@ -1252,6 +1334,8 @@ mod tests {
                 bucket: bucket.map(str::to_string),
                 prefix: None,
             },
+            anchor_epoch: 0,
+            retired_anchors: Vec::new(),
         }
     }
 

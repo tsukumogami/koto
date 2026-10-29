@@ -562,12 +562,12 @@ fn a_leg_bound_to_another_session_is_refused() {
         "leg_bound_to_different_child",
     );
 
-    // Whatever the other session's state: a finished bound session still
-    // holds its leg.
+    // Whatever the other session's state, a holder that finishes never frees
+    // its leg for another session: it answers the leg on its way out.
     run_ok(tmp.path(), &["next", "scope-t1", "--no-cleanup"]);
     let second = scope_request(tmp.path(), r#""scope.md""#, scope_inputs());
-    // (The first leg is now resolved; take a fresh request to check the
-    // bound case against a terminal holder.)
+    // (The first leg is now resolved; take a fresh request to check a
+    // holder that is cancelled rather than finished.)
     init(
         tmp.path(),
         "scope-holder",
@@ -585,13 +585,15 @@ fn a_leg_bound_to_another_session_is_refused() {
             "scope-holder",
         ],
     );
+    // A cancelled holder answers its leg with a cancelled result, so the
+    // other session finds the leg closed rather than free.
     run(tmp.path(), &["cancel", "scope-holder"]);
     assert_attach_refused(
         tmp.path(),
         &second,
         "scope",
         "scope-t1-other",
-        "leg_bound_to_different_child",
+        "leg_already_resolved",
     );
 }
 
@@ -1036,4 +1038,58 @@ fn a_root_whose_request_was_abandoned_does_not_resolve_its_leg() {
     // The session keeps its own record of where it ended.
     let log = std::fs::read_to_string(state_path(tmp.path(), "scope-t1")).unwrap();
     assert!(log.contains(r#""to":"done""#), "{log}");
+}
+
+// ===== Cancel on a self-attached leg =====
+
+/// A root that attached itself through `koto init --attach-live
+/// --koto-leg` and is then cancelled answers its leg with a cancelled
+/// result: the fenced verbs refuse a self-attached leg, so nothing else
+/// could close it. With and without `--cleanup`, since the removal must
+/// not take the leg pointer before the promotion reads it.
+#[test]
+fn cancelling_a_self_attached_root_promotes_a_cancelled_result_onto_its_leg() {
+    for cleanup in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let template = write_template(dir, "scope.md", GATED_TEMPLATE);
+        let id = scope_request(dir, r#""scope.md""#, r#"{"TOPIC":"t1"}"#);
+        let target = format!("{id}:scope");
+        run_ok(
+            dir,
+            &[
+                "init",
+                "scope-t1",
+                "--template",
+                template.to_str().unwrap(),
+                "--var",
+                "TOPIC=t1",
+                "--attach-live",
+                "--koto-leg",
+                &target,
+            ],
+        );
+        let attached = run_ok(dir, &["request", "get", &id]);
+        assert_eq!(attached["legs"]["scope"]["attach"], "self", "{attached}");
+
+        let mut cancel = vec!["cancel", "scope-t1"];
+        if cleanup {
+            cancel.push("--cleanup");
+        }
+        let cancelled = run_ok(dir, &cancel);
+        assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+
+        let envelope = run_ok(dir, &["request", "get", &id]);
+        let leg = &envelope["legs"]["scope"];
+        assert_eq!(
+            leg["disposition"], "resolved",
+            "cleanup={cleanup}: a cancelled self-attached session never promotes a result \
+             onto the leg: {leg}"
+        );
+        assert_eq!(leg["result_source"], "promoted", "{leg}");
+        assert_eq!(leg["result_final_state"], "cancelled", "{leg}");
+        assert_eq!(leg["result"]["status"], "failure", "{leg}");
+        assert_eq!(leg["result"]["payload"]["outcome"], "cancelled", "{leg}");
+        assert_eq!(leg["result"]["payload"]["state"], "work", "{leg}");
+    }
 }

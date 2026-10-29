@@ -33,7 +33,7 @@ use crate::cli::decider_port::{input_sha256, try_decider_lock, LockHold};
 use crate::decider::check::{
     blocks, build_check_request, effective_check_mode, is_retryable, reason_for_error,
     recorded_probabilities, verdict, AgentAnswer, CheckOutcome, DeciderCheck, DeciderFallback,
-    UnansweredReason,
+    UnansweredReason, UnitLabels, UnitRef,
 };
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
 use crate::decider::types::{
@@ -45,7 +45,7 @@ use crate::engine::types::{Event, EventPayload};
 use crate::findings::{Finding, FindingLevel, GateFailure, MessageSource};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::session::SessionBackend;
-use crate::template::decider_check::{declaration_hash, CheckMode, DeciderCheckSpec};
+use crate::template::decider_check::{CheckMode, DeciderCheckSpec, UnitsMode};
 use crate::template::types::{Gate, GATE_TYPE_DECIDER_CHECK};
 
 /// Model recorded when no answer named one.
@@ -85,6 +85,142 @@ impl ConsultBudget {
     }
 }
 
+/// Most (unit, criterion) consultations one `koto next` sends for unit-mode
+/// checks (DESIGN-doc-rule-checks-m4.md, Decision 2). It is the per-state
+/// compile-time bound, so one state's declared units always fit.
+pub const MAX_UNIT_CONSULTATIONS_PER_CALL: usize =
+    crate::template::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE as usize;
+
+/// The per-`koto next` count of unit-mode consultations. It is separate
+/// from [`ConsultBudget`]: a unit-mode check draws only from this one, so
+/// the routing decider's allowance is never spent on units. Like
+/// [`ConsultBudget`], a slot is taken only for a request about to be sent.
+#[derive(Debug, Clone, Default)]
+pub struct UnitBudget(Rc<Cell<usize>>);
+
+impl UnitBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take one slot for a request about to be sent; `false` when spent.
+    pub fn try_take(&self) -> bool {
+        let used = self.0.get();
+        if used >= MAX_UNIT_CONSULTATIONS_PER_CALL {
+            return false;
+        }
+        self.0.set(used + 1);
+        true
+    }
+
+    /// Slots taken so far this call.
+    pub fn used(&self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Longest unit key, document or section, in bytes.
+pub const MAX_UNIT_NAME_BYTES: usize = 128;
+
+/// Whether `s` fits the name shape a unit's key, document and section must
+/// have: 1 to 128 bytes of letters, digits and `._:@/-`, not starting with
+/// `/` or `-`, so it can go into a command line as written and never reads
+/// as an option.
+pub fn unit_name_is_valid(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_UNIT_NAME_BYTES
+        && !s.starts_with(['/', '-'])
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:@/-".contains(&b))
+}
+
+/// One unit an extraction printed.
+#[derive(Debug, Clone, PartialEq)]
+struct Unit {
+    reference: UnitRef,
+    text: String,
+}
+
+/// The units in a unit-mode extraction's output: one JSON object per line,
+/// with string `key` and `text` and optional string `document` and
+/// `section`. Blank lines are skipped, unknown fields ignored, and a `null`
+/// optional field read as absent. `None` when any line isn't such an
+/// object, a name is outside [`unit_name_is_valid`], or a key repeats.
+fn parse_units(stdout: &str) -> Option<Vec<Unit>> {
+    let mut units: Vec<Unit> = Vec::new();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let obj = value.as_object()?;
+        let key = obj.get("key")?.as_str()?;
+        let text = obj.get("text")?.as_str()?;
+        let optional = |name: &str| -> Option<Option<String>> {
+            match obj.get(name) {
+                None | Some(serde_json::Value::Null) => Some(None),
+                Some(serde_json::Value::String(s)) if unit_name_is_valid(s) => {
+                    Some(Some(s.clone()))
+                }
+                Some(_) => None,
+            }
+        };
+        let document = optional("document")?;
+        let section = optional("section")?;
+        if !unit_name_is_valid(key) || units.iter().any(|u| u.reference.key == key) {
+            return None;
+        }
+        units.push(Unit {
+            reference: UnitRef {
+                key: key.to_string(),
+                document,
+                section,
+            },
+            text: text.to_string(),
+        });
+    }
+    Some(units)
+}
+
+/// The visit a check is graded in: the state, the `seq` of the event that
+/// opened the visit, and the events since.
+struct Visit<'e> {
+    state: String,
+    seq: u64,
+    events: &'e [Event],
+}
+
+impl<'e> Visit<'e> {
+    fn of(events: &'e [Event], state: String) -> Self {
+        let index = arrival_index(events, &state);
+        Visit {
+            seq: index.map(|i| events[i].seq).unwrap_or(0),
+            events: index.map(|i| &events[i + 1..]).unwrap_or(events),
+            state,
+        }
+    }
+}
+
+/// One unit's requests (one per criterion, in declaration order), what the
+/// unit decided before anything is asked, and its input's hash and size.
+type UnitRequests = (
+    Vec<DecisionRequest>,
+    Option<CheckOutcome>,
+    Option<(String, u64)>,
+);
+
+/// One criterion to grade, on the whole slice or on one unit.
+struct Pair<'s, 'a> {
+    criterion: &'s crate::template::decider_check::CheckCriterion,
+    hash: String,
+    request: &'a DecisionRequest,
+    /// What the slice or unit decided before anything is asked.
+    early: Option<CheckOutcome>,
+    /// The input's hash and size; absent with no input.
+    input: Option<&'a (String, u64)>,
+    unit: Option<&'a UnitRef>,
+    /// The check's declared unit labels, which the records carry beside
+    /// `unit`; absent with no unit.
+    labels: Option<&'a UnitLabels>,
+}
+
 /// The declaration hash of each criterion of every decider check in
 /// `gates`, keyed by gate name, computed from the gate as the template wrote
 /// it, before its command is substituted, so a changing variable in the
@@ -99,7 +235,7 @@ pub fn declaration_hashes(gates: &BTreeMap<String, Gate>) -> BTreeMap<String, Ve
                 name.clone(),
                 spec.criteria
                     .iter()
-                    .map(|c| declaration_hash(c, &g.command, spec.max_bytes, &spec.label))
+                    .map(|c| spec.declaration_hash(c, &g.command))
                     .collect(),
             ))
         })
@@ -264,6 +400,8 @@ struct Graded<'s> {
     record: Option<DeciderCheck>,
     /// Set when the criterion fell back to the agent this evaluation.
     fallback: Option<DeciderFallback>,
+    /// The unit graded, for a unit-mode check.
+    unit: Option<UnitRef>,
 }
 
 impl Graded<'_> {
@@ -297,6 +435,9 @@ pub struct CliCheckEvaluator<'a> {
     global: GlobalMode,
     endpoint_origin: SettingOrigin,
     budget: ConsultBudget,
+    /// Unit-mode consultations this call; never shared with the routing
+    /// decider.
+    unit_budget: UnitBudget,
     ledger_root: Option<PathBuf>,
     /// How long to wait for `decider.lock` ([`lock_wait_for`]); zero tries
     /// once.
@@ -324,11 +465,19 @@ impl<'a> CliCheckEvaluator<'a> {
             global,
             endpoint_origin,
             budget,
+            unit_budget: UnitBudget::new(),
             ledger_root: None,
             lock_wait: Duration::ZERO,
             working_dir,
             env,
         }
+    }
+
+    /// The per-call unit budget unit-mode checks draw from; an evaluator
+    /// built without this gets a fresh one.
+    pub fn with_unit_budget(mut self, budget: UnitBudget) -> Self {
+        self.unit_budget = budget;
+        self
     }
 
     /// Where ledger lines go (`~/.koto`); `None` writes none.
@@ -375,6 +524,16 @@ impl<'a> CliCheckEvaluator<'a> {
         let output = run_shell_command(&gate.command, self.working_dir, gate.timeout, self.env);
         self.env.record(&format!("gate '{}'", name), &output);
         let duration_ms = Some(output.duration_ms);
+        if spec.units == Some(UnitsMode::Jsonl) {
+            // A cut capture ends in a line that can't be parsed, so it is an
+            // extraction failure, like a command that failed.
+            let units = if output.failure_kind.is_some() || output.stdout_truncated {
+                None
+            } else {
+                parse_units(&output.stdout)
+            };
+            return self.evaluate_units(name, spec, hashes, units, duration_ms);
+        }
         let slice = output.stdout.as_str();
         // One request per criterion, in declaration order. Each carries the
         // same labelled slice, and the recorded input hash is taken from the
@@ -435,119 +594,321 @@ impl<'a> CliCheckEvaluator<'a> {
             drop(lock);
             return unreadable_log_result(name, spec, self.global, duration_ms);
         };
-        let visit_index = arrival_index(events, &state);
-        let visit_seq = visit_index.map(|i| events[i].seq).unwrap_or(0);
-        let visit_events = visit_index.map(|i| &events[i + 1..]).unwrap_or(events);
+        let visit = Visit::of(events, state);
 
+        let take = || self.budget.try_take();
         let mut graded = Vec::with_capacity(spec.criteria.len());
         for (i, (criterion, request)) in spec.criteria.iter().zip(&requests).enumerate() {
-            let hash = hashes.get(i).cloned().unwrap_or_default();
-            let mode = effective_check_mode(criterion.mode, self.global);
-            let sha = input.as_ref().map(|(sha, _)| sha.as_str());
-            // Order matters (DESIGN-decider-fallback.md, Decision 2): an
-            // empty slice is never graded; a reusable decider verdict comes
-            // first; then an answer the agent recorded for this slice; only
-            // then the early outcome, the lock and the cap. Every path that
-            // ends unanswered is therefore checked for an answer first, so
-            // any reason, present or future, falls back the same way.
-            let reused = match early {
-                None => sha.and_then(|s| {
-                    reusable(visit_events, &state, name, &criterion.rule_id, &hash, s)
-                }),
-                Some(_) => None,
-            };
-            let answered = match (early, reused) {
-                (Some(CheckOutcome::NotGraded), _) | (_, Some(_)) => None,
-                _ => applicable_answer(visit_events, &state, name, &criterion.rule_id, &hash, sha),
-            };
-            let (outcome, record_from) = match (early, reused, answered, &lock) {
-                (Some(CheckOutcome::NotGraded), ..) => (
-                    CheckOutcome::NotGraded,
-                    Some(Consulted::unsent(CheckOutcome::NotGraded)),
-                ),
-                (_, Some(o), ..) => (o, None),
-                (_, None, Some(a), _) => (agent_outcome(a), None),
-                (Some(o), None, None, _) => (o, Some(Consulted::unsent(o))),
-                (None, None, None, None) => {
-                    let o = CheckOutcome::Unanswered(UnansweredReason::Busy);
-                    (o, Some(Consulted::unsent(o)))
-                }
-                (None, None, None, Some(_)) => {
-                    let c = if self.budget.try_take() {
-                        self.consult(criterion, request)
-                    } else {
-                        Consulted::unsent(CheckOutcome::Unanswered(UnansweredReason::CapSpent))
-                    };
-                    (c.outcome, Some(c))
-                }
-            };
-            // The decider's own record keeps its rule: only a veto fail
-            // from the decider blocks there. An agent fail blocks the same
-            // way, only in veto.
-            let blocked = match answered {
-                Some(a) => mode == CheckMode::Veto && a == AgentAnswer::Fail,
-                None => blocks(outcome, mode),
-            };
-            let fallback = match (outcome, answered) {
-                (CheckOutcome::Unanswered(reason), None) => Some(DeciderFallback {
-                    state: state.clone(),
-                    visit_seq,
-                    gate: name.to_string(),
-                    rule_id: criterion.rule_id.clone(),
-                    declaration_hash: hash.clone(),
-                    mode,
-                    reason,
-                    input_sha256: input.as_ref().map(|(sha, _)| sha.clone()),
-                    input_bytes: input.as_ref().map(|(_, n)| *n),
-                }),
-                _ => None,
-            };
-            let record = record_from.map(|c| {
-                let (recorded, reason) = c.outcome.recorded();
-                DeciderCheck {
-                    state: state.clone(),
-                    visit_seq,
-                    gate: name.to_string(),
-                    rule_id: criterion.rule_id.clone(),
-                    rule_ref: criterion.rule_ref.clone(),
-                    declaration_hash: hash.clone(),
-                    mode,
-                    threshold: criterion.threshold,
-                    outcome: recorded,
-                    reason,
-                    blocked,
-                    provider: self.decider.provider().to_string(),
-                    model: c.model,
-                    probabilities: recorded_probabilities(&c.probabilities),
-                    input_sha256: input.as_ref().map(|(sha, _)| sha.clone()),
-                    input_bytes: input.as_ref().map(|(_, n)| *n),
-                    input_tokens: c.usage.input_tokens,
-                    output_tokens: c.usage.output_tokens,
-                    unread_usage_attempts: c.usage.unread_attempts,
-                    attempts: c.attempts,
-                    latency_ms: c.latency_ms,
-                    error_class: c.error_class,
-                    endpoint_origin: Some(self.endpoint_origin),
-                }
-            });
-            graded.push(Graded {
-                criterion,
-                mode,
-                outcome,
-                agent: answered,
-                blocked,
-                record,
-                fallback,
-            });
+            graded.push(self.grade(
+                &visit,
+                name,
+                Pair {
+                    criterion,
+                    hash: hashes.get(i).cloned().unwrap_or_default(),
+                    request,
+                    early,
+                    input: input.as_ref(),
+                    unit: None,
+                    labels: None,
+                },
+                lock.is_some(),
+                (&take, UnansweredReason::CapSpent),
+            ));
         }
         drop(lock);
+        self.finish(name, spec, graded, session_id, None, duration_ms)
+    }
 
+    /// Evaluate a unit-mode check (DESIGN-doc-rule-checks-m4.md, Decisions 1
+    /// to 3). `units` is what the extraction printed, or `None` when it
+    /// failed, timed out, was cut at the capture bound, or printed a line
+    /// that isn't a unit: then every criterion is unanswered with
+    /// `extraction_failed` and no unit is named. No units at all grades
+    /// nothing. Otherwise each unit gets its own early outcome (empty is
+    /// not graded, longer than `max_bytes` is over budget), and the rest are
+    /// graded one (unit, criterion) request at a time, units in print order
+    /// and criteria in declaration order, each drawing a slot from the
+    /// per-call unit budget, never from the cap the routing decider shares.
+    fn evaluate_units(
+        &self,
+        name: &str,
+        spec: &DeciderCheckSpec,
+        hashes: &[String],
+        units: Option<Vec<Unit>>,
+        duration_ms: Option<u64>,
+    ) -> StructuredGateResult {
+        // One request per (unit, criterion). Each unit's input hash is taken
+        // from its own request, so two units' verdicts never collide. A unit
+        // past the check's `max_units` is decided first, whatever its size,
+        // so it is never sent; then an empty unit, then one over budget.
+        let limit = spec.max_units.map_or(usize::MAX, |n| n as usize);
+        let per_unit: Vec<UnitRequests> = units
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, u)| {
+                let requests: Vec<DecisionRequest> = spec
+                    .criteria
+                    .iter()
+                    .map(|c| build_check_request(c, &spec.label, &u.text))
+                    .collect();
+                let empty = u.text.trim().is_empty();
+                let input = requests
+                    .first()
+                    .filter(|_| !empty)
+                    .map(|r| (input_sha256(&r.inputs), u.text.len() as u64));
+                let early = if index >= limit {
+                    Some(CheckOutcome::Unanswered(UnansweredReason::UnitLimit))
+                } else if empty {
+                    Some(CheckOutcome::NotGraded)
+                } else if u.text.len() > spec.max_bytes as usize {
+                    Some(CheckOutcome::Unanswered(UnansweredReason::OverBudget))
+                } else {
+                    None
+                };
+                (requests, early, input)
+            })
+            .collect();
+        let lock = if per_unit.iter().any(|(_, early, _)| early.is_none()) {
+            self.lock_waiting()
+        } else {
+            None
+        };
+        let read = self.backend.read_events_local(self.session).ok();
+        let Some((session_id, events, state)) = read.as_ref().and_then(|(header, events)| {
+            let state = derive_state_from_log(events).filter(|s| !s.is_empty())?;
+            Some((
+                Some(header.session_id.as_str()).filter(|s| !s.is_empty()),
+                events.as_slice(),
+                state,
+            ))
+        }) else {
+            drop(lock);
+            return unreadable_log_result(name, spec, self.global, duration_ms);
+        };
+        let visit = Visit::of(events, state);
+
+        let mut graded = Vec::new();
+        match per_unit.is_empty() {
+            // No unit to grade: each criterion once, with no unit, exactly
+            // as a failed extraction or an empty slice is graded today.
+            true => {
+                let early = if units.is_none() {
+                    CheckOutcome::Unanswered(UnansweredReason::ExtractionFailed)
+                } else {
+                    CheckOutcome::NotGraded
+                };
+                let none = || false;
+                for (i, criterion) in spec.criteria.iter().enumerate() {
+                    let request = build_check_request(criterion, &spec.label, "");
+                    graded.push(self.grade(
+                        &visit,
+                        name,
+                        Pair {
+                            criterion,
+                            hash: hashes.get(i).cloned().unwrap_or_default(),
+                            request: &request,
+                            early: Some(early),
+                            input: None,
+                            unit: None,
+                            labels: None,
+                        },
+                        false,
+                        (&none, UnansweredReason::UnitLimit),
+                    ));
+                }
+            }
+            false => {
+                let take = || self.unit_budget.try_take();
+                let labels = UnitLabels::declared(
+                    spec.unit_document.as_deref(),
+                    spec.unit_section.as_deref(),
+                );
+                for (unit, (requests, early, input)) in units.iter().flatten().zip(&per_unit) {
+                    for (i, (criterion, request)) in spec.criteria.iter().zip(requests).enumerate()
+                    {
+                        graded.push(self.grade(
+                            &visit,
+                            name,
+                            Pair {
+                                criterion,
+                                hash: hashes.get(i).cloned().unwrap_or_default(),
+                                request,
+                                early: *early,
+                                input: input.as_ref(),
+                                unit: Some(&unit.reference),
+                                labels: labels.as_ref(),
+                            },
+                            lock.is_some(),
+                            (&take, UnansweredReason::UnitLimit),
+                        ));
+                    }
+                }
+            }
+        }
+        drop(lock);
+        // A failed extraction and one that printed nothing both list no
+        // units: in neither case did the extraction name a unit.
+        let printed: Vec<UnitRef> = units
+            .iter()
+            .flatten()
+            .map(|u| u.reference.clone())
+            .collect();
+        self.finish(name, spec, graded, session_id, Some(&printed), duration_ms)
+    }
+
+    /// Append each new record's ledger line and build the gate's result.
+    fn finish(
+        &self,
+        name: &str,
+        spec: &DeciderCheckSpec,
+        graded: Vec<Graded>,
+        session_id: Option<&str>,
+        units: Option<&[UnitRef]>,
+        duration_ms: Option<u64>,
+    ) -> StructuredGateResult {
         let records: Vec<DeciderCheck> = graded.iter().filter_map(|g| g.record.clone()).collect();
         for record in &records {
             let line = LedgerRecord::checked(self.session, session_id, record.clone());
             append_or_warn(self.ledger_root.as_deref(), &line);
         }
-        result_for(self.session, name, spec, &graded, records, duration_ms)
+        result_for(
+            self.session,
+            name,
+            spec,
+            &graded,
+            units,
+            records,
+            duration_ms,
+        )
+    }
+
+    /// Grade one criterion, on the whole slice or on one unit, and build its
+    /// records. `locked` says whether this tick holds `decider.lock`;
+    /// `budget` takes a slot for a request about to be sent and names the
+    /// reason recorded when none is left.
+    ///
+    /// Order matters (DESIGN-decider-fallback.md, Decision 2): an empty
+    /// slice is never graded; a reusable decider verdict comes first; then
+    /// an answer the agent recorded for this slice; only then the early
+    /// outcome, the lock and the budget. Every path that ends unanswered is
+    /// therefore checked for an answer first, so any reason, present or
+    /// future, falls back the same way. Reuse and answers match on the unit
+    /// too, so neither ever carries over from one unit to another.
+    fn grade<'s>(
+        &self,
+        visit: &Visit,
+        name: &str,
+        pair: Pair<'s, '_>,
+        locked: bool,
+        budget: (&dyn Fn() -> bool, UnansweredReason),
+    ) -> Graded<'s> {
+        let Pair {
+            criterion,
+            hash,
+            request,
+            early,
+            input,
+            unit,
+            labels,
+        } = pair;
+        // The labels go only beside a unit.
+        let unit_labels = unit.and(labels).cloned();
+        let (take, spent) = budget;
+        let mode = effective_check_mode(criterion.mode, self.global);
+        let sha = input.map(|(sha, _)| sha.as_str());
+        let reused = match early {
+            None => sha.and_then(|s| reusable(visit, name, &criterion.rule_id, &hash, s, unit)),
+            Some(_) => None,
+        };
+        let answered = match (early, reused) {
+            (Some(CheckOutcome::NotGraded), _) | (_, Some(_)) => None,
+            _ => applicable_answer(visit, name, &criterion.rule_id, &hash, sha, unit),
+        };
+        let (outcome, record_from) = match (early, reused, answered, locked) {
+            (Some(CheckOutcome::NotGraded), ..) => (
+                CheckOutcome::NotGraded,
+                Some(Consulted::unsent(CheckOutcome::NotGraded)),
+            ),
+            (_, Some(o), ..) => (o, None),
+            (_, None, Some(a), _) => (agent_outcome(a), None),
+            (Some(o), None, None, _) => (o, Some(Consulted::unsent(o))),
+            (None, None, None, false) => {
+                let o = CheckOutcome::Unanswered(UnansweredReason::Busy);
+                (o, Some(Consulted::unsent(o)))
+            }
+            (None, None, None, true) => {
+                let c = if take() {
+                    self.consult(criterion, request)
+                } else {
+                    Consulted::unsent(CheckOutcome::Unanswered(spent))
+                };
+                (c.outcome, Some(c))
+            }
+        };
+        // The decider's own record keeps its rule: only a veto fail from the
+        // decider blocks there. An agent fail blocks the same way, only in
+        // veto.
+        let blocked = match answered {
+            Some(a) => mode == CheckMode::Veto && a == AgentAnswer::Fail,
+            None => blocks(outcome, mode),
+        };
+        let fallback = match (outcome, answered) {
+            (CheckOutcome::Unanswered(reason), None) => Some(DeciderFallback {
+                state: visit.state.clone(),
+                visit_seq: visit.seq,
+                gate: name.to_string(),
+                rule_id: criterion.rule_id.clone(),
+                declaration_hash: hash.clone(),
+                mode,
+                reason,
+                input_sha256: input.map(|(sha, _)| sha.clone()),
+                input_bytes: input.map(|(_, n)| *n),
+                unit: unit.cloned(),
+                unit_labels: unit_labels.clone(),
+            }),
+            _ => None,
+        };
+        let record = record_from.map(|c| {
+            let (recorded, reason) = c.outcome.recorded();
+            DeciderCheck {
+                state: visit.state.clone(),
+                visit_seq: visit.seq,
+                gate: name.to_string(),
+                rule_id: criterion.rule_id.clone(),
+                rule_ref: criterion.rule_ref.clone(),
+                declaration_hash: hash.clone(),
+                mode,
+                threshold: criterion.threshold,
+                outcome: recorded,
+                reason,
+                blocked,
+                provider: self.decider.provider().to_string(),
+                model: c.model,
+                probabilities: recorded_probabilities(&c.probabilities),
+                input_sha256: input.map(|(sha, _)| sha.clone()),
+                input_bytes: input.map(|(_, n)| *n),
+                input_tokens: c.usage.input_tokens,
+                output_tokens: c.usage.output_tokens,
+                unread_usage_attempts: c.usage.unread_attempts,
+                attempts: c.attempts,
+                latency_ms: c.latency_ms,
+                error_class: c.error_class,
+                endpoint_origin: Some(self.endpoint_origin),
+                unit: unit.cloned(),
+                unit_labels,
+            }
+        });
+        Graded {
+            criterion,
+            mode,
+            outcome,
+            agent: answered,
+            blocked,
+            record,
+            fallback,
+            unit: unit.cloned(),
+        }
     }
 
     /// Ask the provider about one criterion, retrying once on a transient
@@ -604,23 +965,24 @@ impl<'a> CliCheckEvaluator<'a> {
 }
 
 /// The latest verdict recorded in this visit for the same gate, criterion,
-/// declaration and slice. An unanswered or not-graded outcome is never
-/// reused.
+/// declaration, slice and unit (none, for a single-slice check). An
+/// unanswered or not-graded outcome is never reused.
 fn reusable(
-    visit_events: &[Event],
-    state: &str,
+    visit: &Visit,
     gate: &str,
     rule_id: &str,
     hash: &str,
     sha: &str,
+    unit: Option<&UnitRef>,
 ) -> Option<CheckOutcome> {
-    visit_events.iter().rev().find_map(|e| match &e.payload {
+    visit.events.iter().rev().find_map(|e| match &e.payload {
         EventPayload::DeciderChecked(c)
-            if c.state == state
+            if c.state == visit.state
                 && c.gate == gate
                 && c.rule_id == rule_id
                 && c.declaration_hash == hash
-                && c.input_sha256.as_deref() == Some(sha) =>
+                && c.input_sha256.as_deref() == Some(sha)
+                && c.unit.as_ref() == unit =>
         {
             CheckOutcome::from_recorded_verdict(c.outcome)
         }
@@ -631,22 +993,24 @@ fn reusable(
 /// The latest answer the agent recorded in this visit for the same gate,
 /// criterion, declaration and slice (DESIGN-decider-fallback.md, Decision
 /// 2). Two absent slice hashes match: a failed extraction has no slice,
-/// and its answer stands while extraction keeps failing.
+/// and its answer stands while extraction keeps failing. In unit mode the
+/// answer must name the same unit.
 fn applicable_answer(
-    visit_events: &[Event],
-    state: &str,
+    visit: &Visit,
     gate: &str,
     rule_id: &str,
     hash: &str,
     sha: Option<&str>,
+    unit: Option<&UnitRef>,
 ) -> Option<AgentAnswer> {
-    visit_events.iter().rev().find_map(|e| match &e.payload {
+    visit.events.iter().rev().find_map(|e| match &e.payload {
         EventPayload::DeciderCheckAnswered(a)
-            if a.state == state
+            if a.state == visit.state
                 && a.gate == gate
                 && a.rule_id == rule_id
                 && a.declaration_hash == hash
-                && a.input_sha256.as_deref() == sha =>
+                && a.input_sha256.as_deref() == sha
+                && a.unit.as_ref() == unit =>
         {
             Some(a.answer)
         }
@@ -720,6 +1084,7 @@ fn unreadable_log_result(
         rule_ref: None,
         effect_landed: None,
         message_source: MessageSource::Koto,
+        unit: None,
     };
     StructuredGateResult {
         outcome: GateOutcome::Pending,
@@ -756,32 +1121,60 @@ fn waiting_finding(
     gate: &str,
     criterion: &crate::template::decider_check::CheckCriterion,
     reason: UnansweredReason,
+    unit: Option<&UnitRef>,
 ) -> Finding {
+    let on_unit = unit
+        .map(|u| format!(" on unit {}", u.key))
+        .unwrap_or_default();
+    let unit_flag = unit
+        .map(|u| format!(" --unit {}", shell_word(&u.key)))
+        .unwrap_or_default();
     Finding {
         rule_id: criterion.rule_id.clone(),
         level: FindingLevel::Warning,
-        message: format!(
-            "criterion {} is waiting on your answer: the decider gave no verdict ({}). \
-             Record it with `koto decider answer {} --gate {} --criterion {} --answer \
+        message: capped(format!(
+            "criterion {}{} is waiting on your answer: the decider gave no verdict ({}). \
+             Record it with `koto decider answer {} --gate {} --criterion {}{} --answer \
              <pass|fail|unclear>`, then run `koto next {}` again. {} Answer pass if: {} \
              Answer fail if: {} Answer unclear if: {}",
             criterion.rule_id,
+            on_unit,
             reason.as_str(),
             shell_word(session),
             shell_word(gate),
             shell_word(&criterion.rule_id),
+            unit_flag,
             shell_word(session),
             criterion.question,
             criterion.pass,
             criterion.fail,
             criterion.escape,
-        ),
+        )),
         path: None,
         line: None,
         column: None,
         rule_ref: Some(criterion.rule_ref.clone()),
         effect_landed: None,
         message_source: MessageSource::Koto,
+        unit: unit.cloned(),
+    }
+}
+
+/// `message` cut to the finding bound, never splitting a character. A unit
+/// finding adds the unit's key to the template's text, so the cut is made
+/// here rather than left to whoever reads the finding; a message already
+/// within the bound comes back unchanged.
+fn capped(mut message: String) -> String {
+    let n = crate::redact::safe_cut_len(message.as_bytes(), crate::findings::MESSAGE_MAX_BYTES);
+    message.truncate(n);
+    message
+}
+
+/// `id` appended to `ids` unless already there, so a criterion that fails
+/// on several units is listed once, in first-seen order.
+fn push_once<'s>(ids: &mut Vec<&'s str>, id: &'s str) {
+    if !ids.contains(&id) {
+        ids.push(id);
     }
 }
 
@@ -792,31 +1185,55 @@ fn waiting_finding(
 /// criterion waiting on the agent, when any waits; otherwise `passed`. A
 /// `pending` evaluation judged nothing, so it stamps no attempt and counts
 /// no rule. A shadow criterion never blocks, whoever answered.
+///
+/// In unit mode (`units` is the list the extraction printed) every finding
+/// names its unit, the criterion lists name each criterion once, and the
+/// output gains `units`: one entry per printed unit, in print order, with
+/// the criteria that failed it, wait on it, or were answered for it.
 fn result_for(
     session: &str,
     gate: &str,
     spec: &DeciderCheckSpec,
     graded: &[Graded],
+    units: Option<&[UnitRef]>,
     records: Vec<DeciderCheck>,
     duration_ms: Option<u64>,
 ) -> StructuredGateResult {
-    let ids = |keep: &dyn Fn(&Graded) -> bool| -> Vec<&str> {
-        graded
-            .iter()
-            .filter(|g| keep(g))
-            .map(|g| g.criterion.rule_id.as_str())
-            .collect()
+    let ids = |keep: &dyn Fn(&Graded) -> bool, unit: Option<&str>| -> Vec<&str> {
+        let mut out = Vec::new();
+        for g in graded.iter().filter(|g| keep(g)) {
+            if unit.is_none() || g.unit.as_ref().map(|u| u.key.as_str()) == unit {
+                push_once(&mut out, g.criterion.rule_id.as_str());
+            }
+        }
+        out
     };
-    let failed = ids(&|g| g.blocked);
-    let unanswered = ids(&|g| g.mode == CheckMode::Veto && g.waiting().is_some());
-    let awaiting = ids(&|g| g.waiting().is_some());
-    let agent_answered = ids(&|g| g.agent.is_some());
+    let failed = ids(&|g| g.blocked, None);
+    let unanswered = ids(
+        &|g| g.mode == CheckMode::Veto && g.waiting().is_some(),
+        None,
+    );
+    let awaiting = ids(&|g| g.waiting().is_some(), None);
+    let agent_answered = ids(&|g| g.agent.is_some(), None);
 
     let mut findings = Vec::new();
     for g in graded {
         if g.blocked {
             let c = g.criterion;
-            let (message, source) = if g.agent.is_some() {
+            let (message, source) = if let Some(u) = &g.unit {
+                let whose = if g.agent.is_some() {
+                    ("you answered fail", MessageSource::Koto)
+                } else {
+                    ("the decider judged it to fail", MessageSource::Decider)
+                };
+                (
+                    capped(format!(
+                        "criterion {} failed on unit {}: {}: {}",
+                        c.rule_id, u.key, whose.0, c.fail
+                    )),
+                    whose.1,
+                )
+            } else if g.agent.is_some() {
                 (
                     format!(
                         "criterion {} failed: you answered fail for the {}: {}",
@@ -843,9 +1260,16 @@ fn result_for(
                 rule_ref: Some(c.rule_ref.clone()),
                 effect_landed: None,
                 message_source: source,
+                unit: g.unit.clone(),
             });
         } else if let Some(reason) = g.waiting() {
-            findings.push(waiting_finding(session, gate, g.criterion, reason));
+            findings.push(waiting_finding(
+                session,
+                gate,
+                g.criterion,
+                reason,
+                g.unit.as_ref(),
+            ));
         }
     }
 
@@ -860,9 +1284,24 @@ fn result_for(
         fallback: None,
         captured: None,
     });
+    let mut output = check_output(&failed, &unanswered, &awaiting, &agent_answered, "");
+    if let Some(units) = units {
+        output["units"] = units
+            .iter()
+            .map(|u| {
+                let key = Some(u.key.as_str());
+                serde_json::json!({
+                    "key": u.key,
+                    "failed": ids(&|g| g.blocked, key),
+                    "awaiting": ids(&|g| g.waiting().is_some(), key),
+                    "agent_answered": ids(&|g| g.agent.is_some(), key),
+                })
+            })
+            .collect();
+    }
     StructuredGateResult {
         outcome,
-        output: check_output(&failed, &unanswered, &awaiting, &agent_answered, ""),
+        output,
         failure,
         findings,
         duration_ms,
@@ -887,6 +1326,56 @@ mod tests {
         assert!(!a.try_take());
         assert!(!b.try_take());
         assert_eq!(a.used(), MAX_CONSULTATIONS_PER_CALL);
+    }
+
+    #[test]
+    fn the_unit_budget_is_its_own_count() {
+        let units = UnitBudget::new();
+        let shared = ConsultBudget::new();
+        for _ in 0..MAX_UNIT_CONSULTATIONS_PER_CALL {
+            assert!(units.try_take());
+        }
+        assert!(!units.try_take());
+        assert_eq!(units.used(), MAX_UNIT_CONSULTATIONS_PER_CALL);
+        assert_eq!(shared.used(), 0, "units never spend the shared cap");
+    }
+
+    #[test]
+    fn units_parse_from_json_lines() {
+        let out = "{\"key\":\"ac-1\",\"text\":\"one\",\"document\":\"docs/x.md\",\"section\":null,\"extra\":1}\n\
+                   \n\
+                   {\"key\":\"ac-2\",\"text\":\"\"}\r\n";
+        let units = parse_units(out).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].reference.key, "ac-1");
+        assert_eq!(units[0].reference.document.as_deref(), Some("docs/x.md"));
+        assert_eq!(units[0].reference.section, None);
+        assert_eq!(units[0].text, "one");
+        assert_eq!(units[1].text, "");
+        assert_eq!(parse_units("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn a_bad_line_name_or_repeat_refuses_every_unit() {
+        for out in [
+            "not json",
+            "[1]",
+            "{\"text\":\"t\"}",
+            "{\"key\":\"k\"}",
+            "{\"key\":1,\"text\":\"t\"}",
+            "{\"key\":\"-k\",\"text\":\"t\"}",
+            "{\"key\":\"/k\",\"text\":\"t\"}",
+            "{\"key\":\"a b\",\"text\":\"t\"}",
+            "{\"key\":\"k\",\"text\":\"t\",\"section\":\"has space\"}",
+            "{\"key\":\"k\",\"text\":\"t\",\"document\":7}",
+            "{\"key\":\"k\",\"text\":\"t\"}\n{\"key\":\"k\",\"text\":\"u\"}",
+        ] {
+            assert!(parse_units(out).is_none(), "{}", out);
+        }
+        let long = format!("{{\"key\":\"{}\",\"text\":\"t\"}}", "k".repeat(129));
+        assert!(parse_units(&long).is_none());
+        let max = format!("{{\"key\":\"{}\",\"text\":\"t\"}}", "k".repeat(128));
+        assert!(parse_units(&max).is_some());
     }
 
     #[test]
@@ -947,8 +1436,14 @@ mod tests {
                     escape: "can't tell".into(),
                     threshold: 0.9,
                     mode: *mode,
+                    summary: None,
+                    rule_text: None,
                 })
                 .collect(),
+            units: None,
+            max_units: None,
+            unit_document: None,
+            unit_section: None,
         });
         gate
     }
@@ -1072,11 +1567,12 @@ mod tests {
             ExtractionFailed,
             CapSpent,
             Busy,
+            UnitLimit,
         ];
         for r in &all {
             match r {
                 ProviderError | UnreadableResponse | OverBudget | ExtractionFailed | CapSpent
-                | Busy => {}
+                | Busy | UnitLimit => {}
             }
         }
         all
@@ -1098,6 +1594,8 @@ mod tests {
                     reason,
                     input_sha256: None,
                     input_bytes: None,
+                    unit: None,
+                    unit_labels: None,
                 };
                 let graded = vec![Graded {
                     criterion: &spec.criteria[0],
@@ -1107,8 +1605,9 @@ mod tests {
                     blocked: false,
                     record: None,
                     fallback: Some(fallback),
+                    unit: None,
                 }];
-                let r = result_for("wf", "comments", spec, &graded, Vec::new(), None);
+                let r = result_for("wf", "comments", spec, &graded, None, Vec::new(), None);
                 let label = format!("{:?} {:?}", reason, mode);
                 assert_eq!(r.outcome, GateOutcome::Pending, "{}", label);
                 assert_eq!(r.output["awaiting"], serde_json::json!(["r"]), "{}", label);
@@ -1262,6 +1761,8 @@ mod tests {
             input_sha256: fallback.input_sha256.clone(),
             answer,
             fallback_seq: 3,
+            unit: fallback.unit.clone(),
+            unit_labels: fallback.unit_labels.clone(),
         });
         backend
             .append_event("wf", &p, &crate::engine::types::now_iso8601())
@@ -1353,7 +1854,7 @@ mod tests {
         let c = &mut gate.decider_check.as_mut().unwrap().criteria[0];
         c.rule_id = "odd id".into();
         c.question = "Q?".into();
-        let f = waiting_finding("wf", "comments", c, UnansweredReason::OverBudget);
+        let f = waiting_finding("wf", "comments", c, UnansweredReason::OverBudget, None);
         assert_eq!(f.level, FindingLevel::Warning);
         assert_eq!(f.message_source, MessageSource::Koto);
         let cmd = "`koto decider answer wf --gate comments --criterion 'odd id' --answer";

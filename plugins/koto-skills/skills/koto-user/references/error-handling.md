@@ -69,6 +69,11 @@ Fields:
 - `replace_held_live` (exit 2) — the finished session is still kept by the retention rule, so it would be moved aside, but a session under it is still running, waits to promote its result to a request leg, or can't be read. Carries `live`, naming them. Nothing changed; finish or cancel those first.
 - `replace_failed` (exit 1) — removing or moving aside the finished session failed partway. koto undid the move, so nothing was replaced; when even the undo failed, `stranded` lists the renames left in place, which stay readable under their new names.
 
+`koto init --attach-live` refuses a running session it can't confirm as the caller's with `origin_mismatch` (exit 2). Nothing changes, and the way forward never takes the session away from the run that owns it:
+
+- The session was started in another worktree or session store. `recorded` names where it was started and `requested` where this invocation runs. Use another session name, or run the command from the directory the message names, where the session belongs. When only the store differs, run it against the session store the session was started in.
+- The session has no origin record, because a koto release older than the record started it. Finish it with the koto version that started it, or use another session name.
+
 ---
 
 ## NextErrorCode table
@@ -89,9 +94,13 @@ All `koto next` error codes, their exit codes, and what to do:
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
 | `execution_anchor_unresolvable` | 3 | No | The session's recorded execution anchor names nothing on this machine — the checkout was deleted, or the session moved machines | If the checkout was deleted, restore it at the path the message names. If the session belongs on this machine now, it has to come over by `koto session import` from its source workspace, not by rebinding the copy here; see the cloud sync guide's "Moving a session to another host". Otherwise escalate |
 | `capture_unset` | 3 | No | A state reads a `capture_stdout_as` name that no state delivered on this run — in its instruction text, in its `default_action`'s `command` or `working_dir`, or in any field of one of its gates. The message names which, the gate where one is involved, the value, and the state that produces it. Nothing is spawned, read or compiled on either path | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
-| `import_source_running`, `import_source_unpushed`, `import_source_has_children` | 2 | No | A same-host `koto session import` (no `--as`, run on the host that created the session) found the source still held by another process, ahead of the bucket, or with a local child. `import_source_unpushed` also refuses from any host while a `koto next` on the source stopped before pushing what its commands wrote (the bucket holds the source's `batch-open.json`). Nothing was written | Stop the source, run `koto session resolve <name> --keep local` in its workspace, or deal with the child, as the code says. For a stopped `koto next`, run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then run the same import again. See `command-reference.md`, "koto session import" |
-| `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
-| `session_bound_elsewhere` | 2 | No | Under the cloud backend, the command named a session from a directory that isn't the session's workspace, so it would have synced against another workspace's copy in the bucket. The message names the bound directory | Run the command from the directory the message names. See [session_bound_elsewhere](#session_bound_elsewhere) |
+| `import_source_running`, `import_source_unpushed`, `import_source_has_children` | 2 | No | A same-host `koto session import` (no `--as`, run on the host that created the session) found the source still held by another process, ahead of the bucket, or with a local child. `import_source_unpushed` also refuses from any host while a `koto next` on the source stopped before pushing what its commands wrote, or a write window on it isn't closed yet (the bucket holds the source's `batch-open.json`). Nothing was written | Stop the source, run `koto session resolve <name> --keep local` in its workspace, or deal with the child, as the code says. For a stopped `koto next`, run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then run the same import again. See `command-reference.md`, "koto session import" |
+| `relation_conflict` | 2 | No | A re-run of `koto session import` found the copy already holds a continues relation naming a different session. The copy is unchanged | Continue the existing copy, or import under another name with `--as`. A copy built without a relation isn't a conflict: the re-run adds the relation and exits 0 |
+| `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The commands that would change it refuse; reads still exit 0. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
+| `session_superseded` | 2 | No | The session was superseded with `koto init <succ> --continues <it> --supersede`: its log holds the fence, and koto writes nothing more to it. The message names the newest session in the chain; the body carries `superseded_by`, `newest` and `actor` | Continue in the session the message names. Reads of this session still work. See [session_superseded](#session_superseded) |
+| `session_unlocated` | 2 | No | Under the cloud backend, koto can't tell which bucket copy is the named session's own: no copy on this host and none under this directory's prefix, but one under another directory's (`no_local_copy`; a session the bucket holds nowhere reads as absent), a recorded copy that is missing or another session's (`recorded_copy_mismatch`), or a session with no recorded prefix, named from outside its own directory, whose two candidate prefixes don't give one copy carrying its `session_id` (`no_candidate_copy`, `ambiguous_copies`, `candidate_copy_mismatch`, `candidate_unreadable`). A session that records its prefix, and one located by its candidates, is read and written there from any directory | Act on the `reason`; for the four candidate reasons, run from the directory the message names. See [session_unlocated](#session_unlocated) |
+| `session_rebound` | non-zero | No | Under the cloud backend, a write to the session (an event, a context key, a header rewrite) ran from an anchor a `koto session rebind` moved the session away from, or read the session before a rebind. Nothing was written. The message names the anchor the session is bound to now | Stop writing from the old anchor. If this process is the session's current owner, run the command again from the directory the message names; otherwise the session has a successor and this process is done with it |
+| `session conflict` | non-zero | No | Under the cloud backend, this host's state log and the bucket's copy each hold an event the other lacks, so a pull or a push refused instead of overwriting either. The message gives both sides' event counts, byte lengths and last seqs. A refused push leaves the write in this host's log | Escalate: someone decides which history to keep with `koto session resolve <name> --keep local` or `--keep remote`, run from the session's directory. Don't resolve it yourself unless you were told to |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
@@ -157,15 +166,15 @@ Check that the directory is the one you meant.
 
 ## session_migrated
 
-`koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses instead of forking. Nothing is read or written on the refused call. On the host that created the session, a same-host import keeps the session's name without `--as`, and the old workspace's commands refuse from the local copy too, so the refusal doesn't depend on reaching the bucket.
+`koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses writes instead of forking. Nothing is read or written on the refused call. On the host that created the session, a same-host import keeps the session's name without `--as`, and the old workspace's commands refuse from the local copy too, so the refusal doesn't depend on reaching the bucket.
 
-`koto next`, `koto status` and the `koto context` commands refuse with this code. Each writes the error to **stdout**, not stderr, and exits 2. `koto next` uses the nested shape:
+These commands refuse with this code: `koto next`, `koto context add` and `remove`, `koto rewind`, `koto cancel`, `koto decisions record`, `koto overrides record`, `koto session link`, `koto session rebind`, `resolve`, `update`, `pin` and `unpin`. Each writes the error to **stdout**, not stderr, and exits 2. The source is a read-only predecessor of the copy, so `koto status`, `koto context get`, `exists` and `list`, `koto decisions list` and `koto overrides list` (and their `--workspace` forms) still exit 0 and answer from the source's last pushed bucket copy, changing nothing. `koto next` uses the nested shape:
 
 ```json
 {"error":{"code":"session_migrated","message":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","details":[]}}
 ```
 
-`koto status` and the `koto context` commands use the flat shape, with the code leading the message. This refusal is an exception to Shape 2's stderr rule: it goes to stdout like `koto next`'s.
+The other commands use the flat shape, with the code leading the message. This refusal is an exception to Shape 2's stderr rule: it goes to stdout like `koto next`'s.
 
 ```json
 {"error":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","command":"status"}
@@ -173,17 +182,42 @@ Check that the directory is the one you meant.
 
 The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. A migrated source's pin is inert, since the import carried it to the moved copy: it doesn't refuse the cleanup, and `koto session unpin` refuses it as a migrated source (if an older release ran the import, check the moved copy is pinned first); any other pinned session refuses cleanup with `pinned` until `koto session unpin <name>` releases it. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
 
-## session_bound_elsewhere
+## session_superseded
 
-Under the cloud backend a session lives in the bucket under a prefix derived from the directory it was started in, while every workspace on a host shares one local session store. A command that names a session from another directory would sync that shared copy against the other directory's prefix, which can hold an older session of the same name. So `koto status`, the `koto context` commands, `koto decisions record` and `list`, `koto overrides record` and `list`, `koto rewind`, `koto cancel` and `koto session resolve` refuse it first, before any request. A directory counts as the session's workspace when it is the directory the session was created in (recorded with its origin) or its execution anchor; a subdirectory of either doesn't. A session an older koto created has no such record and counts only its anchor. The local backend never refuses.
-
-The error goes to **stdout**, flat, exit 2:
+`koto init <succ> --template <path> --continues <pred> --supersede` appends a `session_superseded` event to `<pred>`'s own log. From then on koto refuses every write to `<pred>`: `koto next`, `koto context add` and `remove`, `koto decisions record`, `koto overrides record`, `koto rewind` and `koto cancel` exit 2 with code `session_superseded` and write nothing (a refused `koto context add` doesn't store the value). The message names the newest session, found by following each fence forward. `koto next` uses the nested shape:
 
 ```json
-{"error":"session_bound_elsewhere: session 'review' is bound to /srv/ws-a, not to the directory this command ran in; under the cloud backend a session is read only from its own workspace, so run the command from /srv/ws-a","command":"context get"}
+{"error":{"code":"session_superseded","message":"session 'coord-1' was superseded by 'coord-2' (session_superseded), so nothing was written; continue in 'coord-2'","details":[]},"superseded_by":"coord-2","newest":"coord-2","actor":{"host":"build-1","user":"dev"}}
 ```
 
-Run the command from the directory the message names. Nothing was read or written on the refused call.
+The other commands use the flat shape with `"code": "session_superseded"` beside `error` and `command`. Reads keep working: `koto context get`, `exists` and `list`, `koto status` and `koto session hierarchy` answer for the superseded session as before, which is how the successor or an operator inspects what it left.
+
+The remedy is to continue in the session the message names. Don't try to get around the refusal; two sessions advancing one run is what the fence exists to stop. A second `--supersede` of the same predecessor is refused by `koto init` itself with `superseded_by` (`superseded_by=<name>` in the message).
+
+## session_unlocated
+
+Under the cloud backend a session records the prefix it was created under (`origin.store.prefix`), and koto reads and writes a named session at that prefix from any directory: `koto status`, the `koto context` commands, `koto decisions`, `koto overrides`, `koto rewind`, `koto cancel` and `koto session resolve` all work on the session's own copy wherever they run. Run from anywhere but the session's own workspace, the copy is read strictly: a bucket that can't answer fails the command rather than answer from this host's copy.
+
+A session an older koto created records no prefix. From the directory it is bound to it works exactly as before. From any other directory koto locates it among two candidate prefixes, its execution anchor's and the one this host's last sync of it ran under, with one listing per distinct candidate, and uses the one candidate that holds its state, strictly, once that copy carries the local header's `session_id`.
+
+When koto can't tell which copy is the session's own, those commands refuse first, before anything is read or written. The error goes to **stdout**, flat, exit 2:
+
+```json
+{"error":"session_unlocated: session 'review' records no prefix for its own copy, and the bucket holds a copy of it under both 3f2a9c0d4b1e7a65 and 9e1d22b07c4a5f38, and koto can't tell which is its own, so nothing was read or written; run the command from /srv/ws-a, where it reads as before","code":"session_unlocated","command":"context get","session":"review","reason":"ambiguous_copies","locations":["3f2a9c0d4b1e7a65","9e1d22b07c4a5f38"]}
+```
+
+`reason` says why, and `locations` lists the bucket prefixes it concerns:
+
+| `reason` | When | Fix |
+|----------|------|-----|
+| `no_local_copy` | This host has no copy of the session and the bucket holds none under the current directory's prefix, but another directory's prefix holds one (a session held nowhere reads as absent) | Run from the directory the session was started in, or read it with `--workspace` |
+| `recorded_copy_mismatch` | The bucket's copy at the recorded prefix is missing, or carries another `session_id` (another session of the same name) | Nothing was read or written; check which session you meant |
+| `no_candidate_copy` | The session records no prefix (or the value isn't 16 lowercase hex), the command runs outside the directory it is bound to, and neither candidate prefix holds a copy of it | Run from the directory the message names, where it works as before |
+| `ambiguous_copies` | As above, and both candidates hold a copy, so neither can be taken as its own; `locations` names both | Run from the directory the message names |
+| `candidate_copy_mismatch` | As above, and the one candidate's copy carries another `session_id` (another session of the same name), or one side carries none to confirm it by | Nothing was read or written; run from the directory the message names |
+| `candidate_unreadable` | As above, and a candidate's listing failed | Run the command again once the bucket answers, or from the directory the message names |
+
+`koto session rebind` of a session koto can't locate refuses the same way from a directory that is neither the one it is bound to nor the one it moves to, with the command to run in the message. A session that records its prefix, or that its candidates locate, rebinds from any directory. The local backend never refuses.
 
 ---
 
@@ -387,7 +421,7 @@ Every subcommand under `koto request` reports failure through the nested envelop
 | `template_mismatch` | 2 | `attach` named a root session built from a template file the leg doesn't name | Attach a session started from one of the leg's templates |
 | `input_mismatch` | 2 | `attach` named a root session whose recorded variable differs from one of the leg's `inputs`, or that doesn't declare it; `details` names the key | Don't attach this session; the leg was asked for different values |
 | `session_terminal` | 2 | `attach` named a finished or cancelled session | A finished session can't answer a leg; start a fresh one |
-| `self_attached_leg` | 2 | `progress`, `resolve`, or `abandon` on a leg a root session attached itself to | Don't. The result arrives from that session's terminal tick; use `abandon-request` to give up on the whole request |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or `abandon` on a leg a root session attached itself to | Don't. The result arrives from that session's terminal tick, or from `koto cancel`; use `abandon-request` to give up on the whole request |
 | `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling | Ask for something reachable |
 | `predicate_became_impossible` | 2 | The predicate stopped being reachable while waiting, through abandonment or close | Distinct from a timeout on purpose: this is "never", not "not yet" |
 | `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself | Report to the user; retrying won't help |

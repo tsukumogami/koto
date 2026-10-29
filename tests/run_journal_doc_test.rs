@@ -107,7 +107,16 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "decider_fallback",
             "decider_field",
             "driver_seen",
+            "evidence_field",
             "response",
+            "rule_delivered",
+            "review_round",
+            "review_verdict",
+            "review_decision",
+            "doc_checked",
+            "doc_rule_checked",
+            "doc_section_written",
+            "doc_fix_applied",
             "session_started",
             "state_entered",
             "terminal"
@@ -207,6 +216,8 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
         "decider_consulted",
         "decider_checked",
         "decider_fallback",
+        "decider_check_answered",
+        "rule_delivered",
         "check_overridden",
         "response",
     ] {
@@ -496,5 +507,64 @@ fn the_decider_fallback_attributes_collide_with_no_other_attribute() {
                 "{new} nests under {other}"
             );
         }
+    }
+}
+
+/// The attributes unit mode and rule delivery added
+/// (DESIGN-doc-rule-checks-m4.md, Decision 5) collide with nothing the
+/// journal writes: none equals another attribute (each is written once, by
+/// one constant), none is a dot-prefix of another or has another as its
+/// dot-prefix, and `koto.unit` and `koto.rule` exist only as prefixes, never
+/// as a field a backend that nests dotted names would have to hold as both
+/// a value and an object.
+#[test]
+fn the_unit_and_rule_delivery_attributes_collide_with_no_other_attribute() {
+    let field = Regex::new(r"^koto\.[a-z_]+(\.[a-z_]+)*$").unwrap();
+    let written: BTreeSet<String> = source_literals()
+        .into_iter()
+        .filter(|s| field.is_match(s))
+        .collect();
+    let new = [
+        "koto.unit.key",
+        "koto.unit.document",
+        "koto.unit.section",
+        "koto.decider.confidence_bp",
+        "koto.rule.extent",
+        "koto.rule.unit_count",
+        "koto.rule.via",
+        "koto.rule.delivery",
+    ];
+    for new in new {
+        assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");
+        for other in written.iter().filter(|o| o.as_str() != new) {
+            assert!(
+                !other.starts_with(&format!("{new}.")),
+                "{other} nests under {new}"
+            );
+            assert!(
+                !new.starts_with(&format!("{other}.")),
+                "{new} nests under {other}"
+            );
+        }
+    }
+    for prefix in ["koto.unit", "koto.rule"] {
+        assert!(
+            !written.contains(prefix),
+            "{SOURCE_DIR} writes {prefix} as a field; it is only a prefix"
+        );
+    }
+    // The delivery's extent isn't called a level, which would read as a
+    // severity beside `koto.finding.level`.
+    assert!(!written.contains("koto.rule.level"));
+    // Each new name is written by exactly one constant: a second literal
+    // would let two spellings drift apart.
+    let source = std::fs::read_to_string(root().join(SOURCE_DIR).join("mod.rs")).unwrap();
+    let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+    for name in new {
+        assert_eq!(
+            source.matches(&format!("\"{name}\"")).count(),
+            1,
+            "{name} is spelled out more than once in {SOURCE_DIR}/mod.rs"
+        );
     }
 }

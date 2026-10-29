@@ -579,6 +579,311 @@ pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Res
     Ok(())
 }
 
+/// A predecessor `--continues` named, checked before anything is written:
+/// its name and what the relation will record about it (R2).
+pub(crate) struct ContinuesTarget {
+    pub pred: String,
+    hints: crate::session::links::LinkHints,
+    /// Under the cloud backend, the predecessor's workspace prefix: where
+    /// its back-reference goes and what the relation records.
+    prefix: Option<String>,
+}
+
+impl ContinuesTarget {
+    /// The predecessor's workspace prefix, under the cloud backend.
+    pub(crate) fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+}
+
+/// Why `--continues` was refused: the message and the exit code (2 for
+/// what the caller named, 3 for a store that couldn't be read or written).
+pub(crate) struct ContinuesError {
+    pub message: String,
+    pub exit: i32,
+}
+
+impl ContinuesError {
+    fn caller(message: String) -> Self {
+        Self {
+            message,
+            exit: super::EXIT_CALLER_ERROR,
+        }
+    }
+}
+
+/// Check `--continues <pred> [--continues-from <workspace>]` for session
+/// `successor` before anything is written (R1, R3): `pred` passes the
+/// session-name rule and isn't `successor`; `--continues-from` names a
+/// workspace (an absolute path or a 16-hex workspace id, as `koto
+/// --workspace` takes it); `pred` is a session in the local store, and not
+/// an anchor or an anchor's close record. A running, finished or pinned
+/// predecessor may be named. Nothing here reads `KOTO_ANCHOR`,
+/// `KOTO_AUTHORITY`, a request leg or a dispatcher (R20): a coordinator's
+/// successor, an operator by hand and an unrelated agent session record the
+/// relation the same way.
+///
+/// Under the cloud backend the predecessor is looked up in this host's copy
+/// when it is in the successor's own workspace and held here, and
+/// otherwise in the bucket, under the workspace `--continues-from` names
+/// (the successor's own by default): a bucket that can't be listed exits 3,
+/// a session the bucket doesn't hold exits 2. A predecessor with the
+/// successor's own name is accepted only from another workspace (an
+/// import's copy naming its source). On the local backend there is one
+/// store, so `--continues-from` is checked and the predecessor is looked up
+/// there.
+pub(crate) fn resolve_continues(
+    backend: &Backend,
+    successor: &str,
+    pred: &str,
+    from: Option<&str>,
+) -> std::result::Result<ContinuesTarget, ContinuesError> {
+    use crate::engine::types::SessionKind;
+    use crate::session::links::{self, LinkHints, LinkKind};
+
+    links::validate_peer(LinkKind::Continues, pred)
+        .map_err(|e| ContinuesError::caller(format!("--continues: {e}")))?;
+    let from_prefix = match from {
+        Some(from) => Some(
+            crate::session::cloud::workspace_read::WorkspaceId::parse(from)
+                .map_err(|e| ContinuesError::caller(format!("--continues-from: {}", e.message)))?
+                .prefix()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let cloud = backend.as_cloud();
+    let own_prefix = cloud.map(|c| c.workspace_prefix().to_string());
+    let elsewhere = matches!(
+        (&from_prefix, &own_prefix),
+        (Some(f), Some(own)) if f != own
+    );
+    if pred == successor && !elsewhere {
+        return Err(ContinuesError::caller(format!(
+            "--continues: session '{successor}' can't continue itself"
+        )));
+    }
+    let (header, hints, prefix) = match cloud {
+        Some(cloud) if elsewhere || !backend.session_dir(pred).is_dir() => {
+            let pred_prefix = from_prefix
+                .clone()
+                .or(own_prefix.clone())
+                .unwrap_or_default();
+            let header = cloud
+                .remote_header_at(&pred_prefix, pred)
+                .map_err(|e| ContinuesError {
+                    message: format!(
+                        "--continues: the bucket couldn't be read to look '{pred}' up: {e:#}; \
+                         nothing was written"
+                    ),
+                    exit: super::EXIT_INFRASTRUCTURE,
+                })?
+                .ok_or_else(|| {
+                    ContinuesError::caller(format!(
+                        "--continues: no session named '{pred}' in workspace {pred_prefix}"
+                    ))
+                })?;
+            let hints = LinkHints {
+                session_id: Some(header.session_id.clone()).filter(|id| !id.is_empty()),
+                workspace: header
+                    .execution_dir
+                    .clone()
+                    .or_else(|| header.origin.as_ref().map(|o| o.anchor.clone()))
+                    .map(|p| p.to_string_lossy().into_owned()),
+            };
+            (Some(header), hints, Some(pred_prefix))
+        }
+        _ => {
+            if !backend.exists(pred) {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: no session named '{pred}' in this store"
+                )));
+            }
+            (
+                backend.read_header(pred).ok(),
+                LinkHints::for_peer(backend, pred),
+                own_prefix.clone(),
+            )
+        }
+    };
+    if let Some(header) = header {
+        match header.session_kind() {
+            SessionKind::Anchor => {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: '{pred}' is an agent session's anchor, which no session \
+                     continues"
+                )))
+            }
+            SessionKind::AnchorClose => {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: '{pred}' is an anchor's close record, which no session \
+                     continues"
+                )))
+            }
+            SessionKind::Ordinary => {}
+        }
+    }
+    Ok(ContinuesTarget {
+        pred: pred.to_string(),
+        hints,
+        prefix,
+    })
+}
+
+/// Write the continues relation `target` names into `successor`, and only
+/// there (Decision 1). Returns whether it was written; a relation the
+/// session already holds changes nothing. A session already continuing
+/// another predecessor is refused with exit 2, writing nothing; a store
+/// that can't be read or written exits 3.
+///
+/// Under the cloud backend the back-reference goes first: it is PUT beside
+/// the predecessor before the relation is written, and a PUT the bucket
+/// doesn't confirm exits 3 with nothing written. The relation is then
+/// pushed strictly; when that fails, the relation and the pointer are taken
+/// back and the command exits 3, so running it again works (R19).
+pub(crate) fn record_continues(
+    backend: &Backend,
+    successor: &str,
+    target: &ContinuesTarget,
+) -> std::result::Result<crate::session::links::LinkWrite, ContinuesError> {
+    use crate::session::links::{self, ContinuesHints, ContinuesRefusal};
+    let holder_session_id = backend
+        .read_header(successor)
+        .ok()
+        .map(|h| h.session_id)
+        .filter(|id| !id.is_empty());
+    let cloud = backend.as_cloud();
+    let hints = ContinuesHints {
+        peer: target.hints.clone(),
+        prefix: cloud.and(target.prefix.clone()),
+        holder_session_id: holder_session_id.clone(),
+        holder_prefix: cloud.map(|c| c.workspace_prefix().to_string()),
+    };
+    let failed = |e: anyhow::Error| match e.downcast_ref::<ContinuesRefusal>() {
+        Some(refusal) => ContinuesError::caller(format!("--continues: {refusal}")),
+        None => ContinuesError {
+            message: format!(
+                "could not record that '{successor}' continues '{}': {e:#}; nothing was written",
+                target.pred
+            ),
+            exit: super::EXIT_INFRASTRUCTURE,
+        },
+    };
+    let write = || links::write_continues(backend, successor, &target.pred, &hints);
+    let (Some(cloud), Some(pred_prefix)) = (cloud, target.prefix.as_deref()) else {
+        return write().map_err(failed);
+    };
+    // A session that already continues another predecessor is refused
+    // before any pointer is written.
+    let held = links::continues_of(backend, successor).map_err(failed)?;
+    if let Some(existing) = held.iter().find(|p| **p != target.pred) {
+        return Err(failed(
+            ContinuesRefusal::OtherPredecessor {
+                existing: existing.clone(),
+            }
+            .into(),
+        ));
+    }
+    let Some(holder_id) = holder_session_id else {
+        return Err(failed(anyhow::anyhow!(
+            "the session's header records no session id, which its back-reference needs"
+        )));
+    };
+    let owed = cloud.pointer_for(successor, pred_prefix, &target.pred, &holder_id);
+    cloud
+        .record_continues_with_pointer(successor, &owed, write)
+        .map_err(failed)
+}
+
+/// Record `koto init --continues` in the session just opened, before the
+/// command reports it: the session never exists without its relation
+/// unless this write fails, and then the command fails (exit 3, or 2 when
+/// an attached session already continues another one) naming the
+/// `koto session link` that records it.
+pub(crate) fn record_continues_at_init(backend: &Backend, name: &str, target: &ContinuesTarget) {
+    if let Err(e) = record_continues(backend, name, target) {
+        super::exit_with_error_code(
+            serde_json::json!({
+                "error": format!(
+                    "{}; session '{name}' was opened without it: run `koto session link {name} \
+                     --continues {}` to record it",
+                    e.message, target.pred
+                ),
+                "command": "init",
+            }),
+            e.exit,
+        )
+    }
+}
+
+/// `koto session link <session> --continues <pred> [--continues-from
+/// <workspace>]`: record that `session` continues `pred`, in `session` only.
+///
+/// Every check runs before anything is written: the session name, that the
+/// session exists and wasn't imported elsewhere, and
+/// [`resolve_continues`]'s checks of the predecessor. A refusal exits 2
+/// with `{"error", "command"}`; a write that fails exits 3. Prints
+/// `{"name", "kind": "continues", "peer", "written"}`, `written: false`
+/// when the session already held this relation and nothing changed.
+pub fn handle_link_continues(
+    backend: &Backend,
+    session: &str,
+    pred: &str,
+    from: Option<&str>,
+) -> Result<()> {
+    let refuse = |error: String, code: i32| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({ "error": error, "command": "session link" }),
+            code,
+        )
+    };
+    if let Err(e) = ValidatedSessionId::new(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    let target = resolve_continues(backend, session, pred, from)
+        .unwrap_or_else(|e| refuse(e.message, e.exit));
+    if !backend.exists(session) {
+        refuse(
+            format!("session '{session}' does not exist"),
+            super::EXIT_CALLER_ERROR,
+        );
+    }
+    if let Err(e) = backend.check_not_migrated(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    // Under the cloud backend the back-reference names this directory's
+    // workspace as the successor's: a session whose own copy is under
+    // another prefix refuses.
+    if let Err(e) = backend.check_located(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    if !backend
+        .home_of(session)
+        .is_ok_and(|home| home.own_workspace)
+    {
+        refuse(
+            format!(
+                "session '{session}' keeps its own copy under another directory's prefix, and \
+                 a continues relation is recorded only from the session's own workspace; run \
+                 the command from the directory the session was started in"
+            ),
+            super::EXIT_CALLER_ERROR,
+        );
+    }
+    let outcome =
+        record_continues(backend, session, &target).unwrap_or_else(|e| refuse(e.message, e.exit));
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": session,
+            "kind": crate::session::links::LinkKind::Continues.as_str(),
+            "peer": pred,
+            "written": outcome.written(),
+        }))?
+    );
+    Ok(())
+}
+
 /// `koto session pin <name> --reason <reason>`: record a pin in `name`.
 ///
 /// Prints `{"name", "pin": {"reason", "set_by", "set_at"}, "store"}`, the
@@ -635,6 +940,61 @@ pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Resu
         }))?
     );
     Ok(())
+}
+
+/// Handle `koto session needed <path>`: print one line and exit 0 (not
+/// needed), 1 (needed) or 2 (can't decide), as
+/// [`crate::session::needed`] judges `path`.
+///
+/// Builds no backend: constructing one can migrate an old store layout,
+/// and the cloud backend's reaches for its bucket. The sessions directory
+/// is the one the configured backend keeps on this host: the cloud
+/// backend's local copies under the koto root, or for the local backend
+/// `KOTO_SESSIONS_BASE` when set. Under the cloud backend the bucket is
+/// read through a read-only reader ([`CloudBackend::bucket_reader`]),
+/// which is only listed and read. A reader that can't be made keeps every
+/// running session it would have been asked about. A configuration that
+/// can't be loaded or checked exits 2, like any other undecided answer.
+///
+/// [`CloudBackend::bucket_reader`]: crate::session::cloud::CloudBackend::bucket_reader
+pub fn handle_needed(path: &str) -> Result<()> {
+    use crate::session::cloud::CloudBackend;
+    use crate::session::needed::{needed, Answer, Bucket};
+
+    let answer = match needed_store() {
+        Ok((base, None)) => needed(&base, std::path::Path::new(path), &Bucket::None),
+        Ok((base, Some(cloud))) => match CloudBackend::bucket_reader(base.clone(), &cloud) {
+            Ok(reader) => needed(&base, std::path::Path::new(path), &Bucket::Reads(&reader)),
+            Err(_) => needed(&base, std::path::Path::new(path), &Bucket::Unavailable),
+        },
+        Err(e) => Answer::Undecided(format!(
+            "can't decide: the sessions directory can't be found: {e:#}"
+        )),
+    };
+    match &answer {
+        Answer::Undecided(_) => eprintln!("{}", answer.line()),
+        _ => println!("{}", answer.line()),
+    }
+    std::process::exit(answer.exit_code());
+}
+
+/// The sessions directory `koto session needed` reads, resolved the way
+/// `build_backend` resolves it, without building the backend, and the
+/// cloud configuration when the backend is the cloud one.
+fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
+    let config = crate::config::resolve::load_config()?;
+    crate::config::session_env::check(&config)?;
+    let koto_sessions = || -> Result<std::path::PathBuf> {
+        Ok(crate::koto_home::koto_home_or_err()?.join("sessions"))
+    };
+    match config.session.backend.as_str() {
+        "cloud" => Ok((koto_sessions()?, Some(config.session.cloud.clone()))),
+        "local" => match std::env::var("KOTO_SESSIONS_BASE") {
+            Ok(base) => Ok((std::path::PathBuf::from(base), None)),
+            Err(_) => Ok((koto_sessions()?, None)),
+        },
+        other => anyhow::bail!("unknown backend: {other}"),
+    }
 }
 
 /// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
@@ -874,18 +1234,37 @@ pub(crate) struct LiveMembers {
     /// Why the hierarchy couldn't be judged, when it couldn't; `members` is
     /// then empty and says nothing.
     pub error: Option<String>,
+    /// What the continues relation would have kept the session for:
+    /// `relation_keepers` and `relation_unreadable`
+    /// (`hierarchy::relation_report_json`). Empty when nothing continuing
+    /// it has standing.
+    pub relation: serde_json::Map<String, serde_json::Value>,
+    /// The same as text lines (`kept: continued by <keeper> (<standing>)
+    /// via <path>`), for stderr.
+    pub relation_lines: Vec<String>,
 }
 
 /// Judge `name`'s hierarchy in the local store `base` and list its other
-/// live members. Never fails: the removal goes ahead whatever this finds.
-/// A malformed retention setting falls back to the defaults (it only moves
+/// live members, and what the continues relation would have kept it for
+/// (with, under the cloud backend, the bucket's answer when nothing local
+/// keeps it). Never fails: the removal goes ahead whatever this finds. A
+/// malformed retention setting falls back to the defaults (it only moves
 /// when an unobserved anchor idles out), with a warning.
-pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
-    use crate::session::hierarchy::{sanitize, Graph, Judge, RetentionSettings, Scope, Verdict};
+pub(crate) fn live_members(
+    backend: &dyn SessionBackend,
+    base: &std::path::Path,
+    name: &str,
+) -> LiveMembers {
+    use crate::session::hierarchy::{
+        relation_report_json, relation_text, sanitize, Graph, Judge, RetentionSettings, Scope,
+        Verdict,
+    };
 
     let none = |error: Option<String>| LiveMembers {
         members: Vec::new(),
         error,
+        relation: Default::default(),
+        relation_lines: Vec::new(),
     };
     if ValidatedSessionId::new(name).is_err() {
         return none(None);
@@ -908,9 +1287,10 @@ pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
     }
     let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
     match judge.judge(name, &Scope::Whole) {
-        Ok(j) => match j.verdict {
-            Verdict::Keep { keepers, .. } => LiveMembers {
-                members: keepers
+        Ok(j) => {
+            let related = crate::session::continues_bucket::relation_at_removal(backend, &j, name);
+            let members = match &j.verdict {
+                Verdict::Keep { keepers, .. } => keepers
                     .iter()
                     .filter(|k| k.name != name)
                     .map(|k| {
@@ -921,10 +1301,15 @@ pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
                         })
                     })
                     .collect(),
+                Verdict::Release { .. } => Vec::new(),
+            };
+            LiveMembers {
+                members,
                 error: None,
-            },
-            Verdict::Release { .. } => none(None),
-        },
+                relation: relation_report_json(&related),
+                relation_lines: relation_text(&related),
+            }
+        }
         Err(e) => none(Some(format!("{e:#}"))),
     }
 }
@@ -934,6 +1319,14 @@ pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
     use crate::session::hierarchy::sanitize;
     if let Some(e) = &live.error {
         eprintln!("warning: removed '{}'; {}", sanitize(name), sanitize(e));
+    }
+    // What the continues relation would have kept it for, one line per
+    // keeper, as every removal by rule prints it.
+    for line in &live.relation_lines {
+        eprintln!(
+            "warning: removed '{}', which the retention rule would have {line}",
+            sanitize(name)
+        );
     }
     if live.members.is_empty() {
         return;
@@ -979,6 +1372,51 @@ pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_
         return;
     }
     record_dispatched_by(backend, session, requested_by);
+}
+
+/// Refuse `koto session rebind <name>` from a directory that is neither the
+/// session's own workspace nor the one the rebind moves it to, when koto
+/// can't tell which bucket copy is the session's own (koto#477).
+///
+/// A session that records the prefix it was created under is pushed there
+/// whatever directory the rebind runs in, so it rebinds from anywhere, and
+/// so does one recorded before koto named the prefix once its copy is
+/// located. One that can't be located would be pushed under the third
+/// directory's prefix, where neither the old workspace nor the new one reads
+/// it. Run from the target (the usual `koto session rebind <name>` stood in
+/// the new checkout) it is accepted even when every directory the session
+/// records is gone, as for a session whose instance was torn down; the
+/// rebind's fence makes any writer left at the old anchor refuse. The local
+/// backend never refuses.
+pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<()> {
+    use crate::session::{Unlocated, UnlocatedReason};
+    use std::path::{Path, PathBuf};
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let here = canonical(&std::env::current_dir()?);
+    let target = to.map_or_else(|| here.clone(), |dir| canonical(&PathBuf::from(dir)));
+    if target == here {
+        return Ok(());
+    }
+    let Err(e) = backend.check_located(name) else {
+        return Ok(());
+    };
+    let Some(Unlocated {
+        reason: UnlocatedReason::NoRecordedPrefix { anchor, .. },
+        ..
+    }) = e.downcast_ref::<Unlocated>()
+    else {
+        return Err(e);
+    };
+    let at = anchor
+        .as_deref()
+        .unwrap_or("the directory the session was started in");
+    anyhow::bail!(
+        "{e}. A rebind of it runs from the directory it is bound to or from the directory it \
+         moves to: run `koto session rebind {name} --to {}` from {at}, or `koto session rebind \
+         {name}` from {}",
+        target.display(),
+        target.display()
+    )
 }
 
 /// Move a session's execution anchor to `to`, defaulting to the
@@ -1051,6 +1489,12 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         return Ok(());
     }
 
+    // Under the cloud backend, the home before the move, when it has one:
+    // a session that takes its home from its anchor moves home with it.
+    let home_before = backend
+        .as_cloud()
+        .map(|cloud| cloud.home_prefix(name).ok().map(|home| home.prefix));
+
     // Event first, header second, matching the adoption path in
     // `handle_next`: a crash between the two leaves a visible record of
     // the move rather than a silent one.
@@ -1068,12 +1512,24 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         // `koto init --attach-live` from the new checkout still finds
         // its own session. A session with no origin record gets none:
         // nothing backfills one.
+        //
+        // The rebind also fences the anchor it leaves (koto#477): the epoch
+        // goes up and the old anchor is retired, so a process still writing
+        // from there gets `session_rebound` instead of forking the log.
         if let Some(origin) = h.origin.as_mut() {
+            let left = from.clone().unwrap_or_else(|| origin.anchor.clone());
             origin.anchor = target.clone();
+            crate::session::rebind_fence::advance(origin, Some(&left), &target);
         }
         h.execution_dir = Some(target.clone());
         h
     })?;
+
+    // The rewrite pushed the state file to the new home; the context keys
+    // go there too, or stderr names the ones that didn't (koto#524).
+    if let (Some(cloud), Some(before)) = (backend.as_cloud(), home_before) {
+        cloud.carry_context_after_rebind(name, before.as_deref());
+    }
 
     println!(
         "{}",

@@ -18,6 +18,9 @@
 //!   with when it was made, which every koto process on the host reuses for
 //!   `session.cloud.check_window_secs` (koto#439). A push from this host
 //!   removes it.
+//! - `cloud-ctx-synced.json` ([`SyncedKeys`]): for each context key, the
+//!   hash this host last knew the session's home to hold, so which of two
+//!   differing copies moved is read from hashes, not host clocks (koto#524).
 //!
 //! A read probes the bucket once per session per process: one listing of
 //! the session's prefix says whether the migration marker is there and
@@ -49,6 +52,76 @@ pub const TICK_FILE: &str = "cloud-tick.id";
 
 /// File name of the last listing this host made of a session.
 pub const CHECK_FILE: &str = "cloud-check.json";
+
+/// File name of the context hashes this host last synced with a session's
+/// home.
+pub const SYNCED_FILE: &str = "cloud-ctx-synced.json";
+
+/// The hash of each context key this host last knew the session's home to
+/// hold: the copy it pushed there, pulled from there, or found there equal
+/// to its own. Kept for one home, so a record left from before a rebind
+/// moved the home says nothing about the new one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedKeys {
+    /// The workspace prefix the hashes were synced with.
+    pub home: String,
+    /// Key to lowercase hex SHA-256, as the manifest writes it.
+    #[serde(default)]
+    pub keys: std::collections::BTreeMap<String, String>,
+}
+
+impl SyncedKeys {
+    /// The record in `dir` for `home`, or an empty one for it when there is
+    /// none, it doesn't parse, or it is for another home.
+    pub fn load(dir: &Path, home: &str) -> Self {
+        std::fs::read(dir.join(SYNCED_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|synced| synced.home == home)
+            .unwrap_or_else(|| SyncedKeys {
+                home: home.to_string(),
+                keys: Default::default(),
+            })
+    }
+
+    /// The hash of `key` this host last synced with the home.
+    pub fn hash(&self, key: &str) -> Option<&str> {
+        self.keys.get(key).map(String::as_str)
+    }
+}
+
+/// Record that `home` holds `hash` for each of `keys` in the session whose
+/// directory is `dir`, replacing a record for any other home. Best-effort:
+/// a record that can't be written only leaves the next read to compare
+/// stamps, as before.
+pub fn note_synced<'a>(dir: &Path, home: &str, keys: impl IntoIterator<Item = (&'a str, &'a str)>) {
+    let mut synced = SyncedKeys::load(dir, home);
+    let before = synced.clone();
+    for (key, hash) in keys {
+        synced.keys.insert(key.to_string(), hash.to_string());
+    }
+    if synced == before {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(&synced) {
+        write_replacing(dir, SYNCED_FILE, &bytes);
+    }
+}
+
+/// Drop `key` from the record in `dir`, after this host removed it.
+pub fn forget_synced(dir: &Path, key: &str) {
+    let Some(mut synced) = std::fs::read(dir.join(SYNCED_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SyncedKeys>(&bytes).ok())
+    else {
+        return;
+    };
+    if synced.keys.remove(key).is_some() {
+        if let Ok(bytes) = serde_json::to_vec(&synced) {
+            write_replacing(dir, SYNCED_FILE, &bytes);
+        }
+    }
+}
 
 /// What this host last knew of one session in the bucket.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +168,13 @@ impl Stamp {
     /// Whether `bytes` are exactly the stamped bytes.
     pub fn matches(&self, bytes: &[u8]) -> bool {
         bytes.len() as u64 == self.state_len && sha256_hex(bytes) == self.state_sha256
+    }
+
+    /// Whether `bytes` are the stamped bytes with more appended: a local log
+    /// that has written events since this host last synced it (koto#477).
+    pub fn extended_by(&self, bytes: &[u8]) -> bool {
+        let len = self.state_len as usize;
+        bytes.len() > len && sha256_hex(&bytes[..len]) == self.state_sha256
     }
 
     /// A stamp for `bytes`, stored under `state_key` with `etag`, keeping the
@@ -283,6 +363,24 @@ mod tests {
             Stamp::for_bytes(Some(&old), "other", "e2", b"b").manifest_etag,
             None
         );
+    }
+
+    #[test]
+    fn a_synced_record_is_kept_per_home_and_drops_a_removed_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(SyncedKeys::load(dir.path(), "p1").hash("k"), None);
+        note_synced(dir.path(), "p1", [("k", "h1"), ("j", "h2")]);
+        assert_eq!(SyncedKeys::load(dir.path(), "p1").hash("k"), Some("h1"));
+        // Another home's record says nothing of this one.
+        assert_eq!(SyncedKeys::load(dir.path(), "p2").hash("k"), None);
+        forget_synced(dir.path(), "k");
+        let synced = SyncedKeys::load(dir.path(), "p1");
+        assert_eq!(synced.hash("k"), None);
+        assert_eq!(synced.hash("j"), Some("h2"));
+        // A sync with a new home replaces the old home's record.
+        note_synced(dir.path(), "p2", [("j", "h3")]);
+        assert_eq!(SyncedKeys::load(dir.path(), "p1").hash("j"), None);
+        assert_eq!(SyncedKeys::load(dir.path(), "p2").hash("j"), Some("h3"));
     }
 
     #[test]

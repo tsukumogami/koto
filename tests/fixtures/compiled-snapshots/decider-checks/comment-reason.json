@@ -1,0 +1,49 @@
+{
+  "format_version": 1,
+  "name": "decider-check-comment-reason",
+  "version": "1.0",
+  "description": "Demonstrates a decider check that grades the comments a change adds, in shadow.",
+  "initial_state": "review",
+  "variables": {
+    "BASE": {
+      "description": "Commit the change is compared against",
+      "default": "HEAD"
+    }
+  },
+  "states": {
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "review": {
+      "directive": "Check the comments your change adds.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "comment_reasons": {
+          "type": "decider-check",
+          "command": "git diff --unified=2 --no-color {{BASE}} -- ':(exclude)*.md'",
+          "decider_check": {
+            "max_bytes": 2560,
+            "label": "change",
+            "criteria": [
+              {
+                "rule_id": "comment_reason",
+                "rule_ref": "https://github.com/tsukumogami/shirabe/blob/main/skills/work-on/references/phases/phase-4-implementation.md",
+                "question": "Does every comment this change adds record why the code is shaped this way, rather than restating what the code does?",
+                "pass": "Each added comment gives a reason, constraint, or rejected alternative that the code can't show.",
+                "fail": "At least one added comment restates what the code does, or its reason is only a restatement.",
+                "escape": "The change adds no comment, or the comments or the code are missing, so it can't be judged.",
+                "threshold": 0.9,
+                "mode": "shadow"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -43,9 +43,7 @@ fn koto(dir: &Path) -> StdCommand {
     cmd.env("HOME", dir);
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
-    // Every command runs as `s`'s own agent session, whose anchor holds it,
-    // so a `context get` is an own read and appends to `s`'s log, racing the
-    // tick: a read with no anchor would go to the host's read spool instead.
+    // Every command runs as `s`'s own agent session, whose anchor holds it.
     cmd.env("KOTO_ANCHOR", "anchor-own");
     cmd
 }
@@ -125,7 +123,12 @@ fn concurrent_appends_keep_seq_unique_and_every_read_logged_once() {
             .unwrap();
         let readers: Vec<_> = (0..READERS)
             .map(|_| {
+                // Each reader carries the tick's marker naming `s`, as a
+                // command `s`'s own tick runs does, so its read appends to
+                // `s`'s log and races the tick: a read outside the tick
+                // would go to the host's read spool instead.
                 koto(dir)
+                    .env("KOTO_TICK_SESSION", "s")
                     .args(["context", "get", "s", "note"])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())

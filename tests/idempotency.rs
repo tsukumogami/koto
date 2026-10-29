@@ -74,6 +74,7 @@ fn evidence_payload(state: &str, value: serde_json::Value) -> EventPayload {
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn canonical_json_key_order_independence() {
         fields: fields_a,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
 
     let mut fields_b: HashMap<String, serde_json::Value> = HashMap::new();
@@ -207,6 +209,7 @@ fn canonical_json_key_order_independence() {
         fields: fields_b,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
 
     let h_a = idempotency_hash("s", &p_a);
@@ -499,6 +502,7 @@ fn hash_is_payload_value_independent_of_construction() {
         fields: fields_1,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     let mut fields_2 = HashMap::new();
     fields_2.insert("second".to_string(), serde_json::json!("beta"));
@@ -508,6 +512,7 @@ fn hash_is_payload_value_independent_of_construction() {
         fields: fields_2,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     assert_eq!(idempotency_hash("s", &p1), idempotency_hash("s", &p2));
 }

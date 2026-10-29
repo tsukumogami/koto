@@ -457,9 +457,11 @@ pub struct CloudConfig {
     /// that doesn't serve bucket subdomains. Unset means false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_style: Option<bool>,
-    /// How many days a migration marker whose target is present is kept
-    /// before `koto session prune --migrated-from` may remove it without
-    /// `--source-retired`. Unset means [`DEFAULT_MARKER_RETAIN_DAYS`].
+    /// Once, how many days a migration marker whose target is present was
+    /// kept before `koto session prune --migrated-from` could remove it. It
+    /// no longer decides removal (the continues relation does); a prune run
+    /// with it set reports it `ignored`. Unset means
+    /// [`DEFAULT_MARKER_RETAIN_DAYS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker_retain_days: Option<u64>,
     /// How many seconds this host's koto processes share one check of a

@@ -33,6 +33,8 @@ struct SourceFrontmatter {
     states: HashMap<String, SourceState>,
     #[serde(default)]
     pass_env: Vec<String>,
+    #[serde(default)]
+    review_vocabulary: crate::template::types::ReviewVocabulary,
 }
 
 /// YAML front-matter view of a variable declaration.
@@ -98,6 +100,11 @@ struct SourceState {
     /// read as "not declared".
     #[serde(default)]
     clear_on_entry: Option<Vec<String>>,
+    /// Rules the state's directive carries. Kept as a YAML value so a value
+    /// that isn't a list of entries, an unknown key and a missing field each
+    /// get their own coded error rather than serde's.
+    #[serde(default)]
+    directive_rules: Option<serde_yaml_ng::Value>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -127,6 +134,8 @@ struct SourceActionDecl {
     fallback: Option<String>,
     #[serde(default)]
     capture_stdout_as: Option<String>,
+    #[serde(default)]
+    capture_allow_empty: bool,
 }
 
 /// Polling configuration in source YAML.
@@ -494,6 +503,26 @@ struct SourceGate {
     /// criterion, in declaration order.
     #[serde(default)]
     criteria: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit mode, kept raw so a value other than
+    /// `jsonl` is refused with `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's per-evaluation unit cap, kept raw so a value
+    /// that isn't a whole number of at least 1 is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    max_units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit document and section names, kept raw so
+    /// a value that isn't a name-shaped string is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    unit_document: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    unit_section: Option<serde_yaml_ng::Value>,
+    /// A `command` gate's "not ready" exit codes. The compiled-template
+    /// validator checks the gate type and the range.
+    #[serde(default)]
+    not_ready_exit_codes: Vec<i32>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -536,6 +565,11 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "max_bytes",
     "label",
     "criteria",
+    "units",
+    "max_units",
+    "unit_document",
+    "unit_section",
+    "not_ready_exit_codes",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -547,6 +581,8 @@ const SOURCE_CRITERION_KEYS: &[&str] = &[
     "escape",
     "threshold",
     "mode",
+    "summary",
+    "rule_text",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -602,6 +638,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             let gate = compile_gate(state_name, gate_name, source_gate)?;
             compiled_gates.insert(gate_name.clone(), gate);
         }
+        resolve_unit_caps(state_name, &mut compiled_gates)?;
 
         // Transform source transitions to compiled transitions.
         let compiled_transitions: Vec<Transition> = source_state
@@ -647,6 +684,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             }),
             fallback: sa.fallback.clone(),
             capture_stdout_as: sa.capture_stdout_as.clone(),
+            capture_allow_empty: sa.capture_allow_empty,
         });
 
         let compiled_materialize_children =
@@ -679,6 +717,11 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             None => None,
         };
 
+        let directive_rules = match &source_state.directive_rules {
+            Some(value) => compile_directive_rules(state_name, value)?,
+            None => Vec::new(),
+        };
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -696,6 +739,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 skip_if: compiled_skip_if,
                 result: compiled_result,
                 clear_on_entry: source_state.clear_on_entry.clone().unwrap_or_default(),
+                directive_rules,
             },
         );
     }
@@ -751,6 +795,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         variables,
         states: compiled_states,
         pass_env: fm.pass_env,
+        review_vocabulary: fm.review_vocabulary,
     };
 
     // Run validation rules (includes evidence routing validation).
@@ -970,6 +1015,14 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             gate_name
         ));
     }
+    if !source.not_ready_exit_codes.is_empty() && source.gate_type != GATE_TYPE_COMMAND {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: not_ready_exit_codes is only allowed on a command gate, not on {:?}",
+            state_name,
+            gate_name,
+            source.gate_type
+        ));
+    }
     if source.gate_type == GATE_TYPE_DECIDER_CHECK {
         return compile_decider_check(state_name, gate_name, source, overridable);
     }
@@ -977,6 +1030,10 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
         ("max_bytes", source.max_bytes.is_some()),
         ("label", source.label.is_some()),
         ("criteria", source.criteria.is_some()),
+        ("units", source.units.is_some()),
+        ("max_units", source.max_units.is_some()),
+        ("unit_document", source.unit_document.is_some()),
+        ("unit_section", source.unit_section.is_some()),
     ] {
         if present {
             return Err(anyhow!(
@@ -1028,6 +1085,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                     pending_exit_code: p.pending_exit_code.unwrap_or(DEFAULT_PENDING_EXIT_CODE),
                 }),
                 decider_check: None,
+                not_ready_exit_codes: source.not_ready_exit_codes.clone(),
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -1053,6 +1111,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -1085,6 +1144,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -1126,6 +1186,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_REQUEST_LEG => {
@@ -1148,6 +1209,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             };
             super::types::validate_request_leg_gate(state_name, gate_name, &gate)
                 .map_err(|e| anyhow!(e))?;
@@ -1163,6 +1225,113 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             SUPPORTED_GATE_TYPES.join(", ")
         )),
     }
+}
+
+/// The keys a `directive_rules` entry takes, every one required.
+const DIRECTIVE_RULE_KEYS: [&str; 4] = ["rule_id", "check", "extent", "when_set"];
+
+/// Lower a state's `directive_rules` from its YAML value.
+///
+/// Only the shape is checked here: a list of maps, each with exactly the four
+/// keys as strings, and an `extent` of `summary` or `full` (the case matters,
+/// as it does for every closed set a template names). The bounds on
+/// `rule_id` and `check`, and what `when_set` may name, are checked by
+/// `CompiledTemplate::validate`, so a cached template is held to them too.
+fn compile_directive_rules(
+    state_name: &str,
+    value: &serde_yaml_ng::Value,
+) -> anyhow::Result<Vec<super::types::DirectiveRule>> {
+    use super::decider_check::RuleLevel;
+    use serde_yaml_ng::Value;
+    let err = |code: &str, detail: String, remedy: &str| {
+        anyhow!(
+            "validation error: {}: state {:?}: directive_rules{}\n  remedy: {}",
+            code,
+            state_name,
+            detail,
+            remedy
+        )
+    };
+    let Value::Sequence(entries) = value else {
+        return Err(err(
+            "E-DIRECTIVE-RULE-SHAPE",
+            " must be a list of entries".into(),
+            "write directive_rules as a list, one entry per rule",
+        ));
+    };
+    // An empty list compiles to the same JSON as no field, so it is refused
+    // like `clear_on_entry: []`: written out, it most likely means rules
+    // were meant to be listed and weren't.
+    if entries.is_empty() {
+        return Err(err(
+            "E-DIRECTIVE-RULE-SHAPE",
+            " must list at least one entry".into(),
+            "list the rules the directive carries, or remove the field",
+        ));
+    }
+    let mut rules = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let Value::Mapping(map) = entry else {
+            return Err(err(
+                "E-DIRECTIVE-RULE-SHAPE",
+                format!(" entry {} must be a map", i),
+                "give each entry rule_id, check, extent and when_set",
+            ));
+        };
+        let mut fields: BTreeMap<&str, String> = BTreeMap::new();
+        for (k, v) in map {
+            let key = match k.as_str() {
+                Some(key) if DIRECTIVE_RULE_KEYS.contains(&key) => key,
+                _ => {
+                    return Err(err(
+                        "E-DIRECTIVE-RULE-SHAPE",
+                        format!(
+                            " entry {}: unknown key {:?}; an entry takes rule_id, check, \
+                             extent and when_set",
+                            i,
+                            k.as_str().unwrap_or("<not a string>")
+                        ),
+                        "remove the key",
+                    ))
+                }
+            };
+            let Some(text) = v.as_str() else {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-SHAPE",
+                    format!(" entry {}: {} must be a string", i, key),
+                    "write the value as a string",
+                ));
+            };
+            fields.insert(key, text.to_string());
+        }
+        for key in DIRECTIVE_RULE_KEYS {
+            if !fields.contains_key(key) {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-MISSING",
+                    format!(" entry {}: missing {}", i, key),
+                    "give each entry rule_id, check, extent and when_set",
+                ));
+            }
+        }
+        let extent = match fields["extent"].as_str() {
+            "summary" => RuleLevel::Summary,
+            "full" => RuleLevel::Full,
+            other => {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-EXTENT",
+                    format!(" entry {}: extent {:?} is not summary or full", i, other),
+                    "set extent to summary or full",
+                ))
+            }
+        };
+        rules.push(super::types::DirectiveRule {
+            rule_id: fields["rule_id"].clone(),
+            check: fields["check"].clone(),
+            extent,
+            when_set: fields["when_set"].clone(),
+        });
+    }
+    Ok(rules)
 }
 
 /// Compile a `decider-check` gate (DESIGN-koto-decider-checks.md, Decision
@@ -1182,8 +1351,8 @@ fn compile_decider_check(
     overridable: bool,
 ) -> anyhow::Result<Gate> {
     use super::decider_check::{
-        CheckCriterion, CheckMode, DeciderCheckSpec, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES,
-        DEFAULT_CHECK_THRESHOLD,
+        CheckCriterion, CheckMode, DeciderCheckSpec, UnitsMode, DEFAULT_CHECK_LABEL,
+        DEFAULT_CHECK_MAX_BYTES, DEFAULT_CHECK_THRESHOLD,
     };
     let err = |code: &str, detail: String, remedy: &str| {
         anyhow!(
@@ -1259,6 +1428,52 @@ fn compile_decider_check(
             ))
         }
     };
+    let units = match &source.units {
+        None => None,
+        Some(v) => match v.as_str().and_then(UnitsMode::parse) {
+            Some(mode) => Some(mode),
+            None => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": units must be one of {}, found {:?}",
+                        UnitsMode::NAMES.join(", "),
+                        v
+                    ),
+                    "set units to jsonl, or omit it to grade the whole output as one slice",
+                ))
+            }
+        },
+    };
+    let max_units = match &source.max_units {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=u64::from(u32::MAX)).contains(&n) => Some(n as u32),
+            _ => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": max_units must be a whole number of units, at least 1, found {:?}",
+                        v
+                    ),
+                    "set max_units to the most units one evaluation grades, or omit it",
+                ))
+            }
+        },
+    };
+    // The name shape and the unit-mode rule are `validate_spec`'s, so a
+    // cached template gets them too; only the type is checked here.
+    let unit_label = |key: &str, raw: &Option<serde_yaml_ng::Value>| match raw {
+        None => Ok(None),
+        Some(serde_yaml_ng::Value::String(s)) => Ok(Some(s.clone())),
+        Some(v) => Err(err(
+            "E-DECIDER-CHECK-UNITS",
+            format!(": {} must be a string, found {:?}", key, v),
+            "set it to a short name such as prd, or omit it",
+        )),
+    };
+    let unit_document = unit_label("unit_document", &source.unit_document)?;
+    let unit_section = unit_label("unit_section", &source.unit_section)?;
     let mut criteria = Vec::new();
     match &source.criteria {
         None => {}
@@ -1315,6 +1530,16 @@ fn compile_decider_check(
                 let pass = text("pass")?;
                 let fail = text("fail")?;
                 let escape = text("escape")?;
+                // Absent stays absent; a present but empty text is
+                // refused by `validate_spec` with E-DECIDER-CHECK-RULE.
+                let summary = match fields.get("summary") {
+                    None => None,
+                    Some(_) => Some(text("summary")?),
+                };
+                let rule_text = match fields.get("rule_text") {
+                    None => None,
+                    Some(_) => Some(text("rule_text")?),
+                };
                 let threshold = match fields.get("threshold") {
                     None => DEFAULT_CHECK_THRESHOLD,
                     Some(v) => v.as_f64().ok_or_else(|| {
@@ -1358,6 +1583,8 @@ fn compile_decider_check(
                     escape,
                     threshold,
                     mode,
+                    summary,
+                    rule_text,
                 });
             }
         }
@@ -1390,8 +1617,39 @@ fn compile_decider_check(
             max_bytes,
             label,
             criteria,
+            units,
+            max_units,
+            unit_document,
+            unit_section,
         }),
+        not_ready_exit_codes: Vec::new(),
     })
+}
+
+/// Write each unit-mode check on one state that declares no `max_units`
+/// its share of the state's unit bound (`unit_caps`), so the compiled spec
+/// carries the cap the evaluator applies. Refused with
+/// `E-DECIDER-CHECK-UNITS` when the declared caps leave no share.
+fn resolve_unit_caps(state_name: &str, gates: &mut BTreeMap<String, Gate>) -> anyhow::Result<()> {
+    use super::decider_check::{unit_caps, DeciderCheckSpec};
+    let checks: Vec<(&str, &DeciderCheckSpec)> = gates
+        .iter()
+        .filter(|(_, g)| g.gate_type == GATE_TYPE_DECIDER_CHECK)
+        .filter_map(|(n, g)| g.decider_check.as_ref().map(|s| (n.as_str(), s)))
+        .collect();
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let caps = unit_caps(state_name, &checks).map_err(|e| anyhow!("validation error: {}", e))?;
+    let names: Vec<String> = checks.iter().map(|(n, _)| n.to_string()).collect();
+    for (name, cap) in names.iter().zip(caps) {
+        if let Some(spec) = gates.get_mut(name).and_then(|g| g.decider_check.as_mut()) {
+            if spec.units.is_some() {
+                spec.max_units = cap;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convert a `request-leg` gate's raw `expect` value into its compiled form.
@@ -1623,6 +1881,76 @@ mod tests {
             let warnings = t.collect_pass_env_warnings();
             assert_eq!(warnings.len(), 2, "{warnings:?}");
             assert!(warnings.iter().all(|w| w.starts_with("W7:")));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // review_vocabulary: (`koto review record`)
+    // -----------------------------------------------------------------------
+
+    mod review_vocabulary {
+        use super::*;
+
+        const BASE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
+            VOCAB\
+            states:\n  a:\n    terminal: true\n---\n\n## a\n\nDone.\n";
+
+        fn source(vocab: &str) -> String {
+            BASE.replace("VOCAB", vocab)
+        }
+
+        #[test]
+        fn declared_seats_and_sections_compile_into_the_template() {
+            let f = write_temp(&source(
+                "review_vocabulary:\n  seats: [clarity, scope]\n  sections: [goals, frontmatter]\n",
+            ));
+            let t = compile(f.path(), true).unwrap();
+            assert_eq!(t.review_vocabulary.seats, vec!["clarity", "scope"]);
+            assert_eq!(t.review_vocabulary.sections, vec!["goals", "frontmatter"]);
+            let json = serde_json::to_value(&t).unwrap();
+            assert_eq!(
+                json["review_vocabulary"],
+                serde_json::json!({"seats": ["clarity", "scope"], "sections": ["goals", "frontmatter"]})
+            );
+        }
+
+        #[test]
+        fn a_template_without_a_vocabulary_compiles_to_the_same_json() {
+            let f = write_temp(&source(""));
+            let t = compile(f.path(), true).unwrap();
+            assert!(t.review_vocabulary.is_empty());
+            let json = serde_json::to_value(&t).unwrap();
+            assert!(
+                json.get("review_vocabulary").is_none(),
+                "no key, so the hash is unchanged"
+            );
+        }
+
+        #[test]
+        fn malformed_duplicated_or_unknown_entries_are_errors() {
+            for bad in [
+                "review_vocabulary:\n  seats: [\"has space\"]\n",
+                "review_vocabulary:\n  sections: [\"/abs\"]\n",
+                "review_vocabulary:\n  seats: [\"\"]\n",
+                "review_vocabulary:\n  seats: [a, a]\n",
+                "review_vocabulary:\n  seat: [a]\n",
+            ] {
+                let f = write_temp(&source(bad));
+                let err = compile(f.path(), true).unwrap_err().to_string();
+                assert!(
+                    err.contains("review_vocabulary") || err.contains("unknown field"),
+                    "{bad}: {err}"
+                );
+            }
+            let many: Vec<String> = (0..=crate::template::types::REVIEW_VOCABULARY_MAX)
+                .map(|i| format!("s{i}"))
+                .collect();
+            let f = write_temp(&source(&format!(
+                "review_vocabulary:\n  seats: [{}]\n",
+                many.join(", ")
+            )));
+            let err = compile(f.path(), true).unwrap_err().to_string();
+            assert!(err.contains("at most"), "{err}");
         }
     }
 
@@ -3293,6 +3621,220 @@ Done.
         compile(f.path(), true)
     }
 
+    // -----------------------------------------------------------------
+    // directive_rules and capture_allow_empty
+    // -----------------------------------------------------------------
+
+    /// A template whose `work` state carries `rules` (YAML under
+    /// `directive_rules:`, or nothing) and is reached from `probe`, whose
+    /// action captures `NOTE`. `TOPIC` is a declared variable.
+    fn directive_rules_template(rules: &str, action_extra: &str) -> String {
+        format!(
+            r#"---
+name: directive-rules
+version: "1.0"
+initial_state: probe
+variables:
+  TOPIC:
+    default: t
+states:
+  probe:
+    default_action:
+      command: "echo note"
+      capture_stdout_as: NOTE
+{action_extra}    transitions:
+      - target: work
+  work:
+{rules}    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## probe
+
+Probe.
+
+## work
+
+Work. {{{{NOTE}}}}
+
+## done
+
+Done.
+"#
+        )
+    }
+
+    fn one_rule(fields: &str) -> String {
+        format!("    directive_rules:\n      - {}\n", fields)
+    }
+
+    const FULL_RULE: &str =
+        "{rule_id: probe/ack-value, check: probe_ack, extent: full, when_set: NOTE}";
+
+    #[test]
+    fn directive_rules_compile_into_the_state() {
+        let t = compile_src(&directive_rules_template(&one_rule(FULL_RULE), "")).unwrap();
+        let rules = &t.states["work"].directive_rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_id, "probe/ack-value");
+        assert_eq!(rules[0].check, "probe_ack");
+        assert_eq!(
+            rules[0].extent,
+            crate::template::decider_check::RuleLevel::Full
+        );
+        assert_eq!(rules[0].when_set, "NOTE");
+    }
+
+    #[test]
+    fn directive_rules_accept_both_extents_and_a_declared_variable() {
+        let rules = "    directive_rules:\n      \
+             - {rule_id: a, check: c, extent: summary, when_set: TOPIC}\n      \
+             - {rule_id: b, check: c, extent: full, when_set: NOTE}\n";
+        let t = compile_src(&directive_rules_template(rules, "")).unwrap();
+        let extents: Vec<&str> = t.states["work"]
+            .directive_rules
+            .iter()
+            .map(|r| r.extent.as_str())
+            .collect();
+        assert_eq!(extents, vec!["summary", "full"]);
+    }
+
+    #[test]
+    fn a_directive_rule_missing_a_field_is_refused_naming_it() {
+        let all = [
+            ("rule_id", "a"),
+            ("check", "c"),
+            ("extent", "full"),
+            ("when_set", "NOTE"),
+        ];
+        for missing in ["rule_id", "check", "extent", "when_set"] {
+            let fields: Vec<String> = all
+                .iter()
+                .filter(|(k, _)| *k != missing)
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let entry = format!("{{{}}}", fields.join(", "));
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-MISSING"), "{missing}: {err}");
+            assert!(
+                err.contains(&format!("missing {missing}")),
+                "{missing}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_id_outside_the_bounds_is_refused() {
+        let long = "r".repeat(129);
+        for id in ["\"\"", "\"  \"", long.as_str()] {
+            let entry = format!("{{rule_id: {id}, check: c, extent: full, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-ID"), "{id}: {err}");
+        }
+        let at_bound = "r".repeat(128);
+        let entry = format!("{{rule_id: {at_bound}, check: c, extent: full, when_set: NOTE}}");
+        compile_src(&directive_rules_template(&one_rule(&entry), "")).unwrap();
+    }
+
+    #[test]
+    fn a_directive_rule_check_that_is_not_name_shaped_is_refused() {
+        for check in [
+            "\"has space\"",
+            "\"/abs\"",
+            "\"~home\"",
+            "\"\"",
+            "\"semi;colon\"",
+        ] {
+            let entry = format!("{{rule_id: a, check: {check}, extent: full, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-CHECK"), "{check}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_extent_outside_summary_and_full_is_refused() {
+        for extent in ["Full", "SUMMARY", "most", "\"\""] {
+            let entry = format!("{{rule_id: a, check: c, extent: {extent}, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-EXTENT"), "{extent}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_when_set_must_name_a_variable_or_a_capture() {
+        for name in ["MISSING", "SESSION_DIR"] {
+            let entry = format!("{{rule_id: a, check: c, extent: full, when_set: {name}}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-WHEN-SET"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn directive_rules_that_are_not_a_list_of_entries_are_refused() {
+        for value in [
+            "    directive_rules:\n      rule_id: a\n",
+            "    directive_rules: probe/ack-value\n",
+            "    directive_rules: []\n",
+            "    directive_rules:\n      - probe/ack-value\n",
+            "    directive_rules:\n      - {rule_id: a, check: c, extent: full, when_set: NOTE, extra: x}\n",
+            "    directive_rules:\n      - {rule_id: 7, check: c, extent: full, when_set: NOTE}\n",
+        ] {
+            let err = compile_src(&directive_rules_template(value, ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-SHAPE"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn capture_allow_empty_compiles_beside_a_capture() {
+        let t = compile_src(&directive_rules_template(
+            "",
+            "      capture_allow_empty: true\n",
+        ))
+        .unwrap();
+        assert!(
+            t.states["probe"]
+                .default_action
+                .as_ref()
+                .unwrap()
+                .capture_allow_empty
+        );
+    }
+
+    #[test]
+    fn capture_allow_empty_without_a_capture_is_refused() {
+        let src = assignment_template(
+            "    default_action:\n      command: \"true\"\n      capture_allow_empty: true\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("capture_allow_empty needs capture_stdout_as"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_template_without_the_new_fields_omits_them_from_compiled_json() {
+        let t = compile_src(&directive_rules_template("", "")).unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("directive_rules"), "got: {json}");
+        assert!(!json.contains("capture_allow_empty"), "got: {json}");
+    }
+
     const DETAIL_ACCEPTS: &str = "    accepts:\n      detail:\n        type: string\n";
     const CI_GATE: &str =
         "    gates:\n      ci:\n        type: command\n        command: \"true\"\n";
@@ -3483,6 +4025,63 @@ Done.
     }
 
     const CMD: &str = "        command: ./ci-status.sh\n";
+
+    fn not_ready_template(gate_type: &str, gate_body: &str) -> String {
+        assignment_template(
+            &format!("    gates:\n      ci:\n        type: {gate_type}\n{gate_body}"),
+            "      - target: done\n        when:\n          gates.ci.exit_code: 0",
+        )
+    }
+
+    #[test]
+    fn not_ready_exit_codes_compile_onto_a_command_gate_and_are_omitted_when_absent() {
+        let src = not_ready_template(
+            "command",
+            &format!("{CMD}        not_ready_exit_codes: [2, 4]\n"),
+        );
+        let compiled = compile_src(&src).unwrap();
+        let gate = compiled
+            .states
+            .values()
+            .find_map(|s| s.gates.get("ci"))
+            .unwrap();
+        assert_eq!(gate.not_ready_exit_codes, vec![2, 4]);
+
+        let plain = compile_src(&not_ready_template("command", CMD)).unwrap();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("not_ready_exit_codes"), "{json}");
+    }
+
+    #[test]
+    fn not_ready_exit_codes_are_refused_off_a_command_gate_and_out_of_range() {
+        let cases = [
+            (
+                not_ready_template(
+                    "context-exists",
+                    "        key: notes\n        not_ready_exit_codes: [2]\n",
+                ),
+                "not_ready_exit_codes is only allowed on a command gate",
+            ),
+            (
+                not_ready_template(
+                    "command",
+                    &format!("{CMD}        not_ready_exit_codes: [0]\n"),
+                ),
+                "must hold exit codes between 1 and 255, found 0",
+            ),
+            (
+                not_ready_template(
+                    "command",
+                    &format!("{CMD}        not_ready_exit_codes: [2, 256]\n"),
+                ),
+                "must hold exit codes between 1 and 255, found 256",
+            ),
+        ];
+        for (src, want) in cases {
+            let err = format!("{:#}", compile_src(&src).unwrap_err());
+            assert!(err.contains(want), "want {want:?} in {err}");
+        }
+    }
 
     #[test]
     fn poll_compiles_onto_a_command_gate_with_defaults_filled() {

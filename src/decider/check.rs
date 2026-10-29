@@ -39,6 +39,47 @@ pub enum UnansweredReason {
     CapSpent,
     /// Another `koto next` on the session held the decider lock.
     Busy,
+    /// A unit-mode check's per-call unit budget was already spent, so this
+    /// unit wasn't asked about.
+    UnitLimit,
+}
+
+/// One unit of a unit-mode check, as its extraction printed it
+/// (DESIGN-doc-rule-checks-m4.md, Decision 3): its key and, when printed,
+/// the document and section it came from. Every value is name-shaped, so it
+/// can go into a command line as written. Never its text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UnitRef {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+}
+
+/// The names a unit-mode check declares for its units' document and
+/// section (`unit_document` and `unit_section`), carried on the decider
+/// events beside the printed [`UnitRef`] so the run journal can export a
+/// template name in place of a printed value. Kept apart from `UnitRef`,
+/// which is compared whole when reusing a verdict or an answer and is
+/// printed in findings: a declared name is neither the unit's identity nor
+/// something the agent needs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UnitLabels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+}
+
+impl UnitLabels {
+    /// The labels a check declares, or `None` when it declares neither.
+    pub fn declared(document: Option<&str>, section: Option<&str>) -> Option<UnitLabels> {
+        (document.is_some() || section.is_some()).then(|| UnitLabels {
+            document: document.map(str::to_string),
+            section: section.map(str::to_string),
+        })
+    }
 }
 
 /// Who a missing verdict comes down to, for the report: the provider
@@ -71,7 +112,9 @@ impl UnansweredReason {
             UnansweredReason::ProviderError | UnansweredReason::UnreadableResponse => {
                 UnansweredCause::Provider
             }
-            UnansweredReason::CapSpent | UnansweredReason::Busy => UnansweredCause::NotAsked,
+            UnansweredReason::CapSpent | UnansweredReason::Busy | UnansweredReason::UnitLimit => {
+                UnansweredCause::NotAsked
+            }
             UnansweredReason::OverBudget | UnansweredReason::ExtractionFailed => {
                 UnansweredCause::Input
             }
@@ -86,6 +129,7 @@ impl UnansweredReason {
             UnansweredReason::ExtractionFailed => "extraction_failed",
             UnansweredReason::CapSpent => "cap_spent",
             UnansweredReason::Busy => "busy",
+            UnansweredReason::UnitLimit => "unit_limit",
         }
     }
 }
@@ -341,6 +385,14 @@ pub struct DeciderCheck {
     /// The configuration layer the endpoint came from; a label, never a URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_origin: Option<SettingOrigin>,
+    /// The unit this consultation graded, for a unit-mode check; absent for
+    /// a check that grades one slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
+    /// The check's declared unit labels, beside `unit`, when it declares
+    /// any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_labels: Option<UnitLabels>,
 }
 
 impl DeciderCheck {
@@ -411,6 +463,13 @@ pub struct DeciderFallback {
     /// The slice's size in bytes, as captured; absent with no slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_bytes: Option<u64>,
+    /// The unit handed back, for a unit-mode check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
+    /// The check's declared unit labels, beside `unit`, when it declares
+    /// any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_labels: Option<UnitLabels>,
 }
 
 /// The agent's answer to one fallback: the payload of the
@@ -432,6 +491,93 @@ pub struct DeciderCheckAnswered {
     pub answer: AgentAnswer,
     /// The `seq` of the `decider_fallback` event this answers.
     pub fallback_seq: u64,
+    /// The answered fallback's unit, for a unit-mode check; an answer
+    /// applies only to the same unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
+    /// The answered fallback's unit labels, copied from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_labels: Option<UnitLabels>,
+}
+
+/// One failed criterion's rule handed back in a `koto next` response: the
+/// payload of the `rule_delivered` event appended after the response prints
+/// (DESIGN-doc-rule-checks-m4.md, Decision 4).
+///
+/// Names, a level and a count only: never the rule's text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleDelivered {
+    pub state: String,
+    pub gate: String,
+    pub rule_id: String,
+    pub level: crate::template::decider_check::RuleLevel,
+    /// How many units the rule was handed back for, for a unit-mode check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_count: Option<u64>,
+    /// How koto learned of the delivery: `check_output` when a command
+    /// check printed a `::koto-rule-delivered::` line. Absent on a decider
+    /// check's delivery, which koto made itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<RuleVia>,
+    /// For a delivery a check reported, whether it printed the rule or
+    /// refused to release it. Absent on a decider check's delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::findings::RuleDeliveryOutcome>,
+}
+
+/// Where a `rule_delivered` event's delivery was reported from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleVia {
+    /// A command check printed a `::koto-rule-delivered::` line.
+    CheckOutput,
+    /// `koto next` printed a directive whose state declares the rule in
+    /// `directive_rules`, with the entry's `when_set` value non-empty.
+    Directive,
+}
+
+impl RuleVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleVia::CheckOutput => "check_output",
+            RuleVia::Directive => "directive",
+        }
+    }
+}
+
+impl RuleDelivered {
+    /// The `rule_delivered` event for a delivery a command gate's check
+    /// printed in `state`.
+    pub fn from_check_output(
+        state: &str,
+        gate: &str,
+        printed: &crate::findings::PrintedRuleDelivery,
+    ) -> Self {
+        RuleDelivered {
+            state: state.to_string(),
+            gate: gate.to_string(),
+            rule_id: printed.rule_id.clone(),
+            level: printed.extent,
+            unit_count: None,
+            via: Some(RuleVia::CheckOutput),
+            delivery: Some(printed.delivery),
+        }
+    }
+
+    /// The `rule_delivered` event for a `directive_rules` entry of `state`
+    /// whose directive `koto next` printed. A directive delivery is never in
+    /// unit mode, so `unit_count` is absent rather than zero.
+    pub fn from_directive(state: &str, rule: &crate::template::types::DirectiveRule) -> Self {
+        RuleDelivered {
+            state: state.to_string(),
+            gate: rule.check.clone(),
+            rule_id: rule.rule_id.clone(),
+            level: rule.extent,
+            unit_count: None,
+            via: Some(RuleVia::Directive),
+            delivery: Some(crate::findings::RuleDeliveryOutcome::Printed),
+        }
+    }
 }
 
 /// Round unrounded probabilities for the record.
@@ -439,6 +585,24 @@ pub fn recorded_probabilities(p: &BTreeMap<String, f64>) -> BTreeMap<String, f64
     p.iter()
         .map(|(k, v)| (k.clone(), round_recorded(*v)))
         .collect()
+}
+
+/// The decider's confidence in basis points: the highest of the
+/// probabilities read for `pass`, `fail` and `unclear`, times 10,000,
+/// rounded half up (DESIGN-doc-rule-checks-m4.md, the run journal's one
+/// probability). `None` when none was read, as when no answer was.
+///
+/// The record's four-place probabilities give the same value as the
+/// unrounded ones, since rounding to four places and then to basis points
+/// is one rounding, so the run journal computes it from the event.
+pub fn confidence_bp(probabilities: &BTreeMap<String, f64>) -> Option<u64> {
+    let best = [PASS_VALUE, FAIL_VALUE, ESCAPE_VALUE]
+        .iter()
+        .filter_map(|v| probabilities.get(*v).copied())
+        .filter(|p| p.is_finite())
+        .reduce(f64::max)?;
+    // `f64::round` rounds half away from zero, which is half up here.
+    Some((best.clamp(0.0, 1.0) * 10_000.0).round() as u64)
 }
 
 #[cfg(test)]
@@ -455,6 +619,8 @@ mod tests {
             escape: "No comment, or can't tell.".into(),
             threshold: 0.9,
             mode: CheckMode::Veto,
+            summary: None,
+            rule_text: None,
         }
     }
 
@@ -660,6 +826,8 @@ mod tests {
             reason: UnansweredReason::ExtractionFailed,
             input_sha256: None,
             input_bytes: None,
+            unit: None,
+            unit_labels: None,
         };
         let v = serde_json::to_value(&fb).unwrap();
         assert_eq!(v["reason"], "extraction_failed");
@@ -677,6 +845,8 @@ mod tests {
             input_sha256: Some("abc".into()),
             answer: AgentAnswer::Fail,
             fallback_seq: 9,
+            unit: None,
+            unit_labels: None,
         };
         let v = serde_json::to_value(&ans).unwrap();
         assert_eq!(v["answer"], "fail");
@@ -713,6 +883,8 @@ mod tests {
             latency_ms: 0,
             error_class: None,
             endpoint_origin: Some(SettingOrigin::Default),
+            unit: None,
+            unit_labels: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["outcome"], "unanswered");
@@ -726,6 +898,46 @@ mod tests {
         assert_eq!(
             back.check_outcome(),
             CheckOutcome::Unanswered(UnansweredReason::OverBudget)
+        );
+    }
+
+    #[test]
+    fn confidence_is_the_highest_probability_in_basis_points_rounded_half_up() {
+        let probs = |pass: f64, fail: f64, unclear: f64| {
+            let mut p = BTreeMap::new();
+            p.insert("pass".to_string(), pass);
+            p.insert("fail".to_string(), fail);
+            p.insert("unclear".to_string(), unclear);
+            p
+        };
+        assert_eq!(confidence_bp(&probs(0.12345, 0.8, 0.07655)), Some(8000));
+        // Rounded to four places first, as the record holds them: the same.
+        let recorded = recorded_probabilities(&probs(0.12345, 0.8, 0.07655));
+        assert_eq!(confidence_bp(&recorded), Some(8000));
+        // Rounded, not cut.
+        assert_eq!(confidence_bp(&probs(0.66666, 0.2, 0.13334)), Some(6667));
+        assert_eq!(confidence_bp(&probs(0.0, 1.0, 0.0)), Some(10_000));
+        assert_eq!(confidence_bp(&probs(0.34, 0.33, 0.33)), Some(3400));
+        // Nothing read, nothing written.
+        assert_eq!(confidence_bp(&BTreeMap::new()), None);
+        // Only the three answer keys count.
+        let mut other = BTreeMap::new();
+        other.insert("proceed".to_string(), 0.9);
+        assert_eq!(confidence_bp(&other), None);
+    }
+
+    #[test]
+    fn unit_labels_are_declared_only_when_the_check_names_one() {
+        assert_eq!(UnitLabels::declared(None, None), None);
+        let l = UnitLabels::declared(Some("prd"), None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&l).unwrap(),
+            serde_json::json!({"document": "prd"})
+        );
+        let l = UnitLabels::declared(Some("prd"), Some("acs")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&l).unwrap(),
+            serde_json::json!({"document": "prd", "section": "acs"})
         );
     }
 }

@@ -78,6 +78,74 @@ pub struct CompiledTemplate {
     /// that declares none keeps its compiled form and hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pass_env: Vec<String>,
+    /// The seat names and section slugs `koto review record` may store as
+    /// given for a session on this template; any other value is stored as
+    /// `other`. Skipped when empty so a template that declares none keeps
+    /// its compiled form and hash.
+    #[serde(default, skip_serializing_if = "ReviewVocabulary::is_empty")]
+    pub review_vocabulary: ReviewVocabulary,
+}
+
+/// The most names one `review_vocabulary` list may declare. Each declared
+/// name can become a telemetry value, so the lists are kept well under the
+/// number of distinct values a telemetry attribute can carry.
+pub const REVIEW_VOCABULARY_MAX: usize = 100;
+
+/// The review vocabulary a template declares (`review_vocabulary:` in its
+/// front matter): which seat names and section slugs `koto review record`
+/// records as given. A value the template doesn't declare is recorded as
+/// `other`, and a template that declares none gets `other` for every
+/// value, so a caller can't put an arbitrary string into telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewVocabulary {
+    /// Seat names, e.g. `clarity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// Section slugs, e.g. `scope-boundary` or `frontmatter`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<String>,
+}
+
+impl ReviewVocabulary {
+    /// Whether the template declares no seat and no section.
+    pub fn is_empty(&self) -> bool {
+        self.seats.is_empty() && self.sections.is_empty()
+    }
+
+    /// Refuse a list longer than [`REVIEW_VOCABULARY_MAX`], a name outside
+    /// the run journal's name shape (1 to 128 characters from
+    /// `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`), and a name
+    /// declared twice.
+    pub fn validate(&self) -> Result<(), String> {
+        for (list, names) in [("seats", &self.seats), ("sections", &self.sections)] {
+            if names.len() > REVIEW_VOCABULARY_MAX {
+                return Err(format!(
+                    "review_vocabulary.{}: at most {} names; got {}",
+                    list,
+                    REVIEW_VOCABULARY_MAX,
+                    names.len()
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for name in names {
+                if !crate::run_journal::is_name(name) {
+                    return Err(format!(
+                        "review_vocabulary.{}: {:?} must be 1 to 128 characters from \
+                         A-Z a-z 0-9 . _ : / @ -, not starting with / or ~",
+                        list, name
+                    ));
+                }
+                if !seen.insert(name.as_str()) {
+                    return Err(format!(
+                        "review_vocabulary.{}: {:?} is declared twice",
+                        list, name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The error code a compiled template gets when one of its `decider-check`
@@ -227,6 +295,32 @@ pub struct TemplateState {
     /// declare it keeps its template hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_on_entry: Vec<String>,
+    /// Rules this state's directive carries, each recorded as a
+    /// `rule_delivered` event (`via: directive`) when `koto next` prints the
+    /// directive with the entry's `when_set` value non-empty.
+    ///
+    /// Telemetry only: nothing routes on it and the response is unchanged.
+    /// Omitted from the compiled JSON when empty, so a template that doesn't
+    /// declare it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directive_rules: Vec<DirectiveRule>,
+}
+
+/// One `directive_rules` entry: a rule a state's directive hands the agent.
+///
+/// `rule_id`, `check` and `extent` are copied onto the `rule_delivered`
+/// event; `when_set` names the variable or capture whose value carries the
+/// rule, so a run where it renders as nothing records no delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DirectiveRule {
+    /// The rule's id, within koto's rule-id bounds.
+    pub rule_id: String,
+    /// The check the rule belongs to, recorded as `koto.check.name`.
+    pub check: String,
+    /// How much of the rule the directive carries.
+    pub extent: crate::template::decider_check::RuleLevel,
+    /// A declared variable or `capture_stdout_as` name.
+    pub when_set: String,
 }
 
 /// Template-level declaration that a state fans out child workflows from an
@@ -385,6 +479,14 @@ pub struct Gate {
     /// without it keeps its template hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decider_check: Option<super::decider_check::DeciderCheckSpec>,
+    /// Exit codes of a `command` gate that mean "my input wasn't ready to
+    /// judge". An evaluation that exits with one is logged as not ready, the
+    /// same as one whose command printed a `::koto-not-ready::` line. It is
+    /// telemetry only: the outcome, routing and fallback finding stay as
+    /// they are. Empty on every other gate, and omitted from the compiled
+    /// JSON when empty, so a template without it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ready_exit_codes: Vec<i32>,
 }
 
 /// How koto re-evaluates a polling command gate.
@@ -443,9 +545,26 @@ fn validate_decider_check_gate(
     super::decider_check::validate_spec(state_name, gate_name, spec)
 }
 
+/// Refuse `capture_allow_empty` on a `default_action` that names no
+/// capture: there is no value for it to deliver empty.
+fn validate_capture_allow_empty(state_name: &str, state: &TemplateState) -> Result<(), String> {
+    match &state.default_action {
+        Some(action) if action.capture_allow_empty && action.capture_stdout_as.is_none() => {
+            Err(format!(
+                "state {:?}: default_action capture_allow_empty needs capture_stdout_as\n  \
+                 remedy: name the capture, or remove capture_allow_empty",
+                state_name
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The per-state decider-check rules: at most
 /// [`MAX_CRITERIA_PER_STATE`](super::decider_check::MAX_CRITERIA_PER_STATE)
-/// criteria across the state's checks, each `rule_id` once, and no `when`
+/// criteria across the state's checks, unit-mode caps within
+/// [`MAX_UNIT_CONSULTATIONS_PER_STATE`](super::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE)
+/// ([`unit_caps`](super::decider_check::unit_caps)), each `rule_id` once, and no `when`
 /// clause, `skip_if` condition or context assignment reading a decider
 /// check's output. A decider verdict must never route
 /// (DESIGN-koto-decider-checks.md, Decision 1).
@@ -469,6 +588,11 @@ fn validate_state_decider_checks(state_name: &str, state: &TemplateState) -> Res
             state_name, total, MAX_CRITERIA_PER_STATE
         ));
     }
+    // The unit bound: max_units times criteria over the unit-mode checks.
+    // A compiled template carries every cap, so this only sums.
+    let named: Vec<(&str, &super::decider_check::DeciderCheckSpec)> =
+        checks.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    super::decider_check::unit_caps(state_name, &named)?;
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (gate_name, spec) in &checks {
         for c in &spec.criteria {
@@ -587,6 +711,38 @@ fn validate_poll_gates(state_name: &str, state: &TemplateState) -> Result<(), St
     Ok(())
 }
 
+/// Validate every gate's `not_ready_exit_codes` on one state: allowed on a
+/// `command` gate only, each code a real exit status (1 to 255; 0 is a
+/// pass, and a gate that passed was judged).
+fn validate_not_ready_exit_codes(state_name: &str, state: &TemplateState) -> Result<(), String> {
+    for (gate_name, gate) in &state.gates {
+        if gate.not_ready_exit_codes.is_empty() {
+            continue;
+        }
+        let at = format!(
+            "state {:?} gate {:?}: not_ready_exit_codes",
+            state_name, gate_name
+        );
+        if gate.gate_type != GATE_TYPE_COMMAND {
+            return Err(format!(
+                "{at} is only allowed on a command gate, not on {:?}",
+                gate.gate_type
+            ));
+        }
+        if let Some(code) = gate
+            .not_ready_exit_codes
+            .iter()
+            .find(|c| !(1..=255).contains(*c))
+        {
+            return Err(format!(
+                "{at} must hold exit codes between 1 and 255, found {}",
+                code
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `EX_TEMPFAIL`: the conventional "try again later" status.
 pub const DEFAULT_PENDING_EXIT_CODE: i32 = 75;
 
@@ -647,6 +803,8 @@ impl Gate {
             // reads as its question, never substituted: only its `command`
             // is.
             decider_check: _,
+            // Exit codes are numbers only; they carry no references.
+            not_ready_exit_codes: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
@@ -701,6 +859,13 @@ pub struct ActionDecl {
     /// and nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_stdout_as: Option<String>,
+    /// When true, an output that is empty once trimmed is delivered under
+    /// `capture_stdout_as` as the empty string instead of failing the tick,
+    /// so a directive that interpolates it renders it as nothing. A
+    /// non-empty output is checked as it always is. Requires
+    /// `capture_stdout_as`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_allow_empty: bool,
 }
 
 impl ActionDecl {
@@ -731,6 +896,7 @@ impl ActionDecl {
             polling: _,
             fallback: _,
             capture_stdout_as: _,
+            capture_allow_empty: _,
         } = self;
         vec![
             ("command", command.as_str()),
@@ -764,6 +930,7 @@ impl ActionDecl {
             polling: _,
             fallback,
             capture_stdout_as: _,
+            capture_allow_empty: _,
         } = self;
         let mut fields = Vec::new();
         if let Some(prose) = fallback {
@@ -1413,6 +1580,7 @@ impl CompiledTemplate {
         for name in &self.pass_env {
             crate::engine::command_env::validate_declared_name(name)?;
         }
+        self.review_vocabulary.validate()?;
         // Collect the capture names before the per-state loop: a `{{KEY}}`
         // reference resolves against the union of the variables block, every
         // state's capture name, and the runtime names, and a state may read a
@@ -1763,7 +1931,10 @@ impl CompiledTemplate {
             }
 
             self.validate_clear_on_entry(state_name, state)?;
+            self.validate_directive_rules(state_name, state, &captures)?;
+            validate_capture_allow_empty(state_name, state)?;
             validate_poll_gates(state_name, state)?;
+            validate_not_ready_exit_codes(state_name, state)?;
 
             // Validate a declared terminal result map.
             if let Some(result) = &state.result {
@@ -2086,6 +2257,54 @@ impl CompiledTemplate {
             }
         }
         out
+    }
+
+    /// Validate one state's `directive_rules` against what the compiled form
+    /// can hold but the record must not: a `rule_id` outside koto's rule-id
+    /// bounds (non-blank, at most [`RULE_ID_MAX_BYTES`] bytes), a `check`
+    /// outside the run journal's name shape, which a record would otherwise
+    /// drop, and a `when_set` that names neither a declared variable nor a
+    /// `capture_stdout_as` name. A runtime name (`SESSION_DIR`) is refused:
+    /// it is always set, so it could never say whether the rule was carried.
+    ///
+    /// [`RULE_ID_MAX_BYTES`]: crate::findings::RULE_ID_MAX_BYTES
+    fn validate_directive_rules(
+        &self,
+        state_name: &str,
+        state: &TemplateState,
+        captures: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        use crate::findings::RULE_ID_MAX_BYTES;
+        for (i, rule) in state.directive_rules.iter().enumerate() {
+            if rule.rule_id.trim().is_empty() || rule.rule_id.len() > RULE_ID_MAX_BYTES {
+                return Err(format!(
+                    "E-DIRECTIVE-RULE-ID: state {:?}: directive_rules entry {}: \
+                     rule_id must be 1 to {} bytes and not blank, found {:?}\n  \
+                     remedy: shorten or fill in the rule_id",
+                    state_name, i, RULE_ID_MAX_BYTES, rule.rule_id
+                ));
+            }
+            if !crate::run_journal::is_name(&rule.check) {
+                return Err(format!(
+                    "E-DIRECTIVE-RULE-CHECK: state {:?}: directive_rules entry {}: \
+                     check {:?} is not a check name; use 1 to 128 letters, digits and . _ : / @ -, \
+                     not starting with / or ~\n  \
+                     remedy: name the check the rule belongs to",
+                    state_name, i, rule.check
+                ));
+            }
+            if !self.variables.contains_key(&rule.when_set)
+                && !captures.contains_key(&rule.when_set)
+            {
+                return Err(format!(
+                    "E-DIRECTIVE-RULE-WHEN-SET: state {:?}: directive_rules entry {}: \
+                     when_set {:?} is neither a declared variable nor a capture_stdout_as name\n  \
+                     remedy: name the variable or capture whose value carries the rule",
+                    state_name, i, rule.when_set
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validate one state's `clear_on_entry` list.
@@ -3498,6 +3717,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -3517,10 +3737,12 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0".to_string(),
@@ -3559,6 +3781,7 @@ mod tests {
             polling: None,
             fallback: Some("look in {{V}}".to_string()),
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         let named: Vec<&'static str> = probe.literal_fields().into_iter().map(|(f, _)| f).collect();
         assert!(
@@ -3575,6 +3798,7 @@ mod tests {
                 polling: None,
                 fallback: None,
                 capture_stdout_as: None,
+                capture_allow_empty: false,
             };
             match field {
                 "fallback" => action.fallback = Some("look in {{V}}".to_string()),
@@ -3629,6 +3853,7 @@ mod tests {
             polling: None,
             fallback: Some("plain prose with no reference in it".to_string()),
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         t.validate(false).unwrap();
     }
@@ -3654,6 +3879,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3682,6 +3908,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3711,6 +3938,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -3805,6 +4033,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -3842,6 +4071,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -3878,6 +4108,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         assert!(
@@ -4044,6 +4275,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4112,6 +4344,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4170,6 +4403,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4226,6 +4460,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -4352,6 +4587,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4410,6 +4646,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4452,6 +4689,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4478,6 +4716,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4511,6 +4750,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4546,6 +4786,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4571,6 +4812,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: Some(key.to_string()),
+            capture_allow_empty: false,
         });
         t
     }
@@ -4625,6 +4867,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: Some("BRANCH".to_string()),
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("already delivered by state"), "got: {}", err);
@@ -4663,6 +4906,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4693,6 +4937,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4724,6 +4969,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4745,6 +4991,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4775,6 +5022,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4810,6 +5058,7 @@ mod tests {
                     expect: None,
                     poll: None,
                     decider_check: None,
+                    not_ready_exit_codes: Vec::new(),
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -4856,6 +5105,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         state.transitions = vec![Transition {
@@ -4923,6 +5173,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4944,6 +5195,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4965,6 +5217,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4985,6 +5238,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         t.validate(true).unwrap();
     }
@@ -5003,6 +5257,7 @@ mod tests {
             }),
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5032,6 +5287,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         t.validate(true).unwrap();
     }
@@ -5050,6 +5306,7 @@ mod tests {
             }),
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         });
         t.validate(true).unwrap();
     }
@@ -5066,6 +5323,7 @@ mod tests {
             }),
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         let json = serde_json::to_string(&action).unwrap();
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
@@ -5081,6 +5339,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         let json = serde_json::to_string(&action).unwrap();
         // Optional/empty fields should be omitted.
@@ -5276,6 +5535,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5295,6 +5555,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5314,6 +5575,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5507,6 +5769,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t
@@ -5645,6 +5908,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -5682,6 +5946,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -5754,6 +6019,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -5795,6 +6061,7 @@ command: "./check.sh"
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         t
@@ -5938,6 +6205,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_a = BTreeMap::new();
@@ -5973,6 +6241,7 @@ command: "./check.sh"
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -6003,6 +6272,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut accepts = BTreeMap::new();
@@ -6063,6 +6333,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -6105,6 +6376,7 @@ command: "./check.sh"
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -6162,6 +6434,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t
@@ -6469,6 +6742,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -6496,6 +6770,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let done = TemplateState {
             directive: "Done.".to_string(),
@@ -6512,12 +6787,14 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let mut states = BTreeMap::new();
         states.insert("plan".to_string(), plan);
         states.insert("done".to_string(), done);
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "batch-parent".to_string(),
             version: "1.0".to_string(),
@@ -6658,6 +6935,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -6688,6 +6966,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("plan2".to_string(), plan2);
         let err = t.validate(true).unwrap_err();
@@ -6816,6 +7095,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("blocked".to_string(), blocked);
         let warnings = t.collect_materialize_children_warnings();
@@ -6846,6 +7126,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6920,6 +7201,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6959,6 +7241,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6991,6 +7274,7 @@ command: "./check.sh"
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         for (name, assign) in ["a", "b"].iter().zip(assigns) {
@@ -7019,6 +7303,7 @@ command: "./check.sh"
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             );
         }

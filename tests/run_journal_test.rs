@@ -408,11 +408,14 @@ impl Env {
             .collect()
     }
 
-    /// Records for `session`, in journal order.
+    /// Records for `session`, in journal order, without the
+    /// `evidence_field` records each `--with-data` relays: this suite reads
+    /// the identity records, and `run_journal_checks_test.rs` covers the
+    /// relayed kinds. Every line still passes [`check_shape`].
     fn records(&self, session: &str) -> Vec<Value> {
         self.journal()
             .into_iter()
-            .filter(|r| r["session"] == session)
+            .filter(|r| r["session"] == session && r["kind"] != "evidence_field")
             .collect()
     }
 
@@ -483,6 +486,9 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.status",
             "koto.check.unanswered_count",
             "koto.check.error",
+            "koto.check.reason",
+            "koto.check.not_ready",
+            "koto.check.pre_directive",
         ],
         "check_finding" => &[
             "koto.seq",
@@ -494,6 +500,14 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
             "koto.rule.id",
             "koto.finding.level",
             "koto.finding.count",
+            "koto.finding.source",
+        ],
+        "evidence_field" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.evidence.field",
+            "koto.evidence.value",
         ],
         "check_disputed" => &[
             "koto.seq",

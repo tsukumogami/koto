@@ -3,6 +3,11 @@
 //! (`tests/support/fake_s3.rs`). Markers come from real `koto session
 //! import` runs (host B importing from host A); only the unreadable marker
 //! and the aged `migrated_at` are written into the bucket directly.
+//!
+//! A present target's marker goes only once the copy's lineage lets the
+//! source go: every host keeps finished sessions for one second
+//! (`retention.keep` in its user config), and a test that removes a source
+//! finishes its copy on B and waits that second out first.
 
 #![cfg(unix)]
 
@@ -47,6 +52,11 @@ impl Hosts {
         let a = Host::new(root.path(), "a", &cloud);
         let b = Host::new(root.path(), "b", &cloud);
         let c = Host::new(root.path(), "c", &cloud);
+        for host in [&a, &b, &c] {
+            let koto = host.home.join(".koto");
+            std::fs::create_dir_all(&koto).unwrap();
+            std::fs::write(koto.join("config.toml"), "[retention]\nkeep = \"1s\"\n").unwrap();
+        }
         for host in [&b, &c] {
             let template = host.ws.join(migration_carrier::TEMPLATE_FILE);
             let run = host.koto(&["template", "compile", template.to_str().unwrap()]);
@@ -91,6 +101,30 @@ impl Hosts {
         assert!(run.ok(), "import {name}: {}", run.describe());
     }
 
+    /// Tick each of B's copies to the terminal state, keeping it, then wait
+    /// out its retention: nothing later keeps the sources any more.
+    fn finish(&self, names: &[&str]) {
+        for name in names {
+            for args in [
+                vec!["next", name],
+                vec!["next", name, "--with-data", r#"{"choice":"go"}"#],
+                vec![
+                    "next",
+                    name,
+                    "--with-data",
+                    r#"{"verdict":"approve"}"#,
+                    "--no-cleanup",
+                ],
+            ] {
+                let run = self.b.koto(&args);
+                assert!(run.ok(), "{args:?}: {}", run.describe());
+            }
+            let run = self.b.koto(&["status", name]);
+            assert_eq!(run.json["current_state"], "done", "{}", run.describe());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+    }
+
     /// `koto session prune --migrated-from <A> <extra>` run on `host`.
     fn prune_on(&self, host: &Host, extra: &[&str]) -> Run {
         let ws = self.a.ws_str();
@@ -116,6 +150,36 @@ impl Hosts {
 
     fn marker_key(&self, name: &str) -> String {
         format!("{}migrated.json", self.source(name))
+    }
+
+    /// The back-reference B's copy of `name` keeps beside its source. A
+    /// removal of the source leaves it: it is the copy's.
+    fn pointer(&self, name: &str) -> String {
+        format!(
+            "{}ctx/koto/continued-by/{}/{name}",
+            self.source(name),
+            self.b.prefix()
+        )
+    }
+
+    /// Every key under `<A>/<name>/` a removal of the source deletes: all
+    /// but the back-references beside it.
+    fn deletable(&self, name: &str) -> Vec<String> {
+        let area = format!("{}ctx/koto/continued-by/", self.source(name));
+        self.s3
+            .keys_under(&self.source(name))
+            .into_iter()
+            .filter(|k| !k.starts_with(&area))
+            .collect()
+    }
+
+    /// The source of `name` is removed: only its copy's back-reference is
+    /// left under `<A>/<name>/`.
+    fn assert_removed(&self, name: &str) {
+        assert_eq!(
+            self.s3.keys_under(&self.source(name)),
+            vec![self.pointer(name)]
+        );
     }
 
     /// Every object in the bucket with its bytes.
@@ -266,15 +330,18 @@ fn each_target_status_is_named_and_siblings_never_cross_match() {
         assert_eq!(broken["reason"], "unreadable");
         assert!(broken["target_status"].is_null());
 
+        // `foo-2`'s copy runs on B, so the relation keeps it, with or
+        // without the flag, which is only reported ignored.
         let foo2 = &all["foo-2"];
+        assert_eq!(foo2["removable"], false, "{foo2:#}");
+        assert_eq!(foo2["reason"], "relation", "{foo2:#}");
+        assert_eq!(foo2["relation_keepers"][0]["keeper"], "foo-2", "{foo2:#}");
+        assert_eq!(foo2["relation_keepers"][0]["standing"], "alive", "{foo2:#}");
+        assert!(names(&out["remove"]).is_empty());
         if extra.is_empty() {
-            assert_eq!(foo2["removable"], false, "{foo2:#}");
-            assert_eq!(foo2["reason"], "age", "{foo2:#}");
-            assert!(names(&out["remove"]).is_empty());
+            assert!(out.get("ignored").is_none(), "{out:#}");
         } else {
-            assert_eq!(foo2["removable"], true, "{foo2:#}");
-            assert_eq!(foo2["reason"], "source_retired", "{foo2:#}");
-            assert_eq!(names(&out["remove"]), vec!["foo-2"]);
+            assert_eq!(out["ignored"], serde_json::json!(["source_retired"]));
         }
     }
     let replaced = &entries(&h.prune_ok(&[]))["again"];
@@ -288,33 +355,41 @@ fn each_target_status_is_named_and_siblings_never_cross_match() {
 }
 
 #[test]
-fn the_age_bound_and_source_retired_decide_a_present_target() {
+fn neither_the_age_bound_nor_source_retired_decides_a_present_target() {
     let h = Hosts::new();
     h.migrate("foo");
     h.migrate("foo-2");
+    let ignored = |out: &Value| out.get("ignored").cloned();
 
-    // Inside the default 30-day bound: kept, and the age is the reason.
+    // The copies run on B: the relation keeps both, whatever the bound.
     let out = h.prune_ok(&[]);
     assert_eq!(out["marker_retain_days"], 30);
+    assert_eq!(ignored(&out), None);
     for e in entries(&out).values() {
         assert_eq!(
             (&e["removable"], &e["reason"]),
-            (&Value::Bool(false), &Value::from("age"))
+            (&Value::Bool(false), &Value::from("relation"))
         );
-        assert!(e["detail"]
-            .as_str()
-            .unwrap()
-            .contains("inside the 30-day bound"));
+        assert!(e["detail"].as_str().unwrap().contains("continued by"));
     }
-    // --source-retired widens the rule to them, and says so.
-    let out = h.prune_ok(&["--source-retired"]);
-    assert_eq!(names(&out["remove"]), vec!["foo", "foo-2"]);
-    for e in entries(&out).values() {
-        assert_eq!(e["reason"], "source_retired");
-    }
+    // --source-retired no longer widens the rule; it is reported ignored.
+    let run = h.prune(&["--source-retired"]);
+    assert!(run.ok(), "{}", run.describe());
+    assert!(names(&run.json["remove"]).is_empty());
+    assert_eq!(
+        ignored(&run.json),
+        Some(serde_json::json!(["source_retired"]))
+    );
+    assert!(
+        run.stderr
+            .contains("ignored: source_retired no longer decides removal"),
+        "{}",
+        run.stderr
+    );
 
-    // The bound is a user config key. A project can't shorten it: setting it
-    // there is refused, and a project file that holds it is ignored.
+    // The bound is a user config key. A project can't set it: setting it
+    // there is refused, and a project file that holds it is ignored, so it
+    // isn't reported either.
     let run =
         h.b.koto(&["config", "set", "session.cloud.marker_retain_days", "0"]);
     assert!(
@@ -336,10 +411,12 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
     .unwrap();
     let out = h.prune_ok(&[]);
     assert_eq!(out["marker_retain_days"], 30);
+    assert_eq!(ignored(&out), None);
     assert!(names(&out["remove"]).is_empty());
     std::fs::write(&project, &text).unwrap();
 
-    // Set for the user, at 0 days every present target's marker is past it.
+    // Set for the user, even at 0 days, it decides nothing: it is reported
+    // ignored, and the relation still keeps both.
     let run = h.b.koto(&[
         "config",
         "set",
@@ -351,15 +428,26 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
     let run =
         h.b.koto(&["config", "get", "session.cloud.marker_retain_days"]);
     assert_eq!(run.stdout.trim(), "0", "{}", run.describe());
-    let out = h.prune_ok(&[]);
-    assert_eq!(out["marker_retain_days"], 0);
-    assert_eq!(names(&out["remove"]), vec!["foo", "foo-2"]);
-    for e in entries(&out).values() {
-        assert_eq!(e["reason"], "age");
+    let run = h.prune(&[]);
+    assert!(run.ok(), "{}", run.describe());
+    assert_eq!(run.json["marker_retain_days"], 0);
+    assert_eq!(
+        ignored(&run.json),
+        Some(serde_json::json!(["marker_retain_days"]))
+    );
+    assert!(
+        run.stderr
+            .contains("ignored: marker_retain_days no longer decides removal"),
+        "{}",
+        run.stderr
+    );
+    assert!(names(&run.json["remove"]).is_empty());
+    for e in entries(&run.json).values() {
+        assert_eq!(e["reason"], "relation");
     }
 
-    // Back to the default, with `foo`'s marker dated long ago: past the
-    // bound, while `foo-2` stays inside it.
+    // Back to the default, with `foo`'s marker dated long ago: its age
+    // decides nothing either.
     let run = h.b.koto(&[
         "config",
         "unset",
@@ -372,13 +460,13 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
     marker["migrated_at"] = Value::from("2020-01-01T00:00:00.000Z");
     h.s3.put(&key, &serde_json::to_vec(&marker).unwrap());
     let out = h.prune_ok(&[]);
-    assert_eq!(names(&out["remove"]), vec!["foo"]);
+    assert!(names(&out["remove"]).is_empty(), "{out:#}");
     let all = entries(&out);
-    assert_eq!(all["foo"]["reason"], "age");
+    assert_eq!(all["foo"]["reason"], "relation");
     assert!(all["foo"]["age_days"].as_u64().unwrap() > 30);
-    assert_eq!(all["foo-2"]["removable"], false);
 
-    // A bound larger than the marker's age keeps it again.
+    // Once the copies finish and their retention passes, both are
+    // removable, whatever the bound says.
     let run = h.b.koto(&[
         "config",
         "set",
@@ -387,8 +475,12 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
         "100000",
     ]);
     assert!(run.ok(), "config set: {}", run.describe());
+    h.finish(&["foo", "foo-2"]);
     let out = h.prune_ok(&[]);
-    assert!(names(&out["remove"]).is_empty(), "{out:#}");
+    assert_eq!(names(&out["remove"]), vec!["foo", "foo-2"], "{out:#}");
+    for e in entries(&out).values() {
+        assert_eq!(e["reason"], "released");
+    }
 }
 
 #[test]
@@ -396,10 +488,11 @@ fn apply_removes_only_the_removable_source_and_leaves_its_sibling_byte_identical
     let h = Hosts::new();
     h.migrate("foo");
     h.migrate("foo-2");
-    // `foo-2`'s target is gone, so its marker is kept; `foo` is removable
-    // with --source-retired. `plain` was never migrated.
+    // `foo-2`'s target is gone, so its marker is kept; `foo`'s copy
+    // finished, so it is removable. `plain` was never migrated.
     let run = h.b.koto(&["session", "cleanup", "foo-2"]);
     assert!(run.ok(), "cleanup: {}", run.describe());
+    h.finish(&["foo"]);
     h.start(&h.a, "plain");
     assert!(h.s3.keys_under(&h.source("foo")).len() > 1);
 
@@ -407,7 +500,7 @@ fn apply_removes_only_the_removable_source_and_leaves_its_sibling_byte_identical
     let b_local = local_store(&h.b);
     let a_local = local_store(&h.a);
 
-    let preview = h.prune_ok(&["--source-retired"]);
+    let preview = h.prune_ok(&[]);
     assert_eq!(names(&preview["remove"]), vec!["foo"]);
     assert_eq!(names(&preview["kept"]), vec!["foo-2"]);
     // The preview changes nothing in the bucket.
@@ -426,11 +519,12 @@ fn apply_removes_only_the_removable_source_and_leaves_its_sibling_byte_identical
     assert!(out["failed"].as_array().unwrap().is_empty());
     assert!(out["skipped"].as_array().unwrap().is_empty());
 
-    // Every object under `<A>/foo/` is gone, and nothing else changed.
+    // Every object under `<A>/foo/` but the copy's back-reference is gone,
+    // and nothing else changed.
     let after = h.bucket();
-    assert!(h.s3.keys_under(&h.source("foo")).is_empty());
+    h.assert_removed("foo");
     let mut expected = before.clone();
-    expected.retain(|k, _| !k.starts_with(&h.source("foo")));
+    expected.retain(|k, _| !k.starts_with(&h.source("foo")) || *k == h.pointer("foo"));
     assert_eq!(after, expected);
     assert!(!h.s3.keys_under(&h.source("foo-2")).is_empty());
 
@@ -454,10 +548,11 @@ fn apply_removes_only_the_removable_source_and_leaves_its_sibling_byte_identical
 fn a_delete_failure_leaves_the_marker_refusing_and_a_retry_finishes() {
     let h = Hosts::new();
     h.migrate("foo");
+    h.finish(&["foo"]);
     let state = format!("{}koto-foo.state.jsonl", h.source("foo"));
     h.s3.fail("DELETE", &state, 500);
 
-    let run = h.prune(&["--apply", "--source-retired"]);
+    let run = h.prune(&["--apply"]);
     assert_eq!(run.code, Some(3), "{}", run.describe());
     assert_eq!(names(&run.json["failed"]), vec!["foo"]);
     assert!(run.json["removed"].as_array().unwrap().is_empty());
@@ -473,10 +568,10 @@ fn a_delete_failure_leaves_the_marker_refusing_and_a_retry_finishes() {
     // of the session stays where it is.
     h.s3.clear_faults();
     let a_local = local_store(&h.a);
-    let run = h.prune_on(&h.a, &["--apply", "--source-retired"]);
+    let run = h.prune_on(&h.a, &["--apply"]);
     assert!(run.ok(), "retry: {}", run.describe());
     assert_eq!(names(&run.json["removed"]), vec!["foo"]);
-    assert!(h.s3.keys_under(&h.source("foo")).is_empty());
+    h.assert_removed("foo");
     assert_eq!(local_store(&h.a), a_local);
     assert!(h.a.session_dir("foo").is_dir());
 }
@@ -486,8 +581,9 @@ fn the_marker_plan_applies_unchanged_and_refuses_when_stale_or_unknown() {
     let h = Hosts::new();
     h.migrate("foo");
     h.migrate("foo-2");
+    h.finish(&["foo", "foo-2"]);
 
-    let preview = h.prune_ok(&["--source-retired"]);
+    let preview = h.prune_ok(&[]);
     assert_eq!(names(&preview["remove"]), vec!["foo", "foo-2"]);
     let stale = preview["plan"].as_str().unwrap().to_string();
 
@@ -501,9 +597,8 @@ fn the_marker_plan_applies_unchanged_and_refuses_when_stale_or_unknown() {
     assert_eq!(dropped, vec!["foo-2"]);
     assert_eq!(h.bucket(), before, "a stale plan removed something");
 
-    // A fresh preview's token applies, with the --source-retired its preview
-    // was given (the stored plan records it).
-    let preview = h.prune_ok(&["--source-retired"]);
+    // A fresh preview's token applies.
+    let preview = h.prune_ok(&[]);
     let token = preview["plan"].as_str().unwrap().to_string();
     assert_ne!(token, stale);
     // A session-mode apply never takes a marker plan.
@@ -525,7 +620,7 @@ fn the_marker_plan_applies_unchanged_and_refuses_when_stale_or_unknown() {
 
     let out = h.prune_ok(&["--apply", "--plan", &token]);
     assert_eq!(names(&out["removed"]), vec!["foo"]);
-    assert!(h.s3.keys_under(&h.source("foo")).is_empty());
+    h.assert_removed("foo");
     assert!(h.s3.object(&h.marker_key("foo-2")).is_some());
 
     // Applied once, the plan is gone.
@@ -545,16 +640,19 @@ fn arguments_and_the_local_backend_are_checked_before_anything_runs() {
         &["--execution-dir", "/work/project"][..],
         &["--plan", "0123456789abcdef0123456789abcdef"][..],
         &["--apply", "--plan", "not-a-token"][..],
-        &[
-            "--apply",
-            "--plan",
-            "0123456789abcdef0123456789abcdef",
-            "--source-retired",
-        ][..],
     ] {
         let run = h.prune(extra);
         refused(&run, "invalid_arguments", 2);
     }
+    // --source-retired no longer decides anything, so an apply of a plan
+    // takes it and exits as it would without it: here, no such plan.
+    let run = h.prune(&[
+        "--apply",
+        "--plan",
+        "0123456789abcdef0123456789abcdef",
+        "--source-retired",
+    ]);
+    refused(&run, "prune_plan_unknown", 4);
     let run =
         h.b.koto(&["session", "prune", "--migrated-from", "relative/path"]);
     refused(&run, "invalid_arguments", 2);
@@ -620,15 +718,12 @@ fn a_truncated_or_corrupt_target_log_keeps_the_marker_and_the_source_through_pre
     for name in ["cut", "garbled", "whole"] {
         h.migrate(name);
     }
-    let preview = h.prune_ok(&["--source-retired"]);
+    h.finish(&["cut", "garbled", "whole"]);
+    let preview = h.prune_ok(&[]);
     assert_eq!(names(&preview["remove"]), vec!["cut", "garbled", "whole"]);
     let stale = preview["plan"].as_str().unwrap().to_string();
     let whole = &entries(&preview)["whole"];
-    assert_eq!(
-        whole["objects"],
-        h.s3.keys_under(&h.source("whole")).len(),
-        "{whole:#}"
-    );
+    assert_eq!(whole["objects"], h.deletable("whole").len(), "{whole:#}");
 
     // `cut`'s target log loses half its final line, as a torn write leaves
     // it; `garbled`'s first event no longer parses. Both headers still name
@@ -672,10 +767,10 @@ fn a_truncated_or_corrupt_target_log_keeps_the_marker_and_the_source_through_pre
     }
 
     // An apply with no plan judges again and removes only `whole`.
-    let out = h.prune_ok(&["--apply", "--source-retired"]);
+    let out = h.prune_ok(&["--apply"]);
     assert_eq!(names(&out["removed"]), vec!["whole"]);
     assert_eq!(names(&out["kept"]), vec!["cut", "garbled"]);
-    assert!(h.s3.keys_under(&h.source("whole")).is_empty());
+    h.assert_removed("whole");
     assert_eq!(source_objects(&h, "cut"), cut_before);
     assert_eq!(source_objects(&h, "garbled"), garbled_before);
     // The old copies still refuse on the source host.
@@ -700,6 +795,9 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
     for name in all_names {
         h.migrate(name);
     }
+    // The copies of the three that stay present finish, so nothing later
+    // keeps their sources.
+    h.finish(&["no-log", "grown", "untouched"]);
     // `ahead`'s source log gains two events past the target's last, which
     // carries the source's events plus the import's one.
     rewrite_log(&h, &log_key(&h.a, "ahead"), |lines| {
@@ -739,14 +837,14 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
     rewrite_log(&h, &log_key(&h.b, "grown"), |lines| {
         with_more_events(lines, 3)
     });
-    let no_log_objects = h.s3.keys_under(&h.source("no-log")).len();
+    let no_log_objects = h.deletable("no-log").len();
     let kept = ["ahead", "tied", "altered", "short", "torn-source"];
     let before: BTreeMap<_, _> = kept
         .iter()
         .map(|name| (*name, source_objects(&h, name)))
         .collect();
 
-    let all = entries(&h.prune_ok(&["--source-retired"]));
+    let all = entries(&h.prune_ok(&[]));
     for (name, says) in [
         ("ahead", "the source's runs to seq"),
         ("tied", "differs from the source's"),
@@ -768,10 +866,10 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
     }
     assert_eq!(all["no-log"]["objects"], no_log_objects);
 
-    let out = h.prune_ok(&["--apply", "--source-retired"]);
+    let out = h.prune_ok(&["--apply"]);
     assert_eq!(names(&out["removed"]), vec!["grown", "no-log", "untouched"]);
     for name in kept {
         assert_eq!(source_objects(&h, name), before[name], "{name}");
     }
-    assert!(h.s3.keys_under(&h.source("no-log")).is_empty());
+    h.assert_removed("no-log");
 }

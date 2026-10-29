@@ -7,10 +7,10 @@
 //! out of the log bytes the commit already read under its lock and writes
 //! one record per distinct (key, reader, access) tuple, in first-read
 //! order. Nothing is kept between processes, because the session's log
-//! already holds the event that opened the visit and every own read (its
-//! tick's, and its own agent session's), and the read spool beside it
-//! (`crate::session::read_spool`) holds the reads this host made with no
-//! reader's anchor, under either backend.
+//! already holds the event that opened the visit and every read its own
+//! tick made, and the read spool beside it (`crate::session::read_spool`)
+//! holds the reads this host made outside the tick with no other agent
+//! session's anchor (none, or the session's own), under either backend.
 //!
 //! The fold holds at most [`MAX_TUPLES`] tuples and one overflow counter,
 //! however long the visit is, and parses only the lines whose type word is

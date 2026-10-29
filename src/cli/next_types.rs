@@ -658,9 +658,10 @@ impl NextResponse {
     /// `details` field.
     ///
     /// Callers use this after [`NextResponse::with_details_suppressed_unless_full`]
-    /// to decide whether to append an `InstructionsDelivered` record:
-    /// the response carries the instructions exactly when this is
-    /// `true`, which already accounts for suppression. `Terminal` and
+    /// to set the `details_included` of the `InstructionsDelivered` record
+    /// they append for every printed directive: the response carries the
+    /// instructions exactly when this is `true`, which already accounts for
+    /// suppression. `Terminal` and
     /// `Error` never carry `details` and always answer `false`.
     pub fn carries_details(&self) -> bool {
         match self {
@@ -754,13 +755,18 @@ impl RetentionReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeptChild {
     pub name: String,
-    /// The retention reason code, as `retention.reason` spells it.
+    /// The retention reason code, as `retention.reason` spells it, or
+    /// `relation` for a child the sweep kept because a later session
+    /// continuing it has standing.
     pub reason: &'static str,
     /// The links and lineage that keep it, naming the sessions they name;
-    /// for a pinned child, its pin.
+    /// for a pinned child, its pin; for a child the relation keeps, its
+    /// keepers.
     pub detail: String,
-    /// For a pinned child: `kept_by_pin` and `pin` or `pin_unreadable`.
-    /// Empty, and absent from the JSON, for every other child.
+    /// For a pinned child: `kept_by_pin` and `pin` or `pin_unreadable`; for
+    /// a child the relation keeps: `kept_by_relation`, `relation_keepers`
+    /// and `relation_unreadable`. Empty, and absent from the JSON, for
+    /// every other child.
     #[serde(flatten)]
     pub pin: serde_json::Map<String, serde_json::Value>,
 }
@@ -780,19 +786,24 @@ pub struct Retention {
     /// beside whichever reason keeps it. Empty, and absent from the JSON,
     /// for a session with no pin.
     pub pin: serde_json::Map<String, serde_json::Value>,
+    /// For a kept session a continues link names: `relation_keepers` (and
+    /// `relation_unreadable`), the later sessions whose standing keeps it,
+    /// beside the reason (`hierarchy`, since the link is an edge). Empty,
+    /// and absent from the JSON, for a session no continues link names.
+    pub relation: serde_json::Map<String, serde_json::Value>,
     pub kept_children: Vec<KeptChild>,
 }
 
 impl Serialize for Retention {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(
-            1 + usize::from(self.reason.is_some()) + self.pin.len(),
+            1 + usize::from(self.reason.is_some()) + self.pin.len() + self.relation.len(),
         ))?;
         map.serialize_entry("retained", &self.reason.is_some())?;
         if let Some(reason) = self.reason {
             map.serialize_entry("reason", reason.as_str())?;
         }
-        for (k, v) in &self.pin {
+        for (k, v) in self.pin.iter().chain(&self.relation) {
             map.serialize_entry(k, v)?;
         }
         map.end()
@@ -1052,6 +1063,11 @@ pub enum NextErrorCode {
     /// beside this copy. Caller error: continue the session where the
     /// message says it now lives; ticking this copy would fork it.
     SessionMigrated,
+    /// The session was superseded (`koto init --continues <it>
+    /// --supersede`): its log holds a `session_superseded` fence, and koto
+    /// writes nothing more to it. Caller error: continue in the newest
+    /// session the message names.
+    SessionSuperseded,
 }
 
 impl NextErrorCode {
@@ -1074,6 +1090,7 @@ impl NextErrorCode {
             // re-running the nested tick will refuse identically.
             NextErrorCode::NestedInvocation => 2,
             NextErrorCode::SessionMigrated => 2,
+            NextErrorCode::SessionSuperseded => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,
@@ -1241,6 +1258,101 @@ pub fn attach_attempts(
         envelope.insert("attempts".to_string(), serde_json::to_value(attempts)?);
     }
     Ok(())
+}
+
+/// Add a `rules` array to each blocking decider-check condition whose
+/// `output.failed` names a criterion that declares a `summary` or a
+/// `rule_text` (DESIGN-doc-rule-checks-m4.md, Decision 4), and return one
+/// [`RuleDelivered`](crate::decider::check::RuleDelivered) per entry added,
+/// for the caller to append once the response has printed.
+///
+/// Each entry has `rule_id`, `level`, `text` and, in unit mode, `units`:
+/// the keys of the units in `output.units` that failed the criterion, in
+/// print order. The level comes from the rule's per-visit count in
+/// `attempts`, which already counts the evaluation being reported: the
+/// summary on the first failing evaluation in the visit, the full text on
+/// every later one, the one declared text when only one is. A rule the
+/// counts leave out (no `attempts`, or a cap dropped it) gets the summary,
+/// the level that never over-delivers. A condition with no such criterion
+/// is left byte-identical.
+pub fn attach_rules(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    state: &str,
+    gates: &BTreeMap<String, Gate>,
+    attempts: Option<&crate::engine::advance::AttemptCounts>,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    let mut delivered = Vec::new();
+    let Some(conditions) = envelope
+        .get_mut("blocking_conditions")
+        .and_then(|b| b.as_array_mut())
+    else {
+        return delivered;
+    };
+    for cond in conditions.iter_mut() {
+        let Some(gate) = cond["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(spec) = gates.get(&gate).and_then(|g| g.decider_check.as_ref()) else {
+            continue;
+        };
+        let failed: Vec<String> = cond["output"]["failed"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let units = cond["output"]["units"].as_array().cloned();
+        let mut rules = Vec::new();
+        for rule_id in failed {
+            let Some(criterion) = spec.criteria.iter().find(|c| c.rule_id == rule_id) else {
+                continue;
+            };
+            let visit = attempts
+                .and_then(|a| a.rules.get(&gate))
+                .and_then(|r| r.get(&rule_id))
+                .map(|c| c.visit);
+            let Some((level, text)) = criterion.rule_for(visit) else {
+                continue;
+            };
+            let mut entry = serde_json::json!({
+                "rule_id": rule_id,
+                "level": level.as_str(),
+                "text": text,
+            });
+            let unit_count = units.as_ref().map(|units| {
+                let keys: Vec<serde_json::Value> = units
+                    .iter()
+                    .filter(|u| {
+                        u["failed"]
+                            .as_array()
+                            .is_some_and(|f| f.iter().any(|id| id == rule_id.as_str()))
+                    })
+                    .map(|u| u["key"].clone())
+                    .collect();
+                let count = keys.len() as u64;
+                entry["units"] = serde_json::Value::Array(keys);
+                count
+            });
+            rules.push(entry);
+            delivered.push(crate::decider::check::RuleDelivered {
+                state: state.to_string(),
+                gate: gate.clone(),
+                rule_id,
+                level,
+                unit_count,
+                via: None,
+                delivery: None,
+            });
+        }
+        if !rules.is_empty() {
+            if let Some(obj) = cond.as_object_mut() {
+                obj.insert("rules".to_string(), serde_json::Value::Array(rules));
+            }
+        }
+    }
+    delivered
 }
 
 /// The top-level key a `koto next` response carries a passing check's
@@ -2244,6 +2356,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         }
     }
 
@@ -2389,6 +2502,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -2408,6 +2522,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -2715,6 +2830,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -2756,6 +2872,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         let mut gate_defs = BTreeMap::new();
         gate_defs.insert("locked".to_string(), gate(false));
@@ -2804,6 +2921,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 

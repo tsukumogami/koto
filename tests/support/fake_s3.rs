@@ -11,7 +11,8 @@
 //! bucket, addressed path-style (`/<bucket>/<key>`), from a map in memory:
 //! GET, PUT, HEAD and DELETE of objects, and ListObjectsV2
 //! (`?list-type=2&prefix=..&delimiter=..`) answered in the XML rust-s3
-//! parses. Every request is recorded as (method, key) in arrival order, so a
+//! parses, 1000 entries a page with a continuation token, as S3 pages.
+//! Every request is recorded as (method, key) in arrival order, so a
 //! test can assert exactly what a command wrote where. [`FakeS3::fail`]
 //! makes every matching request answer with a given status instead,
 //! [`FakeS3::garble_listing`] answers a listing with a body that isn't one,
@@ -22,6 +23,10 @@
 //! see what a command's round trips cost against a distant bucket.
 //! [`FakeS3::hold`] holds one request's reply after handling it, so a test
 //! can stop the command waiting on it at that exact point.
+//!
+//! A PUT honours `If-Match` and `If-None-Match: *` as S3 does: when the
+//! stored object's ETag isn't the one named, or an object is there for
+//! `If-None-Match: *`, it answers 412 PreconditionFailed and stores nothing.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
@@ -49,6 +54,8 @@ pub struct Request {
     pub key: String,
     /// For a listing, its `prefix` parameter.
     pub list_prefix: Option<String>,
+    /// For a listing, its `delimiter` parameter, when it has one.
+    pub delimiter: Option<String>,
     /// The access key id the request was signed with, read from the
     /// `Credential=` part of its `Authorization` header; `None` when the
     /// request carried no signature.
@@ -291,6 +298,10 @@ struct Incoming {
     query: Vec<(String, String)>,
     body: Vec<u8>,
     access_key: Option<String>,
+    /// The `If-Match` header, when the request carried one.
+    if_match: Option<String>,
+    /// The `If-None-Match` header, when the request carried one.
+    if_none_match: Option<String>,
 }
 
 fn read_request(stream: &TcpStream) -> Option<Incoming> {
@@ -303,6 +314,8 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
 
     let mut content_length = 0usize;
     let mut access_key = None;
+    let mut if_match = None;
+    let mut if_none_match = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -323,6 +336,12 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
                     .and_then(|rest| rest.split('/').next())
                     .map(str::to_string);
             }
+            if name.trim().eq_ignore_ascii_case("if-match") {
+                if_match = Some(value.trim().to_string());
+            }
+            if name.trim().eq_ignore_ascii_case("if-none-match") {
+                if_none_match = Some(value.trim().to_string());
+            }
         }
     }
     let mut body = vec![0u8; content_length];
@@ -341,6 +360,8 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
         query,
         body,
         access_key,
+        if_match,
+        if_none_match,
     })
 }
 
@@ -469,6 +490,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         } else {
             None
         },
+        delimiter: param("delimiter").filter(|d| is_list && !d.is_empty()),
         access_key: req.access_key.clone(),
         at: Instant::now(),
     });
@@ -506,7 +528,14 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
     if is_list {
         let prefix = param("prefix").unwrap_or_default();
         let delimiter = param("delimiter").filter(|d| !d.is_empty());
-        return Reply::ok(list_xml(bucket, &st.objects, &prefix, delimiter.as_deref()));
+        let after = param("continuation-token").filter(|t| !t.is_empty());
+        return Reply::ok(list_xml(
+            bucket,
+            &st.objects,
+            &prefix,
+            delimiter.as_deref(),
+            after.as_deref(),
+        ));
     }
 
     match req.method.as_str() {
@@ -531,6 +560,20 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
             },
         },
         "PUT" => {
+            let current = st.objects.get(&key).map(|bytes| etag(bytes));
+            let unquote = |t: &str| t.trim().trim_matches('"').to_string();
+            let failed = match (&req.if_match, &req.if_none_match) {
+                (Some(want), _) => current.as_deref().map(unquote) != Some(unquote(want)),
+                (None, Some(any)) if any.trim() == "*" => current.is_some(),
+                _ => false,
+            };
+            if failed {
+                return Reply::error(
+                    412,
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                );
+            }
             let tag = etag(&req.body);
             st.objects.insert(key, req.body.clone());
             Reply {
@@ -551,27 +594,56 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
     }
 }
 
+/// Most entries (keys and common prefixes) one listing page holds, as S3
+/// answers by default.
+const PAGE_KEYS: usize = 1000;
+
 /// A ListObjectsV2 result: keys under `prefix`, with keys that hold
-/// `delimiter` past the prefix rolled up into common prefixes.
+/// `delimiter` past the prefix rolled up into common prefixes, at most
+/// [`PAGE_KEYS`] entries a page. A page that stops short says so and names
+/// its last entry as the token the next page starts after.
 fn list_xml(
     bucket: &str,
     objects: &BTreeMap<String, Vec<u8>>,
     prefix: &str,
     delimiter: Option<&str>,
+    after_token: Option<&str>,
 ) -> Vec<u8> {
     let mut contents = Vec::new();
     let mut common: Vec<String> = Vec::new();
+    let mut entries = 0usize;
+    let mut next_token: Option<String> = None;
     for (key, bytes) in objects.range(prefix.to_string()..) {
         let Some(after) = key.strip_prefix(prefix) else {
             break;
         };
-        match delimiter.and_then(|d| after.find(d).map(|i| (d, i))) {
-            Some((d, i)) => {
-                let rolled = format!("{}{}", prefix, &after[..i + d.len()]);
-                if common.last() != Some(&rolled) {
-                    common.push(rolled);
-                }
+        let entry = delimiter
+            .and_then(|d| after.find(d).map(|i| (d, i)))
+            .map(|(d, i)| format!("{}{}", prefix, &after[..i + d.len()]));
+        let name = entry.clone().unwrap_or_else(|| key.clone());
+        if after_token.is_some_and(|t| name.as_str() <= t) {
+            continue;
+        }
+        if let Some(rolled) = &entry {
+            if common.last() == Some(rolled) {
+                continue;
             }
+        }
+        if entries == PAGE_KEYS {
+            next_token = Some(
+                common
+                    .last()
+                    .into_iter()
+                    .chain(contents.last().map(|(k, _, _): &(String, usize, String)| k))
+                    .max()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            break;
+        }
+        entries += 1;
+        match entry {
+            Some(rolled) => common.push(rolled),
             None => contents.push((key.clone(), bytes.len(), etag(bytes))),
         }
     }
@@ -586,9 +658,16 @@ fn list_xml(
         xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
     }
     xml.push_str(&format!(
-        "<KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
-        contents.len() + common.len()
+        "<KeyCount>{}</KeyCount><MaxKeys>{PAGE_KEYS}</MaxKeys><IsTruncated>{}</IsTruncated>",
+        contents.len() + common.len(),
+        next_token.is_some()
     ));
+    if let Some(token) = &next_token {
+        xml.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(token)
+        ));
+    }
     for (key, size, tag) in &contents {
         xml.push_str(&format!(
             "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\

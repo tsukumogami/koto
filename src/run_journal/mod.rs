@@ -55,22 +55,34 @@
 //!   `default_action_executed` (check `__action__`), with the outcome,
 //!   attempt numbers, rule count, logged finding count (and whether the
 //!   findings were cut) and run time; a decider check's also carries its
-//!   awaiting and agent-answered criterion counts.
+//!   awaiting and agent-answered criterion counts. When the outcome isn't
+//!   `passed` it carries `koto.check.reason`, why (see `CHECK_REASONS`),
+//!   and every one carries `koto.check.not_ready` (the check said its input
+//!   wasn't ready) and `koto.check.pre_directive` (no `koto next` had
+//!   printed the state's directive in the visit yet; see [`pre_directive`]).
 //! - `check_rule`: one per key of that event's `rule_counts`, after its
 //!   `check_evaluated`, with the rule's visit and session counts. A rule id
 //!   outside the name shape is written as its digest ([`name_or_digest`]).
 //! - `check_finding`: one per distinct (rule id, level) among that event's
 //!   logged findings, passing or failing, after its `check_rule` records,
-//!   with the gate as `koto.check.name` and how many findings had the pair
-//!   (see [`with_findings`]).
+//!   with the gate as `koto.check.name`, how many findings had the pair
+//!   (see [`with_findings`]) and `koto.finding.source`: `check` when the
+//!   check printed them, `fallback` for the finding koto wrote.
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate or
 //!   of a decider check waiting on the agent, never an outcome. A polling
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Eight more are relayed the same way, with the same two sequence
-//! numbers, from decider, evidence, override and dispute events:
+//! Ten more are relayed the same way, with the same two sequence
+//! numbers, from decider, evidence, override, dispute and rule-delivery
+//! events:
 //!
+//! - `evidence_field`: one per entry of an agent's `evidence_submitted`
+//!   `exported_fields`, with the state, the field's name as
+//!   `koto.evidence.field` and its value as `koto.evidence.value`: a value
+//!   the state's `accepts` declares for an enum field (or its digest),
+//!   `other` for one it doesn't, or `true` or `false` for a boolean. String
+//!   and number fields are never relayed (see [`exported_fields`]).
 //! - `decider_consulted`: one per `decider_consulted` event, with the
 //!   provider, model, outcome, token counts and timings, the field count,
 //!   an `input_unavailable` consultation's reason and its input's label
@@ -86,14 +98,29 @@
 //! - `decider_checked`: one per `decider_checked` event (one criterion of a
 //!   decider check), with the gate as `koto.check`, the criterion's id as
 //!   `koto.rule.id` (digested like a rule id), the mode, outcome, reason,
-//!   whether it blocked, tokens and timings. A verdict koto reuses appends
-//!   no event, so it writes no record.
+//!   whether it blocked, tokens and timings, and, when an answer was read,
+//!   `koto.decider.confidence_bp`. A verdict koto reuses appends no event,
+//!   so it writes no record.
 //! - `decider_fallback`: one per `decider_fallback` event (a criterion
 //!   handed to the agent), with the gate as `koto.check`, the criterion's id
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `decider_check_answered`: one per `decider_check_answered` event (the
 //!   agent's answer to a fallback), with the gate, the criterion's id, the
 //!   answer, and the `seq` and reason of the fallback it answers.
+//!
+//!   For a unit-mode check, each of these three also carries the unit:
+//!   `koto.unit.key`, always the key's digest, and `koto.unit.document` and
+//!   `koto.unit.section`, the check's declared label or else the digest of
+//!   the printed value (see `with_unit`). A check without units writes none
+//!   of them.
+//! - `rule_delivered`: one per `rule_delivered` event (a failed criterion's
+//!   rule handed back in a `koto next` response, or a rule a command check
+//!   said it printed or refused), with the state, the gate as
+//!   `koto.check.name`, the criterion's or rule's id as `koto.rule.id`,
+//!   `koto.rule.extent` (`summary` or `full`), for a unit-mode check
+//!   `koto.rule.unit_count`, and, for a command check's report,
+//!   `koto.rule.via` (`check_output`) and `koto.rule.delivery` (`printed`
+//!   or `refused`). Never the rule's text.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
 //! - `check_disputed`: one per `finding_disputed`, with the state, the gate
@@ -101,12 +128,57 @@
 //!   rule id (digested like a rule id) and who disputed it, never the
 //!   reason.
 //!
+//! Four more are relayed the same way from the events `koto review record`
+//! appends, one record per event, so each entry of a batch has its own
+//! `koto.seq`. Each carries `koto.doc.type` (`brief`, `prd`, `design`,
+//! `plan`) and `koto.doc.schema` (`brief/v1`, `prd/v1`, `design/v1`,
+//! `plan/v1`, `plan/v2`, `absent` or `other`). When the caller gave
+//! `--doc-format`, `review_round`, `review_verdict` and `review_decision`
+//! also carry `koto.doc.format` (the four types, `vision`, `strategy` or
+//! `roadmap`), and for the three charter formats carry no `koto.doc.type`:
+//!
+//! - `review_round`: one per `review_round_started`, with
+//!   `koto.review.round`, `koto.review.seat_count` and the boolean
+//!   `koto.review.fallback`.
+//! - `review_verdict`: one per `review_verdict_recorded`, with the round,
+//!   `koto.review.seat` and `koto.review.section` (as the session's template
+//!   declares them, or `other`), `koto.rule.id` and `koto.review.verdict`
+//!   (`pass` or `fail`).
+//! - `review_decision`: one per `review_decision_recorded`, with the round
+//!   and `koto.review.decision` (`rerun`, `fix_and_proceed`, `loop_back`,
+//!   `proceed`, `stop`).
+//! - `doc_checked`: one per `doc_check_recorded`, with `koto.rule.id` and
+//!   `koto.doc.check_outcome` (`passed`, `failed`, `error`).
+//!
+//! Three record a document while it is drafted. Each `koto review record`
+//! call appends one event holding all its entries, and each entry is
+//! relayed as one record, so the records of one call share its `koto.seq`.
+//! Each carries `koto.state` (the state the session was in) and
+//! `koto.doc.format`:
+//!
+//! - `doc_rule_checked`: one per entry of `doc_rule_checks_recorded`, with
+//!   `koto.rule.id`, `koto.doc.rule_outcome` (`pass`, `fail`, `not_ready`,
+//!   `error`) and `koto.doc.check_moment` (`pre_jury`, `post_fix`,
+//!   `post_create`).
+//! - `doc_section_written`: one per `doc_section_recorded`, with
+//!   `koto.doc.section` (as the session's template declares it, or
+//!   `other`) and `koto.doc.section_write` (`first`, `rewrite`).
+//! - `doc_fix_applied`: one per entry of `doc_fix_recorded`, with
+//!   `koto.rule.id`, `koto.doc.section`, `koto.doc.fix_answers`
+//!   (`jury_fail`, `check_fail`), `koto.doc.fix_check_rule` (a rule id,
+//!   digested like one, or `none`) and, for a jury FAIL given its round,
+//!   `koto.doc.fix_round`.
+//!
 //! None of them copies a probability, hash, threshold, endpoint, rule
-//! reference, rationale, dispute reason, override value or output, and `koto.visit.seq` is
-//! always koto's visit, never the `visit_seq` a decider event carries. An
-//! answer, a field name and an input label are names the template declares
-//! (an agent's value outside them is written `other`) or koto's own words;
-//! nothing the session wrote is copied.
+//! reference or text, rationale, dispute reason, override value or output,
+//! with one exception: `decider_checked`'s `koto.decider.confidence_bp`,
+//! the highest of the criterion's answer probabilities as an integer in
+//! basis points. `koto.visit.seq` is always koto's visit, never the
+//! `visit_seq` a decider event carries. An answer, a field name, an input
+//! label and a unit label are names the template declares (an agent's value
+//! outside them is written `other`) or koto's own words; nothing the session
+//! wrote is copied, and a unit's key, document and section as an extraction
+//! printed them are written only as digests.
 //!
 //! One more sums a visit's `context_read` events when the visit ends (see
 //! `context_reads`). It carries `koto.seq` (the sequence number of the
@@ -155,9 +227,11 @@
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked`, `decider_fallback`,
-//!   `decider_check_answered`, `gate_override_recorded` and
-//!   `finding_disputed`, and `decider_answered` for an agent's
-//!   `evidence_submitted` that answers a consultation.
+//!   `decider_check_answered`, `gate_override_recorded`,
+//!   `finding_disputed` and `rule_delivered`, the review and drafting kinds
+//!   for the events `koto review record` appends, `evidence_field` for an
+//!   agent's `evidence_submitted` that carries `exported_fields`, and
+//!   `decider_answered` for one that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
 //!   `context_reads` just before its own record. A `context_read` an
@@ -284,6 +358,15 @@ pub(crate) fn name_or_digest(value: &str) -> String {
     if is_name(value) {
         return value.to_string();
     }
+    digest(value)
+}
+
+/// `sha256:` and the first 32 lowercase hex characters of the SHA-256 of
+/// `value`'s UTF-8 bytes, whatever its shape: how [`name_or_digest`] writes
+/// an odd id, and how a unit's key, and a document or section an extraction
+/// printed, are always written, so nothing an extraction printed reaches the
+/// journal. The result has the id shape.
+pub(crate) fn digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let hex = hex::encode(Sha256::digest(value.as_bytes()));
     format!("sha256:{}", &hex[..32])
@@ -360,13 +443,18 @@ impl Record {
         self
     }
 
-    /// Whether this is one of the five identity kinds, which are flushed to
-    /// disk with the batch that carries them.
-    fn is_identity(&self) -> bool {
+    /// The record's kind.
+    fn kind(&self) -> &str {
         self.fields
             .first()
             .and_then(|(_, kind)| kind.as_str())
-            .is_some_and(|kind| IDENTITY_KINDS.contains(&kind))
+            .unwrap_or_default()
+    }
+
+    /// Whether this is one of the five identity kinds, which are flushed to
+    /// disk with the batch that carries them.
+    fn is_identity(&self) -> bool {
+        IDENTITY_KINDS.contains(&self.kind())
     }
 
     fn to_line(&self) -> String {
@@ -714,6 +802,18 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DeciderFallback(_)
             | EventPayload::GateOverrideRecorded { .. }
             | EventPayload::FindingDisputed(_)
+            | EventPayload::RuleDelivered(_)
+            | EventPayload::ReviewRoundStarted(_)
+            | EventPayload::ReviewVerdictRecorded(_)
+            | EventPayload::ReviewDecisionRecorded(_)
+            | EventPayload::DocCheckRecorded(_)
+            | EventPayload::DocRuleChecksRecorded(_)
+            | EventPayload::DocSectionRecorded(_)
+            | EventPayload::DocFixRecorded(_)
+            | EventPayload::EvidenceSubmitted {
+                exported_fields: Some(_),
+                ..
+            }
     )
 }
 
@@ -745,8 +845,151 @@ const FINDING_LEVEL_FIELD: &str = "koto.finding.level";
 const FINDING_PAIR_COUNT_FIELD: &str = "koto.finding.count";
 /// On `check_disputed`: who disputed the finding.
 const DISPUTE_SOURCE_FIELD: &str = "koto.dispute.source";
+/// On `check_finding`: `check` when the check printed the findings,
+/// `fallback` when koto wrote its fallback finding.
+const FINDING_SOURCE_FIELD: &str = "koto.finding.source";
+/// On `check_evaluated` whose outcome isn't `passed`: why, one of
+/// [`CHECK_REASONS`](crate::engine::types::CHECK_REASONS).
+const CHECK_REASON_FIELD: &str = "koto.check.reason";
+/// On every `check_evaluated`: whether the check said its input wasn't
+/// ready to judge.
+const CHECK_NOT_READY_FIELD: &str = "koto.check.not_ready";
+/// On every `check_evaluated`: whether the check ran before any `koto next`
+/// had printed the state's directive in the current visit.
+const CHECK_PRE_DIRECTIVE_FIELD: &str = "koto.check.pre_directive";
 /// The most `check_finding` records one evaluation writes.
 const MAX_FINDING_RECORDS: usize = 50;
+
+// The names the unit and rule-delivery records add
+// (DESIGN-doc-rule-checks-m4.md, Decision 5). `koto.unit` and `koto.rule`
+// are only ever prefixes, never a field of their own.
+
+/// One record per `rule_delivered` event: a failed criterion's rule handed
+/// back in a `koto next` response.
+const RULE_DELIVERED: &str = "rule_delivered";
+/// On `rule_delivered`: how much of the rule was handed back, `summary` or
+/// `full`. Not called a level, so it can't be read as a severity beside
+/// `koto.finding.level`.
+const RULE_EXTENT_FIELD: &str = "koto.rule.extent";
+/// On `rule_delivered`, for a unit-mode check: how many units the rule was
+/// handed back for.
+const RULE_UNIT_COUNT_FIELD: &str = "koto.rule.unit_count";
+/// On `rule_delivered`, for a delivery a command check reported:
+/// `check_output`. Absent on a decider check's delivery.
+const RULE_VIA_FIELD: &str = "koto.rule.via";
+/// Beside `koto.rule.via`: `printed` or `refused`, as the check reported.
+const RULE_DELIVERY_FIELD: &str = "koto.rule.delivery";
+// The names the document review records add (`koto review record`). Every
+// value is one the verb already validated or mapped: a closed-set value, a
+// schema bucket, a declared seat or section (or `other`), a rule id, a count
+// or a flag.
+
+/// One record per `review_round_started` event.
+const REVIEW_ROUND: &str = "review_round";
+/// One record per `review_verdict_recorded` event.
+const REVIEW_VERDICT: &str = "review_verdict";
+/// One record per `review_decision_recorded` event.
+const REVIEW_DECISION: &str = "review_decision";
+/// One record per `doc_check_recorded` event.
+const DOC_CHECKED: &str = "doc_checked";
+/// On the four review kinds: `brief`, `prd`, `design` or `plan`.
+const DOC_TYPE_FIELD: &str = "koto.doc.type";
+/// On the four review kinds: the document's schema bucket.
+const DOC_SCHEMA_FIELD: &str = "koto.doc.schema";
+/// On `doc_checked`: `passed`, `failed` or `error`.
+const DOC_CHECK_OUTCOME_FIELD: &str = "koto.doc.check_outcome";
+/// On `review_round`, `review_verdict` and `review_decision`: the round.
+const REVIEW_ROUND_FIELD: &str = "koto.review.round";
+/// On `review_round`: how many seats the round spawned.
+const REVIEW_SEAT_COUNT_FIELD: &str = "koto.review.seat_count";
+/// On `review_round`: whether the round is a fallback round.
+const REVIEW_FALLBACK_FIELD: &str = "koto.review.fallback";
+/// On `review_verdict`: the seat, as the template declares it, or `other`.
+const REVIEW_SEAT_FIELD: &str = "koto.review.seat";
+/// On `review_verdict`: the section, as the template declares it, or
+/// `other`.
+const REVIEW_SECTION_FIELD: &str = "koto.review.section";
+/// On `review_verdict`: `pass` or `fail`.
+const REVIEW_VERDICT_FIELD: &str = "koto.review.verdict";
+/// On `review_decision`: what follows the round.
+const REVIEW_DECISION_FIELD: &str = "koto.review.decision";
+/// On the three review kinds when the caller gave `--doc-format`, and on
+/// the three document kinds always: `brief`, `prd`, `design`, `plan`,
+/// `vision`, `strategy` or `roadmap`.
+const DOC_FORMAT_FIELD: &str = "koto.doc.format";
+
+// The names the drafting records add (`koto review record rule-checks`,
+// `section-written` and `fix`). Each call is one event, so the records of
+// one call share its `koto.seq`.
+
+/// One record per entry of a `doc_rule_checks_recorded` event.
+const DOC_RULE_CHECKED: &str = "doc_rule_checked";
+/// One record per `doc_section_recorded` event.
+const DOC_SECTION_WRITTEN: &str = "doc_section_written";
+/// One record per entry of a `doc_fix_recorded` event.
+const DOC_FIX_APPLIED: &str = "doc_fix_applied";
+/// On `doc_rule_checked`: `pass`, `fail`, `not_ready` or `error`.
+const DOC_RULE_OUTCOME_FIELD: &str = "koto.doc.rule_outcome";
+/// On `doc_rule_checked`: `pre_jury`, `post_fix` or `post_create`.
+const DOC_CHECK_MOMENT_FIELD: &str = "koto.doc.check_moment";
+/// On `doc_section_written` and `doc_fix_applied`: the section, as the
+/// template declares it, or `other`.
+const DOC_SECTION_FIELD: &str = "koto.doc.section";
+/// On `doc_section_written`: `first` or `rewrite`.
+const DOC_SECTION_WRITE_FIELD: &str = "koto.doc.section_write";
+/// On `doc_fix_applied`: `jury_fail` or `check_fail`.
+const DOC_FIX_ANSWERS_FIELD: &str = "koto.doc.fix_answers";
+/// On `doc_fix_applied` answering a jury FAIL, when the caller gave the
+/// round: the jury round, 1 to 50.
+const DOC_FIX_ROUND_FIELD: &str = "koto.doc.fix_round";
+/// On `doc_fix_applied`: the check rule that decides the answered rule
+/// (digested like a rule id), or `none`.
+const DOC_FIX_CHECK_RULE_FIELD: &str = "koto.doc.fix_check_rule";
+
+/// On the three decider-check kinds, for a unit-mode check: the unit's key,
+/// always as its digest.
+const UNIT_KEY_FIELD: &str = "koto.unit.key";
+/// Beside `koto.unit.key`: the check's declared `unit_document`, else the
+/// digest of the document the extraction printed for the unit.
+const UNIT_DOCUMENT_FIELD: &str = "koto.unit.document";
+/// Beside `koto.unit.key`: the check's declared `unit_section`, else the
+/// digest of the section the extraction printed for the unit.
+const UNIT_SECTION_FIELD: &str = "koto.unit.section";
+/// On `decider_checked`, when an answer was read: the decider's confidence
+/// in basis points ([`crate::decider::check::confidence_bp`]). The one
+/// probability the journal carries, as an integer.
+const CONFIDENCE_FIELD: &str = "koto.decider.confidence_bp";
+
+/// `record` with the unit fields of a unit-mode decider-check event, or
+/// unchanged when the event names no unit, so a check without units writes
+/// exactly what it wrote before units existed. The key is always digested;
+/// a document or section is the check's declared label when it has one,
+/// otherwise the digest of what the extraction printed, otherwise absent.
+/// Nothing an extraction printed is copied as printed.
+fn with_unit(
+    record: Record,
+    unit: Option<&crate::decider::check::UnitRef>,
+    labels: Option<&crate::decider::check::UnitLabels>,
+) -> Record {
+    let Some(unit) = unit else {
+        return record;
+    };
+    let pick = |declared: Option<&String>, printed: Option<&String>| {
+        declared.cloned().or_else(|| printed.map(|p| digest(p)))
+    };
+    let document = pick(
+        labels.and_then(|l| l.document.as_ref()),
+        unit.document.as_ref(),
+    );
+    let section = pick(
+        labels.and_then(|l| l.section.as_ref()),
+        unit.section.as_ref(),
+    );
+    record
+        .name(UNIT_KEY_FIELD, Some(digest(&unit.key).as_str()))
+        .name(UNIT_DOCUMENT_FIELD, document.as_deref())
+        .name(UNIT_SECTION_FIELD, section.as_deref())
+}
 
 /// What every record placed in a session's log shares: the records relayed
 /// from one committed event, or a `response` record.
@@ -779,15 +1022,18 @@ impl Relay<'_> {
 /// `decider_consulted` event writes one record of its own name, followed by
 /// a `decider_field` per field when it asked about several; a
 /// `decider_checked` or `decider_fallback` event writes one record of its
-/// own name, a `gate_override_recorded` one `check_overridden`, and a
-/// `finding_disputed` one `check_disputed`. Every other payload relays
-/// nothing here: `decider_answered` and `decider_check_answered`, which
-/// need the earlier event they answer, come from [`paired`].
+/// own name, a `gate_override_recorded` one `check_overridden`, a
+/// `finding_disputed` one `check_disputed`, and a `rule_delivered` one
+/// record of its own name. Every other payload relays nothing here:
+/// `decider_answered` and `decider_check_answered`, which need the earlier
+/// event they answer, come from [`paired`].
 ///
 /// Each field is copied by name from the event, never by stripping it, so
 /// nothing the event carries beyond these (output, streams, a finding's
 /// message, path or reference, commands, probabilities, hashes, thresholds,
-/// rationales, dispute reasons, override values) can reach the journal.
+/// rationales, dispute reasons, override values, rule texts, a unit as
+/// printed) can reach the journal. The one value derived from a probability
+/// is `decider_checked`'s integer `koto.decider.confidence_bp`.
 fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
     match payload {
         EventPayload::GateEvaluated {
@@ -881,6 +1127,11 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
         // The reason stays in the log. The attempt numbers are the disputed
         // evaluation's, which the event carries, so a reader joins the
         // dispute to exactly that `check_evaluated`.
+        EventPayload::EvidenceSubmitted {
+            state,
+            exported_fields: Some(exported),
+            ..
+        } => evidence_fields(relay, state, exported),
         EventPayload::FindingDisputed(d) => vec![relay
             .record(CHECK_DISPUTED)
             .name("koto.state", Some(d.state.as_str()))
@@ -889,6 +1140,93 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .int("koto.visit_attempt", d.visit_attempt)
             .name("koto.rule.id", Some(name_or_digest(&d.rule_id).as_str()))
             .name(DISPUTE_SOURCE_FIELD, Some(d.source.as_str()))],
+        // Names, the extent and a count; the rule's text stays in the
+        // template and the printed response.
+        EventPayload::RuleDelivered(r) => vec![relay
+            .record(RULE_DELIVERED)
+            .name("koto.state", Some(r.state.as_str()))
+            .name(CHECK_NAME_FIELD, Some(r.gate.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&r.rule_id).as_str()))
+            .name(RULE_EXTENT_FIELD, Some(r.level.as_str()))
+            .int(RULE_UNIT_COUNT_FIELD, r.unit_count)
+            .name(RULE_VIA_FIELD, r.via.map(|v| v.as_str()))
+            .name(RULE_DELIVERY_FIELD, r.delivery.map(|d| d.as_str()))],
+        // The review records: `koto review record` stored only validated or
+        // mapped values, and each is copied by name. A rule id is digested
+        // like every other, though the verb already refused one outside the
+        // name shape.
+        // `koto.doc.type` is left out for a charter format, and
+        // `koto.doc.format` when the caller didn't give one.
+        EventPayload::ReviewRoundStarted(r) => vec![relay
+            .record(REVIEW_ROUND)
+            .name(DOC_TYPE_FIELD, r.doc_type.as_deref())
+            .name(DOC_FORMAT_FIELD, r.doc_format.as_deref())
+            .name(DOC_SCHEMA_FIELD, Some(r.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(r.round))
+            .int(REVIEW_SEAT_COUNT_FIELD, Some(r.seat_count))
+            .flag(REVIEW_FALLBACK_FIELD, r.fallback)],
+        EventPayload::ReviewVerdictRecorded(v) => vec![relay
+            .record(REVIEW_VERDICT)
+            .name(DOC_TYPE_FIELD, v.doc_type.as_deref())
+            .name(DOC_FORMAT_FIELD, v.doc_format.as_deref())
+            .name(DOC_SCHEMA_FIELD, Some(v.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(v.round))
+            .name(REVIEW_SEAT_FIELD, Some(v.seat.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&v.rule_id).as_str()))
+            .name(REVIEW_SECTION_FIELD, Some(v.section.as_str()))
+            .name(REVIEW_VERDICT_FIELD, Some(v.verdict.as_str()))],
+        EventPayload::ReviewDecisionRecorded(d) => vec![relay
+            .record(REVIEW_DECISION)
+            .name(DOC_TYPE_FIELD, d.doc_type.as_deref())
+            .name(DOC_FORMAT_FIELD, d.doc_format.as_deref())
+            .name(DOC_SCHEMA_FIELD, Some(d.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(d.round))
+            .name(REVIEW_DECISION_FIELD, Some(d.decision.as_str()))],
+        EventPayload::DocCheckRecorded(c) => vec![relay
+            .record(DOC_CHECKED)
+            .name(DOC_TYPE_FIELD, Some(c.doc_type.as_str()))
+            .name(DOC_SCHEMA_FIELD, Some(c.schema.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()))
+            .name(DOC_CHECK_OUTCOME_FIELD, Some(c.outcome.as_str()))],
+        // The drafting records: one per entry, all under the event's one
+        // `koto.seq`, so the sequence orders checks and fixes in a run.
+        EventPayload::DocRuleChecksRecorded(c) => c
+            .entries
+            .iter()
+            .map(|e| {
+                relay
+                    .record(DOC_RULE_CHECKED)
+                    .name("koto.state", Some(c.state.as_str()))
+                    .name(DOC_FORMAT_FIELD, Some(c.doc_format.as_str()))
+                    .name("koto.rule.id", Some(name_or_digest(&e.rule_id).as_str()))
+                    .name(DOC_RULE_OUTCOME_FIELD, Some(e.outcome.as_str()))
+                    .name(DOC_CHECK_MOMENT_FIELD, Some(c.moment.as_str()))
+            })
+            .collect(),
+        EventPayload::DocSectionRecorded(s) => vec![relay
+            .record(DOC_SECTION_WRITTEN)
+            .name("koto.state", Some(s.state.as_str()))
+            .name(DOC_FORMAT_FIELD, Some(s.doc_format.as_str()))
+            .name(DOC_SECTION_FIELD, Some(s.section.as_str()))
+            .name(DOC_SECTION_WRITE_FIELD, Some(s.write.as_str()))],
+        EventPayload::DocFixRecorded(f) => f
+            .entries
+            .iter()
+            .map(|e| {
+                relay
+                    .record(DOC_FIX_APPLIED)
+                    .name("koto.state", Some(f.state.as_str()))
+                    .name(DOC_FORMAT_FIELD, Some(f.doc_format.as_str()))
+                    .name("koto.rule.id", Some(name_or_digest(&e.rule_id).as_str()))
+                    .name(DOC_SECTION_FIELD, Some(e.section.as_str()))
+                    .name(DOC_FIX_ANSWERS_FIELD, Some(f.answers.as_str()))
+                    .int(DOC_FIX_ROUND_FIELD, f.round)
+                    .name(
+                        DOC_FIX_CHECK_RULE_FIELD,
+                        Some(name_or_digest(&e.check_rule).as_str()),
+                    )
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -1063,11 +1401,12 @@ fn paired(payload: &EventPayload, relay: &Relay<'_>, prior_log: &str) -> Vec<Rec
         }
         EventPayload::DeciderCheckAnswered(a) => {
             let reason = pairing::fallback(prior_log, a.fallback_seq).map(|f| f.reason);
-            vec![relay
+            let answered = relay
                 .record(DECIDER_CHECK_ANSWERED)
                 .name("koto.state", Some(a.state.as_str()))
                 .name("koto.check", Some(a.gate.as_str()))
-                .name("koto.rule.id", Some(name_or_digest(&a.rule_id).as_str()))
+                .name("koto.rule.id", Some(name_or_digest(&a.rule_id).as_str()));
+            vec![with_unit(answered, a.unit.as_ref(), a.unit_labels.as_ref())
                 .name("koto.decider.answer", Some(a.answer.as_str()))
                 .name("koto.decider.reason", reason.map(|r| r.as_str()))
                 .int("koto.decider.fallback_seq", Some(a.fallback_seq))]
@@ -1091,20 +1430,91 @@ fn agent_answer(submitted: &Value, fc: &crate::decider::FieldConsultation) -> St
         .map_or(OTHER_ANSWER.to_string(), |v| name_or_digest(&v))
 }
 
+/// The `exported_fields` map an agent's evidence submission carries: for
+/// each enum or boolean field `accepts` declares and `submitted` includes,
+/// the value telemetry may carry. An enum value is the declared value
+/// (digested like a rule id when outside the name shape) when `accepts`
+/// declares it, and `other` when it doesn't, the rule
+/// `koto.decider.agent_answer` follows; a boolean is `true` or `false`.
+/// String, number and task-list fields, fields `accepts` doesn't declare,
+/// and fields left out of the submission have no entry. `None` when no
+/// entry is left, so such a submission is logged exactly as before.
+pub(crate) fn exported_fields(
+    accepts: &std::collections::BTreeMap<String, crate::template::types::FieldSchema>,
+    submitted: &serde_json::Map<String, Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (field, schema) in accepts {
+        let Some(value) = submitted.get(field) else {
+            continue;
+        };
+        let exported = match schema.field_type.as_str() {
+            "enum" => match value {
+                Value::String(v) if schema.values.iter().any(|d| d == v) => name_or_digest(v),
+                _ => OTHER_ANSWER.to_string(),
+            },
+            "boolean" => match value {
+                Value::Bool(b) => b.to_string(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        out.insert(field.clone(), exported);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// One record per entry of an agent's evidence submission's
+/// `exported_fields` (see [`exported_fields`]).
+const EVIDENCE_FIELD: &str = "evidence_field";
+
+/// The `evidence_field` records of an evidence submission: one per entry of
+/// its `exported_fields`, in field-name order, each with the state, the
+/// field's name (digested like a rule id when outside the name shape) and
+/// the exported value. The value is checked again here, so only the name
+/// shape (or its digest) ever reaches the journal. Nothing else of the
+/// submission is copied.
+fn evidence_fields(
+    relay: &Relay<'_>,
+    state: &str,
+    exported: &std::collections::BTreeMap<String, String>,
+) -> Vec<Record> {
+    exported
+        .iter()
+        .map(|(field, value)| {
+            relay
+                .record(EVIDENCE_FIELD)
+                .name("koto.state", Some(state))
+                .name("koto.evidence.field", Some(name_or_digest(field).as_str()))
+                .name("koto.evidence.value", Some(name_or_digest(value).as_str()))
+        })
+        .collect()
+}
+
 /// A `decider_checked` record: one decider-check criterion's verdict, under
 /// its gate as `koto.check` and its id (or the id's digest) as
-/// `koto.rule.id`. Like [`decider_consulted`], the event's own `visit_seq`
-/// isn't copied.
+/// `koto.rule.id`, with its unit for a unit-mode check (see [`with_unit`]).
+/// Like [`decider_consulted`], the event's own `visit_seq` isn't copied.
+///
+/// The probabilities aren't copied either. The one exception is
+/// `koto.decider.confidence_bp`, the highest of them as an integer in basis
+/// points, written whenever the event holds an answer's probabilities and
+/// absent when no answer was read.
 fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -> Record {
-    relay
+    let checked = relay
         .record("decider_checked")
         .name("koto.state", Some(c.state.as_str()))
         .name("koto.check", Some(c.gate.as_str()))
-        .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()));
+    with_unit(checked, c.unit.as_ref(), c.unit_labels.as_ref())
         .name("koto.decider.provider", Some(c.provider.as_str()))
         .name("koto.decider.model", Some(c.model.as_str()))
         .name("koto.decider.mode", Some(c.mode.as_str()))
         .name("koto.decider.outcome", Some(c.outcome.as_str()))
+        .int(
+            CONFIDENCE_FIELD,
+            crate::decider::check::confidence_bp(&c.probabilities),
+        )
         .name("koto.decider.reason", c.reason.map(|r| r.as_str()))
         .flag("koto.decider.blocked", c.blocked)
         .name(
@@ -1127,13 +1537,15 @@ fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -
 /// `koto.check` and its id (or the id's digest) as `koto.rule.id`, with its
 /// mode, the reason it got no verdict and the slice's size. Like
 /// [`decider_checked`], the event's own `visit_seq` isn't copied, and no
-/// hash, question or slice is.
+/// hash, question or slice is; a unit-mode check's unit is written as
+/// [`with_unit`] writes it.
 fn decider_fallback(relay: &Relay<'_>, f: &crate::decider::check::DeciderFallback) -> Record {
-    relay
+    let fallback = relay
         .record("decider_fallback")
         .name("koto.state", Some(f.state.as_str()))
         .name("koto.check", Some(f.gate.as_str()))
-        .name("koto.rule.id", Some(name_or_digest(&f.rule_id).as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&f.rule_id).as_str()));
+    with_unit(fallback, f.unit.as_ref(), f.unit_labels.as_ref())
         .name("koto.decider.mode", Some(f.mode.as_str()))
         .name("koto.decider.reason", Some(f.reason.as_str()))
         .int("koto.decider.input_bytes", f.input_bytes)
@@ -1163,7 +1575,16 @@ fn check_evaluated(
     if check.findings_truncated {
         record = record.flag(FINDINGS_TRUNCATED_FIELD, true);
     }
-    record.int("koto.check.duration_ms", check.duration_ms)
+    // The reason is koto's own word from a closed set, written only when
+    // the check didn't pass; anything else the log holds is left out.
+    let reason = check
+        .reason
+        .as_deref()
+        .filter(|r| outcome != "passed" && crate::engine::types::CHECK_REASONS.contains(r));
+    record
+        .int("koto.check.duration_ms", check.duration_ms)
+        .name(CHECK_REASON_FIELD, reason)
+        .flag(CHECK_NOT_READY_FIELD, check.not_ready)
 }
 
 /// `evaluated`, followed by one `check_rule` per error rule.
@@ -1231,8 +1652,68 @@ fn with_findings(
                 .name("koto.rule.id", Some(name_or_digest(rule_id).as_str()))
                 .name(FINDING_LEVEL_FIELD, Some(level.as_str()))
                 .int(FINDING_PAIR_COUNT_FIELD, Some(count))
+                .name(
+                    FINDING_SOURCE_FIELD,
+                    Some(finding_source(check, check_name, rule_id, level)),
+                )
         })
         .collect()
+}
+
+/// Who wrote the findings of one (rule id, level) pair: `fallback` for
+/// koto's fallback finding, `check` for every finding the check printed. A
+/// fallback is written only when the check printed no `error` finding, so
+/// when the event logged one it is the only `error` finding named after the
+/// check, and no finding the check printed shares its pair.
+fn finding_source(
+    check: &CheckEventFields,
+    check_name: &str,
+    rule_id: &str,
+    level: &crate::findings::FindingLevel,
+) -> &'static str {
+    let fallback = check.fallback_logged
+        && *level == crate::findings::FindingLevel::Error
+        && rule_id == check_name;
+    if fallback {
+        "fallback"
+    } else {
+        "check"
+    }
+}
+
+/// Whether the check event `payload` ran before the state's directive was
+/// shown in its visit: `prior_log` (the log before the event) holds no
+/// `instructions_delivered` for the event's state after `visit_seq`, the
+/// event that opened the visit. Every printed directive appends one, so
+/// this is true on arrival in the same invocation, on the first tick after
+/// `koto init` (which prints none), and after a rewind or a loop back, each
+/// of which opens a visit with no directive shown yet. `None` for a payload
+/// that isn't a check event.
+fn pre_directive(payload: &EventPayload, prior_log: &str, visit_seq: Option<u64>) -> Option<bool> {
+    let state = match payload {
+        EventPayload::GateEvaluated { state, .. }
+        | EventPayload::DefaultActionExecuted { state, .. } => state,
+        _ => return None,
+    };
+    #[derive(serde::Deserialize)]
+    struct Delivered {
+        seq: u64,
+        #[serde(rename = "type")]
+        event_type: String,
+        payload: DeliveredState,
+    }
+    #[derive(serde::Deserialize)]
+    struct DeliveredState {
+        state: String,
+    }
+    let shown = prior_log
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"instructions_delivered\""))
+        .filter_map(|line| serde_json::from_str::<Delivered>(line.trim()).ok())
+        .take_while(|d| visit_seq.is_none_or(|v| d.seq > v))
+        .any(|d| d.event_type == "instructions_delivered" && d.payload.state == *state);
+    Some(!shown)
 }
 
 fn session_started(
@@ -1457,7 +1938,16 @@ pub(crate) fn after_commit(
             seq: commit.seq,
             visit_seq: commit.visit_seq_for(payload),
         };
-        records.extend(relayed(payload, &relay));
+        let mut relayed_records = relayed(payload, &relay);
+        if let Some(pre) = pre_directive(payload, &commit.prior_log, relay.visit_seq) {
+            for r in relayed_records
+                .iter_mut()
+                .filter(|r| r.kind() == "check_evaluated")
+            {
+                r.fields.push((CHECK_PRE_DIRECTIVE_FIELD, Value::from(pre)));
+            }
+        }
+        records.extend(relayed_records);
         records.extend(paired(payload, &relay, &commit.prior_log));
     }
     write(root, &records);

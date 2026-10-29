@@ -500,6 +500,9 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
             "overrides",
             // Added by the check lifecycle work, not by the dashboard.
             "disputes",
+            // Added by the document review telemetry work, not by the
+            // dashboard.
+            "review",
             "config",
             "decider",
             "workspace",

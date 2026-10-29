@@ -113,6 +113,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -132,10 +133,12 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0".to_string(),
@@ -192,10 +195,12 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let t = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "single".to_string(),
             version: "1.0".to_string(),
@@ -255,6 +260,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -274,6 +280,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -293,11 +300,13 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
 
         let t = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "branching".to_string(),
             version: "1.0".to_string(),
@@ -340,6 +349,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let output = to_mermaid(&t);
@@ -384,6 +394,7 @@ mod tests {
                             expect: None,
                             poll: None,
                             decider_check: None,
+                            not_ready_exit_codes: Vec::new(),
                         },
                     );
                     g
@@ -397,6 +408,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
 
@@ -433,6 +445,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -456,6 +469,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -479,6 +493,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -498,11 +513,13 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
 
         let t = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "example".to_string(),
             version: "1.0".to_string(),

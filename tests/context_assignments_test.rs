@@ -3,8 +3,9 @@
 //! Each test drives the real binary: a transition fires on one of the three
 //! paths that append a `Transitioned` event (evidence-resolved, gate-resolved
 //! auto-advance, skip_if), and `koto context get` reads the assigned value
-//! back. The atomicity test makes the store unwritable across the transition
-//! and checks that the next read still sees the value.
+//! back. The atomicity tests make the store unwritable across the transition
+//! and check that a read still answers the value, from the log and without
+//! storing it, and that the session's next tick stores it.
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
@@ -25,6 +26,8 @@ fn koto_cmd(dir: &Path) -> Command {
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);
+    // No reader's anchor: a read here is anchorless.
+    cmd.env_remove("KOTO_ANCHOR");
     cmd
 }
 
@@ -302,13 +305,10 @@ Done.
     );
 }
 
-#[test]
-fn failed_store_write_is_restored_on_the_next_read() {
-    let dir = TempDir::new().unwrap();
-    // `work` assigns `outcome` on its way to `mid`; `mid` routes on a
-    // context-exists gate over that key, so a context gate is one of the
-    // readers that has to see the value.
-    let template = r#"---
+/// `work` assigns `outcome` on its way to `mid`; `mid` routes on a
+/// context-exists gate over that key, so a context gate is one of the
+/// readers that has to see the value.
+const LOST_WRITE_TEMPLATE: &str = r#"---
 name: atomic-assign
 version: "1.0"
 initial_state: work
@@ -350,49 +350,104 @@ Mid.
 
 Done.
 "#;
-    init(dir.path(), "wf", template);
+
+/// Start `wf` on [`LOST_WRITE_TEMPLATE`] and take the transition that
+/// assigns `outcome` with the store unwritable, so the store write is lost
+/// and only the log holds the value; then make the store writable again.
+/// `wf` waits in `mid`, its gate blocked on the missing key.
+fn lose_the_assigned_write(dir: &Path) {
+    init(dir, "wf", LOST_WRITE_TEMPLATE);
 
     // Make the store unwritable: its directory is a regular file, so every
     // write after the event append fails. The log lives beside it and is
     // unaffected.
-    let ctx = sessions_base(dir.path()).join("wf").join("ctx");
+    let ctx = sessions_base(dir).join("wf").join("ctx");
     let _ = std::fs::remove_dir_all(&ctx);
     std::fs::write(&ctx, b"not a directory").unwrap();
 
-    let resp = next(dir.path(), "wf", Some(r#"{"decision": "ok"}"#));
+    let resp = next(dir, "wf", Some(r#"{"decision": "ok"}"#));
     assert_eq!(resp["state"], "mid", "got: {resp}");
-    let events = transitioned_events(dir.path(), "wf");
+    let events = transitioned_events(dir, "wf");
     assert_eq!(
         events.last().unwrap()["payload"]["context_assignments"]["outcome"],
         "landed"
     );
-
-    // Restore the store. The next tick's context gate sees the value...
     std::fs::remove_file(&ctx).unwrap();
+}
+
+/// Every file of `wf`'s session directory but the host's read spool, with
+/// its bytes.
+fn session_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![sessions_base(dir).join("wf")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if !p.ends_with("context-reads.jsonl") {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn failed_store_write_is_restored_by_the_next_tick() {
+    let dir = TempDir::new().unwrap();
+    lose_the_assigned_write(dir.path());
+
+    // The next tick stores the value before its context gate reads it...
     let resp = next(dir.path(), "wf", None);
     assert_eq!(resp["state"], "done", "got: {resp}");
-    // ...and so does `koto context get`.
+    // ...and so `koto context get` reads it from the store.
+    assert_eq!(
+        std::fs::read_to_string(sessions_base(dir.path()).join("wf/ctx/outcome")).unwrap(),
+        "landed"
+    );
     assert_eq!(
         ctx_get(dir.path(), "wf", "outcome").as_deref(),
         Some("landed")
     );
 }
 
+/// A read from another process after the lost write answers the assigned
+/// value from the log and stores nothing: `get`, `exists` and `list` report
+/// it, and the session's files are byte-identical. The session's next tick
+/// is what stores it.
 #[test]
-fn context_get_alone_restores_a_value_the_store_missed() {
+fn reads_answer_a_lost_value_from_the_log_and_store_nothing() {
     let dir = TempDir::new().unwrap();
-    init(dir.path(), "wf", EVIDENCE_TEMPLATE);
-
-    let ctx = sessions_base(dir.path()).join("wf").join("ctx");
-    let _ = std::fs::remove_dir_all(&ctx);
-    std::fs::write(&ctx, b"not a directory").unwrap();
-    let resp = next(dir.path(), "wf", Some(r#"{"decision": "ok"}"#));
-    assert_eq!(resp["state"], "done", "got: {resp}");
-    std::fs::remove_file(&ctx).unwrap();
+    lose_the_assigned_write(dir.path());
+    let before = session_files(dir.path());
 
     assert_eq!(
         ctx_get(dir.path(), "wf", "outcome").as_deref(),
         Some("landed")
+    );
+    let exists = koto_cmd(dir.path())
+        .args(["context", "exists", "wf", "outcome"])
+        .output()
+        .unwrap();
+    assert_eq!(exists.status.code(), Some(0), "{exists:?}");
+    let list = koto_cmd(dir.path())
+        .args(["context", "list", "wf"])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{list:?}");
+    let keys: Vec<String> = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(keys.contains(&"outcome".to_string()), "{keys:?}");
+
+    assert_eq!(session_files(dir.path()), before);
+    assert!(!sessions_base(dir.path()).join("wf/ctx/outcome").exists());
+
+    let resp = next(dir.path(), "wf", None);
+    assert_eq!(resp["state"], "done", "got: {resp}");
+    assert_eq!(
+        std::fs::read_to_string(sessions_base(dir.path()).join("wf/ctx/outcome")).unwrap(),
+        "landed"
     );
 }
 

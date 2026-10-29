@@ -438,8 +438,10 @@ jobs:
 
   decider-checks-compat-v0-14-1:
     # Proves koto v0.14.1 reads a session and a decider ledger the PR's koto
-    # writes while a template uses a decider check, against the loopback stub
-    # (no provider, no secret). Same pinned installer as the jobs above.
+    # writes while a template uses a decider check, single-slice and in unit
+    # mode with a rule delivery, and that the PR's koto reads a log and ledger
+    # v0.14.1 wrote, against the loopback stub (no provider, no secret). Same
+    # pinned installer as the jobs above.
     name: Decider Checks Compat (koto v0.14.1)
     runs-on: ubuntu-latest
     env:

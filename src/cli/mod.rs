@@ -13,12 +13,14 @@ pub mod decider_port;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
+pub mod init_supersede;
 pub(crate) mod move_aside;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
 pub mod request;
 pub mod retry;
+pub mod review;
 pub mod session;
 pub mod session_anchor;
 pub(crate) mod session_inventory;
@@ -193,6 +195,62 @@ pub enum Command {
         #[arg(long = "dispatched-by", value_name = "NAME")]
         dispatched_by: Option<String>,
 
+        /// Record that this session continues session PRED, its
+        /// predecessor: a continues relation in the new, attached or
+        /// replacement session's own context, written before the command
+        /// reports the session, as `koto session link --continues` writes
+        /// it. The relation keeps PRED from every removal by rule while
+        /// this session, or a session continuing it, is pinned, alive or
+        /// within its own retention. PRED is checked before anything is
+        /// written: a name that fails the session-name rule or is this
+        /// session's own, a name with no session, an anchor or close
+        /// record, and, in this release, the cloud backend exit 2.
+        #[arg(long = "continues", value_name = "PRED")]
+        continues: Option<String>,
+
+        /// The workspace PRED lives in: its absolute path or its workspace
+        /// id (16 lowercase hex digits). Defaults to this session's own
+        /// workspace.
+        #[arg(
+            long = "continues-from",
+            value_name = "WORKSPACE",
+            requires = "continues"
+        )]
+        continues_from: Option<String>,
+
+        /// Take PRED's work over: fence PRED, then open this session
+        /// continuing it. The fence is a `session_superseded` event
+        /// appended to PRED's own log under its append lock (waited for
+        /// at most 10 seconds); from then on koto refuses every write to
+        /// PRED (`koto next`, context writes, decisions, overrides,
+        /// rewinds, cancels) with `session_superseded`, naming the newest
+        /// session in the chain, while its reads keep working. Requires
+        /// --continues; can't be used with --parent, --from-stdin,
+        /// --attach-live, --replace-terminal or --koto-leg. Refusals exit
+        /// 2 with nothing written: PRED already superseded by another
+        /// session (`superseded_by=<name>`), `stale_state`, `self`,
+        /// `cycle`, `session_exists`, and the cloud backend in this
+        /// release; a lock still held after 10 seconds exits 3
+        /// `fence_unavailable`. Running the same command again finishes
+        /// an interrupted run, or changes nothing.
+        #[arg(long, requires = "continues")]
+        supersede: bool,
+
+        /// With --supersede, copy every context key starting with PREFIX
+        /// (a plain string prefix, as `koto context list --prefix` takes
+        /// it) from PRED into this session, skipping keys this session
+        /// already holds with the same value. Repeatable. Keys under
+        /// `koto/` are never carried. Once the carry is done the session
+        /// holds `koto/superseded-carry-complete`, and a later run carries
+        /// nothing.
+        #[arg(long = "carry", value_name = "PREFIX", requires = "supersede")]
+        carry: Vec<String>,
+
+        /// With --supersede, refuse with `stale_state` (exit 2, nothing
+        /// written) unless PRED is in state STATE.
+        #[arg(long = "expect-state", value_name = "STATE", requires = "supersede")]
+        expect_state: Option<String>,
+
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
         /// or to the parent session's anchor when `--parent` is given.
@@ -334,6 +392,12 @@ pub enum Command {
     Disputes {
         #[command(subcommand)]
         subcommand: disputes::DisputesSubcommand,
+    },
+
+    /// Document review event recording, as telemetry (moves nothing)
+    Review {
+        #[command(subcommand)]
+        subcommand: review::ReviewSubcommand,
     },
 
     /// Configuration management subcommands
@@ -550,10 +614,18 @@ pub enum SessionCommand {
     ///
     /// With no name, print the koto root instead: `$KOTO_HOME` when set,
     /// else `~/.koto`. It builds no backend and writes nothing, so a test
-    /// harness can check the root before running anything else.
+    /// harness can check the root before running anything else. With
+    /// `--json` it prints the root with the backend koto resolved, where that
+    /// came from and, for the cloud backend, the bucket.
     Dir {
         /// Session name; omit it to print the koto root
         name: Option<String>,
+
+        /// With no name: print `root`, `backend`, `backend_source`, `bucket`
+        /// (cloud only) and `backend_ignored` (when `KOTO_HOME` kept the run
+        /// off a cloud backend another layer asked for) as JSON
+        #[arg(long, conflicts_with = "name")]
+        json: bool,
     },
     /// List all sessions as JSON
     ///
@@ -587,7 +659,9 @@ pub enum SessionCommand {
     /// Remove a session directory (idempotent).
     ///
     /// Removes the session even when the retention rule would keep it, and
-    /// names every other live member of its hierarchy in `live_members`.
+    /// names every other live member of its hierarchy in `live_members`,
+    /// and every later session continuing it that would have kept it in
+    /// `relation_keepers`. A pin still refuses it.
     Cleanup {
         /// Session name
         name: String,
@@ -606,19 +680,26 @@ pub enum SessionCommand {
     /// open anchor), its hierarchy is kept by the retention rule (h: a live
     /// member, the retention not yet passed, or something unreadable; see
     /// `koto session hierarchy`), its `chain/parent` context key is malformed
-    /// (d), it is bound to a request leg still waiting (e), it is a
-    /// coordinator's session (f), or, under the cloud backend, its remote
-    /// copy may be newer (g). A failed removal, or a sessions directory that
-    /// can't be read, exits 3; a malformed retention setting exits 2.
+    /// (d), it is bound to a request leg still waiting (e), or, under the
+    /// cloud backend, its remote copy may be newer (g). A session's name
+    /// keeps nothing. A session a later session continues (`koto
+    /// session link --continues`) is kept while that session, or one
+    /// continuing it, is pinned, alive or within its own retention (r), with
+    /// `kept_by_relation` and `relation_keepers` naming each keeper. A
+    /// failed removal, or a sessions directory that can't be read, exits 3;
+    /// a malformed retention setting exits 2.
     ///
     /// `--migrated-from <workspace-path>` (cloud backend only) previews and
     /// removes instead the migration markers `koto session import` left
     /// under that workspace's bucket prefix. A marker is removable only when
     /// its target is present, with a log that reads cleanly and begins with
-    /// every event of the old copy's log, and then once at least
-    /// `session.cloud.marker_retain_days` old or with `--source-retired`;
-    /// removal deletes everything under the old session's prefix, the
-    /// marker last.
+    /// every event of the old copy's log, and then once no later session
+    /// keeps the source through the continues relation (the copy, or a
+    /// session after it, still running, pinned or inside its retention
+    /// keeps it, reason `relation`); removal deletes everything under the
+    /// old session's prefix, the marker last.
+    /// `session.cloud.marker_retain_days` and `--source-retired` no longer
+    /// decide removal: a run that sets either lists it under `ignored`.
     Prune {
         /// Only sessions whose execution directory is this directory or lies
         /// under it. Filters narrow the candidates only: a session outside
@@ -661,9 +742,8 @@ pub enum SessionCommand {
         #[arg(long = "migrated-from", value_name = "WORKSPACE")]
         migrated_from: Option<String>,
 
-        /// With `--migrated-from`: the source host is gone for good, so a
-        /// marker whose target is present is removable inside
-        /// `session.cloud.marker_retain_days` too.
+        /// With `--migrated-from`: accepted for older scripts, but no longer
+        /// decides removal; the run reports it under `ignored`.
         #[arg(long = "source-retired")]
         source_retired: bool,
     },
@@ -682,6 +762,22 @@ pub enum SessionCommand {
         #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
         children: ChildrenPolicy,
     },
+    /// Close a write window: push the session's deferred writes at once
+    ///
+    /// Under the cloud backend, a koto process run with `KOTO_WRITE_WINDOW`
+    /// naming a session writes that session's local copy only, as a tick's
+    /// commands do, and the bucket shows `batch-open.json` until this
+    /// pushes the keys, the context manifest and the state file together.
+    /// Exit 0 means the bucket holds every write the window made; it prints
+    /// `{"name": ..., "flushed": true}` when this command pushed them and
+    /// `false` when nothing was left to push. A failed push leaves the
+    /// batch open: an unreachable bucket clears on a retry, and a `session
+    /// conflict` needs `koto session resolve`. A no-op under the local
+    /// backend.
+    Flush {
+        /// Session name
+        name: String,
+    },
     /// Update session metadata fields
     Update {
         /// Session name
@@ -691,22 +787,57 @@ pub enum SessionCommand {
         intent: String,
     },
 
-    /// Record that another session dispatched this one.
+    /// Record that another session dispatched this one, or that this one
+    /// continues another.
     ///
-    /// Writes a dispatched-by link, `koto/links/dispatched-by/<NAME>`, into
-    /// SESSION's own context and nowhere else: the dispatcher is not
-    /// written, and need not exist. Meant to be run by the session's own
-    /// driver when a dispatch had no request leg to record it. Recording a
-    /// link the session already holds changes nothing and exits 0. A
-    /// dispatcher name that fails the session-name rule, or names SESSION
-    /// itself, exits 2 and writes nothing.
+    /// With `--dispatched-by NAME`, writes a dispatched-by link,
+    /// `koto/links/dispatched-by/<NAME>`, into SESSION's own context and
+    /// nowhere else: the dispatcher is not written, and need not exist.
+    /// Meant to be run by the session's own driver when a dispatch had no
+    /// request leg to record it. A dispatcher name that fails the
+    /// session-name rule, or names SESSION itself, exits 2 and writes
+    /// nothing.
+    ///
+    /// With `--continues PRED`, records that SESSION continues PRED: the
+    /// relation `koto/links/continues/<PRED>`, in SESSION only, which keeps
+    /// PRED from every removal by rule while SESSION, or a session
+    /// continuing it, is pinned, alive or within its own retention. It
+    /// needs no anchor, authority, request leg or dispatcher, and grants no
+    /// authority. A session continues at most one predecessor. Exits 2 and
+    /// writes nothing for a name that fails the session-name rule or is
+    /// SESSION's own, a name with no session, an anchor or close record, a
+    /// SESSION already continuing another session, and, in this release,
+    /// the cloud backend.
+    ///
+    /// Recording a link the session already holds changes nothing and
+    /// exits 0. Exactly one of `--dispatched-by` and `--continues` is
+    /// required.
     Link {
         /// The session to record the link in
         session: String,
 
         /// Name of the session that dispatched SESSION
-        #[arg(long = "dispatched-by", value_name = "NAME")]
-        dispatched_by: String,
+        #[arg(
+            long = "dispatched-by",
+            value_name = "NAME",
+            required_unless_present = "continues",
+            conflicts_with = "continues"
+        )]
+        dispatched_by: Option<String>,
+
+        /// Name of the session SESSION continues (its predecessor)
+        #[arg(long = "continues", value_name = "PRED")]
+        continues: Option<String>,
+
+        /// The workspace PRED lives in: its absolute path or its workspace
+        /// id (16 lowercase hex digits). Defaults to SESSION's own
+        /// workspace.
+        #[arg(
+            long = "continues-from",
+            value_name = "WORKSPACE",
+            requires = "continues"
+        )]
+        continues_from: Option<String>,
     },
 
     /// Pin a session so no removal by rule takes it.
@@ -767,7 +898,11 @@ pub enum SessionCommand {
     /// closes it by hand) or the release instant and when the retention
     /// passes, anything unreadable, every member with its kind, liveness,
     /// stop and the edge that joined it, and the three retention settings
-    /// with their origins. Reads the local sessions directory only and
+    /// with their origins. A session holding a continues relation shows
+    /// its `predecessor`, one a relation names shows its `successors`, and
+    /// one the relation keeps shows `relation_keepers`; the relation joins
+    /// no hierarchy, so none of these change the members. Reads the local
+    /// sessions directory only and
     /// writes nothing. A malformed retention setting exits 2 naming it; a
     /// sessions directory that can't be read exits 3.
     Hierarchy {
@@ -789,6 +924,27 @@ pub enum SessionCommand {
     Anchor {
         #[command(subcommand)]
         action: session_anchor::AnchorCommand,
+    },
+
+    /// Whether a workflow session still needs a directory.
+    ///
+    /// PATH is needed while a workflow session anchored at it or under it
+    /// (its execution directory, compared by whole path components after
+    /// resolving symlinks) is running and no later member of its lineage
+    /// (the sessions continuing it, theirs, and so on) is anchored outside
+    /// it. Terminal and cancelled sessions don't need it, and a session
+    /// anchored above PATH doesn't count. A session under PATH that can't
+    /// be read, or whose continues relation can't be read, keeps it.
+    ///
+    /// Exits 0 when PATH isn't needed, 1 when it is, printing one line of
+    /// at most 200 bytes naming the session whose name sorts first and why,
+    /// with how many need PATH, and 2 when it can't decide: PATH can't be
+    /// resolved, the sessions directory can't be listed, or a session's
+    /// header can't be read. Reads this host's sessions directory only,
+    /// under either backend, and writes nothing.
+    Needed {
+        /// The directory to judge
+        path: String,
     },
 
     /// Move a session's execution anchor to another directory.
@@ -820,10 +976,15 @@ pub enum SessionCommand {
     /// configured bucket, and creates it here, named --as when given, as a
     /// new local session anchored in the current directory: the source's
     /// events plus a `session_imported` event, every context key, and the
-    /// compiled template. It pushes the new session under this workspace's prefix,
-    /// then leaves a `migrated.json` marker beside the source, so the old
-    /// copy refuses with `session_migrated` from then on. Nothing else
-    /// under the source's prefix is written.
+    /// compiled template. The new session records the source as the session
+    /// it continues (`koto/links/continues/<source>`), and a back-reference
+    /// is written beside the source before the push; after the push a
+    /// `migrated.json` marker joins it. The old copy stays as a read-only
+    /// predecessor: every write on it refuses with `session_migrated`
+    /// (exit 2), while `koto status`, `koto context get`, `exists`, `list`,
+    /// `koto decisions list` and `koto overrides list` answer from its last
+    /// pushed copy. A re-run on a copy whose relation names another session
+    /// refuses with `relation_conflict` (exit 2).
     ///
     /// Import only a stopped source: no process may still be advancing the
     /// session, and its last write must have reached the remote. Stop the
@@ -1103,10 +1264,12 @@ fn load_compiled_template(path: &str) -> anyhow::Result<CompiledTemplate> {
 
 /// The exit code of a failed `koto context add` or `koto context remove`:
 /// 2 for a key in the reserved `koto/` area, which the caller must not
-/// name, and 3 for anything else.
+/// name, or a session superseded since the command's own check, and 3 for
+/// anything else.
 fn context_write_exit_code(e: &anyhow::Error) -> i32 {
     if e.downcast_ref::<crate::session::links::ReservedKeyError>()
         .is_some()
+        || crate::engine::persistence::session_superseded(e).is_some()
     {
         EXIT_CALLER_ERROR
     } else {
@@ -1126,23 +1289,181 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     std::process::exit(code);
 }
 
-/// Refuse, exit 2, when `session` belongs to another directory's workspace
-/// under the cloud backend, before `command` reads or writes it (koto#457).
-/// From here a read would answer from this host's copy without checking the
-/// session's own copy in the bucket, and a write would be pushed under
-/// another workspace's prefix, where the session's own workspace never
-/// reads it. The message names the directory to run from. The local backend
-/// never refuses.
-fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
-    if let Err(e) = backend.check_bound_here(session) {
-        exit_with_error_code(
-            serde_json::json!({
-                "error": e.to_string(),
-                "command": command
-            }),
-            EXIT_CALLER_ERROR,
-        );
+/// Refuse, exit 2, before `command` reads or writes `session`, when under
+/// the cloud backend koto can't tell which bucket copy is the session's own
+/// (`session_unlocated`), or the check of its own copy fails. A session that
+/// records the prefix it was created under is read and written there from
+/// any directory, so only an unlocated one refuses. The local backend never
+/// refuses.
+///
+/// A `session_unlocated` refusal carries `code`, `session`, `reason` and
+/// `locations` (the bucket prefixes the reason names) beside `error` and
+/// `command`.
+///
+/// A located session whose continues relation still owes its
+/// back-reference beside the predecessor (recorded under the local backend,
+/// by an earlier build, or under another name) gets it now, before the
+/// command writes or pushes anything ([`Backend::ensure_backref`]).
+fn refuse_if_unlocated(backend: &Backend, session: &str, command: &str) {
+    if let Err(e) = backend.check_located(session) {
+        refuse_unlocated(&e, command);
     }
+    backend.ensure_backref(session);
+}
+
+/// Refuse, exit 2 with `{"error", "command"}`, before `command` writes
+/// `session`, when the session was imported into another workspace: the
+/// source is kept as a read-only predecessor, and the message names the
+/// copy and its workspace. For the writes whose own path reaches the
+/// bucket before any read would refuse (`koto session resolve`, `koto
+/// session update`). Any other error of the check is left to the command,
+/// which meets it as it did before.
+fn refuse_if_migrated(backend: &Backend, session: &str, command: &str) {
+    if let Err(e) = backend.check_not_migrated_to_write(session) {
+        if e.is::<crate::session::SessionMigrated>() {
+            exit_with_error_code(
+                serde_json::json!({ "error": e.to_string(), "command": command }),
+                EXIT_CALLER_ERROR,
+            );
+        }
+    }
+}
+
+/// Print [`refuse_if_unlocated`]'s refusal of `e` for `command`, exit 2.
+fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
+    let mut error = serde_json::json!({
+        "error": e.to_string(),
+        "command": command
+    });
+    if let Some(unlocated) = e.downcast_ref::<crate::session::Unlocated>() {
+        error["code"] = "session_unlocated".into();
+        error["session"] = unlocated.session.clone().into();
+        error["reason"] = unlocated.reason.as_str().into();
+        error["locations"] = unlocated.reason.locations().into();
+    }
+    exit_with_error_code(error, EXIT_CALLER_ERROR);
+}
+
+/// [`refuse_if_unlocated`] for a read verb a migrated source is served on
+/// (`koto status`, `koto decisions list`, `koto overrides list`): a session
+/// this workspace's copy of was imported away on this host is answered
+/// from the copy it left in the bucket
+/// ([`workspace_read::serve_migrated_source`]) rather than refused. `Some`
+/// with the command's result when it was served that way; `None` when the
+/// command goes on to read the session as usual.
+///
+/// The migration marker is asked for before any owed back-reference goes
+/// up ([`Backend::ensure_backref`]): a source whose marker only the bucket
+/// holds (imported from another host) is served as it is, with no pointer
+/// written for it and no confirmation recorded beside it.
+fn locate_or_serve(
+    backend: &Backend,
+    session: &str,
+    command: &str,
+    read: impl FnOnce() -> Command,
+) -> Option<Result<()>> {
+    match backend.check_located(session) {
+        Ok(()) => match backend.check_not_migrated(session) {
+            Err(e) if e.is::<crate::session::SessionMigrated>() => {
+                Some(workspace_read::serve_migrated_source(backend, read(), e))
+            }
+            _ => {
+                backend.ensure_backref(session);
+                None
+            }
+        },
+        Err(e) if e.is::<crate::session::SessionMigrated>() => {
+            Some(workspace_read::serve_migrated_source(backend, read(), e))
+        }
+        Err(e) => refuse_unlocated(&e, command),
+    }
+}
+
+/// The message and fields of a `session_superseded` refusal of `session`,
+/// or `None` when `session` isn't superseded. The message names the newest
+/// session in its supersede chain, the one to continue in; the fields carry
+/// the direct successor, the newest member and the fence's actor.
+fn superseded_refusal(
+    backend: &dyn SessionBackend,
+    session: &str,
+) -> Option<(String, serde_json::Value)> {
+    let superseded = crate::session::links::newest_member(backend, session)?;
+    let message = format!(
+        "session '{session}' was superseded by '{}' (session_superseded), so nothing was \
+         written; continue in '{}'",
+        superseded.fence.by, superseded.newest
+    );
+    let fields = serde_json::json!({
+        "superseded_by": superseded.fence.by,
+        "newest": superseded.newest,
+        "actor": superseded.fence.actor,
+    });
+    Some((message, fields))
+}
+
+/// Refuse, exit 2 with code `session_superseded`, when `session` was
+/// superseded, before `command` writes anything to it. The log append
+/// refuses the same write on its own; checking first keeps a command that
+/// writes a store or a file before it appends from writing that.
+fn refuse_if_superseded(backend: &dyn SessionBackend, session: &str, command: &str) {
+    if let Some((message, fields)) = superseded_refusal(backend, session) {
+        let mut body = serde_json::json!({
+            "error": message,
+            "command": command,
+            "code": "session_superseded",
+        });
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), fields.as_object()) {
+            obj.extend(more.clone());
+        }
+        exit_with_error_code(body, EXIT_CALLER_ERROR);
+    }
+}
+
+/// [`refuse_if_superseded`] for `koto next`, in the error shape `koto next`
+/// prints: `{"error": {"code": "session_superseded", ...}, ...fields}`.
+fn refuse_next_if_superseded(backend: &dyn SessionBackend, session: &str) {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+    if let Some((message, fields)) = superseded_refusal(backend, session) {
+        let err = NextError {
+            code: NextErrorCode::SessionSuperseded,
+            message,
+            details: vec![],
+        };
+        let mut body = serde_json::json!({ "error": err });
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), fields.as_object()) {
+            obj.extend(more.clone());
+        }
+        exit_with_error_code(body, err.code.exit_code());
+    }
+}
+
+/// Report a command's failure on stderr and return its exit code: 2, with
+/// the refusal's own text, for a write a superseded session's log refused
+/// (`session_superseded`), and 1 with the error's text for anything else.
+pub fn report_failure(e: &anyhow::Error) -> i32 {
+    match crate::engine::persistence::session_superseded(e) {
+        Some(refused) => {
+            eprintln!("{refused}");
+            EXIT_CALLER_ERROR
+        }
+        None => {
+            eprintln!("{e}");
+            // A session imported elsewhere is the caller's to continue
+            // where the message says, exit 2, whichever command met it.
+            if is_session_migrated(e) {
+                EXIT_CALLER_ERROR
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// Whether `err` is a [`crate::session::SessionMigrated`] refusal, at its
+/// top or anywhere in its chain of causes.
+fn is_session_migrated(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<crate::session::SessionMigrated>())
 }
 
 /// What `koto next` runs on its way out, however it exits: the flush of
@@ -1160,11 +1481,13 @@ fn flush_before_exit() {
 /// Determine the exit code for an engine error by downcasting to EngineError.
 ///
 /// Delegates the per-variant mapping to [`EngineError::exit_code`] so the
-/// CLI surface and the engine layer stay in sync. Falls back to exit code
-/// 1 when the underlying error does not downcast to an `EngineError`.
+/// CLI surface and the engine layer stay in sync. A session imported
+/// elsewhere ([`crate::session::SessionMigrated`]) is a caller error, exit
+/// 2. Falls back to exit code 1 when the underlying error is neither.
 pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
         Some(e) => e.exit_code(),
+        None if is_session_migrated(err) => EXIT_CALLER_ERROR,
         None => 1,
     }
 }
@@ -1186,6 +1509,7 @@ fn build_backend() -> Result<Backend> {
     // project file choosing where that pair is sent: refused here, before any
     // session is opened or any request made (DESIGN-koto-cloud-session-config).
     crate::config::session_env::check(&config)?;
+    warn_koto_home_backend_ignored(&config);
 
     match config.session.backend.as_str() {
         "local" => Ok(Backend::Local(build_local_backend()?)),
@@ -1198,6 +1522,50 @@ fn build_backend() -> Result<Backend> {
         other => {
             anyhow::bail!("unknown backend: {other}")
         }
+    }
+}
+
+/// What `koto session dir --json` prints: the koto root, the backend the
+/// config resolved and where that came from, the bucket for the cloud
+/// backend, and the setting `KOTO_HOME` ignored, if any. Built from the
+/// loaded config alone: no backend, no request, nothing written.
+fn session_dir_report(
+    root: &std::path::Path,
+    config: &crate::config::KotoConfig,
+) -> serde_json::Value {
+    use crate::config::session_env::Origin;
+    let source = match config.session_env.origin("session.backend") {
+        Origin::User => "user-config",
+        Origin::Project => "project-config",
+        Origin::Env(_) => "env",
+        Origin::Default | Origin::Unset => "default",
+    };
+    let mut out = serde_json::json!({
+        "root": root.display().to_string(),
+        "backend": config.session.backend,
+        "backend_source": source,
+    });
+    if config.session.backend == "cloud" {
+        out["bucket"] = serde_json::json!(config.session.cloud.bucket);
+    }
+    if let Some(ignored) = &config.session_env.backend_ignored {
+        out["backend_ignored"] = serde_json::json!(ignored);
+    }
+    out
+}
+
+/// Say once per process that `KOTO_HOME` kept the run off a cloud backend some
+/// other layer asked for, naming that layer and never its value.
+fn warn_koto_home_backend_ignored(config: &crate::config::KotoConfig) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if let Some(ignored) = &config.session_env.backend_ignored {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: KOTO_HOME is set, so the cloud backend {ignored} asked for is ignored \
+                 and koto runs on the local backend under the koto root; to use the cloud \
+                 backend there, set session.backend = \"cloud\" in the root's config.toml"
+            );
+        });
     }
 }
 
@@ -1623,12 +1991,23 @@ pub fn run(app: App) -> Result<()> {
             parent,
             intent,
             dispatched_by,
+            continues,
+            continues_from,
+            supersede,
+            carry,
+            expect_state,
             execution_dir,
             legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
             let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if supersede && (entry_flags_used || from_stdin || parent.is_some()) {
+                init_entry::usage_error(
+                    "--supersede can't be used with --parent, --from-stdin, --attach-live, \
+                     --replace-terminal or --koto-leg",
+                );
+            }
             if let Some(dispatcher) = &dispatched_by {
                 use crate::session::links::{validate_peer, LinkKind};
                 if let Err(e) = validate_peer(LinkKind::DispatchedBy, dispatcher) {
@@ -1678,10 +2057,7 @@ pub fn run(app: App) -> Result<()> {
             };
 
             let backend = build_backend()?;
-            // Resolve `--execution-dir` once, before either init path:
-            // a directory that does not resolve is a caller error, and
-            // both paths record the canonical form.
-            let execution_dir = execution_dir.map(|dir| match std::fs::canonicalize(&dir) {
+            let canonical_dir = |dir: String| match std::fs::canonicalize(&dir) {
                 Ok(canonical) => canonical,
                 Err(e) => exit_with_error_code(
                     serde_json::json!({
@@ -1690,7 +2066,51 @@ pub fn run(app: App) -> Result<()> {
                     }),
                     2,
                 ),
+            };
+            if supersede {
+                // `requires` holds both: clap refuses --supersede without
+                // --continues, and the --from-stdin path is refused above.
+                let pred = continues.as_deref().unwrap_or_default();
+                let template = template.unwrap_or_else(|| {
+                    init_entry::usage_error("koto init --supersede requires --template <path>")
+                });
+                let execution_dir = execution_dir.map(canonical_dir);
+                init_supersede::run(
+                    &backend,
+                    &init_supersede::SupersedeArgs {
+                        name: &name,
+                        template: &template,
+                        vars: &vars,
+                        intent: intent.as_deref(),
+                        dispatched_by: dispatched_by.as_deref(),
+                        pred,
+                        continues_from: continues_from.as_deref(),
+                        execution_dir: execution_dir.as_deref(),
+                        legacy_environment,
+                        carry: &carry,
+                        expect_state: expect_state.as_deref(),
+                    },
+                )?;
+                session_anchor::hold_from_env(&backend, &name, "init");
+                return Ok(());
+            }
+            // `--continues` is checked before anything is written, so a
+            // refused predecessor leaves no session behind (R3); the
+            // relation itself is written once the session exists, before
+            // the command reports it.
+            let continues = continues.as_deref().map(|pred| {
+                session::resolve_continues(&backend, &name, pred, continues_from.as_deref())
+                    .unwrap_or_else(|e| {
+                        exit_with_error_code(
+                            serde_json::json!({"error": e.message, "command": "init"}),
+                            e.exit,
+                        )
+                    })
             });
+            // Resolve `--execution-dir` once, before either init path:
+            // a directory that does not resolve is a caller error, and
+            // both paths record the canonical form.
+            let execution_dir = execution_dir.map(canonical_dir);
             if from_stdin {
                 // --from-stdin is the inline (strict-only) path. Reject the
                 // two incompatible flag combinations before reading stdin
@@ -1740,6 +2160,11 @@ pub fn run(app: App) -> Result<()> {
                     intent.as_deref(),
                     execution_dir.as_deref(),
                     legacy_environment,
+                    &|| {
+                        if let Some(target) = &continues {
+                            session::record_continues_at_init(&backend, &name, target);
+                        }
+                    },
                 )?;
                 // The inline path's helper sees the store only as a
                 // `SessionBackend`, so `--dispatched-by` is recorded here,
@@ -1768,6 +2193,7 @@ pub fn run(app: App) -> Result<()> {
                             vars: &vars,
                             intent: intent.as_deref(),
                             dispatched_by: dispatched_by.as_deref(),
+                            continues: continues.as_ref(),
                             execution_dir: execution_dir.as_deref(),
                             legacy_environment,
                         },
@@ -1784,6 +2210,7 @@ pub fn run(app: App) -> Result<()> {
                         execution_dir.as_deref(),
                         legacy_environment,
                         dispatched_by.as_deref(),
+                        continues.as_ref(),
                     )
                 };
                 // The agent session that ran this init holds the session
@@ -1808,6 +2235,10 @@ pub fn run(app: App) -> Result<()> {
             // Leaked so the exit flush can reach it from any exit path,
             // `std::process::exit` included. One per process, which ends.
             let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
+            // A superseded session is refused before anything below writes
+            // to it or anywhere else: the anchor's held-by link, the tick's
+            // own log appends.
+            refuse_next_if_superseded(backend, &name);
             let tick = name.clone();
             let _ = EXIT_FLUSH.set(Box::new(move || {
                 if let Err(e) = backend.flush_pending(&tick) {
@@ -1829,6 +2260,9 @@ pub fn run(app: App) -> Result<()> {
                 // A new id for this tick, which its commands' reads of other
                 // sessions are fresh for (`crate::session::sync_stamp`).
                 backend.begin_tick(&name);
+                // A back-reference its continues relation still owes goes
+                // up before the tick pushes anything.
+                backend.ensure_backref(&name);
             }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(
@@ -1849,17 +2283,22 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "cancel");
+            refuse_if_unlocated(&backend, &name, "cancel");
+            refuse_if_superseded(&backend, &name, "cancel");
             handle_cancel(&backend, backend.local_base_dir(), &name, cleanup)
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "rewind");
+            refuse_if_unlocated(&backend, &name, "rewind");
+            refuse_if_superseded(&backend, &name, "rewind");
             handle_rewind(&backend, &backend, &name, rationale)
         }
         Command::Status { name } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "status");
+            let read = || Command::Status { name: name.clone() };
+            if let Some(served) = locate_or_serve(&backend, &name, "status", read) {
+                return served;
+            }
             handle_status(&backend, &name)
         }
         Command::Workflows {
@@ -1918,11 +2357,23 @@ pub fn run(app: App) -> Result<()> {
             Ok(())
         }
         Command::Session {
-            subcommand: SessionCommand::Dir { name: None },
+            subcommand: SessionCommand::Dir { name: None, json },
         } => {
-            println!("{}", crate::koto_home::koto_home_or_err()?.display());
+            let root = crate::koto_home::koto_home_or_err()?;
+            if !json {
+                println!("{}", root.display());
+                return Ok(());
+            }
+            let config = crate::config::resolve::load_config()?;
+            println!(
+                "{}",
+                serde_json::to_string(&session_dir_report(&root, &config))?
+            );
             Ok(())
         }
+        Command::Session {
+            subcommand: SessionCommand::Needed { path },
+        } => session::handle_needed(&path),
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -1944,8 +2395,13 @@ pub fn run(app: App) -> Result<()> {
                     inputs.as_deref(),
                     coordinator_of_record.as_deref(),
                 ),
-                SessionCommand::Dir { name: Some(name) } => session::handle_dir(&backend, &name),
-                SessionCommand::Dir { name: None } => unreachable!("handled before the backend"),
+                SessionCommand::Dir {
+                    name: Some(name), ..
+                } => session::handle_dir(&backend, &name),
+                SessionCommand::Dir { name: None, .. } => {
+                    unreachable!("handled before the backend")
+                }
+                SessionCommand::Needed { .. } => unreachable!("handled before the backend"),
                 SessionCommand::List {
                     pinned: true, json, ..
                 } => session::handle_list_pinned(&backend, json),
@@ -1958,7 +2414,7 @@ pub fn run(app: App) -> Result<()> {
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
                     // And judge the hierarchy while the session is still in it.
-                    let live = session::live_members(backend.local_base_dir(), &name);
+                    let live = session::live_members(&backend, backend.local_base_dir(), &name);
                     session::handle_cleanup(&backend, &name)?;
                     session::warn_live_members(&name, &live);
                     let mut out = serde_json::json!({
@@ -1969,6 +2425,9 @@ pub fn run(app: App) -> Result<()> {
                     });
                     if let Some(e) = live.error {
                         out["live_members_error"] = serde_json::json!(e);
+                    }
+                    for (k, v) in live.relation {
+                        out[k] = v;
                     }
                     println!("{}", serde_json::to_string(&out)?);
                     Ok(())
@@ -1994,14 +2453,17 @@ pub fn run(app: App) -> Result<()> {
                         confirm_short_retention,
                         migrated_from: migrated_from.as_deref(),
                         source_retired,
-                        // Only marker mode reads the bound, so a config that
-                        // fails to load can't stop a session-mode prune.
+                        // Only marker mode reads the setting, to report it
+                        // ignored, so a config that fails to load can't stop
+                        // a session-mode prune.
                         marker_retain_days: match migrated_from {
-                            Some(_) => crate::config::resolve::load_config()?
-                                .session
-                                .cloud
-                                .marker_retain_days(),
-                            None => crate::config::DEFAULT_MARKER_RETAIN_DAYS,
+                            Some(_) => {
+                                crate::config::resolve::load_config()?
+                                    .session
+                                    .cloud
+                                    .marker_retain_days
+                            }
+                            None => None,
                         },
                     },
                 ),
@@ -2014,13 +2476,29 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "session resolve");
+                    // Migrated first: a source imported elsewhere refuses
+                    // before an owed back-reference goes up for it.
+                    refuse_if_migrated(&backend, &name, "session resolve");
+                    refuse_if_unlocated(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
+                }
+                SessionCommand::Flush { name } => {
+                    refuse_if_unlocated(&backend, &name, "session flush");
+                    let flushed = backend.flush_window(&name)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "flushed": flushed
+                        }))?
+                    );
+                    Ok(())
                 }
                 SessionCommand::Recover { apply, sessions } => {
                     session::handle_recover(&backend, apply, &sessions)
                 }
                 SessionCommand::Update { name, intent } => {
+                    refuse_if_migrated(&backend, &name, "session update");
                     session::handle_update(&backend, &name, &intent)?;
                     println!(
                         "{}",
@@ -2034,7 +2512,20 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Link {
                     session,
                     dispatched_by,
-                } => session::handle_link(&backend, &session, &dispatched_by),
+                    continues,
+                    continues_from,
+                } => match (dispatched_by, continues) {
+                    (Some(dispatched_by), None) => {
+                        session::handle_link(&backend, &session, &dispatched_by)
+                    }
+                    (None, Some(pred)) => session::handle_link_continues(
+                        &backend,
+                        &session,
+                        &pred,
+                        continues_from.as_deref(),
+                    ),
+                    _ => unreachable!("clap requires exactly one of the two"),
+                },
                 SessionCommand::Anchor { action } => session_anchor::handle(&backend, action),
                 SessionCommand::Pin { name, reason } => {
                     session::handle_pin(&backend, &name, &reason)
@@ -2046,6 +2537,15 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_hierarchy(&backend, &name, json)
                 }
                 SessionCommand::Rebind { name, to } => {
+                    if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "session rebind"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
                 SessionCommand::Import {
@@ -2086,15 +2586,50 @@ pub fn run(app: App) -> Result<()> {
             // where to run the command (koto#457); a session imported away
             // on this host still refuses as migrated, which the guard asks
             // before its own question.
-            refuse_if_bound_elsewhere(&backend, session, command);
-            if let Err(e) = backend.check_not_migrated(session) {
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": e.to_string(),
-                        "command": command
-                    }),
-                    EXIT_CALLER_ERROR,
-                );
+            //
+            // A read of a migrated session doesn't refuse: `get`, `exists`
+            // and `list` are answered from the copy the source left in the
+            // bucket, written nowhere and logged nowhere. `add` and
+            // `remove` refuse, naming where the session went.
+            let session = session.clone();
+            let served_read = matches!(
+                subcommand,
+                ContextCommand::Get { .. }
+                    | ContextCommand::Exists { .. }
+                    | ContextCommand::List { .. }
+            );
+            if served_read {
+                // The marker is asked for before an owed back-reference
+                // goes up, so a migrated source gets no pointer written.
+                let refused = match backend.check_located(&session) {
+                    Ok(()) => {
+                        let refused = backend.check_not_migrated(&session).err();
+                        if refused.is_none() {
+                            backend.ensure_backref(&session);
+                        }
+                        refused
+                    }
+                    Err(e) if e.is::<crate::session::SessionMigrated>() => Some(e),
+                    Err(e) => refuse_unlocated(&e, command),
+                };
+                if let Some(e) = refused {
+                    return workspace_read::serve_migrated_source(
+                        &backend,
+                        Command::Context { subcommand },
+                        e,
+                    );
+                }
+            } else {
+                refuse_if_unlocated(&backend, &session, command);
+                if let Err(e) = backend.check_not_migrated(&session) {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": e.to_string(),
+                            "command": command
+                        }),
+                        EXIT_CALLER_ERROR,
+                    );
+                }
             }
             match subcommand {
                 ContextCommand::Add {
@@ -2119,9 +2654,18 @@ pub fn run(app: App) -> Result<()> {
                             EXIT_CALLER_ERROR,
                         );
                     }
+                    // Before the store is written: the append that follows
+                    // the store write would refuse too, but too late.
+                    refuse_if_superseded(&backend, &session, "context add");
                     if let Err(e) =
                         context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
+                        // Under the cloud backend the fence can arrive with
+                        // the command's own pull, after the check above:
+                        // refuse in the same shape, naming the newest member.
+                        if crate::engine::persistence::session_superseded(&e).is_some() {
+                            refuse_if_superseded(&backend, &session, "context add");
+                        }
                         exit_with_error_code(
                             serde_json::json!({
                                 "error": e.to_string(),
@@ -2137,9 +2681,12 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
-                    let events = context::restore_assigned(store, &backend, &session, &key);
-                    // The reader's anchor decides where the read is logged
-                    // (DESIGN-session-retention.md, Decision 5).
+                    // The log answers a value a lost store write left
+                    // behind, without storing it: a read writes nothing
+                    // into the session it reads (DESIGN-koto-trusted-removal.md,
+                    // Decision 5). The reader's anchor decides where the read
+                    // is logged (DESIGN-session-retention.md, Decision 5).
+                    let events = context::read_session_log(&backend, &session, &key);
                     let reader_anchor = context::reader_anchor();
                     if let Err(e) = context::handle_get(
                         store,
@@ -2159,7 +2706,7 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
-                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    let events = context::read_session_log(&backend, &session, &key);
                     let reader_anchor = context::reader_anchor();
                     match context::handle_exists(
                         store,
@@ -2194,6 +2741,7 @@ pub fn run(app: App) -> Result<()> {
                             EXIT_CALLER_ERROR,
                         );
                     }
+                    refuse_if_superseded(&backend, &session, "context remove");
                     if let Err(e) = context::handle_remove(store, &backend, &session, &key) {
                         exit_with_error_code(
                             serde_json::json!({
@@ -2206,7 +2754,14 @@ pub fn run(app: App) -> Result<()> {
                     Ok(())
                 }
                 ContextCommand::List { session, prefix } => {
-                    if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {
+                    let events = backend
+                        .exists(&session)
+                        .then(|| backend.read_events(&session).ok())
+                        .flatten()
+                        .map(|(_, events)| events);
+                    if let Err(e) =
+                        context::handle_list(store, events.as_deref(), &session, prefix.as_deref())
+                    {
                         context::exit_with_failed_read("context list", &e);
                     }
                     Ok(())
@@ -2332,11 +2887,17 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             match subcommand {
                 DecisionsSubcommand::Record { name, with_data } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "decisions record");
+                    refuse_if_unlocated(&backend, &name, "decisions record");
+                    refuse_if_superseded(&backend, &name, "decisions record");
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "decisions list");
+                    let read = || Command::Decisions {
+                        subcommand: DecisionsSubcommand::List { name: name.clone() },
+                    };
+                    if let Some(served) = locate_or_serve(&backend, &name, "decisions list", read) {
+                        return served;
+                    }
                     handle_decisions_list(&backend, name)
                 }
             }
@@ -2350,11 +2911,17 @@ pub fn run(app: App) -> Result<()> {
                     rationale,
                     with_data,
                 } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "overrides record");
+                    refuse_if_unlocated(&backend, &name, "overrides record");
+                    refuse_if_superseded(&backend, &name, "overrides record");
                     overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
                 }
                 overrides::OverridesSubcommand::List { name } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "overrides list");
+                    let read = || Command::Overrides {
+                        subcommand: overrides::OverridesSubcommand::List { name: name.clone() },
+                    };
+                    if let Some(served) = locate_or_serve(&backend, &name, "overrides list", read) {
+                        return served;
+                    }
                     overrides::handle_overrides_list(&backend, name)
                 }
             }
@@ -2362,6 +2929,10 @@ pub fn run(app: App) -> Result<()> {
         Command::Disputes { subcommand } => {
             let backend = build_backend()?;
             disputes::handle(&backend, subcommand)
+        }
+        Command::Review { subcommand } => {
+            let backend = build_backend()?;
+            review::handle(&backend, subcommand)
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
@@ -2637,7 +3208,49 @@ fn handle_init(
     execution_dir: Option<&Path>,
     legacy_environment: bool,
     dispatched_by: Option<&str>,
+    continues: Option<&session::ContinuesTarget>,
 ) -> Result<()> {
+    let (initial_state, environment_report) = create_session(
+        backend,
+        name,
+        template,
+        vars,
+        parent,
+        intent,
+        execution_dir,
+        legacy_environment,
+        dispatched_by,
+        continues,
+        None,
+    )?;
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    add_environment_report(&mut out, environment_report.as_ref());
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+/// [`handle_init`]'s work short of printing: check the name, create the
+/// session, record its intent, continues relation and dispatched-by link,
+/// and return its initial state with the environment report. A refusal
+/// prints its error and exits, as `koto init` always has. `session_id`, for
+/// a top-level session only, is the header's id instead of a fresh one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_session(
+    backend: &Backend,
+    name: &str,
+    template: &str,
+    vars: &[String],
+    parent: Option<&str>,
+    intent: Option<&str>,
+    execution_dir: Option<&Path>,
+    legacy_environment: bool,
+    dispatched_by: Option<&str>,
+    continues: Option<&session::ContinuesTarget>,
+    session_id: Option<&str>,
+) -> Result<(String, Option<crate::engine::command_env::RecordReport>)> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
         exit_with_error_code(
@@ -2693,17 +3306,30 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    let environment_report = match init_child::init_child_from_parent_at(
-        backend,
-        parent,
-        name,
-        template_path,
-        vars,
-        &mut cache,
-        None,
-        execution_dir,
-        legacy_environment,
-    ) {
+    let created = match (session_id, parent) {
+        (Some(id), None) => init_child::init_session_with_id(
+            backend,
+            name,
+            template_path,
+            vars,
+            &mut cache,
+            execution_dir,
+            legacy_environment,
+            id,
+        ),
+        _ => init_child::init_child_from_parent_at(
+            backend,
+            parent,
+            name,
+            template_path,
+            vars,
+            &mut cache,
+            None,
+            execution_dir,
+            legacy_environment,
+        ),
+    };
+    let environment_report = match created {
         Ok(value) => value,
         Err(err) => {
             match err.kind {
@@ -2770,6 +3396,11 @@ fn handle_init(
         record_default_intent(backend, name);
     }
 
+    // `--continues`, checked before anything was written: the relation, in
+    // the new session only, before the session is reported.
+    if let Some(target) = continues {
+        session::record_continues_at_init(backend, name, target);
+    }
     // `--dispatched-by`, validated before anything was written: a link in
     // the new session only.
     if let Some(dispatcher) = dispatched_by {
@@ -2795,14 +3426,7 @@ fn handle_init(
                 name
             )
         })?;
-
-    let mut out = serde_json::json!({
-        "name": name,
-        "state": initial_state
-    });
-    add_environment_report(&mut out, environment_report.as_ref());
-    println!("{}", serde_json::to_string(&out)?);
-    Ok(())
+    Ok((initial_state, environment_report))
 }
 
 /// Handle the inline `koto init <name> --from-stdin` path.
@@ -2820,6 +3444,10 @@ fn handle_init(
 /// - strict-validation / compile failure → exit 1; the message is the
 ///   compiler's verbatim error, which names the failing element (state /
 ///   transition / gate) rather than a generic "invalid template".
+///
+/// `created` runs once the session exists and before it is reported: the
+/// caller's `--continues` relation.
+#[allow(clippy::too_many_arguments)]
 fn handle_init_inline(
     backend: &dyn SessionBackend,
     name: &str,
@@ -2828,6 +3456,7 @@ fn handle_init_inline(
     intent: Option<&str>,
     execution_dir: Option<&Path>,
     legacy_environment: bool,
+    created: &dyn Fn(),
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -2903,6 +3532,9 @@ fn handle_init_inline(
     } else {
         record_default_intent(backend, name);
     }
+    // The caller's links (`--continues`), written before the session is
+    // reported.
+    created();
 
     // Recover the initial state for the `{ name, state }` stdout line,
     // identical to the file path.
@@ -3794,12 +4426,14 @@ fn finish_terminal_tick(
         workspace::sweep_if_parent(backend, context_store, name, compiled);
         // Through the pin guard: a pin set since the retention check keeps
         // the session. A tick that holds the session's lock already (a
-        // batching state's) decides under that lock.
+        // batching state's) decides under that lock. Under the cloud
+        // backend a back-reference written beside it since the check is
+        // walked last, and a later session with standing keeps it too.
         let removal = match held {
-            Some(lock) => crate::session::pin::remove_guarded_with(backend, name, lock, || {
+            Some(lock) => crate::session::pin::remove_by_rule_with(backend, name, lock, || {
                 backend.cleanup(name)
             }),
-            None => crate::session::pin::remove_guarded(backend, name),
+            None => crate::session::pin::remove_by_rule(backend, name),
         };
         match removal {
             Ok(crate::session::pin::Removal::Removed) => {}
@@ -3808,6 +4442,13 @@ fn finish_terminal_tick(
                     "warning: session {name} was pinned since its terminal was reached, so it \
                      is kept: {}",
                     guard.text().unwrap_or_default()
+                );
+                forget_finished_record(backend, name);
+            }
+            Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                eprintln!(
+                    "warning: session {name} is kept: {}",
+                    crate::session::hierarchy::relation_text(&related).join("; ")
                 );
                 forget_finished_record(backend, name);
             }
@@ -4011,7 +4652,11 @@ pub(crate) mod finished_record_hooks {
 /// host doesn't keep), and a session about to be removed is checked for a
 /// pin object another host wrote, which keeps it as `pinned`; a bucket that
 /// can't be checked then keeps it as `bucket_unchecked`. A session kept for
-/// another reason costs no request.
+/// another reason costs no request. A session about to be removed whose pin
+/// guard is clear is then asked about the continues relation in the bucket
+/// (a successor this host never pulled), sharing the guard's listing; one
+/// the bucket's walk keeps is kept as `hierarchy`, and the report names its
+/// keepers.
 ///
 /// Returns the reason with the guard that read the pin, which the report
 /// prints ([`terminal_retention_report`]), so the decision and the report
@@ -4058,8 +4703,32 @@ fn terminal_retention(
         (Some(next_types::RetentionReason::NoCleanup), guard)
     } else {
         let guard = guard_removal(backend, name);
-        (kept_by(&guard), guard)
+        if kept_by(&guard).is_some() {
+            return (kept_by(&guard), guard);
+        }
+        // A session with no local edge may still be continued by a session
+        // only the bucket holds: the bucket's answer about the continues
+        // relation is asked here, at the one point the tick would remove
+        // it, after the pin guard, whose listing it shares. It keeps the
+        // session as `hierarchy`, and the report names the keepers.
+        let related = crate::session::continues_bucket::bucket_keepers(
+            backend,
+            name,
+            &crate::session::continues_bucket::Clock::configured(),
+        );
+        if related.keeps() {
+            BUCKET_RELATION.with(|r| *r.borrow_mut() = Some(related));
+            return (Some(next_types::RetentionReason::Hierarchy), guard);
+        }
+        (None, guard)
     }
+}
+
+thread_local! {
+    /// What the bucket said continues a session this tick keeps for it,
+    /// from [`terminal_retention`] to the report it prints.
+    static BUCKET_RELATION: std::cell::RefCell<Option<crate::session::hierarchy::RelationVerdict>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The `retention` a terminal tick reports: the reason it keeps the
@@ -4086,11 +4755,46 @@ fn terminal_retention_report(
     } else {
         Vec::new()
     };
+    let relation = match reason {
+        Some(_) => terminal_relation(backend, name),
+        None => Default::default(),
+    };
     next_types::Retention {
         reason,
         pin,
+        relation,
         kept_children,
     }
+}
+
+/// The continues relation's report for a session a terminal tick keeps:
+/// `relation_keepers` (and `relation_unreadable`) when a later session
+/// continuing it has standing. Judged only when a continues link may name
+/// the session ([`crate::session::hierarchy::relation_probe`]), so a tick
+/// of a session no relation names reads no more than it did
+/// (DESIGN-koto-session-continues.md, Decision 5). A judgment that can't
+/// be made reports nothing: the session is kept either way.
+fn terminal_relation(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings};
+    // Kept for what only the bucket holds: the tick already asked it.
+    if let Some(related) = BUCKET_RELATION.with(|r| r.borrow_mut().take()) {
+        return hierarchy::relation_report_json(&related);
+    }
+    let dir = backend.session_dir(name);
+    let Some(base) = dir.parent() else {
+        return Default::default();
+    };
+    if !hierarchy::relation_probe(base, name) {
+        return Default::default();
+    }
+    let (Ok(settings), Ok(graph)) = (RetentionSettings::load(), Graph::scan(base)) else {
+        return Default::default();
+    };
+    let related = Judge::new(&graph, settings, std::time::SystemTime::now()).relation(name);
+    hierarchy::relation_report_json(&related)
 }
 
 /// Promote a bound leg's result onto its request log.
@@ -4183,6 +4887,52 @@ fn promote_leg_result(
             retryable
         }
     }
+}
+
+/// Answer a self-attached leg when its session is cancelled.
+///
+/// A cancel never reaches a terminal tick, so nothing else would promote
+/// onto the leg, and a self-attached leg refuses the fenced verbs,
+/// `abandon` among them, so its requester could not close it either. The
+/// cancel promotes a failure itself, with `final_state` `cancelled`, the
+/// name `request_store::attach` and `init_entry` already give a cancelled
+/// session. A leg a coordinator bound is left alone: its requester can
+/// still abandon it under the epoch fence. That is why the leg is read
+/// here before `promote_leg_result`, which would promote onto any leg.
+#[cfg(unix)]
+fn promote_cancel_onto_self_attached_leg(session_dir: &std::path::Path, state: &str) {
+    use crate::engine::request_store::{self, ValidatedRequestId};
+    use crate::engine::types::{LegDisposition, TerminalOutcome, WorkflowResult};
+
+    let Some(pointer) = crate::engine::leg_pointer::read_pointer_best_effort(session_dir) else {
+        return;
+    };
+    let (Some(root), Ok(request_id)) = (
+        crate::koto_home::koto_home(),
+        ValidatedRequestId::new(&pointer.request_id),
+    ) else {
+        return;
+    };
+    let open_self_attached = match request_store::read_view(&root, &request_id) {
+        Ok(view) => view
+            .leg(&pointer.leg_name)
+            .is_ok_and(|leg| leg.disposition == LegDisposition::Open && leg.is_self_attached()),
+        Err(e) => {
+            eprintln!("warning: leg result promotion skipped: {e}");
+            false
+        }
+    };
+    if !open_self_attached {
+        return;
+    }
+    let result = WorkflowResult::with_string_payload(
+        TerminalOutcome::Failure,
+        format!("cancelled in state '{state}'"),
+        [("outcome", "cancelled"), ("state", state)],
+    );
+    // No later tick retries a cancel, so a retryable failure is only
+    // warned about, as promote_leg_result already does.
+    promote_leg_result(&pointer, &result, "cancelled");
 }
 
 // ===========================================================
@@ -4363,6 +5113,7 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
         ),
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &timestamp) {
         // Losing the audit costs an operator the ability to tell "never
@@ -5407,6 +6158,9 @@ fn handle_next(
     // The per-call consultation cap, shared by the routing decider's port and
     // the check evaluator.
     let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
+    // The per-call unit budget unit-mode checks draw from, apart from the
+    // shared cap so units never spend the routing decider's allowance.
+    let unit_budget = crate::cli::check_evaluator::UnitBudget::new();
 
     // Check for reserved variable name collisions in the template.
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
@@ -5496,6 +6250,7 @@ fn handle_next(
             &command_env,
         )
         .with_ledger_root(ledger_root())
+        .with_unit_budget(unit_budget)
         // Every tick that consults waits for the lock; an evaluator built
         // without this tries it once.
         .with_lock_wait(crate::cli::check_evaluator::lock_wait_for(
@@ -5942,14 +6697,28 @@ fn handle_next(
                     ),
                 };
                 println!("{}", serde_json::to_string(&out)?);
+                // The rules the printed directive carried, recorded after
+                // the print and before `instructions_delivered`, in the order
+                // the natural path uses. No gate ran on this path, so there
+                // are no check deliveries to put ahead of them.
+                append_rule_deliveries(
+                    backend,
+                    &name,
+                    directive_deliveries(&compiled, &resp, &variables, &overlay),
+                );
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
                 // has already shipped.
-                if resp.carries_details() {
+                // Every response that prints a directive is recorded, with
+                // whether it carried the details: details suppression counts
+                // only the records that did, and the run journal reads any
+                // record as "the directive was shown".
+                if resp.directive_parts().is_some() {
                     let ts = now_iso8601();
                     let delivery_payload = EventPayload::InstructionsDelivered {
                         state: target.clone(),
+                        details_included: Some(resp.carries_details()),
                     };
                     if let Err(e) = backend.append_event(&name, &delivery_payload, &ts) {
                         eprintln!(
@@ -6254,11 +7023,20 @@ fn handle_next(
             // a failure here (deleted cwd, permission issues) leaves the
             // field `None` and the resolver tolerates the absence.
             let submitter_cwd = std::env::current_dir().ok();
+            // The enum and boolean values telemetry may carry, read against
+            // the state's declared `accepts` while the compiled template is
+            // at hand; the run journal relays them as `evidence_field`.
+            let exported_fields = crate::run_journal::exported_fields(
+                accepts,
+                data.as_object()
+                    .expect("validate_evidence guarantees object input"),
+            );
             let payload = EventPayload::EvidenceSubmitted {
                 state: current_state.clone(),
                 fields,
                 submitter_cwd,
                 source: None,
+                exported_fields,
             };
             if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                 let ne = NextError {
@@ -6343,6 +7121,9 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+    // The log's last seq before this tick evaluates anything: the check
+    // events past it are this tick's own.
+    let pre_advance_seq = current_events.last().map(|e| e.seq).unwrap_or(0);
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
@@ -6360,8 +7141,9 @@ fn handle_next(
 
     // Repair any transition `context_assignments` an earlier tick recorded
     // but did not get into the store, before a context gate reads it
-    // (koto#204). Non-fatal: the log still holds the value and the next read
-    // tries again.
+    // (koto#204). This is the one place a lost value is stored: a read
+    // answers it from the log and writes nothing. Non-fatal: the log still
+    // holds the value and the next tick tries again.
     if let Err(e) =
         crate::engine::context_assign::reconcile(context_store, &name, &current_events, None)
     {
@@ -6372,8 +7154,9 @@ fn handle_next(
     //
     // A `Transitioned` event carrying `context_assignments` is appended first
     // and then projected into the context store. The append is the commit
-    // point; a store write that fails here is repaired from the log on the
-    // next read, so it is reported rather than failing the tick.
+    // point; a store write that fails here is answered from the log by any
+    // read and stored by the next tick, so it is reported rather than
+    // failing the tick.
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
         // The advance loop asks for a clearing by appending its event; the
         // clearing itself (re-derived from the persisted log, keys removed
@@ -6413,7 +7196,7 @@ fn handle_next(
             {
                 eprintln!(
                     "warning: transition recorded, but writing its context_assignments failed: {}; \
-                     the next read restores them from the log",
+                     reads answer them from the log and the next tick stores them",
                     e
                 );
             }
@@ -6540,6 +7323,7 @@ fn handle_next(
                             ..Default::default()
                         },
                         stderr_ends_with_note: true,
+                        markers: Default::default(),
                     };
                     return ActionResult::Failed {
                         command,
@@ -7528,6 +8312,17 @@ fn handle_next(
             // response with blocking conditions
             // (DESIGN-koto-failure-reporting.md, Decision 3).
             next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
+            // A failed decider check's rules, levelled by the counts just
+            // attached (DESIGN-doc-rule-checks-m4.md, Decision 4).
+            let rule_deliveries = match compiled.states.get(final_state.as_str()) {
+                Some(st) => next_types::attach_rules(
+                    &mut envelope,
+                    final_state,
+                    &st.gates,
+                    attempts.as_ref(),
+                ),
+                None => Vec::new(),
+            };
             // A passing check's warnings, after `attempts` and only when
             // there are any.
             next_types::attach_advisories(&mut envelope, &advisories)?;
@@ -7536,6 +8331,27 @@ fn handle_next(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
             );
+            // Each rule handed back is recorded only after the print, as
+            // the delivery below is: a crash in between loses the record,
+            // never the delivery. The record holds no text. A command
+            // check's own reports, kept on this tick's `gate_evaluated`
+            // events, follow the decider check's. This tick wrote those
+            // events locally, so the local read sees them without a pull.
+            let check_deliveries = backend
+                .read_events_local(&name)
+                .map(|(_, events)| check_output_deliveries(&events, pre_advance_seq))
+                .unwrap_or_default();
+            // The rules the printed directive carried come last: they were
+            // delivered by this print, after every check that ran this tick.
+            let carried = directive_deliveries(&compiled, &resp, &variables, &overlay);
+            append_rule_deliveries(
+                backend,
+                &name,
+                rule_deliveries
+                    .into_iter()
+                    .chain(check_deliveries)
+                    .chain(carried),
+            );
             // The delivery record is appended only after the response
             // prints, so a crash between the two re-delivers on the
             // next tick rather than silently suppressing
@@ -7543,10 +8359,13 @@ fn handle_next(
             // advancement path", step 4). Non-fatal on error, matching
             // the SchedulerRan/BatchFinalized append idiom above: the
             // response has already shipped and cannot be un-printed.
-            if resp.carries_details() {
+            // Every response that prints a directive is recorded, with
+            // whether it carried the details (see the directed path).
+            if resp.directive_parts().is_some() {
                 let ts = now_iso8601();
                 let payload = EventPayload::InstructionsDelivered {
                     state: final_state.clone(),
+                    details_included: Some(resp.carries_details()),
                 };
                 if let Err(e) = backend.append_event(&name, &payload, &ts) {
                     eprintln!(
@@ -7620,6 +8439,78 @@ fn journal_response(
             details,
         );
     }
+}
+
+/// Append one `rule_delivered` event per delivery, in order. Called only
+/// after the response has printed, so a failed append is a warning: the
+/// delivery already happened and can't be taken back.
+#[cfg(unix)]
+fn append_rule_deliveries(
+    backend: &dyn SessionBackend,
+    name: &str,
+    deliveries: impl IntoIterator<Item = crate::decider::check::RuleDelivered>,
+) {
+    for delivery in deliveries {
+        let payload = EventPayload::RuleDelivered(delivery);
+        if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
+            eprintln!("warning: failed to append RuleDelivered event: {}", e);
+        }
+    }
+}
+
+/// The `rule_delivered` events for the `directive_rules` of the state whose
+/// directive `resp` printed: one per entry whose `when_set` value is
+/// non-empty, in declared order. Nothing for a response that printed no
+/// directive. The value is read through the same lookup the directive's
+/// substitution used, so for a directive that interpolates `when_set` the
+/// rule records exactly when its text was carried.
+#[cfg(unix)]
+fn directive_deliveries(
+    compiled: &CompiledTemplate,
+    resp: &next_types::NextResponse,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    let Some((state, _, _)) = resp.directive_parts() else {
+        return Vec::new();
+    };
+    let Some(template_state) = compiled.states.get(state) else {
+        return Vec::new();
+    };
+    template_state
+        .directive_rules
+        .iter()
+        .filter(|rule| {
+            variables
+                .value_with(&rule.when_set, overlay)
+                .is_some_and(|v| !v.is_empty())
+        })
+        .map(|rule| crate::decider::check::RuleDelivered::from_directive(state, rule))
+        .collect()
+}
+
+/// The `rule_delivered` events for the rules command gates said they
+/// printed or refused this tick: one per entry of `rules_delivered` on each
+/// `gate_evaluated` past `after_seq`, in log order. A check that printed no
+/// `::koto-rule-delivered::` line contributes nothing.
+#[cfg(unix)]
+fn check_output_deliveries(
+    events: &[Event],
+    after_seq: u64,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    events
+        .iter()
+        .filter(|e| e.seq > after_seq)
+        .filter_map(|e| match &e.payload {
+            EventPayload::GateEvaluated {
+                state, gate, check, ..
+            } => Some(check.rules_delivered.iter().map(move |printed| {
+                crate::decider::check::RuleDelivered::from_check_output(state, gate, printed)
+            })),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Non-unix stub for handle_next.
@@ -7890,7 +8781,7 @@ fn handle_decisions_record(
 ///
 /// Returns accumulated decisions for the current state's epoch as a
 /// standalone JSON response.
-fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<()> {
+fn handle_decisions_list(backend: &Backend, name: String) -> Result<()> {
     if !backend.exists(&name) {
         exit_with_error_code(
             serde_json::json!({
@@ -7903,6 +8794,14 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 
     let (_, events) = match backend.read_events(&name) {
         Ok(result) => result,
+        // A session imported elsewhere is answered from the copy it left
+        // in the bucket.
+        Err(err) if err.is::<crate::session::SessionMigrated>() => {
+            let read = Command::Decisions {
+                subcommand: DecisionsSubcommand::List { name },
+            };
+            return workspace_read::serve_migrated_source(backend, read, err);
+        }
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
             exit_with_error_code(
@@ -8007,9 +8906,18 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
 
     let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
+        // A session imported elsewhere is answered from the copy it left
+        // in the bucket, as a read-only predecessor of the copy.
+        Err(err) if err.is::<crate::session::SessionMigrated>() => {
+            let read = Command::Status {
+                name: name.to_string(),
+            };
+            return workspace_read::serve_migrated_source(backend, read, err);
+        }
         Err(err) => {
             // A session imported elsewhere exits 2, as `koto next` does for
-            // it: the caller continues it where the message says.
+            // it, when it can't be served (the reader's own backend): the
+            // caller continues it where the message says.
             let code = if err
                 .downcast_ref::<crate::session::SessionMigrated>()
                 .is_some()
@@ -8542,7 +9450,9 @@ fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_
 /// Handle the `koto cancel` command.
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
-/// and cancel of already-terminal workflows. When `cleanup` is true, also
+/// and cancel of already-terminal workflows. A session self-attached to a
+/// request leg answers it with a cancelled result
+/// ([`promote_cancel_onto_self_attached_leg`]). When `cleanup` is true, also
 /// removes the session directory after the event is written so the name can
 /// be reused without a separate `koto session cleanup` call; the output then
 /// names, under `live_members`, every other live member of its hierarchy in
@@ -8660,12 +9570,16 @@ fn handle_cancel(
         }));
     }
 
+    // Before any `--cleanup` removal, which takes the leg pointer with it.
+    #[cfg(unix)]
+    promote_cancel_onto_self_attached_leg(&backend.session_dir(name), current_state);
+
     let children = query_children(backend, name);
 
     // Capture children before cleanup — once the session is removed the
     // relationship disappears from the backend listing. We still report
     // them so the caller has the same visibility regardless of --cleanup.
-    let live = cleanup.then(|| session::live_members(sessions_base, name));
+    let live = cleanup.then(|| session::live_members(backend, sessions_base, name));
     let cleaned = if cleanup {
         match crate::session::pin::remove_guarded(backend, name) {
             Ok(crate::session::pin::Removal::Kept(guard)) => {
@@ -8685,6 +9599,9 @@ fn handle_cancel(
                 forget_finished_record(backend, name);
                 true
             }
+            // An explicit removal: the relation never stops it, so the
+            // guard never answers this.
+            Ok(crate::session::pin::Removal::KeptByRelation(_)) => false,
             Err(e) => {
                 // The cancel event is already persisted; surface the
                 // cleanup failure without rolling back.
@@ -8713,6 +9630,9 @@ fn handle_cancel(
         out["live_members"] = serde_json::json!(live.members);
         if let Some(e) = live.error {
             out["live_members_error"] = serde_json::json!(e);
+        }
+        for (k, v) in live.relation {
+            out[k] = v;
         }
     }
     println!("{}", serde_json::to_string(&out)?);
@@ -8935,6 +9855,7 @@ mod tests {
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: name.to_string(),
             version: "1.0".to_string(),
@@ -9126,6 +10047,7 @@ Done.
             None,
             None,
             false,
+            &|| {},
         )
         .expect("inline init");
 
@@ -9152,6 +10074,7 @@ Done.
             Some("My explicit intent"),
             None,
             false,
+            &|| {},
         )
         .expect("inline init");
 
@@ -9188,6 +10111,7 @@ Done.
             None,
             false,
             None,
+            None,
         )
         .expect("init should succeed");
 
@@ -9218,6 +10142,7 @@ Done.
             None,
             None,
             false,
+            None,
             None,
         )
         .expect("init should succeed");
@@ -9253,6 +10178,7 @@ Done.
             None,
             None,
             false,
+            &|| {},
         )
         .expect("inline init should succeed");
 
@@ -9305,6 +10231,7 @@ Done.
             None,
             None,
             false,
+            None,
             None,
         )
         .expect("init should succeed");
@@ -9693,6 +10620,7 @@ Done.
                     .collect(),
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -9819,6 +10747,7 @@ Done.
         states.insert("done".to_string(), TemplateState::default());
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "child".to_string(),
             version: "1".to_string(),
@@ -10153,6 +11082,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let substituted =
@@ -10221,6 +11151,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -10296,6 +11227,7 @@ Done.
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -10371,6 +11303,7 @@ Done.
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -10461,6 +11394,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -10542,6 +11476,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let expected_command = {

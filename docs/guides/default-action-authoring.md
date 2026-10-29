@@ -803,7 +803,11 @@ so early rather than to ration anything.
 
 After the command exits zero, koto trims the output and then checks it, in this order:
 
-1. **Empty.** Nothing, or nothing but whitespace.
+1. **Empty.** Nothing, or nothing but whitespace. An action that sets
+   `capture_allow_empty: true` beside `capture_stdout_as` skips this case: the
+   empty output is delivered as the empty string, and a directive that
+   interpolates the name renders nothing. Use it when a command's silence is
+   an answer; the other three checks still apply to a non-empty output.
 2. **Redacted.** The output held a credential koto knows about -- a token or proxy password
    from the environment, a `pass_env:` value, or koto's own decider or cloud key -- and koto
    replaced it with a `[REDACTED:<source>]` marker before anything read the output. A marker

@@ -450,6 +450,103 @@ Body text.
         }
     }
 
+    /// The four `koto review record` events: a well-formed line of each
+    /// validates clean, and one missing a required field or carrying a value
+    /// outside its closed set is rejected, so the contract declares them
+    /// rather than skipping them as unknown.
+    #[test]
+    fn shipped_spec_declares_the_review_events() {
+        let line = |event: &str, payload: Value| {
+            serde_json::json!({
+                "seq": 1,
+                "timestamp": "2024-01-01T00:00:00Z",
+                "type": event,
+                "payload": payload,
+            })
+            .to_string()
+        };
+        let good = [
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_type": "prd", "schema": "prd/v1", "round": 1, "seat_count": 3, "fallback": false}),
+            ),
+            line(
+                "review_verdict_recorded",
+                serde_json::json!({"doc_type": "plan", "schema": "plan/v2", "round": 2, "seat": "other", "rule_id": "rs-001", "section": "goals", "verdict": "fail"}),
+            ),
+            line(
+                "review_decision_recorded",
+                serde_json::json!({"doc_type": "design", "schema": "absent", "round": 1, "decision": "fix_and_proceed"}),
+            ),
+            line(
+                "doc_check_recorded",
+                serde_json::json!({"doc_type": "brief", "schema": "other", "rule_id": "r1", "outcome": "error"}),
+            ),
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_format": "vision", "schema": "absent", "round": 1, "seat_count": 3, "fallback": false}),
+            ),
+            line(
+                "doc_rule_checks_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "roadmap", "moment": "pre_jury", "entries": [{"rule_id": "r1", "outcome": "not_ready"}]}),
+            ),
+            line(
+                "doc_section_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "section": "other", "write": "first"}),
+            ),
+            line(
+                "doc_fix_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "design", "answers": "jury_fail", "round": 2, "entries": [{"rule_id": "rs-1", "section": "goals", "check_rule": "none"}]}),
+            ),
+        ];
+        let log = write_temp(&format!(
+            "{}\n{}\n",
+            anchored_header_line(),
+            good.join("\n")
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+
+        for bad in [
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_type": "prd"}),
+            ),
+            line(
+                "review_verdict_recorded",
+                serde_json::json!({"doc_type": "plan", "schema": "plan/v2", "round": 2, "seat": "other", "rule_id": "rs-001", "section": "goals", "verdict": "PASS"}),
+            ),
+            line(
+                "review_decision_recorded",
+                serde_json::json!({"doc_type": "design", "schema": "design/v9", "round": 1, "decision": "proceed"}),
+            ),
+            line(
+                "doc_check_recorded",
+                serde_json::json!({"doc_type": "brief", "schema": "other", "rule_id": "r1", "outcome": "timed_out"}),
+            ),
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_format": "memo", "schema": "absent", "round": 1, "seat_count": 3, "fallback": false}),
+            ),
+            line(
+                "doc_rule_checks_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "moment": "later", "entries": []}),
+            ),
+            line(
+                "doc_section_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "section": "other", "write": "append"}),
+            ),
+            line(
+                "doc_fix_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "design", "answers": "jury_fail"}),
+            ),
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), bad));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(result.is_err(), "accepted: {bad}");
+        }
+    }
+
     /// A well-formed `decider_consulted` line, as a consulting run writes it.
     const DECIDER_CONSULTED: &str = r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_consulted","payload":{"state":"review","visit_seq":1,"provider":"jev","model":"jev-1","input_sha256":"ab","outcome":"applied","latency_ms":12,"directive_bytes":300,"endpoint_origin":"default","fields":{"verdict":{"declaration_hash":"cd","modes":{"proceed":"auto"},"probabilities":{"proceed":0.95,"unclear":0.05},"winning":"proceed","confidence":0.95,"threshold":0.9,"at_threshold":true,"outcome":"qualified"}}}}"#;
 

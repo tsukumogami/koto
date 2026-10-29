@@ -36,7 +36,7 @@ states:
 
 Required fields: `name`, `version`, `initial_state`, `states`.
 
-Optional fields: `description`, `variables`, `pass_env` (environment variable names a gate or action command reads; see [`pass_env:`](#pass_env--variables-a-command-reads)).
+Optional fields: `description`, `variables`, `pass_env` (environment variable names a gate or action command reads; see [`pass_env:`](#pass_env--variables-a-command-reads)), `review_vocabulary` (seat names and section slugs `koto review record` may record; see [`review_vocabulary:`](#review_vocabulary--seats-and-sections-a-review-may-record)).
 
 ### Variables
 
@@ -832,6 +832,67 @@ session never starts or resumes on it; compile the template again from its
 source. The full reference is `docs/guides/decider-authoring.md` ("Checking
 the agent's work").
 
+#### Unit mode: grading each item on its own
+
+A check whose output is a list of items (acceptance criteria, sections,
+findings) can grade each one apart with `units: jsonl`. The command then prints
+one JSON object per line, `{"key": "ac-1", "text": "...", "document": "prd",
+"section": "acceptance-criteria"}`, where `key` and `text` are required and
+`document` and `section` are optional. Each unit is graded against each
+criterion on its own, and only that unit's text is sent:
+
+```yaml
+gates:
+  acceptance:
+    type: decider-check
+    command: "cat units.jsonl"
+    max_bytes: 512             # now the budget for one unit's text
+    units: jsonl
+    max_units: 8               # optional: grade at most this many units
+    unit_document: prd         # optional: the label the run journal exports
+    unit_section: acceptance-criteria
+    criteria:
+      ac_binary:
+        rule_ref: "https://example.org/rules/ac-binary"
+        question: "Can this acceptance criterion be checked pass or fail with no judgment?"
+        pass: "It names one observable outcome a tester can check."
+        fail: "It needs judgment, or names no observable outcome."
+        escape: "It isn't an acceptance criterion."
+        mode: veto
+        summary: "State one observable outcome per criterion."     # optional, 1-300 bytes
+        rule_text: "Each acceptance criterion names one observable outcome a tester can check without judgment."  # optional, 1-4096 bytes
+```
+
+- **The unit bound.** One `koto next` sends at most 32 unit consultations, a
+  budget apart from the four-consultation cap routing and single-slice checks
+  share. The compiler sums `max_units` times criteria over a state's unit-mode
+  checks and refuses more than 32. A check without `max_units` gets the
+  default share: 32 divided by the criteria across the state's unit-mode
+  checks, rounded down (16 for a two-criterion check alone), or of what the
+  checks declaring `max_units` leave. Units past the cap fall back with
+  `unit_limit`.
+- **Per-unit outcomes.** A failing unit gives an error finding whose `unit`
+  names it, and `output.units` lists every printed unit in order with the
+  criteria it `failed`, is `awaiting` on, or the agent answered. A unit over
+  `max_bytes`, or one the decider gives no verdict for, falls back to the agent
+  alone; its waiting finding's command carries `--unit <key>`. An empty unit
+  isn't graded. A line that isn't such an object, a key outside the name shape
+  below (one starting with `-`, say), or a key printed twice fails the
+  extraction (`extraction_failed`) and names no unit.
+- **The labels.** `unit_document` and `unit_section` are names (letters,
+  digits and `._:/@-`, 1 to 128 bytes, not starting with `/`, `~` or `-`). The
+  run journal exports them in place of what the extraction printed, which it
+  only ever exports as a digest. They don't move the declaration hash.
+- **The rule coming back.** A veto criterion that fails hands its rule back in
+  the blocking condition's `rules`: `summary` on the first failing evaluation
+  of that check and rule in the visit, `rule_text` on every one after it. A
+  criterion declaring only one gets that one; declaring neither adds nothing.
+  Shadow criteria deliver nothing. Both texts work on single-slice checks too.
+
+`max_units`, `unit_document` and `unit_section` belong to unit-mode checks
+only (`E-DECIDER-CHECK-UNITS`); an empty or over-long `summary` or `rule_text`
+is `E-DECIDER-CHECK-RULE`.
+
 ### Findings: telling the agent why a check failed
 
 A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object on their blocking condition beside `output`. It holds `findings`, `findings_truncated`, and for command gates and actions the `captured` streams. None of it is routable: `when` clauses, `override_default` and recorded overrides see only the fields in the table above.
@@ -859,6 +920,33 @@ A command that knows more prints one finding per line to **stdout**, prefixed wi
 The prefix must start the line and the object must be the only thing after it. A missing required key, a wrong type, an empty `rule_id`, an unknown `level`, or a `line` without `path` (or `column` without `line`) makes the whole line ordinary output. `null` counts as absent and unknown keys are ignored. Standard error is never read for findings, finding lines stay in the captured text, and a check that exits 0 returns no `failure` whatever it printed. The exit status decides pass or fail, not the levels. A passing check's `warning` findings still reach the agent, under the response's top-level `advisories`, without blocking, so `warning` is the level for something the agent should see but needn't fix to move on; `info` stays out of the response.
 
 Emit these lines from a wrapper -- `jq` over a linter's JSON output, a few lines of Python -- rather than hand-built `echo`, so the JSON is always valid. Caps, ordering past 100 findings, `message_source` and `effect_landed` are in the [`default_action` authoring guide's Reporting findings section](../../../../../docs/guides/default-action-authoring.md#reporting-findings), which applies to gates as well as actions. You own what your checks print: koto redacts only the credentials it knows about, and the agent reads findings as data, not instructions.
+
+#### Saying "not ready" (telemetry only)
+
+A check whose input wasn't there to judge yet (no pull request open, no body written) can say so, for telemetry, in either of two ways:
+
+- print a line that starts with `::koto-not-ready::` on **stdout**; anywhere else in a line, or indented, it's ordinary output;
+- on a `command` gate, list the exit codes that mean it in `not_ready_exit_codes` (1 to 255; refused on other gate types):
+
+```yaml
+gates:
+  pr_body:
+    type: command
+    command: ./check-pr-body.sh
+    not_ready_exit_codes: [2]
+```
+
+Either one marks the evaluation `not_ready` in its run-journal record and nothing more: the outcome, routing, overrides and the fallback finding are exactly what they'd be without it. A check that echoes text it didn't write (a PR body, a commit message) should prefix those lines so none starts with `::`.
+
+#### Reporting rule deliveries (telemetry only)
+
+A `command` gate's check that hands the agent a rule's text, or declines to, can say so with one stdout line per rule:
+
+```
+::koto-rule-delivered::{"rule_id":"pr-body/one-separator","extent":"full","delivery":"refused"}
+```
+
+The object takes exactly three keys: `rule_id` (non-empty), `extent` (`summary` or `full`) and `delivery` (`printed` or `refused`). Any other shape, or the prefix anywhere but at the start of the line, is ordinary output. koto keeps each valid line on the gate's evaluation and, once the `koto next` response has printed, records a `rule_delivered` event for it. Nothing else changes: the outcome, routing and findings are the same with or without the line.
 
 ### Routing on gate output (`gates.*` paths)
 
@@ -1118,6 +1206,7 @@ states:
 |---|---|---|---|
 | `command` | Yes | string | The command line, passed to `/bin/sh -c` as a single string |
 | `capture_stdout_as` | No | string | A name the command's trimmed stdout is delivered under, readable by later states |
+| `capture_allow_empty` | No | bool | With `capture_stdout_as`: deliver an empty output as the empty string instead of failing the tick |
 | `fallback` | No | string | Prose the agent reads when the action fails. Spliced onto `directive` after substitution, so write it as literal text |
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. An absolute literal is a compile error |
 | `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
@@ -1149,7 +1238,17 @@ Read it anywhere a variable can be read: a later directive or details section, a
 
 Two bounds apply and they do different jobs. **64KB per stream** bounds what the response and event log carry. **4096 bytes** bounds what a capture may deliver, measured after trimming -- far smaller because a captured value is a token landing in prose and possibly a shell word, not a transcript.
 
-Delivery fails four ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it held a known credential that koto replaced with a `[REDACTED:<source>]` marker (`redacted`, with `source` naming where the credential came from), it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@+ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+Delivery fails four ways (three under `capture_allow_empty: true`, below), all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it held a known credential that koto replaced with a `[REDACTED:<source>]` marker (`redacted`, with `source` naming where the credential came from), it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@+ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+
+**`capture_allow_empty: true`** turns the `empty` case into a value: an output that is empty once trimmed is delivered as the empty string, so a directive that interpolates the name renders nothing in its place. Use it for a command whose silence is an answer, such as one that prints a rule only for some runs. A non-empty output still takes every other check, and without the flag an empty output fails exactly as described above. The compiler refuses the flag on an action with no `capture_stdout_as`.
+
+```yaml
+  changelog_rule:
+    default_action:
+      command: ./changelog-rule.sh
+      capture_stdout_as: CHANGELOG_RULE
+      capture_allow_empty: true
+```
 
 Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token. That covers a state's own action: a `{{NAME}}` in `command` or in `working_dir` is checked before either is substituted, so the token never reaches `sh -c` and nothing is spawned. It is a stop and not an action failure, so `fallback` prose is not delivered for it.
 
@@ -1196,6 +1295,18 @@ Declared values are read live on each tick and never written to the session, so 
 **Every declared value is treated as a credential.** koto can't tell a token from a hostname, so any `pass_env:` value 8 bytes or longer that reaches a command is replaced with `[REDACTED:<NAME>]` in that command's output before the response, the session log or a finding sees it. A `capture_stdout_as` whose output holds one is refused with `capture_error.case: "redacted"`, naming the variable and never the value. So don't declare a variable whose value you need a command to print back or capture; pass it through a template variable instead if it isn't secret. A value under 8 bytes is never matched. A template that declares nothing compiles to the same hash as before the field existed. A command can still set variables for itself (`GIT_DIR=/srv/mirror.git git log -1`).
 
 Author with two more facts in mind. `PATH` is recorded without its empty and relative entries (`.`, `node_modules/.bin`), so a command that relied on one must spell the path, such as `./node_modules/.bin/eslint`. And the record can't change after creation: a tool that moves off the recorded `PATH` fails until the session is replaced, and koto's response says so when it happens. For the full picture, including `koto init --legacy-environment` (this release only) and what the fixed environment does and doesn't protect against, see [What a command's environment is](../../../../../docs/guides/default-action-authoring.md#what-a-commands-environment-is).
+
+### `review_vocabulary:` — seats and sections a review may record
+
+`koto review record` records a document review's per-seat verdicts as telemetry (see [review record](../../../../../docs/guides/cli-usage.md#review-record)). A verdict names a seat and a section, and koto stores either one as given only when the session's template declares it; any other value is stored as `other`, so a caller can't put an arbitrary string into telemetry. A template that runs document reviews declares the names it allows:
+
+```yaml
+review_vocabulary:
+  seats: [clarity, scope, feasibility]
+  sections: [problem-statement, goals, scope-boundary, frontmatter, document]
+```
+
+Each name must be 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`, appear once in its list, and each list holds at most 100 names; anything else is a compile error. A template that declares no vocabulary gets `other` for every seat and section, and compiles to the same hash as before the field existed.
 
 ### skip_if — automatic transitions
 
@@ -1329,7 +1440,7 @@ transitions:
 
 Compile-time rules: keys must be usable context keys, outside the reserved `koto/` area (a first component of `koto`, in any case) that only koto writes; values must be strings (numbers and booleans are written as text, mappings and lists are errors); `${evidence.<field>}` must name an `accepts` field of the source state; `${gates.<gate>...}` must name a gate on the source state; `{{VAR}}` must be a declared variable or capture; any other `${...}` (for example `${context.key}`) is an error.
 
-Runtime rules: only the edge that fires writes. It writes on every kind of transition: evidence-resolved, gate-resolved auto-advance, and `skip_if`. An evidence field not submitted, or a gate path absent from that tick's output, resolves to `""` and the transition still happens. Evidence belongs to the state it was submitted to: when a submission moves the session into a state that auto-advances in the same tick, `${evidence.<field>}` on that state's outgoing edge resolves to `""` even though the field was in the submission, and it overwrites any value an earlier edge stored under the key. Put the assignment on the edge out of the state that takes the evidence. A gate path walks any nesting (`${gates.leg.payload.pr}`). Values are stored as resolved and never expanded again. A later write to the same key replaces the earlier one. The values are recorded on the `transitioned` event, and a failed store write is restored from the log on the next `koto context get`, `koto context exists`, or context gate.
+Runtime rules: only the edge that fires writes. It writes on every kind of transition: evidence-resolved, gate-resolved auto-advance, and `skip_if`. An evidence field not submitted, or a gate path absent from that tick's output, resolves to `""` and the transition still happens. Evidence belongs to the state it was submitted to: when a submission moves the session into a state that auto-advances in the same tick, `${evidence.<field>}` on that state's outgoing edge resolves to `""` even though the field was in the submission, and it overwrites any value an earlier edge stored under the key. Put the assignment on the edge out of the state that takes the evidence. A gate path walks any nesting (`${gates.leg.payload.pr}`). Values are stored as resolved and never expanded again. A later write to the same key replaces the earlier one. The values are recorded on the `transitioned` event. If the store write fails, `koto context get`, `koto context exists` and `koto context list` answer the value from the log without storing it, and the session's next tick restores it in the store before its context gates read it.
 
 A command gate's output is only `exit_code` and `error`. To put what a script printed into context, have a `default_action` run `koto context add`. That command refuses keys under `koto/` too (exit 2), so pick action keys outside it as well.
 
@@ -1360,6 +1471,50 @@ reserved `koto/` area (a first component of `koto`, in any case), no
 duplicates, not
 on a terminal state, not an empty list, and not a key any transition writes
 through `context_assignments`.
+
+### `directive_rules` — rules a directive carries, recorded as telemetry
+
+A directive can carry a rule the agent must follow, in place of (or before) a
+check's finding that would hand it back. `directive_rules` names those rules so
+koto records each delivery the way it records a check's: as a
+`rule_delivered` event with `via: directive`, which the run journal relays as
+telemetry. Nothing routes on it and the response is unchanged.
+
+```yaml
+states:
+  open_pr:
+    directive_rules:
+      - rule_id: release/changelog-entry
+        check: changelog
+        extent: full
+        when_set: CHANGELOG_RULE
+```
+
+Each time `koto next` prints the state's directive (an advance into it, a tick
+that holds there, a `--to` move), it appends one event per entry whose
+`when_set` value is non-empty (whether or not the directive interpolates it), after the response prints. Each event
+carries the state, `check` as the check name, `rule_id`, `extent`,
+`via: directive` and `delivery: printed`; it never carries the rule's text or a
+`unit_count`. A re-print records again, an entry whose value is empty records
+nothing, and `koto status` records nothing. Pair `when_set` with a capture
+that uses `capture_allow_empty` when the rule is carried in some runs and not
+others: the empty run renders nothing and records nothing.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `rule_id` | Yes | The rule's id: not blank, at most 128 bytes |
+| `check` | Yes | The check the rule belongs to: 1 to 128 letters, digits and `. _ : / @ -`, not starting with `/` or `~` |
+| `extent` | Yes | `summary` or `full`, exactly (the case matters) |
+| `when_set` | Yes | A declared variable or a `capture_stdout_as` name whose value carries the rule; a runtime name is refused |
+
+Compile-time rules, each with its own code: a value that isn't a non-empty
+list of maps, an unknown key or a non-string value
+(`E-DIRECTIVE-RULE-SHAPE`); a missing field, named in the message
+(`E-DIRECTIVE-RULE-MISSING`); `rule_id` out of bounds (`E-DIRECTIVE-RULE-ID`);
+`check` out of shape (`E-DIRECTIVE-RULE-CHECK`); another `extent`
+(`E-DIRECTIVE-RULE-EXTENT`); and a `when_set` that names neither a variable
+nor a capture (`E-DIRECTIVE-RULE-WHEN-SET`). A template without the field
+compiles to the same bytes and hash as before it existed.
 
 ### Self-loops
 

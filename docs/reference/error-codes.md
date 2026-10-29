@@ -55,7 +55,7 @@ The `error` text for duplicate and unknown keys, and for an allowlist failure, i
 | `session_live` | `--replace-terminal` without `--attach-live` found a running session. | `state` |
 | `session_terminal` | `--attach-live` without `--replace-terminal` found a finished session. | `state` |
 | `template_mismatch` | `--attach-live` found a session built from another template file. | `recorded`, `requested` |
-| `origin_mismatch` | `--attach-live` found a session from another worktree, session store or bucket, or one with no origin record. A session the local store started is not refused under the cloud backend from the same anchor and sessions directory: it is uploaded and adopted. | `recorded`, `requested` |
+| `origin_mismatch` | `--attach-live` found a session from another worktree, session store or bucket, or one with no origin record. A session the local store started is not refused under the cloud backend from the same anchor and sessions directory: it is uploaded and adopted. Use another session name, or run the command from the directory the session belongs to (against its own session store when only the store differs); a session with no origin record can also be finished with the koto version that started it. | `recorded`, `requested` |
 | `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
 | `replace_held_live` | `--replace-terminal` found a finished session the retention rule keeps, so it would move aside, but a descendant in its subtree is still running, waits to promote its result to a request leg, or can't be read. | `live` |
 
@@ -329,7 +329,7 @@ for real on every tick. The same gate reports `agent_actionable: false` in
 the decider gave no verdict on. A missing session prints the flat format with
 exit 1. A session log that can't be read exits with the code its read error
 carries, and an unreadable template exits 3, as `koto overrides record` does.
-Three refusals carry a typed code, each with exit code 2 and nothing appended
+Six refusals carry a typed code, each with exit code 2 and nothing appended
 to the state log. The `error` object names the `gate`, the
 `criterion` and, once the session is loaded, the `state`.
 
@@ -355,6 +355,33 @@ answer:
 
 ```json
 {"error":{"code":"no_fallback","message":"criterion 'comment_reason' of 'comments' has not fallen back to you in this visit to 'review': only a criterion the decider gave no verdict on takes your answer","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+For a check that grades units, `no_fallback` also means the `--unit` key was
+printed by the check's latest evaluation but has no pending fallback for the
+criterion there: the decider gave that unit a verdict.
+
+**`unit_required`** -- the criterion's pending fallbacks in the check's latest
+evaluation name units, and no `--unit` was given. Answer one unit at a time,
+with the `--unit <key>` the waiting finding's command carries:
+
+```json
+{"error":{"code":"unit_required","message":"criterion 'ac_binary' of 'ac_binary' is waiting on your answer for units; name the unit with --unit, as the waiting finding does","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
+```
+
+**`unit_not_expected`** -- `--unit` was given, but the check doesn't grade
+units, or the criterion's pending fallbacks in its latest evaluation name none
+(an extraction that failed, say). Answer without `--unit`:
+
+```json
+{"error":{"code":"unit_not_expected","message":"criterion 'comment_reason' of 'comments' isn't waiting on a unit; answer without --unit","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+**`unknown_unit`** -- the `--unit` key isn't one the check's latest evaluation
+printed, including a unit that has since left the extraction's output:
+
+```json
+{"error":{"code":"unknown_unit","message":"the latest evaluation of 'ac_binary' printed no unit 'ac-99'; run koto next and answer a unit its waiting findings name","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
 ```
 
 ### disputes record
@@ -390,6 +417,65 @@ nothing yet:
 
 ```json
 {"error":{"code":"gate_not_evaluated","message":"gate 'lint' has no settled evaluation logged in state 'work': only a check koto evaluated to an outcome can be disputed, not one still pending","gate":"lint","state":"work"},"command":"disputes record"}
+```
+
+---
+
+### review record
+
+`koto review record` records document review events as telemetry, without
+changing any outcome. A missing session prints the flat format with exit 1
+and appends nothing, and so does an append that fails. A session log that
+can't be read exits with the code its read error carries, and a log whose
+current state or template can't be read exits 3. Every other refusal carries
+a typed code, exits 2 and appends nothing, so one invalid entry refuses the
+whole batch. The `error` object carries `entry`, the 0-based index of the
+`--file` entry at fault, and `field`, the flag or key, when they apply. No
+message repeats a value the caller gave.
+
+**`session_terminal`** -- the session is at a terminal state or was
+cancelled:
+
+```json
+{"error":{"code":"session_terminal","message":"workflow 'scope-export' has finished (terminal state 'done'); review events are recorded only on a session in a non-terminal state"},"command":"review record"}
+```
+
+**`invalid_value`** -- a flag's or an entry field's value is outside its set
+or bounds (a document type, verdict, decision or check outcome outside its
+closed set, a round or seat count that isn't a positive integer, a rule id
+outside its shape):
+
+```json
+{"error":{"code":"invalid_value","message":"entry 3: field verdict must be PASS or FAIL","entry":3,"field":"verdict"},"command":"review record"}
+```
+
+**`invalid_entry`** -- a `--file` entry isn't an object, lacks a field, has a
+field that isn't one of its keys (named only as "an unknown field"), or has a
+field of the wrong type:
+
+```json
+{"error":{"code":"invalid_entry","message":"entry 0: field seat is missing","entry":0,"field":"seat"},"command":"review record"}
+```
+
+**`invalid_file`** -- the `--file` can't be read, is larger than 1 MiB, isn't
+UTF-8, isn't valid JSON (the message gives the line and column) or isn't a
+JSON array:
+
+```json
+{"error":{"code":"invalid_file","message":"--file is not valid JSON (line 1, column 14)","field":"--file"},"command":"review record"}
+```
+
+**`batch_too_large`** -- the `--file` array holds more than 200 entries:
+
+```json
+{"error":{"code":"batch_too_large","message":"--file holds 201 entries; a batch holds at most 200","field":"--file"},"command":"review record"}
+```
+
+**`cap_reached`** -- the session already holds review events, and recording
+these would take it past 2,000:
+
+```json
+{"error":{"code":"cap_reached","message":"the session holds 1990 review events; recording 12 more would pass the cap of 2000"},"command":"review record"}
 ```
 
 ---
@@ -600,7 +686,7 @@ Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template 
 
 A `decider-check` gate (see `docs/guides/decider-authoring.md`, "Checking the agent's work") has these compile-time errors. Each fails compilation, both when a source template compiles and when a cached compiled template is loaded, and each message names the state, the check and, where there is one, the criterion. None is relaxed by `--allow-legacy-gates`.
 
-**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label` or `criteria` on a gate that isn't a decider check.
+**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label`, `criteria` or `units` on a gate that isn't a decider check.
 
 ```
 E-DECIDER-CHECK-FIELD: state "review" check "g" criterion "r1": question must be non-empty; the decider reads it as part of the question
@@ -633,6 +719,37 @@ E-DECIDER-CHECK-BUDGET: state "review" check "g": max_bytes 0 is outside 1 to 81
 ```
 E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 64 bytes of letters, digits, `_` and `-`
   remedy: rename the label, or omit it for "artifact"
+```
+
+**E-DECIDER-CHECK-UNITS (error)**: a check's unit declaration is refused. The cases:
+
+- `units` is set to something other than `jsonl`, the one way a check's extraction can print units.
+- `max_units` isn't a whole number of at least 1.
+- `max_units`, `unit_document` or `unit_section` is set on a check without `units: jsonl`. The error names the field.
+- `unit_document` or `unit_section` isn't a string in koto's name shape: 1 to 128 bytes of letters, digits and `._:/@-`, not starting with `/`, `~` or `-`.
+- A state's unit-mode checks declare `max_units` times criteria summing to more than 32, the most unit consultations one `koto next` sends. The error names the state and the sum.
+- A unit-mode check without `max_units` is compiled with 32 divided by the criteria across the state's unit-mode checks, rounded down; when some checks declare `max_units`, it divides what they leave. A state whose declared checks leave less than one unit per remaining criterion is refused, naming the state and the checks without `max_units`.
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, found String("csv")
+  remedy: set units to jsonl, or omit it to grade the whole output as one slice
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review": its unit-mode checks' max_units times criteria sum to 33; a state may declare at most 32
+  remedy: lower max_units, or move a check to another state
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": max_units is only allowed on a check with units: jsonl
+  remedy: set units: jsonl, or remove max_units
+```
+
+**E-DECIDER-CHECK-RULE (error)**: a criterion's `summary` is empty or over 300 bytes, or its `rule_text` is empty or over 4,096 bytes. Either text is handed back in `koto next` when the criterion fails, so it has to fit a response.
+
+```
+E-DECIDER-CHECK-RULE: state "review" check "g" criterion "ac_binary": summary must be 1 to 300 bytes, found 0
+  remedy: write the summary within 300 bytes, or omit it
 ```
 
 **E-DECIDER-CHECK-DUPLICATE (error)**: two criteria on one state, in the same check or different ones, share a `rule_id`.
@@ -678,6 +795,27 @@ E-DECIDER-CHECK-SPEC: state "review" check "comments": the compiled template has
 ```
 
 Fix: compile the template again from its source with this koto. A session whose cached template has lost its spec can't be resumed; start a new one.
+
+#### `directive_rules` codes
+
+A state's `directive_rules` list (rules its directive carries, recorded as telemetry) has six compile-time errors. Each names the state and, past the shape check, the entry's index.
+
+**E-DIRECTIVE-RULE-SHAPE (error)**: the value isn't a non-empty list, an entry isn't a map, an entry has a key other than `rule_id`, `check`, `extent` and `when_set`, or a value isn't a string.
+
+**E-DIRECTIVE-RULE-MISSING (error)**: an entry lacks one of the four fields; the message names it.
+
+```
+validation error: E-DIRECTIVE-RULE-MISSING: state "pr_creation": directive_rules entry 0: missing when_set
+  remedy: give each entry rule_id, check, extent and when_set
+```
+
+**E-DIRECTIVE-RULE-EXTENT (error)**: `extent` is something other than `summary` or `full`, including another case such as `Full`.
+
+**E-DIRECTIVE-RULE-ID (error)**: `rule_id` is blank or longer than 128 bytes.
+
+**E-DIRECTIVE-RULE-CHECK (error)**: `check` isn't a check name: 1 to 128 letters, digits and `. _ : / @ -`, not starting with `/` or `~`.
+
+**E-DIRECTIVE-RULE-WHEN-SET (error)**: `when_set` names neither a declared variable nor a `capture_stdout_as` name.
 
 ---
 
@@ -766,7 +904,7 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `template_mismatch` | 2 | `attach` named a root session built from a template the leg's `template` doesn't name, compared by the source template's file name. A session with no template file (`--from-stdin`) matches nothing. |
 | `input_mismatch` | 2 | `attach` named a root session whose recorded value for one of the leg's `inputs` differs, or whose template doesn't declare that input. `rebind: true` variables aren't compared. `details` names the key and both values. |
 | `session_terminal` | 2 | `attach` named a session at a terminal state, or a cancelled one. |
-| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick. `abandon-request` and `close` still work. |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick, or from `koto cancel`, which promotes a cancelled result. `abandon-request` and `close` still work. |
 | `request_id_collision` | 2 | The generated identifier already had a record on disk. |
 | `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
 | `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |

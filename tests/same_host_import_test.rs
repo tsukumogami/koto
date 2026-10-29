@@ -289,7 +289,8 @@ fn assert_refused(out: &Out, code: &str) {
     assert_eq!(out.json()["error"]["code"], code, "{}", out.describe());
 }
 
-/// The replacement continues; the source refuses, naming B.
+/// The replacement continues; the source refuses to move, naming B, and
+/// its reads answer from the copy it left in the bucket.
 fn assert_moved(h: &Host) {
     let out = h.koto(
         &h.b,
@@ -300,8 +301,7 @@ fn assert_moved(h: &Host) {
     assert_eq!(out.json()["state"], "review", "{}", out.describe());
     for args in [
         vec!["next", NAME],
-        vec!["status", NAME],
-        vec!["context", "get", NAME, "notes.md"],
+        vec!["next", NAME, "--with-data", r#"{"choice":"go"}"#],
     ] {
         let out = h.koto(&h.a, &args, &[]);
         assert_eq!(out.code, Some(2), "{args:?} from A: {}", out.describe());
@@ -312,6 +312,12 @@ fn assert_moved(h: &Host) {
             "{args:?} names B: {all}"
         );
     }
+    let out = h.koto(&h.a, &["status", NAME], &[]);
+    assert_eq!(out.code, Some(0), "status from A: {}", out.describe());
+    assert_eq!(out.json()["current_state"], "wait", "{}", out.describe());
+    let out = h.koto(&h.a, &["context", "get", NAME, "notes.md"], &[]);
+    assert_eq!(out.code, Some(0), "get from A: {}", out.describe());
+    assert_eq!(out.raw, KEYS[0].1, "{}", out.describe());
 }
 
 #[test]
@@ -1167,18 +1173,24 @@ fn local_files(h: &Host, name: &str) -> Files {
 }
 
 /// `before` and `after` are the same objects but the migration marker the
-/// import adds beside the source.
+/// import adds beside the source and the back-reference its copy's relation
+/// keeps there.
 fn only_marked(before: &Files, after: &Files, ws: &Path, name: &str) {
     let marker = format!("{}/{}/migrated.json", prefix_of(ws), name);
+    let backrefs = format!("{}/{}/ctx/koto/continued-by/", prefix_of(ws), name);
     let rest: Files = after
         .iter()
-        .filter(|(k, _)| *k != marker)
+        .filter(|(k, _)| *k != marker && !k.starts_with(&backrefs))
         .cloned()
         .collect();
     assert_eq!(&rest, before, "the source changed beyond its marker");
     assert!(
         after.iter().any(|(k, _)| *k == marker),
         "no marker on {name}"
+    );
+    assert!(
+        after.iter().any(|(k, _)| k.starts_with(&backrefs)),
+        "no back-reference beside {name}"
     );
 }
 
@@ -1330,31 +1342,31 @@ fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
             assert!(why.contains(&imp), "{name}: {why}");
         }
     }
-    // The migrated source keeps nothing and refuses reads.
+    // The migrated source keeps nothing and refuses writes; its reads
+    // answer from the copy it left in the bucket.
     let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &[]).json();
     let source = member(&hierarchy, "coord");
     assert_eq!(source["migrated"], true, "{hierarchy:#}");
     assert_eq!(source["alive"], false);
-    let refused = h.koto(&h.a, &["context", "get", "coord", "notes.md"], &[]);
+    let refused = h.koto(&h.a, &["context", "add", "coord", "late.md"], &[]);
     assert_eq!(refused.code, Some(2), "{}", refused.describe());
     assert!(format!("{}{}", refused.stdout, refused.stderr).contains("session_migrated"));
+    let read = h.koto(&h.a, &["context", "get", "coord", "notes.md"], &[]);
+    assert_eq!(read.code, Some(0), "{}", read.describe());
+    assert_eq!(read.raw, b"the notes\n");
 
-    // Only coord moved: b is still bound to A, where it was started, so the
-    // reviewer reads b's log and keys from there. From B, whose prefix isn't
-    // b's, the read refuses rather than sync against it (koto#457).
+    // Only coord moved: b's own copy is still under A's prefix, where it
+    // was started, so the reviewer reads b's log and keys from there, and
+    // from B the read takes the same copy rather than anything under B's
+    // prefix.
     let out = ok(&h, &h.a, &["context", "list", "b"], &as_importer);
     assert!(out.stdout.contains("notes.md"), "{}", out.describe());
     let out = ok(&h, &h.a, &["status", "b"], &as_importer);
     assert_eq!(out.json()["is_terminal"], true, "{}", out.describe());
     let out = ok(&h, &h.a, &["context", "get", "b", "notes.md"], &as_importer);
     assert_eq!(out.raw, b"the notes\n");
-    let refused = h.koto(&h.b, &["context", "get", "b", "notes.md"], &as_importer);
-    assert_eq!(refused.code, Some(2), "{}", refused.describe());
-    assert!(
-        refused.stdout.contains("session_bound_elsewhere"),
-        "{}",
-        refused.describe()
-    );
+    let out = ok(&h, &h.b, &["context", "get", "b", "notes.md"], &as_importer);
+    assert_eq!(out.raw, b"the notes\n");
 }
 
 /// A held-by link whose anchor is open here is kept as it is, although the
@@ -1722,10 +1734,13 @@ fn an_import_drops_the_reserved_keys_a_bucket_must_not_carry() {
         out.describe()
     );
     assert_eq!(out.json()["keys"], 2, "notes.md and the good link");
+    // Besides what came across, the import's own records: what it copied,
+    // and the relation naming the source.
     assert_eq!(
         manifest_keys(&h, "s-b"),
         [
             "koto/imported-from",
+            "koto/links/continues/s",
             "koto/links/dispatched-by/good",
             "notes.md"
         ]

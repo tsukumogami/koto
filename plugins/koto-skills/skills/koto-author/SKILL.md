@@ -44,7 +44,7 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto >= 0.24.1 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.31.4 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
 
 If koto is not installed or the version is too old, install the latest release:
@@ -153,6 +153,10 @@ Two protocol steps an agent used to do from prose are koto's to do:
 - **Retries that must not see the last attempt's verdict**: declare `clear_on_entry: [keys]` on the state a retry loop returns to. koto removes those keys whenever the workflow enters the state again (not on the first entry), before the state's action and gates run. Don't write remove-then-verify blocks into a directive.
 
 The [template format guide](references/template-format.md) has both field schemas and their compile rules.
+
+### Recording a rule a directive carries
+
+When a directive hands the agent a rule (rather than a check's finding handing it back), declare it in the state's `directive_rules` (`rule_id`, `check`, `extent` of `summary` or `full`, and `when_set`, a variable or capture that carries the rule's text). Each time `koto next` prints that directive with the `when_set` value non-empty, koto appends a `rule_delivered` event with `via: directive`, which reaches the run journal as telemetry; nothing routes on it. For a rule carried in some runs and not others, produce the text with a `default_action` that sets `capture_stdout_as` and `capture_allow_empty: true`: a run with no rule captures the empty string, renders nothing and records nothing. The [template format guide](references/template-format.md#directive_rules--rules-a-directive-carries-recorded-as-telemetry) has the fields and their compile codes.
 
 ## Reference material
 
