@@ -182,7 +182,7 @@ still protect one inside them. For each session it reads:
 
 | Rule | Keeps | How the prune knows |
 |------|-------|---------------------|
-| a | a session the retention engine judges alive | the engine's liveness check: a koto session is alive while its status is `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink); a close session never is; an anchor is alive until its observed close, or the idle period after its last activity, has passed |
+| a | a session the retention engine judges alive | the engine's liveness check: a koto session is alive while its status is `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink); a close session never is; an anchor is alive until it closes, which for an observed anchor is only its observed close, and for one with no observed marker is also the idle period after its last activity passing |
 | b | replaced by rule `h` in the session-retention design; it kept a session some running or unreadable session references, or any finished session while some session's header couldn't be read | nothing: the letter stays unused |
 | c | replaced by rule `h` in the session-retention design; it kept a finished session that references a running or unreadable one | nothing: the letter stays unused |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
@@ -223,35 +223,37 @@ never saw. A local log longer than the remote one only means this host's last
 push didn't land, which the removal loses nothing by. A remote `version.json`
 the local copy has none to compare with keeps the session too.
 
-Under the original rules b and c, an unreadable session counts as possibly
-running, so it protects what it references and what references it, as rule a
-keeps it. When
-the unreadable part is the header, what it references is unknown: its
-`parent_workflow` is in the header it lost. So while any session's header
-can't be read, rule b keeps every finished session and names that session,
-so a person can inspect or remove it and let the prune go on. Nothing
-narrows the set, since the execution directory that could scope it is in the
-header too. Rule `h` keeps the same posture: in the retention design an
-unreadable log taints its component and counts as alive, and an unreadable
-header, manifest or links directory taints every component.
+Under the original rules b and c, an unreadable session counted as possibly
+running, so it protected what it referenced and what referenced it, as rule a
+kept it. When the unreadable part was the header, what it referenced was
+unknown: its `parent_workflow` is in the header it lost. So while any
+session's header couldn't be read, rule b kept every finished session and
+named that session, so a person could inspect or remove it and let the prune
+go on. Nothing narrowed the set, since the execution directory that could
+scope it is in the header too. Rule `h` keeps the same posture: in the
+retention design an unreadable log taints its component and counts as alive,
+and an unreadable header, manifest or links directory taints every component.
 
-The reference map has an edge A to B when A's header `parent_workflow` is B,
-or A's context key `chain/parent` holds exactly B. The context key is read from
-the local session directory (`ctx/` under the session's directory) directly,
-never through the cloud backend's context store, so a prune makes no network
-call to judge a session.
+The original reference map had an edge A to B when A's header
+`parent_workflow` was B, or A's context key `chain/parent` held exactly B.
+Rule `h`'s graph has these edges and the `koto/links/` entries too. The
+context key is read from the local session directory (`ctx/` under the
+session's directory) directly, never through the cloud backend's context
+store, so a prune makes no network call to judge a session.
 
-The original rules b and c carried the resume convention's close rule
-without knowing about it, as follows; rule `h` now covers these cases through
-the hierarchy. A chain parent that exits with an `exit:` value closes its children and
-then itself. Nothing running references either, so both go. A clean cancel,
-refusal or error terminal closes nothing: the children stay running, and they
-reference the parent through `chain/parent`. So rule b keeps the parent, and
-the running children aren't candidates at all. A koto-lineage child of a
-running parent is kept by rule c until the parent finishes, so a parent never
-loses a child it hasn't read. The prune never removes a running session,
-which is also why it never loses another feature's open per-visit journal
-aggregate: one exists only on a session that hasn't finished.
+The original rules b and c carried the resume convention's close rule without
+knowing about it. A chain parent that exits with an `exit:` value closes its
+children and then itself. Nothing running referenced either, so both went. A
+clean cancel, refusal or error terminal closes nothing: the children stay
+running, and they reference the parent through `chain/parent`. So rule b kept
+the parent, and the running children weren't candidates at all. A
+koto-lineage child of a running parent was kept by rule c until the parent
+finished, so a parent never lost a child it hadn't read. Rule `h` keeps more:
+a parent with children always has an edge, so it and its children are kept at
+its terminal tick, and prune reclaims the subtree once the retention design's
+rule releases it. The prune never removes a running session, which is also
+why it never loses another feature's open per-visit journal aggregate: one
+exists only on a session that hasn't finished.
 
 *Alternative: a generic reference area in context (`refs/<name>`).* A
 session would declare each session it depends on as a key, and koto would
@@ -495,8 +497,9 @@ Session mode:
    `Cancelled`, plus finished records (below) that pass the filters. The age
    filter compares `finished_at` with now.
 3. For each session that passes the filters, whatever its status, evaluate
-   rules a to g in order (b and c are now rule `h`, and f is retired), so a
-   running or unreadable session shows on `kept` under rule a. The first rule that applies puts the session on `kept` with
+   rules a to g in order, so a running or unreadable session shows on `kept`
+   under rule a. Since this design, b and c have become rule `h`, which the
+   session-retention design specifies, and f is retired. The first rule that applies puts the session on `kept` with
    that rule's letter and a detail (the referencing or referenced name, the
    request id); a candidate no rule keeps goes on the would-remove list.
    Records have
