@@ -169,6 +169,21 @@
 //!   digested like one, or `none`) and, for a jury FAIL given its round,
 //!   `koto.doc.fix_round`.
 //!
+//! Two record a code review round (a pull request review panel), kept
+//! apart from the document review kinds and their `koto.review.` fields.
+//! One `koto review record ... code-round` call appends one
+//! `code_review_round_recorded` event, relayed as one round record and one
+//! verdict record per seat, all under its `koto.seq`. Each carries
+//! `koto.state` and `koto.code_review.round`:
+//!
+//! - `code_review_round`: with `koto.code_review.seat_count` and
+//!   `koto.code_review.head`, the reviewed head as the digest koto stored,
+//!   never a commit id.
+//! - `code_review_verdict`: one per seat, with `koto.code_review.seat` (as
+//!   the session's template declares it, or `other`),
+//!   `koto.code_review.model` and `koto.code_review.verdict` (`pass` or
+//!   `fail`).
+//!
 //! None of them copies a probability, hash, threshold, endpoint, rule
 //! reference or text, rationale, dispute reason, override value or output,
 //! with one exception: `decider_checked`'s `koto.decider.confidence_bp`,
@@ -810,6 +825,7 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DocRuleChecksRecorded(_)
             | EventPayload::DocSectionRecorded(_)
             | EventPayload::DocFixRecorded(_)
+            | EventPayload::CodeReviewRoundRecorded(_)
             | EventPayload::EvidenceSubmitted {
                 exported_fields: Some(_),
                 ..
@@ -945,6 +961,29 @@ const DOC_FIX_ROUND_FIELD: &str = "koto.doc.fix_round";
 /// On `doc_fix_applied`: the check rule that decides the answered rule
 /// (digested like a rule id), or `none`.
 const DOC_FIX_CHECK_RULE_FIELD: &str = "koto.doc.fix_check_rule";
+
+// The names the code review records add (`koto review record code-round`).
+// They sit under `koto.code_review`, never `koto.review`, so a reader of the
+// document review kinds never counts a code review panel as a jury. One
+// call is one event, so a round's records share its `koto.seq`.
+
+/// One record per `code_review_round_recorded` event.
+const CODE_REVIEW_ROUND: &str = "code_review_round";
+/// One record per seat of a `code_review_round_recorded` event.
+const CODE_REVIEW_VERDICT: &str = "code_review_verdict";
+/// On both code review kinds: the round's number.
+const CODE_REVIEW_ROUND_FIELD: &str = "koto.code_review.round";
+/// On `code_review_round`: how many seats the round recorded.
+const CODE_REVIEW_SEAT_COUNT_FIELD: &str = "koto.code_review.seat_count";
+/// On `code_review_round`: the reviewed head's digest, as stored.
+const CODE_REVIEW_HEAD_FIELD: &str = "koto.code_review.head";
+/// On `code_review_verdict`: the seat, as the template declares it, or
+/// `other`.
+const CODE_REVIEW_SEAT_FIELD: &str = "koto.code_review.seat";
+/// On `code_review_verdict`: the model the seat ran on.
+const CODE_REVIEW_MODEL_FIELD: &str = "koto.code_review.model";
+/// On `code_review_verdict`: `pass` or `fail`.
+const CODE_REVIEW_VERDICT_FIELD: &str = "koto.code_review.verdict";
 
 /// On the three decider-check kinds, for a unit-mode check: the unit's key,
 /// always as its digest.
@@ -1227,6 +1266,31 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
                     )
             })
             .collect(),
+        // A code review round: the round record, then one verdict per seat
+        // in the order given, all under the event's one `koto.seq`. The
+        // head is already a digest; a model is digested like a rule id,
+        // though the verb already refused one outside the name shape.
+        EventPayload::CodeReviewRoundRecorded(c) => {
+            let mut records = vec![relay
+                .record(CODE_REVIEW_ROUND)
+                .name("koto.state", Some(c.state.as_str()))
+                .int(CODE_REVIEW_ROUND_FIELD, Some(c.round))
+                .int(CODE_REVIEW_SEAT_COUNT_FIELD, Some(c.entries.len() as u64))
+                .name(CODE_REVIEW_HEAD_FIELD, Some(c.head.as_str()))];
+            records.extend(c.entries.iter().map(|e| {
+                relay
+                    .record(CODE_REVIEW_VERDICT)
+                    .name("koto.state", Some(c.state.as_str()))
+                    .int(CODE_REVIEW_ROUND_FIELD, Some(c.round))
+                    .name(CODE_REVIEW_SEAT_FIELD, Some(e.seat.as_str()))
+                    .name(
+                        CODE_REVIEW_MODEL_FIELD,
+                        Some(name_or_digest(&e.model).as_str()),
+                    )
+                    .name(CODE_REVIEW_VERDICT_FIELD, Some(e.verdict.as_str()))
+            }));
+            records
+        }
         _ => Vec::new(),
     }
 }

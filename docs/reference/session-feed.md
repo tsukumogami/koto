@@ -918,6 +918,22 @@ events:
         type: array
         required: true
 
+  code_review_round_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      round:
+        type: integer
+        required: true
+      head:
+        type: string
+        required: true
+      entries:
+        type: array
+        required: true
+
   anchor_started:
     tier: 3
     fields:
@@ -2616,6 +2632,43 @@ each event of the four above does.
 
 The run journal relays `doc_rule_checked` and `doc_fix_applied` records,
 one per entry, and one `doc_section_written` record per section event.
+
+One more records a code review round (a pull request review panel) as an
+event of its own, kept apart from the document review events so a reader of
+those never counts a code review panel as a document jury:
+`code_review_round_recorded`, appended by a `code-round` call with the round
+and every seat in one event. It is recorded, not obeyed, refused on a
+finished session and checked like the events above; an invalid seat refuses
+the whole call. It counts one entry for the round and one per seat against
+the session's cap of 2,000 review entries.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | The state the session was in when the call was made. |
+| `round` | integer | The round's number, at least 1. |
+| `head` | string | The reviewed head as koto's digest of the `--head` value: `sha256:` and 32 lowercase hex characters. The value given (a commit id, say) is never stored; the same value gives the same digest in every session. |
+| `entries` | array | One object per seat, at least 1 and at most 200: `{"seat", "model", "verdict"}`. `seat` is kept as given when the session's template declares it in `review_vocabulary.seats` and is `other` otherwise; `model` is the model the seat ran on, bound as `rule_id` above; `verdict` is `pass` or `fail`. |
+
+```json
+{
+  "type": "code_review_round_recorded",
+  "payload": {
+    "state": "review",
+    "round": 1,
+    "head": "sha256:9c1185a5c5e9fc54612808977ee8f548",
+    "entries": [
+      {"seat": "correctness", "model": "claude-opus-4-5", "verdict": "pass"},
+      {"seat": "security", "model": "claude-opus-4-5", "verdict": "fail"},
+      {"seat": "other", "model": "gpt-5.1", "verdict": "pass"}
+    ]
+  }
+}
+```
+
+The [run journal](run-journal.md#code-review-records) relays one
+`code_review_round` record and one `code_review_verdict` record per seat,
+all under the event's `seq`. Additive: an older koto lands the event in its
+unknown-event bucket and reads the rest of the log.
 
 ---
 

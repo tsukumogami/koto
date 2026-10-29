@@ -118,6 +118,23 @@ to `0.9.x`).
   `strategy` and `roadmap`, for which `koto.doc.type` is left out. The
   session cap of 2,000 now counts review entries, one per entry of a batch
   call. Checks and refusals work as for the four review events.
+- **`koto review record code-round` records a code review round as its
+  own kinds (koto#537).** `code-round --round <n> --head <head> --file`
+  takes a JSON array of seats, each `{"seat", "model", "verdict"}` with
+  `verdict` `pass` or `fail`, at most 200, and appends one
+  `code_review_round_recorded` event. The run journal relays one
+  `code_review_round` record (`koto.code_review.round`,
+  `koto.code_review.seat_count`, `koto.code_review.head`) and one
+  `code_review_verdict` per seat (`koto.code_review.seat`,
+  `koto.code_review.model`, `koto.code_review.verdict`), all under the
+  call's `koto.seq` and carrying `koto.state`, so a pull request review
+  panel is never counted among the document review kinds. The head is
+  stored only as its digest, never as the commit id given. A seat the
+  template's `review_vocabulary` doesn't declare is `other`, a model must
+  have the journal's name shape, and a malformed batch is refused whole
+  with nothing written. The round and each seat count against the
+  session's 2,000 review entries. The document review subcommands and
+  their records are unchanged.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root
