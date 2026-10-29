@@ -352,6 +352,35 @@ fn a_cross_prefix_supersede_fences_creates_and_carries() {
         .object(&format!("{w2}/s/ctx/koto/superseded-carry-complete"))
         .is_some());
 
+    // The carry goes up as one push: from the first carried key on, s's
+    // manifest is put once, after every carried key and the marker. A push
+    // per key would put it after each one.
+    let requests = h.s3.requests();
+    let carried_key = |key: &str| {
+        PRED_KEYS
+            .iter()
+            .any(|(k, _)| key == format!("{w2}/s/ctx/{k}"))
+            || key == format!("{w2}/s/ctx/koto/superseded-carry-complete")
+    };
+    let first = requests
+        .iter()
+        .position(|r| r.method == "PUT" && carried_key(&r.key))
+        .expect("no carried key was put");
+    let manifest_key = format!("{w2}/s/ctx/manifest.json");
+    let manifest_puts: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .skip(first)
+        .filter(|(_, r)| r.method == "PUT" && r.key == manifest_key)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(manifest_puts.len(), 1, "{requests:?}");
+    let last_key = requests
+        .iter()
+        .rposition(|r| r.method == "PUT" && carried_key(&r.key))
+        .unwrap();
+    assert!(last_key < manifest_puts[0], "{requests:?}");
+
     // A re-run changes nothing.
     let again = h.bucket();
     let out = h.supersede(2, "s");
