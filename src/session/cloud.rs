@@ -4128,8 +4128,10 @@ impl CloudBackend {
     /// prefix after a rebind (koto#520). The key goes up through the write
     /// path, as written by the writer the local manifest names, so the
     /// home's object and manifest name the copy this host holds; a version
-    /// conflict is the write's error. A backend that never writes keeps the
-    /// local copy and says the bucket's is older.
+    /// conflict is the write's error, so the read reports it rather than
+    /// answering from either copy. Either way the difference is reported on
+    /// stderr, never resolved silently. A backend that never writes keeps
+    /// the local copy and says the bucket's is older.
     fn push_kept_key(&self, session: &str, key: &str) -> anyhow::Result<()> {
         if self.probes.read_only {
             eprintln!(
@@ -4139,6 +4141,11 @@ impl CloudBackend {
             );
             return Ok(());
         }
+        eprintln!(
+            "warning: kept this host's copy of context key '{}' in session '{}': the bucket's \
+             copy under the session's home is older, so this host's copy is pushed over it",
+            key, session
+        );
         let writer = self.local.meta(session, key).and_then(|meta| meta.writer);
         let content = self.local.get(session, key)?;
         self.add_as(session, key, &content, writer.as_deref())

@@ -255,6 +255,10 @@ pub enum Pull {
 /// form koto writes them (`YYYY-MM-DDTHH:MM:SS.mmmZ`, or without the
 /// milliseconds). A timestamp in any other form never counts as later, so
 /// the pull goes ahead as it did before.
+///
+/// The stamps come from the clocks of the hosts that wrote them (a pull
+/// stamps the time it pulled), so two writes made on different hosts within
+/// their clocks' skew can sort the wrong way round.
 fn written_later(local: &str, remote: &str) -> bool {
     match (sortable_timestamp(local), sortable_timestamp(remote)) {
         (Some(local), Some(remote)) => local > remote,
