@@ -680,9 +680,9 @@ pub enum SessionCommand {
     /// open anchor), its hierarchy is kept by the retention rule (h: a live
     /// member, the retention not yet passed, or something unreadable; see
     /// `koto session hierarchy`), its `chain/parent` context key is malformed
-    /// (d), it is bound to a request leg still waiting (e), it is a
-    /// coordinator's session (f), or, under the cloud backend, its remote
-    /// copy may be newer (g). A session a later session continues (`koto
+    /// (d), it is bound to a request leg still waiting (e), or, under the
+    /// cloud backend, its remote copy may be newer (g). A session's name
+    /// keeps nothing. A session a later session continues (`koto
     /// session link --continues`) is kept while that session, or one
     /// continuing it, is pinned, alive or within its own retention (r), with
     /// `kept_by_relation` and `relation_keepers` naming each keeper. A
