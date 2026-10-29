@@ -39,8 +39,11 @@
 //! - d: its `chain/parent` context key is malformed.
 //! - e: it is bound to a request leg that is still waiting, or whose
 //!   pointer or request can't be read.
-//! - f: it is a coordinator's session (`coordinate-`).
 //! - g: under the cloud backend, its remote copy may be newer.
+//!
+//! Letter f is retired: a session's name keeps nothing. A coordinator's
+//! finished session stays while a later session continues it, which rule r
+//! judges like any other.
 //!
 //! The filters narrow which sessions are candidates, never which count as
 //! members of a hierarchy, and `--older-than` measures a session's age from
@@ -413,7 +416,7 @@ fn first_rule(
     })
 }
 
-/// Rules d to g: what keeps a session whose hierarchy is released, with
+/// Rules d, e and g: what keeps a session whose hierarchy is released, with
 /// the fields its entry carries besides: `bucket_unchecked` when rule g's
 /// listing of the bucket failed, since that listing would have found a pin
 /// too (R23). Empty otherwise.
@@ -432,9 +435,6 @@ fn later_rule(
     }
     if let Some(detail) = leg_keeps(&base.join(name)) {
         return plain('e', detail);
-    }
-    if name.starts_with("coordinate-") {
-        return plain('f', "a coordinator's session".to_string());
     }
     if let Backend::Cloud(cloud) = backend {
         match cloud.remote_copy_check(name) {

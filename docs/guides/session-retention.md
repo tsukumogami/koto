@@ -143,6 +143,26 @@ Under the cloud backend the relation holds on every host sharing the bucket;
 [the continues relation in the bucket](#the-continues-relation-in-the-bucket)
 says how.
 
+## Coordinator sessions and the retired name rule
+
+A session's name keeps nothing. Earlier releases' `koto session prune` kept
+every session whose name starts with `coordinate-` (its rule `f`), however
+long ago it finished. That rule is gone. A coordinator's finished session is
+now judged like any other: it stays while it is pinned, while its hierarchy is
+kept, or while a later session that continues it has standing, and the entry
+names that successor (`kept: continued by <successor> (<standing>)`). Once
+nothing keeps it, the next prune removes it, on the local and the cloud
+backend alike. `koto workspace prune` never had the name rule, so it doesn't
+change.
+
+To keep a coordinator's session past the upgrade, give it a keeper before you
+upgrade: pin it with `koto session pin <name> --reason <why>`, or record the
+session that carries on its work with
+`koto session link <successor> --continues <name>`. After upgrading, run
+`koto session prune` without `--apply` first: it removes nothing and lists
+what the next `--apply` would remove and what it keeps, with the keeper of
+each.
+
 ## Under the cloud backend
 
 The bucket decides. A pin is its own object,
