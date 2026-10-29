@@ -4185,12 +4185,25 @@ impl CloudBackend {
     /// conflict is the write's error, so the read reports it rather than
     /// answering from either copy. Either way the difference is reported on
     /// stderr, never resolved silently. A backend that never writes keeps
-    /// the local copy and says the bucket's is older.
+    /// the local copy and says the bucket's is older, and so does a read of
+    /// a session its successor fenced, since the push would be a write the
+    /// fence refuses and reads of a fenced session keep working.
     fn push_kept_key(&self, session: &str, key: &str) -> anyhow::Result<()> {
         if self.probes.read_only {
             eprintln!(
                 "warning: kept this host's copy of context key '{}' in session '{}': the \
                  bucket's copy is older, and this command never writes",
+                key, session
+            );
+            return Ok(());
+        }
+        if let Err(e) = self.refuse_if_superseded(session) {
+            if crate::engine::persistence::session_superseded(&e).is_none() {
+                return Err(e);
+            }
+            eprintln!(
+                "warning: kept this host's copy of context key '{}' in session '{}': the \
+                 bucket's copy is older, and the session is superseded, so nothing is pushed",
                 key, session
             );
             return Ok(());

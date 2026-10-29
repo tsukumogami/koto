@@ -534,6 +534,51 @@ fn writes_to_the_predecessor_after_the_fence_are_refused_from_either_workspace()
     }
 }
 
+/// A read of the fenced predecessor whose local copy of a key is newer
+/// than the bucket's still answers from the local copy, as reads of a
+/// fenced session do, and pushes nothing: the kept copy would be a write
+/// to a superseded session.
+#[test]
+fn a_read_of_the_fenced_predecessor_keeps_a_newer_local_key_without_pushing() {
+    let h = Hosts::new();
+    h.predecessor();
+    let w1 = prefix_of(&h.w1);
+    let out = h.supersede(1, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+
+    // The bucket's copy of `record/a` becomes an older, different version.
+    let manifest_key = format!("{w1}/p/ctx/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&h.s3.object(&manifest_key).unwrap()).unwrap();
+    let hash = manifest["keys"]["record/a"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let last = if hash.ends_with('0') { "1" } else { "0" };
+    manifest["keys"]["record/a"]["hash"] =
+        Value::from(format!("{}{last}", &hash[..hash.len() - 1]));
+    manifest["keys"]["record/a"]["created_at"] = Value::from("2026-01-01T00:00:00.000Z");
+    h.s3.put(&manifest_key, manifest.to_string().as_bytes());
+    let before = h.bucket();
+
+    let out = h.run(1, &h.w1, &["context", "get", "p", "record/a"]);
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"alpha");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("superseded"),
+        "{out:?}"
+    );
+    assert_eq!(
+        h.bucket(),
+        before,
+        "a read of a fenced session wrote the bucket"
+    );
+}
+
 /// A fence in the bucket's copy that names an invalid successor, and a
 /// manifest that names an invalid key, are refused before a key is built
 /// from either: nothing is written, and the bad key is never fetched.
