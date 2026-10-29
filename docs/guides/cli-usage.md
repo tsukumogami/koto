@@ -159,6 +159,12 @@ The command works in five steps, and the successor's session id is chosen before
 
 Nothing is created before the fence, so a refusal leaves both sessions as they were. Running the same command again finishes a run that was interrupted (a crash after the fence creates `<succ>` with the session id the fence recorded) or, when everything is done, changes nothing and reports `"outcome": "unchanged"`.
 
+**Under the cloud backend.** `<pred>` usually lives under another workspace's bucket prefix (name it with `--continues-from <workspace>` when this directory holds no copy of it), and `<succ>` lives under this directory's. Steps 1 and 2 work on the bucket's copy of `<pred>`, not on a local one: koto pulls `<pred>`'s state file from its prefix along with its ETag, checks that copy, and pushes it back with the fence appended as a PUT conditional on that ETag (`If-Match`), the conditional write every cloud state push makes. If the bucket refuses that push (`<pred>` moved since the pull), the push fails, or the bucket doesn't support conditional writes, the command exits 3 `fence_unavailable` with nothing written in either prefix; it never falls back to an unconditional write. When two successors race, the first push wins; the other's push is refused, it reads the winner's fence and refuses `superseded_by`. In step 4 koto reads the carried keys from `<pred>`'s prefix (the context manifest, then each key) and writes them, the marker last, into `<succ>` under this directory's prefix as one push.
+
+What each prefix gets: under `<pred>`'s, its state file with the fence appended, the one conditional write, and the back-reference plain `--continues` puts beside a predecessor; under `<succ>`'s, `<succ>` itself with its relation, the carried keys and the marker. So the host running the command needs write access to both prefixes. A host holding a copy of `<pred>` refuses writes to it once it pulls the fence: `koto context add` and every log append check the fence after their pull, and a push from a copy that predates the fence is refused `session_superseded` rather than reported as a conflict. A copy of `<pred>` on the host that ran the command takes the fence at once.
+
+Names read from `<pred>`'s log or the bucket are checked before koto builds a path or key from them: a fence naming an invalid session refuses `invalid_fence` (exit 2), and a manifest naming an invalid key fails the carry.
+
 **Output (JSON):**
 
 ```json
@@ -184,9 +190,9 @@ Reads keep working: `koto context get`, `koto context exists`, `koto context lis
 | `self` | 2 | `<succ>` and `<pred>` are the same session. |
 | `cycle` | 2 | `<succ>` exists and `<pred>` already descends from it, through continues relations or supersede fences. |
 | `session_exists` | 2 | `<succ>` exists and no earlier run of this command opened it. |
-| `cloud_unsupported` | 2 | The cloud backend is configured. Its fence isn't supported in this release. |
+| `invalid_fence` | 2 | `<pred>`'s log already holds a fence naming a session or session id koto doesn't accept. |
 | `invalid_usage` | 2 | `--supersede` with `--parent`, `--from-stdin`, `--attach-live`, `--replace-terminal` or `--koto-leg`, or a `--carry` prefix under `koto/`. `--carry` and `--expect-state` require `--supersede`, which requires `--continues`. |
-| `fence_unavailable` | 3 | `<pred>`'s log stayed locked by another writer for 10 seconds. Run the command again. |
+| `fence_unavailable` | 3 | `<pred>`'s log stayed locked by another writer for 10 seconds, or, under the cloud backend, the bucket refused or failed the fence's conditional push, can't write conditionally, or holds no copy of `<pred>`. Run the command again. |
 
 The checks plain `--continues` makes on `<pred>` (the session-name rule, a session that exists, not an anchor or close record) refuse as they do there.
 

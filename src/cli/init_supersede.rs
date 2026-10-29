@@ -26,7 +26,23 @@
 //!    PRED looks again and finds the fence.
 //!
 //! Nothing is created before the fence, so every refusal writes nothing.
-//! The local backend only: the cloud backend is refused.
+//!
+//! Under the cloud backend the predecessor usually lives under another
+//! workspace's prefix, and steps 1 and 2 work on the bucket's copy there,
+//! not on this host's: its state is pulled with its ETag (from the
+//! `--continues-from` prefix, else the one its local copy records), checked,
+//! and pushed back with the fence appended, conditional on that ETag. A
+//! refused or failed conditional push, or a bucket that can't write
+//! conditionally, exits 3 `fence_unavailable` with nothing written; there
+//! is no unconditional fallback. Of two successors the first push wins; the
+//! other's push is refused, it reads the fence, and it refuses as it would
+//! at step 1. Step 4 reads the carried keys from the same prefix (one GET of
+//! the manifest, one per key) and writes them into the successor, under
+//! this directory's prefix, as one push.
+//!
+//! Names read from a log or the bucket (a fence's successor and session id,
+//! a home prefix, a carried key) are validated before anything is built
+//! from them.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -38,6 +54,7 @@ use crate::engine::persistence::{
     FENCE_LOCK_WAIT,
 };
 use crate::engine::types::{generate_session_id, now_iso8601, SupersedeActor};
+use crate::session::cloud::{check_fence_names, CloudBackend, CloudFence, PulledState};
 use crate::session::context::ContextStore;
 use crate::session::context_log::{added_event, WRITER_KOTO};
 use crate::session::links::{self, is_reserved_key, supersede_fence, MAX_SUPERSEDE_HOPS};
@@ -152,16 +169,6 @@ fn closes_a_loop(backend: &Backend, succ: &str, pred: &str) -> bool {
 /// refusal prints its error and exits.
 pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     let SupersedeArgs { name, pred, .. } = *args;
-    if backend.is_cloud() {
-        refuse(
-            "cloud_unsupported",
-            "--supersede: the cloud backend's fence isn't supported in this release; nothing \
-             was written"
-                .to_string(),
-            super::EXIT_CALLER_ERROR,
-            serde_json::Value::Null,
-        );
-    }
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
         refuse(
             "invalid_usage",
@@ -199,16 +206,30 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
             )
         });
 
-    // 1. Check.
+    // 1. Check: the bucket's copy under the cloud backend, else the log.
     let pred_log = backend.session_dir(pred).join(state_file_name(pred));
-    let (_, pred_events) = backend.read_events_local(pred).unwrap_or_else(|e| {
-        refuse(
-            "persistence_error",
-            format!("--supersede: could not read '{pred}''s log: {e:#}; nothing was written"),
-            super::EXIT_INFRASTRUCTURE,
-            serde_json::Value::Null,
-        )
-    });
+    let pulled = backend
+        .as_cloud()
+        .map(|cloud| pull_pred(cloud, pred, args.continues_from, &target));
+    let pred_events = match &pulled {
+        Some(pulled) => pulled.events.clone(),
+        None => {
+            backend
+                .read_events_local(pred)
+                .unwrap_or_else(|e| {
+                    refuse(
+                        "persistence_error",
+                        format!(
+                            "--supersede: could not read '{pred}''s log: {e:#}; nothing was \
+                             written"
+                        ),
+                        super::EXIT_INFRASTRUCTURE,
+                        serde_json::Value::Null,
+                    )
+                })
+                .1
+        }
+    };
     let succ_exists = backend.exists(name);
     let succ_session_id = || {
         backend
@@ -219,7 +240,7 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     };
     // `Some(id)` when an earlier run of this command already fenced PRED
     // for this successor: the id the successor has, or is created with.
-    let rerun_id = match superseded_by(&pred_events) {
+    let rerun_id = match superseded_by(&pred_events).map(|f| trusted(pred, f)) {
         Some(fence) if fence.by == name => {
             if succ_exists && succ_session_id() != fence.by_session_id {
                 // A session of the same name, but not the one the fence
@@ -280,27 +301,9 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
                 actor: actor(),
                 at: now_iso8601(),
             };
-            match append_supersede_fence(&pred_log, &fence, &fence.at, FENCE_LOCK_WAIT) {
-                Ok(FenceOutcome::Fenced { .. }) | Ok(FenceOutcome::AlreadyOurs) => id,
-                Ok(FenceOutcome::SupersededByOther(other)) => {
-                    refuse_superseded_by(backend, pred, &other)
-                }
-                Ok(FenceOutcome::Unavailable) => refuse(
-                    "fence_unavailable",
-                    format!(
-                        "--supersede: '{pred}''s log stayed locked by another writer for {} \
-                         seconds; nothing was written. Run the command again",
-                        FENCE_LOCK_WAIT.as_secs()
-                    ),
-                    super::EXIT_INFRASTRUCTURE,
-                    serde_json::Value::Null,
-                ),
-                Err(e) => refuse(
-                    "persistence_error",
-                    format!("--supersede: could not fence '{pred}': {e:#}; nothing was written"),
-                    super::EXIT_INFRASTRUCTURE,
-                    serde_json::Value::Null,
-                ),
+            match &pulled {
+                Some(pulled) => fence_in_bucket(backend, pred, pulled, &fence, id),
+                None => fence_locally(backend, pred, &pred_log, &fence, id),
             }
         }
     };
@@ -332,7 +335,8 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     }
 
     // 4. Carry.
-    let carried = carry(backend, pred, name, args.carry).unwrap_or_else(|e| {
+    let pred_prefix = pulled.as_ref().map(|p| p.prefix.as_str());
+    let carried = carry(backend, pred, name, args.carry, pred_prefix).unwrap_or_else(|e| {
         refuse(
             "persistence_error",
             format!(
@@ -367,43 +371,195 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Step 2 on the local backend: append the fence to `pred`'s own log under
+/// its append lock. Returns the successor's session id, or refuses.
+fn fence_locally(
+    backend: &Backend,
+    pred: &str,
+    pred_log: &Path,
+    fence: &SupersedeFence,
+    id: String,
+) -> String {
+    match append_supersede_fence(pred_log, fence, &fence.at, FENCE_LOCK_WAIT) {
+        Ok(FenceOutcome::Fenced { .. }) | Ok(FenceOutcome::AlreadyOurs) => id,
+        Ok(FenceOutcome::SupersededByOther(other)) => refuse_superseded_by(backend, pred, &other),
+        Ok(FenceOutcome::Unavailable) => refuse(
+            "fence_unavailable",
+            format!(
+                "--supersede: '{pred}''s log stayed locked by another writer for {} \
+                 seconds; nothing was written. Run the command again",
+                FENCE_LOCK_WAIT.as_secs()
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+        Err(e) => refuse(
+            "persistence_error",
+            format!("--supersede: could not fence '{pred}': {e:#}; nothing was written"),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+/// Step 2 on the cloud backend: push the fence into the pulled copy,
+/// conditional on its ETag. Returns the successor's session id, or refuses:
+/// a rival's fence as `superseded_by`, and anything that isn't a confirmed
+/// conditional push exits 3 `fence_unavailable`, nothing written.
+fn fence_in_bucket(
+    backend: &Backend,
+    pred: &str,
+    pulled: &PulledState,
+    fence: &SupersedeFence,
+    id: String,
+) -> String {
+    // `pulled` is only ever set under the cloud backend.
+    let Some(cloud) = backend.as_cloud() else {
+        unreachable!("a pulled copy is the cloud backend's");
+    };
+    match cloud.push_fence(pulled, fence) {
+        CloudFence::Fenced => id,
+        CloudFence::Taken(other)
+            if other.by == fence.by && other.by_session_id == fence.by_session_id =>
+        {
+            id
+        }
+        CloudFence::Taken(other) => refuse_superseded_by(backend, pred, &trusted(pred, other)),
+        CloudFence::Unavailable(reason) => refuse(
+            "fence_unavailable",
+            format!(
+                "--supersede: '{pred}' couldn't be fenced in the bucket: {reason}; nothing was \
+                 written. Run the command again"
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
 /// Copy every key under each of `prefixes` from `pred` into `succ`, then
 /// write [`CARRY_COMPLETE_KEY`] in `succ`. Returns how many keys were
 /// written. Skips everything when the marker is already there, reserved
 /// keys always, and a key `succ` already holds with the same value. Reads
 /// `pred` through the store directly, so the carry logs no read in it;
 /// each write in `succ` is logged as a `context_added` by writer `koto`.
-fn carry(backend: &Backend, pred: &str, succ: &str, prefixes: &[String]) -> Result<usize> {
+///
+/// Under the cloud backend `pred` is read from the bucket under
+/// `pred_prefix`, its fenced copy's prefix, and `succ`'s writes are held
+/// and pushed together once the marker is written. A batch an interrupted
+/// carry left open is pushed first, so a re-run sees what it wrote.
+fn carry(
+    backend: &Backend,
+    pred: &str,
+    succ: &str,
+    prefixes: &[String],
+    pred_prefix: Option<&str>,
+) -> Result<usize> {
     let store: &dyn ContextStore = backend;
+    let cloud = backend.as_cloud();
+    if let Some(cloud) = cloud {
+        cloud.flush_interrupted_batch(succ)?;
+    }
     if store.ctx_exists(succ, CARRY_COMPLETE_KEY) {
         return Ok(0);
     }
-    let mut keys = BTreeSet::new();
-    for prefix in prefixes {
-        keys.extend(
-            store
-                .list_keys(pred, Some(prefix))?
-                .into_iter()
-                .filter(|k| !is_reserved_key(k)),
-        );
-    }
+    let source = match (cloud, pred_prefix) {
+        (Some(cloud), Some(prefix)) => cloud.carry_source(prefix, pred, prefixes)?,
+        _ => {
+            let mut keys = BTreeSet::new();
+            for prefix in prefixes {
+                keys.extend(
+                    store
+                        .list_keys(pred, Some(prefix))?
+                        .into_iter()
+                        .filter(|k| !is_reserved_key(k)),
+                );
+            }
+            keys.into_iter()
+                .map(|key| store.get(pred, &key).map(|value| (key, value)))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    let held = cloud.map(|cloud| cloud.defer_writes_to(succ));
     let mut carried = 0;
-    for key in &keys {
-        let value = store.get(pred, key)?;
-        if store.ctx_exists(succ, key) && store.get(succ, key).ok().as_ref() == Some(&value) {
+    for (key, value) in &source {
+        if store.ctx_exists(succ, key) && store.get(succ, key).ok().as_ref() == Some(value) {
             continue;
         }
-        write_koto_key(backend, succ, key, &value)?;
+        write_koto_key(backend, succ, key, value)?;
         carried += 1;
     }
     let marker = serde_json::to_vec(&serde_json::json!({
         "from": pred,
         "prefixes": prefixes,
-        "keys": keys.len(),
+        "keys": source.len(),
         "at": now_iso8601(),
     }))?;
     write_koto_key(backend, succ, CARRY_COMPLETE_KEY, &marker)?;
+    drop(held);
+    if let Some(cloud) = cloud {
+        cloud.flush_window(succ)?;
+    }
     Ok(carried)
+}
+
+/// `fence`, read from `pred`'s log or its bucket copy, once its names check
+/// out. One naming an invalid successor or session id is refused, exit 2
+/// `invalid_fence`, with nothing written, before any path or key is built
+/// from it.
+fn trusted(pred: &str, fence: SupersedeFence) -> SupersedeFence {
+    if let Err(e) = check_fence_names(&fence) {
+        refuse(
+            "invalid_fence",
+            format!("--supersede: '{pred}''s log can't be trusted: {e:#}; nothing was written"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    fence
+}
+
+/// Pull `pred`'s state from the bucket for the fence: from the
+/// `--continues-from` workspace when one was named, else from the prefix
+/// this host's copy records as its home, else from the prefix it was looked
+/// up under. A copy that can't be read exits 3, and a prefix holding none
+/// exits 3 `fence_unavailable`; either way nothing is written.
+fn pull_pred(
+    cloud: &CloudBackend,
+    pred: &str,
+    continues_from: Option<&str>,
+    target: &super::session::ContinuesTarget,
+) -> PulledState {
+    let prefix = match (continues_from, target.prefix()) {
+        (Some(_), Some(prefix)) => prefix.to_string(),
+        (_, looked_up) => cloud
+            .home_prefix(pred)
+            .map(|home| home.prefix)
+            .ok()
+            .or_else(|| looked_up.map(str::to_string))
+            .unwrap_or_else(|| cloud.workspace_prefix().to_string()),
+    };
+    match cloud.pull_for_fence(&prefix, pred) {
+        Ok(Some(pulled)) => pulled,
+        Ok(None) => refuse(
+            "fence_unavailable",
+            format!(
+                "--supersede: the bucket holds no state of '{pred}' under its workspace prefix, \
+                 so it can't be fenced there; nothing was written"
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+        Err(e) => refuse(
+            "persistence_error",
+            format!(
+                "--supersede: could not pull '{pred}''s state from the bucket: {e:#}; nothing \
+                 was written"
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+    }
 }
 
 /// Write `key` in `session` with writer `koto` and log it there.

@@ -2535,6 +2535,12 @@ pub fn run(app: App) -> Result<()> {
                     if let Err(e) =
                         context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
+                        // Under the cloud backend the fence can arrive with
+                        // the command's own pull, after the check above:
+                        // refuse in the same shape, naming the newest member.
+                        if crate::engine::persistence::session_superseded(&e).is_some() {
+                            refuse_if_superseded(&backend, &session, "context add");
+                        }
                         exit_with_error_code(
                             serde_json::json!({
                                 "error": e.to_string(),
