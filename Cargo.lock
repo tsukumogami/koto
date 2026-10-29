@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "koto"
-version = "0.31.3-dev"
+version = "0.31.3"
 dependencies = [
  "aho-corasick",
  "anyhow",
