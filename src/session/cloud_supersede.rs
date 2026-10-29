@@ -1,5 +1,5 @@
 //! The cloud backend's half of `koto init --supersede`
-//! (`crate::cli::init_supersede`): the predecessor's state pulled from its
+//! (`src/cli/init_supersede.rs`): the predecessor's state pulled from its
 //! own workspace prefix, the fence pushed back conditional on that copy,
 //! and the carried keys read from the same prefix.
 //!
