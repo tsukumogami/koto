@@ -236,7 +236,8 @@ and an unreadable header, manifest or links directory taints every component.
 
 The original reference map had an edge A to B when A's header
 `parent_workflow` was B, or A's context key `chain/parent` held exactly B.
-Rule `h`'s graph has these edges and the `koto/links/` entries too. The
+Rule `h`'s graph has these edges, with the retention design's epoch-branch
+rule for `parent_workflow`, and the `koto/links/` entries too. The
 context key is read from the local session directory (`ctx/` under the
 session's directory) directly, never through the cloud backend's context
 store, so a prune makes no network call to judge a session.
@@ -498,9 +499,10 @@ Session mode:
    filter compares `finished_at` with now.
 3. For each session that passes the filters, whatever its status, evaluate
    rules a to g in order, so a running or unreadable session shows on `kept`
-   under rule a. Since this design, b and c have become rule `h`, which the
-   session-retention design specifies, and f is retired. The first rule that applies puts the session on `kept` with
-   that rule's letter and a detail (the referencing or referenced name, the
+   under rule a. The session-retention design later replaced b and c with
+   rule `h`, which it specifies, and koto#532 retired f, so the live letters
+   are a, d, e, g and h. The first rule that applies puts the session on
+   `kept` with that rule's letter and a detail (the referencing or referenced name, the
    request id); a candidate no rule keeps goes on the would-remove list.
    Records have
    no rules: koto writes one only when it removes a session itself, and that
@@ -519,7 +521,7 @@ Session mode:
 {"mode": "preview", "plan": "<token>",
  "remove": [{"kind": "session", "name": "...", "session_id": "...", "status": "terminal",
              "state": "done", "failure": false, "finished_at": "...", "execution_dir": "..."}],
- "kept": [{"name": "...", "rule": "b", "detail": "referenced by running session 'x'"}]}
+ "kept": [{"name": "...", "rule": "e", "detail": "<request id>"}]}
 ```
 
 6. Apply recomputes steps 1 to 4. With `--plan` it runs with the stored
