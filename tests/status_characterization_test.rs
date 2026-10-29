@@ -379,7 +379,7 @@ fn a_tampered_template_reports_the_mismatch_without_failing() {
 }
 
 #[test]
-fn a_migrated_session_exits_two_with_the_exact_error_object() {
+fn a_migrated_session_answers_status_and_refuses_a_write_with_the_exact_error_object() {
     let s3 = FakeS3::start("koto-status-characterization");
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join("ws")).unwrap();
@@ -435,14 +435,38 @@ fn a_migrated_session_exits_two_with_the_exact_error_object() {
     status.env("HOME", tmp.path());
     status.env("AWS_ACCESS_KEY_ID", "k");
     status.env("AWS_SECRET_ACCESS_KEY", "s");
+    // An import keeps its source as a read-only predecessor: `status`
+    // answers from the copy the source left in the bucket.
     let output = status.args(["status", "wf"]).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json = parse_last_json(&output.stdout);
+    assert_eq!(json["name"], "wf", "{json:#}");
+    assert_eq!(json["is_terminal"], false, "{json:#}");
+
+    // A write still refuses, exit 2, with the exact error object.
+    let mut remove = koto_command::koto();
+    remove.env_remove("CLAUDE_CODE_SESSION_ID");
+    remove.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "0");
+    remove.current_dir(&ws);
+    remove.env("HOME", tmp.path());
+    remove.env("AWS_ACCESS_KEY_ID", "k");
+    remove.env("AWS_SECRET_ACCESS_KEY", "s");
+    let output = remove
+        .args(["context", "remove", "wf", "notes.md"])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(2), "caller-actionable exit");
     let json = parse_last_json(&output.stdout);
     assert_eq!(
         json,
         serde_json::json!({
             "error": "session_migrated: session 'wf' was migrated to 'wf-elsewhere' in /srv/other; continue it there",
-            "command": "status",
+            "command": "context remove",
         })
     );
 }

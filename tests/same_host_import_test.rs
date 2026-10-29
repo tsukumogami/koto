@@ -289,7 +289,8 @@ fn assert_refused(out: &Out, code: &str) {
     assert_eq!(out.json()["error"]["code"], code, "{}", out.describe());
 }
 
-/// The replacement continues; the source refuses, naming B.
+/// The replacement continues; the source refuses to move, naming B, and
+/// its reads answer from the copy it left in the bucket.
 fn assert_moved(h: &Host) {
     let out = h.koto(
         &h.b,
@@ -300,8 +301,7 @@ fn assert_moved(h: &Host) {
     assert_eq!(out.json()["state"], "review", "{}", out.describe());
     for args in [
         vec!["next", NAME],
-        vec!["status", NAME],
-        vec!["context", "get", NAME, "notes.md"],
+        vec!["next", NAME, "--with-data", r#"{"choice":"go"}"#],
     ] {
         let out = h.koto(&h.a, &args, &[]);
         assert_eq!(out.code, Some(2), "{args:?} from A: {}", out.describe());
@@ -312,6 +312,12 @@ fn assert_moved(h: &Host) {
             "{args:?} names B: {all}"
         );
     }
+    let out = h.koto(&h.a, &["status", NAME], &[]);
+    assert_eq!(out.code, Some(0), "status from A: {}", out.describe());
+    assert_eq!(out.json()["current_state"], "wait", "{}", out.describe());
+    let out = h.koto(&h.a, &["context", "get", NAME, "notes.md"], &[]);
+    assert_eq!(out.code, Some(0), "get from A: {}", out.describe());
+    assert_eq!(out.raw, KEYS[0].1, "{}", out.describe());
 }
 
 #[test]
@@ -1336,14 +1342,18 @@ fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
             assert!(why.contains(&imp), "{name}: {why}");
         }
     }
-    // The migrated source keeps nothing and refuses reads.
+    // The migrated source keeps nothing and refuses writes; its reads
+    // answer from the copy it left in the bucket.
     let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &[]).json();
     let source = member(&hierarchy, "coord");
     assert_eq!(source["migrated"], true, "{hierarchy:#}");
     assert_eq!(source["alive"], false);
-    let refused = h.koto(&h.a, &["context", "get", "coord", "notes.md"], &[]);
+    let refused = h.koto(&h.a, &["context", "add", "coord", "late.md"], &[]);
     assert_eq!(refused.code, Some(2), "{}", refused.describe());
     assert!(format!("{}{}", refused.stdout, refused.stderr).contains("session_migrated"));
+    let read = h.koto(&h.a, &["context", "get", "coord", "notes.md"], &[]);
+    assert_eq!(read.code, Some(0), "{}", read.describe());
+    assert_eq!(read.raw, b"the notes\n");
 
     // Only coord moved: b's own copy is still under A's prefix, where it
     // was started, so the reviewer reads b's log and keys from there, and

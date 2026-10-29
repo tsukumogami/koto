@@ -873,3 +873,430 @@ fn the_sources_pin_travels_and_keeps_nothing_once_the_copy_is_released() {
         [w.pointer_key(&w.a, "v2", &w.b, "v2")]
     );
 }
+
+// ---------------------------------------------------------------------
+// The source stays readable
+// ---------------------------------------------------------------------
+
+/// The temporary directory a host's reads keep their scratch copies in,
+/// under the test's root.
+fn reads_tmp(host: &Host) -> PathBuf {
+    let dir = host
+        .home
+        .parent()
+        .unwrap()
+        .join(format!("tmp-{}", host.label));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// `run`, with the host's temporary directory under the test's root, and
+/// no scratch copy left behind there afterwards.
+fn read(host: &Host, args: &[&str]) -> Run {
+    let tmp = reads_tmp(host);
+    let output = cmd(host).env("TMPDIR", &tmp).args(args).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+        serde_json::from_str(last).unwrap_or(Value::Null)
+    });
+    let r = Run {
+        code: output.status.code(),
+        stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        json,
+    };
+    let left: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("koto-workspace-read-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "{} koto {args:?} left scratch behind: {left:?}",
+        host.label
+    );
+    r
+}
+
+/// Write `bytes` to a file under the host's home and return its path.
+fn file(host: &Host, name: &str, bytes: &[u8]) -> String {
+    let path = host.home.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// `koto context add <name> <key>` on `host`, with `bytes` as the content.
+fn add_key(host: &Host, name: &str, key: &str, bytes: &[u8]) {
+    let src = file(host, "content.tmp", bytes);
+    ok(host, &["context", "add", name, key, "--from-file", &src]);
+}
+
+/// What a read must leave alone: every object under the source's and the
+/// copy's prefixes, the marker among them, and the local copies of both
+/// sessions (the same directory when they share a host).
+struct Untouched {
+    bucket: BTreeMap<String, Vec<u8>>,
+    local: Vec<BTreeMap<String, Vec<u8>>>,
+}
+
+impl World {
+    fn untouched(&self, copy_host: &Host, copy: &str) -> Untouched {
+        let mut bucket = self.objects(&format!("{}/v2/", self.a.prefix()));
+        bucket.extend(self.objects(&format!("{}/{copy}/", copy_host.prefix())));
+        assert!(bucket.contains_key(&self.marker_key("v2")), "no marker");
+        Untouched {
+            bucket,
+            local: vec![
+                dir_files(&self.a.session_dir("v2")),
+                dir_files(&copy_host.session_dir(copy)),
+            ],
+        }
+    }
+
+    /// The source v2 in W1 on host 1 with a key, a decision and the state
+    /// `work`, imported by `into` and then moved on there: the copy has a
+    /// key of the same name with other content, a key of its own, a second
+    /// decision, and stands at `done`.
+    fn source_and_moved_copy(&self, into: &Host) {
+        self.init(&self.a, "v2", &[]);
+        add_key(&self.a, "v2", "notes.md", b"source notes");
+        ok(
+            &self.a,
+            &[
+                "decisions",
+                "record",
+                "v2",
+                "--with-data",
+                r#"{"choice":"source-choice","rationale":"the source's"}"#,
+            ],
+        );
+        self.compile(into);
+        let r = self.import(into, "v2", &self.a, &[]);
+        assert!(r.ok(), "import: {}", r.describe());
+        add_key(into, "v2", "notes.md", b"copy notes");
+        add_key(into, "v2", "copy-only.md", b"the copy's");
+        ok(
+            into,
+            &[
+                "decisions",
+                "record",
+                "v2",
+                "--with-data",
+                r#"{"choice":"copy-choice","rationale":"the copy's"}"#,
+            ],
+        );
+        self.done(into, "v2");
+    }
+}
+
+/// Each read verb on `host`, `prefix` the global options before it, answers
+/// with the source's values: state `work`, its notes, its one decision.
+fn assert_source_reads(host: &Host, prefix: &[&str]) {
+    let with = |args: &[&str]| -> Vec<String> {
+        prefix
+            .iter()
+            .chain(args.iter())
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let go = |args: &[&str]| {
+        let argv = with(args);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        read(host, &argv)
+    };
+    let r = go(&["status", "v2"]);
+    assert_eq!(r.code, Some(0), "status: {}", r.describe());
+    assert_eq!(r.json["name"], "v2", "{}", r.describe());
+    assert_eq!(r.json["current_state"], "work", "{}", r.describe());
+    assert_eq!(r.json["is_terminal"], false, "{}", r.describe());
+
+    let r = go(&["context", "get", "v2", "notes.md"]);
+    assert_eq!(r.code, Some(0), "get: {}", r.describe());
+    assert_eq!(r.stdout, "source notes", "{}", r.describe());
+
+    let r = go(&["context", "exists", "v2", "notes.md"]);
+    assert_eq!(r.code, Some(0), "exists: {}", r.describe());
+    let r = go(&["context", "exists", "v2", "copy-only.md"]);
+    assert_eq!(r.code, Some(1), "exists copy-only: {}", r.describe());
+
+    let r = go(&["context", "list", "v2"]);
+    assert_eq!(r.code, Some(0), "list: {}", r.describe());
+    let keys: Vec<String> = serde_json::from_value(r.json.clone()).unwrap();
+    assert!(keys.contains(&"notes.md".to_string()), "{keys:?}");
+    assert!(!keys.contains(&"copy-only.md".to_string()), "{keys:?}");
+
+    let r = go(&["decisions", "list", "v2"]);
+    assert_eq!(r.code, Some(0), "decisions list: {}", r.describe());
+    assert_eq!(r.json["state"], "work", "{}", r.describe());
+    assert_eq!(r.json["decisions"]["count"], 1, "{}", r.describe());
+    assert_eq!(
+        r.json["decisions"]["items"][0]["choice"],
+        "source-choice",
+        "{}",
+        r.describe()
+    );
+
+    let r = go(&["overrides", "list", "v2"]);
+    assert_eq!(r.code, Some(0), "overrides list: {}", r.describe());
+    assert_eq!(r.json["state"], "work", "{}", r.describe());
+    assert_eq!(r.json["overrides"]["count"], 0, "{}", r.describe());
+}
+
+/// Each read verb on `host` answers with the copy's values.
+fn assert_copy_reads(host: &Host) {
+    let r = read(host, &["status", "v2"]);
+    assert_eq!(r.code, Some(0), "status: {}", r.describe());
+    assert_eq!(r.json["current_state"], "done", "{}", r.describe());
+    let r = read(host, &["context", "get", "v2", "notes.md"]);
+    assert_eq!(r.code, Some(0), "get: {}", r.describe());
+    assert_eq!(r.stdout, "copy notes", "{}", r.describe());
+    let r = read(host, &["context", "exists", "v2", "copy-only.md"]);
+    assert_eq!(r.code, Some(0), "exists: {}", r.describe());
+    let r = read(host, &["context", "list", "v2"]);
+    let keys: Vec<String> = serde_json::from_value(r.json.clone()).unwrap();
+    assert!(keys.contains(&"copy-only.md".to_string()), "{keys:?}");
+    let r = read(host, &["decisions", "list", "v2"]);
+    assert_eq!(r.code, Some(0), "decisions list: {}", r.describe());
+    assert_eq!(r.json["state"], "done", "{}", r.describe());
+    let r = read(host, &["overrides", "list", "v2"]);
+    assert_eq!(r.code, Some(0), "overrides list: {}", r.describe());
+    assert_eq!(r.json["state"], "done", "{}", r.describe());
+}
+
+/// No PUT and no DELETE reached the bucket since the requests were
+/// cleared.
+fn assert_no_bucket_writes(s3: &FakeS3, what: &str) {
+    let writes: Vec<String> = s3
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT" || r.method == "DELETE")
+        .map(|r| format!("{} {}", r.method, r.key))
+        .collect();
+    assert!(writes.is_empty(), "{what} wrote to the bucket: {writes:#?}");
+}
+
+#[test]
+fn every_read_verb_answers_a_migrated_source_with_its_own_values_and_changes_nothing() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.b, &w.s3);
+    for host in [&w.a, &w.b] {
+        assert!(under(&reads_tmp(host), &w.root));
+    }
+    w.source_and_moved_copy(&w.b);
+    let before = w.untouched(&w.b, "v2");
+    w.s3.clear_requests();
+
+    // In the source's workspace, and through --workspace from the copy's,
+    // by id and by path alike.
+    assert_source_reads(&w.a, &[]);
+    let id = w.a.prefix();
+    let path = w.a.ws_str();
+    assert_source_reads(&w.b, &["--workspace", &id]);
+    assert_source_reads(&w.b, &["--workspace", &path]);
+    assert_source_reads(&w.a, &["--workspace", &id]);
+
+    let after = w.untouched(&w.b, "v2");
+    assert_eq!(after.bucket, before.bucket, "the bucket changed");
+    assert_eq!(after.local, before.local, "a local copy changed");
+    assert_no_bucket_writes(&w.s3, "a read of the source");
+
+    // The copy's workspace still answers with the copy.
+    assert_copy_reads(&w.b);
+}
+
+#[test]
+fn a_same_host_import_answers_each_workspace_with_its_own_session() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.a2, &w.s3);
+    for host in [&w.a, &w.a2] {
+        assert!(under(&reads_tmp(host), &w.root));
+    }
+    // No --as: the copy holds the name in the store both workspaces share.
+    w.source_and_moved_copy(&w.a2);
+    assert_eq!(w.a.session_dir("v2"), w.a2.session_dir("v2"));
+    let before = w.untouched(&w.a2, "v2");
+    w.s3.clear_requests();
+
+    // From the source's workspace: the source's state, its values.
+    assert_source_reads(&w.a, &[]);
+    let after = w.untouched(&w.a2, "v2");
+    assert_eq!(after.bucket, before.bucket, "the bucket changed");
+    assert_eq!(
+        after.local, before.local,
+        "the shared local copy, the copy's, changed"
+    );
+    assert_no_bucket_writes(&w.s3, "a read of the source");
+
+    // From the copy's workspace: the copy's.
+    assert_copy_reads(&w.a2);
+}
+
+#[test]
+fn a_read_key_that_could_leave_the_scratch_directory_is_refused_before_any_read() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.b, &w.s3);
+    w.source_and_moved_copy(&w.b);
+    let before = w.untouched(&w.b, "v2");
+    let tmp = reads_tmp(&w.a);
+    let id = w.a.prefix();
+    for (global, verb) in [(&[][..], "get"), (&["--workspace", id.as_str()][..], "get")] {
+        let mut args: Vec<&str> = global.to_vec();
+        args.extend(["context", verb, "v2", "../../escape.md"]);
+        w.s3.clear_requests();
+        let r = read(&w.a, &args);
+        assert_eq!(r.code, Some(3), "{args:?}: {}", r.describe());
+        assert!(
+            r.json["error"].as_str().is_some_and(|e| e.contains("'..'")),
+            "{args:?}: {}",
+            r.describe()
+        );
+        // The reader asked the bucket nothing about the session's keys.
+        assert!(
+            !w.s3.requests().iter().any(|q| q.key.contains("/ctx/")),
+            "{args:?}: {:#?}",
+            w.s3.requests()
+        );
+    }
+    let mut args = vec!["--workspace", id.as_str()];
+    args.extend(["context", "exists", "v2", "../../escape.md"]);
+    let r = read(&w.a, &args);
+    assert_eq!(r.code, Some(2), "{}", r.describe());
+    assert!(!tmp.parent().unwrap().join("escape.md").exists());
+    assert!(!w.root.join("escape.md").exists());
+    let after = w.untouched(&w.b, "v2");
+    assert_eq!(after.bucket, before.bucket);
+    assert_eq!(after.local, before.local);
+}
+
+/// The verbs that write or move a session, each with the exit code its
+/// `session_migrated` refusal has today on a source imported from another
+/// host (`same_host` false) or on this one. This work changes none of them:
+/// a migrated source's writes refuse as they did before its reads were
+/// served. Several still exit 1, not 2, as they did before.
+///
+/// Left out: `koto session resolve --keep local` and `koto session update`
+/// on a source imported from another host. Both exit 0 today and write to
+/// the source's bucket prefix (its `version.json`, its state file), so they
+/// don't refuse at all; that predates this work and isn't covered here.
+fn write_verbs(src: &str, same_host: bool) -> Vec<(Vec<String>, i32)> {
+    let one_cross = if same_host { 2 } else { 1 };
+    let mut verbs: Vec<(Vec<&str>, i32)> = vec![
+        (vec!["next", "v2"], 2),
+        (vec!["next", "v2", "--with-data", r#"{"marker":"done"}"#], 2),
+        (
+            vec!["context", "add", "v2", "new.md", "--from-file", src],
+            2,
+        ),
+        (vec!["context", "remove", "v2", "notes.md"], 2),
+        (vec!["rewind", "v2"], one_cross),
+        (vec!["cancel", "v2"], one_cross),
+        (
+            vec![
+                "decisions",
+                "record",
+                "v2",
+                "--with-data",
+                r#"{"choice":"x","rationale":"y"}"#,
+            ],
+            one_cross,
+        ),
+        (
+            vec![
+                "overrides",
+                "record",
+                "v2",
+                "--gate",
+                "g",
+                "--rationale",
+                "r",
+            ],
+            one_cross,
+        ),
+        (vec!["session", "link", "v2", "--continues", "other"], 2),
+        (vec!["session", "link", "v2", "--dispatched-by", "other"], 2),
+        (vec!["session", "rebind", "v2"], 1),
+        (vec!["session", "pin", "v2", "--reason", "r"], 2),
+        (vec!["session", "unpin", "v2"], 2),
+    ];
+    if same_host {
+        verbs.push((vec!["session", "resolve", "v2", "--keep", "local"], 2));
+        verbs.push((vec!["session", "update", "v2", "--intent", "x"], 1));
+    }
+    verbs
+        .into_iter()
+        .map(|(args, code)| (args.into_iter().map(str::to_string).collect(), code))
+        .collect()
+}
+
+/// The source's workspace, `host` on it: every verb `write_verbs` names
+/// still refuses with `session_migrated`, with today's exit code, naming
+/// the copy and its workspace, and changes neither the source nor the copy
+/// in the bucket or on this host. A refused `koto next` still records its
+/// tick's id beside the source's local copy (`cloud-tick.id`), host-local
+/// bookkeeping no read or write of the session's log or keys sees, so that
+/// one file is left out of the comparison.
+fn assert_writes_refused(w: &World, host: &Host, copy_host: &Host, same_host: bool) {
+    let src = file(host, "new.md", b"new");
+    let comparable = |u: Untouched| -> Untouched {
+        Untouched {
+            bucket: u.bucket,
+            local: u
+                .local
+                .into_iter()
+                .map(|mut files| {
+                    files.remove("cloud-tick.id");
+                    files
+                })
+                .collect(),
+        }
+    };
+    let before = comparable(w.untouched(copy_host, "v2"));
+    w.s3.clear_requests();
+    let mut wrong = Vec::new();
+    for (args, code) in write_verbs(&src, same_host) {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = read(host, &argv);
+        let all = format!("{}{}", r.stdout, r.stderr);
+        let refused = r.code == Some(code)
+            && all.contains("session_migrated")
+            && all.contains("'v2'")
+            && all.contains(&copy_host.ws_str());
+        if !refused {
+            wrong.push(format!(
+                "{} (want exit {code}): {}",
+                args.join(" "),
+                r.describe()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let after = comparable(w.untouched(copy_host, "v2"));
+    assert_eq!(after.bucket, before.bucket, "the bucket changed");
+    assert_eq!(after.local, before.local, "a local copy changed");
+    assert_no_bucket_writes(&w.s3, "a refused write");
+}
+
+#[test]
+fn every_write_verb_still_refuses_on_a_migrated_source() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.b, &w.s3);
+    w.init(&w.a, "other", &[]);
+    w.source_and_moved_copy(&w.b);
+    assert_writes_refused(&w, &w.a, &w.b, false);
+}
+
+#[test]
+fn every_write_verb_still_refuses_on_a_same_host_migrated_source() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.a2, &w.s3);
+    w.init(&w.a, "other", &[]);
+    w.source_and_moved_copy(&w.a2);
+    assert_writes_refused(&w, &w.a, &w.a2, true);
+}

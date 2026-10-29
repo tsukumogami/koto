@@ -1301,19 +1301,49 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 /// command writes or pushes anything ([`Backend::ensure_backref`]).
 fn refuse_if_unlocated(backend: &Backend, session: &str, command: &str) {
     if let Err(e) = backend.check_located(session) {
-        let mut error = serde_json::json!({
-            "error": e.to_string(),
-            "command": command
-        });
-        if let Some(unlocated) = e.downcast_ref::<crate::session::Unlocated>() {
-            error["code"] = "session_unlocated".into();
-            error["session"] = unlocated.session.clone().into();
-            error["reason"] = unlocated.reason.as_str().into();
-            error["locations"] = unlocated.reason.locations().into();
-        }
-        exit_with_error_code(error, EXIT_CALLER_ERROR);
+        refuse_unlocated(&e, command);
     }
     backend.ensure_backref(session);
+}
+
+/// Print [`refuse_if_unlocated`]'s refusal of `e` for `command`, exit 2.
+fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
+    let mut error = serde_json::json!({
+        "error": e.to_string(),
+        "command": command
+    });
+    if let Some(unlocated) = e.downcast_ref::<crate::session::Unlocated>() {
+        error["code"] = "session_unlocated".into();
+        error["session"] = unlocated.session.clone().into();
+        error["reason"] = unlocated.reason.as_str().into();
+        error["locations"] = unlocated.reason.locations().into();
+    }
+    exit_with_error_code(error, EXIT_CALLER_ERROR);
+}
+
+/// [`refuse_if_unlocated`] for a read verb a migrated source is served on
+/// (`koto status`, `koto decisions list`, `koto overrides list`): a session
+/// this workspace's copy of was imported away on this host is answered
+/// from the copy it left in the bucket
+/// ([`workspace_read::serve_migrated_source`]) rather than refused. `Some`
+/// with the command's result when it was served that way; `None` when the
+/// command goes on to read the session as usual.
+fn locate_or_serve(
+    backend: &Backend,
+    session: &str,
+    command: &str,
+    read: impl FnOnce() -> Command,
+) -> Option<Result<()>> {
+    match backend.check_located(session) {
+        Ok(()) => {
+            backend.ensure_backref(session);
+            None
+        }
+        Err(e) if e.is::<crate::session::SessionMigrated>() => {
+            Some(workspace_read::serve_migrated_source(backend, read(), e))
+        }
+        Err(e) => refuse_unlocated(&e, command),
+    }
 }
 
 /// The message and fields of a `session_superseded` refusal of `session`,
@@ -2217,7 +2247,10 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Status { name } => {
             let backend = build_backend()?;
-            refuse_if_unlocated(&backend, &name, "status");
+            let read = || Command::Status { name: name.clone() };
+            if let Some(served) = locate_or_serve(&backend, &name, "status", read) {
+                return served;
+            }
             handle_status(&backend, &name)
         }
         Command::Workflows {
@@ -2501,15 +2534,45 @@ pub fn run(app: App) -> Result<()> {
             // where to run the command (koto#457); a session imported away
             // on this host still refuses as migrated, which the guard asks
             // before its own question.
-            refuse_if_unlocated(&backend, session, command);
-            if let Err(e) = backend.check_not_migrated(session) {
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": e.to_string(),
-                        "command": command
-                    }),
-                    EXIT_CALLER_ERROR,
-                );
+            //
+            // A read of a migrated session doesn't refuse: `get`, `exists`
+            // and `list` are answered from the copy the source left in the
+            // bucket, written nowhere and logged nowhere. `add` and
+            // `remove` refuse, naming where the session went.
+            let session = session.clone();
+            let served_read = matches!(
+                subcommand,
+                ContextCommand::Get { .. }
+                    | ContextCommand::Exists { .. }
+                    | ContextCommand::List { .. }
+            );
+            if served_read {
+                let refused = match backend.check_located(&session) {
+                    Ok(()) => {
+                        backend.ensure_backref(&session);
+                        backend.check_not_migrated(&session).err()
+                    }
+                    Err(e) if e.is::<crate::session::SessionMigrated>() => Some(e),
+                    Err(e) => refuse_unlocated(&e, command),
+                };
+                if let Some(e) = refused {
+                    return workspace_read::serve_migrated_source(
+                        &backend,
+                        Command::Context { subcommand },
+                        e,
+                    );
+                }
+            } else {
+                refuse_if_unlocated(&backend, &session, command);
+                if let Err(e) = backend.check_not_migrated(&session) {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": e.to_string(),
+                            "command": command
+                        }),
+                        EXIT_CALLER_ERROR,
+                    );
+                }
             }
             match subcommand {
                 ContextCommand::Add {
@@ -2772,7 +2835,12 @@ pub fn run(app: App) -> Result<()> {
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => {
-                    refuse_if_unlocated(&backend, &name, "decisions list");
+                    let read = || Command::Decisions {
+                        subcommand: DecisionsSubcommand::List { name: name.clone() },
+                    };
+                    if let Some(served) = locate_or_serve(&backend, &name, "decisions list", read) {
+                        return served;
+                    }
                     handle_decisions_list(&backend, name)
                 }
             }
@@ -2791,7 +2859,12 @@ pub fn run(app: App) -> Result<()> {
                     overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
                 }
                 overrides::OverridesSubcommand::List { name } => {
-                    refuse_if_unlocated(&backend, &name, "overrides list");
+                    let read = || Command::Overrides {
+                        subcommand: overrides::OverridesSubcommand::List { name: name.clone() },
+                    };
+                    if let Some(served) = locate_or_serve(&backend, &name, "overrides list", read) {
+                        return served;
+                    }
                     overrides::handle_overrides_list(&backend, name)
                 }
             }
@@ -8651,7 +8724,7 @@ fn handle_decisions_record(
 ///
 /// Returns accumulated decisions for the current state's epoch as a
 /// standalone JSON response.
-fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<()> {
+fn handle_decisions_list(backend: &Backend, name: String) -> Result<()> {
     if !backend.exists(&name) {
         exit_with_error_code(
             serde_json::json!({
@@ -8664,6 +8737,14 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 
     let (_, events) = match backend.read_events(&name) {
         Ok(result) => result,
+        // A session imported elsewhere is answered from the copy it left
+        // in the bucket.
+        Err(err) if err.is::<crate::session::SessionMigrated>() => {
+            let read = Command::Decisions {
+                subcommand: DecisionsSubcommand::List { name },
+            };
+            return workspace_read::serve_migrated_source(backend, read, err);
+        }
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
             exit_with_error_code(
@@ -8768,9 +8849,18 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
 
     let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
+        // A session imported elsewhere is answered from the copy it left
+        // in the bucket, as a read-only predecessor of the copy.
+        Err(err) if err.is::<crate::session::SessionMigrated>() => {
+            let read = Command::Status {
+                name: name.to_string(),
+            };
+            return workspace_read::serve_migrated_source(backend, read, err);
+        }
         Err(err) => {
             // A session imported elsewhere exits 2, as `koto next` does for
-            // it: the caller continues it where the message says.
+            // it, when it can't be served (the reader's own backend): the
+            // caller continues it where the message says.
             let code = if err
                 .downcast_ref::<crate::session::SessionMigrated>()
                 .is_some()

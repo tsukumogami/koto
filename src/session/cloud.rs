@@ -348,6 +348,12 @@ struct Probes {
     /// tick in the reader's own workspace never runs a session in this
     /// prefix. Kept here, in the box, so the backend stays small.
     read_only: bool,
+    /// A read-only reader that serves a session carrying a migration
+    /// marker from the copy it left in the bucket
+    /// ([`workspace_read::WorkspaceReader::serve_migrated`]): its reads
+    /// pass the migration check, while every write still refuses, as
+    /// `read_only` makes them. Never set without `read_only`.
+    serve_migrated: bool,
     /// The continues relation's bucket walk: its judgment-pass memo and the
     /// listings of a session the removal check that follows a pin guard or
     /// a remote-copy check shares. Kept here, in the box, for the same
@@ -420,6 +426,7 @@ impl CloudBackend {
                 answers: Mutex::new(HashMap::new()),
                 window: std::time::Duration::ZERO,
                 read_only: false,
+                serve_migrated: false,
                 walk: Mutex::default(),
                 homes: Mutex::default(),
                 located: Mutex::default(),
@@ -548,6 +555,12 @@ impl CloudBackend {
     /// answer per session with whether a listing of its own confirmed it; a
     /// write asks again when the answer it finds was borrowed.
     fn check_migration(&self, id: &str, write: bool) -> anyhow::Result<()> {
+        // A reader serving a migrated source reads the copy the source left
+        // behind: its reads pass, and its writes refuse, as every write of
+        // a read-only backend does, before or after this check.
+        if !write && self.probes.read_only && self.probes.serve_migrated {
+            return Ok(());
+        }
         self.local_guard(id)?;
         // A marker under this prefix belongs to another workspace's session
         // of the same name, not to `id`'s local copy (koto#457).
@@ -698,6 +711,34 @@ impl CloudBackend {
             target: id.to_string(),
             workspace,
         })
+    }
+
+    /// The bucket prefix of the copy of `id` a [`SessionMigrated`] refusal
+    /// is about: the copy this workspace's command would have read.
+    ///
+    /// A same-host import leaves the imported session at the name in the
+    /// shared local store, so when the local copy is an import of this
+    /// workspace's own copy ([`CloudBackend::local_guard`]), the source is
+    /// under this directory's prefix, whatever the local header records.
+    /// Otherwise the marker was found under `id`'s home
+    /// ([`CloudBackend::home`]), beside the source's state file.
+    pub(crate) fn migrated_source_prefix(&self, id: &str) -> String {
+        if self.local_import_from_here(id).is_some() {
+            return self.prefix.clone();
+        }
+        self.home(id)
+    }
+
+    /// The bucket this backend reads, for a reader of another prefix in it
+    /// ([`workspace_read::WorkspaceReader::for_migrated_source`]).
+    pub(crate) fn bucket_handle(&self) -> Box<Bucket> {
+        self.bucket.clone()
+    }
+
+    /// Whether this backend is a read-only reader (`koto --workspace`, or a
+    /// served read of a migrated source).
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.probes.read_only
     }
 
     /// Refuse a command that names `id` when koto can't tell which bucket

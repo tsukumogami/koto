@@ -1046,8 +1046,17 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
         written["target"]["session_id"],
         b.header("wf")["session_id"]
     );
-    let run = a.koto(&["status", "wf"]);
+    let run = a.koto(&["next", "wf"]);
     assert_eq!(run.code, Some(2), "A must refuse now: {}", run.describe());
+    assert_eq!(
+        run.json["error"]["code"],
+        "session_migrated",
+        "{}",
+        run.describe()
+    );
+    // A read of the source answers from the copy it left.
+    let run = a.koto(&["status", "wf"]);
+    assert_eq!(run.code, Some(0), "status in A: {}", run.describe());
 }
 
 /// A crash between the push and the rename leaves the target only in the
@@ -1193,14 +1202,18 @@ fn as_imports_under_a_new_name() {
     let run = b.koto(&["status", "moved"]);
     assert!(run.ok(), "status moved: {}", run.describe());
     assert_eq!(holdings(&s3, &b, "wf"), own, "B's own 'wf' changed");
-    let run = a.koto(&["status", "wf"]);
+    let run = a.koto(&["next", "wf"]);
     assert!(
-        run.json["error"]
+        run.json["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("'moved'")),
         "A's refusal must name the new name: {}",
         run.describe()
     );
+    // A read of the source answers as 'wf', from the copy it left.
+    let run = a.koto(&["status", "wf"]);
+    assert_eq!(run.code, Some(0), "status in A: {}", run.describe());
+    assert_eq!(run.json["name"], "wf", "{}", run.describe());
 }
 
 /// `koto init` pushes the compiled template as `template.json`; the import
@@ -1276,10 +1289,12 @@ fn trust_template_takes_the_bucket_copy_only_when_asked() {
     assert_no_trace(&s3, &c, "wf2");
 }
 
-/// After an import, the source's `koto context` commands and `koto session
-/// rebind` refuse with `session_migrated`, and leave its copy as it was.
+/// After an import, the source's `koto context add` and `remove` and `koto
+/// session rebind` refuse with `session_migrated`, while `get`, `list` and
+/// `exists` answer from the copy the source left in the bucket; all of them
+/// leave its copy as it was.
 #[test]
-fn a_migrated_source_refuses_context_commands_and_rebind() {
+fn a_migrated_source_refuses_context_writes_and_rebind_and_serves_reads() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -1310,12 +1325,6 @@ fn a_migrated_source_refuses_context_commands_and_rebind() {
             ],
             "context add",
         ),
-        (vec!["context", "get", "wf", "notes.md"], "context get"),
-        (vec!["context", "list", "wf"], "context list"),
-        (
-            vec!["context", "exists", "wf", "notes.md"],
-            "context exists",
-        ),
         (
             vec!["context", "remove", "wf", "notes.md"],
             "context remove",
@@ -1338,6 +1347,28 @@ fn a_migrated_source_refuses_context_commands_and_rebind() {
         "rebind: {}",
         run.describe()
     );
+
+    // The reads answer from the source's last pushed copy.
+    let run = a.koto(&["context", "get", "wf", "notes.md"]);
+    assert_eq!(run.code, Some(0), "context get: {}", run.describe());
+    assert_eq!(
+        run.stdout.as_bytes(),
+        notes.as_slice(),
+        "{}",
+        run.describe()
+    );
+    let run = a.koto(&["context", "list", "wf"]);
+    assert_eq!(run.code, Some(0), "context list: {}", run.describe());
+    assert_eq!(
+        run.json,
+        serde_json::json!(["notes.md"]),
+        "{}",
+        run.describe()
+    );
+    let run = a.koto(&["context", "exists", "wf", "notes.md"]);
+    assert_eq!(run.code, Some(0), "context exists: {}", run.describe());
+    let run = a.koto(&["context", "exists", "wf", "new.md"]);
+    assert_eq!(run.code, Some(1), "context exists: {}", run.describe());
 
     assert_eq!(std::fs::read(ctx.join("notes.md")).unwrap(), notes);
     assert!(!ctx.join("new.md").exists());

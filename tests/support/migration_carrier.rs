@@ -708,16 +708,18 @@ impl<'a> Carrier<'a> {
                 ),
             );
 
+            // A read of A's copy answers from what A last pushed: A's
+            // state, not the one B moved on to.
             let run = c.a.koto(&["status", &c.name]);
             ensure(
                 step,
-                run.code == Some(2),
+                run.code == Some(0),
                 format!("koto status in A: {}", run.describe()),
             );
             ensure(
                 step,
-                run.json["error"].as_str() == Some(message),
-                format!("koto status in A gave another message: {}", run.describe()),
+                run.json["current_state"] == "start",
+                format!("koto status in A gave another state: {}", run.describe()),
             );
 
             ensure(
