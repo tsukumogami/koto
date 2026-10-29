@@ -674,8 +674,11 @@ impl CloudBackend {
     /// each with the listing the command's state pull makes anyway:
     ///
     /// - with no local copy, the only candidate is this directory's prefix,
-    ///   and a bucket holding no state there for `id` is `NoLocalCopy`; a
-    ///   listing that fails lets the command go on, as before;
+    ///   and a bucket holding no state there for `id` is `NoLocalCopy` when
+    ///   another workspace's prefix holds it ([`CloudBackend::held_elsewhere`]).
+    ///   A session the bucket holds nowhere was never used, and the command
+    ///   goes on to answer it absent, as before (koto#518); so does one whose
+    ///   listing fails;
     /// - a home that isn't this directory's own is pulled now, strictly
     ///   ([`CloudBackend::sync_pull_state`]): a bucket that can't answer is
     ///   an error, and a copy there that is missing or another session's is
@@ -688,12 +691,14 @@ impl CloudBackend {
         }
         if !self.local.exists(id) {
             return match self.probe(id) {
-                Ok(probe) if probe.state_etag.is_none() => Err(anyhow::Error::new(Unlocated {
-                    session: id.to_string(),
-                    reason: UnlocatedReason::NoLocalCopy {
-                        prefix: home.prefix,
-                    },
-                })),
+                Ok(probe) if probe.state_etag.is_none() && self.held_elsewhere(id) => {
+                    Err(anyhow::Error::new(Unlocated {
+                        session: id.to_string(),
+                        reason: UnlocatedReason::NoLocalCopy {
+                            prefix: home.prefix,
+                        },
+                    }))
+                }
                 _ => Ok(()),
             };
         }
@@ -702,6 +707,38 @@ impl CloudBackend {
             self.sync_pull_state(id)?;
         }
         Ok(())
+    }
+
+    /// Whether a workspace prefix other than this directory's holds `id`'s
+    /// state object: one listing of the bucket's top level, which names the
+    /// workspace prefixes, then one of each other prefix's `<prefix>/<id>/`,
+    /// stopping at the first that holds it. Asked only for a session with no
+    /// local copy and no state under this directory's prefix. A listing that
+    /// fails reads as not held, so the command goes on as before.
+    fn held_elsewhere(&self, id: &str) -> bool {
+        let Ok(pages) = self.bucket.list(String::new(), Some("/".to_string())) else {
+            return false;
+        };
+        let prefixes: Vec<String> = pages
+            .iter()
+            .filter_map(|page| page.common_prefixes.as_ref())
+            .flatten()
+            .filter_map(|cp| cp.prefix.strip_suffix('/'))
+            .filter(|p| is_workspace_prefix(p) && *p != self.prefix)
+            .map(str::to_string)
+            .collect();
+        prefixes.iter().any(|prefix| {
+            let session = format!("{prefix}/{id}/");
+            let state = format!("{session}{}", state_file_name(id));
+            self.bucket
+                .list(session, Some("/".to_string()))
+                .is_ok_and(|pages| {
+                    pages
+                        .iter()
+                        .flat_map(|page| page.contents.iter())
+                        .any(|obj| obj.key == state)
+                })
+        })
     }
 
     /// Where `id`'s own copy lives in the bucket, asked of its local header

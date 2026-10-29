@@ -197,7 +197,8 @@ pub struct Unlocated {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlocatedReason {
     /// This host has no copy of the session, and the bucket holds none
-    /// under the prefix of the directory the command runs in.
+    /// under the prefix of the directory the command runs in, while another
+    /// directory's prefix holds one.
     NoLocalCopy {
         /// The prefix that was asked.
         prefix: String,
