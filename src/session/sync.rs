@@ -238,14 +238,65 @@ pub fn try_push_context_key(
     Ok(())
 }
 
+/// What [`pull_context_if_newer`] did with a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pull {
+    /// The local copy stands and matches what the bucket has, or the bucket
+    /// has nothing to give.
+    Unchanged,
+    /// The bucket's copy was written over the local one.
+    Wrote,
+    /// The copies differ and the local one was written later, so it stands
+    /// and the bucket lacks it (koto#520).
+    LocalNewer,
+}
+
+/// Whether `local` was written later than `remote`, both timestamps in the
+/// form koto writes them (`YYYY-MM-DDTHH:MM:SS.mmmZ`, or without the
+/// milliseconds). A timestamp in any other form never counts as later, so
+/// the pull goes ahead as it did before.
+fn written_later(local: &str, remote: &str) -> bool {
+    match (sortable_timestamp(local), sortable_timestamp(remote)) {
+        (Some(local), Some(remote)) => local > remote,
+        _ => false,
+    }
+}
+
+/// `ts` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, which sorts as text, or `None` when
+/// it is in neither form koto writes.
+fn sortable_timestamp(ts: &str) -> Option<String> {
+    if !ts.is_ascii() {
+        return None;
+    }
+    let ts = match ts.len() {
+        20 => format!("{}.000Z", &ts[..19]),
+        24 => ts.to_string(),
+        _ => return None,
+    };
+    let b = ts.as_bytes();
+    let well_formed = b.iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        10 => *c == b'T',
+        13 | 16 => *c == b':',
+        19 => *c == b'.',
+        23 => *c == b'Z',
+        _ => c.is_ascii_digit(),
+    });
+    well_formed.then_some(ts)
+}
+
 /// Pull a context key from S3 if the remote version differs from local.
 ///
 /// Compares the hash in the remote manifest against the local manifest.
 /// If they differ (or the key is missing locally), downloads the content
-/// and writes it locally with writer `sync`.
+/// and writes it locally with writer `sync` -- unless the local copy was
+/// written later than the remote one, which then stands untouched
+/// ([`Pull::LocalNewer`]). A session whose home moved can find an older
+/// copy under its new home than the one it holds (koto#520); a write from
+/// another host after this one's still comes down.
 ///
-/// Returns whether it wrote the local store, so the caller can log the
-/// write (a `context_added` with `writer: "sync"`).
+/// Returns [`Pull::Wrote`] when it wrote the local store, so the caller can
+/// log the write (a `context_added` with `writer: "sync"`).
 ///
 /// `before_download` runs once a download is due and before it starts, and
 /// nothing is written after its error.
@@ -257,7 +308,7 @@ pub fn try_push_context_key(
 /// whose object can't be fetched (a 404 from an object the manifest names
 /// but the bucket lacks, say), or downloaded bytes that can't be written. A
 /// manifest the listing didn't show, or no listing at all (an unreachable
-/// bucket), leaves the local copy standing, `Ok(false)`, as before.
+/// bucket), leaves the local copy standing, [`Pull::Unchanged`], as before.
 #[allow(clippy::too_many_arguments)]
 pub fn pull_context_if_newer(
     local: &LocalBackend,
@@ -268,7 +319,7 @@ pub fn pull_context_if_newer(
     cache: &ManifestCache,
     manifest_listed: bool,
     before_download: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Pull> {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
@@ -278,19 +329,22 @@ pub fn pull_context_if_newer(
             session,
             key
         ),
-        None => return Ok(false),
+        None => return Ok(Pull::Unchanged),
     };
 
     let remote_meta = match remote_manifest.keys.get(key) {
         Some(m) => m,
-        None => return Ok(false), // Key doesn't exist remotely.
+        None => return Ok(Pull::Unchanged), // Key doesn't exist remotely.
     };
 
     // Check if local hash matches remote hash.
     let local_manifest = local.read_manifest(session).unwrap_or_default();
     if let Some(local_meta) = local_manifest.keys.get(key) {
         if local_meta.hash == remote_meta.hash {
-            return Ok(false); // Hashes match, no download needed.
+            return Ok(Pull::Unchanged); // Hashes match, no download needed.
+        }
+        if written_later(&local_meta.created_at, &remote_meta.created_at) {
+            return Ok(Pull::LocalNewer);
         }
     }
     before_download()?;
@@ -333,7 +387,7 @@ pub fn pull_context_if_newer(
                 e
             )
         })?;
-    Ok(true)
+    Ok(Pull::Wrote)
 }
 
 /// The remote manifest's metadata for `key`, if the remote store has it.
@@ -465,6 +519,39 @@ mod tests {
             pushed.keys.keys().collect::<Vec<_>>(),
             ["koto/links/held-by/a", "notes.md"]
         );
+    }
+
+    /// A local copy counts as later only when both timestamps are in a form
+    /// koto writes; anything else lets the pull go ahead.
+    #[test]
+    fn written_later_compares_koto_timestamps() {
+        assert!(written_later(
+            "2026-10-28T17:49:00.001Z",
+            "2026-10-26T09:00:00.000Z"
+        ));
+        assert!(!written_later(
+            "2026-10-26T09:00:00.000Z",
+            "2026-10-28T17:49:00.001Z"
+        ));
+        assert!(!written_later(
+            "2026-10-28T17:49:00.000Z",
+            "2026-10-28T17:49:00.000Z"
+        ));
+        // Without milliseconds, as older manifests carry it.
+        assert!(written_later(
+            "2026-10-28T17:49:00.500Z",
+            "2026-10-28T17:49:00Z"
+        ));
+        assert!(!written_later(
+            "2026-10-28T17:49:00Z",
+            "2026-10-28T17:49:00.500Z"
+        ));
+        assert!(!written_later("t", "2026-10-28T17:49:00.000Z"));
+        assert!(!written_later("2026-10-28T17:49:00.000Z", ""));
+        assert!(!written_later(
+            "2026-10-28 17:49:00.000Z",
+            "2026-01-01T00:00:00.000Z"
+        ));
     }
 
     #[test]
