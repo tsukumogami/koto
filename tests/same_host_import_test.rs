@@ -1167,18 +1167,24 @@ fn local_files(h: &Host, name: &str) -> Files {
 }
 
 /// `before` and `after` are the same objects but the migration marker the
-/// import adds beside the source.
+/// import adds beside the source and the back-reference its copy's relation
+/// keeps there.
 fn only_marked(before: &Files, after: &Files, ws: &Path, name: &str) {
     let marker = format!("{}/{}/migrated.json", prefix_of(ws), name);
+    let backrefs = format!("{}/{}/ctx/koto/continued-by/", prefix_of(ws), name);
     let rest: Files = after
         .iter()
-        .filter(|(k, _)| *k != marker)
+        .filter(|(k, _)| *k != marker && !k.starts_with(&backrefs))
         .cloned()
         .collect();
     assert_eq!(&rest, before, "the source changed beyond its marker");
     assert!(
         after.iter().any(|(k, _)| *k == marker),
         "no marker on {name}"
+    );
+    assert!(
+        after.iter().any(|(k, _)| k.starts_with(&backrefs)),
+        "no back-reference beside {name}"
     );
 }
 
@@ -1718,10 +1724,13 @@ fn an_import_drops_the_reserved_keys_a_bucket_must_not_carry() {
         out.describe()
     );
     assert_eq!(out.json()["keys"], 2, "notes.md and the good link");
+    // Besides what came across, the import's own records: what it copied,
+    // and the relation naming the source.
     assert_eq!(
         manifest_keys(&h, "s-b"),
         [
             "koto/imported-from",
+            "koto/links/continues/s",
             "koto/links/dispatched-by/good",
             "notes.md"
         ]

@@ -130,10 +130,15 @@ pub(crate) fn listing_error(e: &S3Error) -> crate::session::pin::BucketError {
 /// A migrated source copy, as [`CloudBackend::migrated_source_copy`] reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCopy {
-    /// The objects under the copy's prefix, the marker included.
+    /// The objects under the copy's prefix that its removal deletes, the
+    /// marker included: every one but the back-references its successors
+    /// keep beside it, which are theirs.
     pub objects: usize,
     /// Its log's event lines, verbatim; none when it has no state file.
     pub events: Vec<String>,
+    /// Its log header's session id, when it has a state file that records
+    /// one.
+    pub session_id: Option<String>,
 }
 
 /// What a migration marker's target holds, as
@@ -2452,23 +2457,28 @@ impl CloudBackend {
             .filter(|key| key.starts_with(&session))
             .collect();
         let state_key = format!("{}{}", session, state_file_name(name));
-        let events = if keys.contains(&state_key.as_str()) {
+        let (events, session_id) = if keys.contains(&state_key.as_str()) {
             match self.fetch_object(&state_key) {
                 Ok(Some(bytes)) => {
-                    parse_source_log(&bytes)
-                        .map_err(|e| format!("the source's log doesn't read to the end: {e}"))?
-                        .event_lines
+                    let log = parse_source_log(&bytes)
+                        .map_err(|e| format!("the source's log doesn't read to the end: {e}"))?;
+                    let id = Some(log.header.session_id).filter(|id| !id.is_empty());
+                    (log.event_lines, id)
                 }
                 // Removed between the listing and the GET.
-                Ok(None) => Vec::new(),
+                Ok(None) => (Vec::new(), None),
                 Err(e) => return Err(without_url_userinfo(&format!("{e:#}"))),
             }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         Ok(SourceCopy {
-            objects: keys.len(),
+            objects: keys
+                .iter()
+                .filter(|key| !crate::session::continues_bucket::in_backref_area(&session, key))
+                .count(),
             events,
+            session_id,
         })
     }
 
@@ -4611,6 +4621,9 @@ pub enum ImportErrorCode {
     /// A same-host import found a local session naming the source as its
     /// parent.
     SourceHasChildren,
+    /// A re-run found the copy already built, holding a continues relation
+    /// that names another session than the source. Nothing was changed.
+    RelationConflict,
 }
 
 impl ImportErrorCode {
@@ -4630,6 +4643,7 @@ impl ImportErrorCode {
             ImportErrorCode::SourceRunning => "import_source_running",
             ImportErrorCode::SourceUnpushed => "import_source_unpushed",
             ImportErrorCode::SourceHasChildren => "import_source_has_children",
+            ImportErrorCode::RelationConflict => "relation_conflict",
         }
     }
 
@@ -4646,7 +4660,8 @@ impl ImportErrorCode {
             | ImportErrorCode::TemplateUnavailable
             | ImportErrorCode::SourceRunning
             | ImportErrorCode::SourceUnpushed
-            | ImportErrorCode::SourceHasChildren => 2,
+            | ImportErrorCode::SourceHasChildren
+            | ImportErrorCode::RelationConflict => 2,
             ImportErrorCode::SourceUnreadable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
@@ -4843,6 +4858,21 @@ impl ImportSource {
     fn unreadable(&self, what: &str, e: &dyn std::fmt::Display) -> ImportError {
         unreadable_source(&self.name, &self.workspace, what, e)
     }
+
+    /// The relation a copy with session id `holder_session_id` holds,
+    /// naming this source (R5).
+    fn relation<'a>(
+        &'a self,
+        holder_session_id: &'a str,
+    ) -> crate::session::import_links::ImportRelation<'a> {
+        crate::session::import_links::ImportRelation {
+            source: &self.name,
+            source_session_id: &self.log.header.session_id,
+            source_workspace: &self.workspace,
+            source_prefix: &self.prefix,
+            holder_session_id,
+        }
+    }
 }
 
 fn unreadable_source(
@@ -5016,19 +5046,26 @@ impl CloudBackend {
     /// Reads and checks the source's remote objects; builds the target in
     /// a staging directory inside the session store, with the source's
     /// events plus a `session_imported` event, its context keys and
-    /// manifest verbatim, and the compiled template; pushes it under this
-    /// workspace's prefix; renames it into place; and only then writes
-    /// `migrated.json` beside the source. A failure before the rename
-    /// removes the staging directory and exactly the objects this run
-    /// pushed. The import never writes any other object under the
-    /// source's prefix.
+    /// manifest verbatim, the compiled template, and the relation
+    /// `koto/links/continues/<source>` naming the source (any relation the
+    /// source held is left behind); writes the relation's back-reference
+    /// beside the source; pushes the copy under this workspace's prefix;
+    /// renames it into place; and only then writes `migrated.json` beside
+    /// the source. A failure before the rename removes the staging
+    /// directory, exactly the objects this run pushed and the
+    /// back-reference, so no marker is ever left naming a copy that didn't
+    /// reach the bucket. Besides the marker and the back-reference, the
+    /// import never writes any object under the source's prefix.
     ///
     /// Rollback ends at the rename: once the target is in place, the
     /// marker step never takes anything back, whatever it reports.
     ///
     /// A re-run of an import that stopped at `import_unmarked` writes only
     /// the marker; one whose target reached the bucket but not this
-    /// machine builds and pushes it again.
+    /// machine builds and pushes it again. A re-run that finds the copy
+    /// complete here adds the relation when the copy holds none (a copy an
+    /// earlier release built), and refuses `relation_conflict`, changing
+    /// nothing, when it holds one naming another session.
     ///
     /// It is defined for a stopped source: no process advancing the
     /// session, and its last write on the remote. Nothing here can tell a
@@ -5063,6 +5100,7 @@ impl CloudBackend {
                     {
                         self.finish_takeover(req.target, &source, None);
                     }
+                    self.settle_relation(req.target, &source)?;
                     Ok(outcome(
                         self.local_key_count(req.target)?,
                         TemplateOrigin::Unchanged,
@@ -5107,12 +5145,17 @@ impl CloudBackend {
 
         let (session_id, machine_id, keys, template_origin) =
             match self.existing_target(req, &source)? {
-                ExistingTarget::Local { session_id } => (
-                    session_id,
-                    import_machine_id()?,
-                    self.local_key_count(req.target)?,
-                    TemplateOrigin::Unchanged,
-                ),
+                ExistingTarget::Local { session_id } => {
+                    // The relation goes in before the marker, as on a
+                    // first run.
+                    self.settle_relation(req.target, &source)?;
+                    (
+                        session_id,
+                        import_machine_id()?,
+                        self.local_key_count(req.target)?,
+                        TemplateOrigin::Unchanged,
+                    )
+                }
                 ExistingTarget::Free => {
                     // The manifest first: it refuses a close session as a
                     // source before the template is looked for.
@@ -5121,8 +5164,16 @@ impl CloudBackend {
                     let machine_id = import_machine_id()?;
                     let (mut staging, session_id, manifest) =
                         self.stage_import(req, &source, &template, manifest, &machine_id, None)?;
-                    let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
-                    self.move_into_place(req.target, &mut staging, &pushed)?;
+                    // The back-reference first, so no copy holding the
+                    // relation ever reaches the bucket without it; a push
+                    // or a move that fails takes it back.
+                    let owed =
+                        self.put_import_backref(req.target, &staging.dir, &source, &session_id)?;
+                    let pushed = self
+                        .push_staged(req.target, &staging.dir, &source, &manifest)
+                        .inspect_err(|_| self.take_back_backref(&owed))?;
+                    self.move_into_place(req.target, &mut staging, &pushed)
+                        .inspect_err(|_| self.take_back_backref(&owed))?;
                     // The session is in place: journal it as a new run, with
                     // the state its carried log leaves it in. This comes
                     // before the marker, since a marker failure leaves the
@@ -5151,6 +5202,136 @@ impl CloudBackend {
 
         self.mark_source(req, &source, &session_id, &machine_id)?;
         Ok(outcome(keys, template_origin))
+    }
+
+    /// PUT the back-reference the copy staged at `staged` (session id
+    /// `session_id`, to be named `target` here) owes beside the source, and
+    /// record it as confirmed in the staged directory, so the copy's first
+    /// push carries its relation. Runs before anything of the copy is
+    /// pushed; a PUT the bucket doesn't confirm refuses `import_push_failed`
+    /// with nothing written.
+    fn put_import_backref(
+        &self,
+        target: &str,
+        staged: &Path,
+        source: &ImportSource,
+        session_id: &str,
+    ) -> Result<crate::session::continues_bucket::OwedPointer, ImportError> {
+        let failed = |e: &dyn std::fmt::Display| {
+            ImportError::new(
+                ImportErrorCode::PushFailed,
+                format!(
+                    "could not write the back-reference beside session '{}' in workspace {} \
+                     that the copy's relation needs; nothing was pushed: {}",
+                    source.name, source.workspace, e
+                ),
+            )
+        };
+        let owed = self.pointer_for(target, &source.prefix, &source.name, session_id);
+        self.put_backref(&owed)
+            .map_err(|e| failed(&format!("{e:#}")))?;
+        if let Err(e) = crate::session::continues_bucket::mark_confirmed(staged, &owed.key) {
+            self.take_back_backref(&owed);
+            return Err(failed(&e));
+        }
+        Ok(owed)
+    }
+
+    /// Delete the back-reference an import wrote before its copy failed to
+    /// reach the bucket, best-effort: one left behind names a holder with no
+    /// relation, which every walk reads as stale.
+    fn take_back_backref(&self, owed: &crate::session::continues_bucket::OwedPointer) {
+        if let Err(e) = self.delete_object(&owed.key) {
+            eprintln!(
+                "warning: cloud sync: failed to remove the back-reference {} after a failed \
+                 import; with no relation behind it, walks read it as stale: {}",
+                owed.key, e
+            );
+        }
+    }
+
+    /// On a re-run that found the copy `target` complete here: add the
+    /// relation naming `source` when the copy holds none, back-reference
+    /// first, as `koto session link --continues` records one. A copy that
+    /// already holds it is left alone. A copy holding a relation naming
+    /// another session refuses `relation_conflict`, and nothing is written.
+    fn settle_relation(&self, target: &str, source: &ImportSource) -> Result<(), ImportError> {
+        use crate::session::links::{self, ContinuesHints, LinkBody, LinkHints};
+        use ImportErrorCode::*;
+
+        let failed = |e: &dyn std::fmt::Display| {
+            ImportError::new(
+                PushFailed,
+                format!(
+                    "the copy '{}' is in place, but the relation naming session '{}' from {} \
+                     could not be recorded in it: {}; run the same import again to record it",
+                    target, source.name, source.workspace, e
+                ),
+            )
+        };
+        let held =
+            links::continues_of(&self.local, target).map_err(|e| failed(&format!("{e:#}")))?;
+        // A relation under the source's name counts as this one unless its
+        // body records another session id or another prefix.
+        let names_source = |pred: &str| {
+            if pred != source.name {
+                return false;
+            }
+            let key = links::link_key(links::LinkKind::Continues, pred);
+            let Ok(bytes) = std::fs::read(self.local.session_dir(target).join("ctx").join(&key))
+            else {
+                return true;
+            };
+            let Ok(body) = serde_json::from_slice::<LinkBody>(&bytes) else {
+                return true;
+            };
+            let sid = &source.log.header.session_id;
+            let same_id = match &body.session_id {
+                Some(id) if !id.is_empty() && !sid.is_empty() => id == sid,
+                _ => true,
+            };
+            let same_prefix = body.prefix.value().is_none_or(|p| p == source.prefix);
+            same_id && same_prefix
+        };
+        if held.iter().any(|p| names_source(p)) {
+            return Ok(());
+        }
+        if let Some(other) = held.first() {
+            return Err(ImportError::new(
+                RelationConflict,
+                format!(
+                    "the copy '{}' here already continues '{}', not session '{}' from {}, and a \
+                     session continues at most one predecessor; nothing was changed",
+                    target, other, source.name, source.workspace
+                ),
+            ));
+        }
+
+        let holder_id = self
+            .local
+            .read_header(target)
+            .map(|h| h.session_id)
+            .map_err(|e| failed(&format!("{e:#}")))?;
+        if holder_id.is_empty() {
+            return Err(failed(
+                &"the copy's header records no session id, which its back-reference needs",
+            ));
+        }
+        let hints = ContinuesHints {
+            peer: LinkHints {
+                session_id: Some(source.log.header.session_id.clone()).filter(|id| !id.is_empty()),
+                workspace: Some(source.workspace.clone()),
+            },
+            prefix: Some(source.prefix.clone()),
+            holder_session_id: Some(holder_id.clone()),
+            holder_prefix: Some(self.prefix.clone()),
+        };
+        let owed = self.pointer_for(target, &source.prefix, &source.name, &holder_id);
+        self.record_continues_with_pointer(target, &owed, || {
+            links::write_continues(self, target, &source.name, &hints)
+        })
+        .map(|_| ())
+        .map_err(|e| failed(&format!("{e:#}")))
     }
 
     /// The `session_id` of the local session `target` when its log is an
@@ -5594,12 +5775,18 @@ impl CloudBackend {
             }
             std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
         }
+        // The copy's session id, which its relation records as the holder's.
+        let session_id = into
+            .and_then(|(_, id)| id)
+            .map(str::to_string)
+            .unwrap_or_else(generate_session_id);
         crate::session::import_links::Settlement {
             local_base: base,
             importer_anchor: req.importer_anchor,
             target,
             from_session: &source.name,
             from_session_id: &source.log.header.session_id,
+            relation: Some(source.relation(&session_id)),
         }
         .apply(&ctx_dir, &mut manifest)
         .map_err(|e| write_failed(&ctx_dir, &e))?;
@@ -5619,10 +5806,6 @@ impl CloudBackend {
 
         // The header is the source's, renamed, re-identified and
         // re-anchored here, with a command environment taken on this host.
-        let session_id = into
-            .and_then(|(_, id)| id)
-            .map(str::to_string)
-            .unwrap_or_else(generate_session_id);
         let mut header = source.log.header.clone();
         header.workflow = target.to_string();
         header.session_id = session_id.clone();
@@ -5905,13 +6088,17 @@ impl CloudBackend {
 }
 
 /// The import output's `keys`: the context keys the copy holds, leaving out
-/// the `koto/imported-from` record the import itself writes, so the count
-/// is of what came across.
+/// the `koto/imported-from` record and the relation naming the source, which
+/// the import itself writes, so the count is of what came across.
 fn carried_key_count(manifest: &crate::session::context::Manifest) -> usize {
+    let relations = crate::session::links::continues_prefix();
     manifest
         .keys
         .keys()
-        .filter(|k| k.as_str() != crate::session::import_links::IMPORTED_FROM_KEY)
+        .filter(|k| {
+            k.as_str() != crate::session::import_links::IMPORTED_FROM_KEY
+                && !k.starts_with(&relations)
+        })
         .count()
 }
 
@@ -7854,11 +8041,16 @@ mod tests {
             (SourceNotFound, "import_source_not_found", 2),
             (SourceMigrated, "import_source_migrated", 2),
             (SourceIsChild, "import_source_is_child", 2),
+            (SourceIsAnchorClose, "import_source_is_anchor_close", 2),
             (NameTaken, "import_name_taken", 2),
             (TemplateUnavailable, "import_template_unavailable", 2),
             (SourceUnreadable, "import_source_unreadable", 1),
             (PushFailed, "import_push_failed", 1),
             (Unmarked, "import_unmarked", 1),
+            (SourceRunning, "import_source_running", 2),
+            (SourceUnpushed, "import_source_unpushed", 2),
+            (SourceHasChildren, "import_source_has_children", 2),
+            (RelationConflict, "relation_conflict", 2),
         ] {
             assert_eq!(code.as_str(), text);
             assert_eq!(code.exit_code(), exit, "{text}");

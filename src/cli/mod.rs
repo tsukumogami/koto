@@ -693,10 +693,13 @@ pub enum SessionCommand {
     /// removes instead the migration markers `koto session import` left
     /// under that workspace's bucket prefix. A marker is removable only when
     /// its target is present, with a log that reads cleanly and begins with
-    /// every event of the old copy's log, and then once at least
-    /// `session.cloud.marker_retain_days` old or with `--source-retired`;
-    /// removal deletes everything under the old session's prefix, the
-    /// marker last.
+    /// every event of the old copy's log, and then once no later session
+    /// keeps the source through the continues relation (the copy, or a
+    /// session after it, still running, pinned or inside its retention
+    /// keeps it, reason `relation`); removal deletes everything under the
+    /// old session's prefix, the marker last.
+    /// `session.cloud.marker_retain_days` and `--source-retired` no longer
+    /// decide removal: a run that sets either lists it under `ignored`.
     Prune {
         /// Only sessions whose execution directory is this directory or lies
         /// under it. Filters narrow the candidates only: a session outside
@@ -739,9 +742,8 @@ pub enum SessionCommand {
         #[arg(long = "migrated-from", value_name = "WORKSPACE")]
         migrated_from: Option<String>,
 
-        /// With `--migrated-from`: the source host is gone for good, so a
-        /// marker whose target is present is removable inside
-        /// `session.cloud.marker_retain_days` too.
+        /// With `--migrated-from`: accepted for older scripts, but no longer
+        /// decides removal; the run reports it under `ignored`.
         #[arg(long = "source-retired")]
         source_retired: bool,
     },
@@ -2370,14 +2372,17 @@ pub fn run(app: App) -> Result<()> {
                         confirm_short_retention,
                         migrated_from: migrated_from.as_deref(),
                         source_retired,
-                        // Only marker mode reads the bound, so a config that
-                        // fails to load can't stop a session-mode prune.
+                        // Only marker mode reads the setting, to report it
+                        // ignored, so a config that fails to load can't stop
+                        // a session-mode prune.
                         marker_retain_days: match migrated_from {
-                            Some(_) => crate::config::resolve::load_config()?
-                                .session
-                                .cloud
-                                .marker_retain_days(),
-                            None => crate::config::DEFAULT_MARKER_RETAIN_DAYS,
+                            Some(_) => {
+                                crate::config::resolve::load_config()?
+                                    .session
+                                    .cloud
+                                    .marker_retain_days
+                            }
+                            None => None,
                         },
                     },
                 ),
