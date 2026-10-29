@@ -165,7 +165,7 @@ When koto can't tell which copy is the session's own, the commands that name it 
 
 The reasons are:
 
-- `no_local_copy`: this host holds no copy of the session and the bucket holds none under the current directory's prefix. Run the command from the directory the session was started in, or read it with `--workspace` (below).
+- `no_local_copy`: this host holds no copy of the session and the bucket holds none under the current directory's prefix, but another directory's prefix holds one. A session the bucket holds under no prefix was never used, and reads as absent. Run the command from the directory the session was started in, or read it with `--workspace` (below).
 - `recorded_copy_mismatch`: the bucket holds no copy at the recorded prefix, or the copy there carries another `session_id`, so it is another session of the same name.
 The other four concern a session that records no prefix, named from outside its execution anchor. Each message names the anchor, where the session still reads and writes as before:
 
