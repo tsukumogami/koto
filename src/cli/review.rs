@@ -864,11 +864,25 @@ pub fn code_round_flags(round: &str, head: &str) -> Result<(u64, String), Refusa
     Ok((round, crate::run_journal::digest(head)))
 }
 
+/// A seat's model as a `code-round` call stores it: as given when it has the
+/// journal's name shape (1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`,
+/// not starting with `/` or `~`), and [`UNDECLARED`] (`other`) otherwise,
+/// such as a model id with a `[1m]` suffix. Callers record best effort, so
+/// an odd model id costs that seat's model, not the round.
+pub fn code_model(value: &str) -> String {
+    if crate::run_journal::is_name(value) {
+        value.to_string()
+    } else {
+        UNDECLARED.to_string()
+    }
+}
+
 /// The `code-round` event, from its flags and its batch of seats, recorded
 /// at `state`. Every seat goes in the one event, in order. A seat
-/// `vocabulary` doesn't declare is stored as `other`; a model must have the
-/// journal's name shape, 1 to 128 bytes; a verdict is `pass` or `fail`
-/// (`PASS` and `FAIL` are taken too).
+/// `vocabulary` doesn't declare is stored as `other`, and so is a model
+/// outside the journal's name shape ([`code_model`]); a missing or empty
+/// model is refused. A verdict is `pass` or `fail` (`PASS` and `FAIL` are
+/// taken too).
 pub fn code_round_recorded(
     state: &str,
     round: &str,
@@ -883,19 +897,16 @@ pub fn code_round_recorded(
         let map = entry_object(index, entry, CODE_SEAT_KEYS)?;
         let seat = declared_or_other(string_field(index, map, "seat")?, &vocabulary.seats);
         let model = string_field(index, map, "model")?;
-        if !crate::run_journal::is_name(model) {
-            return Err(bad_entry_value(
-                index,
-                "model",
-                "1 to 128 characters from A-Z a-z 0-9 . _ : / @ -, not starting with / or ~",
-            ));
+        if model.is_empty() {
+            return Err(bad_entry_value(index, "model", "a non-empty string"));
         }
+        let model = code_model(model);
         let verdict = verdict(string_field(index, map, "verdict")?)
             .ok_or_else(|| bad_entry_value(index, "verdict", "pass or fail"))?
             .to_string();
         out.push(CodeReviewSeat {
             seat,
-            model: model.to_string(),
+            model,
             verdict,
         });
     }
@@ -1891,23 +1902,13 @@ mod tests {
                 Some("verdict"),
             ),
             (
-                seat("correctness", "has space", "pass"),
-                INVALID_VALUE,
-                Some("model"),
-            ),
-            (
-                seat("correctness", "/abs", "pass"),
-                INVALID_VALUE,
-                Some("model"),
-            ),
-            (
                 seat("correctness", "", "pass"),
                 INVALID_VALUE,
                 Some("model"),
             ),
             (
-                seat("correctness", &"m".repeat(129), "pass"),
-                INVALID_VALUE,
+                serde_json::json!({"seat": "correctness", "model": 7, "verdict": "pass"}),
+                INVALID_ENTRY,
                 Some("model"),
             ),
             (
@@ -1926,7 +1927,50 @@ mod tests {
         }
         // The longest model is taken.
         let batch = text(&[seat("correctness", &"m".repeat(128), "pass")]);
-        assert!(code_round_recorded("s", "1", "h", &batch, &v).is_ok());
+        let got = code_round_recorded("s", "1", "h", &batch, &v).unwrap();
+        assert_eq!(got.entries[0].model, "m".repeat(128));
+    }
+
+    /// A model outside the journal's name shape is recorded as `other`, as
+    /// an undeclared seat is, and the rest of the round is kept.
+    #[test]
+    fn a_model_that_isnt_name_shaped_is_recorded_as_other() {
+        let v = vocabulary(&["correctness", "security"], &[]);
+        let batch = text(&[
+            seat("correctness", "claude-opus-4-1[1m]", "pass"),
+            seat("security", "claude-opus-4-5", "fail"),
+        ]);
+        let got = code_round_recorded("s", "1", "h", &batch, &v).unwrap();
+        let models: Vec<(&str, &str, &str)> = got
+            .entries
+            .iter()
+            .map(|e| (e.seat.as_str(), e.model.as_str(), e.verdict.as_str()))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                ("correctness", "other", "pass"),
+                ("security", "claude-opus-4-5", "fail"),
+            ]
+        );
+        let too_long = "m".repeat(129);
+        for odd in [
+            "claude-opus-4-1[1m]",
+            "has space",
+            "/abs",
+            "~home",
+            too_long.as_str(),
+        ] {
+            assert_eq!(code_model(odd), "other", "{odd:?}");
+        }
+        for kept in [
+            "claude-opus-4-5",
+            "gpt-5.1",
+            "claude-sonnet-4-5@20250929",
+            "org/model:v2",
+        ] {
+            assert_eq!(code_model(kept), kept);
+        }
     }
 
     #[test]
@@ -1949,7 +1993,7 @@ mod tests {
             vec![format!("{{\"{SENTINEL}\": "), format!("[\"{SENTINEL}\"]")];
         for (field, value) in [
             ("verdict", Value::from(SENTINEL)),
-            ("model", Value::from(format!("{SENTINEL} with space"))),
+            ("model", serde_json::json!([SENTINEL])),
             ("seat", serde_json::json!([SENTINEL])),
             (SENTINEL, Value::from(SENTINEL)),
         ] {

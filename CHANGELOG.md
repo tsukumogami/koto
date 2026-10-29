@@ -130,9 +130,10 @@ to `0.9.x`).
   call's `koto.seq` and carrying `koto.state`, so a pull request review
   panel is never counted among the document review kinds. The head is
   stored only as its digest, never as the commit id given. A seat the
-  template's `review_vocabulary` doesn't declare is `other`, a model must
-  have the journal's name shape, and a malformed batch is refused whole
-  with nothing written. The round and each seat count against the
+  template's `review_vocabulary` doesn't declare is `other`, so is a model
+  outside the journal's name shape (an id with a `[1m]` suffix, say), and
+  a malformed batch (a missing seat or model, an unknown verdict) is
+  refused whole with nothing written. The round and each seat count against the
   session's 2,000 review entries. The document review subcommands and
   their records are unchanged.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the

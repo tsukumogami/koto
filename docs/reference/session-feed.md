@@ -2647,7 +2647,7 @@ the session's cap of 2,000 review entries.
 | `state` | string | The state the session was in when the call was made. |
 | `round` | integer | The round's number, at least 1. |
 | `head` | string | The reviewed head as koto's digest of the `--head` value: `sha256:` and 32 lowercase hex characters. The value given (a commit id, say) is never stored; the same value gives the same digest in every session. |
-| `entries` | array | One object per seat, at least 1 and at most 200: `{"seat", "model", "verdict"}`. `seat` is kept as given when the session's template declares it in `review_vocabulary.seats` and is `other` otherwise; `model` is the model the seat ran on, bound as `rule_id` above; `verdict` is `pass` or `fail`. |
+| `entries` | array | One object per seat, at least 1 and at most 200: `{"seat", "model", "verdict"}`. `seat` is kept as given when the session's template declares it in `review_vocabulary.seats` and is `other` otherwise; `model` is the model the seat ran on, kept as given when it has the name shape of `rule_id` above and `other` otherwise (a missing or empty model refuses the call); `verdict` is `pass` or `fail`. |
 
 ```json
 {

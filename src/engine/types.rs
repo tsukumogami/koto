@@ -1101,7 +1101,8 @@ pub const CODE_REVIEW_ROUND_RECORDED: &str = "code_review_round_recorded";
 pub struct CodeReviewSeat {
     /// A seat the session's template declares, or `other`.
     pub seat: String,
-    /// The model the seat ran on, name-shaped and 1 to 128 bytes.
+    /// The model the seat ran on, as given when name-shaped (1 to 128
+    /// bytes), `other` otherwise.
     pub model: String,
     /// `pass` or `fail`.
     pub verdict: String,

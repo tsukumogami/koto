@@ -401,6 +401,52 @@ fn an_undeclared_seat_is_recorded_as_other() {
     assert!(!env.log("wf").contains("intruder"));
 }
 
+/// A model outside the journal's name shape, such as a model id with a
+/// `[1m]` suffix, is recorded as `other`; the round is kept, not refused.
+#[test]
+fn a_model_that_isnt_name_shaped_is_recorded_as_other() {
+    let env = Env::new();
+    env.init("wf");
+    let batch = json!([
+        seat("correctness", "claude-opus-4-5", "pass"),
+        seat("security", "claude-opus-4-1[1m]", "fail"),
+        seat("maintainability", "gpt-5.1", "pass"),
+    ])
+    .to_string();
+    let out = env.code_round("wf", "1", HEAD, &batch);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(printed["count"], 4);
+
+    let journal = env.journal();
+    assert_eq!(records(&journal, "code_review_round").len(), 1);
+    let got: Vec<(&str, &str, &str)> = records(&journal, "code_review_verdict")
+        .iter()
+        .map(|v| {
+            (
+                v["koto.code_review.seat"].as_str().unwrap(),
+                v["koto.code_review.model"].as_str().unwrap(),
+                v["koto.code_review.verdict"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("correctness", "claude-opus-4-5", "pass"),
+            ("security", "other", "fail"),
+            ("maintainability", "gpt-5.1", "pass"),
+        ]
+    );
+    let events = env.events("wf", "code_review_round_recorded");
+    let stored = &events[0]["payload"]["entries"];
+    assert_eq!(stored[0]["model"], "claude-opus-4-5");
+    assert_eq!(stored[1]["model"], "other");
+    assert_eq!(stored[2]["model"], "gpt-5.1");
+    assert!(!env.journal_text().contains("[1m]"));
+    assert!(!env.log("wf").contains("[1m]"));
+}
+
 /// Exit 2 with `code` and `field`, nothing appended to the session's log or
 /// the journal, and the sentinel printed on neither stream.
 fn refused(env: &Env, round: &str, head: &str, batch: &str, code: &str, field: Option<&str>) {
@@ -473,7 +519,7 @@ fn a_malformed_batch_exits_non_zero_and_writes_nothing() {
         &env,
         "1",
         HEAD,
-        &batch(seat("security", &format!("{SENTINEL} model"), "pass")),
+        &batch(seat("security", "", "pass")),
         "invalid_value",
         Some("model"),
     );

@@ -1269,7 +1269,8 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
         // A code review round: the round record, then one verdict per seat
         // in the order given, all under the event's one `koto.seq`. The
         // head is already a digest; a model is digested like a rule id,
-        // though the verb already refused one outside the name shape.
+        // though the verb already stored one outside the name shape as
+        // `other`.
         EventPayload::CodeReviewRoundRecorded(c) => {
             let mut records = vec![relay
                 .record(CODE_REVIEW_ROUND)
