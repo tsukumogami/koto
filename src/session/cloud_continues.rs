@@ -505,6 +505,15 @@ impl CloudBackend {
         let Some(owed) = owed_pointer(&dir, &self.prefix, id) else {
             return;
         };
+        // A session imported into another workspace is a read-only
+        // predecessor: nothing goes up for it, nor is a confirmation
+        // recorded beside it, and the command refuses or serves it as
+        // migrated where it always did. Its marker may be in the bucket
+        // alone (imported from another host), so this asks the bucket, on a
+        // listing of this process's own, only when a pointer is owed.
+        if self.check_not_migrated_to_write(id).is_err() {
+            return;
+        }
         // A pointer confirmed before under another prefix (the session was
         // rebound to another checkout since) is replaced, not doubled: the
         // relation goes up under this prefix first, so the new pointer

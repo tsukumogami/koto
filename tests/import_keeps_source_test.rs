@@ -1298,3 +1298,174 @@ fn every_write_verb_still_refuses_on_a_same_host_migrated_source() {
     w.source_and_moved_copy(&w.a2);
     assert_writes_refused(&w, &w.a, &w.a2);
 }
+
+// ---------------------------------------------------------------------
+// A source whose own back-reference is owed
+// ---------------------------------------------------------------------
+
+/// Before anything is imported: the session store `host`'s commands use,
+/// and the workspace its bucket prefix is derived from, lie under the
+/// test's root, and that prefix is the one this file's keys are built on.
+fn assert_owed_scratch(w: &World, host: &Host) {
+    assert_scratch(&w.root, host, &w.s3);
+    let store = host.session_dir("v2");
+    assert!(
+        under(store.parent().unwrap(), &w.root),
+        "{}'s session store {} is outside the test root {}",
+        host.label,
+        store.display(),
+        w.root.display()
+    );
+    assert!(
+        under(&host.ws, &w.root),
+        "{}'s workspace {}, which names its bucket prefix, is outside the test root {}",
+        host.label,
+        host.ws.display(),
+        w.root.display()
+    );
+    assert_eq!(host.prefix(), migration_carrier::prefix_of(&host.ws));
+}
+
+/// What a read or a refused write on the source must leave alone: every
+/// object under W1's prefix (v1 with the pointers beside it, the source v2
+/// with its marker) and under the copy's, and host 1's local copies of v1
+/// and v2.
+struct OwedUntouched {
+    bucket: BTreeMap<String, Vec<u8>>,
+    local: Vec<BTreeMap<String, Vec<u8>>>,
+}
+
+impl World {
+    /// v1, then the source v2 continuing it, in W1 on host 1, v2 with a
+    /// key; v2 imported by host 2 and moved on there, so the copy has other
+    /// content under the key and stands at `done`. Then host 1 forgets it
+    /// confirmed v2's own back-reference beside v1, and the bucket loses
+    /// it: the pointer is owed on host 1, which holds the source's relation
+    /// and sees the migration marker only in the bucket. Returns the owed
+    /// pointer's key.
+    fn owed_source_imported(&self) -> String {
+        self.init(&self.a, "v1", &[]);
+        self.init(&self.a, "v2", &["--continues", "v1"]);
+        add_key(&self.a, "v2", "notes.md", b"source notes");
+        let owed = self.pointer_key(&self.a, "v1", &self.a, "v2");
+        let mark = self.a.session_dir("v2").join(".continues-pointer");
+        assert_eq!(
+            std::fs::read_to_string(&mark).unwrap().trim(),
+            owed,
+            "the init confirmed v2's pointer"
+        );
+        self.compile(&self.b);
+        let r = self.import(&self.b, "v2", &self.a, &[]);
+        assert!(r.ok(), "import: {}", r.describe());
+        add_key(&self.b, "v2", "notes.md", b"copy notes");
+        self.done(&self.b, "v2");
+
+        // As on a host that never confirmed it: the pointer is owed.
+        std::fs::remove_file(&mark).unwrap();
+        self.s3.remove(&owed);
+        assert!(self
+            .a
+            .session_dir("v2")
+            .join("ctx/koto/links/continues/v1")
+            .is_file());
+        assert!(self.s3.object(&owed).is_none());
+        assert!(self.s3.object(&self.marker_key("v2")).is_some());
+        owed
+    }
+
+    fn owed_untouched(&self) -> OwedUntouched {
+        let mut bucket = self.objects(&format!("{}/", self.a.prefix()));
+        bucket.extend(self.objects(&format!("{}/v2/", self.b.prefix())));
+        assert!(bucket.contains_key(&self.marker_key("v2")), "no marker");
+        OwedUntouched {
+            bucket,
+            local: vec![
+                dir_files(&self.a.session_dir("v1")),
+                dir_files(&self.a.session_dir("v2")),
+            ],
+        }
+    }
+
+    /// The owed pointer is still neither in the bucket nor confirmed on
+    /// host 1.
+    fn assert_still_owed(&self, owed: &str, what: &str) {
+        assert!(
+            self.s3.object(owed).is_none(),
+            "{what} wrote the source's back-reference"
+        );
+        assert!(
+            !self.a.session_dir("v2").join(".continues-pointer").exists(),
+            "{what} recorded a confirmation beside the source"
+        );
+    }
+}
+
+#[test]
+fn a_read_of_a_migrated_source_owing_its_back_reference_writes_nothing() {
+    let w = World::new();
+    assert_owed_scratch(&w, &w.a);
+    assert_owed_scratch(&w, &w.b);
+    assert!(under(&reads_tmp(&w.a), &w.root));
+    let owed = w.owed_source_imported();
+    let before = w.owed_untouched();
+    w.s3.clear_requests();
+
+    let r = read(&w.a, &["status", "v2"]);
+    assert_eq!(r.code, Some(0), "status: {}", r.describe());
+    assert_eq!(r.json["name"], "v2", "{}", r.describe());
+    assert_eq!(r.json["current_state"], "work", "{}", r.describe());
+    assert_eq!(r.json["is_terminal"], false, "{}", r.describe());
+    w.assert_still_owed(&owed, "status");
+    assert_no_bucket_writes(&w.s3, "status on the source");
+    let after = w.owed_untouched();
+    assert_eq!(after.bucket, before.bucket, "status changed the bucket");
+    assert_eq!(after.local, before.local, "status changed a local copy");
+
+    let r = read(&w.a, &["context", "get", "v2", "notes.md"]);
+    assert_eq!(r.code, Some(0), "get: {}", r.describe());
+    assert_eq!(r.stdout, "source notes", "{}", r.describe());
+    w.assert_still_owed(&owed, "context get");
+    assert_no_bucket_writes(&w.s3, "context get on the source");
+    let after = w.owed_untouched();
+    assert_eq!(
+        after.bucket, before.bucket,
+        "context get changed the bucket"
+    );
+    assert_eq!(
+        after.local, before.local,
+        "context get changed a local copy"
+    );
+}
+
+#[test]
+fn every_write_verb_refuses_a_migrated_source_owing_its_back_reference_before_writing_it() {
+    let w = World::new();
+    assert_owed_scratch(&w, &w.a);
+    assert_owed_scratch(&w, &w.b);
+    w.init(&w.a, "other", &[]);
+    let owed = w.owed_source_imported();
+    let before = w.owed_untouched();
+
+    // `session resolve` on its own first: it asks the bucket on its own
+    // path, and refused as migrated it wrote no pointer.
+    w.s3.clear_requests();
+    for keep in ["local", "remote"] {
+        let r = read(&w.a, &["session", "resolve", "v2", "--keep", keep]);
+        let all = format!("{}{}", r.stdout, r.stderr);
+        assert_eq!(r.code, Some(2), "resolve --keep {keep}: {}", r.describe());
+        assert!(
+            all.contains("session_migrated") && all.contains(&w.b.ws_str()),
+            "resolve --keep {keep}: {}",
+            r.describe()
+        );
+        w.assert_still_owed(&owed, "session resolve");
+    }
+    assert_no_bucket_writes(&w.s3, "session resolve on the source");
+    let after = w.owed_untouched();
+    assert_eq!(after.bucket, before.bucket, "resolve changed the bucket");
+    assert_eq!(after.local, before.local, "resolve changed a local copy");
+
+    // Then every write verb, each refused before an owed pointer goes up.
+    assert_writes_refused(&w, &w.a, &w.b);
+    w.assert_still_owed(&owed, "a refused write");
+}

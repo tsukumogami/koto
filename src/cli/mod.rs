@@ -1346,6 +1346,11 @@ fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
 /// ([`workspace_read::serve_migrated_source`]) rather than refused. `Some`
 /// with the command's result when it was served that way; `None` when the
 /// command goes on to read the session as usual.
+///
+/// The migration marker is asked for before any owed back-reference goes
+/// up ([`Backend::ensure_backref`]): a source whose marker only the bucket
+/// holds (imported from another host) is served as it is, with no pointer
+/// written for it and no confirmation recorded beside it.
 fn locate_or_serve(
     backend: &Backend,
     session: &str,
@@ -1353,10 +1358,15 @@ fn locate_or_serve(
     read: impl FnOnce() -> Command,
 ) -> Option<Result<()>> {
     match backend.check_located(session) {
-        Ok(()) => {
-            backend.ensure_backref(session);
-            None
-        }
+        Ok(()) => match backend.check_not_migrated(session) {
+            Err(e) if e.is::<crate::session::SessionMigrated>() => {
+                Some(workspace_read::serve_migrated_source(backend, read(), e))
+            }
+            _ => {
+                backend.ensure_backref(session);
+                None
+            }
+        },
         Err(e) if e.is::<crate::session::SessionMigrated>() => {
             Some(workspace_read::serve_migrated_source(backend, read(), e))
         }
@@ -2461,8 +2471,10 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => {
-                    refuse_if_unlocated(&backend, &name, "session resolve");
+                    // Migrated first: a source imported elsewhere refuses
+                    // before an owed back-reference goes up for it.
                     refuse_if_migrated(&backend, &name, "session resolve");
+                    refuse_if_unlocated(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
                 }
                 SessionCommand::Flush { name } => {
@@ -2582,10 +2594,15 @@ pub fn run(app: App) -> Result<()> {
                     | ContextCommand::List { .. }
             );
             if served_read {
+                // The marker is asked for before an owed back-reference
+                // goes up, so a migrated source gets no pointer written.
                 let refused = match backend.check_located(&session) {
                     Ok(()) => {
-                        backend.ensure_backref(&session);
-                        backend.check_not_migrated(&session).err()
+                        let refused = backend.check_not_migrated(&session).err();
+                        if refused.is_none() {
+                            backend.ensure_backref(&session);
+                        }
+                        refused
                     }
                     Err(e) if e.is::<crate::session::SessionMigrated>() => Some(e),
                     Err(e) => refuse_unlocated(&e, command),
