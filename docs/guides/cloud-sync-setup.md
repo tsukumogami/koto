@@ -188,6 +188,8 @@ Under the cloud backend, rebind pushes the rewritten header to the bucket along 
 
 Run the rebind from the new location (`koto session rebind <name>`), or from any directory with `--to <new location>`: the rewritten header goes up to the session's own copy, under the prefix it was created under, and nothing moves in the bucket. A session created by an older koto, which records no prefix, rebinds the same way from anywhere once its copy is located, as above, and the header goes up to that copy. When it can't be located, it rebinds only from the new location or from the directory it is bound to; from anywhere else it refuses with `session_unlocated`, naming that directory and the exact command to run. Running it from the new location works even when every directory the session records is gone, as for a session whose old checkout was deleted.
 
+A session that records no prefix takes its home from its execution anchor, so its rebind moves the home to the new location's prefix, which may hold an older copy of the session's context or none. The rebind brings the context there too: every key this host holds that the new home lacks, or holds an older copy of, is pushed, and the new home's manifest names it. A key it couldn't push is named in a warning on stderr; the rebind still succeeds, and the key goes up the next time it's read or written.
+
 A rebind also fences the anchor it leaves. It raises the session's `origin.anchor_epoch` and lists the old anchor in `origin.retired_anchors`, and from then on a write to the session (an event, a header rewrite, a context key) refuses with `session_rebound` when it runs from the old anchor, or when its command read the session before the rebind. A process still working from the old checkout gets that error instead of writing a second history of the session. A rebind back to a retired anchor takes it off the list. A session with no origin record has no fence. An older koto ignores both fields, and reads such a header as before.
 
 ### Reading a session in another workspace
@@ -405,6 +407,8 @@ session conflict: session 'review' has diverged between this host's log (14 even
 ```
 
 Resolve it with `koto session resolve` as above, run from the session's directory. A push that refuses this way after an append leaves the event in this host's log, and the command exits non-zero.
+
+Context keys are compared one at a time when they're read. When this host's copy of a key differs from the home's, the read keeps whichever is newer. Which one that is comes from the hash this host last synced for the key, kept beside the session in `cloud-ctx-synced.json` and never uploaded: a local copy still at that hash means the home moved on, and the home's copy is pulled; a home still at it means this host's copy moved on. Only a key that changed on both sides since, or that this host never synced with this home, falls back to the manifests' write times, which come from each host's clock. A read that keeps this host's copy, or finds a key the home's manifest doesn't list, pushes the copy and then says on stderr whether the push went up or failed, and why. A key the home lacks because another host removed it after this host synced it isn't pushed back.
 
 ## Config reference
 
