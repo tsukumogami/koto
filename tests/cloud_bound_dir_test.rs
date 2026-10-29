@@ -1445,3 +1445,84 @@ fn a_throttled_listing_that_clears_within_the_retries_still_answers() {
         "two throttled requests, then one answered"
     );
 }
+
+/// The probe of this directory's own prefix, the listing made before the
+/// other prefixes are asked, is "can't tell" when the bucket answered it
+/// with a throttle or a server error every time it was asked (koto#531).
+/// `context exists` on a session held only under another prefix refuses,
+/// exit 2, naming the listing and what the bucket answered, instead of
+/// answering absent.
+#[test]
+fn a_failed_own_prefix_probe_is_not_read_as_absent() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{WF}/", prefix_of(&dir));
+
+    s3.fail("LIST", &listing, 503);
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_ne!(
+        out.code,
+        Some(1),
+        "context exists exits 1 with no output for a session another prefix holds, while \
+         the own-prefix probe of {listing:?} fails: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(2), "{}", out.describe());
+    let err = out.json();
+    assert_eq!(err["command"], "context exists", "{}", out.describe());
+    let message = err["error"].as_str().unwrap();
+    assert!(message.contains(&format!("'{WF}'")), "{message}");
+    assert!(message.contains("can't tell"), "{message}");
+    assert!(message.contains(&listing), "{message}");
+    assert!(message.contains("503"), "{message}");
+}
+
+/// A throttled own-prefix probe is asked again (koto#531). When the bucket
+/// throttles it for one whole call (rust-s3's request and its own retry)
+/// and then answers, `context exists` on a session held only under another
+/// prefix refuses with `no_local_copy`, as it does with no throttle.
+#[test]
+fn a_throttled_own_prefix_probe_that_clears_still_refuses() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{WF}/", prefix_of(&dir));
+
+    s3.fail_times("LIST", &listing, 503, 2);
+    s3.clear_requests();
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_ne!(
+        out.code,
+        Some(1),
+        "context exists exits 1 with no output for a session another prefix holds, after \
+         a throttled own-prefix probe of {listing:?}: {}",
+        out.describe()
+    );
+    assert_unlocated(&out, "context exists", "no_local_copy");
+    let asked = s3
+        .requests()
+        .iter()
+        .filter(|r| r.list_prefix.as_deref() == Some(listing.as_str()))
+        .count();
+    assert_eq!(asked, 3, "two throttled requests, then one answered");
+}
+
+/// A host that can't reach the bucket at all still reads a never-used name
+/// as absent, as it did before koto#518 (koto#531): `context exists` exits 1
+/// and prints nothing.
+#[test]
+fn an_unreachable_bucket_still_reads_a_never_used_name_as_absent() {
+    let s3 = FakeS3::start(BUCKET);
+    let mut h = Host::new(&s3, true);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    h.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let dir = h.dir("offline");
+
+    let out = h.koto(&dir, &["context", "exists", "never_used", "k.md"]);
+    assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+    assert!(out.stdout.trim().is_empty(), "{}", out.describe());
+}
