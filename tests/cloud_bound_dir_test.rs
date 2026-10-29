@@ -1026,6 +1026,46 @@ fn a_host_with_no_local_copy_refuses_from_another_prefix() {
     assert_eq!(out.json()["locations"][0], prefix_of(&elsewhere));
 }
 
+/// A session that was never used anywhere reads as absent on a host with
+/// no copy of it, as it did before koto#508, while the bucket holds other
+/// sessions under other prefixes: `context exists` exits 1 and prints
+/// nothing, and `context get` and `status` fail without `session_unlocated`
+/// (koto#518). A session held only under another directory's prefix still
+/// refuses `context exists` with `no_local_copy`.
+#[test]
+fn a_session_never_used_anywhere_reads_as_absent() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let first = Host::new(&s3, true);
+    let second = Host::new(&s3, true);
+    let a = first.dir("a");
+    first.init(&a, &[]);
+    first.add(&a, "k.md", b"value");
+
+    for (h, dir) in [
+        (&first, first.dir("b")),
+        (&second, second.dir("elsewhere")),
+    ] {
+        let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
+        assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+        assert!(out.stdout.trim().is_empty(), "{}", out.describe());
+        for args in [&["context", "get", NEVER, "k.md"][..], &["status", NEVER]] {
+            let out = h.koto(&dir, args);
+            assert_ne!(out.code, Some(0), "koto {args:?}: {}", out.describe());
+            assert!(
+                !out.stdout.contains("session_unlocated"),
+                "koto {args:?}: {}",
+                out.describe()
+            );
+        }
+    }
+
+    let elsewhere = second.dir("elsewhere");
+    let out = second.koto(&elsewhere, &["context", "exists", WF, "k.md"]);
+    assert_unlocated(&out, "context exists", "no_local_copy");
+    assert_eq!(out.json()["locations"][0], prefix_of(&elsewhere));
+}
+
 /// A recorded copy that is missing from the bucket, and one that is another
 /// session's, read from B refuse with `session_unlocated` and the reason
 /// `recorded_copy_mismatch`, print no value and leave every local file as
