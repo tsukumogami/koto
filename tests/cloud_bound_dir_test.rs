@@ -1338,3 +1338,110 @@ fn a_missing_name_s_probe_asks_the_other_prefixes_at_once() {
     let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
     assert_unlocated(&out, "context exists", "no_local_copy");
 }
+
+/// `count` workspace prefixes of the shape koto derives, each holding
+/// another session, as other directories' sessions leave the bucket; and
+/// one of them, `holder`, holding `WF`'s state object besides.
+fn plant_prefixes(s3: &FakeS3, count: u32, holder: u32) -> Vec<String> {
+    let prefixes: Vec<String> = (0..count)
+        .map(|i| format!("{i:016x}"))
+        .inspect(|p| s3.put(&format!("{p}/other/koto-other.state.jsonl"), b"{}\n"))
+        .collect();
+    s3.put(
+        &format!("{}/{WF}/koto-{WF}.state.jsonl", prefixes[holder as usize]),
+        b"{}\n",
+    );
+    prefixes
+}
+
+/// A listing that still fails once koto has asked again is "can't tell",
+/// never "not held" (koto#528). With the listing of the prefix that holds
+/// the session failing, or the bucket's top-level listing that names the
+/// prefixes, `context exists` on a name with no copy on this host refuses,
+/// exit 2, naming the listing and what the bucket answered, instead of
+/// answering absent. Once the bucket answers, the probe refuses with
+/// `no_local_copy` again.
+#[test]
+fn a_failed_listing_of_the_holding_prefix_is_not_read_as_absent() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+
+    for listing in [format!("{}/{WF}/", prefixes[3]), String::new()] {
+        s3.clear_faults();
+        s3.fail("LIST", &listing, 503);
+        let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+        assert_ne!(
+            out.code,
+            Some(1),
+            "context exists answers \"absent\" for a session another prefix holds, while the \
+             listing of {listing:?} fails: {}",
+            out.describe()
+        );
+        assert_eq!(out.code, Some(2), "{}", out.describe());
+        let err = out.json();
+        assert_eq!(err["command"], "context exists", "{}", out.describe());
+        let message = err["error"].as_str().unwrap();
+        assert!(message.contains(&format!("'{WF}'")), "{message}");
+        assert!(message.contains("can't tell"), "{message}");
+        assert!(message.contains("503"), "{message}");
+        if !listing.is_empty() {
+            assert!(message.contains(&listing), "{message}");
+        }
+    }
+
+    s3.clear_faults();
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_unlocated(&out, "context exists", "no_local_copy");
+}
+
+/// A throttled listing is asked again (koto#528). When the listing of the
+/// prefix that holds the session is throttled for one whole call (rust-s3's
+/// request and its own retry) and then answers, `context exists` still
+/// refuses with `no_local_copy`; and a never-used name whose scan meets the
+/// same throttle still answers absent.
+#[test]
+fn a_throttled_listing_that_clears_within_the_retries_still_answers() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 5);
+    let dir = h.dir("probe");
+    let asked = |listing: &str| {
+        s3.requests()
+            .iter()
+            .filter(|r| r.list_prefix.as_deref() == Some(listing))
+            .count()
+    };
+
+    let listing = format!("{}/{WF}/", prefixes[5]);
+    s3.fail_times("LIST", &listing, 503, 2);
+    s3.clear_requests();
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_ne!(
+        out.code,
+        Some(1),
+        "context exists answers \"absent\" for a session another prefix holds, after a \
+         throttled listing of {listing:?}: {}",
+        out.describe()
+    );
+    assert_unlocated(&out, "context exists", "no_local_copy");
+    assert_eq!(
+        asked(&listing),
+        3,
+        "two throttled requests, then one answered"
+    );
+
+    let listing = format!("{}/{NEVER}/", prefixes[5]);
+    s3.fail_times("LIST", &listing, 503, 2);
+    s3.clear_requests();
+    let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
+    assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+    assert!(out.stdout.trim().is_empty(), "{}", out.describe());
+    assert_eq!(
+        asked(&listing),
+        3,
+        "two throttled requests, then one answered"
+    );
+}

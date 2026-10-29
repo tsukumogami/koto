@@ -174,6 +174,10 @@ The other four concern a session that records no prefix, named from outside its 
 - `candidate_copy_mismatch`: the one candidate's copy carries another `session_id`, so it is another session of the same name, or one side carries no `session_id` to confirm it by.
 - `candidate_unreadable`: listing a candidate failed, so koto can't tell what it holds. Run the command again once the bucket answers.
 
+Telling a never-used name from one held under another directory's prefix costs listings. A command that names a session with no copy on this host, and finds no state for it under the current directory's prefix, lists the bucket's top level to learn the workspace prefixes, then lists `<prefix>/<session>/` under each of the others, 64 at a time, until one holds the session. A name used nowhere pays for all of them: with N workspace prefixes in the bucket, N listings after the top-level one, in about N/64 rounds of round trips, and on every such command, since nothing is kept between commands. A few hundred prefixes cost a few seconds, and the cost grows with the number of directories that have ever used the bucket; bounding it would take an index of session names in the bucket, a storage format change koto doesn't make. A session with a copy on this host, or with state under the current directory's prefix, makes none of these listings.
+
+A listing the bucket throttles or fails to answer during that scan is asked up to three times. If one still fails, koto can't tell whether another prefix holds the session, so the command exits 2 with an error naming the listing and what the bucket answered, rather than reading the session as absent. Run it again once the bucket answers.
+
 The local backend answers a name the same from every directory and never refuses.
 
 koto's own reads of other sessions, such as an agent session's anchor or another member of a hierarchy, use the same copy, and a session koto can't locate is read as this host holds it. `koto next` keeps its own check: it refuses a directory outside the session's execution anchor with `execution_anchor_mismatch`.
