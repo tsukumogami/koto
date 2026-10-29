@@ -1042,10 +1042,7 @@ fn a_session_never_used_anywhere_reads_as_absent() {
     first.init(&a, &[]);
     first.add(&a, "k.md", b"value");
 
-    for (h, dir) in [
-        (&first, first.dir("b")),
-        (&second, second.dir("elsewhere")),
-    ] {
+    for (h, dir) in [(&first, first.dir("b")), (&second, second.dir("elsewhere"))] {
         let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
         assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
         assert!(out.stdout.trim().is_empty(), "{}", out.describe());
