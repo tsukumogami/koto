@@ -542,7 +542,10 @@ Session mode:
    first): take `lock_state_file` (non-blocking), re-`inspect`, and confirm
    the same session id, still finished, and no rule applies against the
    referencers and referenced sessions re-inspected now (rule g's remote
-   check included). Then remove it while holding the lock: under the cloud
+   check included). That re-check is the original rules b and c's; under
+   rule `h` the session-retention design's Decision 3 makes one fresh scan
+   and re-judges each component as a unit, removing anchors before their
+   close sessions. Then remove it while holding the lock: under the cloud
    backend the session's remote objects first, except a migration marker
    (R10), and the local directory after them, so a failure part way leaves a
    local copy that a later prune can retry. The remote delete goes through a
