@@ -587,6 +587,11 @@ fn a_read_of_the_fenced_predecessor_keeps_a_newer_local_key_without_pushing() {
         Value::from(format!("{}{last}", &hash[..hash.len() - 1]));
     manifest["keys"]["record/a"]["created_at"] = Value::from("2026-01-01T00:00:00.000Z");
     h.s3.put(&manifest_key, manifest.to_string().as_bytes());
+    // This host keeps no synced hash for the key, as a koto from before it
+    // kept one: the copies are ordered by their write times, and the local
+    // one is the later. With the hash it pushed on record, the bucket's
+    // different copy would read as a later write and be pulled.
+    std::fs::remove_file(h.sessions(1).join("p").join("cloud-ctx-synced.json")).unwrap();
     let before = h.bucket();
 
     let out = h.run(1, &h.w1, &["context", "get", "p", "record/a"]);

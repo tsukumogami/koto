@@ -1489,6 +1489,12 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         return Ok(());
     }
 
+    // Under the cloud backend, the home before the move, when it has one:
+    // a session that takes its home from its anchor moves home with it.
+    let home_before = backend
+        .as_cloud()
+        .map(|cloud| cloud.home_prefix(name).ok().map(|home| home.prefix));
+
     // Event first, header second, matching the adoption path in
     // `handle_next`: a crash between the two leaves a visible record of
     // the move rather than a silent one.
@@ -1518,6 +1524,12 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         h.execution_dir = Some(target.clone());
         h
     })?;
+
+    // The rewrite pushed the state file to the new home; the context keys
+    // go there too, or stderr names the ones that didn't (koto#524).
+    if let (Some(cloud), Some(before)) = (backend.as_cloud(), home_before) {
+        cloud.carry_context_after_rebind(name, before.as_deref());
+    }
 
     println!(
         "{}",
