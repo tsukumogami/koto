@@ -10,8 +10,10 @@
 //! is built by `support/koto_command.rs` with every inherited `KOTO_*`
 //! variable removed, so no command reaches a store or bucket but the
 //! test's own. Under `KOTO_HOME` only the root's own config chooses the
-//! cloud backend, so the cloud store's root config does; the stand-in's
-//! address and keys come from the environment each command sets. Before
+//! cloud backend, so the cloud store's root config does. Each command also
+//! sets `KOTO_SESSION_BACKEND` and the stand-in's address and keys in its
+//! environment, which take effect only because the root chose the cloud
+//! backend: the local store's root has no config, so it stays local. Before
 //! any prune, each test checks that koto resolves its root, backend and
 //! bucket to the test's own, and that every session it prunes lives under
 //! the test's temporary directory.

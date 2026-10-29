@@ -452,8 +452,8 @@ fn error_code(out: &std::process::Output) -> String {
     v["error"]["code"].as_str().unwrap().to_string()
 }
 
-/// One protected session per local rule, each named after the rule, and four
-/// sessions nothing protects. Returns the protected names with their rule.
+/// One protected session per local rule, each named after the rule, and the
+/// sessions nothing protects ([`FREE`]). Returns the protected names with their rule.
 fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
     // a: running. (An unreadable session has a test of its own: one whose
     // header can't be read keeps every finished session.)

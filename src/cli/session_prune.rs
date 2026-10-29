@@ -43,7 +43,9 @@
 //!
 //! Letter f is retired: a session's name keeps nothing. A coordinator's
 //! finished session stays while a later session continues it, which rule r
-//! judges like any other.
+//! judges like any other. The letter isn't reused and g isn't renumbered,
+//! since the letters are the `rule` field of the JSON a caller reads, as b
+//! and c were before them.
 //!
 //! The filters narrow which sessions are candidates, never which count as
 //! members of a hierarchy, and `--older-than` measures a session's age from
