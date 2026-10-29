@@ -188,7 +188,30 @@ pub(crate) fn is_workspace_prefix(prefix: &str) -> bool {
 
 /// How many listings [`CloudBackend::held_elsewhere`] has in flight at once,
 /// each on its own thread and connection.
+///
+/// A probe of a name that exists nowhere asks every other workspace prefix,
+/// so its time is about ceil(N/64) round trips for N prefixes: a few for a
+/// bucket of hundreds, where asking them in turn took minutes (koto#526).
+/// What it costs is up to 64 threads and 64 open connections (rust-s3
+/// opens one per request), for the length of one probe. That stays well
+/// under a process's usual descriptor limit (256 soft on macOS) and under
+/// the per-client connection limits of S3-compatible endpoints; a throttle
+/// it does meet is asked again ([`list_retrying`]).
+///
+/// [`in_parallel`] uses 8 for a flush, which writes: each request carries a
+/// body, runs on every tick, and sits in front of the command's own work.
+/// This one is many tiny reads whose round trips are the whole cost, made
+/// only for a name with no copy on this host, so it runs wider.
 const HELD_ELSEWHERE_FANOUT: usize = 64;
+
+/// How many times [`list_retrying`] asks for a listing the bucket throttled
+/// or failed to answer, the first included. Each ask is rust-s3's request
+/// and its own one retry, a second apart.
+const LIST_ATTEMPTS: u32 = 3;
+
+/// [`list_retrying`]'s wait before its second ask, doubled before each ask
+/// after that.
+const LIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
@@ -682,7 +705,9 @@ impl CloudBackend {
     ///   another workspace's prefix holds it ([`CloudBackend::held_elsewhere`]).
     ///   A session the bucket holds nowhere was never used, and the command
     ///   goes on to answer it absent, as before (koto#518); so does one whose
-    ///   listing fails;
+    ///   listing under this directory's prefix fails. When the other
+    ///   prefixes can't all be asked, koto can't tell whether one holds it,
+    ///   and the command fails rather than answer it absent (koto#528);
     /// - a home that isn't this directory's own is pulled now, strictly
     ///   ([`CloudBackend::sync_pull_state`]): a bucket that can't answer is
     ///   an error, and a copy there that is missing or another session's is
@@ -694,16 +719,27 @@ impl CloudBackend {
             return Ok(());
         }
         if !self.local.exists(id) {
-            return match self.probe(id) {
-                Ok(probe) if probe.state_etag.is_none() && self.held_elsewhere(id) => {
-                    Err(anyhow::Error::new(Unlocated {
-                        session: id.to_string(),
-                        reason: UnlocatedReason::NoLocalCopy {
-                            prefix: home.prefix,
-                        },
-                    }))
-                }
-                _ => Ok(()),
+            let Ok(probe) = self.probe(id) else {
+                return Ok(());
+            };
+            if probe.state_etag.is_some() {
+                return Ok(());
+            }
+            return match self.held_elsewhere(id) {
+                Ok(true) => Err(anyhow::Error::new(Unlocated {
+                    session: id.to_string(),
+                    reason: UnlocatedReason::NoLocalCopy {
+                        prefix: home.prefix,
+                    },
+                })),
+                Ok(false) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!(
+                    "session '{id}' has no copy on this host and the bucket holds none under \
+                     this directory's prefix {}, and koto can't tell whether another \
+                     directory's prefix holds it: {e:#}; nothing was read, so run the command \
+                     again once the bucket answers",
+                    home.prefix
+                )),
             };
         }
         if !home.own_workspace {
@@ -715,19 +751,35 @@ impl CloudBackend {
 
     /// Whether a workspace prefix other than this directory's holds `id`'s
     /// state object: one listing of the bucket's top level, which names the
-    /// workspace prefixes, then one of each other prefix's `<prefix>/<id>/`,
-    /// stopping at the first that holds it. Asked only for a session with no
-    /// local copy and no state under this directory's prefix. A listing that
-    /// fails reads as not held, so the command goes on as before.
+    /// workspace prefixes, then one of each other prefix's `<prefix>/<id>/`.
+    /// Asked only for a session with no local copy and no state under this
+    /// directory's prefix.
+    ///
+    /// `Ok(false)` only when every other prefix was asked and answered that
+    /// it holds no state for `id`. A listing the bucket throttled is asked
+    /// again ([`list_retrying`]); one that still fails is `Err`, since koto
+    /// can't tell what that prefix holds, and the caller reports it rather
+    /// than read the session as absent (koto#528).
     ///
     /// The per-prefix listings run [`HELD_ELSEWHERE_FANOUT`] at a time: asked
     /// in turn, a bucket with hundreds of prefixes kept a probe of a name
-    /// that exists nowhere waiting minutes (koto#526).
-    fn held_elsewhere(&self, id: &str) -> bool {
+    /// that exists nowhere waiting minutes (koto#526). Once a prefix is found
+    /// holding the session, or a listing fails for good, no further listing
+    /// starts, though those already in flight finish.
+    ///
+    /// `Relaxed` ordering is enough for both atomics. The index needs only
+    /// atomicity: `fetch_add` is a read-modify-write, so each prefix is
+    /// handed to exactly one worker whatever the ordering. `stop` is only an
+    /// early stop: a worker that reads it late makes one listing more, and
+    /// never changes the answer, which is read after the scope has joined
+    /// every worker, and the join makes all their writes visible. The answer
+    /// stays exact: `found` is set only by a listing that showed the state
+    /// object, and `Ok(false)` needs no stop at all, so every worker ran
+    /// until the index passed the last prefix, each one asked and answered.
+    fn held_elsewhere(&self, id: &str) -> anyhow::Result<bool> {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let Ok(pages) = self.bucket.list(String::new(), Some("/".to_string())) else {
-            return false;
-        };
+        let pages = list_retrying(&self.bucket, String::new())
+            .map_err(|e| anyhow::anyhow!("listing the bucket's workspace prefixes failed: {e}"))?;
         let prefixes: Vec<String> = pages
             .iter()
             .filter_map(|page| page.common_prefixes.as_ref())
@@ -737,36 +789,53 @@ impl CloudBackend {
             .map(str::to_string)
             .collect();
         let bucket = &self.bucket;
-        let holds = |prefix: &str| {
+        let holds = |prefix: &str| -> anyhow::Result<bool> {
             let session = format!("{prefix}/{id}/");
             let state = format!("{session}{}", state_file_name(id));
-            bucket
-                .list(session, Some("/".to_string()))
-                .is_ok_and(|pages| {
-                    pages
-                        .iter()
-                        .flat_map(|page| page.contents.iter())
-                        .any(|obj| obj.key == state)
-                })
+            let pages = list_retrying(bucket, session.clone())
+                .map_err(|e| anyhow::anyhow!("listing {session} failed: {e}"))?;
+            Ok(pages
+                .iter()
+                .flat_map(|page| page.contents.iter())
+                .any(|obj| obj.key == state))
         };
         let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
         let found = AtomicBool::new(false);
+        let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         std::thread::scope(|scope| {
             for _ in 0..prefixes.len().min(HELD_ELSEWHERE_FANOUT) {
                 scope.spawn(|| {
-                    while !found.load(Ordering::Relaxed) {
+                    while !stop.load(Ordering::Relaxed) {
                         let Some(prefix) = prefixes.get(next.fetch_add(1, Ordering::Relaxed))
                         else {
                             break;
                         };
-                        if holds(prefix) {
-                            found.store(true, Ordering::Relaxed);
+                        match holds(prefix) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                found.store(true, Ordering::Relaxed);
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                failed
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_or_insert(e);
+                                stop.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 });
             }
         });
-        found.into_inner()
+        if found.into_inner() {
+            return Ok(true);
+        }
+        match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(false),
+        }
     }
 
     /// Where `id`'s own copy lives in the bucket, asked of its local header
@@ -5881,6 +5950,41 @@ fn is_not_found(e: &S3Error) -> bool {
 /// `If-None-Match` didn't hold.
 fn is_precondition_failed(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(412, _))
+}
+
+/// Whether a failed request is worth asking again: the bucket throttled it
+/// (429, or 503 `SlowDown`), failed on its side (500, 502, 504), or the
+/// connection failed. A refusal such as a 403, or an answer koto can't
+/// parse, would only fail again.
+fn is_transient(e: &S3Error) -> bool {
+    match e {
+        S3Error::HttpFailWithBody(status, _) => matches!(status, 429 | 500 | 502 | 503 | 504),
+        S3Error::Atto(_) | S3Error::Io(_) => true,
+        _ => false,
+    }
+}
+
+/// A delimiter listing of `prefix`, asked up to [`LIST_ATTEMPTS`] times
+/// while it fails with a [transient](is_transient) error, waiting
+/// [`LIST_BACKOFF`], doubled each time, between asks. A
+/// [`HELD_ELSEWHERE_FANOUT`]-wide burst is what an endpoint is likeliest
+/// to throttle, and rust-s3's own single retry a second later can meet the
+/// same throttle.
+fn list_retrying(
+    bucket: &Bucket,
+    prefix: String,
+) -> Result<Vec<s3::serde_types::ListBucketResult>, S3Error> {
+    let mut wait = LIST_BACKOFF;
+    for _ in 1..LIST_ATTEMPTS {
+        match bucket.list(prefix.clone(), Some("/".to_string())) {
+            Err(e) if is_transient(&e) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            result => return result,
+        }
+    }
+    bucket.list(prefix, Some("/".to_string()))
 }
 
 /// A response's `ETag` header, without its quotes; `None` when it has none.
