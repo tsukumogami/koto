@@ -976,10 +976,15 @@ pub enum SessionCommand {
     /// configured bucket, and creates it here, named --as when given, as a
     /// new local session anchored in the current directory: the source's
     /// events plus a `session_imported` event, every context key, and the
-    /// compiled template. It pushes the new session under this workspace's prefix,
-    /// then leaves a `migrated.json` marker beside the source, so the old
-    /// copy refuses with `session_migrated` from then on. Nothing else
-    /// under the source's prefix is written.
+    /// compiled template. The new session records the source as the session
+    /// it continues (`koto/links/continues/<source>`), and a back-reference
+    /// is written beside the source before the push; after the push a
+    /// `migrated.json` marker joins it. The old copy stays as a read-only
+    /// predecessor: every write on it refuses with `session_migrated`
+    /// (exit 2), while `koto status`, `koto context get`, `exists`, `list`,
+    /// `koto decisions list` and `koto overrides list` answer from its last
+    /// pushed copy. A re-run on a copy whose relation names another session
+    /// refuses with `relation_conflict` (exit 2).
     ///
     /// Import only a stopped source: no process may still be advancing the
     /// session, and its last write must have reached the remote. Stop the

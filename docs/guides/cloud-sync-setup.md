@@ -313,7 +313,7 @@ session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; contin
 
 The reads still work. `koto status`, `koto context get`, `exists` and `list`, and `koto decisions list` and `koto overrides list`, exit 0 on the source, and so do their `--workspace` forms. They answer from the source's last pushed copy in the bucket, and a read changes nothing: the source's objects, the marker and the copy stay byte-identical, and no read record is written.
 
-Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket while the copy stands (see below), or until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
+Apart from the back-reference and the marker, nothing under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket while the copy stands (see below), or until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
 
 An imported session is an ordinary session in its new workspace, so it can be imported again from there to a third one.
 
