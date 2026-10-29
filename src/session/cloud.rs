@@ -186,6 +186,10 @@ pub(crate) fn is_workspace_prefix(prefix: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// How many listings [`CloudBackend::held_elsewhere`] has in flight at once,
+/// each on its own thread and connection.
+const HELD_ELSEWHERE_FANOUT: usize = 64;
+
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
 const DELETE_HEADER_BYTES: u64 = 64 * 1024;
@@ -715,7 +719,12 @@ impl CloudBackend {
     /// stopping at the first that holds it. Asked only for a session with no
     /// local copy and no state under this directory's prefix. A listing that
     /// fails reads as not held, so the command goes on as before.
+    ///
+    /// The per-prefix listings run [`HELD_ELSEWHERE_FANOUT`] at a time: asked
+    /// in turn, a bucket with hundreds of prefixes kept a probe of a name
+    /// that exists nowhere waiting minutes (koto#526).
     fn held_elsewhere(&self, id: &str) -> bool {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let Ok(pages) = self.bucket.list(String::new(), Some("/".to_string())) else {
             return false;
         };
@@ -727,10 +736,11 @@ impl CloudBackend {
             .filter(|p| is_workspace_prefix(p) && *p != self.prefix)
             .map(str::to_string)
             .collect();
-        prefixes.iter().any(|prefix| {
+        let bucket = &self.bucket;
+        let holds = |prefix: &str| {
             let session = format!("{prefix}/{id}/");
             let state = format!("{session}{}", state_file_name(id));
-            self.bucket
+            bucket
                 .list(session, Some("/".to_string()))
                 .is_ok_and(|pages| {
                     pages
@@ -738,7 +748,25 @@ impl CloudBackend {
                         .flat_map(|page| page.contents.iter())
                         .any(|obj| obj.key == state)
                 })
-        })
+        };
+        let next = AtomicUsize::new(0);
+        let found = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..prefixes.len().min(HELD_ELSEWHERE_FANOUT) {
+                scope.spawn(|| {
+                    while !found.load(Ordering::Relaxed) {
+                        let Some(prefix) = prefixes.get(next.fetch_add(1, Ordering::Relaxed))
+                        else {
+                            break;
+                        };
+                        if holds(prefix) {
+                            found.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        found.into_inner()
     }
 
     /// Where `id`'s own copy lives in the bucket, asked of its local header

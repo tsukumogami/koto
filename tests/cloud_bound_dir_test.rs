@@ -1282,3 +1282,59 @@ fn a_read_from_another_directory_costs_no_more_requests() {
     let from_b = count(&b);
     assert!(from_b <= from_a, "warm: {from_b} from B, {from_a} from A");
 }
+
+/// `context exists` on a name with no local copy, against a bucket holding
+/// many workspace prefixes across a slow network, asks every other prefix
+/// whether it holds the session, but not one prefix after another: the
+/// listings all go out within a fraction of what the prefixes would cost
+/// asked in turn, and the probe still answers absent (koto#526). A session
+/// one of those prefixes holds still refuses with `no_local_copy`.
+#[test]
+fn a_missing_name_s_probe_asks_the_other_prefixes_at_once() {
+    const MISSING: &str = "missing";
+    const PREFIXES: u32 = 48;
+    let latency = std::time::Duration::from_millis(150);
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let planted: Vec<String> = (0..PREFIXES)
+        .map(|i| format!("{i:016x}"))
+        .inspect(|p| s3.put(&format!("{p}/other/koto-other.state.jsonl"), b"{}\n"))
+        .collect();
+    let dir = h.dir("probe");
+
+    s3.set_latency(latency);
+    s3.clear_requests();
+    let out = h.koto(&dir, &["context", "exists", MISSING, "k.md"]);
+    s3.set_latency(std::time::Duration::ZERO);
+    assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+    assert!(out.stdout.trim().is_empty(), "{}", out.describe());
+
+    let scan: Vec<std::time::Instant> = s3
+        .requests()
+        .into_iter()
+        .filter(|r| {
+            r.list_prefix.as_deref().is_some_and(|p| {
+                planted
+                    .iter()
+                    .any(|prefix| p == format!("{prefix}/{MISSING}/"))
+            })
+        })
+        .map(|r| r.at)
+        .collect();
+    assert_eq!(scan.len(), planted.len(), "one listing per other prefix");
+    let span = *scan.iter().max().unwrap() - *scan.iter().min().unwrap();
+    let serial = latency * PREFIXES;
+    assert!(
+        span < serial / 4,
+        "the probe ran one listing per other workspace prefix in turn: {} listings went out \
+         over {span:?}, against {serial:?} for all of them asked one after another",
+        scan.len()
+    );
+
+    s3.put(
+        &format!("{}/{WF}/koto-{WF}.state.jsonl", planted.last().unwrap()),
+        b"{}\n",
+    );
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_unlocated(&out, "context exists", "no_local_copy");
+}
