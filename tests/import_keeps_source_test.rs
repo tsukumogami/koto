@@ -1173,74 +1173,58 @@ fn a_read_key_that_could_leave_the_scratch_directory_is_refused_before_any_read(
     assert_eq!(after.local, before.local);
 }
 
-/// The verbs that write or move a session, each with the exit code its
-/// `session_migrated` refusal has today on a source imported from another
-/// host (`same_host` false) or on this one. This work changes none of them:
-/// a migrated source's writes refuse as they did before its reads were
-/// served. Several still exit 1, not 2, as they did before.
-///
-/// Left out: `koto session resolve --keep local` and `koto session update`
-/// on a source imported from another host. Both exit 0 today and write to
-/// the source's bucket prefix (its `version.json`, its state file), so they
-/// don't refuse at all; that predates this work and isn't covered here.
-fn write_verbs(src: &str, same_host: bool) -> Vec<(Vec<String>, i32)> {
-    let one_cross = if same_host { 2 } else { 1 };
-    let mut verbs: Vec<(Vec<&str>, i32)> = vec![
-        (vec!["next", "v2"], 2),
-        (vec!["next", "v2", "--with-data", r#"{"marker":"done"}"#], 2),
-        (
-            vec!["context", "add", "v2", "new.md", "--from-file", src],
-            2,
-        ),
-        (vec!["context", "remove", "v2", "notes.md"], 2),
-        (vec!["rewind", "v2"], one_cross),
-        (vec!["cancel", "v2"], one_cross),
-        (
-            vec![
-                "decisions",
-                "record",
-                "v2",
-                "--with-data",
-                r#"{"choice":"x","rationale":"y"}"#,
-            ],
-            one_cross,
-        ),
-        (
-            vec![
-                "overrides",
-                "record",
-                "v2",
-                "--gate",
-                "g",
-                "--rationale",
-                "r",
-            ],
-            one_cross,
-        ),
-        (vec!["session", "link", "v2", "--continues", "other"], 2),
-        (vec!["session", "link", "v2", "--dispatched-by", "other"], 2),
-        (vec!["session", "rebind", "v2"], 1),
-        (vec!["session", "pin", "v2", "--reason", "r"], 2),
-        (vec!["session", "unpin", "v2"], 2),
+/// The verbs that write or move a session. On a migrated source each one
+/// refuses with `session_migrated`, exit 2, from a source imported from
+/// another host and from one imported on this host alike.
+fn write_verbs(src: &str) -> Vec<Vec<String>> {
+    let verbs: Vec<Vec<&str>> = vec![
+        vec!["next", "v2"],
+        vec!["next", "v2", "--with-data", r#"{"marker":"done"}"#],
+        vec!["context", "add", "v2", "new.md", "--from-file", src],
+        vec!["context", "remove", "v2", "notes.md"],
+        vec!["rewind", "v2"],
+        vec!["cancel", "v2"],
+        vec![
+            "decisions",
+            "record",
+            "v2",
+            "--with-data",
+            r#"{"choice":"x","rationale":"y"}"#,
+        ],
+        vec![
+            "overrides",
+            "record",
+            "v2",
+            "--gate",
+            "g",
+            "--rationale",
+            "r",
+        ],
+        vec!["session", "link", "v2", "--continues", "other"],
+        vec!["session", "link", "v2", "--dispatched-by", "other"],
+        vec!["session", "rebind", "v2"],
+        vec!["session", "resolve", "v2", "--keep", "local"],
+        vec!["session", "resolve", "v2", "--keep", "remote"],
+        vec!["session", "update", "v2", "--intent", "x"],
+        vec!["session", "pin", "v2", "--reason", "r"],
+        vec!["session", "unpin", "v2"],
     ];
-    if same_host {
-        verbs.push((vec!["session", "resolve", "v2", "--keep", "local"], 2));
-        verbs.push((vec!["session", "update", "v2", "--intent", "x"], 1));
-    }
     verbs
         .into_iter()
-        .map(|(args, code)| (args.into_iter().map(str::to_string).collect(), code))
+        .map(|args| args.into_iter().map(str::to_string).collect())
         .collect()
 }
 
 /// The source's workspace, `host` on it: every verb `write_verbs` names
-/// still refuses with `session_migrated`, with today's exit code, naming
-/// the copy and its workspace, and changes neither the source nor the copy
-/// in the bucket or on this host. A refused `koto next` still records its
-/// tick's id beside the source's local copy (`cloud-tick.id`), host-local
-/// bookkeeping no read or write of the session's log or keys sees, so that
-/// one file is left out of the comparison.
-fn assert_writes_refused(w: &World, host: &Host, copy_host: &Host, same_host: bool) {
+/// refuses with `session_migrated`, exit 2, naming the copy and its
+/// workspace, and changes neither the source nor the copy in the bucket or
+/// on this host. `resolve` and `update`, whose own paths reach the bucket,
+/// are each checked to leave the source's objects and its marker
+/// byte-identical. A refused `koto next` still records its tick's id beside
+/// the source's local copy (`cloud-tick.id`), host-local bookkeeping no
+/// read or write of the session's log or keys sees, so that one file is
+/// left out of the comparison.
+fn assert_writes_refused(w: &World, host: &Host, copy_host: &Host) {
     let src = file(host, "new.md", b"new");
     let comparable = |u: Untouched| -> Untouched {
         Untouched {
@@ -1255,23 +1239,37 @@ fn assert_writes_refused(w: &World, host: &Host, copy_host: &Host, same_host: bo
                 .collect(),
         }
     };
+    let source = format!("{}/v2/", w.a.prefix());
+    let marker = w.marker_key("v2");
     let before = comparable(w.untouched(copy_host, "v2"));
     w.s3.clear_requests();
     let mut wrong = Vec::new();
-    for (args, code) in write_verbs(&src, same_host) {
+    for args in write_verbs(&src) {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let source_before = w.objects(&source);
         let r = read(host, &argv);
         let all = format!("{}{}", r.stdout, r.stderr);
-        let refused = r.code == Some(code)
+        let refused = r.code == Some(2)
             && all.contains("session_migrated")
             && all.contains("'v2'")
             && all.contains(&copy_host.ws_str());
         if !refused {
             wrong.push(format!(
-                "{} (want exit {code}): {}",
+                "{} (want exit 2): {}",
                 args.join(" "),
                 r.describe()
             ));
+        }
+        if matches!(argv[..2], ["session", "resolve"] | ["session", "update"]) {
+            let source_after = w.objects(&source);
+            if source_after != source_before {
+                wrong.push(format!("{} changed the source's objects", args.join(" ")));
+            }
+            if !source_after.contains_key(&marker)
+                || source_after.get(&marker) != source_before.get(&marker)
+            {
+                wrong.push(format!("{} changed the marker", args.join(" ")));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -1288,7 +1286,7 @@ fn every_write_verb_still_refuses_on_a_migrated_source() {
     assert_scratch(&w.root, &w.b, &w.s3);
     w.init(&w.a, "other", &[]);
     w.source_and_moved_copy(&w.b);
-    assert_writes_refused(&w, &w.a, &w.b, false);
+    assert_writes_refused(&w, &w.a, &w.b);
 }
 
 #[test]
@@ -1298,5 +1296,5 @@ fn every_write_verb_still_refuses_on_a_same_host_migrated_source() {
     assert_scratch(&w.root, &w.a2, &w.s3);
     w.init(&w.a, "other", &[]);
     w.source_and_moved_copy(&w.a2);
-    assert_writes_refused(&w, &w.a, &w.a2, true);
+    assert_writes_refused(&w, &w.a, &w.a2);
 }

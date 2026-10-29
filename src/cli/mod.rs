@@ -1306,6 +1306,24 @@ fn refuse_if_unlocated(backend: &Backend, session: &str, command: &str) {
     backend.ensure_backref(session);
 }
 
+/// Refuse, exit 2 with `{"error", "command"}`, before `command` writes
+/// `session`, when the session was imported into another workspace: the
+/// source is kept as a read-only predecessor, and the message names the
+/// copy and its workspace. For the writes whose own path reaches the
+/// bucket before any read would refuse (`koto session resolve`, `koto
+/// session update`). Any other error of the check is left to the command,
+/// which meets it as it did before.
+fn refuse_if_migrated(backend: &Backend, session: &str, command: &str) {
+    if let Err(e) = backend.check_not_migrated_to_write(session) {
+        if e.is::<crate::session::SessionMigrated>() {
+            exit_with_error_code(
+                serde_json::json!({ "error": e.to_string(), "command": command }),
+                EXIT_CALLER_ERROR,
+            );
+        }
+    }
+}
+
 /// Print [`refuse_if_unlocated`]'s refusal of `e` for `command`, exit 2.
 fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
     let mut error = serde_json::json!({
@@ -1415,9 +1433,22 @@ pub fn report_failure(e: &anyhow::Error) -> i32 {
         }
         None => {
             eprintln!("{e}");
-            1
+            // A session imported elsewhere is the caller's to continue
+            // where the message says, exit 2, whichever command met it.
+            if is_session_migrated(e) {
+                EXIT_CALLER_ERROR
+            } else {
+                1
+            }
         }
     }
+}
+
+/// Whether `err` is a [`crate::session::SessionMigrated`] refusal, at its
+/// top or anywhere in its chain of causes.
+fn is_session_migrated(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<crate::session::SessionMigrated>())
 }
 
 /// What `koto next` runs on its way out, however it exits: the flush of
@@ -1435,11 +1466,13 @@ fn flush_before_exit() {
 /// Determine the exit code for an engine error by downcasting to EngineError.
 ///
 /// Delegates the per-variant mapping to [`EngineError::exit_code`] so the
-/// CLI surface and the engine layer stay in sync. Falls back to exit code
-/// 1 when the underlying error does not downcast to an `EngineError`.
+/// CLI surface and the engine layer stay in sync. A session imported
+/// elsewhere ([`crate::session::SessionMigrated`]) is a caller error, exit
+/// 2. Falls back to exit code 1 when the underlying error is neither.
 pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
     match err.downcast_ref::<EngineError>() {
         Some(e) => e.exit_code(),
+        None if is_session_migrated(err) => EXIT_CALLER_ERROR,
         None => 1,
     }
 }
@@ -2429,6 +2462,7 @@ pub fn run(app: App) -> Result<()> {
                     children,
                 } => {
                     refuse_if_unlocated(&backend, &name, "session resolve");
+                    refuse_if_migrated(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
                 }
                 SessionCommand::Flush { name } => {
@@ -2447,6 +2481,7 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_recover(&backend, apply, &sessions)
                 }
                 SessionCommand::Update { name, intent } => {
+                    refuse_if_migrated(&backend, &name, "session update");
                     session::handle_update(&backend, &name, &intent)?;
                     println!(
                         "{}",

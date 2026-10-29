@@ -1050,6 +1050,16 @@ impl Backend {
         }
     }
 
+    /// [`Backend::check_not_migrated`] for a command about to write `id`:
+    /// the answer comes from a listing this process made, never one another
+    /// process shared. Always `Ok` on the local backend.
+    pub fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_not_migrated_to_write(id),
+        }
+    }
+
     /// Refuse with [`SessionMigrated`] when `id` was imported into another
     /// workspace. Always `Ok` on the local backend, which has no remote
     /// copy to import from and makes no request.
