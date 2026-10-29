@@ -541,7 +541,8 @@ Wiring:
   reasons. `--force` never overrides the rule.
 - **`koto session prune`.** Rule a becomes "alive by the engine"; rules b and
   c become rule `h` (hierarchy), whose `detail` is the rendered verdict with a
-  structured `hierarchy` field; d, e, f and g stay. Filters pick candidates
+  structured `hierarchy` field; d, e, f and g stay (koto#532 later retired
+  f, the `coordinate-` name rule). Filters pick candidates
   only, and `--older-than` measures from the stop instant. At apply: one
   fresh scan, each component re-judged as a unit, each member removed under
   its own lock after a status and session-id check, anchors before their

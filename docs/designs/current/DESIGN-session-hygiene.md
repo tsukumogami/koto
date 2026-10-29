@@ -187,8 +187,16 @@ still protect one inside them. For each session it reads:
 | c | a finished session that references a running or unreadable one | the reference map, checked against the referenced session's status; a reference to a name with no session protects nothing |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
 | e | a session bound to a waiting or unreadable request leg | `request-leg.toml` in the session directory; the request is read with `request_store::read_view`; kept when the request is open with the leg open, or when the pointer or the request can't be read or parsed; a request that doesn't exist releases it |
-| f | a coordinator's session | the name begins `coordinate-` |
+| f | retired by koto#532; it kept every session whose name begins `coordinate-` | nothing: the letter stays unused |
 | g | under the cloud backend, a session whose remote copy is ahead of the local one, diverged from it, or can't be read | one listing of the session's remote prefix: a remote state log longer than the local one keeps it, and when a remote `version.json` is listed it is compared with the local one by the existing `check_sync`, where anything but `Safe` keeps it |
+
+Rule f is retired. A session's name keeps nothing: a finished coordinator
+session is kept like any other, by a pin, by its hierarchy, or by a later
+session that continues it (rule r, whose entry names that successor). The
+letter f stays unused, since the letters are the `rule` field callers read in
+prune's JSON. The retention guide's
+[Coordinator sessions and the retired name rule](../../guides/session-retention.md#coordinator-sessions-and-the-retired-name-rule)
+covers the change.
 
 Rule g goes beyond the PRD's list for one reason. The cloud backend's
 cleanup deletes the session's remote objects too, and a host whose local copy
@@ -364,8 +372,9 @@ verb:
   keeps running and unreadable sessions, anything a running session
   references or that references a running session (through
   `parent_workflow` or `chain/parent`), malformed references, sessions
-  bound to a waiting request leg, `coordinate-` sessions, and, under the
-  cloud backend, sessions whose remote copy may be newer. A preview is
+  bound to a waiting request leg, and, under the cloud backend, sessions
+  whose remote copy may be newer. It no longer keeps `coordinate-` sessions
+  by name: koto#532 retired that rule. A preview is
   stored under its plan token so an exact apply can diff against it, and
   each removal happens under the session's lock after a re-check
   (R5 to R11).
