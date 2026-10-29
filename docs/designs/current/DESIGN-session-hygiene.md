@@ -182,7 +182,7 @@ still protect one inside them. For each session it reads:
 
 | Rule | Keeps | How the prune knows |
 |------|-------|---------------------|
-| a | a session the retention engine judges alive | the engine's liveness check: a koto session is alive while its status is `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink); a close session never is; an anchor is alive until it closes, which for an observed anchor is only its observed close, and for one with no observed marker is also the idle period after its last activity passing |
+| a | a session alive by the engine (the session-retention design's liveness check) | a koto session is alive while its status is `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink). A close session is never alive. An anchor is alive until it closes: an observed anchor closes only by its observed close, and one with no observed marker also closes once the idle period after its last activity passes |
 | b | replaced by rule `h` in the session-retention design; it kept a session some running or unreadable session references, or any finished session while some session's header couldn't be read | nothing: the letter stays unused |
 | c | replaced by rule `h` in the session-retention design; it kept a finished session that references a running or unreadable one | nothing: the letter stays unused |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
@@ -230,7 +230,7 @@ unknown: its `parent_workflow` is in the header it lost. So while any
 session's header couldn't be read, rule b kept every finished session and
 named that session, so a person could inspect or remove it and let the prune
 go on. Nothing narrowed the set, since the execution directory that could
-scope it is in the header too. Rule `h` keeps the same posture: in the
+scope it is in the header too. Rule `h` also fails toward keeping: in the
 retention design an unreadable log taints its component and counts as alive,
 and an unreadable header, manifest or links directory taints every component.
 
@@ -493,18 +493,19 @@ mistake is a usage error rather than a store-wide removal.
 Session mode:
 
 1. Enumerate every local session (above) and `inspect` each one. Read each
-   session's `chain/parent` and build the reference map (Decision 3).
+   session's `chain/parent` and build the reference map (Decision 3), which
+   rule `h`'s graph has since replaced.
 2. Candidates are sessions that pass the filters and are `Terminal` or
    `Cancelled`, plus finished records (below) that pass the filters. The age
    filter compares `finished_at` with now.
 3. For each session that passes the filters, whatever its status, evaluate
-   rules a to g in order, so a running or unreadable session shows on `kept`
-   under rule a. The session-retention design later replaced b and c with
-   rule `h`, which it specifies, and koto#532 retired f, so the live letters
-   are a, d, e, g and h. The first rule that applies puts the session on
-   `kept` with that rule's letter and a detail (the referencing or referenced name, the
-   request id); a candidate no rule keeps goes on the would-remove list.
-   Records have
+   the rules in order, so a running or unreadable session shows on `kept`
+   under rule a. As first shipped the rules were a to g; the
+   session-retention design later replaced b and c with rule `h`, which it
+   specifies, and koto#532 retired f. The first rule that applies puts the
+   session on `kept` with that rule's letter and a detail (the request id
+   for rule e; for rule `h`, the engine's rendered verdict); a candidate no
+   rule keeps goes on the would-remove list. Records have
    no rules: koto writes one only when it removes a session itself, and that
    removal already waited until the session's parent had its
    `child_completed` (the terminal tick defers removal when that append
@@ -823,7 +824,7 @@ built on its inspection helper.
 1. **Listing.** `session_inventory.rs`, `SessionInfo`'s two fields,
    `--execution-dir` and `--state`, the koto-user skill's command reference,
    and the 1,000-session timing (R1 to R4, R30 for listing).
-2. **Prune (sessions).** `session_prune.rs`, rules a to g, stored plans,
+2. **Prune (sessions).** `session_prune.rs`, rules a to g as first shipped, stored plans,
    both apply modes, exit 4, the checked cloud delete, the 1,000-session
    preview timing (R30 for the prune), and the `docs/workspace-layout.md` and
    skill updates (R5 to R11). Depends on 1.
