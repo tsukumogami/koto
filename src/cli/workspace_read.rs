@@ -8,7 +8,14 @@
 //! workspace's prefix whose local copies live in a scratch directory that is
 //! removed however the command exits.
 //!
-//! A read through `--workspace` logs nothing: `context get` and `exists`
+//! The same reader answers the read verbs on a session this workspace's
+//! copy of was imported elsewhere ([`serve_migrated_source`]): `koto
+//! session import` keeps its source as a read-only predecessor, so where a
+//! read of it used to refuse with `session_migrated`, it answers from the
+//! last copy the source pushed. Every verb that writes still refuses there.
+//! The `--workspace` forms serve a migrated session the same way.
+//!
+//! A read through the reader logs nothing: `context get` and `exists`
 //! record no `context_read`, anchored or not, since that would write to the
 //! session read or to this host. It reads no log either, so it answers from
 //! the store alone.
@@ -16,11 +23,13 @@
 use anyhow::Result;
 
 use super::{
-    context, exit_with_error_code, handle_status, Command, ContextCommand, EXIT_CALLER_ERROR,
-    EXIT_FLUSH,
+    context, exit_with_error_code, handle_decisions_list, handle_status, overrides, Command,
+    ContextCommand, DecisionsSubcommand, EXIT_CALLER_ERROR, EXIT_FLUSH,
 };
-use crate::session::cloud::workspace_read::{WorkspaceId, WorkspaceReadError, WorkspaceReader};
-use crate::session::Backend;
+use crate::session::cloud::workspace_read::{
+    WorkspaceId, WorkspaceReadError, WorkspaceReadErrorCode, WorkspaceReader,
+};
+use crate::session::{Backend, SessionMigrated};
 
 /// The `code` a verb that refuses `--workspace` prints.
 pub const READ_ONLY_CODE: &str = "workspace_read_only";
@@ -41,6 +50,14 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
             ContextCommand::List { session, .. } => Some(("context list", session)),
             ContextCommand::Add { .. } | ContextCommand::Remove { .. } => None,
         },
+        Command::Decisions { subcommand } => match subcommand {
+            DecisionsSubcommand::List { name } => Some(("decisions list", name)),
+            DecisionsSubcommand::Record { .. } => None,
+        },
+        Command::Overrides { subcommand } => match subcommand {
+            overrides::OverridesSubcommand::List { name } => Some(("overrides list", name)),
+            overrides::OverridesSubcommand::Record { .. } => None,
+        },
         _ => None,
     }
 }
@@ -57,6 +74,15 @@ fn exit_with_read_error(command: &str, e: &WorkspaceReadError) -> ! {
     );
 }
 
+/// Print `refused`, a read's refusal of a migrated session, as `command`'s
+/// error envelope and exit 2, as the read verbs did before they served it.
+fn exit_with_refusal(command: &str, refused: &anyhow::Error) -> ! {
+    exit_with_error_code(
+        serde_json::json!({ "error": refused.to_string(), "command": command }),
+        EXIT_CALLER_ERROR,
+    );
+}
+
 /// Run `command` against the session it names in `workspace`'s part of the
 /// bucket. Refuses any verb but the read verbs, a workspace that names
 /// nothing, and a workspace whose session backend isn't the cloud one.
@@ -66,9 +92,9 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
         exit_with_error_code(
             serde_json::json!({
                 "error": "--workspace reads a session in another workspace, so only \
-                          `koto status`, `koto context get`, `koto context exists` and \
-                          `koto context list` accept it; a verb that writes or removes \
-                          refuses it",
+                          `koto status`, `koto context get`, `koto context exists`, \
+                          `koto context list`, `koto decisions list` and `koto overrides \
+                          list` accept it; a verb that writes or removes refuses it",
                 "code": READ_ONLY_CODE,
             }),
             EXIT_CALLER_ERROR,
@@ -91,7 +117,85 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
             EXIT_CALLER_ERROR,
         );
     }
-    let reader = WorkspaceReader::open(&config.session.cloud, id)?;
+    check_read_key(verb, &command);
+    // A session imported elsewhere is answered from the copy it left here,
+    // as the same read in its own workspace answers it.
+    let reader = WorkspaceReader::open(&config.session.cloud, id)?.serve_migrated();
+    serve(reader, verb, &name, command, None)
+}
+
+/// Answer `command`, one of the read verbs, on the session this workspace's
+/// `backend` refused with `refused`: a [`SessionMigrated`] its first read
+/// returned. The session's copy here was imported elsewhere and is kept as
+/// a read-only predecessor, so the read is answered from the last copy it
+/// pushed, through a [`WorkspaceReader`] on that copy's prefix
+/// ([`WorkspaceReader::for_migrated_source`]): nothing is written to the
+/// bucket or to this host's session store, and no read is recorded.
+///
+/// The refusal stands, exit 2 as before, when there is no copy to answer
+/// from: the local backend, a backend that is itself a reader, or a bucket
+/// that no longer holds the source's state file.
+pub(super) fn serve_migrated_source(
+    backend: &Backend,
+    command: Command,
+    refused: anyhow::Error,
+) -> Result<()> {
+    let Some((verb, name)) = read_verb(&command).map(|(verb, name)| (verb, name.to_string()))
+    else {
+        unreachable!("only a read verb is served from a migrated source");
+    };
+    let Backend::Cloud(cloud) = backend else {
+        exit_with_refusal(verb, &refused);
+    };
+    if cloud.is_read_only() || refused.downcast_ref::<SessionMigrated>().is_none() {
+        exit_with_refusal(verb, &refused);
+    }
+    check_read_key(verb, &command);
+    let reader = WorkspaceReader::for_migrated_source(cloud, &name)
+        .unwrap_or_else(|_| exit_with_refusal(verb, &refused));
+    serve(reader, verb, &name, command, Some(&refused))
+}
+
+/// Refuse the key `context get` or `context exists` names when it isn't one
+/// koto could have stored, before a reader and its scratch directory exist,
+/// so nothing joins it to a path under that directory. `get` fails as a read
+/// that failed (exit 3), `exists` as an unusable key (exit 2), as the same
+/// verbs do on a session in this workspace.
+fn check_read_key(verb: &str, command: &Command) {
+    let Command::Context { subcommand } = command else {
+        return;
+    };
+    let (key, exists) = match subcommand {
+        ContextCommand::Get { key, .. } => (key, false),
+        ContextCommand::Exists { key, .. } => (key, true),
+        _ => return,
+    };
+    let Err(e) = WorkspaceReader::check_key(key) else {
+        return;
+    };
+    if exists {
+        let reason = crate::session::validate::unusable_context_key_reason(key)
+            .unwrap_or_else(|| e.to_string());
+        exit_with_error_code(
+            serde_json::json!({ "error": reason, "command": verb }),
+            EXIT_CALLER_ERROR,
+        );
+    }
+    context::exit_with_failed_read(verb, &e);
+}
+
+/// Answer `command` (`verb`, on session `name`) through `reader`.
+///
+/// `refused` is the refusal a served read of a migrated source replaces:
+/// when the bucket holds no copy of the session to answer from, it is what
+/// the command prints, rather than a not-found the caller couldn't act on.
+fn serve(
+    reader: WorkspaceReader,
+    verb: &'static str,
+    name: &str,
+    command: Command,
+    refused: Option<&anyhow::Error>,
+) -> Result<()> {
     // The scratch directory goes however the command exits: on return when
     // `_scratch` drops, and on `exit_with_error_code`'s way out through the
     // exit flush. Only `koto next` sets that flush otherwise, and it never
@@ -105,15 +209,26 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
         set.is_ok(),
         "the exit flush was already set, so a --workspace read couldn't remove its scratch"
     );
-    let located = reader.locate(&name).and_then(|()| {
+    let located = reader.locate(name).and_then(|()| {
         if verb == "status" {
-            reader.fetch_template(&name)
+            reader.fetch_template(name)
         } else {
             Ok(())
         }
     });
     if let Err(e) = located {
-        exit_with_read_error(verb, &e);
+        match refused {
+            Some(refused)
+                if matches!(
+                    e.code,
+                    WorkspaceReadErrorCode::SessionNotFound
+                        | WorkspaceReadErrorCode::WorkspaceNotFound
+                ) =>
+            {
+                exit_with_refusal(verb, refused)
+            }
+            _ => exit_with_read_error(verb, &e),
+        }
     }
     // `scratch` owns the directory `backend` keeps its copies in, so it
     // must outlive `backend`: it is dropped last, or by hand before
@@ -121,72 +236,77 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
     let (cloud, scratch) = reader.into_parts();
     let backend = Backend::Cloud(cloud);
     // A session imported into another workspace refuses here, exit 2, as
-    // it does without `--workspace`, naming where it went. There is no
+    // it does without `--workspace`, naming where it went, when the reader
+    // doesn't serve migrated sessions; one that does passes. There is no
     // `session_unlocated` check, on purpose: that refusal guards this
     // host's shared copy, and this backend reads the session under the
     // prefix it was named by into a scratch copy, never the shared one.
-    if let Err(e) = backend.check_not_migrated(&name) {
-        exit_with_error_code(
-            serde_json::json!({ "error": e.to_string(), "command": verb }),
-            EXIT_CALLER_ERROR,
-        );
+    if let Err(e) = backend.check_not_migrated(name) {
+        exit_with_refusal(verb, &e);
     }
 
-    let Command::Context { subcommand } = command else {
-        // `read_verb` let through only `status` and the context reads.
-        return handle_status(&backend, &name);
-    };
-    match subcommand {
-        ContextCommand::Get {
-            session,
-            key,
-            to_file,
-        } => {
-            // No events and no reader anchor: the read is logged nowhere
-            // (see the module header), unlike the same verb without
-            // `--workspace`.
-            if let Err(e) = context::handle_get(
-                &backend,
-                &backend,
-                None,
-                None,
-                &session,
-                &key,
-                to_file.as_deref(),
-            ) {
-                context::exit_with_failed_read(verb, &e);
-            }
-        }
-        ContextCommand::Exists { session, key } => {
-            // Logged nowhere, as `context get` above.
-            let code = match context::handle_exists(&backend, &backend, None, None, &session, &key)
-            {
-                context::KeyPresence::Present => 0,
-                context::KeyPresence::Absent => 1,
-                context::KeyPresence::Unusable(reason) => {
-                    exit_with_error_code(
-                        serde_json::json!({ "error": reason, "command": verb }),
-                        EXIT_CALLER_ERROR,
-                    );
+    match command {
+        Command::Status { .. } => handle_status(&backend, name),
+        Command::Decisions { .. } => handle_decisions_list(&backend, name.to_string()),
+        Command::Overrides { .. } => overrides::handle_overrides_list(&backend, name.to_string()),
+        Command::Context { subcommand } => {
+            match subcommand {
+                ContextCommand::Get {
+                    session,
+                    key,
+                    to_file,
+                } => {
+                    // No events and no reader anchor: the read is logged
+                    // nowhere (see the module header), unlike the same verb
+                    // in the session's own workspace.
+                    if let Err(e) = context::handle_get(
+                        &backend,
+                        &backend,
+                        None,
+                        None,
+                        &session,
+                        &key,
+                        to_file.as_deref(),
+                    ) {
+                        context::exit_with_failed_read(verb, &e);
+                    }
                 }
-            };
-            // `process::exit` runs no destructor and not the exit flush,
-            // which only `exit_with_error_code` runs, so the scratch
-            // directory is removed here by hand.
-            drop(backend);
-            drop(scratch);
-            std::process::exit(code);
-        }
-        ContextCommand::List { session, prefix } => {
-            if let Err(e) = context::handle_list(&backend, None, &session, prefix.as_deref()) {
-                context::exit_with_failed_read(verb, &e);
+                ContextCommand::Exists { session, key } => {
+                    // Logged nowhere, as `context get` above.
+                    let code = match context::handle_exists(
+                        &backend, &backend, None, None, &session, &key,
+                    ) {
+                        context::KeyPresence::Present => 0,
+                        context::KeyPresence::Absent => 1,
+                        context::KeyPresence::Unusable(reason) => {
+                            exit_with_error_code(
+                                serde_json::json!({ "error": reason, "command": verb }),
+                                EXIT_CALLER_ERROR,
+                            );
+                        }
+                    };
+                    // `process::exit` runs no destructor and not the exit
+                    // flush, which only `exit_with_error_code` runs, so the
+                    // scratch directory is removed here by hand.
+                    drop(backend);
+                    drop(scratch);
+                    std::process::exit(code);
+                }
+                ContextCommand::List { session, prefix } => {
+                    if let Err(e) =
+                        context::handle_list(&backend, None, &session, prefix.as_deref())
+                    {
+                        context::exit_with_failed_read(verb, &e);
+                    }
+                }
+                ContextCommand::Add { .. } | ContextCommand::Remove { .. } => {
+                    unreachable!("read_verb refuses context add and remove")
+                }
             }
+            Ok(())
         }
-        ContextCommand::Add { .. } | ContextCommand::Remove { .. } => {
-            unreachable!("read_verb refuses context add and remove")
-        }
+        _ => unreachable!("read_verb lets through only the read verbs"),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -196,7 +316,14 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     /// The verbs `--workspace` reads through. Everything else refuses it.
-    const READ_VERBS: [&str; 4] = ["status", "context get", "context exists", "context list"];
+    const READ_VERBS: [&str; 6] = [
+        "status",
+        "context get",
+        "context exists",
+        "context list",
+        "decisions list",
+        "overrides list",
+    ];
 
     /// Every runnable verb of `cmd`, as the words that name it: each leaf,
     /// and each group whose subcommand is optional (`koto workflows`).

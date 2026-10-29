@@ -460,9 +460,10 @@ leaves those markers alone. They can now be removed too, with
 `koto session prune --migrated-from <old workspace>`: a marker goes,
 together with the old copy beside it, only when the session it points
 at is present at its target, with a log that reads cleanly and begins
-with every event of the old copy's log, and the marker is at least
-`session.cloud.marker_retain_days` old (or `--source-retired` says the
-old host is gone). That mode works on the bucket only and never touches
+with every event of the old copy's log, and the copy (or any session
+continuing it) is no longer running, pinned or within retention.
+`session.cloud.marker_retain_days` and `--source-retired` are accepted
+but no longer decide. That mode works on the bucket only and never touches
 `$HOME/.koto/sessions/` beyond its stored plan; see
 `docs/guides/cloud-sync-setup.md` for the rule.
 

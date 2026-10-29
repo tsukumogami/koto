@@ -386,7 +386,7 @@ pub fn handle_overrides_record(
 ///
 /// Returns the full session override history (all epochs) as a JSON object
 /// with `state` (current workflow state) and `overrides.items` array.
-pub fn handle_overrides_list(backend: &dyn SessionBackend, name: String) -> Result<()> {
+pub fn handle_overrides_list(backend: &crate::session::Backend, name: String) -> Result<()> {
     if !backend.exists(&name) {
         exit_with_error_code(
             serde_json::json!({
@@ -399,6 +399,14 @@ pub fn handle_overrides_list(backend: &dyn SessionBackend, name: String) -> Resu
 
     let (_, events) = match backend.read_events(&name) {
         Ok(result) => result,
+        // A session imported elsewhere is answered from the copy it left
+        // in the bucket.
+        Err(err) if err.is::<crate::session::SessionMigrated>() => {
+            let read = super::Command::Overrides {
+                subcommand: OverridesSubcommand::List { name },
+            };
+            return super::workspace_read::serve_migrated_source(backend, read, err);
+        }
         Err(err) => {
             let code = exit_code_for_engine_error(&err);
             exit_with_error_code(

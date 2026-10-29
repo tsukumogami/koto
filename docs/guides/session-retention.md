@@ -21,6 +21,11 @@ It keeps that session only. The rest of its hierarchy is kept or released by
 the rule as before, so a pinned child doesn't keep its parent and a pinned
 parent doesn't keep its children.
 
+A session `koto session import` moved is kept too, by the copy. The import
+leaves the source in place as a read-only predecessor, and the source stays
+while the copy, or any session that continues it, is alive, pinned, or within
+`retention.keep` (see [Import keeps its source](#import-keeps-its-source)).
+
 ## Pinning and unpinning
 
 ```bash
@@ -190,11 +195,48 @@ and reports `bucket_unchecked` with `unreachable` or `unparseable`;
 `koto session import` carries a pin and its release record to the moved copy,
 an unreadable pin included. An anchor's recorded authority never travels. The
 migrated source's pin is inert, since the moved copy holds it: no removal keeps
-the source for it, so `koto session cleanup` in the old workspace and
-`koto session prune --migrated-from` both remove the source, and
-`koto session unpin` refuses it. A source an older release imported may have
+the source for it, so `koto session cleanup` in the old workspace removes the
+source, and `koto session prune --migrated-from` does once the copy no longer
+keeps it, and `koto session unpin` refuses it. A source an older release imported may have
 lost its pin on the way; check that the moved copy is pinned before removing
 the source.
+
+### Import keeps its source
+
+`koto session import` doesn't retire the session it copies. The source stays
+as a read-only predecessor of the copy, held by the continues relation:
+
+- Before the copy is pushed, the import writes `koto/links/continues/<source>`
+  in the copy, recording the source's name, session id, workspace path and
+  bucket prefix plus the copy's own session id, and a back-reference beside the
+  source. The migration marker comes after the push, so a failed push leaves no
+  marker. A relation the source itself held, naming its own predecessor, isn't
+  carried into the copy.
+- Running the same import again on a copy built without a relation adds it and
+  exits 0. On a copy whose relation names another session it exits 2 with
+  `relation_conflict` and leaves the copy unchanged.
+- In its own workspace the source refuses every command that would change it
+  with `session_migrated` (exit 2), naming the copy and its workspace: `koto next`,
+  `koto context add` and `remove`, `rewind`, `cancel`, `decisions record`,
+  `overrides record`, `session link`, `session rebind`, `resolve`, `update`,
+  `pin` and `unpin`. `koto status`, `koto context get`, `exists` and `list`,
+  `koto decisions list` and `koto overrides list` still exit 0, in their
+  `--workspace` forms too, and answer from the source's last pushed bucket
+  copy. A read changes nothing: the source's objects, the marker and the copy
+  stay byte-identical, and no read record is written.
+- `koto session prune --migrated-from <workspace>` removes the marker and the
+  source only once the relation lets go. While the copy or a later member is
+  alive, pinned or within retention, they are kept with reason `relation` and
+  `relation_keepers`; once none is, `--apply` removes them (reason
+  `released`). A target that's absent, replaced, unverified or unknown keeps the
+  marker as before.
+- `session.cloud.marker_retain_days` and `--source-retired` are still accepted
+  but no longer decide removal. A run that uses either lists it under `ignored`
+  in its JSON and prints `ignored: <name> no longer decides removal` on stderr.
+
+A source an earlier release imported has no relation on its copy, but its
+marker names the copy, so it is kept while the copy runs. So is a source pruned
+from a second host that never pulled the copy.
 
 ### The continues relation in the bucket
 
@@ -319,6 +361,11 @@ session, and their import drops the pin. Under the cloud backend, a pin is an
 object older releases never read, so they don't keep a pinned session there at
 all. Releases before v0.23.0 ignore pins entirely.
 
+The first release that honours the relation `koto session import` leaves is the
+one this guide ships with. Older releases fall short in three ways: their local
+prunes over-keep a chain; under the cloud backend they can delete a predecessor
+whose successor they never pulled; and their import still retires its source.
+
 ## Who writes into a session
 
 Pin and unpin are one named exception to the rule that a koto command writes
@@ -328,6 +375,9 @@ session or host. They write only those two records, with no event in the
 session's log and no clock moved. A successor under the cloud backend is
 another: it writes its back-reference beside its predecessor, which may sit in
 another workspace's prefix, and takes it back when it is removed or renamed.
+`koto session import` is a third: it writes the copy's relation and a
+back-reference beside the source, which may sit in another workspace's prefix,
+and the migration marker after the push.
 These are tracked with koto's other cross-session writers in
 [koto#445](https://github.com/tsukumogami/koto/issues/445).
 

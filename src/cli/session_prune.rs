@@ -114,11 +114,12 @@ pub struct PruneArgs<'a> {
     pub confirm_short_retention: bool,
     /// Marker mode: the source workspace whose migration markers to judge.
     pub migrated_from: Option<&'a str>,
-    /// Marker mode: the source host is gone, so a present target's marker is
-    /// removable inside the retention bound too.
+    /// Marker mode: `--source-retired`, accepted but no longer deciding
+    /// removal; a run that passes it reports it `ignored`.
     pub source_retired: bool,
-    /// Marker mode: `session.cloud.marker_retain_days`.
-    pub marker_retain_days: u64,
+    /// Marker mode: `session.cloud.marker_retain_days` when a config file
+    /// sets it, which no longer decides removal either; `None` when unset.
+    pub marker_retain_days: Option<u64>,
 }
 
 /// One session the prune would remove, as the preview prints it and the

@@ -7,11 +7,14 @@
 //! (`koto/anchor/authority`), a close record
 //! (`koto/anchor-close`), every `koto/links/closes/*` link, any
 //! `koto/imported-from` the source carried, and any key whose first
-//! component spells `koto` in another case. Once the kept keys are staged
+//! component spells `koto` in another case, and every continues relation
+//! (`koto/links/continues/*`) the source held: the copy continues the
+//! source, not the source's own predecessor. Once the kept keys are staged
 //! and checked against the manifest, [`Settlement::apply`] validates every
 //! link body (a malformed one is dropped and reported on stderr), settles
-//! the copy's `koto/links/held-by/*` links, and writes `koto/imported-from`,
-//! updating the manifest for every key it changes.
+//! the copy's `koto/links/held-by/*` links, writes `koto/imported-from`, and
+//! writes the copy's one relation, `koto/links/continues/<source>`
+//! ([`ImportRelation`]), updating the manifest for every key it changes.
 //!
 //! A held-by link is settled by the anchor it names and the importing
 //! command's `KOTO_ANCHOR`:
@@ -41,15 +44,16 @@ use crate::session::context::{KeyMeta, Manifest};
 use crate::session::context_log::WRITER_KOTO;
 use crate::session::hierarchy::{Graph, Judge, RetentionSettings};
 use crate::session::links::{
-    is_reserved_key, link_key, validate_peer, LinkBody, LinkHints, LinkKind, LINKS_PREFIX,
+    is_reserved_key, link_key, validate_peer, LinkBody, LinkHints, LinkKind, Prefix, LINKS_PREFIX,
     MAX_LINK_BODY_BYTES, RESERVED_PREFIX,
 };
 
 pub use crate::session::hierarchy::IMPORTED_FROM_KEY;
 
 /// Whether an import leaves `key` behind whatever the source holds: the
-/// reserved keys that describe the source's own host or agent session, and
-/// the record of an earlier import, which this import writes afresh.
+/// reserved keys that describe the source's own host or agent session, the
+/// record of an earlier import, which this import writes afresh, and any
+/// continues relation, since the copy's only relation names the source.
 pub fn dropped_on_import(key: &str) -> bool {
     key == OBSERVED_KEY
         // The authority an agent session's start handed its anchor belongs
@@ -58,6 +62,9 @@ pub fn dropped_on_import(key: &str) -> bool {
         || key == CLOSE_RECORD_KEY
         || key == IMPORTED_FROM_KEY
         || key.starts_with(&link_key(LinkKind::Closes, ""))
+        // The source's own relation names the source's predecessor; the
+        // copy continues the source instead (R5).
+        || key.starts_with(&link_key(LinkKind::Continues, ""))
         // A reserved component in another case is never one koto wrote; on
         // a case-insensitive filesystem it would land in koto's own area.
         || (is_reserved_key(key) && !key.starts_with(RESERVED_PREFIX))
@@ -137,6 +144,51 @@ pub struct Settlement<'a> {
     /// The source session's name and header id, for `koto/imported-from`.
     pub from_session: &'a str,
     pub from_session_id: &'a str,
+    /// The relation the copy holds, naming the source. `None` writes none.
+    pub relation: Option<ImportRelation<'a>>,
+}
+
+/// The continues relation an import writes in its copy, naming the source
+/// with the fields `--continues` records (R2): the source's name, session
+/// id, workspace path and bucket prefix, and the copy's own session id.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportRelation<'a> {
+    pub source: &'a str,
+    /// The source's header id; empty when its log records none.
+    pub source_session_id: &'a str,
+    /// The source workspace's path, as the import resolved `--from`.
+    pub source_workspace: &'a str,
+    /// The source workspace's bucket prefix.
+    pub source_prefix: &'a str,
+    /// The copy's own session id.
+    pub holder_session_id: &'a str,
+}
+
+impl ImportRelation<'_> {
+    /// `koto/links/continues/<source>`.
+    pub fn key(&self) -> String {
+        link_key(LinkKind::Continues, self.source)
+    }
+
+    /// The relation's body, as `koto session link --continues` writes one
+    /// under the cloud backend.
+    pub fn body(&self) -> Vec<u8> {
+        let body = LinkBody {
+            v: crate::session::links::LINK_BODY_VERSION,
+            session: self.source.to_string(),
+            session_id: Some(self.source_session_id.to_string()).filter(|id| !id.is_empty()),
+            workspace: Some(self.source_workspace.to_string()),
+            prefix: if crate::session::continues_bucket::is_workspace_prefix(self.source_prefix) {
+                Prefix::Value(self.source_prefix.to_string())
+            } else {
+                Prefix::Null
+            },
+            holder_session_id: Some(self.holder_session_id.to_string()).filter(|id| !id.is_empty()),
+            at: crate::engine::types::now_iso8601(),
+            was: None,
+        };
+        serde_json::to_vec(&body).expect("LinkBody serialize is infallible")
+    }
 }
 
 /// The local anchors among `names` that are open and not migrated, and
@@ -216,8 +268,9 @@ fn remove_key(ctx_dir: &Path, manifest: &mut Manifest, key: &str) -> std::io::Re
 
 impl Settlement<'_> {
     /// Settle the staged copy whose context is in `ctx_dir`, listed by
-    /// `manifest`: validate every link body, settle the held-by links and
-    /// write `koto/imported-from`, changing `manifest` to match. Each
+    /// `manifest`: validate every link body, settle the held-by links,
+    /// write `koto/imported-from` and the copy's relation, changing
+    /// `manifest` to match. Each
     /// malformed link is reported on stderr. Fails only on a write to the
     /// staging directory.
     pub fn apply(&self, ctx_dir: &Path, manifest: &mut Manifest) -> std::io::Result<Settled> {
@@ -304,6 +357,12 @@ impl Settlement<'_> {
         });
         let content = serde_json::to_vec(&record).expect("JSON serialize is infallible");
         write_key(ctx_dir, manifest, IMPORTED_FROM_KEY, &content)?;
+
+        // The copy's one relation names the source. Every relation the
+        // source held was left behind with the other dropped keys.
+        if let Some(relation) = &self.relation {
+            write_key(ctx_dir, manifest, &relation.key(), &relation.body())?;
+        }
         Ok(settled)
     }
 }
