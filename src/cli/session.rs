@@ -589,6 +589,13 @@ pub(crate) struct ContinuesTarget {
     prefix: Option<String>,
 }
 
+impl ContinuesTarget {
+    /// The predecessor's workspace prefix, under the cloud backend.
+    pub(crate) fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+}
+
 /// Why `--continues` was refused: the message and the exit code (2 for
 /// what the caller named, 3 for a store that couldn't be read or written).
 pub(crate) struct ContinuesError {
