@@ -235,6 +235,11 @@ pub fn try_push_context_key(
                 crate::session::cloud::without_url_userinfo(&e.to_string())
             )
         })?;
+    crate::session::sync_stamp::note_synced(
+        &local.session_dir(session),
+        prefix,
+        [(key, crate::session::sync_stamp::sha256_hex(&data).as_str())],
+    );
     Ok(())
 }
 
@@ -246,9 +251,45 @@ pub enum Pull {
     Unchanged,
     /// The bucket's copy was written over the local one.
     Wrote,
-    /// The copies differ and the local one was written later, so it stands
-    /// and the bucket lacks it (koto#520).
+    /// The copies differ and the local one is the newer
+    /// ([`newer_locally`]), so it stands and the bucket lacks it (koto#520).
     LocalNewer,
+    /// The home's manifest doesn't list the key, and this host never synced
+    /// the copy it holds with the home, so the copy stands and the home
+    /// lacks it (koto#524).
+    LocalOnly,
+}
+
+/// What the session's listing said of the home's manifest, for a pull whose
+/// fetch of it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// The listing showed a manifest.
+    Shows,
+    /// The listing worked and showed no manifest: the home lists no key.
+    Lacks,
+    /// No listing to go by (the bucket unreachable, say).
+    Unknown,
+}
+
+/// Whether this host's copy of a key, `local`, is the newer of two that
+/// differ, against the home's copy `remote`. `synced` is the hash this host
+/// last knew the home to hold ([`crate::session::sync_stamp::SyncedKeys`]).
+/// A local copy still at it hasn't changed here, so the home's moved on; a
+/// home still at it hasn't changed there, so this host's copy moved on.
+/// Neither depends on the hosts' clocks. Only when both moved, or this host
+/// never synced the key with this home, are the copies' stamps compared
+/// ([`written_later`]).
+pub(crate) fn newer_locally(
+    local: &crate::session::context::KeyMeta,
+    remote: &crate::session::context::KeyMeta,
+    synced: Option<&str>,
+) -> bool {
+    match synced {
+        Some(hash) if hash == local.hash => false,
+        Some(hash) if hash == remote.hash => true,
+        _ => written_later(&local.created_at, &remote.created_at),
+    }
 }
 
 /// Whether `local` was written later than `remote`, both timestamps in the
@@ -258,7 +299,8 @@ pub enum Pull {
 ///
 /// The stamps come from the clocks of the hosts that wrote them (a pull
 /// stamps the time it pulled), so two writes made on different hosts within
-/// their clocks' skew can sort the wrong way round.
+/// their clocks' skew can sort the wrong way round: [`newer_locally`] asks
+/// this only when the synced hashes can't say.
 fn written_later(local: &str, remote: &str) -> bool {
     match (sortable_timestamp(local), sortable_timestamp(remote)) {
         (Some(local), Some(remote)) => local > remote,
@@ -293,11 +335,17 @@ fn sortable_timestamp(ts: &str) -> Option<String> {
 ///
 /// Compares the hash in the remote manifest against the local manifest.
 /// If they differ (or the key is missing locally), downloads the content
-/// and writes it locally with writer `sync` -- unless the local copy was
-/// written later than the remote one, which then stands untouched
+/// and writes it locally with writer `sync` -- unless the local copy is the
+/// newer ([`newer_locally`]), which then stands untouched
 /// ([`Pull::LocalNewer`]). A session whose home moved can find an older
 /// copy under its new home than the one it holds (koto#520); a write from
-/// another host after this one's still comes down.
+/// another host after this one's still comes down, whatever either host's
+/// clock says (koto#524). A key the home's manifest doesn't list stands
+/// too, and is [`Pull::LocalOnly`] unless this host synced that very copy
+/// with the home, which then lacks it because it was removed there since.
+///
+/// Every outcome that finds the copies equal, or pulls, records the home's
+/// hash as synced.
 ///
 /// Returns [`Pull::Wrote`] when it wrote the local store, so the caller can
 /// log the write (a `context_added` with `writer: "sync"`).
@@ -308,11 +356,12 @@ fn sortable_timestamp(ts: &str) -> Option<String> {
 /// Once the bucket has said its copy of the key may differ from this host's,
 /// a step that fails is an error, never a fall-back to the local copy, which
 /// may be stale (koto#457): a manifest the session's listing showed
-/// (`manifest_listed`) that can't be fetched, a key whose hash differs and
+/// ([`Listing::Shows`]) that can't be fetched, a key whose hash differs and
 /// whose object can't be fetched (a 404 from an object the manifest names
 /// but the bucket lacks, say), or downloaded bytes that can't be written. A
-/// manifest the listing didn't show, or no listing at all (an unreachable
-/// bucket), leaves the local copy standing, [`Pull::Unchanged`], as before.
+/// listing that worked and showed no manifest ([`Listing::Lacks`]) is a
+/// home that lists no key; no listing at all (an unreachable bucket) leaves
+/// the local copy standing, [`Pull::Unchanged`], as before.
 #[allow(clippy::too_many_arguments)]
 pub fn pull_context_if_newer(
     local: &LocalBackend,
@@ -321,33 +370,55 @@ pub fn pull_context_if_newer(
     session: &str,
     key: &str,
     cache: &ManifestCache,
-    manifest_listed: bool,
+    listing: Listing,
     before_download: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<Pull> {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
-        None if manifest_listed => anyhow::bail!(
+        None if listing == Listing::Shows => anyhow::bail!(
             "cloud sync: the bucket lists a context manifest for session '{}' but fetching it \
              failed, so the local copy of '{}' may be stale; run the command again",
             session,
             key
         ),
+        None if listing == Listing::Lacks => Manifest::default(),
         None => return Ok(Pull::Unchanged),
     };
 
-    let remote_meta = match remote_manifest.keys.get(key) {
-        Some(m) => m,
-        None => return Ok(Pull::Unchanged), // Key doesn't exist remotely.
+    let dir = local.session_dir(session);
+    let synced = crate::session::sync_stamp::SyncedKeys::load(&dir, prefix);
+    let local_manifest = local.read_manifest(session).unwrap_or_default();
+    let Some(remote_meta) = remote_manifest.keys.get(key) else {
+        // The home lists no such key. A copy this host synced with it was
+        // removed there since; any other copy the home never had, unless
+        // it is one a push leaves out.
+        let lacking = local_manifest.keys.get(key).is_some_and(|meta| {
+            synced.hash(key) != Some(meta.hash.as_str())
+                && !crate::session::context::is_pin_record_key(key)
+                && dir.join("ctx").join(key).is_file()
+                && !withheld_keys(local, prefix, session)
+                    .iter()
+                    .any(|w| w == key)
+        });
+        return Ok(if lacking {
+            Pull::LocalOnly
+        } else {
+            Pull::Unchanged
+        });
     };
 
     // Check if local hash matches remote hash.
-    let local_manifest = local.read_manifest(session).unwrap_or_default();
     if let Some(local_meta) = local_manifest.keys.get(key) {
         if local_meta.hash == remote_meta.hash {
+            crate::session::sync_stamp::note_synced(
+                &dir,
+                prefix,
+                [(key, local_meta.hash.as_str())],
+            );
             return Ok(Pull::Unchanged); // Hashes match, no download needed.
         }
-        if written_later(&local_meta.created_at, &remote_meta.created_at) {
+        if newer_locally(local_meta, remote_meta, synced.hash(key)) {
             return Ok(Pull::LocalNewer);
         }
     }
@@ -391,6 +462,14 @@ pub fn pull_context_if_newer(
                 e
             )
         })?;
+    crate::session::sync_stamp::note_synced(
+        &dir,
+        prefix,
+        [(
+            key,
+            crate::session::sync_stamp::sha256_hex(response.bytes()).as_str(),
+        )],
+    );
     Ok(Pull::Wrote)
 }
 
@@ -556,6 +635,27 @@ mod tests {
             "2026-10-28 17:49:00.000Z",
             "2026-01-01T00:00:00.000Z"
         ));
+    }
+
+    /// The synced hash says which copy moved whatever the stamps say; the
+    /// stamps decide only when it can't.
+    #[test]
+    fn newer_locally_asks_the_synced_hash_before_the_clocks() {
+        let meta = |hash: &str, created_at: &str| crate::session::context::KeyMeta {
+            created_at: created_at.to_string(),
+            size: 1,
+            hash: hash.to_string(),
+            writer: None,
+        };
+        // This host's clock runs ahead: its stamp is the later one.
+        let local = meta("mine", "2999-01-01T00:00:00.000Z");
+        let remote = meta("theirs", "2030-01-01T00:00:00.000Z");
+        assert!(!newer_locally(&local, &remote, Some("mine")));
+        assert!(newer_locally(&remote, &local, Some("mine")));
+        // Both moved, or never synced here: the stamps.
+        assert!(newer_locally(&local, &remote, Some("other")));
+        assert!(newer_locally(&local, &remote, None));
+        assert!(!newer_locally(&remote, &local, None));
     }
 
     #[test]

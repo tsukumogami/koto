@@ -3051,6 +3051,16 @@ impl CloudBackend {
                 sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
             {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
+                crate::session::sync_stamp::note_synced(
+                    &self.local.session_dir(id),
+                    &self.home(id),
+                    present.iter().filter_map(|key| {
+                        manifest
+                            .keys
+                            .get(key.as_str())
+                            .map(|meta| (key.as_str(), meta.hash.as_str()))
+                    }),
+                );
             }
         }
         self.carry_pin_records(id);
@@ -4149,20 +4159,39 @@ impl CloudBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let KeyPush::Failed(e) = self.store_key(session, key, Some((content, writer)))? {
+            eprintln!("warning: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// [`CloudBackend::add_as`], saying how the key went up. With `write`
+    /// the key is written locally first; without it the copy this host
+    /// holds goes up as it is, as a read's push of a kept copy does. A
+    /// failed upload is [`KeyPush::Failed`], since the write stands; a
+    /// refusal (a version conflict, a fence) is the error.
+    fn store_key(
+        &self,
+        session: &str,
+        key: &str,
+        write: Option<(&[u8], Option<&str>)>,
+    ) -> anyhow::Result<KeyPush> {
         self.refuse_if_read_only(&format!("storing '{}' in '{}'", key, session))?;
-        if let Some(writer) = writer {
+        if let Some((_, Some(writer))) = write {
             crate::session::links::check_writer_key(key, writer)?;
         }
         self.check_not_migrated_to_write(session)?;
-        let write = || match writer {
-            Some(w) => self.local.add_with_writer(session, key, content, w),
-            None => self.local.add(session, key, content),
+        let write = || match write {
+            Some((content, Some(w))) => self.local.add_with_writer(session, key, content, w),
+            Some((content, None)) => self.local.add(session, key, content),
+            None => Ok(()),
         };
         // The command pulled the session before this write, so a fence
         // another host pushed is in the local copy by now.
         self.refuse_if_superseded(session)?;
         if is_host_local_key(key) {
-            return write();
+            write()?;
+            return Ok(KeyPush::Withheld);
         }
         self.check_fence(session)?;
 
@@ -4178,7 +4207,8 @@ impl CloudBackend {
                         key: key.to_string(),
                     },
                 )?;
-                return write();
+                write()?;
+                return Ok(KeyPush::Batched);
             }
         }
         self.settle_batch(session)?;
@@ -4188,63 +4218,222 @@ impl CloudBackend {
         // S3 connectivity failures are non-fatal (version check is skipped).
         self.version_guard(session)?;
 
-        sync::push_context_key(
-            &self.local,
-            &self.bucket,
-            &self.home(session),
-            session,
-            key,
-            &self.manifest_cache,
-        );
+        let home = self.home(session);
+        let withheld = sync::withheld_keys(&self.local, &home, session);
+        let pushed = if is_pin_record_key(key) || withheld.iter().any(|w| w == key) {
+            KeyPush::Withheld
+        } else {
+            match sync::try_push_context_key(
+                &self.local,
+                &self.bucket,
+                &home,
+                session,
+                key,
+                &withheld,
+            ) {
+                Ok(()) => {
+                    self.manifest_cache.invalidate();
+                    KeyPush::Pushed
+                }
+                Err(e) => KeyPush::Failed(e),
+            }
+        };
         self.forget_remote_manifest(session);
 
         // Update last_sync_base after successful push.
         self.finalize_version_after_push(session);
 
-        Ok(())
+        Ok(pushed)
     }
 
-    /// Put `key` in the session's home, whose copy is older than the local
-    /// one a read kept ([`sync::Pull::LocalNewer`]). A session that takes its
-    /// home from its anchor finds an older copy under the new directory's
-    /// prefix after a rebind (koto#520). The key goes up through the write
-    /// path, as written by the writer the local manifest names, so the
-    /// home's object and manifest name the copy this host holds; a version
-    /// conflict is the write's error, so the read reports it rather than
-    /// answering from either copy. Either way the difference is reported on
-    /// stderr, never resolved silently. A backend that never writes keeps
-    /// the local copy and says the bucket's is older, and so does a read of
-    /// a session its successor fenced, since the push would be a write the
-    /// fence refuses and reads of a fenced session keep working.
-    fn push_kept_key(&self, session: &str, key: &str) -> anyhow::Result<()> {
+    /// Put `key` in the session's home, which holds an older copy than the
+    /// one a read kept ([`sync::Pull::LocalNewer`]), or none
+    /// ([`sync::Pull::LocalOnly`], `lacking`). A session that takes its home
+    /// from its anchor finds an older copy under the new directory's prefix
+    /// after a rebind (koto#520). The copy this host holds goes up through
+    /// the write path as it is, so the home's object and manifest name it;
+    /// a version conflict is the write's error, so the read reports it
+    /// rather than answering from either copy. The difference is reported on
+    /// stderr once the push has run, saying whether it went up (koto#524),
+    /// never resolved silently. A backend that never writes keeps the local
+    /// copy and says so, and so does a read of a session its successor
+    /// fenced, since the push would be a write the fence refuses and reads
+    /// of a fenced session keep working.
+    fn push_kept_key(&self, session: &str, key: &str, lacking: bool) -> anyhow::Result<()> {
+        let kept = format!(
+            "kept this host's copy of context key '{}' in session '{}': {}",
+            key,
+            session,
+            if lacking {
+                "the session's home lacks it"
+            } else {
+                "the bucket's copy under the session's home is older"
+            }
+        );
         if self.probes.read_only {
-            eprintln!(
-                "warning: kept this host's copy of context key '{}' in session '{}': the \
-                 bucket's copy is older, and this command never writes",
-                key, session
-            );
+            eprintln!("warning: {kept}, and this command never writes");
             return Ok(());
         }
         if let Err(e) = self.refuse_if_superseded(session) {
             if crate::engine::persistence::session_superseded(&e).is_none() {
                 return Err(e);
             }
-            eprintln!(
-                "warning: kept this host's copy of context key '{}' in session '{}': the \
-                 bucket's copy is older, and the session is superseded, so nothing is pushed",
-                key, session
-            );
+            eprintln!("warning: {kept}, and the session is superseded, so nothing is pushed");
             return Ok(());
         }
-        eprintln!(
-            "warning: kept this host's copy of context key '{}' in session '{}': the bucket's \
-             copy under the session's home is older, so this host's copy is pushed over it",
-            key, session
-        );
-        let writer = self.local.meta(session, key).and_then(|meta| meta.writer);
-        let content = self.local.get(session, key)?;
-        self.add_as(session, key, &content, writer.as_deref())
+        match self.store_key(session, key, None) {
+            Ok(KeyPush::Pushed) => eprintln!("warning: {kept}; pushed this host's copy there"),
+            Ok(KeyPush::Batched) => eprintln!(
+                "warning: {kept}; this host's copy goes up with the session's pending writes"
+            ),
+            Ok(KeyPush::Withheld) => {
+                eprintln!("warning: {kept}; this host's copy stays out of the bucket for now")
+            }
+            Ok(KeyPush::Failed(e)) => {
+                eprintln!("warning: {kept}; pushing this host's copy failed: {e:#}")
+            }
+            Err(e) => {
+                eprintln!("warning: {kept}; pushing this host's copy failed: {e:#}");
+                return Err(e);
+            }
+        }
+        Ok(())
     }
+
+    /// Bring `id`'s context to its home after `koto session rebind` moved
+    /// the home from `before` (`None` when the session had none that could
+    /// be located) (koto#524). A session from before koto recorded its
+    /// prefix takes its home from its anchor, so the rebind moves it, and
+    /// the new home may hold an older copy of a key or none; the rebind's
+    /// own push carries only the state file. Every key this host holds that
+    /// the new home lacks, or holds a copy of that is older by the order a
+    /// read uses ([`sync::newer_locally`]), goes up, and the home's manifest
+    /// names it; a key the home holds newer keeps its entry, for a read to
+    /// pull. A key that couldn't be brought is named on stderr, and the
+    /// rebind, already done, stands.
+    pub fn carry_context_after_rebind(&self, id: &str, before: Option<&str>) {
+        let home = self.home(id);
+        if self.probes.read_only || before == Some(home.as_str()) {
+            return;
+        }
+        let missed = |keys: &[String], why: &str| {
+            for key in keys {
+                eprintln!(
+                    "warning: context key '{}' of session '{}' did not reach its new home {}: {}",
+                    key, id, home, why
+                );
+            }
+        };
+        let local = match self.local.read_manifest(id) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                eprintln!(
+                    "warning: the context of session '{}' did not reach its new home {}: reading \
+                     the local manifest failed: {:#}",
+                    id, home, e
+                );
+                return;
+            }
+        };
+        let withheld = self.withheld_keys(id);
+        let mut held: Vec<String> = local
+            .keys
+            .keys()
+            .filter(|key| {
+                !is_host_local_key(key) && !is_pin_record_key(key) && !withheld.contains(key)
+            })
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let manifest_key = format!("{}/{}/ctx/manifest.json", home, id);
+        let mut remote: crate::session::context::Manifest =
+            match self.fetch_object(&manifest_key).and_then(|bytes| {
+                bytes.map_or(Ok(Default::default()), |bytes| {
+                    serde_json::from_slice(&bytes).context("parsing the new home's manifest")
+                })
+            }) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    missed(&held, &format!("reading its manifest there failed: {e:#}"));
+                    return;
+                }
+            };
+        remote.drop_host_local();
+        remote.drop_pin_records();
+        let dir = self.local.session_dir(id);
+        let synced = crate::session::sync_stamp::SyncedKeys::load(&dir, &home);
+        held.retain(|key| {
+            let meta = &local.keys[key];
+            remote.keys.get(key).is_none_or(|theirs| {
+                theirs.hash != meta.hash && sync::newer_locally(meta, theirs, synced.hash(key))
+            })
+        });
+        if held.is_empty() {
+            return;
+        }
+
+        let ctx_dir = dir.join("ctx");
+        let failed: Mutex<Vec<(String, String)>> = Mutex::default();
+        let _ = in_parallel(&held, |key| {
+            let sent = std::fs::read(ctx_dir.join(key))
+                .with_context(|| format!("reading context key '{}'", key))
+                .and_then(|data| self.put_object(&format!("{}/{}/ctx/{}", home, id, key), &data));
+            if let Err(e) = sent {
+                failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((key.clone(), format!("{:#}", e)));
+            }
+            Ok(())
+        });
+        let mut failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+        let sent: Vec<String> = held
+            .into_iter()
+            .filter(|key| failed.iter().all(|(k, _)| k != key))
+            .collect();
+        if !sent.is_empty() {
+            for key in &sent {
+                remote.keys.insert(key.clone(), local.keys[key].clone());
+            }
+            let manifest = serde_json::to_vec_pretty(&remote)
+                .context("serializing the new home's manifest")
+                .and_then(|bytes| self.put_object(&manifest_key, &bytes));
+            self.manifest_cache.invalidate();
+            self.forget_remote_manifest(id);
+            match manifest {
+                Ok(()) => crate::session::sync_stamp::note_synced(
+                    &dir,
+                    &home,
+                    sent.iter()
+                        .map(|key| (key.as_str(), local.keys[key].hash.as_str())),
+                ),
+                Err(e) => {
+                    let why = format!("the manifest there wasn't updated: {:#}", e);
+                    failed.extend(sent.into_iter().map(|key| (key, why.clone())));
+                }
+            }
+        }
+        for (key, why) in failed {
+            missed(&[key], &why);
+        }
+    }
+}
+
+/// How a context key this host holds went to the session's home
+/// ([`CloudBackend::store_key`]).
+enum KeyPush {
+    /// The bucket took the key and the manifest.
+    Pushed,
+    /// The key joined the open batch, which the tick or `koto session
+    /// flush` pushes.
+    Batched,
+    /// The key stays out of the bucket: host-local, a pin record, or a
+    /// continues relation not yet confirmed.
+    Withheld,
+    /// The upload failed; the local copy stands.
+    Failed(anyhow::Error),
 }
 
 /// Every method asks [`CloudBackend::check_not_migrated`] first, so a
@@ -4329,14 +4518,20 @@ impl ContextStore for CloudBackend {
         // session's own tick, `append_event` spools it beside the read
         // instead, so only this host's mirror of the key changes.
         self.prime_manifest(session);
-        // Whether the session's listing showed a manifest the priming
-        // couldn't fetch: the pull then fails rather than reading a local
-        // copy the bucket may have moved past (koto#457). The listing is
-        // the one the priming made, so this asks the bucket nothing.
-        let manifest_listed = self.manifest_cache.get(session).is_none()
-            && self
-                .probe(session)
-                .is_ok_and(|probe| probe.manifest_etag.is_some());
+        // What the session's listing said of a manifest the priming couldn't
+        // fetch: one it showed fails the pull rather than reading a local
+        // copy the bucket may have moved past (koto#457), and none at all is
+        // a home that lacks every key (koto#524). The listing is the one the
+        // priming made, so this asks the bucket nothing.
+        let listing = if self.manifest_cache.get(session).is_some() {
+            sync::Listing::Shows
+        } else {
+            match self.probe(session) {
+                Ok(probe) if probe.manifest_etag.is_some() => sync::Listing::Shows,
+                Ok(_) => sync::Listing::Lacks,
+                Err(_) => sync::Listing::Unknown,
+            }
+        };
         let pulled = sync::pull_context_if_newer(
             &self.local,
             &self.bucket,
@@ -4344,7 +4539,7 @@ impl ContextStore for CloudBackend {
             session,
             key,
             &self.manifest_cache,
-            manifest_listed,
+            listing,
             &|| self.check_context_pull(session),
         )?;
         match pulled {
@@ -4361,7 +4556,8 @@ impl ContextStore for CloudBackend {
                     );
                 }
             }
-            sync::Pull::LocalNewer => self.push_kept_key(session, key)?,
+            sync::Pull::LocalNewer => self.push_kept_key(session, key, false)?,
+            sync::Pull::LocalOnly => self.push_kept_key(session, key, true)?,
             sync::Pull::Unchanged => {}
         }
         self.local.get(session, key)
@@ -4406,6 +4602,8 @@ impl ContextStore for CloudBackend {
             return self.local.remove(session, key);
         }
         self.check_fence(session)?;
+        // A copy this host writes again later is one the home never had.
+        crate::session::sync_stamp::forget_synced(&self.local.session_dir(session), key);
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
                 journal.record(
@@ -6908,7 +7106,7 @@ mod tests {
             "sess",
             "scope.md",
             &backend.manifest_cache,
-            false,
+            sync::Listing::Unknown,
             &|| Ok(()),
         )
         .unwrap();
