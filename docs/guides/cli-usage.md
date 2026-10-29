@@ -965,6 +965,7 @@ Without `--apply` nothing is removed. The command prints the finished sessions a
 - `--all` -- No filter: every session is judged. A preview without filters already covers them all; `--all` is what an `--apply` without `--plan` names when no other filter is given.
 - `--apply` -- Remove instead of previewing.
 - `--plan <token>` -- With `--apply`, remove only sessions the preview that printed `<token>` listed.
+- `--source-retired` -- (`--migrated-from` only) Still accepted, but it no longer decides removal: the run reports it under `ignored` and otherwise behaves as it would without it.
 
 Every session is judged by the retention rule over one scan of the store, with one set of [retention settings](#config-keys-reference) and one `now`: the same judgment [`koto session hierarchy`](#session-hierarchy) prints. The filters narrow which sessions are candidates, never which sessions count as members of a hierarchy: a finished session dispatched by a session that is alive in another execution directory is kept, and named, whatever the filters select. A candidate is kept, and listed under `kept` with the first rule that applies, when:
 

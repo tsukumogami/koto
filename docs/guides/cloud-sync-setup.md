@@ -432,7 +432,7 @@ Context keys are compared one at a time when they're read. When this host's copy
 | `session.cloud.bucket` | `KOTO_SESSION_CLOUD_BUCKET` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
 | `session.cloud.region` | `KOTO_SESSION_CLOUD_REGION` | Region | (none) | Yes |
 | `session.cloud.path_style` | `KOTO_SESSION_CLOUD_PATH_STYLE` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
-| `session.cloud.marker_retain_days` | (none) | No longer decides anything: `koto session prune --migrated-from` accepts it but ignores it, and reports it as `ignored` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
+| `session.cloud.marker_retain_days` | (none) | No longer decides anything: `koto session prune --migrated-from` accepts it but ignores it, and reports it as `ignored` | `30` | No (user only, as before; it decides nothing now) |
 | `session.cloud.check_window_secs` | `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` | Seconds this host's koto processes share one check of a session outside a tick; `0` turns the sharing off. Another host's write can go unseen for up to this long (see [What a read costs](#what-a-read-costs)) | `5` | No (user/env only: a cloned repository's config can't widen it) |
 | `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
