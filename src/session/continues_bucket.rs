@@ -648,9 +648,16 @@ pub fn walk(reads: &dyn BucketReads, memo: &mut Memo, start: &Start<'_>, clock: 
     // again through a relation is a cycle, which keeps. A stale pointer
     // doesn't count as reaching its holder.
     let mut visited: BTreeSet<Pointer> = BTreeSet::from([me.clone()]);
+    // The members reached straight from the judged session. An import's
+    // copy is named twice there, by its pointer and by the source's marker
+    // (or the caller's `extra`): one member, not a cycle.
+    let mut direct: BTreeSet<Pointer> = BTreeSet::new();
     let mut reached: Vec<Reached> = Vec::new();
     let mut stale: BTreeSet<Pointer> = BTreeSet::new();
     while let Some(visit) = queue.pop_front() {
+        if visit.path.is_empty() && direct.contains(&visit.at) {
+            continue;
+        }
         if visited.contains(&visit.at) {
             verdict.unreadable.push(Unreadable {
                 holder: shown(&visit.at.name),
@@ -704,6 +711,9 @@ pub fn walk(reads: &dyn BucketReads, memo: &mut Memo, start: &Start<'_>, clock: 
             }
         };
         visited.insert(visit.at.clone());
+        if visit.path.is_empty() {
+            direct.insert(visit.at.clone());
+        }
         budget.members += 1;
         let id = body
             .as_ref()
