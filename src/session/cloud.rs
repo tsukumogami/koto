@@ -4158,6 +4158,35 @@ impl CloudBackend {
 
         Ok(())
     }
+
+    /// Put `key` in the session's home, whose copy is older than the local
+    /// one a read kept ([`sync::Pull::LocalNewer`]). A session that takes its
+    /// home from its anchor finds an older copy under the new directory's
+    /// prefix after a rebind (koto#520). The key goes up through the write
+    /// path, as written by the writer the local manifest names, so the
+    /// home's object and manifest name the copy this host holds; a version
+    /// conflict is the write's error, so the read reports it rather than
+    /// answering from either copy. Either way the difference is reported on
+    /// stderr, never resolved silently. A backend that never writes keeps
+    /// the local copy and says the bucket's is older.
+    fn push_kept_key(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        if self.probes.read_only {
+            eprintln!(
+                "warning: kept this host's copy of context key '{}' in session '{}': the \
+                 bucket's copy is older, and this command never writes",
+                key, session
+            );
+            return Ok(());
+        }
+        eprintln!(
+            "warning: kept this host's copy of context key '{}' in session '{}': the bucket's \
+             copy under the session's home is older, so this host's copy is pushed over it",
+            key, session
+        );
+        let writer = self.local.meta(session, key).and_then(|meta| meta.writer);
+        let content = self.local.get(session, key)?;
+        self.add_as(session, key, &content, writer.as_deref())
+    }
 }
 
 /// Every method asks [`CloudBackend::check_not_migrated`] first, so a
@@ -4260,18 +4289,22 @@ impl ContextStore for CloudBackend {
             manifest_listed,
             &|| self.check_context_pull(session),
         )?;
-        if pulled {
-            if let Some(meta) = self.local.meta(session, key) {
-                crate::session::context_log::append_to_session_best_effort(
-                    self,
-                    session,
-                    &crate::session::context_log::added_event_from_meta(
-                        key,
-                        &meta,
-                        crate::session::context_log::WRITER_SYNC,
-                    ),
-                );
+        match pulled {
+            sync::Pull::Wrote => {
+                if let Some(meta) = self.local.meta(session, key) {
+                    crate::session::context_log::append_to_session_best_effort(
+                        self,
+                        session,
+                        &crate::session::context_log::added_event_from_meta(
+                            key,
+                            &meta,
+                            crate::session::context_log::WRITER_SYNC,
+                        ),
+                    );
+                }
             }
+            sync::Pull::LocalNewer => self.push_kept_key(session, key)?,
+            sync::Pull::Unchanged => {}
         }
         self.local.get(session, key)
     }
@@ -6817,7 +6850,7 @@ mod tests {
             &|| Ok(()),
         )
         .unwrap();
-        assert!(!pulled);
+        assert_eq!(pulled, sync::Pull::Unchanged);
         let data = backend.local.get("sess", "scope.md").unwrap();
         assert_eq!(data, b"local");
     }
