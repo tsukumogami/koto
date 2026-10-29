@@ -336,6 +336,10 @@ struct Probes {
     /// pull rewrites the stamp to the located prefix, which changes the
     /// candidates but not where the copy is.
     located: Mutex<HashMap<String, Result<Home, Unlocated>>>,
+    /// The session whose writes `koto init --supersede`'s carry holds for
+    /// one push ([`CloudBackend::defer_writes_to`]). Kept here, in the box,
+    /// for the same reason.
+    deferred_to: Mutex<Option<String>>,
 }
 
 impl CloudBackend {
@@ -391,6 +395,7 @@ impl CloudBackend {
                 walk: Mutex::default(),
                 homes: Mutex::default(),
                 located: Mutex::default(),
+                deferred_to: Mutex::default(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -1271,8 +1276,13 @@ impl CloudBackend {
     fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
         self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
-        let refused =
-            |remote: &[u8]| state_log::conflict(id, &key, "the push was refused", data, remote);
+        // A copy the session's successor fenced refuses the push as
+        // `session_superseded`, not as a conflict to resolve.
+        let refused = |remote: &[u8]| {
+            supersede::superseded_refusal(id, data, remote).unwrap_or_else(|| {
+                state_log::conflict(id, &key, "the push was refused", data, remote)
+            })
+        };
         let stamped = self.stamp(id).and_then(|s| s.state_etag);
         let mut sent = self.put_state_if(&key, data, stamped.as_deref());
         if sent
@@ -2755,7 +2765,10 @@ impl CloudBackend {
     /// it ([`reentrancy::runs_inside_tick_of`]), or for `koto session flush`
     /// to close the write window it runs in ([`batch::in_window_of`]).
     fn defers(&self, id: &str) -> bool {
-        !self.probes.read_only && (reentrancy::runs_inside_tick_of(id) || batch::in_window_of(id))
+        !self.probes.read_only
+            && (reentrancy::runs_inside_tick_of(id)
+                || batch::in_window_of(id)
+                || self.defers_by_guard(id))
     }
 
     /// Whether this process is `id`'s own tick or a command it runs: the
@@ -2793,6 +2806,7 @@ impl CloudBackend {
     fn push_state_after_write(&self, id: &str) -> anyhow::Result<()> {
         match self.strict_push_state(id) {
             Err(e) if e.to_string().starts_with("session conflict:") => Err(e),
+            Err(e) if crate::engine::persistence::session_superseded(&e).is_some() => Err(e),
             Err(e) if is_hard_sync_error(&e) => {
                 eprintln!("error: cloud sync: {:#}", e);
                 Ok(())
@@ -4144,6 +4158,9 @@ impl CloudBackend {
             Some(w) => self.local.add_with_writer(session, key, content, w),
             None => self.local.add(session, key, content),
         };
+        // The command pulled the session before this write, so a fence
+        // another host pushed is in the local copy by now.
+        self.refuse_if_superseded(session)?;
         if is_host_local_key(key) {
             return write();
         }
@@ -4196,12 +4213,25 @@ impl CloudBackend {
     /// conflict is the write's error, so the read reports it rather than
     /// answering from either copy. Either way the difference is reported on
     /// stderr, never resolved silently. A backend that never writes keeps
-    /// the local copy and says the bucket's is older.
+    /// the local copy and says the bucket's is older, and so does a read of
+    /// a session its successor fenced, since the push would be a write the
+    /// fence refuses and reads of a fenced session keep working.
     fn push_kept_key(&self, session: &str, key: &str) -> anyhow::Result<()> {
         if self.probes.read_only {
             eprintln!(
                 "warning: kept this host's copy of context key '{}' in session '{}': the \
                  bucket's copy is older, and this command never writes",
+                key, session
+            );
+            return Ok(());
+        }
+        if let Err(e) = self.refuse_if_superseded(session) {
+            if crate::engine::persistence::session_superseded(&e).is_none() {
+                return Err(e);
+            }
+            eprintln!(
+                "warning: kept this host's copy of context key '{}' in session '{}': the \
+                 bucket's copy is older, and the session is superseded, so nothing is pushed",
                 key, session
             );
             return Ok(());
@@ -4905,6 +4935,10 @@ pub mod workspace_read;
 
 #[path = "cloud_continues.rs"]
 mod continues;
+
+#[path = "cloud_supersede.rs"]
+mod supersede;
+pub(crate) use supersede::{check_fence_names, CloudFence, PulledState};
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
