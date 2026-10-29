@@ -452,8 +452,8 @@ fn error_code(out: &std::process::Output) -> String {
     v["error"]["code"].as_str().unwrap().to_string()
 }
 
-/// One protected session per local rule, each named after the rule, and four
-/// sessions nothing protects. Returns the protected names with their rule.
+/// One protected session per local rule, each named after the rule, and the
+/// sessions nothing protects ([`FREE`]). Returns the protected names with their rule.
 fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
     // a: running. (An unreadable session has a test of its own: one whose
     // header can't be read keeps every finished session.)
@@ -493,16 +493,15 @@ fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
     )
     .unwrap();
 
-    // f: a coordinator's session.
-    env.done("coordinate-f");
-
-    // Two rules at once: a coordinator's session that also references a
-    // running one reports the first, c.
+    // A coordinator's session that references a running one is kept by
+    // that reference, as any session is.
     env.done("coordinate-c");
     env.set_chain_parent("coordinate-c", "c-chain-target");
 
-    // Nothing protects these: a success, a failure, a cancel, and a session
-    // bound to a request that doesn't exist.
+    // Nothing protects these: a coordinator's session, whose name keeps
+    // nothing, a success, a failure, a cancel, and a session bound to a
+    // request that doesn't exist.
+    env.done("coordinate-f");
     env.done("free-done");
     env.init("free-failed");
     env.finish("free-failed", "fail");
@@ -530,12 +529,12 @@ fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
         ("d-malformed", "h"),
         ("e-waiting", "e"),
         ("e-unreadable", "e"),
-        ("coordinate-f", "f"),
         ("coordinate-c", "h"),
     ])
 }
 
-const FREE: [&str; 4] = [
+const FREE: [&str; 5] = [
+    "coordinate-f",
     "free-cancelled",
     "free-done",
     "free-failed",
@@ -588,14 +587,14 @@ fn each_rule_keeps_its_session_and_the_preview_names_it() {
         entry["detail"],
         "kept: alive in its hierarchy: b-child-running (koto_session)"
     );
-    // Rule f's doesn't: its hierarchy is released.
-    let f = preview["kept"]
+    // Rule e's doesn't: its hierarchy is released.
+    let e = preview["kept"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|k| k["name"] == "coordinate-f")
+        .find(|k| k["name"] == "e-waiting")
         .unwrap();
-    assert!(f.get("hierarchy").is_none());
+    assert!(e.get("hierarchy").is_none());
 
     // A removable row carries the listing's fields.
     let row = preview["remove"]
