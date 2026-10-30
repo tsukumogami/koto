@@ -29,6 +29,7 @@ rationale: |
   decisions live in the session, the one-writer rule, and tool independence; leaving the run
   journal to the event-sink work keeps telemetry receiving exactly what it receives today.
 upstream: docs/prds/PRD-decision-record.md
+user_visible_surface: true
 decision_provenance: inline-resolved
 ---
 
@@ -196,6 +197,8 @@ descending, so decision files cost the scan nothing and carry no edges. Import c
 verbatim, carries the bucket objects the way it carries pins, writes them create-only at the
 destination, and accumulates every earlier source session id in `koto/imported-from` instead of
 naming only the immediate source, so reversals aimed at a session's pre-import id still find it.
+Import rebuilds that key itself from the source's header and the source's own validated history,
+and discards any copy an archive carries.
 
 The per-tick read runs in `handle_next` before gates are evaluated, through a new pure read path
 that never calls `ContextStore::get` or `read_events` on another session and writes nothing to any
@@ -204,13 +207,30 @@ mirror, spool, manifest or bucket:
 1. **Skip** when the workflow is terminal or the session's own two areas hold nothing. If its own
    areas can't be listed, it doesn't count as empty.
 2. **Aim ids** are the session's header id plus every id in `koto/imported-from`.
-3. **Walk the whole chain**, cycle-guarded, in R12's order, reading `dispatched-by` and `held-by`
-   by `read_dir`. A session with no directory and no bucket object ends the chain `incomplete`; any
-   other failure blocks naming that session.
+3. **Walk the whole chain**, starting at the session itself, cycle-guarded, in R12's order, reading
+   `dispatched-by` and `held-by` by `read_dir`. A peer whose source carries a migration marker
+   resolves to the session it moved to. A session with no directory and no bucket object ends the
+   chain `incomplete`; any other failure blocks naming that session. The walk stops at 64 sessions
+   and blocks as unreadable beyond that, so a hostile link chain can't run a tick past its time
+   limit.
 4. **List `koto/aimed/<aim-id>/`** in each chain session and read only what is found.
 5. **Decide** with R17's standing, R19's race, R18 and R22's clearing rules; a decision that reads
    `reversed` and isn't cleared becomes a reserved synthetic blocking condition on the
    `__action__` precedent, its name refused at template compile time.
+
+A rewind clears a block when the deciding session's own log holds a `rewound` event appended after
+the decision, whose target is the decision's recorded state or a state the workflow last entered
+before it. Each decision records the log sequence number it was recorded at, which makes "after"
+and "before" exact even when a workflow loops through the same state: a later visit that records a
+new decision gets a new id, and only that decision's own reversal can block it.
+
+The tick reads only sessions on the chain, so an `asserted` reversal, which exists only because the
+chain is broken and its reverser sits beyond the break, never blocks a live worker; listings find it
+by scanning the store for `koto/aimed/<aim-id>/` and show the decision reversed. A reversal is
+recorded in the reverser's session when that session is on the original's chain, otherwise in
+`KOTO_ANCHOR`'s anchor when that is on the chain, otherwise (the `asserted` case only) in the
+reverser's session; with none of these, `reverse` fails with `reversal_refused` and reason
+`not_on_chain`.
 
 Locally that is about 20 `read_dir` calls on near-empty or missing directories at depth five, well
 under a millisecond, and it doesn't grow with how many decisions any chain session holds. Under the
@@ -314,10 +334,25 @@ event; it is written only by `koto decisions reverse` after its standing check.
 The decider ledger's five writers stop appending. `koto decider report` reads the same facts from
 session logs (`decider_consulted`, `decider_check_answered`, `gate_override_recorded`,
 `directed_transition`, check events) across the store or `--below <session>`, plus the decision
-keys. koto never reads or deletes an existing ledger file; its docs say it is no longer used.
+keys. koto never reads or deletes an existing ledger file; its docs say it is no longer used. Each
+ledger kind maps to what already sits in the session log:
+
+| Ledger kind | Written today at | Read from instead |
+|---|---|---|
+| `consulted` | `src/cli/decider_port.rs` | the `decider_consulted` event |
+| `answered` | evidence submission in `handle_next` | the `evidence_submitted` event paired with its `decider_consulted`, as the run journal's `decider_answered` relay already pairs them |
+| `directed_exit` | the `--to` path | the `directed_transition` event and its `gate-pass` decision |
+| `checked` | `src/cli/check_evaluator.rs` | the `gate_evaluated` event |
+| `check_overridden` | `src/cli/overrides.rs` | the `gate_override_recorded` event and its `gate-pass` decision |
+
+The repair step validates an event's embedded body exactly as a fresh record is validated before
+creating its key.
 
 The run journal is not changed. No record kind or field it or the event sink carries changes, so the
-opted-in telemetry backend receives exactly what it receives today. The requirement that no gate
+opted-in telemetry backend receives exactly what it receives today. The event sink's emit path
+queues a clone of the journal record, which the journal builds from named event fields, so the sink
+inherits that projection; a test asserts each projected record is byte-identical with and without
+the new field, and is rerun when the event-sink work's releases land. The requirement that no gate
 answer sits in a host file is met by the event-sink work: its first release adds
 `run_journal.enabled`, and its second (koto#545) deletes the journal. This feature's host check of
 that clause runs on a koto without the journal; before then only an isolated test home switches the
@@ -545,6 +580,7 @@ A decision body (field names indicative):
   "session": {"name": "work-on-123", "id": "6f1c..."},
   "time": "2026-11-20T17:04:11.512Z",
   "state": "review",
+  "log_seq": 411,
   "kind": "gate-pass",
   "outcome": "passed",
   "subject": {"workflow": "work-on-123", "state": "review", "gate": "panel"},
@@ -601,8 +637,11 @@ winner), plus the existing `session_migrated`.
 
 ### Phase 1: The write-once store
 
-The reserved areas, the create-only writer in both backends, the guard, retention's stop and
-import's carry. Everything else stands on it.
+The reserved areas, the create-only writer in both backends (running the migrated-source refusal
+and per-area entry limits matching the reader's), the guard, the bucket probe, retention's stop and
+import's carry. Everything else stands on it. The retention stop and the import carry change code
+the session retention work owns, so they start only once that work reads Done; the rest of the phase
+doesn't wait.
 
 Deliverables: `src/decisions/store.rs`, changes to `local.rs`, `cloud.rs`, `sync.rs`, `links.rs`,
 `facts.rs`, `import_links.rs`; tests for R5, R6 and R32.
@@ -621,8 +660,9 @@ names.
 
 ### Phase 4: Reversal
 
-`koto decisions reverse`, standing, refusals, the race and the loser's own refusal record, status
-computation in listings.
+`koto decisions reverse`, standing, refusals, the race and the loser's own refusal record, the
+repeat check on each later decision command in the losing session, status computation in listings,
+and the store scan that finds `asserted` reversals for listings.
 
 Deliverables: `standing.rs`, the CLI; tests for R17 to R21.
 
@@ -645,8 +685,10 @@ Deliverables: changes to `overrides.rs`, `decider_answer.rs`, `disputes.rs`, `mo
 
 ### Phase 7: Reporting and import
 
-`koto decisions report` and `import`, the listing benchmark over 1,000 sessions, and packs under
-`koto/packs/` only if the benchmark nears its limit.
+`koto decisions report` and `import`, and the listing benchmark over 1,000 sessions. R36's listing
+clause depends on that benchmark: one file per decision is estimated at one to one and a half
+seconds locally, inside the limit. If it nears five seconds, a create-only pack format under
+`koto/packs/` is designed as a follow-up before R36 is claimed; nothing here defines one yet.
 
 ### Phase 8: Docs
 
@@ -655,8 +697,8 @@ The reference, guides and koto-skills references.
 ### Phase 9: shirabe
 
 `shirabe transition --record-in`, the merge step, the review panel and dismissals, the coordinator's
-decision scripts, and the interim-entry converter (Decision 5). Lands after Phases 2, 4 and 6 have
-shipped in a koto release.
+decision scripts, and the interim-entry converter (Decision 5). Lands after Phases 2, 4, 6 and 7
+have shipped in a koto release; the converter needs Phase 7's import.
 
 ### Phase 10: Acceptance
 
@@ -688,8 +730,13 @@ session name or id disagrees with where it was read, an id in both areas, or an 
 unparseable file makes that session unreadable, which blocks the live decider (R23). A hostile
 session can use that to stall a worker; the design accepts it, because the alternative is to ignore a
 reversal, and the block names the offending session so a person can resolve it. A reversal with
-standing `asserted` blocks too, with its standing shown in the condition, for the same fail-closed
-reason. `koto decisions import` runs the same validation as a local record, labels everything
+standing `asserted` sits beyond a broken chain, so it never reaches the tick; listings show it, with
+its standing, and a person decides what to do. Writers enforce the same per-area entry limits the
+reader does, so a runaway session can't make itself unreadable to the sessions below it. A
+decision's time is stamped by koto's writer from the clock and never taken from a flag, so winning
+R19's race by backdating needs a direct file write, which is outside what this protects against.
+Human-readable `list` and `show` output strips control and terminal escape characters from reasons
+and handles; JSON output escapes them. `koto decisions import` runs the same validation as a local record, labels everything
 `handed`, never claims `verified`, lets an imported `reverse` name only an entry from the same
 import and never another session's decision, and caps line length and count. `koto/imported-from` is
 written only by the import command, holds validated session ids, and is capped, because it decides
@@ -713,7 +760,8 @@ as an unreadable session rather than as a decision.
 parses the payload as JSON, matches only commands that invoke the `koto` binary, adds a prefix of
 environment assignments built only from values that match koto's identifier pattern, leaves the
 command text byte-identical after that prefix, and changes nothing when anything is ambiguous. Its
-tests feed it hostile command strings. shirabe's scripts pass repository, path, commit and finding
+tests feed it hostile command strings: compound commands, pipes, `env`-prefixed and quoted
+invocations, subshells, and values carrying shell metacharacters. shirabe's scripts pass repository, path, commit and finding
 text to `koto decisions` as separate arguments, never through `eval` or string building, and the
 interim-entry converter writes JSON with a JSON encoder.
 
@@ -752,6 +800,14 @@ widen who may reverse.
 - Two hosts writing one cloud session see refusals rather than silent overwrites.
 - A reversal of a minor call stops the worker too.
 - The host-file requirement can't be verified on a host until the run journal is removed.
+- An `asserted` reversal, recorded beyond a broken chain, shows in listings but doesn't stop a live
+  worker.
+- Accepted limits, each with the trigger for revisiting it: one writable chain session can block a
+  worker that can't clear the block itself (revisit if sessions are ever shared across users through
+  a bucket); a `--by person:<handle>` claim is unauthenticated, so an agent can claim to be a person
+  and the audit trail is the only control (revisit when a harness or forge supplies verified
+  identity); and the host-file check waits on koto#545 (revisit if that release slips past the
+  measurement pipeline's cutover).
 
 ### Mitigations
 
