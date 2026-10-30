@@ -12,8 +12,12 @@
 //! and removes the directory when the process exits. It runs before `main`
 //! while the process has one thread, as `host_session.rs` does. A koto run a
 //! test starts inherits that `HOME` unless the test gives it its own. It
-//! also sets `KOTO_TEST_HOME`, which a re-run of the test binary inherits:
-//! a process that finds it set keeps the `HOME` its parent gave it.
+//! also removes `KOTO_SESSIONS_BASE` and every `KOTO_SESSION_*` variable,
+//! which point koto's session store elsewhere: a koto gate sets the first on
+//! the suites it starts, and a shell configured for the cloud backend sets
+//! the others. It also sets `KOTO_TEST_HOME`, which a re-run of the test
+//! binary inherits: a process that finds it set keeps the `HOME` and the
+//! store variables its parent gave it.
 //!
 //! `koto_command.rs` and `host_session.rs` include it, so every test that
 //! runs koto gets it without naming it; a test crate that includes neither
@@ -21,6 +25,8 @@
 //! `tests/test_home_env.rs` fails the suite when a test crate doesn't get it,
 //! and proves that a machine id written in-process and a template compiled
 //! by the koto binary land outside the `HOME` the process started with.
+//! `tests/session_store_env.rs` proves that a test process started with the
+//! store variables set sees none of them.
 //!
 //! Unix only: on Windows `dirs::home_dir` doesn't read `HOME`.
 
@@ -31,6 +37,12 @@ use std::sync::OnceLock;
 
 /// Set once a process's home is redirected; its children inherit it.
 pub const TEST_HOME_ENV: &str = "KOTO_TEST_HOME";
+
+/// The local session directory koto uses in place of the one under `HOME`.
+const SESSIONS_BASE_ENV: &str = "KOTO_SESSIONS_BASE";
+
+/// The prefix of every session-backend variable koto reads.
+const SESSION_ENV_PREFIX: &str = "KOTO_SESSION_";
 
 /// The directory this process created, removed at exit.
 static CREATED: OnceLock<PathBuf> = OnceLock::new();
@@ -51,6 +63,20 @@ extern "C" fn redirect_home() {
     // A KOTO_HOME from the shell would move the koto root past this HOME.
     std::env::remove_var("KOTO_HOME");
     std::env::remove_var("XDG_CACHE_HOME");
+    // The session store follows these before HOME: a koto gate sets
+    // KOTO_SESSIONS_BASE on every command it runs, and a shell can carry a
+    // cloud backend in KOTO_SESSION_*. A test that wants a store sets it on
+    // the command it runs.
+    let store_vars: Vec<_> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name == SESSIONS_BASE_ENV || name.starts_with(SESSION_ENV_PREFIX)
+        })
+        .collect();
+    for name in store_vars {
+        std::env::remove_var(name);
+    }
     std::env::set_var(TEST_HOME_ENV, &dir);
     let _ = CREATED.set(dir);
     // SAFETY: registers a plain `extern "C"` function with no arguments.
