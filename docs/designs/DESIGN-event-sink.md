@@ -1,5 +1,40 @@
 ---
 schema: design/v1
+status: Proposed
+problem: |
+  koto writes its session records to a local run journal that a separate host
+  job copies and forwards later. That hop is going away: koto has to hand its
+  records to an external event sink, an executable at a fixed path whose
+  contract is fixed upstream, at defined points in each command, without ever
+  holding a command up past 3.0 s, without a flush inside an action's 30 s
+  timer, and without changing a byte of the journal, which stays in release A
+  and goes in release B. Release A ships before 2026-11-09 and must do nothing
+  on a host until a sink is installed there after 2026-11-09T02:00Z.
+decision: |
+  Every record goes through one function, emit, which stamps a clone with the
+  run template (cached in the existing run-journal.json sidecar), drops
+  context_reads, queues it in a process-global queue, and then writes the
+  journal unchanged unless run_journal.enabled is false. telemetry::flush()
+  runs at seven fixed sites for the four in-code flush points and from an exit
+  hook: every process exit now goes through one exit(code) helper in
+  src/exit.rs that runs a registered hook list, with clippy banning direct
+  exits. A flush sends chunks of 200 to the sink in its own process group
+  until a 2.95 s call deadline, kills the group past it, and keeps per-session
+  drop counts in telemetry.json under a separate lock file. koto session
+  identity prints the session's identity with the attribute names as keys.
+  Seven pull requests land release A; release B is mostly deletions.
+rationale: |
+  The hooks already hold the session, header and backend, so widening the one
+  write function to take that context gives a single place for the stamps,
+  the context_reads rule and the line cap without a side channel, and lets
+  sending go on with the journal off. A process-global queue is the only shape
+  the flush points and the exit path can reach without a backend. A lock file
+  beside rename-written data is how koto locks every other shared file, and it
+  makes a double carry impossible. A registered exit-hook list ending main's
+  return too is the smallest change that covers every exit, and clippy
+  resolves the real call path where a grep wouldn't. Caching the run template
+  at child creation is the only time the root is reliably local without
+  changing the synced session header.
 ---
 
 # DESIGN: An external event sink for koto's session records
