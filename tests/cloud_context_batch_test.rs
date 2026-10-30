@@ -1123,3 +1123,401 @@ fn a_window_its_killed_caller_left_open_is_flushed_by_the_next_command() {
     let keys = assert_remote_consistent(&s3, &a);
     assert_eq!(keys, vec!["one.md".to_string(), "two.md".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// The tick's own writes (koto#548): the tick's event appends, header rewrites
+// and context assignments join the same batch, and it pushes once.
+// ---------------------------------------------------------------------------
+
+/// A workflow that runs `actions` in order, one state each as its default
+/// action, and then waits for evidence.
+fn chain_template(actions: &[&str]) -> String {
+    let mut states = String::new();
+    let mut sections = String::new();
+    for (i, action) in actions.iter().enumerate() {
+        let next = if i + 1 < actions.len() {
+            format!("s{}", i + 1)
+        } else {
+            "wait".to_string()
+        };
+        let body: String = action.lines().map(|l| format!("        {}\n", l)).collect();
+        states.push_str(&format!(
+            "  s{i}:\n    default_action:\n      command: |\n{body}    transitions:\n      - \
+             target: {next}\n"
+        ));
+        sections.push_str(&format!("## s{i}\n\nStep {i}.\n\n"));
+    }
+    format!(
+        r#"---
+name: chain
+version: "1.0"
+initial_state: s0
+states:
+{states}  wait:
+    accepts:
+      go:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: done
+        when:
+          go: go
+  done:
+    terminal: true
+---
+
+{sections}## wait
+
+Wait.
+
+## done
+
+Done.
+"#
+    )
+}
+
+/// A workflow whose `ask` state copies three evidence fields into context
+/// on its way to `wait`.
+const ASSIGN_TEMPLATE: &str = r#"---
+name: assign
+version: "1.0"
+initial_state: ask
+states:
+  ask:
+    accepts:
+      decision:
+        type: enum
+        values: [ok]
+        required: true
+      detail:
+        type: string
+        required: true
+    transitions:
+      - target: wait
+        when:
+          decision: ok
+        context_assignments:
+          topic: "topic ${evidence.detail}"
+          source: "source ${evidence.detail}"
+          report: "report ${evidence.detail}"
+  wait:
+    accepts:
+      go:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: done
+        when:
+          go: go
+  done:
+    terminal: true
+---
+
+## ask
+
+Ask.
+
+## wait
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+impl Host {
+    /// Init the session on the workflow `text`.
+    fn init_template(&self, text: &str) {
+        std::fs::write(self.ws.join(TEMPLATE_FILE), text).unwrap();
+        let out = self.koto(&["init", NAME, "--template", TEMPLATE_FILE]);
+        assert!(out.ok(), "init: {}", out.describe());
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.session_dir()
+            .join(format!("koto-{}.state.jsonl", NAME))
+    }
+
+    fn state_key(&self) -> String {
+        self.key(&format!("koto-{}.state.jsonl", NAME))
+    }
+
+    /// The number of events in this host's copy of the session's log.
+    fn local_events(&self) -> usize {
+        std::fs::read_to_string(self.state_path())
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+}
+
+/// How many of `requests` are a DELETE of an object whose key ends in `rest`.
+fn deletes(requests: &[String], rest: &str) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.starts_with("DELETE ") && r.ends_with(rest))
+        .count()
+}
+
+/// A tick that runs through N states with actions appends several events
+/// per state. Each append used to push the whole state file, so the tick
+/// pushed it once per event; now the appends wait in the tick's batch and
+/// the tick pushes the state file once, in one flush, before it returns.
+#[test]
+fn a_tick_through_n_states_pushes_the_state_file_once_against_once_per_event_without_it() {
+    const N: usize = 5;
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init_template(&chain_template(&["true"; N]));
+    let before = h.local_events();
+
+    let mut out = None;
+    let requests = requests_during(&s3, || out = Some(h.next()));
+    let out = out.unwrap();
+    assert!(out.ok(), "next: {}", out.describe());
+    assert_eq!(out.json()["state"], "wait", "{}", out.describe());
+
+    let appended = h.local_events() - before;
+    assert!(
+        appended >= N,
+        "the tick appended {appended} events through {N} states"
+    );
+    assert_eq!(puts(&requests, ".state.jsonl"), 1, "{:#?}", requests);
+    assert_eq!(puts(&requests, "/version.json"), 1, "{:#?}", requests);
+    assert_eq!(puts(&requests, "/batch-open.json"), 1, "{:#?}", requests);
+    assert_eq!(deletes(&requests, "/batch-open.json"), 1, "{:#?}", requests);
+    assert_eq!(
+        s3.object(&h.state_key()).unwrap(),
+        std::fs::read(h.state_path()).unwrap(),
+        "the bucket holds every event the tick appended"
+    );
+    assert!(!h.session_dir().join("cloud-batch.jsonl").exists());
+}
+
+/// Evidence a tick copies into context costs no request when it is written:
+/// each key goes up once, in the tick's flush, beside one manifest, one
+/// state file and one `version.json`. Each one used to cost its own version
+/// check and its own key, manifest and version PUTs.
+#[test]
+fn evidence_a_tick_copies_into_context_waits_for_the_flush() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init_template(ASSIGN_TEMPLATE);
+
+    let mut out = None;
+    let requests = requests_during(&s3, || {
+        out = Some(h.koto(&[
+            "next",
+            NAME,
+            "--with-data",
+            r#"{"decision":"ok","detail":"d"}"#,
+        ]))
+    });
+    let out = out.unwrap();
+    assert!(out.ok(), "next: {}", out.describe());
+    assert_eq!(out.json()["state"], "wait", "{}", out.describe());
+
+    for key in ["topic", "source", "report"] {
+        assert_eq!(
+            puts(&requests, &format!("/ctx/{key}")),
+            1,
+            "{:#?}",
+            requests
+        );
+    }
+    assert_eq!(puts(&requests, "/ctx/manifest.json"), 1, "{:#?}", requests);
+    assert_eq!(puts(&requests, ".state.jsonl"), 1, "{:#?}", requests);
+    assert_eq!(puts(&requests, "/version.json"), 1, "{:#?}", requests);
+
+    // Until the flush, the only object written is the batch-open marker; the
+    // flush then writes the keys, the manifest naming them, the state file
+    // and the version, in that order.
+    let first_key = requests
+        .iter()
+        .position(|r| r.starts_with("PUT ") && r.contains("/ctx/"))
+        .unwrap_or_else(|| panic!("no key PUT in {:#?}", requests));
+    for r in &requests[..first_key] {
+        assert!(
+            !r.starts_with("PUT ") || r.ends_with("/batch-open.json"),
+            "{r} went up before the flush: {:#?}",
+            requests
+        );
+    }
+    let at = |rest: &str| {
+        requests
+            .iter()
+            .position(|r| r.starts_with("PUT ") && r.ends_with(rest))
+            .unwrap()
+    };
+    let last_key = ["topic", "source", "report"]
+        .iter()
+        .map(|k| at(&format!("/ctx/{k}")))
+        .max()
+        .unwrap();
+    assert!(
+        last_key < at("/ctx/manifest.json")
+            && at("/ctx/manifest.json") < at(".state.jsonl")
+            && at(".state.jsonl") < at("/version.json"),
+        "flush out of order: {:#?}",
+        requests
+    );
+    let mut keys = assert_remote_consistent(&s3, &h);
+    keys.sort();
+    assert_eq!(keys, vec!["report", "source", "topic"]);
+    let got = h.koto(&["context", "get", NAME, "topic"]);
+    assert_eq!(got.stdout, "topic d", "{}", got.describe());
+}
+
+/// A tick killed after it appended its own events, before its flush, leaves
+/// them in its batch: the bucket keeps the copy from before the tick beside
+/// `batch-open.json`, an import from another host refuses, and the next
+/// koto command on the session on the tick's host pushes the tick's events.
+#[test]
+fn a_tick_killed_after_its_own_appends_leaves_them_for_the_next_command() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    a.init_template(&chain_template(&["true", "kill -9 $PPID"]));
+    let bucket_before = s3.object(&a.state_key()).unwrap();
+
+    let out = a.next();
+    assert_eq!(
+        out.code,
+        None,
+        "the tick should have been killed: {}",
+        out.describe()
+    );
+    let local = std::fs::read_to_string(a.state_path()).unwrap();
+    assert!(
+        local.contains("\"to\":\"s1\""),
+        "the tick appended its move to s1 before it was killed: {local}"
+    );
+    assert_eq!(
+        s3.object(&a.state_key()).unwrap(),
+        bucket_before,
+        "the tick's appends waited in its batch"
+    );
+    assert!(s3.object(&a.key("batch-open.json")).is_some());
+    assert!(a.session_dir().join("cloud-batch.jsonl").exists());
+
+    let b = Host::new(&s3);
+    let ws = a.ws.to_string_lossy().into_owned();
+    let import = || b.koto(&["session", "import", NAME, "--from", &ws, "--trust-template"]);
+    let out = import();
+    assert_eq!(out.code, Some(2), "{}", out.describe());
+    assert_eq!(
+        out.json()["error"]["code"],
+        "import_source_unpushed",
+        "{}",
+        out.describe()
+    );
+
+    let out = a.koto(&["status", NAME]);
+    assert!(out.ok(), "status: {}", out.describe());
+    assert_eq!(out.json()["current_state"], "s1", "{}", out.describe());
+    assert!(!a.session_dir().join("cloud-batch.jsonl").exists());
+    assert!(s3.object(&a.key("batch-open.json")).is_none());
+    assert_eq!(
+        s3.object(&a.state_key()).unwrap(),
+        std::fs::read(a.state_path()).unwrap(),
+        "the next command pushed the tick's appends"
+    );
+    assert_remote_consistent(&s3, &a);
+
+    let out = import();
+    assert!(out.ok(), "import: {}", out.describe());
+}
+
+/// A read of the session during a tick sees the tick's own appends. While
+/// the tick runs, its appends wait in its batch and the bucket's copy lacks
+/// them. A command of the tick reads this host's copy, which holds them. A
+/// koto command on the same host outside the tick pushes the batch before
+/// it reads, so the bucket holds them from then on. The tick then goes on
+/// from where it was and pushes the rest once, before it returns.
+#[test]
+fn a_read_during_a_tick_sees_the_ticks_own_appends() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let dir = h.ws.join("mid-tick");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str| dir.join(name).display().to_string();
+    let wait_file = |name: &str| {
+        format!(
+            "i=0\nwhile [ ! -f {f} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+            f = file(name)
+        )
+    };
+    let reads = format!(
+        "set -e\nkoto status {NAME} > {inside}\ntouch {before}\n{go1}\nKOTO_TICK_SESSION= koto \
+         status {NAME} > {outside}\ntouch {after}\n{go2}",
+        inside = file("inside.json"),
+        before = file("before"),
+        go1 = wait_file("go1"),
+        outside = file("outside.json"),
+        after = file("after"),
+        go2 = wait_file("go2"),
+    );
+    h.init_template(&chain_template(&["true", &reads]));
+    let has_s1 = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains("\"to\":\"s1\"");
+
+    s3.clear_requests();
+    let tick = h
+        .std_cmd(&["next", NAME])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let limit = Duration::from_secs(30);
+
+    // The tick has moved to s1 and its command is running: the bucket's copy
+    // still lacks the move, and the command read it from this host's copy.
+    wait_for(limit, "the action's first read", || {
+        dir.join("before").exists()
+    });
+    assert!(
+        has_s1(&std::fs::read(h.state_path()).unwrap()),
+        "the local copy holds the tick's move to s1"
+    );
+    assert!(
+        !has_s1(&s3.object(&h.state_key()).unwrap()),
+        "the tick's appends wait in its batch until something reads the bucket"
+    );
+    let inside: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("inside.json")).unwrap()).unwrap();
+    assert_eq!(inside["current_state"], "s1", "{inside}");
+
+    // A koto command outside the tick on the same host pushes the batch
+    // before it reads: it sees the move, and so does the bucket.
+    std::fs::write(dir.join("go1"), "").unwrap();
+    wait_for(limit, "the read outside the tick", || {
+        dir.join("after").exists()
+    });
+    let outside: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("outside.json")).unwrap()).unwrap();
+    assert_eq!(outside["current_state"], "s1", "{outside}");
+    assert!(
+        has_s1(&s3.object(&h.state_key()).unwrap()),
+        "the read outside the tick pushed the tick's appends first"
+    );
+    assert!(!h.session_dir().join("cloud-batch.jsonl").exists());
+
+    std::fs::write(dir.join("go2"), "").unwrap();
+    let out = Host::out(tick.wait_with_output().unwrap());
+    assert!(out.ok(), "next: {}", out.describe());
+    assert_eq!(out.json()["state"], "wait", "{}", out.describe());
+    let requests: Vec<String> = s3.requests().iter().map(describe).collect();
+    // One push of the state file by the read, one by the tick's flush.
+    assert_eq!(puts(&requests, ".state.jsonl"), 2, "{:#?}", requests);
+    assert_eq!(
+        s3.object(&h.state_key()).unwrap(),
+        std::fs::read(h.state_path()).unwrap(),
+        "the tick pushed the rest of its appends"
+    );
+    assert!(!h.session_dir().join("cloud-batch.jsonl").exists());
+    assert!(s3.object(&h.key("batch-open.json")).is_none());
+}

@@ -529,6 +529,17 @@ to `0.9.x`).
 
 ### Changed
 
+- **A cloud `koto next` pushes its session once, before it returns.** The
+  tick's own event appends, header rewrites and the evidence it copies into
+  context now wait in the session's batch with its commands' writes, and the
+  flush on the way out pushes the keys, the manifest, the state file and
+  `version.json` once. A tick used to push the whole state file after almost
+  every event it appended, so its upload grew with the number of events
+  times the state file's size. Every tick that writes now pays the batch's
+  fixed cost (the batch-open marker's PUT and DELETE, and the flush's version
+  and migration checks), and a tick killed before its flush leaves the batch
+  open: `koto session import` refuses the session until the next koto command
+  on that host pushes it. The local backend is unchanged.
 - **End-of-run removal no longer removes a session with a link or
   lineage.** The tick that lands a session in a terminal state now keeps
   it, with or without `--no-cleanup`, when it has a link of its own, a

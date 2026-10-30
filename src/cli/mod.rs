@@ -1468,8 +1468,8 @@ fn is_session_migrated(err: &anyhow::Error) -> bool {
 }
 
 /// What `koto next` runs on its way out, however it exits: the flush of
-/// the writes its commands deferred (koto#376). Set once, by the `next`
-/// arm of [`run`]; other commands leave it unset.
+/// the writes it and its commands deferred (koto#376, koto#548). Set once,
+/// by the `next` arm of [`run`]; other commands leave it unset.
 static EXIT_FLUSH: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 
 /// Run the exit flush, if this command set one.
@@ -2244,8 +2244,8 @@ pub fn run(app: App) -> Result<()> {
             let _ = EXIT_FLUSH.set(Box::new(move || {
                 if let Err(e) = backend.flush_pending(&tick) {
                     eprintln!(
-                        "warning: cloud sync: the writes this tick's commands made are kept on \
-                         this host and pushed by the next koto command on '{}': {:#}",
+                        "warning: cloud sync: the writes this tick and its commands made are \
+                         kept on this host and pushed by the next koto command on '{}': {:#}",
                         tick, e
                     );
                 }
