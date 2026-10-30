@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto has no record of who made a delegated decision or on what authority, and no way for a
   session above to reverse one so koto honours it. The record has to live as write-once keys in
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
