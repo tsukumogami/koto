@@ -278,7 +278,7 @@ local backend, reading the written file back.
   (`test/functional/fixtures/templates/hello-koto.md`) stopped on its
   `awakening` gate shows the entry under "running", its Awakening step as
   Blocked with `gate spirit_greeting: FAIL` as its Outcome, and its summary
-  saying blocked; driven to its end, it shows `✔`, `· done`, every phase
+  saying blocked; driven to its end, it shows the done check mark, `· done`, every phase
   complete (`1/1`) and no Stopped step.
 
 ## Out of Scope
