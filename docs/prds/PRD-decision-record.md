@@ -456,8 +456,10 @@ that footing.
   coordinator, and a chain whose first link is the coordinator labelled `leg`.
 - [ ] In the same run, each of the three decisions exists as keys in the worker's session, and no
   file under `~/.koto/` outside `sessions/` is created or changed holding a decision, a reversal or
-  a gate answer. Until koto removes its run journal, this run sets `run_journal.enabled = false`,
-  and the records koto sends to its telemetry sink are the same as with the journal on. With `~/.koto/_decider_ledger.jsonl` replaced by a directory before the run, every
+  a gate answer. This criterion is checked on a koto that has removed its run journal; before
+  then, an automated test may check it in an isolated koto home with `run_journal.enabled = false`,
+  and in both cases the records koto sends to its telemetry sink are the same as with the journal
+  on. No host is told to switch its journal off early. With `~/.koto/_decider_ledger.jsonl` replaced by a directory before the run, every
   step succeeds, and `koto decider report` returns the gate answer from the worker's session; with
   the file instead holding a stale answer for another session, the report omits it.
 
@@ -676,8 +678,9 @@ that footing.
 
 - koto's run journal, `~/.koto/_run_journal.jsonl`, relays gate overrides and decider answers for
   telemetry. koto's event-sink work sends those records to the telemetry sink directly and removes
-  the journal; until it does, R4 holds only with the journal switched off, and nothing here changes
-  what the telemetry sink receives.
+  the journal on its own schedule, which a host archive's cutover depends on. Until it does, R4
+  holds only in an isolated test with the journal switched off; this feature never switches a
+  host's journal off and changes nothing the telemetry sink receives.
 
 - Overrule counts cover only sessions koto still keeps. A hierarchy whose sessions retention has
   removed no longer counts; a durable monthly reading is the reporting work's to keep.
