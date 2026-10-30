@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   Delegated sessions accept documents, pass gates, merge, escalate or decline to, and
   settle judgment calls with nobody watching. Nobody above can later read who made a
@@ -30,7 +30,7 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
