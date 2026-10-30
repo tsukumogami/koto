@@ -15,7 +15,7 @@ decision: |
   run template (cached in the existing run-journal.json sidecar), drops
   context_reads, queues it in a process-global queue, and then writes the
   journal unchanged unless run_journal.enabled is false. telemetry::flush()
-  runs at seven fixed sites for the four in-code flush points and from an exit
+  runs at eight fixed sites for the four in-code flush points and from an exit
   hook: every process exit now goes through one exit(code) helper in
   src/exit.rs that runs a registered hook list, with clippy banning direct
   exits. A flush sends chunks of 200 to the sink in its own process group
@@ -606,7 +606,7 @@ hook into the orphan count.
 
 ### PR 7: Flush points 1 to 4
 
-The seven `flush()` calls in the table above, each with its ordering test.
+The eight `flush()` calls in the table above, each with its ordering test.
 
 ### Release B (tsukumogami/koto#545)
 
