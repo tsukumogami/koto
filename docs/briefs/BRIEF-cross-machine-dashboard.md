@@ -128,8 +128,7 @@ something every user has to configure around.
   prune rules and shared-bucket reads. Those already exist and are built
   on, not changed; anything new this feature needs from them is named as a
   dependency rather than built here.
-- How a project's own configuration file sets session storage (backend,
-  endpoint, bucket, region, credentials). This feature uses the user-level
-  bucket configuration only.
+- Project-level session-storage settings. This feature reads the bucket
+  configuration koto already resolves at user level.
 - Several developers sharing one bucket. The reader is one developer
   looking at their own machines.
