@@ -90,8 +90,8 @@ with every phase counted complete and no step reading Stopped.
 
 ### Read koto's own classification from the file
 
-A script or another tool reads the entry file rather than the screen, wanting
-to know whether koto considers the session blocked. Trigger: parsing the file
+An integration author's script reads the entry file rather than the screen,
+wanting to know whether koto considers the session blocked. Trigger: parsing the file
 after a gate failure. Outcome shape: koto's own classification is still there
 to read, even though the top-level field now speaks the screen's vocabulary.
 
