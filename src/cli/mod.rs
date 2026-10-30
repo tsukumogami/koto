@@ -394,7 +394,7 @@ pub enum Command {
         subcommand: disputes::DisputesSubcommand,
     },
 
-    /// Document review event recording, as telemetry (moves nothing)
+    /// Document and code review event recording, as telemetry (moves nothing)
     Review {
         #[command(subcommand)]
         subcommand: review::ReviewSubcommand,

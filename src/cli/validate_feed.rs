@@ -547,6 +547,48 @@ Body text.
         }
     }
 
+    /// The `code-round` event: a well-formed line validates clean, and one
+    /// missing a required field or with one of the wrong type is rejected,
+    /// so the contract declares it rather than skipping it as unknown.
+    #[test]
+    fn shipped_spec_declares_the_code_review_event() {
+        let line = |payload: Value| {
+            serde_json::json!({
+                "seq": 1,
+                "timestamp": "2024-01-01T00:00:00Z",
+                "type": "code_review_round_recorded",
+                "payload": payload,
+            })
+            .to_string()
+        };
+        let good = line(serde_json::json!({
+            "state": "review",
+            "round": 2,
+            "head": "sha256:0123456789abcdef0123456789abcdef",
+            "entries": [
+                {"seat": "correctness", "model": "claude-opus-4-5", "verdict": "pass"},
+                {"seat": "other", "model": "gpt-5.1", "verdict": "fail"}
+            ]
+        }));
+        let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), good));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+
+        for bad in [
+            line(serde_json::json!({"state": "review", "round": 2, "entries": []})),
+            line(serde_json::json!({"state": "review", "head": "sha256:00", "entries": []})),
+            line(serde_json::json!({"state": "review", "round": 2, "head": "sha256:00"})),
+            line(serde_json::json!({"round": 2, "head": "sha256:00", "entries": []})),
+            line(
+                serde_json::json!({"state": "review", "round": "2", "head": "sha256:00", "entries": []}),
+            ),
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), bad));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(result.is_err(), "accepted: {bad}");
+        }
+    }
+
     /// A well-formed `decider_consulted` line, as a consulting run writes it.
     const DECIDER_CONSULTED: &str = r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_consulted","payload":{"state":"review","visit_seq":1,"provider":"jev","model":"jev-1","input_sha256":"ab","outcome":"applied","latency_ms":12,"directive_bytes":300,"endpoint_origin":"default","fields":{"verdict":{"declaration_hash":"cd","modes":{"proceed":"auto"},"probabilities":{"proceed":0.95,"unclear":0.05},"winning":"proceed","confidence":0.95,"threshold":0.9,"at_threshold":true,"outcome":"qualified"}}}}"#;
 

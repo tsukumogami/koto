@@ -15,6 +15,13 @@
 //! session event holding all its entries, and the journal relays one record
 //! per entry, so the records of one call share the event's `koto.seq`.
 //!
+//! One more records a code review round (a pull request review panel) as
+//! kinds of its own, apart from the document review events: `code-round`
+//! takes the round's number, the reviewed head and a batch of seats, each
+//! with the model it ran on and its verdict, and appends one event holding
+//! them all. The head is stored only as its digest, never as given, so a
+//! commit id doesn't reach the log or the journal.
+//!
 //! Like `koto disputes record`, the events are recorded, never obeyed:
 //! nothing the advance loop routes on reads them, so no gate outcome, route
 //! or state changes, and the verb works on a session in any non-terminal
@@ -52,9 +59,9 @@ use serde_json::{Map, Value};
 
 use crate::engine::persistence::derive_machine_state;
 use crate::engine::types::{
-    now_iso8601, DocCheckRecorded, DocFix, DocFixRecorded, DocRuleCheck, DocRuleChecksRecorded,
-    DocSectionRecorded, Event, EventPayload, ReviewDecisionRecorded, ReviewRoundStarted,
-    ReviewVerdictRecorded,
+    now_iso8601, CodeReviewRoundRecorded, CodeReviewSeat, DocCheckRecorded, DocFix, DocFixRecorded,
+    DocRuleCheck, DocRuleChecksRecorded, DocSectionRecorded, Event, EventPayload,
+    ReviewDecisionRecorded, ReviewRoundStarted, ReviewVerdictRecorded,
 };
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, ReviewVocabulary};
@@ -78,13 +85,17 @@ pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 /// The call would take the session past [`SESSION_CAP`] review events.
 pub const CAP_REACHED: &str = "cap_reached";
 
-/// The most entries one `verdicts`, `doc-checks`, `rule-checks` or `fix`
-/// call records.
+/// The most entries one `verdicts`, `doc-checks`, `rule-checks`, `fix` or
+/// `code-round` call records.
 pub const BATCH_MAX: usize = 200;
 /// The most review entries one session holds, every kind counted: one for
-/// each round, verdict, decision, document check or section write, and one
-/// per entry of a `rule-checks` or `fix` call.
+/// each round, verdict, decision, document check or section write, one per
+/// entry of a `rule-checks` or `fix` call, and for a `code-round` call one
+/// for the round and one per seat.
 pub const SESSION_CAP: usize = 2000;
+/// The longest `--head` a `code-round` call takes, in bytes. The value is
+/// only ever stored as its digest.
+pub const HEAD_MAX_BYTES: usize = 256;
 /// The largest `--file` read, in bytes: far more than [`BATCH_MAX`] entries
 /// of the longest valid values need.
 pub const FILE_MAX_BYTES: u64 = 1024 * 1024;
@@ -134,10 +145,12 @@ const DOC_CHECK_KEYS: &[&str] = &["rule_id", "outcome", "doc_type", "schema"];
 const RULE_CHECK_KEYS: &[&str] = &["rule_id", "outcome"];
 /// The keys of a `fix` entry, all required.
 const FIX_KEYS: &[&str] = &["rule_id", "section", "check_rule"];
+/// The keys of a `code-round` entry, all required.
+const CODE_SEAT_KEYS: &[&str] = &["seat", "model", "verdict"];
 
 #[derive(Subcommand)]
 pub enum ReviewSubcommand {
-    /// Record a document review event as telemetry. Changes no gate
+    /// Record a document or code review event as telemetry. Changes no gate
     /// outcome, route or state
     Record {
         /// Workflow name (required)
@@ -274,6 +287,21 @@ pub enum ReviewEvent {
         #[arg(long)]
         file: PathBuf,
     },
+    /// A code review round (a pull request review panel), recorded apart
+    /// from document reviews: a JSON array of objects with seat, model and
+    /// verdict (pass or fail), one per seat, at most 200
+    CodeRound {
+        /// The round's number, a positive integer
+        #[arg(long)]
+        round: String,
+        /// The reviewed head (a commit id, say), 1 to 256 bytes; stored
+        /// only as its digest
+        #[arg(long)]
+        head: String,
+        /// The JSON file holding the seats
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 impl ReviewEvent {
@@ -287,6 +315,7 @@ impl ReviewEvent {
             ReviewEvent::RuleChecks { .. } => "rule-checks",
             ReviewEvent::SectionWritten { .. } => "section-written",
             ReviewEvent::Fix { .. } => "fix",
+            ReviewEvent::CodeRound { .. } => "code-round",
         }
     }
 }
@@ -822,6 +851,85 @@ pub fn fix_recorded(
     })
 }
 
+/// A `code-round` call's `--round` and `--head`, as `(round, head digest)`.
+/// The round is a positive integer; the head is 1 to [`HEAD_MAX_BYTES`]
+/// bytes of any text and is kept only as its digest
+/// ([`crate::run_journal::digest`]), so the same head gives the same value
+/// in every session and the value given is never stored.
+pub fn code_round_flags(round: &str, head: &str) -> Result<(u64, String), Refusal> {
+    let round = positive(round).ok_or_else(|| bad_value("--round", "a positive integer"))?;
+    if head.is_empty() || head.len() > HEAD_MAX_BYTES {
+        return Err(bad_value("--head", &format!("1 to {HEAD_MAX_BYTES} bytes")));
+    }
+    Ok((round, crate::run_journal::digest(head)))
+}
+
+/// A seat's model as a `code-round` call stores it: as given when it has the
+/// journal's name shape (1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`,
+/// not starting with `/` or `~`), and [`UNDECLARED`] (`other`) otherwise,
+/// such as a model id with a `[1m]` suffix. Callers record best effort, so
+/// an odd model id costs that seat's model, not the round.
+pub fn code_model(value: &str) -> String {
+    if crate::run_journal::is_name(value) {
+        value.to_string()
+    } else {
+        UNDECLARED.to_string()
+    }
+}
+
+/// The `code-round` event, from its flags and its batch of seats, recorded
+/// at `state`. Every seat goes in the one event, in order. A seat
+/// `vocabulary` doesn't declare is stored as `other`, and so is a model
+/// outside the journal's name shape ([`code_model`]); a missing or empty
+/// model is refused. A verdict is `pass` or `fail` (`PASS` and `FAIL` are
+/// taken too).
+pub fn code_round_recorded(
+    state: &str,
+    round: &str,
+    head: &str,
+    text: &str,
+    vocabulary: &ReviewVocabulary,
+) -> Result<CodeReviewRoundRecorded, Refusal> {
+    let (round, head) = code_round_flags(round, head)?;
+    code_round_seats(state, round, head, text, vocabulary)
+}
+
+/// [`code_round_recorded`] from flags [`code_round_flags`] already checked:
+/// `round` and `head`, the head's digest, as it returned them.
+fn code_round_seats(
+    state: &str,
+    round: u64,
+    head: String,
+    text: &str,
+    vocabulary: &ReviewVocabulary,
+) -> Result<CodeReviewRoundRecorded, Refusal> {
+    let entries = batch_entries(text)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let map = entry_object(index, entry, CODE_SEAT_KEYS)?;
+        let seat = declared_or_other(string_field(index, map, "seat")?, &vocabulary.seats);
+        let model = string_field(index, map, "model")?;
+        if model.is_empty() {
+            return Err(bad_entry_value(index, "model", "a non-empty string"));
+        }
+        let model = code_model(model);
+        let verdict = verdict(string_field(index, map, "verdict")?)
+            .ok_or_else(|| bad_entry_value(index, "verdict", "pass or fail"))?
+            .to_string();
+        out.push(CodeReviewSeat {
+            seat,
+            model,
+            verdict,
+        });
+    }
+    Ok(CodeReviewRoundRecorded {
+        state: state.to_string(),
+        round,
+        head,
+        entries: out,
+    })
+}
+
 /// The text of a `--file`, refused when it can't be read, is larger than
 /// [`FILE_MAX_BYTES`] or isn't UTF-8. The refusal names the cause, never
 /// the path or the content.
@@ -857,8 +965,9 @@ fn io_cause(e: &std::io::Error) -> String {
 
 /// How many review entries `payload` holds, the count [`SESSION_CAP`]
 /// bounds: one for each round, verdict, decision, document check and
-/// section write, the entry count of a `rule-checks` or `fix` event, and 0
-/// for anything else.
+/// section write, the entry count of a `rule-checks` or `fix` event, one
+/// for a code review round and one per seat of it (none when it has no
+/// seats), and 0 for anything else.
 pub fn review_entries(payload: &EventPayload) -> usize {
     match payload {
         EventPayload::ReviewRoundStarted(_)
@@ -868,6 +977,8 @@ pub fn review_entries(payload: &EventPayload) -> usize {
         | EventPayload::DocSectionRecorded(_) => 1,
         EventPayload::DocRuleChecksRecorded(c) => c.entries.len(),
         EventPayload::DocFixRecorded(f) => f.entries.len(),
+        EventPayload::CodeReviewRoundRecorded(c) if c.entries.is_empty() => 0,
+        EventPayload::CodeReviewRoundRecorded(c) => 1 + c.entries.len(),
         _ => 0,
     }
 }
@@ -1055,13 +1166,23 @@ fn handle_record(backend: &dyn SessionBackend, name: String, event: ReviewEvent)
                 .map(EventPayload::DocCheckRecorded)
                 .collect()
         }
+        ReviewEvent::CodeRound { round, head, file } => {
+            // The flags are checked before the file is read.
+            let flags = code_round_flags(&round, &head);
+            let (round, head) = flags.unwrap_or_else(|r| refuse(r));
+            let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
+            let event = code_round_seats(state, round, head, &text, vocabulary)
+                .unwrap_or_else(|r| refuse(r));
+            non_empty(EventPayload::CodeReviewRoundRecorded(event))
+        }
     };
     let count: usize = payloads.iter().map(review_entries).sum();
     within_cap(&events, count).unwrap_or_else(|r| refuse(r));
 
     // `verdicts` and `doc-checks` append one event per entry, so each
-    // journal record gets its own `koto.seq`; `rule-checks` and `fix`
-    // append one event holding every entry, so their records share one.
+    // journal record gets its own `koto.seq`; `rule-checks`, `fix` and
+    // `code-round` append one event holding every entry, so their records
+    // share one.
     // Everything was validated above, so only an append failure (exit 1)
     // can stop a batch partway.
     for payload in &payloads {
@@ -1684,5 +1805,261 @@ mod tests {
             );
             assert!(!err.body().to_string().contains("has space"));
         }
+    }
+
+    // ----- code-round -----
+
+    fn seat(seat: &str, model: &str, verdict: &str) -> Value {
+        serde_json::json!({"seat": seat, "model": model, "verdict": verdict})
+    }
+
+    #[test]
+    fn a_code_round_keeps_its_seats_in_order_and_an_undeclared_seat_is_other() {
+        let v = vocabulary(&["correctness", "security"], &[]);
+        let batch = text(&[
+            seat("correctness", "claude-opus-4-5", "pass"),
+            seat("security", "gpt-5.1", "FAIL"),
+            seat("intruder", "claude-sonnet-4-5@20250929", "PASS"),
+        ]);
+        let got = code_round_recorded("review", "2", "0123abcd", &batch, &v).unwrap();
+        assert_eq!(
+            got,
+            CodeReviewRoundRecorded {
+                state: "review".into(),
+                round: 2,
+                head: crate::run_journal::digest("0123abcd"),
+                entries: vec![
+                    CodeReviewSeat {
+                        seat: "correctness".into(),
+                        model: "claude-opus-4-5".into(),
+                        verdict: "pass".into(),
+                    },
+                    CodeReviewSeat {
+                        seat: "security".into(),
+                        model: "gpt-5.1".into(),
+                        verdict: "fail".into(),
+                    },
+                    CodeReviewSeat {
+                        seat: "other".into(),
+                        model: "claude-sonnet-4-5@20250929".into(),
+                        verdict: "pass".into(),
+                    },
+                ],
+            }
+        );
+        // A template that declares no seats gets `other` for every one.
+        let got =
+            code_round_recorded("review", "1", "h", &batch, &ReviewVocabulary::default()).unwrap();
+        assert!(got.entries.iter().all(|e| e.seat == "other"));
+    }
+
+    #[test]
+    fn a_code_round_head_is_stored_only_as_its_digest() {
+        let head = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let (round, digest) = code_round_flags("1", head).unwrap();
+        assert_eq!(round, 1);
+        assert_eq!(digest, crate::run_journal::digest(head));
+        assert!(digest.starts_with("sha256:"));
+        assert!(!digest.contains(head));
+        // The same head gives the same digest; another head another.
+        assert_eq!(code_round_flags("3", head).unwrap().1, digest);
+        assert_ne!(code_round_flags("1", "other-head").unwrap().1, digest);
+        // A value that is already a digest is digested again.
+        assert_ne!(code_round_flags("1", &digest).unwrap().1, digest);
+        // The longest head is taken.
+        assert!(code_round_flags("1", &"h".repeat(HEAD_MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn a_code_round_refuses_bad_flags_and_entries_and_names_them() {
+        let v = vocabulary(&["correctness"], &[]);
+        let ok = text(&[seat("correctness", "m", "pass")]);
+        for (round, head, field) in [
+            ("0", "h", "--round"),
+            ("-1", "h", "--round"),
+            ("two", "h", "--round"),
+            ("", "h", "--round"),
+            ("1", "", "--head"),
+        ] {
+            let err = code_round_recorded("s", round, head, &ok, &v).unwrap_err();
+            assert_eq!(
+                (err.code, err.field.as_deref()),
+                (INVALID_VALUE, Some(field)),
+                "{round:?} {head:?}"
+            );
+        }
+        let long = "h".repeat(HEAD_MAX_BYTES + 1);
+        let err = code_round_recorded("s", "1", &long, &ok, &v).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--head"));
+        assert!(!err.body().to_string().contains(&long));
+
+        let good = seat("correctness", "m", "pass");
+        let mut missing_seat = good.clone();
+        missing_seat.as_object_mut().unwrap().remove("seat");
+        let mut missing_model = good.clone();
+        missing_model.as_object_mut().unwrap().remove("model");
+        let mut extra = good.clone();
+        extra["rule_id"] = Value::from("rs-001");
+        for (bad, code, field) in [
+            (missing_seat, INVALID_ENTRY, Some("seat")),
+            (missing_model, INVALID_ENTRY, Some("model")),
+            (extra, INVALID_ENTRY, None),
+            (
+                seat("correctness", "m", "maybe"),
+                INVALID_VALUE,
+                Some("verdict"),
+            ),
+            (
+                seat("correctness", "m", "Pass"),
+                INVALID_VALUE,
+                Some("verdict"),
+            ),
+            (
+                seat("correctness", "", "pass"),
+                INVALID_VALUE,
+                Some("model"),
+            ),
+            (
+                serde_json::json!({"seat": "correctness", "model": 7, "verdict": "pass"}),
+                INVALID_ENTRY,
+                Some("model"),
+            ),
+            (
+                serde_json::json!({"seat": 1, "model": "m", "verdict": "pass"}),
+                INVALID_ENTRY,
+                Some("seat"),
+            ),
+        ] {
+            let batch = text(&[good.clone(), bad.clone()]);
+            let err = code_round_recorded("s", "1", "h", &batch, &v).unwrap_err();
+            assert_eq!(
+                (err.code, err.entry, err.field.as_deref()),
+                (code, Some(1), field),
+                "{bad}"
+            );
+        }
+        // The longest model is taken.
+        let batch = text(&[seat("correctness", &"m".repeat(128), "pass")]);
+        let got = code_round_recorded("s", "1", "h", &batch, &v).unwrap();
+        assert_eq!(got.entries[0].model, "m".repeat(128));
+    }
+
+    /// A model outside the journal's name shape is recorded as `other`, as
+    /// an undeclared seat is, and the rest of the round is kept.
+    #[test]
+    fn a_model_that_isnt_name_shaped_is_recorded_as_other() {
+        let v = vocabulary(&["correctness", "security"], &[]);
+        let batch = text(&[
+            seat("correctness", "claude-opus-4-1[1m]", "pass"),
+            seat("security", "claude-opus-4-5", "fail"),
+        ]);
+        let got = code_round_recorded("s", "1", "h", &batch, &v).unwrap();
+        let models: Vec<(&str, &str, &str)> = got
+            .entries
+            .iter()
+            .map(|e| (e.seat.as_str(), e.model.as_str(), e.verdict.as_str()))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                ("correctness", "other", "pass"),
+                ("security", "claude-opus-4-5", "fail"),
+            ]
+        );
+        let too_long = "m".repeat(129);
+        for odd in [
+            "claude-opus-4-1[1m]",
+            "has space",
+            "/abs",
+            "~home",
+            too_long.as_str(),
+        ] {
+            assert_eq!(code_model(odd), "other", "{odd:?}");
+        }
+        for kept in [
+            "claude-opus-4-5",
+            "gpt-5.1",
+            "claude-sonnet-4-5@20250929",
+            "org/model:v2",
+        ] {
+            assert_eq!(code_model(kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_code_round_of_two_hundred_seats_is_taken_and_two_hundred_and_one_refused() {
+        let v = ReviewVocabulary::default();
+        let full: Vec<Value> = (0..BATCH_MAX).map(|_| seat("a", "m", "pass")).collect();
+        let got = code_round_recorded("s", "1", "h", &text(&full), &v).unwrap();
+        assert_eq!(got.entries.len(), BATCH_MAX);
+        let mut over = full;
+        over.push(seat("a", "m", "pass"));
+        let err = code_round_recorded("s", "1", "h", &text(&over), &v).unwrap_err();
+        assert_eq!(err.code, BATCH_TOO_LARGE);
+    }
+
+    #[test]
+    fn code_round_errors_never_echo_what_they_rejected() {
+        const SENTINEL: &str = "SECRET-SENTINEL-7f3a";
+        let v = vocabulary(&["a"], &[]);
+        let mut cases: Vec<String> =
+            vec![format!("{{\"{SENTINEL}\": "), format!("[\"{SENTINEL}\"]")];
+        for (field, value) in [
+            ("verdict", Value::from(SENTINEL)),
+            ("model", serde_json::json!([SENTINEL])),
+            ("seat", serde_json::json!([SENTINEL])),
+            (SENTINEL, Value::from(SENTINEL)),
+        ] {
+            let mut entry = seat("a", "m", "pass");
+            entry[field] = value;
+            cases.push(text(&[entry]));
+        }
+        for case in &cases {
+            let err = code_round_recorded("s", "1", "h", case, &v).expect_err(case);
+            assert!(!err.body().to_string().contains(SENTINEL), "{case}");
+        }
+        let err = code_round_recorded("s", SENTINEL, "h", "[]", &v).unwrap_err();
+        assert!(!err.body().to_string().contains(SENTINEL));
+    }
+
+    /// A code round counts one for the round and one per seat against the
+    /// session cap, and an empty one counts nothing.
+    #[test]
+    fn a_code_round_counts_its_round_and_each_seat_against_the_cap() {
+        let v = ReviewVocabulary::default();
+        let three = code_round_recorded(
+            "s",
+            "1",
+            "h",
+            &text(&[
+                seat("a", "m", "pass"),
+                seat("b", "m", "fail"),
+                seat("c", "m", "pass"),
+            ]),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            review_entries(&EventPayload::CodeReviewRoundRecorded(three.clone())),
+            4
+        );
+        let empty = code_round_recorded("s", "1", "h", "[]", &v).unwrap();
+        let empty = EventPayload::CodeReviewRoundRecorded(empty);
+        assert_eq!(review_entries(&empty), 0);
+        assert!(non_empty(empty).is_empty());
+
+        let check = DocCheckRecorded {
+            doc_type: "plan".into(),
+            schema: "plan/v2".into(),
+            rule_id: "r".into(),
+            outcome: "passed".into(),
+        };
+        let mut events: Vec<Event> = (0..SESSION_CAP - 4)
+            .map(|_| event(EventPayload::DocCheckRecorded(check.clone())))
+            .collect();
+        assert!(within_cap(&events, 4).is_ok());
+        events.push(event(EventPayload::CodeReviewRoundRecorded(three)));
+        assert!(within_cap(&events, 0).is_ok());
+        assert_eq!(within_cap(&events, 1).unwrap_err().code, CAP_REACHED);
     }
 }
