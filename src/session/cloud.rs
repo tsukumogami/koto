@@ -1386,10 +1386,11 @@ impl CloudBackend {
     /// its local state file is still the bytes it checked: the tick is the
     /// freshness window, so no request is made.
     ///
-    /// With `batch_counts`, which only a read passes, a command of `id`'s own
-    /// tick whose batch is open is fresh too: the tick's own writes, kept in
-    /// that batch, are what changed the local copy, not the bucket, and the
-    /// tick checks the bucket again before it pushes them (koto#439). A
+    /// With `batch_counts`, which only a read passes, `id`'s own tick or a
+    /// command it runs is fresh too while its batch is open: the writes of
+    /// the tick and its commands (koto#548), kept in that batch, are what
+    /// changed the local copy, not the bucket, and the tick checks the
+    /// bucket again before it pushes them (koto#439). A
     /// write doesn't pass it, so each write still checks for a migration
     /// marker that landed during the tick. A process in a write window
     /// defers too, but runs under no tick, so it is never fresh here.

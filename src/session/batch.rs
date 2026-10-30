@@ -68,7 +68,9 @@
 //! - The tick pulls its own session once, and that pull flushes a batch an
 //!   earlier process left open. After it the tick never pulls its session
 //!   again, so nothing replaces the tick's writes with the bucket's older
-//!   copy; it pushes the batch once on its way out, however it exits.
+//!   copy; it pushes the batch once on its way out, on every exit path it
+//!   controls. A tick killed before that push leaves the batch open, and
+//!   the next koto command on the session on this host pushes it.
 //! - Every other push of a session flushes its open batch first and pushes
 //!   nothing of its own while the batch is open: a state file or manifest
 //!   pushed alone would name keys the bucket doesn't hold. `ensure_pushed`
