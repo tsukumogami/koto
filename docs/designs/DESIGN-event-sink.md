@@ -106,7 +106,9 @@ can't also be the one writing stdin.
 Key assumptions:
 
 - A spawn failure or a wait error counts as a kill: the chunk is dropped and
-  counted, and the breaker trips.
+  counted, and the breaker trips. A kill only trips it when the call had the
+  sink's full 2.0 s per-call bound; a chunk that would start with less is
+  never started (see Solution Architecture, the flush).
 - Exit 1, and any code outside the contract, neither retries nor trips the
   breaker.
 - A stamped line over the 4096-byte line cap isn't sent and is counted as
@@ -430,11 +432,13 @@ without `chown`.
 **The call.** `Command::new(path).args(["send", "--scope", "koto-journal"])`,
 plus `--carry N` when N > 0, runs with `process_group(0)` and the working
 directory `/`. Stdin is piped, and stdout and stderr go to null. The
-environment is cleared to an allowlist: `HOME`, `PATH`, `TMPDIR`, `LANG`,
-`LC_ALL`, `LC_CTYPE`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`,
-`NO_PROXY`, in either case) and `SSL_CERT_FILE` and `SSL_CERT_DIR`. A
-credential in the user's shell therefore never reaches the sink. koto reads
-only the exit status.
+environment is cleared to an allowlist of names: `HOME`, `PATH`, `TMPDIR`,
+`LANG`, `LC_ALL` and `LC_CTYPE`, plus the three identity variables the sink
+stamps each record with, `CLAUDE_CODE_SESSION_ID`, `NIWA_DISPATCH_ID` and
+`NIWA_WORKSPACE`, each passed only when it's set. Nothing else gets through,
+proxy and certificate variables included, since the sink doesn't use them.
+A credential in the user's shell therefore never reaches the sink. koto
+reads only the exit status.
 
 A writer thread writes the chunk's lines and closes stdin, and an `EPIPE`
 ends it quietly. The flushing thread calls `wait_timeout(deadline - now)`.
@@ -452,12 +456,21 @@ long. It returns at once when the queue is empty. With the breaker in
 `StoppedCounting` it adds each item to its session's `dropped` and returns;
 in `StoppedSilent` it discards them. Otherwise it sets the call deadline to
 `start + 2.85 s`, takes the carry for the sessions in this flush, and sends
-chunks of up to 200, the first with `--carry`. Exit 0 and 4 go on to the
-next chunk; exit 1 or another code drops that chunk, counts it, and goes on;
-exit 2 sets `StoppedSilent` and discards the rest uncounted; exit 3 or a kill
-sets `StoppedCounting`, adds back the taken carry plus the failed chunk's
-records, and counts every chunk not sent. A chunk the deadline doesn't reach
-is dropped and counted the same way. The 150 ms between the call deadline
+chunks of up to 200, the first with `--carry`. A chunk starts only when at
+least 2.0 s, the sink's own per-call bound, is left before the call
+deadline. Since the deadline is 2.85 s, in practice the first chunk always
+starts and a later one starts only after quick calls. Exit 0 and 4 go on to
+the next chunk. Exit 1 or another code drops that chunk, counts it, and
+goes on. Exit 2 sets `StoppedSilent` and discards the rest uncounted. Exit 3,
+a spawn failure, or a kill of a call that had its full 2.0 s sets
+`StoppedCounting`, adds back the taken carry plus the failed chunk's
+records, and counts every chunk not sent.
+
+A chunk that can't start because less than 2.0 s is left is dropped and
+counted, with no call, no kill and no change to the breaker. A kill koto
+would cause itself, on a sink that is slow but healthy, never trips it, so
+a long-lived process (a `koto request` wait, a polling gate) keeps sending
+on its next flush. The 150 ms between the call deadline
 and 3.0 s pays for the group wait (at most 100 ms) and the add-back's lock
 (at most 50 ms), so the flush ends within 3.0 s of its start.
 
@@ -609,6 +622,8 @@ release A run unchanged.
 | Flush point 4: after `terminal`, before removal | `flush_points_test.rs`: `terminal_flush_precedes_removal` (the stub checks the session directory still exists and that `terminal` is in its stdin) | 7 |
 | Flush point 5, and no direct exit outside the helper | `tests/event_sink_exit_test.rs`: `exit_helper_flushes_queued_records`; clippy's `disallowed-methods` in CI; `src/exit.rs` unit test on hook order | 2, 5 |
 | 450 records: 200, 200, 50; a deadline in the second call drops the third; the flush ends within 3.0 s | `src/telemetry/queue.rs` unit tests: `chunks_200_200_50`, `deadline_drops_unreached_chunk` | 5 |
+| A chunk with under 2.0 s left is dropped and counted without a kill or a breaker trip | `queue.rs`: `late_chunk_dropped_breaker_stays_open` (the deadline leaves under 2.0 s before the third chunk; the third is counted, the breaker stays open, the next flush sends) | 5 |
+| The sink's environment holds only the allowlist | `event_sink_records_test.rs`: `sink_env_is_allowlist_only` (with the three identity variables and a decoy credential set, the stub sees the identity variables and nothing outside the allowlist) | 5 |
 | Exit 3: called once, later records counted, carry added back | `queue.rs`: `exit_3_trips_breaker_and_adds_back` | 5, 6 |
 | A hung sink is killed with its group | `event_sink_exit_test.rs`: `hung_sink_killed_with_group` (the stub forks a child; nothing of the group is left) | 5 |
 | Exit 2: called once, nothing counted | `queue.rs`: `exit_2_stops_without_counting` | 5 |
