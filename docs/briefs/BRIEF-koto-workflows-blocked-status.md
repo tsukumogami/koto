@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   An operator can't tell from Claude Code's `/workflows` screen that a koto
   session is stopped on a failing gate: the entry is counted as completed, its
@@ -16,7 +16,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 Framing for the fix to tsukumogami/koto#553, with tsukumogami/koto#554 taken
 in as the same field. It follows the phase-detail work, which promised that a
