@@ -421,7 +421,8 @@ that footing.
 - [ ] In the same run, each of the three decisions exists as keys in the worker's session, and no
   file under `~/.koto/` outside `sessions/` is created or changed holding a decision, a reversal or
   a gate answer. With `~/.koto/_decider_ledger.jsonl` replaced by a directory before the run, every
-  step succeeds, and `koto decider report` returns the gate answer from the worker's session.
+  step succeeds, and `koto decider report` returns the gate answer from the worker's session; with
+  the file instead holding a stale answer for another session, the report omits it.
 
 **A person deciding**
 
@@ -567,7 +568,7 @@ that footing.
   second-month reversal of a first-month decision under the window's reversals, counts defaulted
   gate passes, and states how many sessions it read; `--below` a root counts only that hierarchy.
   A decision timed exactly at the window's start is counted and one timed exactly at its end is
-  not.
+  not, and the fixture's `reverse` and `refused` decisions appear in no decisions-made count.
 
 **Field-level checks**
 
