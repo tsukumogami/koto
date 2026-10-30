@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto's `/workflows` entry serializes its own blocked classification straight
   into the top-level `status`, a word Claude Code 2.1.314 doesn't know, and
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 Design for the requirements in `docs/prds/PRD-koto-workflows-blocked-status.md`
 (tsukumogami/koto#553, with tsukumogami/koto#554 taken in). It replaces the
