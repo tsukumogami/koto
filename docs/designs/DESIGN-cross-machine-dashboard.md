@@ -32,6 +32,7 @@ rationale: |
   can't remove, or need shared writes. A background feed is the only shape
   that keeps bucket requests off the TUI's input thread.
 upstream: docs/prds/PRD-cross-machine-dashboard.md
+user_visible_surface: true
 decision_provenance: inline-resolved
 ---
 
@@ -215,9 +216,10 @@ requests in flight, following every page. Each session's top-level objects
 `template.json`, `batch-open.json`) come back with ETag, LastModified and
 Size, and its `ctx/` tree folds into one entry. A pure classifier then
 decides each session's row: no state object means the session was removed
-(drop it); a `migrated.json` in the session's own directory, or a local
-session's import or supersede record naming it, means a migrated or
-superseded source (hide it); a `sources` entry in another remote row's
+(drop it); a `migrated.json` in the session's own directory whose named
+copy appears in the same scan, or a local session's import or supersede
+record naming it, means a migrated or superseded source (hide it, and count
+it); a `sources` entry in another remote row's
 summary that names it by `session_id` only recedes it, since any bucket
 writer can write such an entry (see Security Considerations);
 a state object with no summary is a legacy session (show it as `unknown`,
@@ -227,9 +229,9 @@ TUI) or on every run (`--once`), and reads as `unknown` if it's over
 64 KiB by its listed Size, doesn't parse, has the wrong schema version, or
 names a different session than its key. A summary whose `state_etag` no
 longer matches the listed state file (an older release pushed the state
-without refreshing the summary) reads as `unknown` once the mismatch has
-lasted two TUI listings, or for `--once` once the state file is more than
-60 seconds old.
+without refreshing the summary) reads as `unknown` once the state file's
+LastModified is more than 60 seconds old, in the TUI and `--once` alike;
+inside that window it's the ordinary gap between the two PUTs.
 
 No delete path changes: cleanup, prune, `prune --migrated-from` and
 relocate already remove everything under `<home>/<id>/`, in every release,
@@ -334,10 +336,11 @@ like `spawn_entry`) and don't move `CURRENT_SCHEMA_VERSION`.
 The name is resolved once per process: `KOTO_MACHINE_NAME` when set and
 non-empty, else `machine.name` from the user-level configuration file, else
 the hostname with any domain part removed. A valid name is 1 to 64
-characters of `[A-Za-z0-9._-]`. `koto config set --user machine.name`
-refuses anything else; an invalid environment value is ignored with one
+characters of `[A-Za-z0-9._-]`, and the name `unknown` is reserved for
+sessions with no record. `koto config set --user machine.name` refuses
+anything else; an invalid environment value is ignored with one
 warning on stderr; a hostname is coerced (other characters become `-`, then
-it's cut to 64).
+it's cut to 64, and a hostname of `unknown` becomes `unknown-host`).
 
 #### Alternatives Considered
 
@@ -455,31 +458,43 @@ delete paths or `origin`.
   and import; `producing_machine(events) -> Option<String>` reads them back.
 - **Row derivation** (new `src/session/row.rs`, lifted out of
   `read_session` in `src/cli/dashboard_data.rs:381-508`):
-  `derive_row(header, events, template) -> SessionRow`, a pure function
+  `derive_row(header, events, template) -> SessionRow` (it needs the event
+  stamp for the producing machine), a pure function
   returning current state, terminal/blocked/failed flags, intent, template
   name, salient variable, batch and request-leg flags, last event time,
   parent and producing machine. The local dashboard and the summary writer
   both call it.
 - **Summary writer** (`src/session/summary.rs`, called from `put_state`
-  after `record_synced`, from `put_state_over`, and once after the import's
-  `push_staged`, which is changed to keep the state PUT's ETag): builds a
-  `SessionSummary` from `derive_row` plus `last_seq`, `state_etag` and
-  `sources`, serializes it under the size cap, and PUTs
-  `<home>/<id>/summary.json`. A failed PUT warns like any push failure and
-  never fails the command; the write honours `refuse_if_read_only`; internal
-  sessions and `push_fence` write none.
-- **Remote reader** (`src/session/remote_feed.rs`): `scan(budget, cache) ->
-  RemoteSnapshot`. Builds its own S3 client from the resolved cloud config
-  with a 10-second request timeout, lists the top level, lists each chosen
-  prefix with delimiter `/ctx/` (falling back per endpoint), classifies each
-  session directory with `classify(listing, cache, locals) -> RemoteRow`,
-  fetches changed summaries, and maps every failure to `unreachable`,
-  `denied`, `timeout` or `throttled`. It holds its ETag cache in memory
-  only, writes nothing to the bucket or the session store, and is never
-  given the `CloudBackend`'s sync paths.
+  after `record_synced`, from `put_state_if` and `put_state_over`, and once
+  after the import's `push_staged`, which is changed to keep the state PUT's
+  ETag): builds a `SessionSummary` from `derive_row` plus `last_seq`,
+  `state_etag` and `sources`, applies the per-field caps, serializes it
+  under the size cap, and PUTs `<home>/<id>/summary.json`. It derives the
+  row from the events and template the push already holds in memory, so it
+  never re-reads the log. A failed PUT warns like any push failure, never
+  fails the command, and marks the session so the next flush writes the
+  summary even if the state didn't change; the write honours
+  `refuse_if_read_only`; internal sessions and `push_fence` write none.
+- **Remote reader** (`src/session/remote_feed.rs`): `scan(budget, cache,
+  locals) -> RemoteSnapshot`. Builds its own S3 client through the same
+  constructor `create_bucket` uses (endpoint, region, path style, TLS and
+  credentials resolved as for every other command), adding a 10-second
+  request timeout and no write method. It reuses the top-level listing and
+  16-hex filter `held_elsewhere` uses, lists each chosen prefix with
+  delimiter `/ctx/` (falling back per endpoint), classifies each session
+  directory, fetches changed summaries with the body read capped at 64 KiB
+  plus one byte, and maps every failure to `unreachable`, `denied`,
+  `timeout` or `throttled`. It holds its ETag cache in memory only, writes
+  nothing to the bucket or the session store, and is never given the
+  `CloudBackend`'s sync paths. The sanitizer lives here, so no unsanitized
+  bucket string leaves the reader.
 - **Dashboard integration** (`src/cli/dashboard_data.rs`,
   `dashboard_state.rs`, `dashboard_render.rs`, `dashboard.rs`): a
-  `RemoteFeed` thread for the TUI and a synchronous call for `--once`; the
+  `RemoteFeed` thread the TUI starts with its first frame and stops when it
+  exits (dropping the channel ends the thread after its current request),
+  which reads the current local set (`session_id`s plus each local
+  session's home prefix and name) from a shared handle the UI thread
+  updates every refresh; a synchronous call for `--once`; the
   `RowKey` composite key; the `@<machine>` / `@unknown` marker on remote
   rows; the Machine row and workspace id in the Session tab and the one-line
   notice on a remote row's other tabs; the status line for a failed or
@@ -515,6 +530,31 @@ object's key as an unreadable row.
 the local backend). `koto dashboard --detail <name>` adds `"machine":
 <string|null>`; `docs/reference/session-feed.md` documents both.
 
+The reader's types:
+
+- `RemoteRow { key: RowKey, row: SessionRow, workspace: String, status:
+  Shown | Unknown(reason) | Receded | Hidden }`, every string sanitized.
+- `RemoteSnapshot { rows: Vec<RemoteRow>, failure: Option<{class, host,
+  failed_workspaces}>, unreadable: usize, hidden_sources: usize,
+  truncated: bool, taken_at }`.
+- `EtagCache`: `(workspace, session_id) -> (summary_etag, SessionRow)`, in
+  memory, owned by the feed thread.
+
+The classifier applies these rules to each session directory in order; the
+first that matches decides:
+
+| Order | Listing shows | Row |
+|-------|---------------|-----|
+| 1 | no state object | dropped (removed session) |
+| 2 | internal name (`~`, `anchor-` prefix, `-closed` suffix) | dropped |
+| 3 | `session_id` or (home, name) of a local session | dropped (shown as local) |
+| 4 | `migrated.json` naming a copy present in this scan, or named by a local import or supersede record | hidden, counted |
+| 5 | state object, no summary | `unknown`, counted unreadable |
+| 6 | summary over 64 KiB, unparseable, wrong schema, key mismatch, or `sources` over 16 | `unknown`, counted unreadable |
+| 7 | summary whose `state_etag` differs and state older than 60 s | `unknown`, counted unreadable |
+| 8 | named in another remote summary's `sources` | receded |
+| 9 | otherwise | shown from the summary |
+
 Configuration: `KOTO_MACHINE_NAME` and the user-level key `machine.name`.
 
 ### Data Flow
@@ -543,7 +583,12 @@ session-shaped directory with a `ctx/` tree and checks that a
 `/ctx/`-delimited listing returns the top-level objects and one common
 prefix. Run it by hand against AWS, MinIO and B2 and record the results in
 the cloud sync guide. A failure on R2 or AWS switches the layout to the
-sibling summary before phase 4 starts.
+sibling summary before phase 4 starts; that layout needs tombstones and new
+deletes in cleanup, prune and relocate, so the plan gains an issue for them
+and is re-checked before phase 4.
+
+The writer (phases 2 to 4) can ship a release before the reader, so
+summaries are already in the bucket when the first reader looks for them.
 
 Deliverables:
 - a probe test in the cloud integration suite
@@ -561,6 +606,8 @@ Deliverables:
 
 ### Phase 3: Shared row derivation
 
+Depends on phase 2, since the row carries the producing machine.
+
 Deliverables:
 - `derive_row` lifted out of `read_session`, with the local dashboard
   calling it and its output unchanged on the existing dashboard tests
@@ -570,8 +617,9 @@ Deliverables:
 Depends on phases 1 to 3.
 
 Deliverables:
-- `SessionSummary` and the PUT after `put_state`, `put_state_over` and
-  import (keeping the import's state ETag)
+- `SessionSummary` and the PUT after `put_state`, `put_state_if`,
+  `put_state_over` and import (keeping the import's state ETag), with the
+  per-field caps and the retry on the next flush
 - tests that a tick issues exactly one extra PUT, that internal sessions
   write none, and that cleanup and prune remove the summary
 
@@ -588,15 +636,16 @@ Deliverables:
   failures, pagination and the request counts R21 and R24 bound
 - the Security Considerations rules: corroborated hiding only, the
   `sources` cap, strict summary parsing, `machine` re-validation, timestamp
-  clamping and the per-run ceilings with their truncation notice
+  clamping, the per-run ceilings with their truncation notice, and the
+  sanitizer
 
 ### Phase 6: Dashboard integration
 
 Depends on phases 2 and 5.
 
 Deliverables:
-- the TUI feed thread, `RowKey`, merge and dedup, marker, Session tab facts,
-  status line and sanitizer
+- the TUI feed thread, `RowKey`, merge and dedup, marker, Session tab facts
+  and status line
 - the `--once` columns and `--detail` field
 - the two evidence scenarios as integration tests against the fake bucket
 
@@ -623,37 +672,64 @@ prevent is a bucket writer using the dashboard against the person reading
 it.
 
 **No silent hiding.** A summary's `sources` list can't hide another
-session's row. Hiding needs corroboration a summary can't forge on its own
-behalf: a `migrated.json` in the hidden session's own directory (which every
-import writes) or a local session's import or supersede record. A `sources`
-entry from a remote summary only recedes the row it names, which stays
-reachable with `--all` and the `a` key. `sources` is capped at 16 entries and
-a summary with more is read as unreadable.
+session's row: a `sources` entry from a remote summary only recedes the row
+it names, which stays reachable with `--all` and the `a` key, and `sources`
+is capped at 16 entries (a summary with more is unreadable). Hiding needs a
+`migrated.json` in the hidden session's own directory whose named copy is
+present in the same scan, or a local import or supersede record. Every
+hidden row is counted on the status line and in `--once`'s stderr note, so
+hiding is never silent. This raises the bar without removing it: a writer
+that plants both a marker and a copy can still hide a row, and that is part
+of the accepted residual risk above.
 
 **Strict parsing and size limits.** A summary is fetched only when its
-listed Size is at most 64 KiB, and the body is parsed into a closed schema:
+listed Size is at most 64 KiB, and the read stops at 64 KiB plus one byte,
+so an object swapped between the listing and the GET can't exceed the bound;
+a body that reaches the limit is unreadable. Each field has its own cap
+(name, template name, state and salient variable 256 bytes each, intent
+1 KiB, machine 64), checked by the writer and again by the reader. The body
+is parsed into a closed schema:
 an unknown `schema` value, a missing required field, or a `session_id`,
 `name` or `home` that disagrees with the object's key makes the row
 unreadable rather than partly trusted. The `machine` value is re-validated
-against the same 1-to-64-character `[A-Za-z0-9._-]` rule the writer uses; a
-value that fails is shown as `unknown`. Timestamps later than the reader's
+against the same 1-to-64-character `[A-Za-z0-9._-]` rule the writer uses,
+with `unknown` reserved; a value that fails is shown as `unknown`, so a
+missing record and a malformed one look the same and neither can pose as a
+real machine named `unknown`. Timestamps later than the reader's
 clock plus five minutes are clamped to the reader's clock, so a forged
 future time can't pin a row at the top of a band.
 
 **Terminal output.** One sanitizer handles every string that came from the
 bucket before it reaches a row: it replaces C0 and C1 control characters,
 DEL, U+2028, U+2029 and the bidirectional override and isolate characters
-(U+202A to U+202E, U+2066 to U+2069) with a space, which removes ESC and so
+(U+202A to U+202E, U+2066 to U+2069), the zero-width and directional marks
+(U+200B to U+200F, U+061C, U+FEFF) and the tag characters (U+E0000 to
+U+E007F) with a space, which removes ESC and so
 every CSI and OSC sequence, and removes tab and newline from `--once`
 fields. Tests feed each of these through `--once` and the TUI's rendered
-buffer.
+buffer. Remote rows offer no action: the TUI's keys on a remote row only
+move the selection and open its Session tab, and no remote string reaches a
+shell or a koto command line.
 
 **Resource ceilings.** A hostile or simply huge bucket can't hang or exhaust
 the reader. Every request times out after 10 seconds, the TUI's scan has
 its per-refresh budget, and each run stops at 5,000 workspace prefixes, 100
 listing pages per prefix and 20,000 sessions, showing a "listing
 truncated" notice on the status line (and stderr for `--once`) when a
-ceiling is reached.
+ceiling is reached. Local rows are never dropped by a ceiling; prefixes are
+taken in order of their most recent state change as the listings report it,
+so the sessions most likely to need the developer survive truncation. A
+writer can still pad the bucket to push real sessions past a ceiling, or
+forge blocked rows to crowd the needs-you band; both are visible (the
+truncation notice, the machine marker on every forged row) and part of the
+accepted risk. Request cost is bounded per run and, in the TUI, per
+refresh; a long-running TUI's total cost is documented rather than
+capped.
+
+**Concurrent writers.** Two machines can push the same session when their
+checkouts share a path (and so a prefix). The summary is last-writer-wins
+like the state file; when the two disagree, the `state_etag` check reads
+the row as `unknown`, so the failure is visible rather than wrong.
 
 **Permission scope.** The reader needs `s3:ListBucket` and `s3:GetObject`
 only and builds its own client that has no write path; a test runs the
@@ -666,10 +742,14 @@ doesn't change, and no setting comes from a project's files.
 **Data exposure.** A summary publishes the session's name, template name,
 state, intent, salient variable and machine name into the bucket. All of
 them except the machine name are already in the state file beside it, so
-the summary exposes nothing new to anyone who can read the bucket. The
-machine name defaults to the short hostname, which is new in the bucket; the
-cloud sync guide says so, and a developer who doesn't want the hostname
-published sets `machine.name` or `KOTO_MACHINE_NAME` to something else.
+the summary gives no new access to anyone who can read the bucket. What
+changes is display: the dashboard now gathers every workspace's intents and
+states on one screen, which matters on a shared or recorded screen, and the
+dashboard guide says so. The machine name defaults to the short hostname,
+which is new in the bucket. The PRD chose the hostname default so a
+developer on several machines needs no setup; the cloud sync guide states
+it, and a developer who doesn't want the hostname published sets
+`machine.name` or `KOTO_MACHINE_NAME` to something else.
 
 **Existing listers.** The summary sits inside the session's directory, not
 at the top level, so `held_elsewhere`, the continues walk and prune, which
