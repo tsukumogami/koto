@@ -525,10 +525,11 @@ fn an_unreadable_bucket_prints_no_endpoint_credentials() {
     }
 }
 
-/// A session imported into another workspace refuses the read as it
-/// refuses any other, naming where it went.
+/// A session imported into another workspace is kept as a read-only
+/// predecessor: the reads answer from the copy it left, and leave the
+/// bucket, marker and all, as it was.
 #[test]
-fn a_migrated_session_refuses_and_names_the_new_one() {
+fn a_migrated_session_is_read_from_the_copy_it_left() {
     let f = fixture();
     let marker = serde_json::json!({
         "schema": 1,
@@ -545,17 +546,39 @@ fn a_migrated_session_refuses_and_names_the_new_one() {
         &format!("{}/{}/migrated.json", f.a.prefix(), NAME),
         marker.to_string().as_bytes(),
     );
+    let before = objects(&f.s3);
+    f.s3.clear_requests();
+    let run = read(&f.b, &f.a.prefix(), &["status", NAME]);
+    ok(&run, "status");
+    assert_eq!(run.json["is_terminal"], true, "{}", run.describe());
+    let run = read(&f.b, &f.a.prefix(), &["context", "get", NAME, "notes.md"]);
+    ok(&run, "context get");
+    assert_eq!(run.stdout.as_bytes(), NOTES);
+    let run = read(&f.b, &f.a.prefix(), &["context", "list", NAME]);
+    ok(&run, "context list");
+    assert!(
+        run.json
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|k| k == "notes.md")),
+        "{}",
+        run.describe()
+    );
+    let run = read(
+        &f.b,
+        &f.a.prefix(),
+        &["context", "exists", NAME, "notes.md"],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.describe());
     for args in [
-        vec!["status", NAME],
-        vec!["context", "get", NAME, "notes.md"],
-        vec!["context", "list", NAME],
+        vec!["decisions", "list", NAME],
+        vec!["overrides", "list", NAME],
     ] {
         let run = read(&f.b, &f.a.prefix(), &args);
-        assert_eq!(run.code, Some(2), "{}", run.describe());
-        let error = run.json["error"].as_str().unwrap_or_default();
-        assert!(error.contains("session_migrated"), "{}", run.describe());
-        assert!(error.contains("moved"), "{}", run.describe());
+        ok(&run, &args.join(" "));
+        assert_eq!(run.json["state"], "done", "{}", run.describe());
     }
+    assert_eq!(writes(&f.s3), Vec::<String>::new());
+    assert_eq!(objects(&f.s3), before);
 }
 
 /// Every verb that writes or removes refuses `--workspace` with

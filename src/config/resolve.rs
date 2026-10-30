@@ -726,8 +726,9 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
 }
 
 /// Apply `session.cloud.marker_retain_days` from a config file. Called for
-/// the user layer only: the bound guards a deletion from the bucket, so a
-/// project file in a cloned repository must not shorten it (`koto config
+/// the user layer only, as before: the setting no longer decides removal
+/// (`koto session prune --migrated-from` reports it under `ignored`), and a
+/// project file in a cloned repository still can't set it (`koto config
 /// set` refuses the key without `--user`).
 fn merge_marker_retention(target: &mut KotoConfig, source: &LoadedConfig) {
     if source.config.session.cloud.marker_retain_days.is_some() {

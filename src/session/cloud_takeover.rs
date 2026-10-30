@@ -144,8 +144,16 @@ impl CloudBackend {
         })?;
         staging.dir = pending.clone();
 
-        // 3. Push.
-        let pushed = self.push_staged(name, &staging.dir, source, &carried)?;
+        // 3. The back-reference beside the source, then the push. Before
+        // the marker, a failure takes both back.
+        let owed = self.put_import_backref(name, &staging.dir, source, &session_id)?;
+        let pushed = self
+            .push_staged(name, &staging.dir, source, &carried)
+            .inspect_err(|_| {
+                if reuse_session_id.is_none() {
+                    self.take_back_backref(&owed);
+                }
+            })?;
         crash_at("after-push");
 
         // 4. Re-check under the locks, then mark. A definite marker failure
@@ -169,6 +177,7 @@ impl CloudBackend {
             // the next run to finish.
             if reuse_session_id.is_none() {
                 self.take_back(&pushed);
+                self.take_back_backref(&owed);
             }
             return Err(e);
         }
@@ -178,7 +187,7 @@ impl CloudBackend {
         staging.moved = true;
         if reuse_session_id.is_none() {
             if let Err(e) = self.mark_source(req, source, &session_id, &machine_id) {
-                if let Some(stop) = self.after_failed_mark(e, source, &session_id, &pushed) {
+                if let Some(stop) = self.after_failed_mark(e, source, &session_id, &pushed, &owed) {
                     return Err(stop);
                 }
             }
@@ -563,11 +572,13 @@ impl CloudBackend {
         source: &ImportSource,
         session_id: &str,
         pushed: &[String],
+        owed: &crate::session::continues_bucket::OwedPointer,
     ) -> Option<ImportError> {
         let pending = takeover_dir(self.local.base_dir(), &source.name);
         if err.code != ImportErrorCode::Unmarked {
             // Another import marked the source meanwhile.
             self.take_back(pushed);
+            self.take_back_backref(owed);
             let _ = std::fs::remove_dir_all(&pending);
             return Some(err);
         }
@@ -583,6 +594,7 @@ impl CloudBackend {
             Ok(Some(marker)) if marker_target_field(&marker, "session_id") == session_id => None,
             Ok(Some(marker)) => {
                 self.take_back(pushed);
+                self.take_back_backref(owed);
                 let _ = std::fs::remove_dir_all(&pending);
                 Some(ImportError::new(
                     ImportErrorCode::SourceMigrated,
@@ -596,6 +608,7 @@ impl CloudBackend {
             }
             Ok(None) => {
                 self.take_back(pushed);
+                self.take_back_backref(owed);
                 let _ = std::fs::remove_dir_all(&pending);
                 Some(ImportError::new(
                     ImportErrorCode::PushFailed,

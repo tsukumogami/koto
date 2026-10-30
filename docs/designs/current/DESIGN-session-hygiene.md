@@ -182,13 +182,32 @@ still protect one inside them. For each session it reads:
 
 | Rule | Keeps | How the prune knows |
 |------|-------|---------------------|
-| a | a running or unreadable session | the inspection: status `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink) |
-| b | a session some running or unreadable session references, or any finished session while some session's header can't be read | the reverse of the reference map below, checked against each referencer's status; a session whose header doesn't parse has no known references, so it counts as a possible referencer of every session and is named in each kept reason |
-| c | a finished session that references a running or unreadable one | the reference map, checked against the referenced session's status; a reference to a name with no session protects nothing |
+| a | a session alive by the engine (the session-retention design's liveness check) | a koto session is alive while its status is `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink). A close session is never alive. An anchor is alive until it closes: an observed anchor closes only by its observed close, and one with no observed marker also closes once the idle period after its last activity passes |
+| b | replaced by rule `h` in the session-retention design; it kept a session some running or unreadable session references, or any finished session while some session's header couldn't be read | nothing: the letter stays unused |
+| c | replaced by rule `h` in the session-retention design; it kept a finished session that references a running or unreadable one | nothing: the letter stays unused |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
 | e | a session bound to a waiting or unreadable request leg | `request-leg.toml` in the session directory; the request is read with `request_store::read_view`; kept when the request is open with the leg open, or when the pointer or the request can't be read or parsed; a request that doesn't exist releases it |
-| f | a coordinator's session | the name begins `coordinate-` |
+| f | retired by koto#532; it kept every session whose name begins `coordinate-` | nothing: the letter stays unused |
 | g | under the cloud backend, a session whose remote copy is ahead of the local one, diverged from it, or can't be read | one listing of the session's remote prefix: a remote state log longer than the local one keeps it, and when a remote `version.json` is listed it is compared with the local one by the existing `check_sync`, where anything but `Safe` keeps it |
+
+Rule f is retired. A session's name keeps nothing: a finished coordinator
+session is kept like any other, by a pin, by its hierarchy, or by a later
+session that continues it (rule r, whose entry names that successor). The
+letter f stays unused, since the letters are the `rule` field callers read in
+prune's JSON. The retention guide's
+[Coordinator sessions and the retired name rule](../../guides/session-retention.md#coordinator-sessions-and-the-retired-name-rule)
+covers the change.
+
+Rules b and c are replaced too. The session-retention design's
+[Decision 3](DESIGN-session-retention.md#decision-3-the-retention-engine-and-its-wiring)
+folds both into rule `h` (hierarchy): the retention engine joins sessions
+through links, `parent_workflow` and a well-formed `chain/parent`, judges
+each joined component as a unit, and prune reports the kept entry's
+`detail` as the engine's rendered verdict with a structured `hierarchy`
+field. The same decision makes rule a "alive by the engine", as the row
+above reads. The letters b and c stay unused, for the same reason as f. The
+paragraphs below on unreadable sessions, the reference map and the chain
+close rule describe rules b and c as they first shipped.
 
 Rule g goes beyond the PRD's list for one reason. The cloud backend's
 cleanup deletes the session's remote objects too, and a host whose local copy
@@ -204,39 +223,47 @@ never saw. A local log longer than the remote one only means this host's last
 push didn't land, which the removal loses nothing by. A remote `version.json`
 the local copy has none to compare with keeps the session too.
 
-An unreadable session counts as possibly running for rules b and c, so it
-protects what it references and what references it, as rule a keeps it. When
-the unreadable part is the header, what it references is unknown: its
-`parent_workflow` is in the header it lost. So while any session's header
-can't be read, rule b keeps every finished session and names that session,
-so a person can inspect or remove it and let the prune go on. Nothing
-narrows the set, since the execution directory that could scope it is in the
-header too.
+Under the original rules b and c, an unreadable session counted as possibly
+running, so it protected what it referenced and what referenced it, as rule a
+kept it. When the unreadable part was the header, what it referenced was
+unknown: its `parent_workflow` is in the header it lost. So while any
+session's header couldn't be read, rule b kept every finished session and
+named that session, so a person could inspect or remove it and let the prune
+go on. Nothing narrowed the set, since the execution directory that could
+scope it is in the header too. Rule `h` also fails toward keeping: in the
+retention design an unreadable log taints its component and counts as alive,
+and an unreadable header, manifest or links directory taints every component.
 
-The reference map has an edge A to B when A's header `parent_workflow` is B,
-or A's context key `chain/parent` holds exactly B. The context key is read from
-the local session directory (`ctx/` under the session's directory) directly,
-never through the cloud backend's context store, so a prune makes no network
-call to judge a session.
+The original reference map had an edge A to B when A's header
+`parent_workflow` was B, or A's context key `chain/parent` held exactly B.
+Rule `h`'s graph has these edges, with the retention design's epoch-branch
+rule for `parent_workflow`, and the `koto/links/` entries too. The
+context key is read from the local session directory (`ctx/` under the
+session's directory) directly, never through the cloud backend's context
+store, so a prune makes no network call to judge a session.
 
-These rules carry the resume convention's close rule without knowing about
-it. A chain parent that exits with an `exit:` value closes its children and
-then itself. Nothing running references either, so both go. A clean cancel,
-refusal or error terminal closes nothing: the children stay running, and they
-reference the parent through `chain/parent`. So rule b keeps the parent, and
-the running children aren't candidates at all. A koto-lineage child of a
-running parent is kept by rule c until the parent finishes, so a parent never
-loses a child it hasn't read. The prune never removes a running session,
-which is also why it never loses another feature's open per-visit journal
-aggregate: one exists only on a session that hasn't finished.
+The original rules b and c carried the resume convention's close rule without
+knowing about it. A chain parent that exits with an `exit:` value closes its
+children and then itself. Nothing running referenced either, so both went. A
+clean cancel, refusal or error terminal closes nothing: the children stay
+running, and they reference the parent through `chain/parent`. So rule b kept
+the parent, and the running children weren't candidates at all. A
+koto-lineage child of a running parent was kept by rule c until the parent
+finished, so a parent never lost a child it hadn't read. Rule `h` keeps more:
+a parent with children always has an edge, so it and its children are kept at
+its terminal tick, and prune reclaims the subtree once the retention design's
+rule releases it. The prune never removes a running session, which is also
+why it never loses another feature's open per-visit journal aggregate: one
+exists only on a session that hasn't finished.
 
 *Alternative: a generic reference area in context (`refs/<name>`).* A
 session would declare each session it depends on as a key, and koto would
 own the convention outright. Rejected for now: the one consumer that links
 sessions without koto lineage already writes `chain/parent`, and a second
 convention would need that consumer to write both until every running
-session had moved over. Rule c accepts exactly one key, compared and never
-interpolated, so widening it later is additive.
+session had moved over. Rule c accepted exactly one key, compared and never
+interpolated, so widening it later was additive. Rule `h`, which replaced it,
+reads `chain/parent` the same way and adds the `koto/links/` entries.
 
 *Alternative: scan the request store for open legs bound to each session.*
 This is the authoritative reverse lookup (`list_requests` plus `read_view` per
@@ -364,8 +391,11 @@ verb:
   keeps running and unreadable sessions, anything a running session
   references or that references a running session (through
   `parent_workflow` or `chain/parent`), malformed references, sessions
-  bound to a waiting request leg, `coordinate-` sessions, and, under the
-  cloud backend, sessions whose remote copy may be newer. A preview is
+  bound to a waiting request leg, and, under the cloud backend, sessions
+  whose remote copy may be newer. It no longer keeps `coordinate-` sessions
+  by name: koto#532 retired that rule. The session-retention design later
+  replaced the two reference rules with rule `h` (hierarchy) and made the
+  running and unreadable rule "alive by the engine". A preview is
   stored under its plan token so an exact apply can diff against it, and
   each removal happens under the session's lock after a re-check
   (R5 to R11).
@@ -463,16 +493,19 @@ mistake is a usage error rather than a store-wide removal.
 Session mode:
 
 1. Enumerate every local session (above) and `inspect` each one. Read each
-   session's `chain/parent` and build the reference map (Decision 3).
+   session's `chain/parent` and build the reference map (Decision 3), which
+   rule `h`'s graph has since replaced.
 2. Candidates are sessions that pass the filters and are `Terminal` or
    `Cancelled`, plus finished records (below) that pass the filters. The age
    filter compares `finished_at` with now.
 3. For each session that passes the filters, whatever its status, evaluate
-   rules a to g in order, so a running or unreadable session shows on `kept`
-   under rule a. The first rule that applies puts the session on `kept` with
-   that rule's letter and a detail (the referencing or referenced name, the
-   request id); a candidate no rule keeps goes on the would-remove list.
-   Records have
+   the rules in order, so a running or unreadable session shows on `kept`
+   under rule a. As first shipped the rules were a to g; the
+   session-retention design later replaced b and c with rule `h`, which it
+   specifies, and koto#532 retired f. The first rule that applies puts the
+   session on `kept` with that rule's letter and a detail (the request id
+   for rule e; for rule `h`, the engine's rendered verdict); a candidate no
+   rule keeps goes on the would-remove list. Records have
    no rules: koto writes one only when it removes a session itself, and that
    removal already waited until the session's parent had its
    `child_completed` (the terminal tick defers removal when that append
@@ -489,7 +522,7 @@ Session mode:
 {"mode": "preview", "plan": "<token>",
  "remove": [{"kind": "session", "name": "...", "session_id": "...", "status": "terminal",
              "state": "done", "failure": false, "finished_at": "...", "execution_dir": "..."}],
- "kept": [{"name": "...", "rule": "b", "detail": "referenced by running session 'x'"}]}
+ "kept": [{"name": "...", "rule": "e", "detail": "<request id>"}]}
 ```
 
 6. Apply recomputes steps 1 to 4. With `--plan` it runs with the stored
@@ -509,7 +542,10 @@ Session mode:
    first): take `lock_state_file` (non-blocking), re-`inspect`, and confirm
    the same session id, still finished, and no rule applies against the
    referencers and referenced sessions re-inspected now (rule g's remote
-   check included). Then remove it while holding the lock: under the cloud
+   check included). That re-check is the original rules b and c's; under
+   rule `h` the session-retention design's Decision 3 makes one fresh scan
+   and re-judges each component as a unit, removing anchors before their
+   close sessions. Then remove it while holding the lock: under the cloud
    backend the session's remote objects first, except a migration marker
    (R10), and the local directory after them, so a failure part way leaves a
    local copy that a later prune can retry. The remote delete goes through a
@@ -791,7 +827,7 @@ built on its inspection helper.
 1. **Listing.** `session_inventory.rs`, `SessionInfo`'s two fields,
    `--execution-dir` and `--state`, the koto-user skill's command reference,
    and the 1,000-session timing (R1 to R4, R30 for listing).
-2. **Prune (sessions).** `session_prune.rs`, rules a to g, stored plans,
+2. **Prune (sessions).** `session_prune.rs`, rules a to g as first shipped, stored plans,
    both apply modes, exit 4, the checked cloud delete, the 1,000-session
    preview timing (R30 for the prune), and the `docs/workspace-layout.md` and
    skill updates (R5 to R11). Depends on 1.
@@ -896,7 +932,8 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
 - The journal stays unbounded by default: rotation is opt-in until the
   journal's consumers list rotated files.
 - The rules know one context key by name, `chain/parent`, so a consumer
-  linking sessions any other way gets no protection from rule c.
+  linking sessions any other way got no protection from rule c. Rule `h`,
+  which replaced it, also joins sessions through `koto/links/` entries.
 - Marker removal by age relies on the stopped-source rule. A host revived
   after the bound could advance its old copy again. The repository owner
   accepts this risk for multi-host use, which koto treats as a migration and
@@ -916,8 +953,9 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   interval a reader would use.
 - Turning rotation on by default later is a one-line change to one setting's
   default, made once consumers list rotated files.
-- Rule c reads one key with a fixed name. Adding a second reference key later
-  is an additive change to the reference map.
+- Rule c read one key with a fixed name. Adding a second reference key later
+  was an additive change to the reference map, which rule `h`'s graph has
+  since made with `koto/links/`.
 - Marker removal by age is opt-in per run and previewed, and the preview shows
   each marker's age and target before anything is removed. The bound is a
   setting, so an operator who keeps old hosts around longer can raise it.

@@ -351,9 +351,10 @@ fn a_successor_the_bucket_cannot_serve_keeps_the_path() {
     assert_eq!(h.needed_read_only(&h.w1), (0, "not needed".to_string()));
 }
 
-/// v1 imported into host 2's workspace leaves a migration marker naming the
-/// copy, anchored there, which releases v1's path; a marker that can't be
-/// read keeps it.
+/// v1 imported into host 2's workspace leaves a copy anchored there that
+/// continues v1, with its back-reference beside v1, and a migration marker
+/// naming the copy. Either releases v1's path; with only the marker there
+/// (an earlier release's import), a marker that can't be read keeps it.
 #[test]
 fn a_session_imported_away_releases_the_path() {
     let h = Hosts::new();
@@ -369,6 +370,25 @@ fn a_session_imported_away_releases_the_path() {
 
     assert_eq!(h.needed_read_only(&h.w1), (0, "not needed".to_string()));
 
+    // The copy's relation, found through its back-reference, releases the
+    // path whatever the marker says.
+    h.s3.fail("GET", &marker, 500);
+    assert_eq!(h.needed_read_only(&h.w1), (0, "not needed".to_string()));
+    h.s3.clear_faults();
+
+    // An import by a release without the relation left the marker alone:
+    // it releases the path, and a marker that can't be read keeps it.
+    let pointer = format!(
+        "{}/v1/ctx/koto/continued-by/{}/v1",
+        prefix_of(&h.w1),
+        prefix_of(&h.w2)
+    );
+    assert!(
+        h.s3.object(&pointer).is_some(),
+        "the import left no pointer"
+    );
+    h.s3.remove(&pointer);
+    assert_eq!(h.needed_read_only(&h.w1), (0, "not needed".to_string()));
     h.s3.fail("GET", &marker, 500);
     assert_eq!(h.needed_read_only(&h.w1).0, 1);
 }

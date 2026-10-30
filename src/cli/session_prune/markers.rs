@@ -3,15 +3,23 @@
 //! prefix, each with the old copy beside it.
 //!
 //! A marker is what makes the source host refuse a session it no longer
-//! owns, so it goes only when the session it points at is safe elsewhere:
-//! its target must be `present` (the target's state file header carries
-//! the session id the marker names, and its whole log reads with no error
-//! and begins with every event of the source's log, unchanged, so a
-//! truncated or corrupt copy, or one behind or apart from the source,
-//! never stands in for it), and then the marker must be at least
-//! `session.cloud.marker_retain_days` old, or the caller must say the source
-//! host is gone with `--source-retired`. Any other target status keeps the
-//! marker whatever its age, and so does a marker that can't be read.
+//! owns, and the source is the copy's read-only predecessor, so both go
+//! only when the copy's lineage no longer needs them: the marker's target
+//! must be `present` (the target's state file header carries the session id
+//! the marker names, and its whole log reads with no error and begins with
+//! every event of the source's log, unchanged, so a truncated or corrupt
+//! copy, or one behind or apart from the source, never stands in for it),
+//! and then the continues relation must no longer keep the source: the
+//! bucket walk from the source, with the marker's target passed in as a
+//! later member, finds no later session with standing (R15). While one
+//! has standing the marker is kept with reason `relation` and the
+//! relation's report fields (`kept_by_relation`, `relation_keepers`). Any
+//! other target status keeps the marker, and so does a marker that can't be
+//! read.
+//!
+//! `session.cloud.marker_retain_days` and `--source-retired` no longer
+//! decide removal. Both are still accepted; a run that sets either lists it
+//! under `ignored` in its output and says so on stderr.
 //!
 //! Removal deletes everything under `<source prefix>/<name>/`, the marker
 //! last, so a removal that stops part way leaves the marker refusing. The
@@ -33,6 +41,8 @@ use super::{
     write_plan_file, PruneArgs, EXIT_PLAN_REFUSED, EXIT_REMOVAL_FAILED,
 };
 use crate::session::cloud::{is_workspace_prefix, CloudBackend, TargetStatus};
+use crate::session::continues_bucket::{Clock, Pointer};
+use crate::session::hierarchy::{self, RelationVerdict};
 use crate::session::validate::validate_session_id;
 use crate::session::Backend;
 
@@ -73,10 +83,16 @@ pub(super) struct MarkerEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objects: Option<usize>,
     /// What decided it: the target status when it isn't `present`,
-    /// `unreadable` for a marker that can't be read, else `age` or
-    /// `source_retired`.
+    /// `unreadable` for a marker that can't be read, else `relation` while
+    /// a later session keeps the source, or `released` once none does.
     pub reason: String,
     pub detail: String,
+    /// For a marker the relation keeps: `kept_by_relation`,
+    /// `relation_keepers`, `relation_unreadable` and `bucket_unchecked`
+    /// (`hierarchy::relation_json`). Empty, and absent from the JSON,
+    /// otherwise.
+    #[serde(flatten)]
+    pub relation: serde_json::Map<String, serde_json::Value>,
 }
 
 impl MarkerEntry {
@@ -109,13 +125,15 @@ impl MarkerEntry {
             objects: None,
             reason: "unreadable".to_string(),
             detail,
+            relation: serde_json::Map::new(),
         }
     }
 }
 
 /// A stored marker plan. It lives at `markers-<source prefix>-<token>.json`,
-/// a name no session plan can have, and records what the preview ran with
-/// so `--apply --plan` runs with the same.
+/// a name no session plan can have. `source_retired` records the flag the
+/// preview was given; it no longer decides anything, and is kept so a plan
+/// file reads the same across releases.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredMarkerPlan {
     mode: String,
@@ -123,6 +141,7 @@ struct StoredMarkerPlan {
     created_at: String,
     migrated_from: String,
     source_prefix: String,
+    #[serde(default)]
     source_retired: bool,
     remove: Vec<MarkerEntry>,
 }
@@ -186,49 +205,32 @@ fn parse_marker(bytes: &[u8]) -> std::result::Result<MarkerBody, String> {
     })
 }
 
-/// The rule: whether a marker of `age` whose target stands at `status` is
-/// removable, what decided it, and a sentence saying so.
+/// The rule: whether a marker whose target stands at `status` is
+/// removable, what decided it, and a sentence saying so. `relation` is the
+/// walk's verdict for the source, asked only for a present target: while
+/// it keeps, so does the marker.
 fn decide(
     status: &TargetStatus,
     expected_id: &str,
-    age: Duration,
-    retain_days: u64,
-    source_retired: bool,
+    relation: Option<&RelationVerdict>,
 ) -> (bool, &'static str, String) {
-    let days = age.as_secs() / DAY;
     match status {
-        TargetStatus::Present => {
-            let bound = Duration::from_secs(retain_days.saturating_mul(DAY));
-            if age >= bound {
-                (
-                    true,
-                    "age",
-                    format!(
-                        "the target is present and the marker is {days} days old, past the \
-                         {retain_days}-day bound"
-                    ),
-                )
-            } else if source_retired {
-                (
-                    true,
-                    "source_retired",
-                    format!(
-                        "the target is present and --source-retired was given; the marker is \
-                         {days} days old, inside the {retain_days}-day bound"
-                    ),
-                )
-            } else {
-                (
-                    false,
-                    "age",
-                    format!(
-                        "the target is present but the marker is {days} days old, inside the \
-                         {retain_days}-day bound (session.cloud.marker_retain_days); pass \
-                         --source-retired once the source host is gone for good"
-                    ),
-                )
-            }
-        }
+        TargetStatus::Present => match relation {
+            Some(verdict) if verdict.keeps() => (
+                false,
+                "relation",
+                format!(
+                    "the target is present, and the source is its read-only predecessor while \
+                     a later session has standing ({})",
+                    hierarchy::relation_text(verdict).join("; ")
+                ),
+            ),
+            _ => (
+                true,
+                "released",
+                "the target is present, and no later session keeps the source".to_string(),
+            ),
+        },
         TargetStatus::Migrated => (
             false,
             "migrated",
@@ -269,9 +271,7 @@ fn evaluate(
     cloud: &CloudBackend,
     source_prefix: &str,
     name: &str,
-    retain_days: u64,
-    source_retired: bool,
-    now: SystemTime,
+    clock: &Clock,
 ) -> Option<MarkerEntry> {
     let bytes = match cloud.read_migration_marker(source_prefix, name) {
         Ok(Some(bytes)) => bytes,
@@ -294,15 +294,28 @@ fn evaluate(
         &body.target.session_id,
         source.as_ref().map_err(String::as_str),
     );
+    // A present target: what keeps the source now is the relation, the
+    // marker's target passed in as a later member (R6, R15).
+    let relation = matches!(status, TargetStatus::Present).then(|| {
+        cloud.relation_walk_with(
+            &Pointer {
+                prefix: source_prefix.to_string(),
+                name: name.to_string(),
+            },
+            source
+                .as_ref()
+                .ok()
+                .and_then(|copy| copy.session_id.as_deref()),
+            &[Pointer {
+                prefix: body.target.prefix.clone(),
+                name: body.target.session.clone(),
+            }],
+            clock,
+        )
+    });
     // A marker dated in the future is as young as it gets.
-    let age = now.duration_since(body.at).unwrap_or(Duration::ZERO);
-    let (removable, reason, detail) = decide(
-        &status,
-        &body.target.session_id,
-        age,
-        retain_days,
-        source_retired,
-    );
+    let age = clock.now.duration_since(body.at).unwrap_or(Duration::ZERO);
+    let (removable, reason, detail) = decide(&status, &body.target.session_id, relation.as_ref());
     Some(MarkerEntry {
         kind: "marker".to_string(),
         name: name.to_string(),
@@ -314,6 +327,10 @@ fn evaluate(
         objects: source.ok().map(|copy| copy.objects),
         reason: reason.to_string(),
         detail,
+        relation: relation
+            .filter(|v| v.keeps())
+            .map(|v| hierarchy::relation_json(&v))
+            .unwrap_or_default(),
     })
 }
 
@@ -323,24 +340,13 @@ struct Verdict {
     token: String,
 }
 
-fn judge(
-    cloud: &CloudBackend,
-    source_prefix: &str,
-    retain_days: u64,
-    source_retired: bool,
-) -> Result<Verdict> {
-    let now = SystemTime::now();
+fn judge(cloud: &CloudBackend, source_prefix: &str) -> Result<Verdict> {
+    cloud.begin_relation_pass();
+    let clock = Clock::configured();
     let mut remove = Vec::new();
     let mut kept = Vec::new();
     for name in cloud.migration_marker_names(source_prefix)? {
-        let Some(entry) = evaluate(
-            cloud,
-            source_prefix,
-            &name,
-            retain_days,
-            source_retired,
-            now,
-        ) else {
+        let Some(entry) = evaluate(cloud, source_prefix, &name, &clock) else {
             continue;
         };
         if entry.removable {
@@ -375,12 +381,6 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
                 "--plan {token:?} isn't a plan token (32 lowercase hex digits)"
             ));
         }
-        if args.source_retired {
-            usage(
-                "--plan applies with the --source-retired choice its preview made; pass \
-                 --source-retired only to the preview",
-            );
-        }
     }
     let Backend::Cloud(cloud) = backend else {
         usage(
@@ -399,17 +399,14 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
         ),
         None => None,
     };
-    let source_retired = match &stored {
-        Some(plan) => plan.source_retired,
-        None => args.source_retired,
-    };
+    // Neither setting decides removal any more (R15): each one the run
+    // sets is reported, and the run goes on as it would without it.
+    let ignored = ignored_settings(args);
+    for name in &ignored {
+        eprintln!("ignored: {name} no longer decides removal");
+    }
 
-    let verdict = judge(
-        cloud,
-        &source_prefix,
-        args.marker_retain_days,
-        source_retired,
-    )?;
+    let verdict = judge(cloud, &source_prefix)?;
 
     if !args.apply {
         let plan = StoredMarkerPlan {
@@ -418,7 +415,7 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
             created_at: crate::engine::types::now_iso8601(),
             migrated_from: migrated_from.to_string(),
             source_prefix: source_prefix.clone(),
-            source_retired,
+            source_retired: args.source_retired,
             remove: verdict.remove.clone(),
         };
         write_plan_file(
@@ -426,19 +423,22 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
             &plan_file_name(&source_prefix, &verdict.token),
             &serde_json::to_vec(&plan)?,
         )?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "mode": "preview",
-                "migrated_from": migrated_from,
-                "prefix": source_prefix,
-                "marker_retain_days": args.marker_retain_days,
-                "source_retired": source_retired,
-                "plan": verdict.token,
-                "remove": verdict.remove,
-                "kept": verdict.kept,
-            }))?
-        );
+        let mut out = json!({
+            "mode": "preview",
+            "migrated_from": migrated_from,
+            "prefix": source_prefix,
+            "marker_retain_days": args
+                .marker_retain_days
+                .unwrap_or(crate::config::DEFAULT_MARKER_RETAIN_DAYS),
+            "source_retired": args.source_retired,
+            "plan": verdict.token,
+            "remove": verdict.remove,
+            "kept": verdict.kept,
+        });
+        if !ignored.is_empty() {
+            out["ignored"] = json!(ignored);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
@@ -479,35 +479,45 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
         verdict.remove.retain(|e| named.contains(&e.key()));
     }
 
-    let outcome = apply(
-        cloud,
-        &source_prefix,
-        &verdict.remove,
-        args.marker_retain_days,
-        source_retired,
-    );
+    let outcome = apply(cloud, &source_prefix, &verdict.remove);
     if let Some(token) = args.plan {
         if outcome.failed.is_empty() {
             remove_plan_file(&base, &plan_file_name(&source_prefix, token));
         }
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "mode": "apply",
-            "migrated_from": migrated_from,
-            "prefix": source_prefix,
-            "plan": verdict.token,
-            "removed": outcome.removed,
-            "skipped": outcome.skipped,
-            "kept": verdict.kept,
-            "failed": outcome.failed,
-        }))?
-    );
+    let mut out = json!({
+        "mode": "apply",
+        "migrated_from": migrated_from,
+        "prefix": source_prefix,
+        "plan": verdict.token,
+        "removed": outcome.removed,
+        "skipped": outcome.skipped,
+        "kept": verdict.kept,
+        "failed": outcome.failed,
+    });
+    if !ignored.is_empty() {
+        out["ignored"] = json!(ignored);
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
     if !outcome.failed.is_empty() {
         std::process::exit(EXIT_REMOVAL_FAILED);
     }
     Ok(())
+}
+
+/// The settings this run sets that no longer decide removal:
+/// `marker_retain_days` when a config file sets
+/// `session.cloud.marker_retain_days`, and `source_retired` when
+/// `--source-retired` was passed.
+fn ignored_settings(args: &PruneArgs<'_>) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    if args.marker_retain_days.is_some() {
+        ignored.push("marker_retain_days");
+    }
+    if args.source_retired {
+        ignored.push("source_retired");
+    }
+    ignored
 }
 
 #[derive(Default)]
@@ -518,27 +528,17 @@ struct Outcome {
 }
 
 /// Remove each entry's source copy, marker last, after reading the marker
-/// again and judging it again: a marker rewritten since (another
-/// `migrated_at`), gone, or no longer removable is skipped with the reason.
-fn apply(
-    cloud: &CloudBackend,
-    source_prefix: &str,
-    entries: &[MarkerEntry],
-    retain_days: u64,
-    source_retired: bool,
-) -> Outcome {
+/// again and judging it again, the relation included: a marker rewritten
+/// since (another `migrated_at`), gone, or no longer removable is skipped
+/// with the reason.
+fn apply(cloud: &CloudBackend, source_prefix: &str, entries: &[MarkerEntry]) -> Outcome {
     let mut outcome = Outcome::default();
     for entry in entries {
         let skip = |reason: String| json!({"name": entry.name, "reason": reason});
-        let now = SystemTime::now();
-        let fresh = match evaluate(
-            cloud,
-            source_prefix,
-            &entry.name,
-            retain_days,
-            source_retired,
-            now,
-        ) {
+        // Every judgment reads the bucket afresh: a later session that
+        // gained standing since the preview keeps the source.
+        cloud.begin_relation_pass();
+        let fresh = match evaluate(cloud, source_prefix, &entry.name, &Clock::configured()) {
             Some(fresh) => fresh,
             None => {
                 outcome
@@ -657,29 +657,28 @@ mod tests {
     }
 
     #[test]
-    fn only_a_present_target_is_removable_and_then_by_age_or_retirement() {
-        let day = Duration::from_secs(DAY);
-        let young = day * 2;
-        let old = day * 31;
-
-        // Present: by age past the bound, or inside it with --source-retired.
+    fn a_present_target_is_removable_only_once_the_relation_lets_go() {
+        use crate::session::hierarchy::{RelationKeeper, Standing};
         let present = TargetStatus::Present;
-        let by_age = decide(&present, "id", old, 30, false);
-        assert_eq!((by_age.0, by_age.1), (true, "age"));
-        assert!(decide(&present, "id", day * 30, 30, false).0);
-        let kept = decide(&present, "id", young, 30, false);
-        assert_eq!((kept.0, kept.1), (false, "age"));
-        assert!(kept.2.contains("inside the 30-day bound"), "{}", kept.2);
-        let retired = decide(&present, "id", young, 30, true);
-        assert_eq!((retired.0, retired.1), (true, "source_retired"));
-        // A bound of 0 days makes every present target's marker old enough.
-        assert_eq!(decide(&present, "id", Duration::ZERO, 0, false).1, "age");
-        assert!(decide(&present, "id", Duration::ZERO, 0, false).0);
-        // A huge bound doesn't overflow.
-        assert!(!decide(&present, "id", old, u64::MAX, false).0);
+        // Nothing later keeps the source: removable, released.
+        let (removable, reason, _) = decide(&present, "id", Some(&RelationVerdict::default()));
+        assert_eq!((removable, reason), (true, "released"));
+        // The copy runs: kept, the relation the reason, the keeper named.
+        let mut keeps = RelationVerdict::default();
+        keeps.keepers.push(RelationKeeper {
+            keeper: "copy".to_string(),
+            standing: Standing::Alive,
+            retention_passes_at: None,
+            pin: crate::session::pin::PinFact::None,
+            pin_source: crate::session::pin::SOURCE_BUCKET,
+            path: Vec::new(),
+        });
+        let (removable, reason, detail) = decide(&present, "id", Some(&keeps));
+        assert_eq!((removable, reason), (false, "relation"));
+        assert!(detail.contains("continued by copy (alive)"), "{detail}");
 
-        // Anything else is kept at any age, with or without the flag, and the
-        // status is the reason.
+        // Anything else is kept whatever the relation says, and the status
+        // is the reason.
         for (status, word) in [
             (TargetStatus::Migrated, "migrated"),
             (TargetStatus::Replaced("id-2".to_string()), "replaced"),
@@ -693,14 +692,37 @@ mod tests {
                 "unknown",
             ),
         ] {
-            for age in [young, old] {
-                for retired in [false, true] {
-                    let (removable, reason, _) = decide(&status, "id", age, 30, retired);
-                    assert!(!removable, "{word} {age:?} {retired}");
-                    assert_eq!(reason, word);
-                }
+            for relation in [None, Some(&keeps)] {
+                let (removable, reason, _) = decide(&status, "id", relation);
+                assert!(!removable, "{word}");
+                assert_eq!(reason, word);
             }
         }
+    }
+
+    #[test]
+    fn the_settings_that_no_longer_decide_are_reported_ignored() {
+        let args = |days: Option<u64>, retired: bool| PruneArgs {
+            execution_dir: None,
+            older_than: None,
+            all: false,
+            apply: false,
+            plan: None,
+            confirm_short_retention: false,
+            migrated_from: Some("/w"),
+            source_retired: retired,
+            marker_retain_days: days,
+        };
+        assert!(ignored_settings(&args(None, false)).is_empty());
+        assert_eq!(
+            ignored_settings(&args(Some(0), false)),
+            ["marker_retain_days"]
+        );
+        assert_eq!(ignored_settings(&args(None, true)), ["source_retired"]);
+        assert_eq!(
+            ignored_settings(&args(Some(30), true)),
+            ["marker_retain_days", "source_retired"]
+        );
     }
 
     #[test]
@@ -714,8 +736,9 @@ mod tests {
             target_status: Some("present".to_string()),
             removable: true,
             objects: Some(3),
-            reason: "age".to_string(),
+            reason: "released".to_string(),
             detail: String::new(),
+            relation: serde_json::Map::new(),
         };
         let lines = |es: &[MarkerEntry]| es.iter().map(MarkerEntry::token_line).collect();
         let a = entry("foo", "2026-01-01T00:00:00.000Z");

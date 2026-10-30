@@ -34,7 +34,7 @@ pub fn validate_project_key(key: &str) -> Result<(), String> {
         ))
     } else if key == "session.cloud.marker_retain_days" {
         Err(format!(
-            "key '{}' guards a deletion from the bucket and can only be set in user config (--user)",
+            "key '{}' can only be set in user config (--user); it no longer decides removal",
             key
         ))
     } else if key == "session.cloud.check_window_secs" {

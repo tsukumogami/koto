@@ -29,6 +29,25 @@ to `0.9.x`).
   its release record, with no log event. They are listed with koto's other
   cross-session writers in
   [koto#445](https://github.com/tsukumogami/koto/issues/445).
+- **`koto session import` keeps its source as a read-only predecessor.
+  v0.32.0 is the first release that honours the relation it leaves.** The
+  copy gets `koto/links/continues/<source>` and the source a back-reference,
+  both written before the copy is pushed, and the migration marker follows
+  the push. In the source's own workspace, `koto next`, `koto context add` and
+  `remove`, `rewind`, `cancel`, `decisions record`, `overrides record`,
+  `session link`, `session rebind`, `resolve`, `update`, `pin` and `unpin`
+  still exit 2 with `session_migrated`; `koto status`, `koto context get`,
+  `exists` and `list`, `koto decisions list` and `koto overrides list` now
+  exit 0 and answer from its last pushed bucket copy, changing nothing. A
+  re-run on a copy that holds a relation naming another session exits 2 with
+  `relation_conflict`. `koto session prune --migrated-from` removes the
+  marker and source only once the copy and any later member have no standing
+  (reason `released`), so `session.cloud.marker_retain_days` and
+  `--source-retired` are accepted but ignored; a run that uses either lists it
+  under `ignored`. Older releases fall short in three ways: their local prunes
+  over-keep a chain; under the cloud backend they can delete a predecessor
+  whose successor they never pulled; and their import still retires its
+  source.
 
 - **Anchorless context reads are no longer written to the read session's
   log.** `koto context get` and `koto context exists` run with no reader

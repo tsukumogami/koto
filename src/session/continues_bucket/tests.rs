@@ -955,3 +955,75 @@ fn a_migration_marker_beside_the_session_counts_its_target_or_keeps() {
     .verdict;
     assert_eq!(v.keepers.len(), 1, "{v:?}");
 }
+
+#[test]
+fn a_copy_named_by_its_pointer_and_by_the_marker_is_one_member() {
+    // The import's copy holds a relation naming the source, with its
+    // pointer beside it, and the source's marker names the same copy.
+    let b = MemBucket {
+        cached: BTreeMap::from([(hash(), template())]),
+        marker: Some(Ok(Some(Pointer {
+            prefix: WS2.to_string(),
+            name: "v2".to_string(),
+        }))),
+        ..Default::default()
+    };
+    session(&b, WS1, "v2", &id(2), "done", NOW - 9 * DAY, None);
+    session(
+        &b,
+        WS2,
+        "v2",
+        &id(3),
+        "work",
+        NOW,
+        Some((WS1, "v2", &id(2))),
+    );
+    b.put(&format!("{WS2}/v2/ctx/koto/imported-from"), b"{}");
+    let check = |v: RelationVerdict| {
+        assert!(v.unreadable.is_empty(), "{v:?}");
+        assert!(v.unchecked.is_empty(), "{v:?}");
+        assert_eq!(v.keepers.len(), 1, "{v:?}");
+        assert_eq!(v.keepers[0].keeper, "v2");
+        assert_eq!(v.keepers[0].standing, Standing::Alive);
+        assert!(v.keepers[0].path.is_empty());
+    };
+    let facts = BucketRemovalFacts {
+        migrated: Ok(true),
+        ..facts_of(&b, WS1, "v2", Some(&id(2)), false)
+    };
+    check(run(&b, &facts));
+    // The same through the caller's `extra`, as `prune --migrated-from`
+    // passes the marker's target.
+    let facts = facts_of(&b, WS1, "v2", Some(&id(2)), false);
+    let extra = [Pointer {
+        prefix: WS2.to_string(),
+        name: "v2".to_string(),
+    }];
+    let mut memo = Memo::default();
+    check(
+        walk(
+            &b,
+            &mut memo,
+            &Start {
+                facts: &facts,
+                skip: None,
+                extra: &extra,
+            },
+            &clock(),
+        )
+        .verdict,
+    );
+    // A pointer beside a session naming the session itself is still a
+    // cycle.
+    let c = MemBucket {
+        cached: BTreeMap::from([(hash(), template())]),
+        ..Default::default()
+    };
+    session(&c, WS1, "v1", &id(1), "done", NOW - 9 * DAY, None);
+    c.put(&pointer_key(WS1, "v1", WS1, "v1"), &pointer_body(&id(1)));
+    let v = run(&c, &facts_of(&c, WS1, "v1", Some(&id(1)), false));
+    assert!(
+        v.unreadable.iter().any(|u| u.reason == Reason::Cycle),
+        "{v:?}"
+    );
+}

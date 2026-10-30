@@ -218,7 +218,7 @@ The errors a read through `--workspace` can print, each as JSON with a `code`:
 | `workspace_needs_cloud` | 2 | The session backend here is local, so there's no bucket to read |
 | `workspace_read_only` | 2 | The verb writes or removes |
 
-A session that was imported elsewhere refuses with `session_migrated`, naming where it went, as it does in its own workspace.
+A session that was imported elsewhere is still read: the four verbs answer from the source's last pushed copy in the bucket, as they do in its own workspace (see "What happens to the old copy" below).
 
 ## 5. Moving a session to another host
 
@@ -279,7 +279,9 @@ On success it prints one JSON object:
 | `template` | Where the compiled template came from: `local-cache`, `bucket` (under `--trust-template`), or `unchanged` when a re-run found the session already built |
 | `marked` | The source now carries its migration marker |
 
-The new session holds the source's events plus a `session_imported` event, every context key, and the compiled template. It's pushed under this workspace's prefix, and only then does the import leave a `migrated.json` marker beside the source.
+The new session holds the source's events plus a `session_imported` event, every context key, and the compiled template, and a continues relation to the source (see "What the import settles in koto's own keys" below). Before the copy is pushed under this workspace's prefix, the import writes a back-reference beside the source; only after the push does it leave a `migrated.json` marker there, so a push that fails leaves no marker.
+
+Running the same import again on a copy an earlier release built, which has no relation, adds the relation and exits 0. If the copy's relation names a different session, the import exits 2 with `relation_conflict` and changes nothing.
 
 One key is the exception. `workflows/publish-location`, the Claude Code `/workflows` folder koto renders the session into, names a folder on the host that wrote it, so it never goes to the bucket and the import doesn't carry it. A manifest pushed by koto 0.19.0 or earlier can list it without its object; the import skips that entry too. On its first commit on the new host, the session publishes its own location from `KOTO_WORKFLOWS_DIR` or the Claude Code session there.
 
@@ -293,8 +295,9 @@ The keys under `koto/` are koto's records about the session (see "The reserved `
 - It checks every link it keeps (`koto/links/<kind>/<peer>`): a known kind, a session name as the peer, and a body of at most 4 KiB naming that same peer. A link that fails is dropped, with a warning on stderr naming the key and why.
 - It settles each `koto/links/held-by/<anchor>` link by the anchor it names, using the `KOTO_ANCHOR` the import runs with as the importing agent session's anchor. The link is kept when that name resolves in this host's store to an anchor that is open and not migrated; the anchor's recorded workspace is a hint only and never decides it. Otherwise it is rewritten to `koto/links/held-by/<your anchor>`, its body carrying `"was"` with the old name, or, when the import runs with no anchor (or `KOTO_ANCHOR` names no anchor here), dropped. Dispatched-by links are carried unchanged.
 - It writes `koto/imported-from`, `{"from_session": "<source name>", "from_session_id": "<source id>"}`, into every copy, replacing anything the source held there. That record is what lets the retention rule treat the source as migrated and resolve links naming it to the copy.
+- It drops every `koto/links/continues/*` relation the source held, since the copy continues the source, not the source's own predecessor, and writes the copy's one relation, `koto/links/continues/<source name>`. Its body records the source's name, session id, workspace path and bucket prefix, plus the copy's own session id. That relation is what keeps the source while the copy stands (see "Removing the old copy and its marker").
 
-The copy's manifest is written from what it then holds, so later verification sees the changed keys. The source gets nothing beyond the migration marker.
+The copy's manifest is written from what it then holds, so later verification sees the changed keys. The source gets a back-reference to the copy and the migration marker, and nothing else.
 
 An anchor's template is embedded in koto and never reaches the template cache, so an anchor imports with this build's embedded template when its hash matches, with no `koto template compile` first.
 
@@ -302,13 +305,15 @@ So import an anchor before the sessions it holds when you move them together: a 
 
 ### What happens to the old copy
 
-From then on the source refuses. `koto next`, `koto status`, and the `koto context` commands on the old host exit 2 with `session_migrated` and a message naming where the session went:
+From then on the source is a read-only predecessor of the copy. Every command that would change it, in its own workspace, exits 2 with `session_migrated` and a message naming where the session went: `koto next`, `koto context add` and `remove`, `koto rewind`, `koto cancel`, `koto decisions record`, `koto overrides record`, `koto session link` (`--continues` included), `koto session rebind`, `resolve`, `update`, `pin` and `unpin`.
 
 ```
 session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there
 ```
 
-Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
+The reads still work. `koto status`, `koto context get`, `exists` and `list`, and `koto decisions list` and `koto overrides list`, exit 0 on the source, and so do their `--workspace` forms. They answer from the source's last pushed copy in the bucket, and a read changes nothing: the source's objects, the marker and the copy stay byte-identical, and no read record is written.
+
+Apart from the back-reference and the marker, nothing under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket while the copy stands (see below), or until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
 
 An imported session is an ordinary session in its new workspace, so it can be imported again from there to a third one.
 
@@ -321,7 +326,7 @@ cd /srv/ws-b
 koto session import review --from /srv/ws-a
 ```
 
-It prints the same JSON as an import from another host, with `name` set to `review`. Before it writes anything, it checks the old copy and refuses, leaving it untouched, when:
+It prints the same JSON as an import from another host, with `name` set to `review`. Afterwards `koto status review` run from the source workspace answers with the source's state, and from this workspace with the copy's. Before it writes anything, it checks the old copy and refuses, leaving it untouched, when:
 
 - another process holds the session's lock (`import_source_running`): stop it first;
 - the local copy holds events or context the bucket lacks (`import_source_unpushed`): run `koto session resolve review --keep local` in the source workspace, then import again;
@@ -337,7 +342,7 @@ The swap needs a filesystem that can exchange two directories atomically (`renam
 
 ### Removing the old copy and its marker
 
-Markers pile up under the old workspace's prefix, each beside whatever of the old copy is still there. Once the old host can't come back and advance its copy, remove them with `koto session prune --migrated-from`, run from any workspace on the same bucket:
+Markers pile up under the old workspace's prefix, each beside whatever of the old copy is still there. The old copy stays while the session that continues it stands. Once it doesn't, and the old host can't come back and advance its copy, remove the markers with `koto session prune --migrated-from`, run from any workspace on the same bucket:
 
 ```bash
 koto session prune --migrated-from /srv/ws-a                  # preview
@@ -355,13 +360,21 @@ Pass the old workspace's absolute path as it was on its own host, the same path 
 | `unverified` | The right session's state file, but its log doesn't read to the end (a line that doesn't parse, the last one included, or a gap in its sequence), it ends before the old copy's does, it holds a different event at some point the old copy's log reaches, or the old copy can't be listed or its log can't be read |
 | `unknown` | The listing or the read failed |
 
-A marker is removable only when its target is `present`, and then only once it is at least `session.cloud.marker_retain_days` days old (default 30), or when you pass `--source-retired` to say the old host is gone for good. Setting `marker_retain_days` to 0 makes every marker whose target is `present` removable at once. Any other status keeps the marker at any age, with or without the flag, because the old copy beside it may be the only one left. A marker whose body doesn't parse, has no `migrated_at`, or whose target doesn't name a session and a workspace prefix is kept as `unreadable`. Every entry carries `removable`, a `reason` (the target status, `unreadable`, `age`, or `source_retired`) and a `detail` sentence, so the preview shows which markers `--source-retired` adds. An entry whose old copy could be listed and its log read also carries `objects`, the number of objects its removal deletes, the marker included.
+A marker is removable only when its target is `present` and the continues relation no longer keeps the old copy. For a `present` target the prune walks the relation with the copy as a later member. While the copy, or any session that continues it, has standing (it is running, pinned, or within its retention period), the marker and the old copy are kept with the reason `relation`, and the entry carries `relation_keepers`: each keeper with its `standing` (`alive` for a running copy), `retention_passes_at`, `pin` and the `path` of sessions between the old copy and it. When the copy has finished, its retention has passed and it is unpinned, the entry is removable with the reason `released`. Any other target status keeps the marker, with the status as the reason (`absent` for an absent target), because the old copy beside it may be the only one left. A marker whose body doesn't parse, has no `migrated_at`, or whose target doesn't name a session and a workspace prefix is kept as `unreadable`. Every entry carries `removable`, a `reason` and a `detail` sentence. An entry whose old copy could be listed and its log read also carries `objects`, the number of objects its removal deletes, the marker included.
+
+A source imported by an earlier release, whose copy has no relation but whose marker names the copy, is still kept while the copy runs, with the copy named as the keeper. So is a prune run on a second host that never pulled the copy. In a chain, if v1 was imported into v2 in one workspace and v2 into a third with the copy running, a prune of the first workspace keeps v1, naming the copy as keeper with v2 in its `path`.
+
+`session.cloud.marker_retain_days` and `--source-retired` are still accepted but no longer decide removal. A run where a config file sets `marker_retain_days`, or that passes `--source-retired`, adds `ignored` to its JSON (a list of `marker_retain_days` and/or `source_retired`), prints `ignored: <name> no longer decides removal` on stderr for each, and otherwise behaves as it would without them.
 
 Removing a marker deletes everything under `<prefix>/<name>/` in the old workspace's prefix, the marker last. The marker isn't removed on its own: without it, the old copy would read as a live session again. An old copy whose state file is already gone, as a removal that stopped part way leaves it, has no events left to compare, so a retry only needs a target whose log reads cleanly. Apply reads each marker again and judges it again, so a marker rewritten since the preview, or whose target changed, is skipped with the reason. Nothing locks the bucket between that last judgement and the deletes, so a target that changes in that short window isn't seen. If a delete fails, that entry stops before its marker goes, so the old copy still refuses; it is listed under `failed`, the run exits 3, and running it again finishes the job.
 
-The plan token and stored plan work as they do for finished sessions (see the [CLI usage guide](cli-usage.md#session-prune)): an unchanged token applies, one whose set changed exits 4 with `prune_plan_stale`, and the stored plan records whether `--source-retired` was given. `--apply` without `--plan` removes what is removable now. Marker removal never touches the local session store: a local copy of the old session on the host you run it from stays, and the only local write is the stored plan.
+The plan token and stored plan work as they do for finished sessions (see the [CLI usage guide](cli-usage.md#session-prune)): an unchanged token applies, one whose set changed exits 4 with `prune_plan_stale`, and the stored plan records the workspace. `--apply` without `--plan` removes what is removable now. Marker removal never touches the local session store: a local copy of the old session on the host you run it from stays, and the only local write is the stored plan.
 
-Remove the old host's local copy first. Once the marker and the old copy in the bucket are gone, nothing is left to refuse for it: a local copy still on the old host reads as an ordinary session there, and the next command that syncs it pushes it back under the old workspace's prefix. Run `koto session cleanup <name>` in the old workspace on that host before you prune (cleanup leaves the marker in place), or retire the host. A pin on the old copy doesn't stop this: the import carried the pin to the moved copy, so the old copy's pin keeps nothing, cleanup removes it, and `koto session unpin` refuses it as a migrated source. An import an older release ran may not have carried the pin, so check that the moved copy is pinned (`koto session list --pinned` in the new workspace) before removing the old one. Any other pinned session refuses cleanup until `koto session unpin <name>` releases it. `--source-retired` says you have done one of these.
+Remove the old host's local copy first. Once the marker and the old copy in the bucket are gone, nothing is left to refuse for it: a local copy still on the old host reads as an ordinary session there, and the next command that syncs it pushes it back under the old workspace's prefix. Run `koto session cleanup <name>` in the old workspace on that host before you prune (cleanup leaves the marker in place), or retire the host. A pin on the old copy doesn't stop this: the import carried the pin to the moved copy, so the old copy's pin keeps nothing, cleanup removes it, and `koto session unpin` refuses it as a migrated source. An import an older release ran may not have carried the pin, so check that the moved copy is pinned (`koto session list --pinned` in the new workspace) before removing the old one. Any other pinned session refuses cleanup until `koto session unpin <name>` releases it.
+
+### Older releases
+
+The relation only protects the old copy from a release that knows it. An older release's local prunes over-keep a chain. Under the cloud backend, an older release can delete a predecessor whose successor it never pulled. And an older release's `koto session import` still retires its source: it leaves the marker and no relation on the copy.
 
 ### Import errors
 
@@ -419,7 +432,7 @@ Context keys are compared one at a time when they're read. When this host's copy
 | `session.cloud.bucket` | `KOTO_SESSION_CLOUD_BUCKET` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
 | `session.cloud.region` | `KOTO_SESSION_CLOUD_REGION` | Region | (none) | Yes |
 | `session.cloud.path_style` | `KOTO_SESSION_CLOUD_PATH_STYLE` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
-| `session.cloud.marker_retain_days` | (none) | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
+| `session.cloud.marker_retain_days` | (none) | No longer decides anything: `koto session prune --migrated-from` accepts it but ignores it, and reports it as `ignored` | `30` | No (user only, as before; it decides nothing now) |
 | `session.cloud.check_window_secs` | `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` | Seconds this host's koto processes share one check of a session outside a tick; `0` turns the sharing off. Another host's write can go unseen for up to this long (see [What a read costs](#what-a-read-costs)) | `5` | No (user/env only: a cloned repository's config can't widen it) |
 | `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |

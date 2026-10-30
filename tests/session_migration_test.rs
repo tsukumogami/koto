@@ -140,12 +140,18 @@ fn carrier_moves_a_session_from_a_to_b_to_c() {
         import_requests.join("\n  ")
     );
 
-    // The import wrote exactly one object under A's prefix, the marker,
-    // and left every object A had there byte for byte.
+    // The import wrote exactly two objects under A's prefix, the copy's
+    // back-reference first and the marker last, and left every object A
+    // had there byte for byte.
     let marker_key = format!("{}migrated.json", a_session);
+    let pointer_key = format!("{}ctx/koto/continued-by/{}/{}", a_session, b.prefix(), name);
     ensure(
         step,
-        writes_under(&s3, &a.prefix()) == vec![("PUT".to_string(), marker_key.clone())],
+        writes_under(&s3, &a.prefix())
+            == vec![
+                ("PUT".to_string(), pointer_key.clone()),
+                ("PUT".to_string(), marker_key.clone()),
+            ],
         format!(
             "writes under A's prefix were {:?}",
             writes_under(&s3, &a.prefix())
@@ -169,8 +175,10 @@ fn carrier_moves_a_session_from_a_to_b_to_c() {
     for key in carrier.key_hashes.keys() {
         expected.push(format!("{}ctx/{}", b_session, key));
     }
-    // The record of where the copy came from, which every import writes.
+    // The record of where the copy came from, and the relation naming the
+    // source, which every import writes.
     expected.push(format!("{}ctx/koto/imported-from", b_session));
+    expected.push(format!("{}ctx/koto/links/continues/{}", b_session, name));
     expected.sort();
     ensure(
         step,
@@ -357,9 +365,13 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
     let moved = session_prefix(&a, "moved");
     let run = a.koto(&["session", "cleanup", "moved"]);
     assert!(run.ok(), "cleanup: {}", run.describe());
+    // The back-reference beside it is the copy's, which cleanup leaves.
     assert_eq!(
         s3.keys_under(&moved),
-        vec![format!("{}migrated.json", moved)],
+        vec![
+            format!("{}ctx/koto/continued-by/{}/moved", moved, b.prefix()),
+            format!("{}migrated.json", moved),
+        ],
         "cleanup must delete everything but the marker"
     );
 
@@ -584,11 +596,17 @@ fn import_refusals() {
     assert_no_trace(&s3, &d, "wf");
     assert_eq!(
         writes_under(&s3, &a.prefix()),
-        vec![(
-            "PUT".to_string(),
-            format!("{}/wf/migrated.json", a.prefix())
-        )],
-        "the only write under A's prefix is the one import's marker"
+        vec![
+            (
+                "PUT".to_string(),
+                format!("{}/wf/ctx/koto/continued-by/{}/wf", a.prefix(), c.prefix())
+            ),
+            (
+                "PUT".to_string(),
+                format!("{}/wf/migrated.json", a.prefix())
+            )
+        ],
+        "the only writes under A's prefix are the one import's back-reference and marker"
     );
 }
 
@@ -847,10 +865,10 @@ fn import_refuses_a_source_log_it_cannot_carry() {
 }
 
 /// A session that never stored a key imports, and its target's manifest
-/// lists only the `koto/imported-from` record the import writes, here and
-/// in the bucket.
+/// lists only the records the import writes, `koto/imported-from` and the
+/// relation naming the source, here and in the bucket.
 #[test]
-fn a_source_with_no_context_keys_imports_with_only_its_import_record() {
+fn a_source_with_no_context_keys_imports_with_only_its_import_records() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -871,7 +889,7 @@ fn a_source_with_no_context_keys_imports_with_only_its_import_record() {
     assert_eq!(run.json["keys"], 0, "{}", run.describe());
     let manifest = b.manifest("bare");
     let keys: Vec<&String> = manifest["keys"].as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["koto/imported-from"]);
+    assert_eq!(keys, ["koto/imported-from", "koto/links/continues/bare"]);
     let pushed = s3
         .object(&format!("{}ctx/manifest.json", session_prefix(&b, "bare")))
         .expect("the manifest is pushed");
@@ -881,7 +899,10 @@ fn a_source_with_no_context_keys_imports_with_only_its_import_record() {
     );
     let run = b.koto(&["context", "list", "bare"]);
     assert!(run.ok(), "context list: {}", run.describe());
-    assert_eq!(run.json, serde_json::json!(["koto/imported-from"]));
+    assert_eq!(
+        run.json,
+        serde_json::json!(["koto/imported-from", "koto/links/continues/bare"])
+    );
 }
 
 /// A PUT that fails part way through the push: the import takes back
@@ -897,8 +918,9 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     start_session(&a, "wf");
     compile(&b);
 
-    // The state file, the template, notes.md and the import's own
-    // `koto/imported-from` go up before the manifest.
+    // The back-reference beside the source goes up first; then the state
+    // file, the template, notes.md, the import's own `koto/imported-from`
+    // and the relation naming the source, before the manifest.
     let target = session_prefix(&b, "wf");
     let manifest = format!("{}ctx/manifest.json", target);
     s3.fail("PUT", &manifest, 500);
@@ -918,19 +940,24 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
             .map(|(_, k)| k.clone())
             .collect()
     };
+    let pointer = format!("{}/wf/ctx/koto/continued-by/{}/wf", a.prefix(), b.prefix());
     let pushed: std::collections::BTreeSet<String> = [
         format!("{}koto-wf.state.jsonl", target),
         format!("{}template.json", target),
         format!("{}ctx/notes.md", target),
         format!("{}ctx/koto/imported-from", target),
+        format!("{}ctx/koto/links/continues/wf", target),
+        pointer.clone(),
     ]
     .into_iter()
     .collect();
     assert_eq!(of("PUT"), pushed, "writes were {:?}", writes);
     assert_eq!(of("DELETE"), pushed, "writes were {:?}", writes);
     assert!(
-        writes.iter().all(|(_, k)| k.starts_with(&target)),
-        "a write landed outside the target's prefix: {:?}",
+        writes
+            .iter()
+            .all(|(_, k)| k.starts_with(&target) || *k == pointer),
+        "a write landed outside the target's prefix and the back-reference: {:?}",
         writes
     );
 }
@@ -963,10 +990,11 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     );
     assert_eq!(staging_dirs(&b), Vec::<String>::new());
     let target = holdings(&s3, &b, "wf");
-    // State file, template, notes.md, koto/imported-from, manifest, version.
+    // State file, template, notes.md, koto/imported-from, the relation,
+    // manifest, version.
     assert_eq!(
         target.1.len(),
-        6,
+        7,
         "the target in the bucket: {:?}",
         target.1
     );
@@ -1018,8 +1046,17 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
         written["target"]["session_id"],
         b.header("wf")["session_id"]
     );
-    let run = a.koto(&["status", "wf"]);
+    let run = a.koto(&["next", "wf"]);
     assert_eq!(run.code, Some(2), "A must refuse now: {}", run.describe());
+    assert_eq!(
+        run.json["error"]["code"],
+        "session_migrated",
+        "{}",
+        run.describe()
+    );
+    // A read of the source answers from the copy it left.
+    let run = a.koto(&["status", "wf"]);
+    assert_eq!(run.code, Some(0), "status in A: {}", run.describe());
 }
 
 /// A crash between the push and the rename leaves the target only in the
@@ -1165,14 +1202,18 @@ fn as_imports_under_a_new_name() {
     let run = b.koto(&["status", "moved"]);
     assert!(run.ok(), "status moved: {}", run.describe());
     assert_eq!(holdings(&s3, &b, "wf"), own, "B's own 'wf' changed");
-    let run = a.koto(&["status", "wf"]);
+    let run = a.koto(&["next", "wf"]);
     assert!(
-        run.json["error"]
+        run.json["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("'moved'")),
         "A's refusal must name the new name: {}",
         run.describe()
     );
+    // A read of the source answers as 'wf', from the copy it left.
+    let run = a.koto(&["status", "wf"]);
+    assert_eq!(run.code, Some(0), "status in A: {}", run.describe());
+    assert_eq!(run.json["name"], "wf", "{}", run.describe());
 }
 
 /// `koto init` pushes the compiled template as `template.json`; the import
@@ -1248,10 +1289,12 @@ fn trust_template_takes_the_bucket_copy_only_when_asked() {
     assert_no_trace(&s3, &c, "wf2");
 }
 
-/// After an import, the source's `koto context` commands and `koto session
-/// rebind` refuse with `session_migrated`, and leave its copy as it was.
+/// After an import, the source's `koto context add` and `remove` and `koto
+/// session rebind` refuse with `session_migrated`, while `get`, `list` and
+/// `exists` answer from the copy the source left in the bucket; all of them
+/// leave its copy as it was.
 #[test]
-fn a_migrated_source_refuses_context_commands_and_rebind() {
+fn a_migrated_source_refuses_context_writes_and_rebind_and_serves_reads() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -1282,12 +1325,6 @@ fn a_migrated_source_refuses_context_commands_and_rebind() {
             ],
             "context add",
         ),
-        (vec!["context", "get", "wf", "notes.md"], "context get"),
-        (vec!["context", "list", "wf"], "context list"),
-        (
-            vec!["context", "exists", "wf", "notes.md"],
-            "context exists",
-        ),
         (
             vec!["context", "remove", "wf", "notes.md"],
             "context remove",
@@ -1310,6 +1347,28 @@ fn a_migrated_source_refuses_context_commands_and_rebind() {
         "rebind: {}",
         run.describe()
     );
+
+    // The reads answer from the source's last pushed copy.
+    let run = a.koto(&["context", "get", "wf", "notes.md"]);
+    assert_eq!(run.code, Some(0), "context get: {}", run.describe());
+    assert_eq!(
+        run.stdout.as_bytes(),
+        notes.as_slice(),
+        "{}",
+        run.describe()
+    );
+    let run = a.koto(&["context", "list", "wf"]);
+    assert_eq!(run.code, Some(0), "context list: {}", run.describe());
+    assert_eq!(
+        run.json,
+        serde_json::json!(["notes.md"]),
+        "{}",
+        run.describe()
+    );
+    let run = a.koto(&["context", "exists", "wf", "notes.md"]);
+    assert_eq!(run.code, Some(0), "context exists: {}", run.describe());
+    let run = a.koto(&["context", "exists", "wf", "new.md"]);
+    assert_eq!(run.code, Some(1), "context exists: {}", run.describe());
 
     assert_eq!(std::fs::read(ctx.join("notes.md")).unwrap(), notes);
     assert!(!ctx.join("new.md").exists());
@@ -1376,9 +1435,11 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
 }
 
 /// A source whose terminal tick removed it is not found; an imported
-/// session's own terminal tick removes only its own prefix.
+/// session continues its source, so its own terminal tick keeps it with
+/// that hierarchy for the prunes to judge, and touches nothing under the
+/// source's prefix.
 #[test]
-fn terminal_ticks_remove_a_source_and_only_their_own_target() {
+fn terminal_ticks_remove_a_source_and_keep_an_imported_copy() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -1414,8 +1475,13 @@ fn terminal_ticks_remove_a_source_and_only_their_own_target() {
     s3.clear_requests();
     tick_to_terminal(&b, "wf");
     let target = session_prefix(&b, "wf");
-    assert_eq!(s3.keys_under(&target), Vec::<String>::new());
-    assert!(!b.session_dir("wf").exists());
+    assert!(
+        s3.keys_under(&target)
+            .contains(&format!("{}koto-wf.state.jsonl", target)),
+        "{:?}",
+        s3.keys_under(&target)
+    );
+    assert!(b.session_dir("wf").exists());
     let a_after: Vec<(String, Option<Vec<u8>>)> = s3
         .keys_under(&format!("{}/", a.prefix()))
         .into_iter()
@@ -1425,16 +1491,16 @@ fn terminal_ticks_remove_a_source_and_only_their_own_target() {
         })
         .collect();
     assert_eq!(a_after, a_before, "B's terminal tick touched A's prefix");
-    let deletes: Vec<String> = all_writes(&s3)
-        .into_iter()
-        .filter(|(m, _)| m == "DELETE")
-        .map(|(_, k)| k)
-        .collect();
-    assert!(!deletes.is_empty());
+    let writes = all_writes(&s3);
     assert!(
-        deletes.iter().all(|k| k.starts_with(&target)),
-        "a delete outside B's prefix: {:?}",
-        deletes
+        writes.iter().all(|(_, k)| k.starts_with(&target)),
+        "a write outside B's prefix: {:?}",
+        writes
+    );
+    assert!(
+        writes.iter().all(|(m, _)| m != "DELETE"),
+        "the copy's terminal tick deleted: {:?}",
+        writes
     );
 }
 
@@ -1520,8 +1586,9 @@ fn import_requests_grow_by_one_get_and_one_put_per_key() {
                 .count()
         };
         assert_eq!(per_key("GET", &a), n, "GETs of {name}'s keys");
-        // The source's keys, plus the `koto/imported-from` the import writes.
-        assert_eq!(per_key("PUT", &b), n + 1, "PUTs of {name}'s keys");
+        // The source's keys, plus the `koto/imported-from` and the relation
+        // the import writes.
+        assert_eq!(per_key("PUT", &b), n + 2, "PUTs of {name}'s keys");
         totals.push(requests.len());
     }
     assert_eq!(

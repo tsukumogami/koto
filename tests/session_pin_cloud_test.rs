@@ -982,9 +982,17 @@ fn cleanup_removes_a_pinned_migrated_source_while_the_moved_copy_stays_pinned() 
     );
     h.ok(1, &["session", "cleanup", "P"]);
     assert!(!h.sessions(1).join("P").exists());
+    // The moved copy's back-reference beside the source is the copy's, and
+    // stays with the marker.
     assert_eq!(
         h.objects("P").into_keys().collect::<Vec<_>>(),
-        [h.key("P", "migrated.json")]
+        [
+            h.key(
+                "P",
+                &format!("ctx/koto/continued-by/{}/P", prefix_of(&dest))
+            ),
+            h.key("P", "migrated.json")
+        ]
     );
     // The moved copy is untouched, and its pin still keeps it.
     assert_eq!(h.s3.object(&moved), Some(pin));
@@ -1128,19 +1136,25 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
     );
 
     // The migrated source's pin is inert: unpin refuses it and writes
-    // nothing, and a prune of migrated sources removes it while the moved
-    // copy stays pinned.
+    // nothing. What keeps each source now is its moved copy, through the
+    // relation: the pin the copy carries.
     h.s3.clear_requests();
     let out = h.fails(1, &["session", "unpin", "P"], 2);
     assert_eq!(out["error"]["code"], "not_pinnable", "{out}");
     assert!(h.writes().is_empty(), "{:?}", h.writes());
-    let preview = ok_in_dest(&[
-        "session",
-        "prune",
-        "--migrated-from",
-        &from,
-        "--source-retired",
-    ]);
+    let preview = ok_in_dest(&["session", "prune", "--migrated-from", &from]);
+    assert!(names(&preview["remove"]).is_empty(), "{preview:#}");
+    for name in ["P", "Q"] {
+        let kept = entry(&preview["kept"], name);
+        assert_eq!(kept["reason"], "relation", "{kept:#}");
+        assert_eq!(kept["relation_keepers"][0]["standing"], "pin", "{kept:#}");
+    }
+    // Once P's copy is unpinned and its retention has passed, the source's
+    // own pin keeps nothing, and the prune removes the source; Q's copy,
+    // whose pin can't be read, still keeps Q.
+    ok_in_dest(&["session", "unpin", "P"]);
+    settle();
+    let preview = ok_in_dest(&["session", "prune", "--migrated-from", &from]);
     let token = preview["plan"].as_str().unwrap().to_string();
     let applied = ok_in_dest(&[
         "session",
@@ -1151,10 +1165,8 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
         "--plan",
         &token,
     ]);
-    assert!(
-        names(&applied["removed"]).contains(&"P".to_string()),
-        "{applied:#}"
-    );
+    assert_eq!(names(&applied["removed"]), ["P"], "{applied:#}");
+    assert_eq!(entry(&applied["kept"], "Q")["reason"], "relation");
     assert!(h.s3.object(&h.key("P", PIN)).is_none());
-    assert!(h.s3.object(&moved("P", PIN)).is_some());
+    assert!(h.s3.object(&moved("P", "koto-P.state.jsonl")).is_some());
 }
