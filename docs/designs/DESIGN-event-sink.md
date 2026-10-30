@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto writes its session records to a local run journal that a separate host
   job copies and forwards later. That hop is going away: koto has to hand its
@@ -41,7 +41,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
