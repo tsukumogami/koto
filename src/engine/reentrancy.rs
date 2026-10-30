@@ -63,7 +63,8 @@ pub fn is_tick_process() -> bool {
 ///
 /// The cloud backend defers such a command's writes to `session` and leaves
 /// the bucket to the tick, which flushes them once before it returns
-/// (koto#376). A command writing to any other session pushes at once.
+/// (koto#376), with its own writes to `session` (koto#548). A command
+/// writing to any other session pushes at once.
 pub fn runs_inside_tick_of(session: &str) -> bool {
     !is_tick_process() && enclosing_tick().as_deref() == Some(session)
 }
