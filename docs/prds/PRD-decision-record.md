@@ -16,7 +16,6 @@ goals: |
   from its own session, with every reader agreeing on what is still in effect, and a
   live workflow stops before building on a reversed decision. Nothing about decisions is
   written to or read from a file under koto on the host.
-upstream: docs/briefs/BRIEF-decision-record.md
 motivating_context: |
   A first build (koto#394, koto#396) kept decisions in a host store,
   `~/.koto/decisions/`, because koto removed a session when its workflow succeeded. The
@@ -24,6 +23,8 @@ motivating_context: |
   read and reversed from above through session retention, which has since shipped
   (koto#410 and the work it indexes). The first build's store-independent parts carry
   over as requirements here.
+absorbed:
+  - docs/briefs/BRIEF-decision-record.md
 ---
 
 # PRD: The decision record
@@ -31,6 +32,41 @@ motivating_context: |
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-decision-record](docs/briefs/BRIEF-decision-record.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+Delegated sessions decide unattended: they accept documents, pass gates, merge, take questions
+above them or decide not to, and settle judgment calls. Afterwards nobody above can read who made
+each decision and on what authority, or reverse one so that koto honours the reversal, and the
+partial records koto and shirabe keep each name the decider their own way, one of them in a host
+file. A first build put a shared record in a host store; the owner rejected that as a workaround
+for koto's session lifetime and asked for decisions to live in the koto session, which session
+retention now makes possible.
+
+The outcome this feature exists for: a coordinator, or the person at the top of a chain, opens any
+session below it and reads every decision that session made or received, from the deciding
+session's own keys, after it finished and while the reader's session is alive. When they
+disagree, they reverse it from their own session, every reader sees the original no longer in
+effect, and a live workflow that built on a reversed decision stops at its next step. A person
+deciding is named without an account, and no gate is passed without a named decider.
+
+The journeys that frame it, carried as the User Stories below: a coordinator audits an unattended
+unit after it finished; a maintainer decides at the acceptance point; the coordinator reverses what
+it disagrees with; a worker's escalations, declines and judgment calls become visible; a gate pass
+nobody named is defaulted or refused; a person reverses two levels down after the middle session
+finished, and two reversers race; the session above moves to another workspace by import and keeps
+reading and reversing.
+
+The boundary, carried as the Requirements and Out of Scope below: in are the decision kinds and
+what reversing each means, the two-level decider and people without accounts, the authority and
+chain read from koto's own links, write-once keys in the deciding session, reversal in the
+reverser's session with a deterministic race rule, the blocked next step, the gate decider rule,
+retiring the decider ledger as a host file, and bringing koto's partial records onto one
+vocabulary. Out are on whose behalf a decision was made, who-may-decide policy, undoing effects
+outside koto, changes to retention itself, cross-host reads without an import, any coupling of
+koto and niwa, rebuilding shirabe's own records, and pruning.
 
 ## Problem Statement
 
