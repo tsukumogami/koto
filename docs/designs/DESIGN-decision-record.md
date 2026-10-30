@@ -771,8 +771,9 @@ between hosts):
   delimiter touch the cloud tick that work just made faster (koto#549). The reversal read costs
   nothing for a session with no decisions and about two round trips otherwise.
 - *Successor coordinators.* A coordinator's successor continues its run through a `continues` link
-  that, by that work's rule, grants no authority. A successor therefore can't reverse a decision
-  below its predecessor on standing alone. See open question 3.
+  that, by that work's rule, grants no authority. This design gives a successor no standing over
+  what its predecessor dispatched; whether it should have any is open question 3, and nothing here
+  assumes an answer.
 - *The coordinator's record.* Its `record/decisions` and `record/reversals` keys stay; each row gains a
   decision citation (Decision 5).
 - *Import.* Accumulating source ids in `koto/imported-from` changes a key the import code writes.
@@ -808,23 +809,27 @@ report.
 
 ## Open questions for the state-unification lane
 
-Recorded for the state-unification lane, which was paused when this design was written; the
-recommended answer is what this design assumes.
+Recorded for the state-unification lane, which was paused when this design was written. Questions
+1, 2, 4, 5 and 6 carry the answer this design assumes, each pending that lane's confirmation.
+Question 3 is open: the design assumes no answer to it.
 
 1. **Reserved areas outside the manifest.** Do `koto/decisions/`, `koto/aimed/` and `koto/packs/`, held
    as create-only bucket objects outside the pushed manifest the way the pin is, collide with anything
-   planned for context keys? *Recommended:* no collision; proceed.
+   planned for context keys? *Assumed, pending state-unification confirmation:* no collision; proceed.
 2. **The coordinator's decisions and reversals tables.** Should `record/decisions` and
    `record/reversals` become a rendering over the record, or stay as rows that cite decision ids?
-   *Recommended:* stay and cite now; a rendering is later work.
+   *Assumed, pending state-unification confirmation:* stay and cite now; a rendering is later work.
 3. **Successor standing.** Should a session that continues another, through a `continues` link, stand
    above what its predecessor dispatched when reversing a decision? That lane's rule says the link
-   grants no authority. *Recommended:* yes for reversal only, read as the same run continuing,
-   recorded with standing `asserted` until that lane agrees; otherwise the person above reverses.
+   grants no authority. *Open.* How authority and decisions carry from a coordinator to its
+   successor is being worked out separately. Until it is settled, a successor has no standing over
+   its predecessor's dispatches, and the person above reverses instead. *Recommendation for that
+   work:* let a successor reverse below its predecessor, because it continues the same run. *Answer:*
+   pending.
 4. **Tick budget.** Is about two parallel listing round trips per tick, only for a live session that
-   holds decisions, acceptable within the cloud action limit? *Recommended:* yes.
+   holds decisions, acceptable within the cloud action limit? *Assumed, pending state-unification confirmation:* yes.
 5. **Import history.** May import accumulate every earlier source session id in
-   `koto/imported-from`? *Recommended:* yes.
+   `koto/imported-from`? *Assumed, pending state-unification confirmation:* yes.
 6. **Read logging.** Decision reads from above write nothing at all, not even to the reader's anchor.
    Counting reads from above, which a later instrument wants, would record them in the reader's own
-   session. *Recommended:* write nothing now.
+   session. *Assumed, pending state-unification confirmation:* write nothing now.
