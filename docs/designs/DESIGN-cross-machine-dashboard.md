@@ -202,7 +202,8 @@ intent, `salient_var`, `is_batch_task`, `is_request_leg` and
 `last_event_at`; `last_seq`, `state_etag` (the ETag the state PUT just
 returned) and the recorded machine name; and a `sources` list of
 `{relation: imported | superseded, prefix, name, session_id}` built from the
-session's own import and supersede records. The row fields come from one
+session's own import and supersede records, at most 16 entries. The row
+fields come from one
 pure derivation shared with the local dashboard reader, so a remote row
 equals what the producing machine's own `--once` prints. Internal sessions
 (anchors, close sessions, `~` epoch branches) get no summary.
@@ -214,8 +215,11 @@ requests in flight, following every page. Each session's top-level objects
 `template.json`, `batch-open.json`) come back with ETag, LastModified and
 Size, and its `ctx/` tree folds into one entry. A pure classifier then
 decides each session's row: no state object means the session was removed
-(drop it); a `migrated.json`, or a `sources` entry in another row or a
-local session naming it, means a migrated or superseded source (hide it);
+(drop it); a `migrated.json` in the session's own directory, or a local
+session's import or supersede record naming it, means a migrated or
+superseded source (hide it); a `sources` entry in another remote row's
+summary that names it by `session_id` only recedes it, since any bucket
+writer can write such an entry (see Security Considerations);
 a state object with no summary is a legacy session (show it as `unknown`,
 idle time from the state's LastModified, unless its name marks it
 internal); a summary is fetched only when its listed ETag changed (the
@@ -582,6 +586,9 @@ Deliverables:
 - fake-bucket tests for removal, migrated and superseded sources, legacy
   sessions, stale summaries, oversized and malformed summaries, partial
   failures, pagination and the request counts R21 and R24 bound
+- the Security Considerations rules: corroborated hiding only, the
+  `sources` cap, strict summary parsing, `machine` re-validation, timestamp
+  clamping and the per-run ceilings with their truncation notice
 
 ### Phase 6: Dashboard integration
 
@@ -602,6 +609,72 @@ Deliverables:
   the probe results, and the rewritten sentence about indexes), the
   dashboard guide, `docs/reference/session-feed.md`, and the koto-user
   skill's command reference
+
+## Security Considerations
+
+The bucket is one trust domain. Any machine holding write credentials for it
+can write any object, so everything the reader takes from the bucket
+(listings, summaries, machine names, states) is treated as untrusted input
+for display, and nothing it reads is executed, followed as a path, or used
+to decide a write. The dashboard is an awareness aid: a forged summary can
+make a row show the wrong state or the wrong machine, and that residual risk
+is accepted and stated in the cloud sync guide. What the design does
+prevent is a bucket writer using the dashboard against the person reading
+it.
+
+**No silent hiding.** A summary's `sources` list can't hide another
+session's row. Hiding needs corroboration a summary can't forge on its own
+behalf: a `migrated.json` in the hidden session's own directory (which every
+import writes) or a local session's import or supersede record. A `sources`
+entry from a remote summary only recedes the row it names, which stays
+reachable with `--all` and the `a` key. `sources` is capped at 16 entries and
+a summary with more is read as unreadable.
+
+**Strict parsing and size limits.** A summary is fetched only when its
+listed Size is at most 64 KiB, and the body is parsed into a closed schema:
+an unknown `schema` value, a missing required field, or a `session_id`,
+`name` or `home` that disagrees with the object's key makes the row
+unreadable rather than partly trusted. The `machine` value is re-validated
+against the same 1-to-64-character `[A-Za-z0-9._-]` rule the writer uses; a
+value that fails is shown as `unknown`. Timestamps later than the reader's
+clock plus five minutes are clamped to the reader's clock, so a forged
+future time can't pin a row at the top of a band.
+
+**Terminal output.** One sanitizer handles every string that came from the
+bucket before it reaches a row: it replaces C0 and C1 control characters,
+DEL, U+2028, U+2029 and the bidirectional override and isolate characters
+(U+202A to U+202E, U+2066 to U+2069) with a space, which removes ESC and so
+every CSI and OSC sequence, and removes tab and newline from `--once`
+fields. Tests feed each of these through `--once` and the TUI's rendered
+buffer.
+
+**Resource ceilings.** A hostile or simply huge bucket can't hang or exhaust
+the reader. Every request times out after 10 seconds, the TUI's scan has
+its per-refresh budget, and each run stops at 5,000 workspace prefixes, 100
+listing pages per prefix and 20,000 sessions, showing a "listing
+truncated" notice on the status line (and stderr for `--once`) when a
+ceiling is reached.
+
+**Permission scope.** The reader needs `s3:ListBucket` and `s3:GetObject`
+only and builds its own client that has no write path; a test runs the
+dashboard against the fake bucket and asserts no PUT, DELETE or POST, and no
+new directory in the session store. The writer's credentials and paths are
+unchanged apart from one more PUT per push, into the session's own
+directory, which the existing delete already covers. Credential resolution
+doesn't change, and no setting comes from a project's files.
+
+**Data exposure.** A summary publishes the session's name, template name,
+state, intent, salient variable and machine name into the bucket. All of
+them except the machine name are already in the state file beside it, so
+the summary exposes nothing new to anyone who can read the bucket. The
+machine name defaults to the short hostname, which is new in the bucket; the
+cloud sync guide says so, and a developer who doesn't want the hostname
+published sets `machine.name` or `KOTO_MACHINE_NAME` to something else.
+
+**Existing listers.** The summary sits inside the session's directory, not
+at the top level, so `held_elsewhere`, the continues walk and prune, which
+read only 16-hex top-level prefixes, see nothing new. `koto session list`
+reads only common prefixes under the current prefix and is unaffected.
 
 ## Consequences
 
