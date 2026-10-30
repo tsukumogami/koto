@@ -6128,3 +6128,146 @@ fn a_review_round_with_a_format_carries_it_and_a_charter_format_drops_the_type()
     assert_eq!(r[1]["koto.doc.format"], "plan");
     assert_eq!(r[1]["koto.doc.type"], "plan");
 }
+
+// ----- Code review records -----
+
+/// A code review round relays one `code_review_round` record and then one
+/// `code_review_verdict` per seat, in order, all under the event's one
+/// `koto.seq`, each holding exactly its kind's fields and none of a
+/// document review kind's.
+#[test]
+fn a_code_review_round_relays_one_round_and_one_verdict_per_seat_under_one_seq() {
+    use crate::engine::types::{CodeReviewRoundRecorded, CodeReviewSeat};
+    let f = session_in_a();
+    let head = digest("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    let seat = |seat: &str, model: &str, verdict: &str| CodeReviewSeat {
+        seat: seat.into(),
+        model: model.into(),
+        verdict: verdict.into(),
+    };
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::CodeReviewRoundRecorded(CodeReviewRoundRecorded {
+            state: "a".into(),
+            round: 2,
+            head: head.clone(),
+            entries: vec![
+                seat("correctness", "claude-opus-4-5", "pass"),
+                seat("security", "gpt-5.1", "fail"),
+                seat("other", "claude-sonnet-4-5@20250929", "pass"),
+            ],
+        }),
+    );
+    let j = f.journal();
+    let r: Vec<&serde_json::Value> = j
+        .iter()
+        .filter(|r| r["kind"].as_str().unwrap().starts_with("code_review_"))
+        .collect();
+    let kinds: Vec<(&str, u64)> = r
+        .iter()
+        .map(|r| (r["kind"].as_str().unwrap(), r["koto.seq"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("code_review_round", 3),
+            ("code_review_verdict", 3),
+            ("code_review_verdict", 3),
+            ("code_review_verdict", 3),
+        ]
+    );
+    for rec in &r {
+        let keys: BTreeSet<&str> = rec
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let own: &[&str] = match rec["kind"].as_str().unwrap() {
+            "code_review_round" => &[
+                "koto.state",
+                "koto.code_review.round",
+                "koto.code_review.seat_count",
+                "koto.code_review.head",
+            ],
+            _ => &[
+                "koto.state",
+                "koto.code_review.round",
+                "koto.code_review.seat",
+                "koto.code_review.model",
+                "koto.code_review.verdict",
+            ],
+        };
+        let expected: BTreeSet<&str> = RELAY_FIELDS.iter().chain(own).copied().collect();
+        assert_eq!(keys, expected, "{rec}");
+        assert_eq!(rec["v"], 1);
+        assert_eq!(rec["koto.state"], "a");
+        assert_eq!(rec["koto.code_review.round"], 2);
+        assert_eq!(rec["koto.visit.seq"], 2);
+    }
+    assert_eq!(r[0]["koto.code_review.seat_count"], 3);
+    assert_eq!(r[0]["koto.code_review.head"], head.as_str());
+    let seats: Vec<(&str, &str, &str)> = r[1..]
+        .iter()
+        .map(|r| {
+            (
+                r["koto.code_review.seat"].as_str().unwrap(),
+                r["koto.code_review.model"].as_str().unwrap(),
+                r["koto.code_review.verdict"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seats,
+        vec![
+            ("correctness", "claude-opus-4-5", "pass"),
+            ("security", "gpt-5.1", "fail"),
+            ("other", "claude-sonnet-4-5@20250929", "pass"),
+        ]
+    );
+    // No document review record was written for the round.
+    assert!(!j.iter().any(|r| {
+        let k = r["kind"].as_str().unwrap();
+        k.starts_with("review_") || k.starts_with("doc_")
+    }));
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("4b825dc642cb6eb9a060e54bf8d69288fbee4904"));
+}
+
+/// A round of the most seats, each with the longest seat and model koto
+/// stores, keeps every record within the journal's line limit.
+#[test]
+fn a_code_review_round_of_the_longest_values_fits_one_line_per_record() {
+    use crate::engine::types::{CodeReviewRoundRecorded, CodeReviewSeat};
+    let f = session_in_a();
+    let long = |c: char| c.to_string().repeat(128);
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::CodeReviewRoundRecorded(CodeReviewRoundRecorded {
+            state: long('s'),
+            round: u64::MAX,
+            head: digest("h"),
+            entries: vec![
+                CodeReviewSeat {
+                    seat: long('x'),
+                    model: long('m'),
+                    verdict: "fail".into(),
+                };
+                200
+            ],
+        }),
+    );
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.contains("\"code_review_"))
+        .collect();
+    assert_eq!(lines.len(), 201);
+    for line in lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
+    }
+}

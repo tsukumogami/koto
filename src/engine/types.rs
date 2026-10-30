@@ -1090,6 +1090,40 @@ pub struct DocFixRecorded {
     pub entries: Vec<DocFix>,
 }
 
+/// The event type `koto review record ... code-round` appends: one per
+/// call, holding the round and every seat's verdict. Kept apart from the
+/// document review events, so a reader of those never counts a code review
+/// panel as a document jury.
+pub const CODE_REVIEW_ROUND_RECORDED: &str = "code_review_round_recorded";
+
+/// One seat's verdict in a [`CodeReviewRoundRecorded`] call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeReviewSeat {
+    /// A seat the session's template declares, or `other`.
+    pub seat: String,
+    /// The model the seat ran on, as given when name-shaped (1 to 128
+    /// bytes), `other` otherwise.
+    pub model: String,
+    /// `pass` or `fail`.
+    pub verdict: String,
+}
+
+/// A code review round: the payload of [`CODE_REVIEW_ROUND_RECORDED`]. One
+/// event per call, so the round and every seat share the event's sequence
+/// number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeReviewRoundRecorded {
+    /// The session's state when the call was made.
+    pub state: String,
+    /// The round's number, from 1.
+    pub round: u64,
+    /// The reviewed head, only ever as its digest (`sha256:` and 32 hex
+    /// characters), never the value the caller gave.
+    pub head: String,
+    /// One per seat, at least one.
+    pub entries: Vec<CodeReviewSeat>,
+}
+
 /// The event type every `koto session anchor open` appends to its anchor.
 pub const ANCHOR_STARTED: &str = "anchor_started";
 
@@ -1899,6 +1933,10 @@ pub enum EventPayload {
     /// A fix applied to a document, appended by `koto review record fix`
     /// with every entry in one event.
     DocFixRecorded(DocFixRecorded),
+    /// A code review round and its seats' verdicts, appended by
+    /// `koto review record code-round` in one event. Additive, and degrades
+    /// like `finding_disputed`.
+    CodeReviewRoundRecorded(CodeReviewRoundRecorded),
     /// One `koto session anchor open` call against an anchor
     /// (DESIGN-session-retention.md, Decision 2): every call appends one,
     /// whether it created the anchor or continued it. Additive: an older
@@ -2286,6 +2324,7 @@ impl EventPayload {
             EventPayload::DocRuleChecksRecorded(_) => DOC_RULE_CHECKS_RECORDED,
             EventPayload::DocSectionRecorded(_) => DOC_SECTION_RECORDED,
             EventPayload::DocFixRecorded(_) => DOC_FIX_RECORDED,
+            EventPayload::CodeReviewRoundRecorded(_) => CODE_REVIEW_ROUND_RECORDED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
@@ -2860,6 +2899,15 @@ impl<'de> Deserialize<'de> for Event {
             DOC_FIX_RECORDED => {
                 match serde_json::from_value::<DocFixRecorded>(payload_val.clone()) {
                     Ok(f) => EventPayload::DocFixRecorded(f),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            CODE_REVIEW_ROUND_RECORDED => {
+                match serde_json::from_value::<CodeReviewRoundRecorded>(payload_val.clone()) {
+                    Ok(c) => EventPayload::CodeReviewRoundRecorded(c),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),

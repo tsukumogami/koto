@@ -102,6 +102,8 @@ their digest (see
 | `doc_rule_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.rule.id`, `koto.doc.rule_outcome`, `koto.doc.check_moment` | Once for each entry `koto review record ... rule-checks` records; one call's records share its `koto.seq`. |
 | `doc_section_written` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.doc.section`, `koto.doc.section_write` | `koto review record ... section-written` records a document section written for the first time or rewritten. |
 | `doc_fix_applied` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.rule.id`, `koto.doc.section`, `koto.doc.fix_answers`, `koto.doc.fix_round`, `koto.doc.fix_check_rule` | Once for each entry `koto review record ... fix` records; one call's records share its `koto.seq`. |
+| `code_review_round` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.code_review.round`, `koto.code_review.seat_count`, `koto.code_review.head` | `koto review record ... code-round` records a code review round (a pull request review panel). |
+| `code_review_verdict` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.code_review.round`, `koto.code_review.seat`, `koto.code_review.model`, `koto.code_review.verdict` | Once for each seat of a `koto review record ... code-round` call, after its `code_review_round`; one call's records share its `koto.seq`. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash`, `koto.context.read_by` | A state visit that read context keys ends, or a reader's anchor records a read of another session. |
 
@@ -798,6 +800,37 @@ distinct records.
 ```json
 {"kind":"review_verdict","v":1,"at":"2026-10-10T03:22:05.118Z","session":"scope-export","koto.session.id":"7d1e2f30-4a5b-4c6d-8e9f-0a1b2c3d4e5f","koto.run.id":"7d1e2f30-4a5b-4c6d-8e9f-0a1b2c3d4e5f","koto.seq":42,"koto.visit.seq":38,"koto.doc.type":"prd","koto.doc.schema":"prd/v1","koto.review.round":1,"koto.review.seat":"clarity","koto.rule.id":"rs-012","koto.review.section":"goals","koto.review.verdict":"fail"}
 {"kind":"doc_rule_checked","v":1,"at":"2026-10-10T03:21:40.512Z","session":"charter-export","koto.session.id":"3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f","koto.run.id":"3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f","koto.seq":17,"koto.visit.seq":15,"koto.state":"draft","koto.doc.format":"vision","koto.rule.id":"doc-required-sections","koto.doc.rule_outcome":"not_ready","koto.doc.check_moment":"pre_jury"}
+```
+
+### Code review records
+
+A code review round (a pull request review panel: seats, the model each ran
+on and a pass or fail per seat, at one reviewed head) has kinds of its own,
+`code_review_round` and `code_review_verdict`, with their fields under
+`koto.code_review.`, so a reader of `review_round`, `review_verdict` and
+`review_decision` never counts a code review panel as a document jury. They
+carry no `koto.doc.` field and no `koto.rule.id`.
+
+`koto review record ... code-round` appends one session event holding the
+round and every seat, and the journal relays it as one `code_review_round`
+record followed by one `code_review_verdict` record per seat, in the order
+the seats were given, all sharing the event's `koto.seq`. Like the document
+review records they change no outcome, route or state, and a round counts
+one review entry for itself and one per seat against the session's 2,000.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | both | The state the session was in when the call was made. |
+| `koto.code_review.round` | integer | both | The round's number, from 1. |
+| `koto.code_review.seat_count` | integer | `code_review_round` | How many seats the round recorded: the number of `code_review_verdict` records that follow it. |
+| `koto.code_review.head` | string | `code_review_round` | The reviewed head as koto's digest of the value the caller gave: `sha256:` and 32 lowercase hex characters. Never a commit id; the same head gives the same digest in every session, so rounds at one head compare equal. |
+| `koto.code_review.seat` | string | `code_review_verdict` | The seat, when the session's template declares it among the `seats` of its `review_vocabulary`; `other` otherwise, and always when the template declares none. |
+| `koto.code_review.model` | string | `code_review_verdict` | The model the seat ran on, as given when it has the name shape: 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~` (`^[A-Za-z0-9._:/@-]{1,128}$`). Any other model, such as an id with a `[1m]` suffix, is recorded as `other`, as an undeclared seat is, and the round is kept, so a model in an event koto wrote is never a digest. A missing or empty model still refuses the call. |
+| `koto.code_review.verdict` | string | `code_review_verdict` | `pass` or `fail`. |
+
+```json
+{"kind":"code_review_round","v":1,"at":"2026-10-10T04:02:11.207Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":51,"koto.visit.seq":49,"koto.state":"review","koto.code_review.round":1,"koto.code_review.seat_count":3,"koto.code_review.head":"sha256:9c1185a5c5e9fc54612808977ee8f548"}
+{"kind":"code_review_verdict","v":1,"at":"2026-10-10T04:02:11.207Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":51,"koto.visit.seq":49,"koto.state":"review","koto.code_review.round":1,"koto.code_review.seat":"security","koto.code_review.model":"claude-opus-4-5","koto.code_review.verdict":"fail"}
 ```
 
 ## Response records
