@@ -23,13 +23,23 @@ usage() {
   exit 64
 }
 
+# Lists the names. The listing goes through a file so a failed env -0 stops
+# the script instead of reading as an empty environment: under --check the
+# failure exits non-zero and the command never starts.
 session_names() {
-  local entry
+  local listing entry
+  listing=$(mktemp)
+  if ! env -0 >"$listing"; then
+    rm -f "$listing"
+    echo "without-session-env: can't list the environment with env -0" >&2
+    exit 70
+  fi
   while IFS= read -r -d '' entry; do
     case "${entry%%=*}" in
       KOTO_SESSIONS_BASE | KOTO_SESSION_*) printf '%s\n' "${entry%%=*}" ;;
     esac
-  done < <(env -0)
+  done <"$listing"
+  rm -f "$listing"
 }
 
 if [ "${1:-}" = "--check" ]; then

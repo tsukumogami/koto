@@ -117,6 +117,48 @@ fn the_check_refuses_a_set_variable_without_starting_the_command() {
     }
 }
 
+/// An `env` that can't list the environment with `-0` must stop the
+/// wrapper, not read as an environment with nothing to remove.
+#[cfg(unix)]
+#[test]
+fn the_wrapper_refuses_when_it_cannot_list_the_environment() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake_env = bin.join("env");
+    std::fs::write(
+        &fake_env,
+        "#!/bin/sh\n[ \"$1\" = -0 ] && exit 1\nexec /usr/bin/env \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_env, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for args in [&["--check"][..], &[][..]] {
+        let ran = scratch.path().join("ran");
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend(["touch", ran.to_str().unwrap()]);
+        let out = wrapper(&full)
+            .env("PATH", &path)
+            .env("KOTO_SESSIONS_BASE", scratch.path().join("sessions"))
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "the wrapper ({args:?}) succeeded though it couldn't list the environment"
+        );
+        assert!(
+            !ran.exists(),
+            "the wrapper ({args:?}) started the command though it couldn't list the environment"
+        );
+    }
+}
+
 #[test]
 fn the_check_starts_the_command_when_none_is_set() {
     let scratch = tempfile::tempdir().unwrap();

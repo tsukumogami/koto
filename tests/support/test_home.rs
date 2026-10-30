@@ -17,7 +17,8 @@
 //! the suites it starts, and a shell configured for the cloud backend sets
 //! the others. It also sets `KOTO_TEST_HOME`, which a re-run of the test
 //! binary inherits: a process that finds it set keeps the `HOME` and the
-//! store variables its parent gave it.
+//! store variables its parent gave it. So does a run from a shell that
+//! exports it, which is why nothing outside the suite should set it.
 //!
 //! `koto_command.rs` and `host_session.rs` include it, so every test that
 //! runs koto gets it without naming it; a test crate that includes neither
