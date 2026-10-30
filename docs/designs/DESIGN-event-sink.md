@@ -19,7 +19,7 @@ decision: |
   hook: every process exit now goes through one exit(code) helper in
   src/exit.rs that runs a registered hook list, with clippy banning direct
   exits. A flush sends chunks of 200 to the sink in its own process group
-  until a 2.95 s call deadline, kills the group past it, and keeps per-session
+  until a 2.85 s call deadline, kills the group past it, and keeps per-session
   drop counts in telemetry.json under a separate lock file. koto session
   identity prints the session's identity with the attribute names as keys.
   Seven pull requests land release A; release B is mostly deletions.
@@ -185,12 +185,15 @@ deleted, and locked through `lock_exclusive` in
 `src/engine/jsonl_append.rs`, the call `AppendLock::acquire_within` already
 makes on `append.lock`. A take is lock, read, write 0, unlock; an add-back is
 lock, read, saturating add, write, unlock. Each lock waits at most 50 ms from
-the flush's budget, with no unlocked fallback: a take that can't lock skips
+the flush's budget, with no unlocked fallback. A take that can't lock skips
 that session and leaves its count for the next flush. A per-process gave-up
 flag, like the journal's, means one stalled holder costs one wait. A file
 that isn't a regular file, is over 4 KiB, or doesn't parse as an object
 whose `dropped` is a non-negative integer reads as 0, and the next take
-heals it.
+heals it. A count above 2^32 is clamped to 2^32 on read, so a forged file
+can't send an absurd `--carry`. Cloud sync and `koto session import` carry
+only the state log, version, template and context files, so neither file
+travels with a session.
 
 Just before a session directory is removed (`LocalBackend::cleanup` and
 prune's direct removal, through one helper), the remover takes the session's
@@ -408,41 +411,55 @@ pub fn exit(code: i32) -> !;
 pub fn crash(code: i32) -> !;     // no hooks: the simulated kill in cloud_takeover
 ```
 
-**Discovery.** `discover` reads `FLEET_EVENT_SINK` and acts only on `off`.
-It resolves `$HOME` (unset or relative means no sink), `lstat`s
-`$HOME/.local/libexec/fleet/event-sink` and requires a regular file, not a
-symlink, owned by `geteuid()`, with an execute bit and no group or other
-write bit. It then canonicalizes the parent directory and checks every
-component of the canonical path up to `/`: owned by the user or by root, no
-group or other write bit. The sink is run by that canonical path. Since only
-the user or root can write any directory on it, nobody else can swap a
-component between the check and the spawn. The checks read metadata
-through one function, `trusted(meta, uid)`, so the owner check can be
-unit-tested without `chown`.
+**Discovery.** `discover` reads `FLEET_EVENT_SINK` and acts only on `off`;
+apart from it, `HOME` is the only variable discovery reads. An unset or
+relative `$HOME` means no sink. It canonicalizes
+`$HOME/.local/libexec/fleet` first and checks every component of that
+canonical path up to `/`: owned by the user or by root, no group or other
+write bit. Then it `lstat`s `event-sink` under the canonical directory and
+requires a regular file, not a symlink, owned by `geteuid()`, with an
+execute bit and no group or other write bit. The sink is run by that
+canonical path. Since only the user or root can write any directory on it,
+nobody else can swap a component between the check and the spawn. The
+directory walk runs once per process. The file's own `lstat` check runs
+again just before each spawn, which costs one call. The checks read
+metadata through one function, `trusted(meta, uid)`, so the owner check,
+including a root koto refusing a sink owned by another user, is unit-tested
+without `chown`.
 
 **The call.** `Command::new(path).args(["send", "--scope", "koto-journal"])`,
-plus `--carry N` when N > 0, with `process_group(0)`, stdin piped, stdout
-and stderr to null, and no environment change: koto passes nothing beyond
-what it inherited and reads only the exit status. A writer thread writes the
-chunk's lines and closes stdin; an `EPIPE` ends it quietly. The flushing
-thread calls `wait_timeout(deadline - now)`. When that runs out it sends
-`SIGKILL` to the group, reaps the child, and waits up to 100 ms for the
-group to empty, reusing `wait_for_group_exit` from `src/action.rs` (made
-`pub(crate)`). A spawn failure counts as a kill.
+plus `--carry N` when N > 0, runs with `process_group(0)` and the working
+directory `/`. Stdin is piped, and stdout and stderr go to null. The
+environment is cleared to an allowlist: `HOME`, `PATH`, `TMPDIR`, `LANG`,
+`LC_ALL`, `LC_CTYPE`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+`NO_PROXY`, in either case) and `SSL_CERT_FILE` and `SSL_CERT_DIR`. A
+credential in the user's shell therefore never reaches the sink. koto reads
+only the exit status.
+
+A writer thread writes the chunk's lines and closes stdin, and an `EPIPE`
+ends it quietly. The flushing thread calls `wait_timeout(deadline - now)`.
+When that runs out, it sends `SIGKILL` to the group, but only when the
+spawn succeeded and the pgid is the child's pid and greater than 1. It then
+reaps the child, waits up to 100 ms for the group to empty with
+`wait_for_group_exit` from `src/action.rs` (made `pub(crate)`), and only
+then joins the writer thread. A spawn failure counts as a kill, with no
+signal sent. A sink that exits on time but leaves children in its group is
+left alone.
 
 **The flush.** `flush()` takes the queue's items and releases the mutex
 before anything slow, so a flush never blocks another thread's enqueue for
 long. It returns at once when the queue is empty. With the breaker in
 `StoppedCounting` it adds each item to its session's `dropped` and returns;
 in `StoppedSilent` it discards them. Otherwise it sets the call deadline to
-`start + 2.95 s`, takes the carry for the sessions in this flush, and sends
+`start + 2.85 s`, takes the carry for the sessions in this flush, and sends
 chunks of up to 200, the first with `--carry`. Exit 0 and 4 go on to the
 next chunk; exit 1 or another code drops that chunk, counts it, and goes on;
 exit 2 sets `StoppedSilent` and discards the rest uncounted; exit 3 or a kill
 sets `StoppedCounting`, adds back the taken carry plus the failed chunk's
 records, and counts every chunk not sent. A chunk the deadline doesn't reach
-is dropped and counted the same way. The 50 ms between the call deadline and
-3.0 s pays for that add-back, so the flush ends within 3.0 s of its start.
+is dropped and counted the same way. The 150 ms between the call deadline
+and 3.0 s pays for the group wait (at most 100 ms) and the add-back's lock
+(at most 50 ms), so the flush ends within 3.0 s of its start.
 
 **Stamps.** On the queued clone only: `koto.run.template.name` and
 `koto.run.template.hash` on every kind, each when it has a value, and on
@@ -605,6 +622,61 @@ release A run unchanged.
 The criterion that no backend product name, endpoint or private repository
 name appears is checked by the reviewer against a list held outside this
 repository, not by a test here.
+
+## Security Considerations
+
+koto runs one external program, the event sink, from a fixed path under the
+user's home directory. The only variable besides `HOME` that discovery reads
+is the one that turns sending off, so no variable can point koto at another
+program. koto trusts the sink on local ownership alone:
+
+- The file must be a regular file, not a symlink, owned by the effective
+  user, executable, and not writable by group or others.
+- Its directory is resolved to a canonical path, and every directory from
+  there up to `/` must be owned by the user or root and not writable by
+  group or others.
+- The sink runs by that resolved path, so only the user or root could swap
+  a component between the check and the run.
+- The file is checked again just before each run, and a koto running as
+  root refuses a sink owned by anyone else.
+
+Some things are outside what these checks can catch. They can't see access
+control lists, and koto verifies no signature or hash. A process running as
+the same user can install a sink. So the protection is against other users
+and against group- or world-writable locations, not against a compromised
+account. That's the trust model the fixed contract gives, and the same one
+`PATH` gives every other tool.
+
+The sink runs in its own process group, with working directory `/` and an
+environment cleared to the allowlist in Solution Architecture, so a
+credential in the user's shell doesn't reach it. Its arguments carry
+nothing but a drop count. Its output is discarded, and koto reads only its
+exit status. A timeout or a wait error ends the call by killing that group
+and no other: the signal is sent only after a successful spawn, and only to
+a group whose id is the child's own pid. A hung or hostile sink costs at
+most one bounded flush per process, because the first failure stops later
+calls.
+
+The records the sink receives are the structured records koto already
+writes to its local journal, plus the run's template name and hash and the
+outcome of the preceding check. They hold identifiers, state and rule
+names, counts, sizes, and digests of free-form values, but no command
+output, prompts or context contents. Records of context reads are dropped
+before anything is queued. Template and session names come from files that
+may be synced from elsewhere, so they're validated as names or ids on read,
+written with the JSON encoder, and a line over 4096 bytes isn't sent.
+
+The drop counts live in small owner-only files that are replaced by rename
+and guarded by a separate lock file opened without following symlinks. They
+are read defensively: a file that isn't a regular file, is too large, or
+doesn't parse reads as zero, and a count above the cap is clamped. They
+hold no session content.
+
+Tests never reach a real sink. Every integration test process runs under
+its own scratch home that holds nothing, or that test's stub. A test in
+`tests/koto_command_env.rs` already fails when a test file starts the koto
+binary any other way, and it gains one assertion that the stub harness
+always sets `HOME` on the commands it builds.
 
 ## Consequences
 
