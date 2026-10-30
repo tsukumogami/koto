@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 upstream: docs/briefs/BRIEF-koto-workflows-blocked-status.md
 source_issue: 553
 problem: |
@@ -22,7 +22,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 Requirements for the fix to tsukumogami/koto#553, with tsukumogami/koto#554
 taken in as the same change. Written from the Accepted
