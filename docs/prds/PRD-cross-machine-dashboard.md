@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   A developer who runs koto sessions on several machines, all syncing to the
   S3-compatible bucket they configured, can't see another machine's sessions
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-cross-machine-dashboard](docs/briefs/BRIEF-cross-machine-dashboard.md); carried in Absorbed Brief.
 
