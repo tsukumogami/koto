@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   Delegated sessions accept documents, pass gates, merge, escalate or decline to, and
   settle judgment calls with nobody watching. Nobody above can later read who made a
@@ -31,7 +31,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-decision-record](docs/briefs/BRIEF-decision-record.md); carried in Absorbed Brief.
 
@@ -698,8 +698,16 @@ that footing.
 - **The first build's store-independent parts carry over.** The decision kinds, the decider and its
   labels, the standing rules, reversal as its own final decision, the blocked step after a reversed
   gate pass, and reads that fail closed. `verdict` gains `inconclusive` for a production verdict that
-  is too early to call. The block now covers any reversed decision of a live workflow, not only a
-  gate pass, because a worker that keeps going on a reversed call builds on it the same way.
+  is too early to call.
+- **Any reversed decision blocks a live workflow, not only a gate pass.** This is a product choice,
+  made here on a reading of the planning's three-level scenario, where the grandchild "decides and
+  keeps working" and a reversal from the top blocks its next step whatever kind the decision was.
+  The first build blocked only after a reversed gate pass. The reason for widening it: a worker
+  that keeps going on a reversed judgment, acceptance or escalation builds on it exactly as it
+  would on a reversed gate pass, and a reversal that changes nothing in a live run is a note, not
+  an overrule. The cost is that a reversal of a minor call stops the worker too; R22's rewind and
+  the reverser's replacement decision are the ways out. The alternative, blocking only gate
+  passes, would leave the scenario's judgment reversal with no effect on the running worker.
 - **Default the gate decider to the observed session.** The owner's settled rule: every pass names a
   decider, a defaulted one is marked and countable, and a pass is refused only when no decider can be
   established. The koto session name alone doesn't establish one, since a script with no harness
