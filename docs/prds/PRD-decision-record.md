@@ -452,7 +452,7 @@ that footing.
   terminal. With the coordinator's workflow still not terminal and the worker's session finished
   and kept by retention, listing from the coordinator's session the worker's decisions returns three, each with
   decider kind `session` naming the worker session and its harness identifier labelled `observed`,
-  agent `unknown`, run mode `unattended`, authority `kind` `dispatch` with `dispatcher` the
+  agent `unknown`, run mode `unattended` (handed with `--run-mode unattended`), authority `kind` `dispatch` with `dispatcher` the
   coordinator, and a chain whose first link is the coordinator labelled `leg`.
 - [ ] In the same run, each of the three decisions exists as keys in the worker's session, and no
   file under `~/.koto/` outside `sessions/` is created or changed holding a decision, a reversal or

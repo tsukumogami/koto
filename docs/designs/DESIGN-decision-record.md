@@ -184,9 +184,14 @@ source of truth. A store-level guard, extending `check_writer_key` (`src/session
 refuses every writer and every remove under the three areas, through `add_as`, `remove` and the
 CLI, naming the key; only the create-only decision writer passes. In the bucket each decision is
 its own object put with `If-None-Match: *`: a 412 whose bytes equal the local bytes is success (a
-replayed flush), a 412 with other bytes refuses, a 501 refuses. Decision objects go up before the
-manifest and the state file in a tick's flush, so a refusal stops the tick before its state moves,
-and a pull never overwrites a decision key.
+replayed flush), a 412 with other bytes refuses, a 501 refuses, and the decision path never takes
+the unconditional fallback the state-file put has today. Before its first decision put, koto probes
+a bucket once (Security Considerations). Decision objects go up before the manifest and the state
+file in a tick's flush, so a refusal stops the tick before its state moves, and a pull never
+overwrites a decision key. Because decision files sit outside the manifest, every path that copies
+or rebuilds a session from its manifest has to list the decision areas the way it lists the pin:
+the cloud pull onto a host that has no local copy, import, and a `--workspace` read. Each of those
+paths is named in Issue 1 or Issue 7 of the plan.
 
 A reader treats a session as unreadable (R23) when an id appears in both areas, a file name isn't a
 12-digit id, a body fails to parse, a body's own session name or id disagrees with where it was
@@ -198,7 +203,9 @@ verbatim, carries the bucket objects the way it carries pins, writes them create
 destination, and accumulates every earlier source session id in `koto/imported-from` instead of
 naming only the immediate source, so reversals aimed at a session's pre-import id still find it.
 Import rebuilds that key itself from the source's header and the source's own validated history,
-and discards any copy an archive carries.
+and discards any copy an archive carries. Today the key holds a single source; its readers (the
+hierarchy, the continues-bucket walk and cloud import) and the decision reader accept both that
+single form and the new list, so sessions imported before this change keep working.
 
 The per-tick read runs in `handle_next` before gates are evaluated, through a new pure read path
 that never calls `ContextStore::get` or `read_events` on another session and writes nothing to any
@@ -841,8 +848,8 @@ between hosts):
 decision areas, and import carries decision objects like pins. Neither changes a retention rule, and
 both land as part of this feature's execution, after that work is settled.
 
-**The agent-surface legibility work** (koto#553, scoped in koto#557, rendering koto sessions in Claude
-Code's `/workflows` screen): a reversal block is a blocking condition, so it renders through that
+**The agent-surface legibility work** (rendering koto sessions in Claude Code's `/workflows`
+screen; its blocked-status fix is koto#553, scoped in koto#557): a reversal block is a blocking condition, so it renders through that
 work's blocked-step shape (an `error` step with `blocked: true` and a sanitized one-line reason). The
 synthetic condition's name and reason must go through its sanitizer and caps. Nothing in the
 `koto decisions` command set changes that screen.

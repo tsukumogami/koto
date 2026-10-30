@@ -48,7 +48,7 @@ redesigning a record format for a file that is about to disappear. No issue's la
 koto#545, so everything except that one verdict can land before 2026-11-16.
 
 shirabe's issues (11 and 12) follow the design's fifth decision: shirabe calls the new koto
-commands where it already decides, so they need a koto release carrying Issues 1, 3, 5 and 8.
+commands where it already decides, so Issue 11 needs a koto release carrying Issues 1, 3 and 5, and Issue 12 one that also carries Issue 8.
 
 Each issue below names the PRD requirements and acceptance-criteria groups it serves. Those
 groups carry the planning's evidence scenarios one to one: reading an unattended unit after it
@@ -76,6 +76,8 @@ walks all of them.
 - [ ] The read session's keys and log are byte-identical before and after `list` and `show`, and no session between them changes (R16).
 - [ ] A body over 16 KiB or a reason over 4 KiB is refused; a file in an area that is a symlink, a non-12-digit name, an id in both areas, or an unparseable body makes `list` report the session's affected decisions `unreadable`.
 - [ ] With network access blocked and the local backend, record, list and show succeed (R35).
+- [ ] A decision recorded with a harness tool-call identifier lists it, and the stored body holds no harness field beyond R30's three pointers; a `verdict` recorded with decider kind `check` naming the grader and a pointer to its session event lists that decider, the session that ran it and the pointer (R30).
+- [ ] Under the cloud backend, a pull of the session onto a host with no local copy, and a `--workspace` read, both list the session's decisions, though decision files sit outside the manifest.
 
 **Dependencies**: None
 
@@ -113,6 +115,7 @@ walks all of them.
 - [ ] A fixture writes two reversals of one decision from A and B with known times in both write orders: listings from A, B and C name the earlier one the winner and the other `refused`; with equal times, the one whose session name sorts first; C's keys and log are unchanged (R19).
 - [ ] When `reverse` finds it lost, it exits non-zero and its own session holds a `refused` naming the winner; after a fault point hides the competitor until after the command returns, the losing session's next decision command records the `refused` (R19).
 - [ ] After an acceptance is reversed, a new `accept` of the same subject lists `in-effect` while the original lists `reversed` (R20).
+- [ ] A grader `check` reverses its own earlier `verdict` in the same session, and a worker reverses its own `judgment`; both are accepted. A person entering through the session where another person decided reverses that decision (R17).
 
 **Dependencies**: Blocked by <<ISSUE:1>>
 
@@ -133,6 +136,7 @@ walks all of them.
 - [ ] A session not on C's chain made unreadable doesn't block C; a session holding no decisions makes no chain reads (verified by a read counter in tests).
 - [ ] Under the cloud backend, a chain session whose listing fails with a permission error blocks C naming it, and a chain session migrated by import is read at the session it moved to (R23).
 - [ ] The reserved condition names are refused when a template declares them.
+- [ ] The aim ids include the session's own id and the id in `koto/imported-from` in today's single-source form, so a session imported before Issue 7 lands is blocked by a reversal aimed at its earlier id.
 - [ ] A benchmark on the CI runner, median of five warm runs, measures the tick's added cost at chain depth five with 1,000 decisions per chain session and fails above 50 ms (R36).
 
 **Dependencies**: Blocked by <<ISSUE:3>>
@@ -186,7 +190,7 @@ walks all of them.
 - [ ] A decision recorded against the migrated source is refused with `session_migrated`, and the source still serves its decisions to readers (R6).
 - [ ] A session imported twice keeps both earlier ids in `koto/imported-from`, and a reversal aimed at either earlier id blocks its live workflow; an archive carrying its own `koto/imported-from` has that copy discarded.
 
-**Dependencies**: Blocked by <<ISSUE:3>>
+**Dependencies**: Blocked by <<ISSUE:3>>, <<ISSUE:4>>
 
 **Type**: code
 **Files**: `src/session/hierarchy/facts.rs`, `src/session/import_links.rs`, `src/session/cloud.rs`
@@ -312,6 +316,7 @@ graph TD
     I1 --> I5
     I3 --> I4
     I3 --> I7
+    I4 --> I7
     I3 --> I8
     I5 --> I6
     I5 --> I9
@@ -357,11 +362,11 @@ then Issue 13. Issues 3 and 8 feed Issue 12 through the release.
 
 **After Issue 1:** Issues 3 and 5 in parallel.
 
-**After Issue 3:** Issues 4 and 8 in parallel; Issue 7 too, once session retention reads Done.
+**After Issue 3:** Issues 4 and 8 in parallel; after Issue 4, Issue 7, once session retention reads Done.
 
 **After Issue 5:** Issues 6 and 9 in parallel.
 
-**After a koto release carrying Issues 1, 3, 5 and 8:** Issue 11, then Issue 12, in shirabe.
+**After a koto release carrying Issues 1, 3 and 5:** Issue 11 in shirabe; then Issue 12, once a release also carries Issue 8.
 
 **Docs:** Issue 10 once Issues 1, 3, 4, 5, 6 and 8 have landed.
 
