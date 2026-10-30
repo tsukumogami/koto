@@ -98,10 +98,10 @@ the judgment call. A choice that used to leave no trace now has one, with a name
 
 ### A gate pass nobody named
 
-A session passes a gate without saying who decided. The record names the session itself as the
-decider and marks it as defaulted, so an audit can find every such pass. In a run where no decider
-can be established at all, such as a bare shell with no session identity and no named decider, the
-pass is refused and the workflow stays where it was.
+A worker overrides a failing gate without saying who decided. The maintainer auditing the run
+later finds the worker session named as the decider and marked as defaulted, so every such pass can
+be found and questioned. When a CI script with no session identity tries the same override without
+naming a decider, the pass is refused and the workflow stays where it was.
 
 ### Reversing two levels down
 
