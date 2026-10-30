@@ -16,15 +16,17 @@
 //! 2. stage the new session in a private `.import-<name>-<random>` and,
 //!    once it is complete, rename it to `<sessions>/.takeover-<name>`, so
 //!    that name only ever holds a whole session;
-//! 3. push it under this workspace's prefix;
-//! 4. re-check under the held locks, then write the marker on the source;
+//! 3. write the new session's back-reference beside the source, then push
+//!    it under this workspace's prefix;
+//! 4. re-check under the held locks, then write the marker on the source,
+//!    which stays as a read-only predecessor of the new session;
 //! 5. exchange `.takeover-<name>` and `<name>` in one call;
 //! 6. journal the import, then delete the old copy now in `.takeover-<name>`,
 //!    or, if it changed since it was checked, move it aside to
 //!    `.kept-takeover-<name>-<time>` so the name is usable.
 //!
-//! A failure before the marker takes back what was pushed and leaves the
-//! source as it was. A failure or a crash after it is completed by running
+//! A failure before the marker takes back what was pushed and the
+//! back-reference, and leaves the source as it was. A failure or a crash after it is completed by running
 //! the same command again: the import never deletes anything under the
 //! source's prefix, and the marker names the new session's id.
 
