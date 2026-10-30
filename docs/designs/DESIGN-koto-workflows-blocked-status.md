@@ -1,5 +1,6 @@
 ---
 schema: design/v1
+status: Proposed
 problem: |
   koto's `/workflows` entry serializes its own blocked classification straight
   into the top-level `status`, a word Claude Code 2.1.314 doesn't know, and
