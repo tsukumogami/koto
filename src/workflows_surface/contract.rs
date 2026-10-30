@@ -23,13 +23,24 @@ use serde::Serialize;
 /// `workflowName` and `summary` fields the `/workflows` screen titles an entry
 /// with; `name` stays, carrying the same title, for readers of earlier
 /// versions.
-pub const CONTRACT_VERSION: u32 = 4;
-
-/// Render status mapped onto the `/workflows` vocabulary.
 ///
-/// Version 1 emitted `running`/`completed`/`failed`; version 2 adds `blocked`
-/// (koto's blocked-in-current-epoch), distinct from running and done. Stalled/
-/// pending refinements remain later-slice scope.
+/// Version 5 writes the top-level `status` in Claude Code's vocabulary (a
+/// gate-blocked session reads `running`), adds `koto.status` with koto's own
+/// classification, adds the optional `blocked` and `error` fields on a
+/// `workflow_agent` step, and appends `· blocked on gate <name>` to a blocked
+/// session's `summary`.
+pub const CONTRACT_VERSION: u32 = 5;
+
+/// Longest gate name, in raw characters, written into a step's `error` or a
+/// blocked `summary` before the cut marker. The name is cut before it is
+/// escaped, so a cut never splits an escape sequence.
+pub const GATE_NAME_CAP: usize = 128;
+
+/// koto's own classification of a session, written as `koto.status`.
+///
+/// It is not the screen's word: Claude Code knows no `blocked` status and
+/// counts every status but `running` as completed, so the top-level `status`
+/// is [`RenderStatus::screen_status`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderStatus {
@@ -43,6 +54,43 @@ pub enum RenderStatus {
     Completed,
     /// Terminal failure (state name matches the failure heuristic).
     Failed,
+}
+
+impl RenderStatus {
+    /// The top-level `status` word for this classification: a blocked
+    /// session is still running as far as the screen is concerned.
+    pub fn screen_status(self) -> ScreenStatus {
+        match self {
+            RenderStatus::Running | RenderStatus::Blocked => ScreenStatus::Running,
+            RenderStatus::Completed => ScreenStatus::Completed,
+            RenderStatus::Failed => ScreenStatus::Failed,
+        }
+    }
+}
+
+/// The top-level `status` of an entry, in the words Claude Code's
+/// `/workflows` screen knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// A gate name as it is written into a step's `error` and a blocked
+/// `summary`: cut at [`GATE_NAME_CAP`] raw characters with the cut marker,
+/// then escaped.
+pub fn gate_name_display(name: &str) -> String {
+    use crate::session_view::{sanitize_one_line, CUT_MARKER};
+    let cut = if name.chars().count() > GATE_NAME_CAP {
+        let mut c: String = name.chars().take(GATE_NAME_CAP).collect();
+        c.push_str(CUT_MARKER);
+        c
+    } else {
+        name.to_string()
+    };
+    sanitize_one_line(&cut).into_string()
 }
 
 /// A single phase in the `/workflows` ordered phase list. Each koto template
@@ -87,7 +135,8 @@ pub enum ProgressNode {
         /// The phase's human-readable label.
         #[serde(rename = "phaseTitle")]
         phase_title: String,
-        /// Step state: `done` (completed phase) or `progress` (active phase).
+        /// Step state: `done` (completed phase), `progress` (active phase of a
+        /// running session) or `error` (active phase of a blocked session).
         state: String,
         /// The phase's directive text (what the step asks for).
         #[serde(rename = "promptPreview", skip_serializing_if = "String::is_empty")]
@@ -95,6 +144,13 @@ pub enum ProgressNode {
         /// The phase's produced outcome: evidence and/or gate result.
         #[serde(rename = "resultPreview", skip_serializing_if = "String::is_empty")]
         result_preview: String,
+        /// Whether the step is blocked on a gate; Claude Code draws an
+        /// `error` step with this set as Blocked. Omitted when false.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        blocked: bool,
+        /// The step's Outcome line on an `error` step. Omitted when empty.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        error: String,
     },
 }
 
@@ -155,6 +211,9 @@ pub struct KotoBlock {
     /// The file-contract version (see [`CONTRACT_VERSION`]).
     #[serde(rename = "contractVersion")]
     pub contract_version: u32,
+    /// koto's own classification (contract v5): `running`, `blocked`,
+    /// `completed` or `failed`.
+    pub status: RenderStatus,
     /// The holdings summary (contract v3). `None` on the minimal shape,
     /// omitted from serialization so that render stays lean.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,8 +246,9 @@ pub struct WorkflowFile {
     /// One-line description under the title: `koto · <session> · <state>`,
     /// sanitized and capped like every printed fact.
     pub summary: String,
-    /// Running / completed / failed.
-    pub status: RenderStatus,
+    /// Running / completed / failed, in the screen's vocabulary; koto's own
+    /// classification is `koto.status`.
+    pub status: ScreenStatus,
     /// Start time in epoch milliseconds; Claude Code sorts entries by this.
     #[serde(rename = "startTime")]
     pub start_time: u64,
@@ -231,7 +291,7 @@ impl WorkflowFile {
             name: title.clone(),
             workflow_name: title,
             summary: sanitize_capped(&summary, FACT_CAP).into_string(),
-            status,
+            status: status.screen_status(),
             start_time,
             phases: Vec::new(),
             workflow_progress: Vec::new(),
@@ -240,9 +300,30 @@ impl WorkflowFile {
                 workflow: workflow.to_string(),
                 current_state,
                 contract_version: CONTRACT_VERSION,
+                status,
                 holdings: None,
             },
         }
+    }
+
+    /// Rebuild the summary for a session blocked on `gate`:
+    /// `koto · <workflow> · <state> · blocked on gate <name>`.
+    ///
+    /// The gate name is cut at [`GATE_NAME_CAP`] and escaped on its own, and
+    /// the `koto · <workflow> · <state>` prefix is capped so the whole line
+    /// stays within the fact cap: a long workflow or state name is what gets
+    /// cut, never the "blocked on gate" suffix.
+    pub fn with_blocked_gate(mut self, gate: &str) -> Self {
+        use crate::session_view::{sanitize_capped, CUT_MARKER, FACT_CAP};
+        let workflow = &self.koto.workflow;
+        let prefix = match self.koto.current_state.as_deref() {
+            Some(state) if !state.is_empty() => format!("koto \u{b7} {workflow} \u{b7} {state}"),
+            _ => format!("koto \u{b7} {workflow}"),
+        };
+        let suffix = format!(" \u{b7} blocked on gate {}", gate_name_display(gate));
+        let budget = FACT_CAP.saturating_sub(suffix.chars().count() + CUT_MARKER.chars().count());
+        self.summary = format!("{}{suffix}", sanitize_capped(&prefix, budget));
+        self
     }
 
     /// Attach the holdings summary (contract v3). Additive like
@@ -321,10 +402,12 @@ mod tests {
     }
 
     #[test]
-    fn status_serializes_lowercase() {
+    fn top_level_status_is_the_screen_word() {
+        // Claude Code knows no `blocked`, and counts every status but
+        // `running` as completed: a blocked session is written `running`.
         for (status, want) in [
             (RenderStatus::Running, "running"),
-            (RenderStatus::Blocked, "blocked"),
+            (RenderStatus::Blocked, "running"),
             (RenderStatus::Completed, "completed"),
             (RenderStatus::Failed, "failed"),
         ] {
@@ -336,10 +419,121 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_four() {
-        // Version 4 added workflowName and summary; the guard/fixture anchors
-        // on it.
-        assert_eq!(CONTRACT_VERSION, 4);
+    fn koto_status_carries_kotos_classification() {
+        for (status, want) in [
+            (RenderStatus::Running, "running"),
+            (RenderStatus::Blocked, "blocked"),
+            (RenderStatus::Completed, "completed"),
+            (RenderStatus::Failed, "failed"),
+        ] {
+            let wf = WorkflowFile::new("s", "w", "n".to_string(), None, status, 0);
+            let v: serde_json::Value =
+                serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+            assert_eq!(v["koto"]["status"], want);
+        }
+    }
+
+    #[test]
+    fn contract_version_is_five() {
+        // Version 5 moved koto's classification to koto.status and added the
+        // blocked step and summary; the guard/fixture anchors on it.
+        assert_eq!(CONTRACT_VERSION, 5);
+    }
+
+    fn blocked_file(workflow: &str, state: &str, gate: &str) -> serde_json::Value {
+        let wf = WorkflowFile::new(
+            "s",
+            workflow,
+            "n".to_string(),
+            Some(state.to_string()),
+            RenderStatus::Blocked,
+            0,
+        )
+        .with_blocked_gate(gate);
+        serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_blocked_summary_names_the_gate() {
+        let v = blocked_file("legibility", "verify", "ready_flag");
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} legibility \u{b7} verify \u{b7} blocked on gate ready_flag"
+        );
+    }
+
+    #[test]
+    fn a_control_character_in_the_gate_name_is_escaped_in_the_summary() {
+        let v = blocked_file("wf", "verify", "g\u{1B}[31m\u{202E}x");
+        let summary = v["summary"].as_str().unwrap();
+        assert!(!summary.contains('\u{1B}') && !summary.contains('\u{202E}'));
+        assert!(
+            summary.ends_with(" \u{b7} blocked on gate g\\u{1B}[31m\\u{202E}x"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn an_over_cap_gate_name_is_cut_and_keeps_the_suffix() {
+        use crate::session_view::{CUT_MARKER, FACT_CAP};
+        // Longer than the fact cap itself: cut at the gate-name cap.
+        let gate = "g".repeat(FACT_CAP + 10);
+        let v = blocked_file("wf", "verify", &gate);
+        let summary = v["summary"].as_str().unwrap();
+        let want_tail = format!(
+            " \u{b7} blocked on gate {}{CUT_MARKER}",
+            "g".repeat(GATE_NAME_CAP)
+        );
+        assert!(summary.ends_with(&want_tail), "{summary}");
+        assert!(summary.starts_with("koto \u{b7} wf \u{b7} verify"));
+        assert_eq!(
+            gate_name_display(&gate),
+            format!("{}{CUT_MARKER}", "g".repeat(GATE_NAME_CAP))
+        );
+    }
+
+    #[test]
+    fn a_long_workflow_name_is_cut_before_the_blocked_suffix() {
+        use crate::session_view::{CUT_MARKER, FACT_CAP};
+        let workflow = "w".repeat(FACT_CAP * 2);
+        let v = blocked_file(&workflow, "verify", "ready_flag");
+        let summary = v["summary"].as_str().unwrap();
+        assert!(
+            summary.ends_with(&format!("{CUT_MARKER} \u{b7} blocked on gate ready_flag")),
+            "{summary}"
+        );
+        assert!(summary.chars().count() <= FACT_CAP, "{}", summary.len());
+    }
+
+    #[test]
+    fn a_cut_never_splits_an_escape() {
+        // Control characters straddling the cap: the name is cut raw, so
+        // every escape in the output is whole.
+        let gate = format!("{}\u{1B}\u{1B}", "a".repeat(GATE_NAME_CAP - 1));
+        let shown = gate_name_display(&gate);
+        assert!(shown.contains("\\u{1B}"), "{shown}");
+        assert_eq!(shown.matches("\\u{1B}").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn a_blocked_step_serializes_blocked_and_error() {
+        let progress = vec![ProgressNode::WorkflowAgent {
+            index: 1,
+            label: "Verify".to_string(),
+            phase_index: 1,
+            phase_title: "Verify".to_string(),
+            state: "error".to_string(),
+            prompt_preview: String::new(),
+            result_preview: String::new(),
+            blocked: true,
+            error: "gate tests-pass: FAIL".to_string(),
+        }];
+        let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Blocked, 0)
+            .with_detail(Vec::new(), progress);
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["workflowProgress"][0]["state"], "error");
+        assert_eq!(v["workflowProgress"][0]["blocked"], true);
+        assert_eq!(v["workflowProgress"][0]["error"], "gate tests-pass: FAIL");
     }
 
     #[test]
@@ -426,6 +620,8 @@ mod tests {
                 state: "done".to_string(),
                 prompt_preview: "read the issue".to_string(),
                 result_preview: "3 files identified".to_string(),
+                blocked: false,
+                error: String::new(),
             },
             ProgressNode::WorkflowPhase {
                 index: 2,
@@ -478,12 +674,16 @@ mod tests {
             state: "progress".to_string(),
             prompt_preview: String::new(),
             result_preview: String::new(),
+            blocked: false,
+            error: String::new(),
         }];
         let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Running, 0)
             .with_detail(Vec::new(), progress);
         let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
         assert!(v["workflowProgress"][0].get("promptPreview").is_none());
         assert!(v["workflowProgress"][0].get("resultPreview").is_none());
+        assert!(v["workflowProgress"][0].get("blocked").is_none());
+        assert!(v["workflowProgress"][0].get("error").is_none());
         assert_eq!(v["workflowProgress"][0]["state"], "progress");
     }
 

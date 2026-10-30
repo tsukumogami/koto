@@ -85,7 +85,11 @@ fn session_at_verify(base: &std::path::Path, wf_dir: &std::path::Path) -> LocalB
     backend
         .init_state_file(WORKFLOW, header(), vec![init])
         .unwrap();
-    std::fs::write(backend.session_dir(WORKFLOW).join("template.json"), TEMPLATE).unwrap();
+    std::fs::write(
+        backend.session_dir(WORKFLOW).join("template.json"),
+        TEMPLATE,
+    )
+    .unwrap();
     publish_location(&backend, &backend, WORKFLOW, wf_dir.to_str().unwrap()).unwrap();
     for to in ["implement", "verify"] {
         backend

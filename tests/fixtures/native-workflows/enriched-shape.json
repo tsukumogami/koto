@@ -2,8 +2,8 @@
   "id": "koto-11111111-2222-4333-8444-555555555555",
   "name": "impl-feature · verify",
   "workflowName": "impl-feature · verify",
-  "summary": "koto · impl-feature · verify",
-  "status": "blocked",
+  "summary": "koto · impl-feature · verify · blocked on gate tests-pass",
+  "status": "running",
   "startTime": 1700000000000,
   "phases": [
     {
@@ -63,9 +63,11 @@
       "label": "Verify",
       "phaseIndex": 3,
       "phaseTitle": "Verify",
-      "state": "progress",
+      "state": "error",
       "promptPreview": "Run the test suite and submit the result.",
-      "resultPreview": "gate tests-pass: FAIL"
+      "resultPreview": "gate tests-pass: FAIL",
+      "blocked": true,
+      "error": "gate tests-pass: FAIL"
     },
     {
       "type": "workflow_phase",
@@ -77,7 +79,8 @@
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "workflow": "impl-feature",
     "currentState": "verify",
-    "contractVersion": 4,
+    "contractVersion": 5,
+    "status": "blocked",
     "holdings": {
       "keyCount": 3,
       "totalBytes": 5160,

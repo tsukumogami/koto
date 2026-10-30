@@ -21,7 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
 
-use super::contract::{workflow_filename, Phase, ProgressNode, WorkflowFile};
+use super::contract::{
+    gate_name_display, workflow_filename, Phase, ProgressNode, RenderStatus, WorkflowFile,
+};
 use super::discover;
 use super::project::{self, PhaseEntry, PhaseStatus, StateOutcome};
 
@@ -131,8 +133,9 @@ fn try_materialize(
 
     let target = dir.join(workflow_filename(&proj.session_id));
     let start_time = stable_start_time(&target);
-    let (phases, progress) = build_detail(&enriched.phases);
-    let file = WorkflowFile::new(
+    let active = active_step(proj.status, enriched.blocked_gate.as_deref());
+    let (phases, progress) = build_detail(&enriched.phases, &active);
+    let mut file = WorkflowFile::new(
         &proj.session_id,
         &proj.workflow,
         proj.display_name.clone(),
@@ -142,15 +145,48 @@ fn try_materialize(
     )
     .with_detail(phases, progress)
     .with_holdings(enriched.holdings.clone());
+    // The summary names the gate even when the template can't be read and
+    // there is no phase list to carry a Blocked step.
+    if let Some(gate) = enriched.blocked_gate.as_deref() {
+        file = file.with_blocked_gate(gate);
+    }
     let bytes = file.to_json_bytes()?;
     atomic_write(&dir, &target, &bytes)
+}
+
+/// The shape of the active phase's `workflow_agent` step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveStep {
+    state: &'static str,
+    blocked: bool,
+    error: String,
+}
+
+/// The active step for a session's classification. A blocked session's step
+/// is an `error` flagged `blocked`, which Claude Code draws as Blocked with
+/// `error` as its Outcome, under any run status; every other session keeps
+/// the `progress` step.
+fn active_step(status: RenderStatus, blocked_gate: Option<&str>) -> ActiveStep {
+    match (status, blocked_gate) {
+        (RenderStatus::Blocked, Some(gate)) => ActiveStep {
+            state: "error",
+            blocked: true,
+            error: format!("gate {}: FAIL", gate_name_display(gate)),
+        },
+        _ => ActiveStep {
+            state: "progress",
+            blocked: false,
+            error: String::new(),
+        },
+    }
 }
 
 /// Map the enriched phase list onto the `/workflows` `phases` and
 /// `workflowProgress` fields: one `Phase` per phase, a `workflow_phase` marker
 /// per phase, and a `workflow_agent` step per visited/active phase (carrying
 /// the phase's directive as `promptPreview` and its outcome as `resultPreview`).
-fn build_detail(phases: &[PhaseEntry]) -> (Vec<Phase>, Vec<ProgressNode>) {
+/// The active phase's step takes its shape from `active`.
+fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<ProgressNode>) {
     let mut out_phases = Vec::with_capacity(phases.len());
     let mut progress = Vec::new();
     let mut step_index: u32 = 0;
@@ -167,9 +203,9 @@ fn build_detail(phases: &[PhaseEntry]) -> (Vec<Phase>, Vec<ProgressNode>) {
         });
         // A step is emitted only for phases the session has entered (done) or
         // is in (active); upcoming phases render as a bare marker.
-        let state = match entry.status {
-            PhaseStatus::Done => "done",
-            PhaseStatus::Active => "progress",
+        let (state, blocked, error) = match entry.status {
+            PhaseStatus::Done => ("done", false, String::new()),
+            PhaseStatus::Active => (active.state, active.blocked, active.error.clone()),
             PhaseStatus::Upcoming => continue,
         };
         step_index += 1;
@@ -181,6 +217,8 @@ fn build_detail(phases: &[PhaseEntry]) -> (Vec<Phase>, Vec<ProgressNode>) {
             state: state.to_string(),
             prompt_preview: preview(&entry.directive),
             result_preview: preview(&outcome_line(&entry.outcome)),
+            blocked,
+            error,
         });
     }
 
@@ -587,8 +625,10 @@ mod tests {
             .any(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Review"));
     }
 
-    /// AC3: a session whose latest current-epoch gate did not pass renders
-    /// `blocked` -- not running, not done.
+    /// AC3: a session whose latest current-epoch gate did not pass is written
+    /// top-level `running` (the only status Claude Code doesn't count as
+    /// completed), with `koto.status` `blocked`, its active step an `error`
+    /// flagged `blocked` that names the gate, and a summary saying so.
     #[test]
     fn ac3_gate_blocked_renders_blocked() {
         let base = TempDir::new().unwrap();
@@ -604,7 +644,24 @@ mod tests {
         evaluate_gate(&backend, "solo", "verify", "tests-pass", "failed");
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
-        assert_eq!(v["status"], "blocked");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "blocked");
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} solo \u{b7} verify \u{b7} blocked on gate tests-pass"
+        );
+
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Verify")
+            .expect("active verify step")
+            .clone();
+        assert_eq!(step["state"], "error");
+        assert_eq!(step["blocked"], true);
+        assert_eq!(step["error"], "gate tests-pass: FAIL");
+        assert_eq!(step["resultPreview"], "gate tests-pass: FAIL");
 
         // The active phase's outcome shows the failed gate.
         let verify_detail = v["phases"]
@@ -637,6 +694,65 @@ mod tests {
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
         assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "running");
+        assert_eq!(v["summary"], "koto \u{b7} solo \u{b7} verify");
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Verify")
+            .expect("active verify step")
+            .clone();
+        assert_eq!(step["state"], "progress");
+        assert!(step.get("blocked").is_none());
+        assert!(step.get("error").is_none());
+    }
+
+    #[test]
+    fn active_step_follows_the_classification() {
+        assert_eq!(
+            active_step(RenderStatus::Blocked, Some("tests-pass")),
+            ActiveStep {
+                state: "error",
+                blocked: true,
+                error: "gate tests-pass: FAIL".to_string(),
+            }
+        );
+        let running = ActiveStep {
+            state: "progress",
+            blocked: false,
+            error: String::new(),
+        };
+        assert_eq!(active_step(RenderStatus::Running, None), running);
+        // A gate name with a control character is escaped in the error.
+        assert_eq!(
+            active_step(RenderStatus::Blocked, Some("a\u{7}b")).error,
+            "gate a\\u{7}b: FAIL"
+        );
+    }
+
+    /// A blocked session whose template can't be read has no phase list, but
+    /// its summary still names the gate.
+    #[test]
+    fn a_blocked_session_without_a_template_names_the_gate_in_its_summary() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "verify");
+        evaluate_gate(&backend, "solo", "verify", "tests-pass", "failed");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "blocked");
+        assert!(v.get("workflowProgress").is_none());
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} solo \u{b7} verify \u{b7} blocked on gate tests-pass"
+        );
     }
 
     /// Reaching the terminal state renders `completed` and still carries the

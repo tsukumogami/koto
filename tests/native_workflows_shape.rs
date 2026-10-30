@@ -2,7 +2,8 @@
 //!
 //! The committed fixture at `tests/fixtures/native-workflows/enriched-shape.json`
 //! pins the enriched `koto-<uuid>.json` shape (ordered `phases`, the
-//! `workflowProgress` tree, and the `blocked` status) that koto emits. The future
+//! `workflowProgress` tree, and the blocked reading: top-level `running`,
+//! `koto.status` `blocked` and a Blocked `error` step) that koto emits. The future
 //! drift-guard adopts this fixture as the anchor for its version/fixture guard over the
 //! undocumented Claude Code surface; this test is the discharge of the
 //! shape-change / drift-guard obligation (whenever the emitted shape changes,
@@ -52,6 +53,8 @@ fn canonical_enriched_file() -> WorkflowFile {
             state: "done".to_string(),
             prompt_preview: "Read the issue and map the module.".to_string(),
             result_preview: "evidence: files".to_string(),
+            blocked: false,
+            error: String::new(),
         },
         ProgressNode::WorkflowPhase {
             index: 2,
@@ -65,6 +68,8 @@ fn canonical_enriched_file() -> WorkflowFile {
             state: "done".to_string(),
             prompt_preview: "Implement the change per the gathered context.".to_string(),
             result_preview: String::new(),
+            blocked: false,
+            error: String::new(),
         },
         ProgressNode::WorkflowPhase {
             index: 3,
@@ -75,9 +80,11 @@ fn canonical_enriched_file() -> WorkflowFile {
             label: "Verify".to_string(),
             phase_index: 3,
             phase_title: "Verify".to_string(),
-            state: "progress".to_string(),
+            state: "error".to_string(),
             prompt_preview: "Run the test suite and submit the result.".to_string(),
             result_preview: "gate tests-pass: FAIL".to_string(),
+            blocked: true,
+            error: "gate tests-pass: FAIL".to_string(),
         },
         ProgressNode::WorkflowPhase {
             index: 4,
@@ -93,6 +100,7 @@ fn canonical_enriched_file() -> WorkflowFile {
         1_700_000_000_000,
     )
     .with_detail(phases, workflow_progress)
+    .with_blocked_gate("tests-pass")
     .with_holdings(Holdings {
         key_count: 3,
         total_bytes: 5_160,
@@ -139,19 +147,35 @@ fn enriched_shape_matches_golden_fixture() {
     );
 }
 
-/// The fixture pins contract version 4 and the additive fields, holdings and
-/// the /workflows title fields
-/// included, so a future reader can assert the shape it targets.
+/// The fixture pins contract version 5 and the additive fields, holdings,
+/// the /workflows title fields and the blocked step included, so a future
+/// reader can assert the shape it targets.
 #[test]
-fn fixture_pins_contract_v4_and_new_fields() {
+fn fixture_pins_contract_v5_and_new_fields() {
     let fixture = std::fs::read_to_string(FIXTURE).unwrap();
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 4);
+    assert_eq!(v["koto"]["contractVersion"], 5);
+    // v5: the top-level status is the screen's word, and a blocked session
+    // is running; koto's classification is koto.status.
+    assert_eq!(v["status"], "running");
+    assert_eq!(v["koto"]["status"], "blocked");
+    assert_eq!(
+        v["summary"],
+        "koto \u{b7} impl-feature \u{b7} verify \u{b7} blocked on gate tests-pass"
+    );
+    let blocked: Vec<&serde_json::Value> = v["workflowProgress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "workflow_agent" && n["state"] == "error")
+        .collect();
+    assert_eq!(blocked.len(), 1, "one blocked step");
+    assert_eq!(blocked[0]["blocked"], true);
+    assert_eq!(blocked[0]["error"], "gate tests-pass: FAIL");
     // v4: the /workflows screen titles an entry from workflowName.
     assert!(v["workflowName"].is_string());
     assert!(v["summary"].is_string());
-    assert_eq!(v["status"], "blocked");
     // v3: the holdings summary carries names and sizes, never content.
     assert!(v["koto"]["holdings"]["keyCount"].is_u64());
     assert!(v["koto"]["holdings"]["totalBytes"].is_u64());

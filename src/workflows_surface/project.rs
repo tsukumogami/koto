@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::engine::persistence::{
     derive_machine_state, derive_state_from_log, derive_visit_counts, is_failed_state,
-    is_terminal_state, latest_epoch_gate_failed,
+    is_terminal_state, latest_epoch_gate,
 };
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
 use crate::session::SessionBackend;
@@ -164,6 +164,10 @@ pub struct EnrichedProjection {
     pub phases: Vec<PhaseEntry>,
     /// The holdings summary, folded from the same log read (contract v3).
     pub holdings: Holdings,
+    /// The gate the session is blocked on: `Some` exactly when
+    /// `base.status` is `Blocked`, read from the same epoch-scoped
+    /// evaluation the blocked classification decided on.
+    pub blocked_gate: Option<String>,
 }
 
 /// Fold the holdings summary from the log: last writer wins per key, with
@@ -244,8 +248,8 @@ fn fold_holdings(header: &StateFileHeader, events: &[Event]) -> Holdings {
 /// Derive the enriched projection for `session_id`, reading the log once.
 ///
 /// Reuses the read-seam derivations the minimal projection uses for the base fields and the
-/// dashboard's blocked predicate ([`latest_epoch_gate_failed`]) for the
-/// `blocked` status, then adds the ordered phase list ([`ordered_phases`]) with
+/// read the dashboard's blocked predicate is built on ([`latest_epoch_gate`])
+/// for the `blocked` status and the gate it names, then adds the ordered phase list ([`ordered_phases`]) with
 /// per-phase status, directive, and outcome ([`per_state_outcomes`]). Returns
 /// `None` only when the log cannot be read.
 pub fn derive_enriched_projection(
@@ -260,11 +264,14 @@ pub fn derive_enriched_projection(
     // Blocked overrides a non-terminal Running: a non-terminal session whose
     // latest current-epoch gate did not pass renders `blocked` (same predicate
     // the dashboard's `is_blocked` uses). Precedence: terminal > blocked >
-    // running, so only Running is upgraded.
+    // running, so only Running is upgraded. The gate named is the one the
+    // predicate read, so the entry's text and its classification agree.
+    let mut blocked_gate = None;
     if base.status == RenderStatus::Running {
         if let Some(cs) = base.current_state.as_deref() {
-            if latest_epoch_gate_failed(&events, cs) {
+            if let Some((gate, false)) = latest_epoch_gate(&events, cs) {
                 base.status = RenderStatus::Blocked;
+                blocked_gate = Some(gate);
             }
         }
     }
@@ -287,6 +294,7 @@ pub fn derive_enriched_projection(
         base,
         phases,
         holdings,
+        blocked_gate,
     })
 }
 

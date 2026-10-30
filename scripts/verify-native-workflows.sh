@@ -16,7 +16,9 @@
 #              done-on-completion, default-path-untouched, atomic UUID filename.
 #   Phase detail: ordered phases with the active one marked, the active phase's
 #              directive legible, per-phase evidence/gate outcome, and a
-#              gate-blocked session rendering as `blocked` (not running/done).
+#              gate-blocked session rendering as blocked: top-level
+#              `running`, `koto.status` `blocked`, a Blocked `error` step
+#              naming the gate, and a summary ending `blocked on gate <name>`.
 #
 # The hello-koto template's `awakening` state carries a command gate
 # (spirit_greeting) that fails until a greeting file exists, so the first
@@ -60,8 +62,11 @@ koto_field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['k
 phase_titles() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(','.join(p['title'] for p in d.get('phases',[])))" "$1"; }
 # The `detail` of the phase whose title matches $2.
 phase_detail() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(next((p.get('detail','') for p in d.get('phases',[]) if p['title']==sys.argv[2]),''))" "$1" "$2"; }
-# The promptPreview of the active (state==progress) workflow_agent step.
-active_directive() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(next((n.get('promptPreview','') for n in d.get('workflowProgress',[]) if n.get('type')=='workflow_agent' and n.get('state')=='progress'),''))" "$1"; }
+# The active workflow_agent step: `progress` on a running session, `error` on a
+# blocked one. Prints the field named by $2 (empty when absent).
+active_step_field() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));n=next((n for n in d.get('workflowProgress',[]) if n.get('type')=='workflow_agent' and n.get('state') in ('progress','error')),{});v=n.get(sys.argv[2],'');print(json.dumps(v) if isinstance(v,bool) else v)" "$1" "$2"; }
+# The promptPreview of the active workflow_agent step.
+active_directive() { active_step_field "$1" promptPreview; }
 
 # ---- Setup: init a real session and publish the /workflows location ----
 "$KOTO" init verify --template "$TEMPLATE" --var SPIRIT_NAME=Koto --intent "verify" >/dev/null
@@ -82,8 +87,9 @@ START1="$(field "$F" startTime)"
 
 # ---- AC1: phases render in order with the active one marked ----
 [ "$(phase_titles "$F")" = "Awakening,Eternal" ] || fail "AC1: phases not in expected order (got '$(phase_titles "$F")')"
-# The progress tree must mark the active phase (a workflow_agent with state=progress).
-python3 -c "import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if any(n.get('type')=='workflow_agent' and n.get('state')=='progress' for n in d.get('workflowProgress',[])) else 1)" "$F" || fail "AC1: no active (progress) phase marked"
+# The progress tree must mark the active phase (a workflow_agent with state
+# progress, or error on a blocked session).
+python3 -c "import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if any(n.get('type')=='workflow_agent' and n.get('state') in ('progress','error') for n in d.get('workflowProgress',[])) else 1)" "$F" || fail "AC1: no active phase marked"
 pass "AC1: phases render in order with the active one marked"
 
 # ---- AC2: the active phase's directive is legible ----
@@ -94,7 +100,23 @@ esac
 pass "AC2: active phase directive is legible"
 
 # ---- AC3: a gate-blocked session renders as blocked ----
-[ "$(field "$F" status)" = "blocked" ] || fail "AC3: status != blocked (got '$(field "$F" status)')"
+# Claude Code 2.1.314 counts every status but `running` as completed, so a
+# blocked session is written top-level `running`; koto's own classification is
+# `koto.status`, and the active step is an `error` flagged `blocked`.
+[ "$(field "$F" status)" = "running" ] || fail "AC3: top-level status != running (got '$(field "$F" status)')"
+pass "AC3: top-level status is running"
+[ "$(koto_field "$F" status)" = "blocked" ] || fail "AC3: koto.status != blocked (got '$(koto_field "$F" status)')"
+pass "AC3: koto.status is blocked"
+[ "$(active_step_field "$F" state)" = "error" ] || fail "AC3: active step state != error (got '$(active_step_field "$F" state)')"
+[ "$(active_step_field "$F" blocked)" = "true" ] || fail "AC3: active step not flagged blocked (got '$(active_step_field "$F" blocked)')"
+[ "$(active_step_field "$F" error)" = "gate spirit_greeting: FAIL" ] || fail "AC3: active step error != 'gate spirit_greeting: FAIL' (got '$(active_step_field "$F" error)')"
+pass "AC3: blocked step reads error, blocked, 'gate spirit_greeting: FAIL'"
+SUMMARY="$(field "$F" summary)"
+case "$SUMMARY" in
+  "koto · verify · awakening"*"· blocked on gate spirit_greeting") ;;
+  *) fail "AC3: summary is not the blocked summary (got '$SUMMARY')" ;;
+esac
+pass "AC3: summary ends with '· blocked on gate spirit_greeting'"
 case "$(phase_detail "$F" Awakening)" in
   *"FAIL"*) ;;
   *) fail "AC3: blocked phase does not show the failed gate outcome (got '$(phase_detail "$F" Awakening)')" ;;
