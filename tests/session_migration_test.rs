@@ -1429,8 +1429,9 @@ fn a_migrated_source_refuses_context_writes_and_rebind_and_serves_reads() {
 /// `koto next` on a session that was never migrated makes no request for
 /// the marker check of its own: one listing of the session's prefix answers
 /// it and the tick's pull of its own session, which fetches nothing when the
-/// state file is the one this host pushed (koto#428). The local backend
-/// makes no request at all.
+/// state file is the one this host pushed (koto#428). The rest of the
+/// tick's requests are its batch's. The local backend makes no request at
+/// all.
 #[test]
 fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let s3 = FakeS3::start(BUCKET);
@@ -1448,14 +1449,24 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let put = format!("PUT {}", state);
     // One listing of the session's prefix, for the marker check and the
     // tick's pull of its own session alike, answered once for the whole
-    // tick though the gate reads a context key; then the pushes of the
-    // events the tick appends, the last its `instructions_delivered`.
+    // tick though the gate reads a context key. The events the tick appends
+    // then wait in its batch (koto#548): its first append checks the
+    // version and marks the batch open, and the flush before the tick
+    // returns checks for a marker and the version again, pushes the state
+    // file once and `version.json`, and closes the batch.
+    let version = format!("{}version.json", session);
+    let batch_marker = format!("{}batch-open.json", session);
     let expected = vec![
         format!("LIST {}", session),
-        put.clone(),
-        put.clone(),
-        put.clone(),
+        format!("LIST {}", version),
+        format!("GET {}", version),
+        format!("PUT {}", batch_marker),
+        format!("LIST {}migrated.json", session),
+        format!("LIST {}", version),
+        format!("GET {}", version),
         put,
+        format!("PUT {}", version),
+        format!("DELETE {}", batch_marker),
     ];
     assert_eq!(seen, expected, "koto next made {:?}", seen);
 
