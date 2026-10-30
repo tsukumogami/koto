@@ -438,7 +438,7 @@ The decider ledger stops being written and its report reads sessions. The run jo
 sink are untouched, so telemetry receives what it receives today, and the host-file requirement is
 met when the event-sink work removes the journal.
 
-## What carries over from the first build
+### What carries over from the first build
 
 The first build (koto#394 and koto#396, closed unmerged) carries over in everything that didn't depend
 on its host store:
@@ -462,7 +462,7 @@ The first build put decisions in a host store because the deciding session "may 
 "no cross-session write path". Retention answers the first. The second was wrong for keys, but the
 one-writer rule rules the path out anyway, which is why reversals live in the reverser's session.
 
-## The questions the planning left open
+### The questions the planning left open
 
 - **What becomes of the decider ledger's readers.** Its one reader, `koto decider report`, reads
   sessions (Decision 3). The measurement pipeline and its skill read neither the ledger nor the report
@@ -666,7 +666,68 @@ test of it before then is interim.
 
 ## Security Considerations
 
-To be written from the security review.
+**Attribution, not authentication.** Every decider value is `observed` (koto read it from its own
+environment, keys or hook) or `handed` (a caller supplied it), and neither proves identity. A
+process that can run a shell command can set `KOTO_AGENT_ID`, `KOTO_ANCHOR` or `KOTO_AUTHORITY`,
+open an anchor with any recorded level, or pass `--by person:<handle>`. The links that give standing
+are keys written by the processes acting for each session. Standing therefore says who a record
+claims is above whom among one user's sessions. A reversal's standing is `verified` only when its
+path is complete and the live link keys agree with the chain snapshot stored in the original, and
+`asserted` otherwise; the docs say so beside every command that prints standing. Nothing here
+defends against a process with write access to `~/.koto` or to the bucket credential, which can add
+or delete files directly. Write-once protects against koto's own commands, `koto context`, racing
+writers in one session, and a second put of an existing bucket object. A per-session hash chain over
+decision bodies is available as later hardening if tamper evidence is wanted.
+
+**Untrusted input.** A decision body read from another session, an imported archive, a bucket object
+or an import file is data. The reader enforces the body cap (16 KiB) and reason cap (4 KiB) and a cap
+on entries per area; it `lstat`s the area root, each target directory and each file, opens files
+without following symlinks and confirms a regular file on the open descriptor, and validates every
+session id and decision id against a strict grammar before joining it to a path. A body whose
+session name or id disagrees with where it was read, an id in both areas, or an over-size or
+unparseable file makes that session unreadable, which blocks the live decider (R23). A hostile
+session can use that to stall a worker; the design accepts it, because the alternative is to ignore a
+reversal, and the block names the offending session so a person can resolve it. A reversal with
+standing `asserted` blocks too, with its standing shown in the condition, for the same fail-closed
+reason. `koto decisions import` runs the same validation as a local record, labels everything
+`handed`, never claims `verified`, lets an imported `reverse` name only an entry from the same
+import and never another session's decision, and caps line length and count. `koto/imported-from` is
+written only by the import command, holds validated session ids, and is capped, because it decides
+which reversals a session treats as aimed at itself.
+
+**No self-clearing.** A blocked worker can't clear its own block: a replacement clears only when its
+decider has standing over the reverser, and naming the reversal in `basis` isn't enough on its own.
+Reversing a person's decision takes a person decider; because a handle is unauthenticated, the record
+keeps the entering session and the observed harness id, so a reader sees which agent session claimed
+to be a person.
+
+**Platform guarantees.** The bucket's write-once guarantee rests on the provider honouring
+`If-None-Match: *`. koto probes a bucket once before its first decision put, putting a probe object
+twice and requiring the second to fail with 412, and refuses to hold decisions on a bucket that
+doesn't. Where `atomic_create_rename` would fall back to a replacing rename after a cross-device
+error, the decision writer treats the error as a failure. Another credential holder can still create
+objects under a session's prefix in a shared bucket; the integrity checks make such an object surface
+as an unreadable session rather than as a decision.
+
+**The koto-skills hook.** It rewrites a user's Bash command, so it is the highest-impact new code. It
+parses the payload as JSON, matches only commands that invoke the `koto` binary, adds a prefix of
+environment assignments built only from values that match koto's identifier pattern, leaves the
+command text byte-identical after that prefix, and changes nothing when anything is ambiguous. Its
+tests feed it hostile command strings. shirabe's scripts pass repository, path, commit and finding
+text to `koto decisions` as separate arguments, never through `eval` or string building, and the
+interim-entry converter writes JSON with a JSON encoder.
+
+**Data exposure.** Decision bodies hold free text and pointers: reasons, evidence, links, handles and
+the names of every session on the chain. They aren't scrubbed, and they travel with the session
+through archives, import and the bucket; the docs say so. The opted-in telemetry, decider and model
+backends receive what they receive today: the three events that gain a `decision` field are projected
+into the run journal and the event sink by named fields, so the field never reaches them, and a test
+asserts each projected record is byte-identical with and without it. New output that reaches the
+model (the two synthetic conditions, `list` and `show`) is fixed wording plus ids; a reversal reason
+shown there is capped and labelled as untrusted text. An old decider ledger file may still hold gate
+answers; koto no longer reads or writes it, and the release notes tell the owner it can be deleted.
+Project configuration is never read for standing, deciders or authority, so a cloned repository can't
+widen who may reverse.
 
 ## Consequences
 
