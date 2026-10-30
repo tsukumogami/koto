@@ -384,12 +384,27 @@ classification to step shape in one function.
 **`src/workflows_surface/project.rs`**
 
 - `Projection` gains `cancelled: bool`, set from the `WorkflowCancelled` scan
-  `project_from_log` already does.
+  `project_from_log` already does. It is read only when the status is
+  `Failed`, and the classification order already decides the overlap: a
+  session at a terminal state is classified by its state name first, so a
+  cancelled session that also sits at a failure terminal gets the "ended at"
+  line, and "cancelled at" is written only for a session that is cancelled and
+  not terminal.
 - `EnrichedProjection` gains `blocked_gate: Option<String>`. Where
   `derive_enriched_projection` upgrades `Running` to `Blocked`, it now calls
   `latest_epoch_gate` once and, when the gate failed, sets both the status and
   `blocked_gate`. `blocked_gate` is `Some` exactly when `base.status` is
-  `Blocked`.
+  `Blocked`. It is a projection field rather than something `materialize.rs`
+  reads off the phase list because the summary needs the gate's name even when
+  the template can't be read and there is no phase list.
+- The phase's `detail` and the step's `resultPreview` keep coming from
+  `per_state_outcomes`, which scans the whole log. For a blocked session that
+  can't disagree with `blocked_gate`: the epoch is the tail of the log since the
+  session last entered its current state, it holds at least one gate
+  evaluation (otherwise the session isn't blocked), and so the latest gate
+  recorded for that state anywhere in the log is the epoch's latest. The two
+  reads differ only on a session that isn't blocked, where no `error` is
+  written.
 
 **`src/workflows_surface/contract.rs`**
 
@@ -413,8 +428,9 @@ classification to step shape in one function.
   the top level and `status` into `koto.status`.
 - New `WorkflowFile::with_blocked_gate(self, gate: &str) -> Self`: rebuilds
   `summary` as `koto · <workflow> · <state> · blocked on gate <name>`. The gate
-  name is sanitized and capped on its own first, at a new `GATE_NAME_CAP` of
-  128 characters, and the `koto · <workflow> · <state>` prefix is capped so
+  name is cut on its own first, at a new `GATE_NAME_CAP` of 128 raw
+  characters with the cut marker, and then escaped, so a cut never splits an
+  escape sequence; the `koto · <workflow> · <state>` prefix is capped so
   that prefix and suffix together stay within `FACT_CAP`. A long workflow or
   state name is what gets cut, never the "blocked on gate" suffix.
 
@@ -424,15 +440,16 @@ classification to step shape in one function.
   cancelled: bool, state: &str) -> ActiveStep`, with
   `ActiveStep { state: &'static str, blocked: bool, error: String }`,
   implementing Decision 3's table. The gate or state name inside an `error`
-  string is sanitized and capped at `GATE_NAME_CAP` before it is joined, and
-  the whole line goes through `sanitize_capped(.., FACT_CAP)`.
-- `preview()`, which builds `promptPreview` and `resultPreview`, escapes its
-  input with the shared sanitizer before its existing whitespace collapse and
-  truncation. Today it only collapses and truncates, so a template's directive
-  or gate name can reach the file with raw control characters; after this
-  change every template-derived string in the file gets the same treatment.
+  string is cut at `GATE_NAME_CAP` and escaped the same way before it is
+  joined.
+- `preview()`, which builds `promptPreview` and `resultPreview`, keeps its
+  whitespace collapse and its cut at 240 characters, and then escapes the cut
+  text with `sanitize_one_line`. Escaping after the cut means the cut can't
+  split an escape. Today it only collapses and cuts, so a template's directive
+  or gate name can reach the file with raw control characters.
 - `build_detail` takes the `ActiveStep` and uses it for the `Active` phase;
-  `Done` and `Upcoming` are unchanged.
+  `Done` and `Upcoming` keep their shape. Every title, label and `detail` it
+  writes passes through `sanitize_capped(.., FACT_CAP)`.
 - `phase_detail` takes the session status for the `Active` arm: `Completed`
   with no outcome reads `done`, `Failed` with no outcome reads the step's
   `error`, everything else as today.
@@ -494,8 +511,20 @@ log read; there is no new read, no store access and no remote call (D8).
 
 ## Implementation Approach
 
-One pull request, closing koto#553 and koto#554. The commits below keep each
-step compiling and its tests green.
+One pull request, closing koto#553 and koto#554. The phases are the order the
+work is done in, not separate commits: Phase 1 can land on its own, but the
+version 5 shape breaks today's contract tests, the step tests in
+`materialize.rs` and the golden fixture at once, so Phases 2 to 4 land as one
+commit and Phase 5 follows it.
+
+The new fields ripple through every constructor of the changed types, all of
+them inside `src/workflows_surface/` and `tests/native_workflows_shape.rs`:
+`ProgressNode::WorkflowAgent` literals in `contract.rs`'s tests,
+`build_detail` and the shape test; `Projection` in `project_from_log`; and
+`WorkflowFile.status`'s new type wherever a test reads it. No other file in
+the repository constructs these types, nothing reads a written entry's
+top-level `status` back, and the repository has no JSON schema for the
+entry.
 
 ### Phase 1: the predicate helper and projection facts
 
@@ -527,8 +556,10 @@ Deliverables: `src/workflows_surface/contract.rs`.
 (AC1 to AC3), `koto.status` for all four classifications (AC4), the completed
 and failed shapes (AC5, AC6), the unchanged running shape (AC7), the four
 unblocking cases (AC8), two gates in one state (AC9), the no-template case
-(AC10), an unwritable target (AC19), and a directive and gate name with a
-control character reaching `promptPreview` and `resultPreview` escaped. The
+(AC10), an unwritable target (AC19), template text with a control character
+reaching `promptPreview`, `resultPreview`, a phase title and a `detail`
+escaped, and a failing gate's captured output reaching none of `error`,
+`resultPreview` or the summary. The
 existing tests named in AC11 keep
 their assertions; `ac3_gate_blocked_renders_blocked` and
 `terminal_renders_completed_with_phases` change to the new shapes.
@@ -582,13 +613,30 @@ name is capped on its own, at 128 characters, before it is joined into the
 summary, so a long workflow or state name can't push the "blocked on gate"
 suffix out of the line.
 
-One gap predates this change and is closed by it. `preview()` collapses
+Gaps that predate this change are closed by it. `preview()` collapses
 whitespace and truncates but doesn't escape anything, so `promptPreview` and
 `resultPreview` can carry raw escape sequences from a template's directive or
-gate name today. Routing `preview()` through the same sanitizer means every
-template-derived string in the file gets the same treatment, and the tests
-assert the escaped form for `error`, `summary`, `promptPreview` and
-`resultPreview`.
+gate name today, and `build_detail` copies phase titles, step labels and
+`Phase.detail` (which carries gate names and the key names of submitted
+evidence) into the file unescaped. This change routes `preview()` through the
+sanitizer and passes every title, label and `detail` `build_detail` writes
+through `sanitize_capped(.., FACT_CAP)`, so every string in the
+`workflowProgress` and `phases` arrays gets the treatment the title and summary
+already get. The tests assert the escaped form for `error`, `summary`,
+`promptPreview`, `resultPreview`, a phase title and a `detail` built from an
+evidence key.
+
+The `error` text is fixed at the gate's name and the word FAIL. A test gives a
+failing gate captured output and asserts that none of it reaches `error`,
+`resultPreview` or the summary.
+
+Escaping stops a name from driving the terminal; it doesn't stop a template
+author from choosing a misleading gate name, such as one that reads like a
+second status. That was already true of every name and directive the entry
+shows, and the template author is already the one deciding what the entry
+says. Whether Claude Code hands entry text to its model is outside what this
+design can see; the entry carried template text before this change, and the
+change adds only names.
 
 The change opens no new filesystem, network or process surface. The file is
 still written by the existing temp-file-and-rename path into the directory
@@ -603,9 +651,20 @@ the gate's output or any submitted evidence value. That boundary should hold
 in later changes: a gate's output can contain paths and secrets, and this file
 lands outside koto's session store, in a directory another program reads.
 
-What's left is a compatibility risk rather than a security one: the mapping
-depends on how Claude Code 2.1.314 draws the file. The golden fixture and the
-guide's manual check are what catch a change there.
+Two things the design leaves as they are, because they predate it and its
+change doesn't touch them: the target file name is built from the session id
+in the state header without checking that it is a UUID, and
+`stable_start_time` reads the previous file without a size bound. Both sit
+under the same user's own directories, written by koto itself; tightening them
+is separate work.
+
+What's left is an integrity effect on readers. A script that checked the
+top-level `status` for `blocked` will, from version 5, see a stuck session as
+`running` and draw the wrong conclusion. The CHANGELOG entry says so and points
+such readers at `koto.status`, and the version bump is there for a reader to
+check. Beyond that, the mapping depends on how Claude Code 2.1.314 draws the
+file; the golden fixture and the guide's manual check are what catch a change
+there.
 
 ## Consequences
 
@@ -627,6 +686,9 @@ guide's manual check are what catch a change there.
 - The blocked phase's marker is the failed-phase cross, since its only step is
   errored; "failed" at the phase level is a stronger word than the truth.
 - A reader that used the top-level `blocked` stops seeing it.
+- A blocked session whose compiled template can't be read has no phase list
+  and so no Blocked step; it reads blocked only through the running bucket,
+  the summary and `koto.status`.
 - The mapping is tuned to one Claude Code version's rendering. A later
   version could count buckets differently or stop honoring `blocked` on a
   step.
