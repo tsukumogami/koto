@@ -593,10 +593,16 @@ breaker, the stamps, the `context_reads` exclusion, the telemetry exit hook
 `docs/reference/run-journal.md` naming the three queue-only fields, which
 keeps `tests/run_journal_doc_test.rs`'s two-way check honest.
 
+It also brings the half of `carry.rs` that counting needs: `telemetry.json`,
+`telemetry.lock`, the defensive read and the locked add. Every "dropped and
+counted" path in this pull request then writes real counts, and its breaker
+and deadline tests assert on the file.
+
 ### PR 6: The carry
 
-`carry.rs`, the take and add-back around each call, the removal hook into
-the orphan count, and `--carry` on the first chunk.
+The rest of `carry.rs`: the take before each flush, `--carry` on the first
+chunk, the add-back of taken counts after exit 3 or a kill, and the removal
+hook into the orphan count.
 
 ### PR 7: Flush points 1 to 4
 
@@ -624,7 +630,7 @@ release A run unchanged.
 | 450 records: 200, 200, 50; a deadline in the second call drops the third; the flush ends within 3.0 s | `src/telemetry/queue.rs` unit tests: `chunks_200_200_50`, `deadline_drops_unreached_chunk` | 5 |
 | A chunk with under 2.0 s left is dropped and counted without a kill or a breaker trip | `queue.rs`: `late_chunk_dropped_breaker_stays_open` (the deadline leaves under 2.0 s before the third chunk; the third is counted, the breaker stays open, the next flush sends) | 5 |
 | The sink's environment holds only the allowlist | `event_sink_records_test.rs`: `sink_env_is_allowlist_only` (with the three identity variables and a decoy credential set, the stub sees the identity variables and nothing outside the allowlist) | 5 |
-| Exit 3: called once, later records counted, carry added back | `queue.rs`: `exit_3_trips_breaker_and_adds_back` | 5, 6 |
+| Exit 3: called once, later records counted, carry added back | `queue.rs`: `exit_3_trips_breaker_and_counts` (PR 5: one call, later records in `telemetry.json`); `exit_3_adds_back_taken_carry` (PR 6) | 5, 6 |
 | A hung sink is killed with its group | `event_sink_exit_test.rs`: `hung_sink_killed_with_group` (the stub forks a child; nothing of the group is left) | 5 |
 | Exit 2: called once, nothing counted | `queue.rs`: `exit_2_stops_without_counting` | 5 |
 | Carry sent and zeroed; two processes never carry the same count | `tests/event_sink_carry_test.rs`: `carry_sent_and_zeroed`, `concurrent_processes_never_double_carry` | 6 |
@@ -664,7 +670,11 @@ account. That's the trust model the fixed contract gives, and the same one
 
 The sink runs in its own process group, with working directory `/` and an
 environment cleared to the allowlist in Solution Architecture, so a
-credential in the user's shell doesn't reach it. Its arguments carry
+credential in the user's shell doesn't reach it. The allowlist's only
+entries beyond the basics are the three identity variables the sink stamps
+records with, at its owner's request. A sink that leaves its process group
+(through `setsid`) escapes the group kill. That falls inside the same-user
+limit below. Its arguments carry
 nothing but a drop count. Its output is discarded, and koto reads only its
 exit status. A timeout or a wait error ends the call by killing that group
 and no other: the signal is sent only after a successful spawn, and only to
