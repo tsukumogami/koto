@@ -39,7 +39,7 @@ template-derived string, and the docs an operator or agent reads.
 
 **Goal**: A real session driven into a failing gate through the local backend writes a version 5 entry: top-level `running`, `koto.status` `blocked`, the active step `error` with `blocked` true and `error` `gate <name>: FAIL`, and a summary ending `· blocked on gate <name>`. This is the walking skeleton: it crosses the new persistence helper, the projection, the contract and the materializer on one real input (the `hello-koto` template's `awakening` gate in the verify script, and a unit test's failing gate). It also moves the golden fixture and shape test and the verify script to the new blocked shape so the suite stays green, and bumps `CONTRACT_VERSION` to 5.
 
-**Fixes**: tsukumogami/koto#553
+**Fixes**: https://github.com/tsukumogami/koto/issues/553
 
 **Acceptance Criteria**:
 
@@ -64,7 +64,7 @@ template-derived string, and the docs an operator or agent reads.
 
 **Goal**: A completed koto session's `/workflows` entry shows every step `done`, so the terminal phase reads 1/1, the header reads N/N and nothing reads Stopped; a cancelled session and a session that ended at a failure-named terminal state show their last step as failed with a line saying why. Each entry's `koto.status` reads `completed` or `failed`, and the top-level `status` stays `completed` or `failed`.
 
-**Fixes**: tsukumogami/koto#554
+**Fixes**: https://github.com/tsukumogami/koto/issues/554
 
 **Acceptance Criteria**:
 
