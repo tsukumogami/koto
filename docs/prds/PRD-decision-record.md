@@ -113,10 +113,11 @@ that footing.
 |---|---|
 | deciding session | the koto session a decision's keys live in |
 | agent session | one harness conversation; koto knows it by its anchor session, named in `KOTO_ANCHOR` |
-| chain | the sessions above a session, reached by following koto-owned dispatched-by links upward from it and from its anchor |
+| chain | the ordered sessions above a deciding session: first those reached by following koto-owned dispatched-by links upward from the deciding session, then its anchor (reached by its held-by link) and those reached upward from the anchor, skipping any session already listed |
 | above | a session is above a decision when it, or its anchor, is on the decision's chain |
 | established decider | a decider named with `--by`, or, with none named, a harness session identifier in `CLAUDE_CODE_SESSION_ID` or a readable anchor named in `KOTO_ANCHOR`; the koto session name alone never establishes one |
-| status | each decision reads as exactly one of `in-effect`, `reversed`, `refused` or `unreadable` |
+| status | each decision reads as exactly one of `in-effect`, `reversed`, `refused` or `unreadable`. A `reverse` reads `in-effect` when it wins R19's rule and `refused` when it loses; a `refused` decision always reads `refused`; any other decision reads `reversed` when a winning reversal names it, otherwise `in-effect` |
+| decision keys | the keys holding decisions, under one koto-reserved key prefix the design names |
 
 ### Functional
 
@@ -142,7 +143,7 @@ that footing.
 
   | Kind | Subject |
   |---|---|
-  | `accept` of a document, plan or test change | repository, path or paths, commit |
+  | `accept` of a document, plan, test change, or policy or configuration change | repository, path or paths, commit |
   | `accept` of a plan step | repository, plan path, step identifier, commit |
   | `accept` of an intent or staged draft | where it lives (a koto request identifier, a repository path, or a forge issue), plus an optional link to the ticket or alert it came from |
   | `merge` | repository, pull request number, merged head commit |
@@ -156,16 +157,20 @@ that footing.
 
   A command given a kind, outcome or subject these tables don't allow fails with an error naming
   the field and records nothing.
-- **R3.** Every decision carries an identifier unique within its session, a UTC time to the
-  millisecond, its outcome, an optional reason, and an optional list of `basis` references
+- **R3.** Every decision carries an identifier unique within its session, fixed-width text whose
+  byte order is the order the session recorded its decisions in; a UTC time to the millisecond;
+  the workflow state its session was in when it was recorded, or empty for a session with no
+  workflow state; its outcome; an optional reason; and an optional list of `basis` references
   (session name and identifier) naming earlier decisions it relies on. A decision is addressed
-  from outside its session by the pair of session name and identifier.
+  from outside its session by the pair of session name and identifier. Every identifier
+  comparison in this document is by bytes.
 
 **Where a decision lives**
 
 - **R4.** A decision is recorded as keys in the deciding session: the session whose agent or
   person decided, or, for a person's decision, the session that entered it. A `reverse` is
-  recorded in the reverser's session. No decision, reversal, refusal or gate answer is written to
+  recorded in the reverser's session when that session is on the original's chain, and otherwise
+  in the reverser's anchor, so it always sits in a session on the chain. No decision, reversal, refusal or gate answer is written to
   or read from a file under `~/.koto/` outside the session directories.
 - **R5.** Decision keys are write-once. Once a decision's keys exist, koto refuses every later
   write to or removal of them, by koto's own commands and by `koto context add` or `remove` from
@@ -182,8 +187,9 @@ that footing.
   - `session`: the koto session name; the harness session identifier when `CLAUDE_CODE_SESSION_ID`
     is set, else empty; the anchor session when `KOTO_ANCHOR` names a readable one, else empty;
     and the agent within it that decided, one of `main`, the identifier of an agent the main agent
-    started, or `unknown`. koto records `unknown` whenever the acting agent isn't reported to it,
-    and never fills in `main` on its own.
+    started, or `unknown`. koto takes the agent from `KOTO_AGENT_ID` (`observed`, set by koto's own
+    harness hook from what the harness reports) or from `--agent` (`handed`), records `unknown`
+    when neither gives one, and never fills in `main` on its own.
   - `person`: a handle the surface supplied, the surface (`terminal`, `forge`, `relay`), an
     optional link to the original, and the session that entered it.
   - `check`: the name of an automated check, such as koto's grader, and the session that ran it.
@@ -197,8 +203,9 @@ that footing.
   otherwise the decider is the entering session and the named person is kept as a handed note.
   koto stores links and never fetches them.
 - **R10.** A decision records the run mode, `attended`, `unattended` or `unknown`: `observed`
-  when the harness reports it, `handed` when the caller passes it, `unknown` when neither does.
-  The run mode is recorded separately from the decider.
+  from `KOTO_RUN_MODE` when koto's harness hook sets it from what the harness reports, `handed`
+  from `--run-mode`, `unknown` when neither gives one. The run mode is recorded separately from
+  the decider.
 
 **Authority and the chain**
 
@@ -210,10 +217,11 @@ that footing.
     `none`;
   - `run_mode`: per R10.
 - **R12.** Every decision records its chain as a snapshot taken when it was recorded: the ordered
-  sessions from the deciding session up to a session with no dispatched-by link, each with how koto
-  wrote the link that reached it: `leg` (at a request-leg bind, from the request's requester),
-  `init` (at `koto init --dispatched-by`), `link` (by `koto session link`), `anchor` (into an
-  anchor when it opened, from its dispatcher), or `import` (rewritten at an import). A chain whose
+  sessions in the order the Terms define, each with how koto wrote the link that reached it: `leg`
+  (at a request-leg bind, from the request's requester), `init` (at `koto init --dispatched-by`),
+  `link` (by `koto session link`), `anchor` (into an anchor when it opened, from its dispatcher),
+  `held-by` (the hop from the deciding session to its anchor), or `import` (rewritten at an
+  import). A chain whose
   next session can't be found is marked `incomplete`; missing links are never guessed and never
   count as a root.
 - **R13.** koto reads no workspace-manager file and calls no workspace-manager command to build
@@ -236,23 +244,25 @@ that footing.
 **Reversal**
 
 - **R17.** A `reverse` is accepted when its decider is:
-  - the same decider as the original (same deciding session, or same person handle entered through
-    the same session);
+  - the same decider as the original: the same deciding session for a session decider, the same
+    check name run in the same session for a check, or any person entering through the same
+    session for a person;
   - for an original decided by a session or a check, a session above the original, or a person
-    entering through such a session;
-  - for an original decided by a person, a person entering through the same session or a session
-    above it. A session alone can't reverse a person's decision.
+    (any handle) entering through such a session;
+  - for an original decided by a person, a person (any handle) entering through a session above
+    it. A session alone can't reverse a person's decision.
 
   A reversal records the chain path that gave it standing and its standing: `verified` when that
-  path is complete, `asserted` when it was accepted only because the original's chain is
-  `incomplete`. When no rule matches and the original's chain is complete, koto refuses and
-  records a `refused` decision in the would-be reverser's session.
+  path is complete. When no rule matches and the original's chain is `incomplete`, the reversal is
+  accepted with standing `asserted` unless the original's deciding session is on the reverser's
+  own chain (a session below the decider never asserts over it). In every other unmatched case
+  koto refuses and records a `refused` decision in the would-be reverser's session.
 - **R18.** koto refuses, and records as `refused` in the attempting session, a reversal of a
   `refused` or `reverse` decision, of a decision it can't find, and of a decision already
   `reversed` in what the attempting session can read.
 - **R19.** When two or more reversals of one decision have standing, the winner is the one with
   the earliest time; equal times go to the reverser session whose name sorts first by bytes, then
-  to the smaller identifier. Every reader applies this rule and reads every other reversal of the
+  to the identifier that sorts first. Every reader applies this rule and reads every other reversal of the
   decision as `refused`. Right after `koto decisions reverse` writes a reversal, it reads the
   competing reversals it can reach; if it lost, it records a `refused` decision naming the winner
   in its own session and exits non-zero. Each later decision command in that session repeats the
@@ -261,9 +271,10 @@ that footing.
   session and identifier. The original is never edited or removed. Restoring what was reversed
   takes a new decision of the original kind.
 - **R21.** What reversing each kind means:
-  - `accept` (`accepted`): the subject is no longer accepted. The reversal and the reversed
-    decision both list every decision, in the reader's own session and the sessions R15 reaches
-    from it, whose `basis` names it. koto doesn't edit the document's status.
+  - `accept` (`accepted`): the subject is no longer accepted. When a listing shows the reversal
+    or the reversed decision, it computes, at read time, every decision whose `basis` names the
+    reversed one among the lister's own session and the sessions R15 reaches below it, and shows
+    them as affected. koto doesn't edit the document's status.
   - `accept` (`rejected`): the rejection no longer stands; the subject is neither accepted nor
     rejected until a new `accept` says so.
   - `merge`: the merge is no longer endorsed. The reversal carries a link to the compensating
@@ -282,20 +293,22 @@ that footing.
   reversals aimed at its decisions from the sessions on its chain. When one of its decisions reads
   `reversed`, `koto next` refuses to advance, leaves the state unchanged, and reports a blocking
   condition naming the reversal and its decider. The block clears when either:
-  - `koto rewind` takes the workflow to the state the decision was recorded in or an earlier one;
+  - `koto rewind` takes the workflow to the state the decision recorded (R3) or an earlier one;
     or
-  - a new decision of the same kind names the reversal in its `basis`. For a `gate-pass` it must be
-    for the same workflow, state and gate, and its decider must have standing over the reversal by
-    R17's rules (the reverser, or a session or person above the reverser); a pass whose standing is
-    `asserted` doesn't clear a `verified` reversal.
+  - a new decision of the same kind names the reversal in its `basis`, recorded in a session on
+    the deciding session's chain by a decider with standing over the reversal by R17's rules (the
+    reverser, or a session or person above the reverser). For a `gate-pass` it must be for the same
+    workflow, state and gate, and a pass whose standing is `asserted` doesn't clear a `verified`
+    reversal. The deciding session can't clear its own block this way; its route is the rewind.
 
   A reversal that lost R19's race blocks nothing.
 - **R23.** Reading reversals at `koto next` writes nothing in any session on the chain. Reads fail
   closed. A chain session is unreadable when its directory exists but a decision or reversal key in
   it fails to parse, its keys can't be read for a reason other than absence, or, under the cloud
   backend, its listing fails with an error other than not-found; then `koto next` blocks with a
-  condition naming that session, and a listing shows each affected decision as `unreadable`, never
-  `in-effect`. A session with no directory and no bucket object ends the chain as `incomplete` and
+  condition naming that session, and a listing shows every decision whose chain includes that
+  session as `unreadable`, never `in-effect`, along with any decision in it whose key fails to
+  parse. A session with no directory and no bucket object ends the chain as `incomplete` and
   blocks nothing; a migrated session resolves to the session it moved to.
 
 **Every gate pass has a decider**
@@ -340,13 +353,18 @@ that footing.
   | the coordinator settling, escalating or holding a question | `judgment`, `escalate`, `decline-escalation` |
   | the coordinator recording a reversal row | `reverse` |
 
-  `record/decisions`, `record/reversals` and the panel's verdict ledger keep their current shape;
-  each row they gain also cites the decision's session and identifier.
+  `record/decisions`, `record/reversals` and the panel's verdict ledger keep every field they have
+  today; each row they gain carries one added field citing the decision's session and identifier,
+  and every existing reader of those keys passes its tests unchanged.
 - **R28.** `koto decisions import <file>` reads JSON Lines, one entry per line with fields
   `source`, `source_id`, `time`, `kind`, `outcome`, `subject`, `decider`, `authority` and an
   optional `reason`, and records each as a decision in the importing session. An imported decision
-  keeps its decider and authority labelled `handed` and its `source` and `source_id`. The pair
-  `source` and `source_id` identifies an entry: importing it again adds nothing.
+  keeps its source `time`, gains the time it was imported, keeps its decider and authority labelled
+  `handed`, and keeps its `source` and `source_id`. Any kind but `refused` may be imported; an
+  imported `reverse` names its original by `source` and `source_id` and has standing `asserted`.
+  The pair `source` and `source_id` identifies an entry: importing it again adds nothing. A line
+  that fails to parse or breaks R1 or R2 stops the import with its line number, and the import then
+  records nothing.
 
 **Reports and evidence**
 
@@ -384,8 +402,9 @@ that footing.
 - **R36.** Measured as the median of five warm runs on the CI runner koto's workflows use: the
   reversal read R22 adds to `koto next` costs under 50 ms on the local backend at a chain depth of
   five with 1,000 decisions in each session, and touches only the sessions on the deciding
-  session's own chain; a listing below a root and the R29 report over 1,000 sessions holding
-  100,000 decisions each finish in under five seconds.
+  session's own chain; over a store of 1,000 sessions in one hierarchy four levels deep, holding
+  100 decisions each (100,000 in all), a listing below the root and the R29 report each finish in
+  under five seconds.
 
 ## Acceptance Criteria
 
@@ -394,7 +413,8 @@ that footing.
 - [ ] A worker dispatched by a live coordinator through a request leg runs unattended with
   `CLAUDE_CODE_SESSION_ID` and `KOTO_ANCHOR` set and no acting agent reported. It accepts a
   document, passes a gate with `koto overrides record` and records a merge, then reaches a success
-  terminal. From the coordinator's session, listing the worker's decisions returns three, each with
+  terminal. With the coordinator's workflow still not terminal and the worker's session finished
+  and kept by retention, listing from the coordinator's session the worker's decisions returns three, each with
   decider kind `session` naming the worker session and its harness identifier labelled `observed`,
   agent `unknown`, run mode `unattended`, authority `kind` `dispatch` with `dispatcher` the
   coordinator, and a chain whose first link is the coordinator labelled `leg`.
@@ -407,8 +427,8 @@ that footing.
 
 - [ ] The same unit with a maintainer accepting the document at the terminal records an `accept`
   with decider kind `person`, the handle labelled `handed`, surface `terminal`, and the entering
-  session, run mode `attended` when passed as such, and the stored decision has no account, login
-  or credential field.
+  session; recorded with `--run-mode attended`, it lists run mode `attended` labelled `handed`;
+  and the stored decision has no account, login or credential field.
 - [ ] A relayed acceptance with link `https://forge.example/pr/1#review-2` is recorded as the
   person's with the link stored. The same relay with no link, with an `http` link, with
   `https://user:pw@forge.example/x`, and with `https://forge.example/x?token=1` is each recorded
@@ -451,8 +471,9 @@ that footing.
   `--by` are each refused with an error naming the missing decider; the workflow's state and
   existing records are unchanged, and a `refused` decision is listed whose decider is marked
   `unestablished` with agent `unknown`.
-- [ ] With a fault injected after `koto overrides record` writes its event and before its decision
-  key, the next `koto next` on that session finds both the override and its decision present.
+- [ ] For each of the three commands, a fault point compiled into koto's test builds stops the
+  process after the command's existing record is written and before its decision key; the next
+  `koto next` on that session finds both present.
 
 **Three levels, a finished middle, a live grandchild**
 
@@ -464,8 +485,12 @@ that footing.
 - [ ] In that run, B's and C's session keys and logs are byte-identical before and after A's reads
   and A's reversal, and A's and B's are byte-identical before and after C's `koto next` read the
   reversal.
-- [ ] `koto rewind` of C to the state where the judgment was made lets C advance; in a second run, a
-  new `judgment` from C naming the reversal in its `basis` clears the block instead.
+- [ ] `koto rewind` of C to the state the judgment recorded lets C advance. In a second run, a new
+  `judgment` from C naming the reversal in its `basis` leaves C blocked, and a new `judgment`
+  recorded by A naming the reversal clears the block.
+- [ ] A person working in an agent session whose anchor, not whose koto session, is on C's chain
+  reverses C's judgment: the reversal is recorded in that anchor, C's next `koto next` blocks on
+  it, and listings from A, B and C all show the judgment `reversed`.
 - [ ] With a gate pass in C reversed by A (`verified`), a new pass by C alone doesn't clear the
   block, a new pass recorded through a chain marked `incomplete` (`asserted`) doesn't either, and a
   new pass recorded by A does.
@@ -500,7 +525,8 @@ that footing.
 - [ ] `koto context add` and `koto context remove` against an existing decision key, from the
   deciding session and from another session, are refused with an error naming the key, and the key
   is unchanged. A template that assigns a decision key fails to compile.
-- [ ] R32's two concurrency runs end with the stated counts and distinct identifiers.
+- [ ] R32's two concurrency runs, each started from a shared barrier so the writers overlap, end
+  with the stated counts and distinct identifiers.
 
 **Cloud and import**
 
@@ -518,7 +544,9 @@ that footing.
   subject field, time window, run mode, defaulted) and one combination of two return exactly the
   matching decisions, oldest first with identifier breaking ties.
 - [ ] A decision recorded with a harness tool-call identifier lists that identifier, and the
-  stored decision holds no other harness content.
+  stored decision holds no harness field beyond R30's three pointers.
+- [ ] Listing output carries a format version, and the `--received` listing of a session returns a
+  gate pass another session recorded on its workflow and a reversal of one of its decisions.
 - [ ] A `verdict` recorded with decider kind `check` naming the grader and a pointer to its session
   check event lists that decider, the session that ran it, and the pointer.
 
@@ -538,6 +566,36 @@ that footing.
   decisions made and reversed in a kind by decider-kind table matching the fixture, counts a
   second-month reversal of a first-month decision under the window's reversals, counts defaulted
   gate passes, and states how many sessions it read; `--below` a root counts only that hierarchy.
+  A decision timed exactly at the window's start is counted and one timed exactly at its end is
+  not.
+
+**Field-level checks**
+
+- [ ] Recording with an unknown kind, an outcome its kind doesn't allow, and a subject missing a
+  field R2 requires each fails naming the field, and the session gains no key.
+- [ ] Two decisions recorded in one run have distinct identifiers of equal length whose byte order
+  matches recording order, and each lists the workflow state it was recorded in.
+- [ ] With `KOTO_AGENT_ID=main` a decision lists agent `main` labelled `observed`; with
+  `--agent sub-1` and no variable it lists `sub-1` labelled `handed`; with neither it lists
+  `unknown`. With neither `KOTO_RUN_MODE` nor `--run-mode` the run mode lists `unknown`.
+- [ ] With the deciding agent session's anchor opened with an authority of level `L2` and a grant
+  `merge-pr`, a decision lists `level` `L2` and `grants` `[merge-pr]` labelled `handed`; with no
+  authority recorded it lists `null` and an empty list.
+- [ ] Sessions linked by `koto init --dispatched-by`, by `koto session link`, and through an anchor
+  opened with a dispatcher list chain links labelled `init`, `link`, `anchor` and `held-by`; after
+  the import scenario, the rewritten link lists `import`.
+- [ ] A grader `check` reverses its own earlier verdict in the same session; a person entering
+  through the session where another person decided reverses that decision.
+- [ ] After a reversal loses R19's race without its command noticing (written by a fault point
+  before the competing one appears), the losing session's next decision command records the
+  `refused` decision.
+- [ ] After an acceptance is reversed, a new `accept` of the same subject lists `in-effect` while
+  the original still lists `reversed`. A reversed `judgment` whose reversal carries a replacement
+  outcome lists that outcome on the reversal.
+- [ ] Under the cloud backend, with a chain session's bucket listing made to fail with a permission
+  error, C's `koto next` blocks naming it; with a chain session migrated by import, C reads
+  reversals from the session it moved to.
+- [ ] With a session that is not on C's chain made unreadable, C's `koto next` still advances.
 
 **Independence and the rest**
 
@@ -612,6 +670,9 @@ that footing.
 - **The chain comes from koto's own links.** The workspace manager's session map holds a harness id
   that is deleted at reap and sits outside koto; koto's dispatched-by links survive an import and are
   written by koto.
+- **A reversed party can't clear its own block.** Letting the decider record a new decision that
+  names the reversal would let it overrule the session above it. It rewinds, or the reverser or
+  someone above records the replacement.
 - **Gate declarations wait.** Refusing a pass by anyone other than a gate's declared deciders needs
   declarations, which a later governance feature adds; none of this feature's criteria depend on it.
 - **Counts come from a scan of kept sessions.** The record has no host-wide index; a reporting tool
