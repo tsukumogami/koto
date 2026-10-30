@@ -1,7 +1,6 @@
 ---
 schema: prd/v1
 status: Accepted
-upstream: docs/briefs/BRIEF-koto-workflows-blocked-status.md
 source_issue: 553
 problem: |
   An operator driving koto sessions inside Claude Code can't tell from the
@@ -16,6 +15,8 @@ goals: |
   failing gate's result as its outcome, and its summary line says blocked. A
   finished session reads done all the way down. koto's own classification stays
   readable in the file, and nothing the entry already shows correctly regresses.
+absorbed:
+  - docs/briefs/BRIEF-koto-workflows-blocked-status.md
 ---
 
 # PRD: a gate-blocked koto session reads as blocked in `/workflows`
@@ -24,11 +25,32 @@ goals: |
 
 Accepted
 
+Absorbed [BRIEF-koto-workflows-blocked-status](docs/briefs/BRIEF-koto-workflows-blocked-status.md); carried in Absorbed Brief.
+
 Requirements for the fix to tsukumogami/koto#553, with tsukumogami/koto#554
-taken in as the same change. Written from the Accepted
-`BRIEF-koto-workflows-blocked-status`. Every statement here about what the
-screen shows refers to Claude Code 2.1.314, the version whose shipped code and
-live screen these requirements were checked against.
+taken in as the same change. Every statement here about what the screen shows
+refers to Claude Code 2.1.314, the version whose shipped code and live screen
+these requirements were checked against.
+
+## Absorbed Brief
+
+An operator driving koto sessions inside Claude Code uses `/workflows` to see
+which session needs them, and today a session stopped on a failing gate looks
+finished: koto writes a status word Claude Code doesn't know, the list counts
+the entry as completed, the active step reads Stopped and the gate's FAIL is
+hidden. A finished session has the mirror fault, its last phase drawn as
+unfinished. Both come from how koto marks the active phase's step and which
+status it trusts the screen to understand.
+
+The outcome the operator should get: a blocked session stands apart from the
+finished ones, its step reads Blocked with the failing gate as its outcome and
+its summary says blocked; once unblocked it reads running and then done all
+the way down. An integration author's script still finds koto's own
+classification in the file, and nothing is written where nothing was before.
+The feature holds in the list bucket, summary, step display, the terminal step
+of finished and failed sessions, and the docs and tests that describe them; it
+pushes out durations, the stop and pause keys, live refresh, hierarchies and
+non-gate waits, and any change to when koto calls a session blocked.
 
 ## Problem Statement
 
