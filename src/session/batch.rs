@@ -9,7 +9,10 @@
 //! alone.
 //!
 //! So a cloud write made from inside a tick, on the tick's own session, goes
-//! to the local store only and is recorded here. The batch is flushed once,
+//! to the local store only and is recorded here. That includes the tick's
+//! own writes, its event appends, header rewrites and the evidence it copies
+//! into context, which used to push the whole state file once per event
+//! (koto#548). The batch is flushed once,
 //! by [`crate::session::cloud::CloudBackend::flush_pending`], before the tick
 //! returns (and at every other point where another process or host could
 //! read the bucket: see that method's callers).
@@ -58,10 +61,14 @@
 //! The contract the cloud backend keeps, for anything that writes a session
 //! or pushes it:
 //!
-//! - A write from a tick's command to the tick's session, or from inside a
-//!   write window on the session (a context add or remove, an event append,
-//!   a header rewrite), opens the batch and records itself under the lock;
-//!   it never pushes.
+//! - A write from a tick, or a tick's command, to the tick's session, or
+//!   from inside a write window on the session (a context add or remove, an
+//!   event append, a header rewrite), opens the batch and records itself
+//!   under the lock; it never pushes.
+//! - The tick pulls its own session once, and that pull flushes a batch an
+//!   earlier process left open. After it the tick never pulls its session
+//!   again, so nothing replaces the tick's writes with the bucket's older
+//!   copy; it pushes the batch once on its way out, however it exits.
 //! - Every other push of a session flushes its open batch first and pushes
 //!   nothing of its own while the batch is open: a state file or manifest
 //!   pushed alone would name keys the bucket doesn't hold. `ensure_pushed`
@@ -69,8 +76,8 @@
 //!   needs the bucket to hold everything.
 //! - A read from a process that doesn't defer flushes the batch before it
 //!   reads the bucket, so it can come before the tick's own flush or the
-//!   window's close; a read from a tick's command, or from inside the
-//!   window, answers a key the batch wrote from the local copy.
+//!   window's close; a read from the tick or a tick's command, or from
+//!   inside the window, answers a key the batch wrote from the local copy.
 //! - A pull never writes over an open batch.
 //! - A pull, push, flush or resolve that finds a batch begun and never
 //!   opened deletes its marker, when the bucket's marker is the one the

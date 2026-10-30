@@ -1845,7 +1845,9 @@ impl CloudBackend {
     /// local copy as it is: the tick pulled it, and the writes it and its
     /// commands made since are there and not yet in the bucket. So does a
     /// process in a write window on `id` whose batch is open. A tick
-    /// pulls its own session once per process. A command of a tick that
+    /// pulls its own session once per process, and that first pull pushes a
+    /// batch an earlier process left open; after it the tick's writes wait
+    /// in its batch like its commands'. A command of a tick that
     /// already checked `id` reads the local copy as that check left it
     /// (`crate::session::sync_stamp`). And a pull never writes over an open
     /// batch: the batch is flushed instead, after which the local copy is
@@ -1861,36 +1863,48 @@ impl CloudBackend {
     /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
     /// the only requests a pull adds, and only when such a batch is there.
     fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
+        let own_tick = self.ticks(id);
+        // The tick pulls its own session once. From then on the writes it
+        // and its commands make wait in its batch, and the local copy is
+        // the only one that holds them: a pull would have nothing newer to
+        // bring, and a flush here would push the batch once per read
+        // instead of once per tick (koto#548).
+        if own_tick && self.has_pulled(id) {
+            return Ok(());
+        }
         // A write window's process pulls until its batch is open, so the
         // window's first write starts from the bucket's copy, as a write
         // outside a window does; from then on the batch's writes are the
         // local copy's, like a tick's.
-        if self.defers(id) && (reentrancy::runs_inside_tick_of(id) || self.journal(id).is_open()) {
+        if self.defers_to_another(id)
+            && (reentrancy::runs_inside_tick_of(id) || self.journal(id).is_open())
+        {
             return Ok(());
         }
-        let own_tick =
-            reentrancy::is_tick_process() && self.enclosing_tick().as_deref() == Some(id);
         self.try_clear_unopened_batch(id);
         if self.journal(id).is_open() {
-            match self.flush_pending(id) {
-                Ok(()) => {}
-                Err(e) if is_hard_sync_error(&e) => return Err(e),
-                Err(e) => {
-                    eprintln!(
-                        "warning: cloud sync: kept this host's unpushed writes and skipped the \
-                         pull: {:#}",
-                        e
-                    );
-                    return Ok(());
+            let flushed = self.flush_pending(id);
+            if let Err(e) = &flushed {
+                if is_hard_sync_error(e) {
+                    return flushed;
                 }
             }
+            // The tick works from this host's copy either way: a flush that
+            // failed leaves the batch to its own flush on the way out.
             if own_tick {
                 self.mark_pulled(id);
             }
+            if let Err(e) = flushed {
+                eprintln!(
+                    "warning: cloud sync: kept this host's unpushed writes and skipped the \
+                     pull: {:#}",
+                    e
+                );
+            }
             return Ok(());
         }
-        if own_tick && !self.mark_pulled(id) {
-            return Ok(());
+        if own_tick {
+            self.mark_pulled(id);
         }
         // A session with no home ([`CloudBackend::home_prefix`]) is read as
         // this host holds it: this directory's copy, if there is one, isn't
@@ -2943,14 +2957,30 @@ impl CloudBackend {
         Journal::new(&self.local.session_dir(id))
     }
 
-    /// Whether this process's writes to `id` wait for the tick that runs
-    /// it ([`reentrancy::runs_inside_tick_of`]), or for `koto session flush`
-    /// to close the write window it runs in ([`batch::in_window_of`]).
+    /// Whether this process's writes to `id` wait in its batch: it is the
+    /// `koto next` tick on `id`, which pushes them once before it returns
+    /// (koto#548), or another process pushes them for it
+    /// ([`CloudBackend::defers_to_another`]).
     fn defers(&self, id: &str) -> bool {
+        self.ticks(id) || self.defers_to_another(id)
+    }
+
+    /// Whether another process pushes this process's writes to `id`: the
+    /// tick that runs it ([`reentrancy::runs_inside_tick_of`]), or `koto
+    /// session flush` closing the write window it runs in
+    /// ([`batch::in_window_of`]), or the holder of a
+    /// [`CloudBackend::defer_writes_to`] guard.
+    fn defers_to_another(&self, id: &str) -> bool {
         !self.probes.read_only
             && (reentrancy::runs_inside_tick_of(id)
                 || batch::in_window_of(id)
                 || self.defers_by_guard(id))
+    }
+
+    /// Whether this process is the `koto next` tick on `id` itself, not a
+    /// command it runs.
+    fn ticks(&self, id: &str) -> bool {
+        reentrancy::is_tick_process() && self.is_own_tick(id)
     }
 
     /// Whether this process is `id`'s own tick or a command it runs: the
@@ -2959,10 +2989,18 @@ impl CloudBackend {
         self.enclosing_tick().as_deref() == Some(id)
     }
 
+    /// Whether this process already pulled `id`.
+    fn has_pulled(&self, id: &str) -> bool {
+        self.pulled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
     /// Append `payload` to `id`'s log locally, then push the state file;
-    /// inside a tick on `id`, or a write window on it, the append joins the
-    /// batch instead and the tick, or `koto session flush`, pushes it. The
-    /// caller has run `local_guard`.
+    /// from the tick on `id` or a command it runs, or inside a write window
+    /// on it, the append joins the batch instead and the tick, or `koto
+    /// session flush`, pushes it. The caller has run `local_guard`.
     fn append_logged(
         &self,
         id: &str,
@@ -3113,9 +3151,11 @@ impl CloudBackend {
     }
 
     /// Push everything an open batch of `id` owes the bucket, then close it.
-    /// A no-op in a process that defers its writes to `id` (a command a
-    /// tick on `id` runs, or one inside a write window on it), whose batch
-    /// the tick or `koto session flush` pushes. With no batch open there is
+    /// A no-op in a process whose writes to `id` another process pushes (a
+    /// command a tick on `id` runs, or one inside a write window on it),
+    /// since the tick or `koto session flush` pushes its batch. The tick on
+    /// `id` itself runs this once, on its way out, for its own writes and
+    /// its commands' together (koto#548). With no batch open there is
     /// nothing to push, and the only work is clearing a batch begun and
     /// never opened, if one is there.
     ///
@@ -3131,7 +3171,7 @@ impl CloudBackend {
     /// reads) and last the batch-open marker. A flush that stops part way
     /// leaves the batch open, and the next one pushes it all again.
     pub fn flush_pending(&self, id: &str) -> anyhow::Result<()> {
-        if self.defers(id) {
+        if self.defers_to_another(id) {
             return Ok(());
         }
         self.flush_batch(id)
