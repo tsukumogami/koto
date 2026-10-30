@@ -1077,7 +1077,7 @@ pub enum WorkflowsAction {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum ContextCommand {
     /// Store content under a key (reads from stdin or --from-file)
     Add {
@@ -1345,7 +1345,8 @@ fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
 }
 
 /// [`refuse_if_unlocated`] for a read verb a migrated source is served on
-/// (`koto status`, `koto decisions list`, `koto overrides list`): a session
+/// (`koto status`, `koto decisions list`, `koto overrides list`, and the
+/// `context` reads `get`, `exists` and `list`): a session
 /// this workspace's copy of was imported away on this host is answered
 /// from the copy it left in the bucket
 /// ([`workspace_read::serve_migrated_source`]) rather than refused. `Some`
@@ -2599,25 +2600,11 @@ pub fn run(app: App) -> Result<()> {
                     | ContextCommand::List { .. }
             );
             if served_read {
-                // The marker is asked for before an owed back-reference
-                // goes up, so a migrated source gets no pointer written.
-                let refused = match backend.check_located(&session) {
-                    Ok(()) => {
-                        let refused = backend.check_not_migrated(&session).err();
-                        if refused.is_none() {
-                            backend.ensure_backref(&session);
-                        }
-                        refused
-                    }
-                    Err(e) if e.is::<crate::session::SessionMigrated>() => Some(e),
-                    Err(e) => refuse_unlocated(&e, command),
+                let read = || Command::Context {
+                    subcommand: subcommand.clone(),
                 };
-                if let Some(e) = refused {
-                    return workspace_read::serve_migrated_source(
-                        &backend,
-                        Command::Context { subcommand },
-                        e,
-                    );
+                if let Some(served) = locate_or_serve(&backend, &session, command, read) {
+                    return served;
                 }
             } else {
                 refuse_if_unlocated(&backend, &session, command);

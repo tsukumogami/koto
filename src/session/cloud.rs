@@ -6087,7 +6087,7 @@ impl CloudBackend {
             target,
             from_session: &source.name,
             from_session_id: &source.log.header.session_id,
-            relation: Some(source.relation(&session_id)),
+            relation: source.relation(&session_id),
         }
         .apply(&ctx_dir, &mut manifest)
         .map_err(|e| write_failed(&ctx_dir, &e))?;
@@ -6316,7 +6316,10 @@ impl CloudBackend {
         }
     }
 
-    /// Mark the source as migrated to the target, last. The marker is read
+    /// Mark the source as migrated to the target, last: the copy and the
+    /// back-reference beside the source went up before this, and the marker
+    /// leaves the source as a read-only predecessor, served from its bucket
+    /// copy for reads and refused for writes. The marker is read
     /// again first: when another import marked the source while this one
     /// ran, this one keeps its target and refuses `import_source_migrated`
     /// naming the other, leaving the operator to remove one of the two. The

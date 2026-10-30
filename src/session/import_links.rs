@@ -144,8 +144,8 @@ pub struct Settlement<'a> {
     /// The source session's name and header id, for `koto/imported-from`.
     pub from_session: &'a str,
     pub from_session_id: &'a str,
-    /// The relation the copy holds, naming the source. `None` writes none.
-    pub relation: Option<ImportRelation<'a>>,
+    /// The relation the copy holds, naming the source.
+    pub relation: ImportRelation<'a>,
 }
 
 /// The continues relation an import writes in its copy, naming the source
@@ -360,9 +360,12 @@ impl Settlement<'_> {
 
         // The copy's one relation names the source. Every relation the
         // source held was left behind with the other dropped keys.
-        if let Some(relation) = &self.relation {
-            write_key(ctx_dir, manifest, &relation.key(), &relation.body())?;
-        }
+        write_key(
+            ctx_dir,
+            manifest,
+            &self.relation.key(),
+            &self.relation.body(),
+        )?;
         Ok(settled)
     }
 }

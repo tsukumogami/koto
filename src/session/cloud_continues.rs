@@ -510,8 +510,17 @@ impl CloudBackend {
         // recorded beside it, and the command refuses or serves it as
         // migrated where it always did. Its marker may be in the bucket
         // alone (imported from another host), so this asks the bucket, on a
-        // listing of this process's own, only when a pointer is owed.
-        if self.check_not_migrated_to_write(id).is_err() {
+        // listing of this process's own, only when a pointer is owed. Any
+        // other error of the check (a failed listing, say) leaves the
+        // pointer owed too, with a warning: the next command asks again.
+        if let Err(e) = self.check_not_migrated_to_write(id) {
+            if !e.is::<crate::session::SessionMigrated>() {
+                eprintln!(
+                    "warning: cloud sync: couldn't check whether '{id}' was imported into \
+                     another workspace, so its back-reference stays owed and a later command \
+                     tries again: {e:#}"
+                );
+            }
             return;
         }
         // A pointer confirmed before under another prefix (the session was

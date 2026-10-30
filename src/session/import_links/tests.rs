@@ -168,6 +168,17 @@ fn store() -> Store {
     }
 }
 
+/// The relation every test import writes, naming the source `src`.
+fn relation() -> ImportRelation<'static> {
+    ImportRelation {
+        source: "src",
+        source_session_id: "src-id",
+        source_workspace: "/work/w1",
+        source_prefix: "0123456789abcdef",
+        holder_session_id: "copy-id",
+    }
+}
+
 fn settle(s: &Store, importer: Option<&str>, manifest: &mut Manifest) -> Settled {
     Settlement {
         local_base: &s.base,
@@ -175,7 +186,7 @@ fn settle(s: &Store, importer: Option<&str>, manifest: &mut Manifest) -> Settled
         target: "copy",
         from_session: "src",
         from_session_id: "src-id",
-        relation: None,
+        relation: relation(),
     }
     .apply(&s.ctx, manifest)
     .unwrap()
@@ -339,6 +350,7 @@ fn held_by_links_are_kept_rewritten_or_dropped_by_the_anchor_they_name() {
         manifest.keys.keys().collect::<Vec<_>>(),
         [
             "koto/imported-from",
+            "koto/links/continues/src",
             "koto/links/dispatched-by/coord",
             "koto/links/held-by/anchor-imp",
             "koto/links/held-by/anchor-open",
@@ -407,6 +419,7 @@ fn with_no_importer_anchor_unresolved_held_by_links_are_dropped() {
             manifest.keys.keys().collect::<Vec<_>>(),
             [
                 "koto/imported-from",
+                "koto/links/continues/src",
                 "koto/links/dispatched-by/coord",
                 "koto/links/held-by/anchor-open",
             ]
@@ -437,14 +450,14 @@ fn an_import_of_the_importers_own_anchor_never_links_it_to_itself() {
         target: "copy",
         from_session: "src",
         from_session_id: "src-id",
-        relation: None,
+        relation: relation(),
     }
     .apply(&s.ctx, &mut manifest)
     .unwrap();
     assert_eq!(settled.dropped, vec!["anchor-gone"]);
     assert_eq!(
         manifest.keys.keys().collect::<Vec<_>>(),
-        ["koto/imported-from"]
+        ["koto/imported-from", "koto/links/continues/src"]
     );
 }
 
@@ -468,7 +481,7 @@ fn a_closed_or_migrated_importer_anchor_takes_over_no_held_by_link() {
         assert_eq!(settled.dropped, vec!["anchor-gone"], "{importer}");
         assert_eq!(
             manifest.keys.keys().collect::<Vec<_>>(),
-            ["koto/imported-from"],
+            ["koto/imported-from", "koto/links/continues/src"],
             "{importer}"
         );
         assert_consistent(&s.ctx, &manifest);
@@ -510,7 +523,7 @@ fn the_copy_holds_one_relation_naming_the_source() {
         target: "copy",
         from_session: "src",
         from_session_id: "00000001-0000-4000-8000-000000000000",
-        relation: Some(relation),
+        relation,
     }
     .apply(&s.ctx, &mut manifest)
     .unwrap();
