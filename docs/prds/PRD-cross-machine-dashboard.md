@@ -14,7 +14,8 @@ goals: |
   each with its current state and the name of the machine that produced it,
   read from the developer's own bucket with the credentials koto already
   uses, and with no change for a developer on one machine.
-upstream: docs/briefs/BRIEF-cross-machine-dashboard.md
+absorbed:
+  - docs/briefs/BRIEF-cross-machine-dashboard.md
 ---
 
 # PRD: Sessions from every machine in one dashboard
@@ -22,6 +23,36 @@ upstream: docs/briefs/BRIEF-cross-machine-dashboard.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-cross-machine-dashboard](docs/briefs/BRIEF-cross-machine-dashboard.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
+The feature was framed for a developer who runs koto sessions on several
+machines and syncs them all to an S3-compatible bucket they configure. The
+bucket mechanics it rests on already ship (sync, pins and successors kept
+across hosts, reads of a named session from any directory, one log push per
+tick), but the dashboard on any one machine shows another machine's session
+as a state-less placeholder and names no machine, so the developer logs into
+each machine to find the run waiting on them.
+
+The intended outcome: from whichever machine is in front of them, the
+developer sees every session they run, with its current state and the
+machine it runs on, in the interactive dashboard and as text a script can
+watch, read from their own bucket with no managed service, and with no
+change for a developer on one machine. The framing's journeys were checking
+on a blocked run from another machine, a shell loop reading
+`koto dashboard --once`, and a single-machine user who sees nothing new;
+they're carried as the User Stories below. The boundary it drew (no hosted
+service, no acting on remote sessions, no requests or reviews in the
+dashboard, no changes to bucket continuity, no project-level storage
+settings, no shared buckets) is carried in Out of Scope. The questions it
+deferred (credentials, discovery, how the machine is stamped, the text
+columns) are settled in Requirements and Decisions and Trade-offs.
 
 ## Problem Statement
 
