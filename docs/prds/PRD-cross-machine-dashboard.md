@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   A developer who runs koto sessions on several machines, all syncing to the
   S3-compatible bucket they configured, can't see another machine's sessions
@@ -21,7 +21,7 @@ upstream: docs/briefs/BRIEF-cross-machine-dashboard.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -109,7 +109,9 @@ read.
 **R2. The machine name defaults to the hostname and the developer can set
 it.** The recorded name is, in order: the `KOTO_MACHINE_NAME` environment
 variable, else the `machine.name` key in the user-level configuration
-(`koto config set --user machine.name <name>`), else the hostname. A name is
+(`koto config set --user machine.name <name>`), else the hostname as the
+operating system reports it with any domain part (from the first `.`)
+removed. An empty value counts as unset. A name is
 1 to 64 characters from letters, digits, `.`, `-` and `_`. `koto config set`
 refuses any other value; an environment value that breaks the rule is
 ignored with one warning on stderr and the next source is used; a hostname
@@ -129,8 +131,9 @@ and shape. The machine is a separate fact; nothing that reads `origin`
 today changes behaviour.
 
 **R5. Sessions with no recorded machine read as unknown.** A session created
-by a release that predates this feature shows an empty machine in `--once`
-and `--detail`, and `unknown` in the TUI. The dashboard doesn't substitute
+by a release that predates this feature shows an empty `machine` column in
+`--once`, `"machine": null` in `--detail`, and `unknown` in the TUI marker and
+Session tab. The dashboard doesn't substitute
 the hostname of whichever machine last wrote the session.
 
 ### Reading other machines' sessions
@@ -155,9 +158,10 @@ remote row carries a marker after its name holding `@` and the recorded
 machine name, or `@unknown` when none is recorded; at widths where the name
 cell is truncated, the marker is truncated from its end, never dropped.
 Local rows carry no marker. For a remote row, the Session tab shows the
-facts the row carries, including Machine and the workspace id; its other
-tabs are out of scope. For a local row with a recorded machine, the Session
-tab shows a Machine row.
+facts the row carries, including Machine and the workspace id, and each of
+its other tabs shows one line saying the session's detail lives on its own
+machine. For a local row, the Session tab shows a Machine row holding the
+recorded name, or `unknown`.
 
 **R9. Rows are distinct per session copy, not per name.** Two sessions with
 the same name under different workspace prefixes appear as two rows. A
@@ -174,13 +178,16 @@ bucket or locally, the dashboard lists the copy and doesn't list the source.
 
 **R12. A session whose state isn't published is listed as unknown.** A
 remote session whose current state can't be read within R21's bound (for
-example one last written by a release that predates this feature) is listed
-with status `unknown`, counted in the unreadable tally, and never shown with
-a state it doesn't have.
+example one last written by a release that predates this feature, or one
+whose published state doesn't parse) is listed with status `unknown`,
+counted in the unreadable tally, and never shown with a state it doesn't
+have. The unreadable tally is the count the dashboard already reports for
+sessions it couldn't read: the tally line in the TUI and the stderr note
+from `--once`.
 
 **R13. Removed sessions disappear.** A session removed from the bucket (by
 cleanup or prune on its own machine) disappears from a running TUI within
-R20's bound and from the next `--once` run.
+R22's bound and from the next `--once` run.
 
 ### Text output
 
@@ -216,14 +223,21 @@ this machine's session store. It works with static keys that grant only
 `s3:ListBucket` and `s3:GetObject` on the bucket.
 
 **R19. Bucket failures leave local sessions visible.** Every bucket request
-the dashboard makes times out after at most 10 seconds. When no prefix can be
-listed, the TUI shows its local rows and one status line naming the failure
-class (`unreachable`, `denied`, `timeout` or `throttled`) and the endpoint's
-host; `--once` prints its local rows, writes one stderr line with the same
-two facts, and exits 0. When some prefixes fail and others don't, rows from
-the readable ones show, and the status line (or stderr line) says how many
-workspaces couldn't be read. A remote session whose listing succeeded but
-whose state read failed is counted in the unreadable tally.
+the dashboard makes times out after at most 10 seconds. A failure falls in
+one of four classes: `unreachable` (the connection is refused or the host
+doesn't resolve), `denied` (HTTP 401 or 403), `timeout` (no answer within
+the 10 seconds), and `throttled` (HTTP 429 or 503 after koto's usual
+retries). When the listing of the bucket's top level fails, the run makes no
+further bucket requests: the TUI shows its local rows and one status line
+naming the failure class and the endpoint's host, and `--once` prints its
+local rows, writes one stderr line with the same two facts, and exits 0.
+When some prefixes fail and others don't, rows from the readable ones show,
+and the status line (or stderr line) says how many workspaces couldn't be
+read and names the class of the first failure. A remote session whose
+listing succeeded but whose state read failed is counted in the unreadable
+tally. The TUI's status line clears on the first refresh that reads the
+bucket without failure. A cloud backend with no bucket or no credentials
+configured fails as it does today.
 
 **R20. The local backend is unchanged.** When the local backend is selected,
 whatever bucket settings exist, the dashboard makes no network request, the
@@ -244,8 +258,8 @@ it runs.
 
 **R23. The TUI never waits on the bucket.** No bucket request runs on the
 thread that handles input and rendering. With an endpoint that accepts
-connections and never answers, a key press is reflected on screen within
-200 ms.
+connections and never answers, the frame drawn after a key press reflects it
+within 200 ms.
 
 **R24. The dashboard holds up at a working developer's scale.** With 200
 workspace prefixes and 2,000 sessions in the bucket and every request
@@ -266,13 +280,20 @@ records every request.
   gate's state, and the row's marker reads `@` and A's machine name. (R1,
   R6, R7, R8)
 - [ ] **Evidence scenario, text.** In the same setup, `koto dashboard --once`
-  on B prints a line for that session whose `current_state` and `status`
-  columns equal those A's own `--once` prints for it, whose `machine` column
+  on B prints a line for that session whose `current_state`, `status`,
+  `intent` and `template_name` columns equal those A's own `--once` prints
+  for it, whose `machine` column
   holds A's machine name and whose `workspace` column holds the session's
   prefix. (R6, R7, R14)
 - [ ] With `KOTO_MACHINE_NAME=env-name` and `machine.name = "cfg-name"` set
   at user level, a new session records `env-name`; with only the config key,
-  `cfg-name`; with neither, the hostname. (R1, R2)
+  `cfg-name`; with neither, the hostname without its domain part; with
+  `KOTO_MACHINE_NAME=""`, the config value. A session created by a child
+  spawn and one created by an inline init record the same name as one created
+  by `koto init`, on the local backend as on the cloud backend. (R1, R2)
+- [ ] A 64-character `machine.name` is accepted and a 65-character one is
+  refused; a hostname `my host_01.example.com` is recorded as
+  `my-host_01`. (R2)
 - [ ] `koto config set --user machine.name "bad name!"` exits non-zero and
   changes nothing; `KOTO_MACHINE_NAME="bad name!"` produces one stderr
   warning and the session records the next source's value. (R2)
@@ -283,7 +304,9 @@ records every request.
   B and the source still records A. (R3)
 - [ ] For a session created by the release before this feature, `--once`
   prints an empty `machine` column, `--detail` prints `"machine": null`, and
-  the TUI marker on B reads `@unknown`. (R5, R8, R16)
+  the TUI marker on B reads `@unknown`. The fixture is a session store
+  written by a release that predates this feature, kept in the test suite.
+  (R5, R8, R16)
 - [ ] `--detail` output's `origin` object is byte-identical before and after
   this feature for the same session. (R4)
 - [ ] With A's sessions under three different prefixes, B lists all three
@@ -293,9 +316,11 @@ records every request.
 - [ ] A remote session that has failed is in the needs-you band; a remote
   terminal session is absent without `--all` and present with it. (R7)
 - [ ] On B, a local session's row has no marker, and its Session tab shows a
-  Machine row naming B; a remote row's Session tab shows Machine and the
-  workspace id. At a terminal width of 80 columns a remote row with a
-  40-character machine name still shows `@` and the start of the name. (R8)
+  Machine row naming B (or `unknown` for a session from before this
+  feature); a remote row's Session tab shows Machine and the workspace id,
+  and its other tabs each show the one-line notice. At a terminal width of 80
+  columns a remote row with a 40-character machine name still shows `@` and
+  the name's first 8 characters. (R8)
 - [ ] With sessions named `review` on A and on B under different prefixes,
   B's TUI and `--once review` both show two `review` rows with different
   `machine` and `workspace` values; a child of A's `review` nests under A's
@@ -304,18 +329,22 @@ records every request.
   output. (R10)
 - [ ] After `koto session import` of A's session on B, B's `--once --all`
   lists the copy and not the source. (R11)
-- [ ] A remote session last written by the release before this feature is
-  listed with status `unknown` and counted in the unreadable tally. (R12)
+- [ ] A remote session last written by a release that predates this feature,
+  and one whose published state is truncated mid-record, are each listed with
+  status `unknown` and counted in the unreadable tally. (R12)
+- [ ] With `--needs-you`, B's `--once` includes A's blocked session; with
+  `--status running` it doesn't. (R14)
 - [ ] After `koto session cleanup` of a session on A, B's running TUI drops
   its row within 60 seconds and the next `--once` on B doesn't print it.
   (R13, R22)
 - [ ] With the local backend, every line of `koto dashboard --once` over the
   existing `--once` test fixtures equals the line those tests expect today
   followed by two empty tab-separated fields. (R14, R20)
-- [ ] A machine name, intent and template name each containing a tab, a
-  newline and an ANSI escape print in `--once` with each control character
-  replaced by a space, every line has exactly ten fields, and the TUI shows
-  no escape effect. (R15)
+- [ ] A remote session whose machine name, id, state, intent and template
+  name each contain a tab, a newline, an ESC, a U+0085 and a U+2028 prints in
+  `--once` with each of those replaced by a space and exactly ten fields per
+  line, and the TUI's rendered buffer for its row contains none of those
+  characters. (R15)
 - [ ] `--detail` for a session with a recorded machine prints its name in
   `machine`, and the bucket's request log shows no write during the run.
   (R16, R18)
@@ -325,21 +354,29 @@ records every request.
 - [ ] With an endpoint that refuses connections, B's `--once` prints its
   local rows, one stderr line containing `unreachable` and the endpoint host,
   and exits 0; B's TUI shows its local rows and one status line with the
-  same two facts. (R19)
+  same two facts. With the endpoint answering 403, the class is `denied`;
+  answering 429 to every retry, `throttled`. Once the endpoint answers
+  normally again, the TUI's status line is gone after the next refresh.
+  (R19)
 - [ ] With one of three prefixes returning errors on listing, B shows the
   other two prefixes' sessions and reports that 1 workspace couldn't be
-  read. (R19)
+  read and names that prefix's failure class. A session whose listing
+  succeeds but whose state read returns 500 is counted in the unreadable
+  tally. (R19)
 - [ ] With an endpoint that accepts connections and never answers, B's TUI
   reflects a key press within 200 ms, and `--once` exits 0 within 15
   seconds. (R19, R23)
+- [ ] With an empty bucket, B shows its local rows and no status line; with
+  1,500 sessions under one prefix, all 1,500 are listed. (R6, R19)
 - [ ] With the local backend selected and a bucket configured, a
   `koto dashboard` run makes no network request and shows no markers. (R20)
 - [ ] For a remote session whose event log is 5 MB, B reads at most 64 KiB
   of object data to show its row; a second TUI refresh with no change in the
   bucket issues no GET request. (R21)
 - [ ] After A's tick changes a session's state, B's running TUI shows the
-  new state within 60 seconds, and a `--once` run on B started after the
-  tick exits shows it. (R22)
+  new state within 60 seconds of the tick's exit, measured with the
+  dashboard's refresh clock under test control, and a `--once` run on B
+  started after the tick exits shows it. (R22)
 - [ ] With 200 prefixes, 2,000 sessions and 50 ms per request in the fake
   bucket, `--once` completes within 30 seconds. (R24)
 
