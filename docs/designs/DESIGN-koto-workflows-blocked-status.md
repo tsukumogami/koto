@@ -412,17 +412,25 @@ classification to step shape in one function.
 - `WorkflowFile::new` keeps its signature, writes `status.screen_status()` at
   the top level and `status` into `koto.status`.
 - New `WorkflowFile::with_blocked_gate(self, gate: &str) -> Self`: rebuilds
-  `summary` as `koto · <workflow> · <state> · blocked on gate <name>` and
-  passes it through `sanitize_capped(.., FACT_CAP)` like the summary today.
+  `summary` as `koto · <workflow> · <state> · blocked on gate <name>`. The gate
+  name is sanitized and capped on its own first, at a new `GATE_NAME_CAP` of
+  128 characters, and the `koto · <workflow> · <state>` prefix is capped so
+  that prefix and suffix together stay within `FACT_CAP`. A long workflow or
+  state name is what gets cut, never the "blocked on gate" suffix.
 
 **`src/workflows_surface/materialize.rs`**
 
 - New `fn active_step(status: RenderStatus, blocked_gate: Option<&str>,
   cancelled: bool, state: &str) -> ActiveStep`, with
   `ActiveStep { state: &'static str, blocked: bool, error: String }`,
-  implementing Decision 3's table. The `error` strings are built with the
-  state or gate name inside and passed through `sanitize_capped(..,
-  FACT_CAP)`.
+  implementing Decision 3's table. The gate or state name inside an `error`
+  string is sanitized and capped at `GATE_NAME_CAP` before it is joined, and
+  the whole line goes through `sanitize_capped(.., FACT_CAP)`.
+- `preview()`, which builds `promptPreview` and `resultPreview`, escapes its
+  input with the shared sanitizer before its existing whitespace collapse and
+  truncation. Today it only collapses and truncates, so a template's directive
+  or gate name can reach the file with raw control characters; after this
+  change every template-derived string in the file gets the same treatment.
 - `build_detail` takes the `ActiveStep` and uses it for the `Active` phase;
   `Done` and `Upcoming` are unchanged.
 - `phase_detail` takes the session status for the `Active` arm: `Completed`
@@ -504,8 +512,11 @@ Deliverables: `src/engine/persistence.rs`, `src/workflows_surface/project.rs`.
 `with_blocked_gate`, the version bump and its doc. Contract unit tests:
 `status_serializes_lowercase` splits into the top-level mapping (`Blocked`
 writes `running`) and `koto.status` (all four words); `contract_version_is_four`
-becomes `_is_five`; a blocked summary test and a sanitizer test with a
-control character and an over-cap gate name (AC12, AC17).
+becomes `_is_five`; a blocked summary test; and sanitizer tests with a
+control character in the gate name, an over-cap gate name (cut at
+`GATE_NAME_CAP` with the cut marker, which also covers the PRD's over-fact-cap
+case), and an over-long workflow name that still leaves the suffix intact
+(AC12, AC17).
 
 Deliverables: `src/workflows_surface/contract.rs`.
 
@@ -516,7 +527,9 @@ Deliverables: `src/workflows_surface/contract.rs`.
 (AC1 to AC3), `koto.status` for all four classifications (AC4), the completed
 and failed shapes (AC5, AC6), the unchanged running shape (AC7), the four
 unblocking cases (AC8), two gates in one state (AC9), the no-template case
-(AC10), and an unwritable target (AC19). The existing tests named in AC11 keep
+(AC10), an unwritable target (AC19), and a directive and gate name with a
+control character reaching `promptPreview` and `resultPreview` escaped. The
+existing tests named in AC11 keep
 their assertions; `ac3_gate_blocked_renders_blocked` and
 `terminal_renders_completed_with_phases` change to the new shapes.
 
@@ -557,7 +570,42 @@ about it.
 
 ## Security Considerations
 
-<Phase 5 writes this section.>
+The file koto writes is read by another program and drawn in its terminal
+screen, and part of its text comes from the workflow template, which someone
+other than the operator may have written. This change adds three pieces of
+template-derived text: the gate name in a blocked step's `error`, the same
+name in the summary's suffix, and the state name in a failed step's `error`.
+Each goes through the shared `sanitize_capped` helper, which escapes control,
+bidirectional and invisible formatting characters as visible `\u{XXXX}`
+sequences, folds newlines and tabs to spaces, and caps the length. The gate
+name is capped on its own, at 128 characters, before it is joined into the
+summary, so a long workflow or state name can't push the "blocked on gate"
+suffix out of the line.
+
+One gap predates this change and is closed by it. `preview()` collapses
+whitespace and truncates but doesn't escape anything, so `promptPreview` and
+`resultPreview` can carry raw escape sequences from a template's directive or
+gate name today. Routing `preview()` through the same sanitizer means every
+template-derived string in the file gets the same treatment, and the tests
+assert the escaped form for `error`, `summary`, `promptPreview` and
+`resultPreview`.
+
+The change opens no new filesystem, network or process surface. The file is
+still written by the existing temp-file-and-rename path into the directory
+koto already resolves, under a name built from the session's UUID, and the
+temp file is created owner-only. The new gate lookup reads events koto already
+holds in memory for the same write. No dependency is added, and the only
+read-back is still `startTime` from koto's own previous file.
+
+The new data in the file is koto's four-value classification and a gate or
+state name. The `error` text carries the gate's name and the word FAIL, never
+the gate's output or any submitted evidence value. That boundary should hold
+in later changes: a gate's output can contain paths and secrets, and this file
+lands outside koto's session store, in a directory another program reads.
+
+What's left is a compatibility risk rather than a security one: the mapping
+depends on how Claude Code 2.1.314 draws the file. The golden fixture and the
+guide's manual check are what catch a change there.
 
 ## Consequences
 
