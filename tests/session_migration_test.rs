@@ -384,6 +384,8 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
     // each of the three ticks lists once for its check (a failed listing
     // isn't asked again in that process), and rust-s3 retries a failed
     // request once, so six requests fail and the cleanup's is answered.
+    // The flush of each tick's batch asks again, uncached, with a listing
+    // of the marker's own key (koto#548), so that listing fails too.
     // The marker names a target the bucket doesn't hold: the removal reads
     // a marker's target as a later session that could keep the source, and
     // an absent one keeps nothing.
@@ -395,6 +397,7 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
         br#"{"schema":1,"target":{"session":"gone","session_id":"00000009-0000-4000-8000-000000000000","workspace":"/elsewhere","prefix":"fedcba9876543210"}}"#,
     );
     s3.fail_times("LIST", &ticked, 500, 6);
+    s3.fail("LIST", &marker, 500);
     for args in [
         vec!["next", "ticked"],
         vec!["next", "ticked", "--with-data", r#"{"choice":"go"}"#],
@@ -415,6 +418,53 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
         "the terminal tick's cleanup must keep only the marker"
     );
     assert!(!a.session_dir("ticked").exists());
+}
+
+/// A tick's flush checks for a migration marker before it pushes, with a
+/// listing of the marker's key (koto#548). When that listing fails on a
+/// session that carries no marker, the answer is unknown, not migrated: the
+/// tick succeeds with a warning and keeps its writes in its batch, and the
+/// next koto command on the session pushes them.
+#[test]
+fn a_failed_marker_listing_in_a_ticks_flush_keeps_the_batch_and_is_never_migrated() {
+    let s3 = FakeS3::start(BUCKET);
+    let root = tempfile::TempDir::new().unwrap();
+    let a = Host::new(root.path(), "a", &cloud(&s3));
+    start_session(&a, "live");
+    let session = session_prefix(&a, "live");
+    let marker = format!("{}migrated.json", session);
+    let batch_marker = format!("{}batch-open.json", session);
+    let state = format!("{}koto-live.state.jsonl", session);
+    let local_state = a.session_dir("live").join("koto-live.state.jsonl");
+    let before = s3.object(&state).expect("init pushed the state file");
+
+    // One failed call: rust-s3 retries once.
+    s3.fail_times("LIST", &marker, 500, 2);
+    let run = a.koto(&["next", "live"]);
+    assert!(run.ok(), "next: {}", run.describe());
+    assert!(
+        !run.stdout.contains("session_migrated") && !run.stderr.contains("session_migrated"),
+        "a failed listing read as a migration: {}",
+        run.describe()
+    );
+    assert!(
+        run.stderr
+            .contains("kept on this host and pushed by the next koto command"),
+        "the failed flush must warn: {}",
+        run.describe()
+    );
+    assert_eq!(s3.object(&state), Some(before), "the flush pushed anyway");
+    assert!(s3.keys_under(&session).contains(&batch_marker));
+
+    let run = a.koto(&["status", "live"]);
+    assert!(run.ok(), "status: {}", run.describe());
+    assert_eq!(
+        s3.object(&state),
+        Some(std::fs::read(&local_state).unwrap()),
+        "the next command must push the tick's writes"
+    );
+    assert!(!s3.keys_under(&session).contains(&batch_marker));
+    assert!(!s3.keys_under(&session).contains(&marker));
 }
 
 /// Staging directories an import left in `host`'s session store.
@@ -1497,10 +1547,20 @@ fn terminal_ticks_remove_a_source_and_keep_an_imported_copy() {
         "a write outside B's prefix: {:?}",
         writes
     );
+    // Each tick's batch deletes its own `batch-open.json` once it has
+    // pushed (koto#548); nothing else of the copy is deleted.
+    let batch_marker = format!("{}batch-open.json", target);
     assert!(
-        writes.iter().all(|(m, _)| m != "DELETE"),
+        writes
+            .iter()
+            .all(|(m, k)| m != "DELETE" || *k == batch_marker),
         "the copy's terminal tick deleted: {:?}",
         writes
+    );
+    assert!(
+        !s3.keys_under(&target).contains(&batch_marker),
+        "the copy's batch was left open: {:?}",
+        s3.keys_under(&target)
     );
 }
 
