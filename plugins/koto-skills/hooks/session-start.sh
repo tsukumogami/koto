@@ -17,7 +17,11 @@
 #      session's shell carries that session's `KOTO_ANCHOR`, and its parent's
 #      key must not mark it;
 #   4. runs `koto session anchor open` with those and `--record-authority`
-#      (see koto_clean for its environment), which records the authority
+#      against the store the agent session's shells use: the one the
+#      `KOTO_SESSION_*` configuration names, or koto's config files when
+#      none is set (see koto_clean). The watchers of step 6 inherit the same
+#      environment, so they write to the store the open used. The open
+#      records the authority
 #      the start was handed in `KOTO_AUTHORITY` in the anchor, or clears an
 #      earlier start's; the variable stays in that one call's environment,
 #      never on a command line. A koto from before the flag refuses it, and
@@ -63,19 +67,20 @@ KOTO_LIMIT=5
 
 # Runs koto the way every call in this hook runs it, the open and the
 # watchers alike: with no anchor variable, so nothing acts under an
-# inherited anchor; with no CLAUDE_CODE_SESSION_ID, so koto renders no
-# /workflows entry for the anchor; and with no KOTO_SESSION_* variable, so
-# the store is the one koto's config files name. The watchers must write to
-# the store the open created the anchor in, so they share this environment.
+# inherited anchor, and with no CLAUDE_CODE_SESSION_ID, so koto renders no
+# /workflows entry for the anchor. The KOTO_SESSION_* variables stay: they
+# are store configuration, the same the agent session's shells run koto
+# with, so the anchor lands in the store the session's own koto sessions
+# use (the one those variables name, or the one koto's config files name
+# when none is set). The watchers are started from this process and inherit
+# its whole environment, so they write to the store the open created the
+# anchor in.
 # The call is killed after KOTO_LIMIT seconds; its output is then whatever it
 # printed, which for an open is no valid `anchor=` line.
 koto_clean() {
-  local unsets=() v cmd dog status
-  for v in $(compgen -v KOTO_SESSION_); do
-    unsets+=(-u "$v")
-  done
+  local cmd dog status
   env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u CLAUDE_CODE_SESSION_ID \
-    "${unsets[@]}" koto "$@" &
+    koto "$@" &
   cmd=$!
   # A watchdog in plain shell: macOS has no `timeout` command. It checks
   # every second, so it outlives a koto that finishes by at most a second.

@@ -482,7 +482,7 @@ nothing clears what an earlier start was handed; when the anchor already
 records no authority (an empty list or no record), it writes nothing at all,
 so a start with no `KOTO_AUTHORITY` is a no-op for the anchor. The record is a
 local file write in the anchor, never a bucket call: the hook opens anchors
-with `KOTO_SESSION_*` dropped, and where the anchor is in the cloud store the
+in the store the session's shells use, and where that is the cloud store the
 record is a bare local file under the same rule as a local pin (R20a), never
 uploaded, which is enough because `unpin` reads it on the anchor's own host.
 Without the flag `open`
