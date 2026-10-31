@@ -86,7 +86,22 @@ template-derived string, and the docs an operator or agent reads.
 
 ### Step 3: Unblocking and edge cases clear or keep the blocked reading correctly
 
-A passing re-evaluation, an advance, a rewind or a re-entry without a new evaluation clears the blocked step and summary, two gates in one state name the last-evaluated one, and a session with no readable template still reads blocked through its status and summary.
+**Goal**: The blocked reading appears exactly when koto's own blocked predicate holds and goes away as soon as it stops holding: a passing re-evaluation, an advance, a rewind, or a re-entry without a new evaluation each clear the blocked step and the blocked summary; with two gates in one state the last-evaluated one decides and is the one named; a session whose compiled template can't be read still reads blocked through its top-level status, `koto.status` and summary; a target that can't be written never fails the commit; and a failed session with no current state never writes an empty state name. Steps 1 and 2 left the mapping in `active_step(status, blocked_gate, cancelled, state)` and `phase_detail(entry, active)` in `src/workflows_surface/materialize.rs`, with the blocked gate taken from `latest_epoch_gate` in `src/engine/persistence.rs` through `EnrichedProjection.blocked_gate` in `src/workflows_surface/project.rs`. `a_blocked_session_without_a_template_names_the_gate_in_its_summary` in `materialize.rs` already covers part of the no-template case. This step adds the tests the requirements name for these edges and fixes whatever they show wrong; it changes no file shape.
+
+**Acceptance Criteria**:
+
+- [ ] Starting from a gate-blocked write, four tests each assert the next write has no `workflow_agent` step with `blocked` `true` and no `blocked` in the `summary`: after a passing evaluation of the same gate; after an advance to the next state; after a rewind to an earlier state; and after leaving the state and re-entering it with no new gate evaluation, where the re-entered step also has no `error` field (AC8).
+- [ ] A test records two gates in one state: gate A fails, then gate B passes, and the write is not blocked; then B fails after A passes, and the active step's `error` reads `gate B: FAIL` naming B, and the summary ends `· blocked on gate B` (AC9).
+- [ ] A test drives a gate-blocked session whose compiled template can't be read and asserts top-level `status` `running`, `koto.status` `blocked`, a `summary` containing `blocked`, and no `workflowProgress` member (AC10).
+- [ ] A test publishes a target path that can't be written (an existing regular file where the directory should be), drives a session into a failing gate, and asserts the event append still succeeds and the session's state advanced as it would without rendering (AC19).
+- [ ] A failed session with no current state writes no `error` line ending in `at ` with an empty name: its active step, if any, reads a non-empty reason, and a test pins that.
+- [ ] `ac1_file_appears_with_current_state`, `ac2_file_updates_on_advance`, `start_time_is_stable_across_rewrites`, `native_gate_default_on_and_respects_explicit_optout`, `ac4_no_write_when_headless_and_unpublished`, and the `status` assertion in `terminal_renders_completed_with_phases` still pass with their assertions unchanged (AC11).
+
+**Check**: Run `cargo test workflows_surface` and `cargo test --test native_workflows_blocked_test`, and see the four unblocking tests, the two-gate test, the no-template test, the unwritable-target test and the empty-state test pass alongside the existing ones. Then run `cargo build && scripts/verify-native-workflows.sh` and see it exit 0 with `ALL CHECKS PASSED`.
+
+**Dependencies**: Step 2
+
+**Files**: `src/workflows_surface/materialize.rs`, `src/workflows_surface/project.rs`, `src/engine/persistence.rs`, `tests/native_workflows_blocked_test.rs`
 
 ### Step 4: Every template-derived string in the entry reaches the screen escaped
 
