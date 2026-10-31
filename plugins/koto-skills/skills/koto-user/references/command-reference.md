@@ -1201,7 +1201,9 @@ koto dashboard <name> --detail
 ```
 
 Prints one JSON object describing the named session and exits: the session
-facts (name, state, directive, anchors), every context key with its metadata
+facts (name, state, directive, anchors, and `machine`, the machine that
+produced it, which is `null` rather than absent when none is recorded),
+every context key with its metadata
 in lexicographic order, and a bounded content preview per key (`text` with a
 4 KiB excerpt and a `truncated` flag, `binary`/`not-local` with recorded size
 and hash only, `unreadable` with a reason, `invalid-name`). Read-only: no
@@ -1355,7 +1357,9 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `session.cloud.check_window_secs`, `workflows.native`, `retention.keep`, `retention.idle_period`, `retention.stale_after`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `session.cloud.check_window_secs`, `workflows.native`, `retention.keep`, `retention.idle_period`, `retention.stale_after`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`, `machine.name`.
+
+`machine.name` is the name this machine records on the sessions it creates, user config only (`--user`; a project `.koto/config.toml` can't set it). The name comes from `KOTO_MACHINE_NAME` when it's set and non-empty, else `machine.name`, else the short hostname. A name is 1 to 64 characters of `[A-Za-z0-9._-]` and never `unknown`: `koto config set --user machine.name` refuses anything else, and an invalid variable or hand-edited key is skipped with one stderr warning. Under the cloud backend the name is published to the bucket.
 
 The `retention.*` keys set how long finished session hierarchies are kept (see `koto session hierarchy`): `retention.keep` (default `7d`), `retention.idle_period` (default `7d`, after which an unobserved anchor closes) and `retention.stale_after` (default `30d`, after which an observed anchor is reported stale). Each takes a whole number followed by `s`, `m`, `h` or `d`, may be set in user or project config, and is overridden by `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER`. A malformed value, or a `stale_after` not longer than `keep`, is refused by the commands that judge retention, naming the setting; it never fails a tick, and the activity throttle falls back to the default. For example, `koto config set retention.keep 3d --user` keeps released hierarchies three days, and `KOTO_RETENTION_IDLE_PERIOD=12h koto session hierarchy work-on-12` judges one hierarchy with a shorter idle period.
 

@@ -90,7 +90,7 @@ This creates a session directory at `~/.koto/sessions/<name>/` and writes a stat
 
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
-Every new session's header carries an **origin record**, `origin`: the session's execution anchor (the canonical directory its commands run in) and the identity of the session store that holds it (`kind`, `local` or `cloud`, and the canonical sessions directory `base`). Session names are machine-wide, so the record is what tells two same-named sessions from different worktrees or stores apart. `koto session rebind` moves the record's anchor along with the session. Sessions created before this field existed have none, and nothing backfills it.
+Every new session's header carries an **origin record**, `origin`: the session's execution anchor (the canonical directory its commands run in) and the identity of the session store that holds it (`kind`, `local` or `cloud`, and the canonical sessions directory `base`). Session names are machine-wide, so the record is what tells two same-named sessions from different worktrees or stores apart. `koto session rebind` moves the record's anchor along with the session. Sessions created before this field existed have none, and nothing backfills it. The machine that created the session is recorded on its `workflow_initialized` event, not in the header; see `machine.name` under [Config keys reference](#config-keys-reference) for where the name comes from.
 
 #### Command environment
 
@@ -1356,6 +1356,7 @@ koto config list --json
 | `decider.api_key` | Decider API key | -- | no |
 | `decider.endpoint` | `https` URL of the decision call (plain `http` only for loopback) | `"https://api.typesafe.ai/v1/systemone"` | no |
 | `decider.timeout_ms` | Integer, 1 to 10000 | `2000` | no |
+| `machine.name` | Machine name, 1 to 64 characters of `[A-Za-z0-9._-]`, not `unknown` | short hostname | no (user config only) |
 
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
 
@@ -1368,6 +1369,13 @@ koto config set --user retention.keep 3d        # keep released hierarchies thre
 koto config set retention.idle_period 12h       # this project: unobserved anchors close after 12 hours
 KOTO_RETENTION_STALE_AFTER=60d koto session prune   # one preview with a longer stale threshold
 koto config list | grep retention                # each value with its origin
+```
+
+The `machine.name` key names this machine on the sessions it creates. Every new session records a machine name on its `workflow_initialized` event, chosen in this order: `KOTO_MACHINE_NAME` when it's set and non-empty, then `machine.name` from the user-level config file, then the hostname up to its first `.`, with every character outside `[A-Za-z0-9._-]` replaced by `-`, cut to 64 characters, and `unknown` turned into `unknown-host`. A name is 1 to 64 characters of `[A-Za-z0-9._-]` and is never `unknown`, which is reserved for sessions that record no machine. An empty value counts as unset. A non-empty `KOTO_MACHINE_NAME` or `machine.name` that breaks the rule is skipped for the next source, with one warning on stderr per command naming the variable or key (never the value), and the command goes on. `koto config set --user machine.name` refuses a name that breaks the rule and leaves the file as it was. The key is user-level only: `koto config set machine.name` without `--user` is refused, and a `[machine] name` in a project's `.koto/config.toml` is never read. `koto config get machine.name` and `koto config unset --user machine.name` read and edit the user-level file. A session imported with `koto session import` takes the importing machine's name. Under the cloud backend the name is published to the bucket with each session's summary, so every machine sharing the bucket sees it.
+
+```bash
+koto config set --user machine.name build-01   # name this machine
+KOTO_MACHINE_NAME=ci-runner koto init wf --template work.md   # one command, another name
 ```
 
 `workflows.native` controls rendering koto sessions in Claude Code's `/workflows` screen (see [native-workflows-verification.md](native-workflows-verification.md)); it is on by default and a participating session self-discovers its target directory from `CLAUDE_CODE_SESSION_ID`. Set it to `false` to opt out. A fully headless run (no Claude Code environment) renders nothing regardless.

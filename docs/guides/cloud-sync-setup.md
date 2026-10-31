@@ -438,8 +438,19 @@ Context keys are compared one at a time when they're read. When this host's copy
 | `session.cloud.check_window_secs` | `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` | Seconds this host's koto processes share one check of a session outside a tick; `0` turns the sharing off. Another host's write can go unseen for up to this long (see [What a read costs](#what-a-read-costs)) | `5` | No (user/env only: a cloned repository's config can't widen it) |
 | `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
+| `machine.name` | `KOTO_MACHINE_NAME` | The name this machine records on the sessions it creates and publishes to the bucket (see [The machine name](#the-machine-name)) | short hostname | No (user/env only) |
 
-Precedence for each setting: its variable, then project config, then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config.
+Precedence for each setting: its variable, then project config, then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config. `machine.name` has no project level: its variable, then user config, then the hostname.
+
+### The machine name
+
+Every session records the name of the machine that created it, and under the cloud backend that name is published to the bucket with the session's summary, so `koto dashboard` on every machine sharing the bucket shows where each session came from. By default the name is the short hostname: the part before the first `.`, with every character outside `[A-Za-z0-9._-]` replaced by `-` and cut to 64 characters, so a host called `my host_01.example.com` publishes `my-host_01`. If you'd rather not publish the hostname, or several machines share one, set another name:
+
+```bash
+koto config set --user machine.name laptop-01
+```
+
+or set `KOTO_MACHINE_NAME` for one command or shell, which wins over the config key. A name is 1 to 64 characters of `[A-Za-z0-9._-]` and is never `unknown`. `koto config set` refuses anything else; an invalid `KOTO_MACHINE_NAME`, or an invalid `machine.name` edited into the file by hand, is skipped with one warning on stderr and the next source is used. A project's `.koto/config.toml` can't set it. The name is recorded when a session is created, so changing it doesn't rename sessions that already exist; a session brought over with `koto session import` takes the importing machine's name.
 
 ## Supported providers
 
