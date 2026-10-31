@@ -3134,14 +3134,17 @@ bucket's top-level listing fails every other machine's row stays; one status lin
 
 ### When the Bucket Fails
 
-Every bucket request the dashboard makes gives up after 10 seconds, and every failure
-it meets falls in one of four classes:
+Every request the dashboard's read of other machines' sessions makes gives up after
+10 seconds, and every failure it meets falls in one of four classes. The bound covers
+that read's listings and GETs only; the Session tab's reads of a local row go through
+the session backend without it. The dashboard also turns off the HTTP client's own
+retry for the whole process, so those reads are asked once as well.
 
 | Class | What the bucket did |
 |-------|---------------------|
 | `unreachable` | The connection was refused or the host didn't resolve, or the answer wasn't a usable reply: an HTTP 5xx other than 503, or a body that isn't the listing asked for. |
 | `denied` | Answered HTTP 401 or 403. |
-| `timeout` | Gave no answer within the 10 seconds. |
+| `timeout` | Gave no answer within the 10 seconds. A connection that ends without an answer once the 10 seconds have passed, such as a TLS handshake that stalled, is a timeout too. |
 | `throttled` | Answered HTTP 429 or 503, and kept doing so through koto's usual retries. |
 
 An HTTP 500 and a reply koto can't parse are `unreachable`: the endpoint was reached,
