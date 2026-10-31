@@ -165,7 +165,7 @@ conventions. Each convention has a name (`file shape`, `directory convention`,
 probes, and one demonstration mutation. A probe is
 `{item, anchor, token, window}`: the guard finds every occurrence of `anchor`
 in the release bytes and passes the probe when `token` appears within `window`
-bytes of at least one of them. An `anchor` of `null` means the token must
+bytes on either side of at least one of them. An `anchor` of `null` means the token must
 appear anywhere, which the guard allows only for tokens distinctive enough to
 mean something alone, such as `CLAUDE_CODE_SESSION_ID`. Anchors are string
 literals or stable object keys, never minified identifiers, which change every
@@ -185,8 +185,8 @@ file and exit status 3.
 
 R8 is met offline: a cargo test, `tests/native_workflows_conventions.rs`,
 walks `tests/fixtures/native-workflows/enriched-shape.json`, collects every key
-outside the `koto` block and every `type` value, and fails naming any that no
-file-shape probe lists as its `item`. Keys inside `koto` are skipped because
+outside the `koto` block (the `type` key included) and every `type` value,
+and fails naming any that no file-shape probe lists as its `item`. Keys inside `koto` are skipped because
 Claude Code doesn't read them. The same test checks the recorded-release file
 parses as a version.
 
@@ -234,13 +234,18 @@ Key assumptions:
   file. These runs check the recorded release.
 - `schedule`, weekly (Mondays 06:00 UTC), checking the newest release npm
   reports for `@anthropic-ai/claude-code`.
-- `workflow_dispatch` with a `version` input (default empty, meaning the
-  recorded release; `latest` meaning the newest).
+- `workflow_dispatch` with a `version` input (default empty, which the job
+  maps to omitting `--version` and so checks the recorded release; `latest`
+  meaning the newest). The input reaches the script only as `--version`,
+  through an environment variable; `--evidence` and `--alter` are never fed
+  from a dispatch input.
 
-The job declares `permissions: contents: read`, references no secret, caches
-the downloaded tarball (never the extracted tree) under a key naming the
-resolved version, checks it against the registry's integrity value before
-extracting, and runs
+The job declares `permissions: contents: read`, references no secret, pins
+its actions the way the repository's other workflows do, and caches the
+guard's `--cache-dir` (which holds only downloaded tarballs, never extracted
+trees) under a key naming the resolved version. The guard checks a cached
+tarball against the registry's integrity value before extracting it. The job
+runs
 `--self-test` before the real check so a broken guard can't pass silently. The
 offline coverage test needs no new job: validate.yml's unit-test job already
 runs every cargo test.
@@ -351,16 +356,19 @@ Key assumptions:
 The script gains a `json_escape` function, covering backslash, double quote
 and every control character below U+0020, applied to the context before the
 `printf` fallback interpolates it. The no-`jq` `read_field` matches a JSON
-string that may contain escapes, `"<name>"\s*:\s*"(([^"\\]|\\.)*)"`, and
+string that may contain escapes, `"<name>"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"`, and
 decodes `\"`, `\\` and `\/` in one pass; a value holding any other escape
-(`\n`, `\t`, `\u....`) is refused, which leaves the field empty. The
+(`\n`, `\t`, `\u....`) is refused, and a refused `session_id`,
+`transcript_path` or `cwd` makes the hook print nothing rather than fall back
+to another field, since a fallback would name a directory Claude Code doesn't
+use. The
 derivation rule doesn't change: the directory is
 `<dirname of transcript_path>/<session_id>/workflows`, or
 `<cwd>/<session_id>/workflows` when `transcript_path` is absent or empty, and
 no `session_id` (including stdin that isn't JSON) prints nothing and exits 0.
 Three input rules are new: a `session_id` that doesn't match `[A-Za-z0-9_-]+`
 counts as absent, so it can't add path components; a control character in the
-derived directory makes the hook print nothing; and the `export` line the
+derived directory (below U+0020, or DEL) makes the hook print nothing; and the `export` line the
 context asks the agent to run quotes the directory for the shell (single
 quotes, with an embedded `'` written `'\''`), because JSON escaping alone would
 let a directory named with `$(...)` or a backtick run a command. The context's
@@ -373,12 +381,12 @@ runs a fixed payload matrix twice: once with the normal `PATH` (and asserts
 script needs. The payloads: a plain `session_id` and `transcript_path`; a
 `transcript_path` whose directory contains `"`, `\` and a space; one whose
 directory contains `$(`, a backtick and `'`; an empty `transcript_path` with
-`cwd`; no `session_id`; a `session_id` containing `/`; and stdin that isn't
-JSON. For the first four it parses the output with `jq` from the test's own
+`cwd`; no `session_id`; a `session_id` containing `/`; a directory holding a
+DEL character; and stdin that isn't JSON. For the first four it parses the output with `jq` from the test's own
 `PATH`, checks `hookSpecificOutput.additionalContext` contains the derived
 directory byte for byte, and checks that evaluating the export line in a
 subshell sets `KOTO_WORKFLOWS_DIR` to exactly that directory without running
-anything else; for the last three it checks the output is empty and the status
+anything else; for the last four it checks the output is empty and the status
 is 0. validate-plugins.yml's `hook-smoke-test` job runs it as a new step.
 
 #### Alternatives Considered
@@ -495,6 +503,7 @@ input fields the script reads.
   {
     "schema": 1,
     "package": "@anthropic-ai/claude-code-linux-x64",
+    "member": "<path of the executable inside the tarball, set in Phase 2>",
     "conventions": [
       {
         "name": "file shape",
@@ -515,12 +524,18 @@ input fields the script reads.
   `CLAUDE_CODE_SESSION_ID` with no anchor; the hook input probes `session_id`,
   `transcript_path` and `cwd` near the hook input schema and
   `hook_event_name:C("SessionStart")`. Anchors and windows are calibrated
-  against the recorded release when the file is written.
+  against the recorded release when the file is written, and `member` names
+  the one tarball entry the guard extracts.
 - **Guard script** — `scripts/check-claude-code-conventions.sh`, Bash. Parses
-  `--version <v|latest>`, `--evidence <file>` (use a local file instead of
-  downloading, for offline work), `--alter <slug>` and `--self-test`; resolves
-  the version; fetches and extracts; calls the helper; maps its result to the
-  exit statuses above.
+  `--version <v|latest>`, `--evidence <file>` (scan a local executable instead
+  of downloading, for offline work; it replaces `--version`), `--cache-dir
+  <dir>` (where downloaded tarballs are kept, default a fresh temporary
+  directory), `--alter <slug>` (combines with either source) and
+  `--self-test` (takes no other flag); resolves the version; reads the
+  registry's `dist.integrity` for it with `npm view`; reuses a tarball in the
+  cache directory only when its sha512 matches, else fetches one with `npm
+  pack --ignore-scripts`; extracts `member` with a size cap enforced while
+  streaming; calls the helper; maps its result to the exit statuses below.
 - **Probe helper** — `scripts/claude_code_conventions.py`, run as
   `python3 -I`, reads the evidence with `mmap` and only ever searches it.
 - **Coverage test** — `tests/native_workflows_conventions.rs`, offline, run by
@@ -544,7 +559,8 @@ Guard command line and exit statuses:
 | `check-claude-code-conventions.sh` | recorded release | 0 pass, 1 convention failure |
 | `--version 2.1.320` / `--version latest` | named / newest release | same |
 | `--alter file-shape` (or `directory`, `session-variable`, `hook-input`) | recorded release with that convention's demo mutation | 1, naming the convention |
-| `--self-test` | synthetic evidence, no network | 0 when the guard catches every mutation |
+| `--evidence <file>` (with or without `--alter`) | a local executable, no network | as for a release |
+| `--self-test` | synthetic evidence, no network | 0 when the guard catches every mutation, 1 when it misses one |
 | unpublished version, registry or network failure | — | 2, `could not obtain` |
 | missing or malformed release or expectations file | — | 3, naming the file |
 
@@ -585,6 +601,9 @@ and closes koto#243.
 
 ### Phase 2: The convention guard and its expectations
 
+The first step is to confirm that the Linux x64 package's bundle carries the
+same literals as the macOS build this design inspected; if it doesn't, the
+package name in the expectations file changes before any probe is written.
 Deliverables: `tests/fixtures/native-workflows/claude-code-release`,
 `tests/fixtures/native-workflows/claude-code-conventions.json` calibrated
 against 2.1.316, `scripts/check-claude-code-conventions.sh`,
@@ -594,7 +613,7 @@ The pull request includes the output of the four `--alter` runs, a
 
 ### Phase 3: The CI workflow
 
-Depends on Phase 2. Deliverable: `.github/workflows/claude-code-conventions.yml`
+Depends on Phase 2; can run alongside Phase 4. Deliverable: `.github/workflows/claude-code-conventions.yml`
 with the four triggers, the version-keyed cache, `--self-test` before the real
 check, and `permissions: contents: read`.
 
@@ -650,8 +669,8 @@ through an environment variable, never interpolated into a command line.
 `npm pack` runs in a fresh directory outside the checkout, with install
 scripts disabled and no credentials. The guard extracts only the expected
 executable, by exact member name, refuses absolute paths, `..` components and
-link members, and checks the result is a regular file of plausible size. The
-job has a timeout, so an oversized archive can't hold a runner.
+link members, and caps the extracted size while streaming, so a compressed bomb stops at
+the cap rather than at the disk. The job also has a timeout.
 
 ### Workflow permissions and cache integrity
 
@@ -682,7 +701,12 @@ shell-quoted there as well as JSON-escaped in the envelope; JSON escaping alone
 would let a directory named with `$(...)` or a backtick run a command. The
 no-`jq` reader decodes the escapes it supports in one pass and refuses any
 other. The test matrix covers `$(`, backtick and single-quote paths besides
-quote, backslash and space, and checks both the envelope and the export line.
+quote, backslash and space, and a directory holding a DEL character, and
+checks both the envelope and the export line. One residual stays: the
+directory also appears in the context's plain sentence, so printable text in a
+directory name reaches the agent as text. The sentence labels it as a path,
+and the risk is low because the same agent already sees the working
+directory.
 
 ### The rendered smoke check
 
