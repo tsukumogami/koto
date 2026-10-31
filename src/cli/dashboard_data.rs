@@ -218,7 +218,8 @@ pub struct CachedSession {
 
 /// Hierarchical view of all sessions visible to the dashboard.
 pub struct SessionTree {
-    /// All sessions indexed by session name.
+    /// All sessions indexed by row key: the session name for a local row,
+    /// `name@workspace` for a remote one ([`remote_key`]).
     pub sessions: HashMap<String, CachedSession>,
     /// Names of root sessions (those with no parent, or whose parent is absent).
     pub roots: Vec<String>,
@@ -340,12 +341,13 @@ pub fn stat_and_diff(tree: &SessionTree, session_paths: &[(String, PathBuf)]) ->
         .map(|(name, path)| (name.as_str(), path))
         .collect();
 
-    // Find removes: in tree but not in scan.
+    // Find removes: in tree but not in scan. Remote rows never come from
+    // the local scan; the feed replaces them whole.
     let removes: Vec<String> = tree
         .sessions
-        .keys()
-        .filter(|name| !scan_set.contains_key(name.as_str()))
-        .cloned()
+        .iter()
+        .filter(|(name, s)| !s.remote && !scan_set.contains_key(name.as_str()))
+        .map(|(name, _)| name.clone())
         .collect();
 
     // Find adds and changed.
@@ -605,16 +607,80 @@ fn make_empty_header() -> StateFileHeader {
     }
 }
 
+/// The row key of a remote row: `name@workspace`. Session names allow only
+/// `[a-zA-Z0-9._-]` and `~`, so the key can't collide with a local row's,
+/// which is the bare name.
+pub fn remote_key(name: &str, workspace: &str) -> String {
+    format!("{name}@{workspace}")
+}
+
+/// The session name behind row key `key`.
+pub fn row_name<'a>(key: &'a str, session: &CachedSession) -> &'a str {
+    if session.remote {
+        key.split_once('@').map_or(key, |(name, _)| name)
+    } else {
+        key
+    }
+}
+
+/// The row key of the parent `session` nests under, in the same location:
+/// a remote row's parent is the remote row of that name in its own
+/// workspace, never a same-named local one. `None` when it records no
+/// parent.
+pub fn parent_key(session: &CachedSession) -> Option<String> {
+    let parent = session.header.parent_workflow.as_deref()?;
+    Some(if session.remote {
+        remote_key(parent, session.workspace.as_deref().unwrap_or(""))
+    } else {
+        parent.to_string()
+    })
+}
+
+/// The `session_id`s of the tree's local rows, which a remote scan leaves
+/// to them.
+pub fn local_session_ids(tree: &SessionTree) -> std::collections::HashSet<String> {
+    tree.sessions
+        .values()
+        .filter(|s| !s.remote && !s.header.session_id.is_empty())
+        .map(|s| s.header.session_id.clone())
+        .collect()
+}
+
+/// Drop each remote row whose session this machine now holds a copy of,
+/// so the session shows once, as its local row. Returns whether any went.
+fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
+    let local = local_session_ids(tree);
+    let before = tree.sessions.len();
+    tree.sessions
+        .retain(|_, s| !s.remote || !local.contains(&s.header.session_id));
+    tree.sessions.len() != before
+}
+
+/// Replace the tree's remote rows with those of `rows`, a complete feed
+/// snapshot, keyed by [`remote_key`]. A session this machine holds a copy
+/// of stays its local row.
+pub fn replace_remote_rows(tree: &mut SessionTree, rows: &[crate::session::remote_feed::RemoteRow]) {
+    tree.sessions.retain(|_, s| !s.remote);
+    for row in rows {
+        tree.sessions.insert(
+            remote_key(&row.summary.name, &row.workspace),
+            remote_session(row),
+        );
+    }
+    drop_shadowed_remote(tree);
+    tree.roots = rebuild_roots(&tree.sessions);
+}
+
 /// Rebuild the `roots` Vec from the current session map.
 ///
-/// A session is a root if it has no `parent_workflow` set, or if its
-/// `parent_workflow` is not present in the current session map.
+/// A session is a root if it has no parent, or if its parent's row key
+/// ([`parent_key`]) is not present in the current session map.
 fn rebuild_roots(sessions: &HashMap<String, CachedSession>) -> Vec<String> {
     let mut roots: Vec<String> = sessions
         .iter()
-        .filter(|(_, cached)| match &cached.header.parent_workflow {
+        .filter(|(_, cached)| match parent_key(cached) {
             None => true,
-            Some(parent) => !sessions.contains_key(parent),
+            Some(parent) => !sessions.contains_key(&parent),
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -649,9 +715,12 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
         tree.sessions.insert(name.clone(), cached);
     }
 
+    // A session that now has a local copy leaves its remote row.
+    let shadowed = drop_shadowed_remote(tree);
+
     // Rebuild roots whenever the session set changed (adds or removes).
     // Also rebuild if any mtime-changed session could have had its parent change.
-    if session_set_changed || !diff.changed.is_empty() {
+    if session_set_changed || shadowed || !diff.changed.is_empty() {
         tree.roots = rebuild_roots(&tree.sessions);
     }
 

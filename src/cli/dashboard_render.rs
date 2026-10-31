@@ -8,6 +8,10 @@
 //! - width < 40: "terminal too narrow" message
 //! - width < 80: list-only (full width)
 //! - width >= 80: horizontal split — 40% list / 60% detail
+//!
+//! A narrow list keeps the Name column at least [`NAME_MIN`] wide by
+//! dropping the Children column, then the State column, so a remote row's
+//! `@<machine>` marker stays readable at 80 columns.
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,7 +22,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::cli::dashboard_data::{DetailData, Liveness, SessionTree};
+use crate::cli::dashboard_data::{row_name, CachedSession, DetailData, Liveness, SessionTree};
 use crate::cli::dashboard_state::{
     DashboardAppState, DashboardTab, Membership, SessionTabState, TaskCounts,
 };
@@ -29,6 +33,133 @@ use crate::session_view::{
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
+
+/// The narrowest the Name column gets while a fixed column can still be
+/// dropped to widen it.
+const NAME_MIN: u16 = 14;
+
+/// The characters of a machine name a remote row's marker always keeps.
+const MARKER_MACHINE_MIN: usize = 8;
+
+/// Columns of the label a cut marker leaves room for, when the label has
+/// that many.
+const LABEL_MIN: usize = 4;
+
+/// Ends a label or a machine name that was cut to fit.
+const ELLIPSIS: char = '\u{2026}';
+
+/// The fixed list columns after Name, with their widths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListColumn {
+    State,
+    Idle,
+    Children,
+}
+
+impl ListColumn {
+    fn width(self) -> u16 {
+        match self {
+            ListColumn::State => 12,
+            ListColumn::Idle => 9,
+            ListColumn::Children => 10,
+        }
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            ListColumn::State => "State",
+            ListColumn::Idle => "Idle",
+            // `Children`, not `Tasks`: the count below it is derived from
+            // parent-workflow parentage and never from the batch view, so the
+            // old name implied batch semantics it never had
+            // (DESIGN-request-lifecycle.md Decision 7).
+            ListColumn::Children => "Children",
+        }
+    }
+}
+
+/// The Name column's width and the fixed columns kept for a table `inner`
+/// columns wide. Children goes first, then State, until Name is at least
+/// [`NAME_MIN`] wide; Idle (the liveness glyph) always stays.
+fn list_columns(inner: u16) -> (u16, &'static [ListColumn]) {
+    use ListColumn::*;
+    const SETS: [&[ListColumn]; 3] = [&[State, Idle, Children], &[State, Idle], &[Idle]];
+    let name_width = |set: &[ListColumn]| {
+        // One column of spacing before each fixed column.
+        let fixed: u16 = set.iter().map(|c| c.width() + 1).sum();
+        inner.saturating_sub(fixed)
+    };
+    for set in SETS {
+        if name_width(set) >= NAME_MIN {
+            return (name_width(set), set);
+        }
+    }
+    (name_width(SETS[2]), SETS[2])
+}
+
+/// Columns `s` takes on the terminal.
+fn str_cols(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Columns `c` takes on the terminal.
+fn char_cols(c: char) -> usize {
+    let mut buf = [0u8; 4];
+    str_cols(c.encode_utf8(&mut buf))
+}
+
+/// `s` cut to at most `width` columns, ending in [`ELLIPSIS`] when cut.
+fn clip_cols(s: &str, width: usize) -> String {
+    if str_cols(s) <= width {
+        return s.to_string();
+    }
+    let budget = width.saturating_sub(char_cols(ELLIPSIS));
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        used += char_cols(c);
+        if used > budget {
+            break;
+        }
+        out.push(c);
+    }
+    if width > 0 {
+        out.push(ELLIPSIS);
+    }
+    out
+}
+
+/// A row's name cell, `width` columns at most. `prefix` is the connector,
+/// label and badge; `marker` is a remote row's `@<machine>`. The marker
+/// wins: the label is cut first, and the marker keeps `@` and at least
+/// [`MARKER_MACHINE_MIN`] characters of the machine. A local row (no
+/// marker) is left whole for the table to clip, as before.
+fn fit_name_cell(prefix: &str, marker: Option<&str>, width: usize) -> String {
+    let Some(marker) = marker else {
+        return prefix.to_string();
+    };
+    let full = format!("{prefix} {marker}");
+    if str_cols(&full) <= width {
+        return full;
+    }
+    let label_room = LABEL_MIN.min(str_cols(prefix));
+    let marker_cols = str_cols(marker);
+    // The marker whole, with room for a space and a cut label.
+    if width >= marker_cols + 1 + label_room {
+        let label = clip_cols(prefix, width - marker_cols - 1);
+        return format!("{label} {marker}");
+    }
+    // The marker cut too, never below `@` and its minimum characters.
+    let keep: String = marker.chars().take(1 + MARKER_MACHINE_MIN).collect();
+    let min_cols = str_cols(&keep) + char_cols(ELLIPSIS);
+    let marker_room = width.saturating_sub(1 + label_room).max(min_cols);
+    let marker = clip_cols(marker, marker_room);
+    let label_cols = width.saturating_sub(str_cols(&marker) + 1);
+    if label_cols == 0 {
+        return marker;
+    }
+    format!("{} {marker}", clip_cols(prefix, label_cols))
+}
 
 /// Glyph prefix for a liveness band, shown ahead of the idle time.
 fn liveness_glyph(liveness: Liveness) -> &'static str {
@@ -96,19 +227,24 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
     );
 }
 
+/// The `@<machine>` a remote row is marked with; `None` for a local row.
+fn remote_marker(session: &CachedSession) -> Option<String> {
+    session
+        .remote
+        .then(|| format!("@{}", session.machine.as_deref().unwrap_or("unknown")))
+}
+
 /// Render the session list as a 4-column table with cursor highlighting and scrollbar.
 fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layout::Rect) {
     let rows_data = state.visible_rows();
 
-    // Reserve 1 column for border and 1 for scrollbar on the right (2 total overhead).
-    // Column widths: State=12, Idle=9, Children=10, plus separators.
-    // Name fills the remaining space via Constraint::Min(0).
-    let widths: Vec<Constraint> = vec![
-        Constraint::Min(0),
-        Constraint::Length(12),
-        Constraint::Length(9),
-        Constraint::Length(10),
-    ];
+    // The block's borders take 2 columns (the scrollbar draws over the
+    // right one). Name takes what the fixed columns leave, never less than
+    // NAME_MIN while one of them can still be dropped.
+    let (name_width, columns) = list_columns(area.width.saturating_sub(2));
+    let widths: Vec<Constraint> = std::iter::once(Constraint::Length(name_width))
+        .chain(columns.iter().map(|c| Constraint::Length(c.width())))
+        .collect();
 
     let mut rows: Vec<Row> = Vec::new();
 
@@ -128,30 +264,27 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     }
 
     for row in &rows_data {
-        let name_cell = format!(
+        let prefix = format!(
             "{}{}{}",
             row.connector,
             row.display_name,
             membership_badge(row.membership)
         );
+        let name_cell = fit_name_cell(&prefix, row.marker.as_deref(), name_width as usize);
 
-        let state_cell = row.state.as_deref().unwrap_or("-").to_string();
-        let elapsed_cell = format!(
-            "{} {}",
-            liveness_glyph(row.liveness),
-            format_duration(row.elapsed)
-        );
-        let tasks_cell = format_task_counts(row.task_counts.as_ref());
-
-        rows.push(
-            Row::new(vec![
-                Cell::from(name_cell),
-                Cell::from(state_cell),
-                Cell::from(elapsed_cell),
-                Cell::from(tasks_cell),
-            ])
-            .style(liveness_style(row.liveness)),
-        );
+        let mut cells = vec![Cell::from(name_cell)];
+        for column in columns {
+            cells.push(Cell::from(match column {
+                ListColumn::State => row.state.as_deref().unwrap_or("-").to_string(),
+                ListColumn::Idle => format!(
+                    "{} {}",
+                    liveness_glyph(row.liveness),
+                    format_duration(row.elapsed)
+                ),
+                ListColumn::Children => format_task_counts(row.task_counts.as_ref()),
+            }));
+        }
+        rows.push(Row::new(cells).style(liveness_style(row.liveness)));
     }
 
     // Trailing collapsed summary for the receded set (hidden by default).
@@ -175,16 +308,12 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
 
     let row_count = rows.len();
 
-    let header = Row::new(vec![
-        Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("State").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Idle").style(Style::default().add_modifier(Modifier::BOLD)),
-        // `Children`, not `Tasks`: the count below it is derived from
-        // parent-workflow parentage and never from the batch view, so the
-        // old name implied batch semantics it never had
-        // (DESIGN-request-lifecycle.md Decision 7).
-        Cell::from("Children").style(Style::default().add_modifier(Modifier::BOLD)),
-    ]);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let header = Row::new(
+        std::iter::once(Cell::from("Name").style(bold))
+            .chain(columns.iter().map(|c| Cell::from(c.header()).style(bold)))
+            .collect::<Vec<_>>(),
+    );
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -225,9 +354,15 @@ fn render_detail(
     session_tab: &SessionTabState,
     area: ratatui::layout::Rect,
 ) {
-    let title = match session_name {
-        Some(name) => format!(" {} ", name),
-        None => " session ".to_string(),
+    let focused = session_name.and_then(|key| tree.sessions.get(key));
+    let remote = focused.filter(|s| s.remote);
+    let title = match (session_name, focused) {
+        (Some(key), Some(s)) => match remote_marker(s) {
+            Some(marker) => format!(" {} {marker} ", row_name(key, s)),
+            None => format!(" {key} "),
+        },
+        (Some(key), None) => format!(" {key} "),
+        (None, _) => " session ".to_string(),
     };
 
     let outer_block = Block::default().borders(Borders::ALL).title(title);
@@ -255,13 +390,79 @@ fn render_detail(
         );
     f.render_widget(tabs, chunks[0]);
 
-    // Tab content.
+    // Tab content. A remote row's detail lives on its own machine: only
+    // the Session tab has facts for it, from its summary.
+    if let (Some(key), Some(s)) = (session_name, remote) {
+        match active_tab {
+            DashboardTab::Session => render_remote_session_tab(f, key, s, chunks[1]),
+            _ => f.render_widget(
+                Paragraph::new(remote_detail_line(s)).wrap(Wrap { trim: false }),
+                chunks[1],
+            ),
+        }
+        return;
+    }
     match active_tab {
         DashboardTab::Summary => render_summary_tab(f, detail, session_name, tree, chunks[1]),
         DashboardTab::History => render_history_tab(f, detail, chunks[1]),
         DashboardTab::Remaining => render_remaining_tab(f, detail, chunks[1]),
-        DashboardTab::Session => render_session_tab(f, session_tab, session_name, chunks[1]),
+        DashboardTab::Session => {
+            let machine = focused.and_then(|s| s.machine.as_deref());
+            render_session_tab(f, session_tab, session_name, machine, chunks[1])
+        }
     }
+}
+
+/// The one line the Summary, History and Remaining tabs show for a remote
+/// row.
+fn remote_detail_line(session: &CachedSession) -> String {
+    format!(
+        "This session's detail lives on its own machine, {}.",
+        session.machine.as_deref().unwrap_or("unknown")
+    )
+}
+
+/// The longest a remote fact is shown, in characters.
+const REMOTE_FACT_CAP: usize = 256;
+
+/// The Session tab for a remote row: the machine and workspace it lives
+/// on, then the facts its summary carries. No context key is listed: the
+/// keys live on that machine.
+fn render_remote_session_tab(
+    f: &mut Frame<'_>,
+    key: &str,
+    session: &CachedSession,
+    area: ratatui::layout::Rect,
+) {
+    use crate::session_view::sanitize_capped;
+    let width = area.width as usize;
+    let fact = |v: Option<&str>| {
+        v.filter(|v| !v.is_empty())
+            .map(|v| sanitize_capped(v, REMOTE_FACT_CAP).to_string())
+            .unwrap_or_else(|| ABSENT.to_string())
+    };
+    let facts = [
+        ("Machine", session.machine.as_deref().unwrap_or("unknown").to_string()),
+        ("Workspace", fact(session.workspace.as_deref())),
+        ("Session", fact(Some(row_name(key, session)))),
+        ("State", fact(session.current_state.as_deref())),
+        ("Intent", fact(session.intent.as_deref())),
+        ("Template", fact(session.header.template_name.as_deref())),
+        ("Session id", fact(Some(session.header.session_id.as_str()))),
+        ("Created", fact(Some(session.header.created_at.as_str()))),
+    ];
+    let mut rows: Vec<String> = facts
+        .iter()
+        .flat_map(|(label, value)| wrap_fact(label, value, width))
+        .collect();
+    rows.push(String::new());
+    rows.push(clip("Context keys and history live on that machine.", width));
+    f.render_widget(
+        Paragraph::new(Text::from(
+            rows.into_iter().map(Line::from).collect::<Vec<_>>(),
+        )),
+        area,
+    );
 }
 
 /// Render the Summary tab content.
@@ -557,8 +758,10 @@ fn wrap_fact(label: &str, value: &str, width: usize) -> Vec<String> {
 }
 
 /// One `Label: value` entry per fact, `Label: -` for each the session does
-/// not record. A directive follows behind the gutter.
-fn fact_rows(facts: &SessionFacts, width: usize) -> Vec<String> {
+/// not record. A directive follows behind the gutter. `machine` is the
+/// machine the session's events record; a session from before koto
+/// recorded one reads `unknown`.
+fn fact_rows(facts: &SessionFacts, machine: Option<&str>, width: usize) -> Vec<String> {
     let one = |label: &str, value: Option<&Sanitized>| {
         wrap_fact(label, value.map(|v| v.as_str()).unwrap_or(ABSENT), width)
     };
@@ -589,6 +792,7 @@ fn fact_rows(facts: &SessionFacts, width: usize) -> Vec<String> {
         facts.created_at.as_deref().unwrap_or(ABSENT),
         width,
     ));
+    rows.extend(wrap_fact("Machine", machine.unwrap_or("unknown"), width));
     rows
 }
 
@@ -621,6 +825,7 @@ fn render_session_tab(
     f: &mut Frame<'_>,
     tab: &SessionTabState,
     session_name: Option<&str>,
+    machine: Option<&str>,
     area: ratatui::layout::Rect,
 ) {
     let loaded = session_name.is_some() && tab.loaded_session() == session_name;
@@ -634,7 +839,7 @@ fn render_session_tab(
         return;
     }
     match &tab.snapshot {
-        Some(Ok(snap)) => render_snapshot(f, tab, snap, area),
+        Some(Ok(snap)) => render_snapshot(f, tab, snap, machine, area),
         Some(Err(reason)) => {
             let msg = format!("Session view unavailable: {reason}");
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), area);
@@ -647,9 +852,10 @@ fn render_snapshot(
     f: &mut Frame<'_>,
     tab: &SessionTabState,
     snap: &SessionViewSnapshot,
+    machine: Option<&str>,
     area: ratatui::layout::Rect,
 ) {
-    let facts = fact_rows(&snap.facts, area.width as usize);
+    let facts = fact_rows(&snap.facts, machine, area.width as usize);
     let facts_height = (facts.len() as u16).min(area.height);
     let facts_widget = Paragraph::new(Text::from(
         facts.into_iter().map(Line::from).collect::<Vec<_>>(),
@@ -2445,5 +2651,310 @@ mod tests {
         assert!(pane.contains("\u{2502} alpha body"), "{pane}");
         assert!(pane.contains("b.md"), "{pane}");
         assert!(pane.contains("Anchor: \u{2014}"), "{pane}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote rows: the @machine marker, row keys, and the Session tab
+    // -----------------------------------------------------------------------
+
+    const REMOTE_WS: &str = "0123456789abcdef";
+
+    /// A row read from another machine's summary, keyed as the feed keys it.
+    fn remote_row(
+        name: &str,
+        machine: Option<&str>,
+        intent: Option<&str>,
+        blocked: bool,
+    ) -> (String, crate::cli::dashboard_data::CachedSession) {
+        let mut s = render_session(
+            Some("gated"),
+            Some("check"),
+            intent,
+            false,
+            blocked,
+            Some(std::time::SystemTime::now()),
+        );
+        s.header.workflow = name.to_string();
+        s.header.session_id = format!("{name}-remote-id");
+        s.machine = machine.map(str::to_string);
+        s.workspace = Some(REMOTE_WS.to_string());
+        s.remote = true;
+        (
+            crate::cli::dashboard_data::remote_key(name, REMOTE_WS),
+            s,
+        )
+    }
+
+    /// A local row, live and running.
+    fn local_row(name: &str, intent: Option<&str>) -> crate::cli::dashboard_data::CachedSession {
+        let mut s = render_session(
+            Some("work-on"),
+            Some("implement"),
+            intent,
+            false,
+            false,
+            Some(std::time::SystemTime::now()),
+        );
+        s.header.workflow = name.to_string();
+        s.header.session_id = format!("{name}-local-id");
+        s
+    }
+
+    /// The tree with local and remote rows as the loop holds them after a
+    /// local refresh and a feed snapshot.
+    fn tree_state(rows: Vec<(String, crate::cli::dashboard_data::CachedSession)>) -> DashboardAppState {
+        let mut state = DashboardAppState::new(500);
+        for (key, s) in rows {
+            state.tree.sessions.insert(key, s);
+        }
+        let mut roots: Vec<String> = state
+            .tree
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                crate::cli::dashboard_data::parent_key(s)
+                    .is_none_or(|p| !state.tree.sessions.contains_key(&p))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        roots.sort();
+        state.tree.roots = roots;
+        state
+    }
+
+    /// Each row of a `width` x 24 frame, as text.
+    fn frame_lines(state: &DashboardAppState, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| render_frame(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..24)
+            .map(|y| region_to_string(&buffer, y..y + 1, 0..width))
+            .collect()
+    }
+
+    /// The Name cell of the list row whose text contains `needle`, at a
+    /// full-width (78-column) list: the columns before the State column.
+    fn name_cell_of(lines: &[String], needle: &str) -> Option<String> {
+        let (name_width, _) = list_columns(76);
+        lines.iter().find(|l| l.contains(needle)).map(|l| {
+            l.chars()
+                .skip(1)
+                .take(name_width as usize)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+    }
+
+    #[test]
+    fn a_remote_blocked_row_sits_in_the_needs_you_band_ending_in_its_machine() {
+        let state = tree_state(vec![
+            remote_row("wf", Some("machine-a"), None, true),
+            ("mine".to_string(), local_row("mine", Some("my work"))),
+        ]);
+        let lines = frame_lines(&state, 78);
+        // The first list row (under the border and the header) is the
+        // remote blocked one: the needs-you band leads, with no all-clear.
+        assert!(
+            lines[2].contains("gated \u{b7} check @machine-a"),
+            "first row: {:?}",
+            lines[2]
+        );
+        assert!(lines[2].contains('\u{25cf}'), "needs-you glyph: {:?}", lines[2]);
+        assert!(
+            !lines.iter().any(|l| l.contains("Nothing needs you")),
+            "{lines:#?}"
+        );
+        let cell = name_cell_of(&lines, "@machine-a").unwrap();
+        assert!(cell.ends_with("@machine-a"), "name cell: {cell:?}");
+        // The local row carries no marker.
+        let mine = name_cell_of(&lines, "my work").unwrap();
+        assert_eq!(mine, "my work");
+        assert!(!mine.contains('@'));
+    }
+
+    #[test]
+    fn a_remote_row_without_a_recorded_machine_reads_unknown() {
+        let state = tree_state(vec![remote_row("wf", None, Some("nobody's"), true)]);
+        let lines = frame_lines(&state, 78);
+        let cell = name_cell_of(&lines, "nobody's").unwrap();
+        assert_eq!(cell, "nobody's @unknown");
+    }
+
+    #[test]
+    fn at_80_columns_a_40_character_machine_keeps_at_and_its_first_8_characters() {
+        let machine = "abcdefgh".to_string() + &"x".repeat(32);
+        assert_eq!(machine.len(), 40);
+        let state = tree_state(vec![remote_row(
+            "wf",
+            Some(&machine),
+            Some("a fairly long intent for this session"),
+            true,
+        )]);
+        let lines = frame_lines(&state, 80);
+        // The list pane is the left 40% (32 columns) at 80.
+        let list: Vec<String> = lines.iter().map(|l| l.chars().take(32).collect()).collect();
+        assert!(
+            list.iter().any(|l| l.contains("@abcdefgh")),
+            "the marker keeps @ and 8 characters: {list:#?}"
+        );
+        // The label is cut before the marker is.
+        let row = list.iter().find(|l| l.contains("@abcdefgh")).unwrap();
+        assert!(row.contains("a f"), "some label stays: {row:?}");
+    }
+
+    #[test]
+    fn fit_name_cell_cuts_the_label_before_the_marker() {
+        assert_eq!(fit_name_cell("review", Some("@machine-a"), 40), "review @machine-a");
+        assert_eq!(fit_name_cell("a long label", Some("@m"), 8), "a lo\u{2026} @m");
+        // A marker that can't fit whole keeps @ and 8 characters at least.
+        let cell = fit_name_cell("label", Some("@abcdefghijklmnop"), 10);
+        assert!(cell.starts_with("@abcdefgh"), "{cell:?}");
+        // A local row is left whole for the table to clip.
+        assert_eq!(fit_name_cell("whole label", None, 4), "whole label");
+    }
+
+    #[test]
+    fn same_named_sessions_are_two_rows_and_a_remote_child_nests_under_its_own_parent() {
+        let (remote_key, remote) = remote_row("review", Some("machine-a"), Some("review"), false);
+        let (child_key, mut child) = remote_row("review.child", Some("machine-a"), Some("child"), false);
+        child.header.parent_workflow = Some("review".to_string());
+        let mut state = tree_state(vec![
+            ("review".to_string(), local_row("review", Some("review"))),
+            (remote_key.clone(), remote),
+            (child_key.clone(), child),
+        ]);
+        state.expanded.insert(remote_key.clone());
+        state.expanded.insert("review".to_string());
+
+        let rows = state.visible_rows();
+        let keys: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(rows.len(), 3, "two review rows and one child: {keys:?}");
+        let at = keys.iter().position(|k| *k == remote_key).unwrap();
+        assert_eq!(keys[at + 1], child_key, "the child follows A's review");
+        assert_eq!(rows[at + 1].indent_depth, 1);
+        let local = rows.iter().find(|r| r.session_id == "review").unwrap();
+        assert!(local.task_counts.is_none(), "B's review has no children");
+        assert!(local.marker.is_none());
+        assert_eq!(rows[at].task_counts.as_ref().map(|c| c.total), Some(1));
+
+        let lines = frame_lines(&state, 78);
+        assert_eq!(name_cell_of(&lines, "review @machine-a").unwrap(), "review @machine-a");
+        assert!(
+            lines.iter().any(|l| l.contains("\u{2514}\u{2500} review \u{25b8} child @machine-a")),
+            "{lines:#?}"
+        );
+        let unmarked: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("review") && !l.contains('@'))
+            .collect();
+        assert_eq!(unmarked.len(), 1, "B's own review once, unmarked: {lines:#?}");
+    }
+
+    #[test]
+    fn a_remote_row_whose_session_is_held_locally_shows_once_as_local() {
+        use crate::session::summary::SessionSummary;
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        // What the feed would hand over for B's own pushed copy, had the
+        // scan not yet known B holds it.
+        let row = crate::session::remote_feed::RemoteRow {
+            workspace: REMOTE_WS.to_string(),
+            summary: SessionSummary {
+                schema: 1,
+                session_id: "mine-local-id".to_string(),
+                name: "mine".to_string(),
+                home: REMOTE_WS.to_string(),
+                kind: None,
+                parent: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                template_name: Some("work-on".to_string()),
+                current_state: Some("implement".to_string()),
+                is_terminal: false,
+                is_blocked: false,
+                failed: false,
+                intent: Some("mine".to_string()),
+                salient_var: None,
+                is_batch_task: false,
+                is_request_leg: false,
+                last_event_at: None,
+                last_seq: 1,
+                state_etag: String::new(),
+                machine: Some("machine-b".to_string()),
+                sources: Vec::new(),
+            },
+        };
+        crate::cli::dashboard_data::replace_remote_rows(&mut state.tree, &[row]);
+        let rows = state.visible_rows();
+        let keys: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(keys, vec!["mine"]);
+        assert!(rows[0].marker.is_none());
+    }
+
+    /// Draw the detail pane for the remote row `wf@REMOTE_WS` on `tab`.
+    fn draw_remote(tab: DashboardTab) -> RatatuiBuffer {
+        let (key, s) = remote_row("wf", Some("machine-a"), Some("ship it"), true);
+        let mut state = tree_state(vec![(key.clone(), s)]);
+        state.focused_id = Some(key);
+        state.active_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_remote_rows_session_tab_shows_its_machine_and_workspace() {
+        let buffer = draw_remote(DashboardTab::Session);
+        let text = pane_text(&buffer);
+        assert!(text.contains("Machine: machine-a"), "{text}");
+        assert!(text.contains(&format!("Workspace: {REMOTE_WS}")), "{text}");
+        assert!(text.contains("State: check"), "{text}");
+        assert!(!text.contains("Loading session"), "{text}");
+        // The pane's title names the session and its machine, not the key.
+        let top = region_to_string(&buffer, 0..1, PANE_X - 1..WIDTH);
+        assert!(top.contains("wf @machine-a"), "{top:?}");
+    }
+
+    #[test]
+    fn a_remote_rows_other_tabs_say_its_detail_lives_on_its_own_machine() {
+        for tab in [DashboardTab::Summary, DashboardTab::History, DashboardTab::Remaining] {
+            let buffer = draw_remote(tab.clone());
+            // Below the tabs row, one line of text and nothing else.
+            let content: Vec<String> = pane_rows(&buffer)
+                .into_iter()
+                .skip(1)
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect();
+            assert_eq!(
+                content,
+                vec!["This session's detail lives on its own machine, machine-a.".to_string()],
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_rows_session_tab_shows_the_recorded_machine() {
+        let tab = loaded(snapshot(vec![entry("plan", 3)]), 0, text("x", false));
+        let mut state = empty_state();
+        let mut wf = local_row("wf", None);
+        wf.machine = Some("machine-b".to_string());
+        wf.mtime = SystemTime::UNIX_EPOCH;
+        state.tree.sessions.insert("wf".to_string(), wf);
+        state.tree.roots = vec!["wf".to_string()];
+        state.active_tab = DashboardTab::Session;
+        state.focused_id = Some("wf".to_string());
+        state.session_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        let text = pane_text(terminal.backend().buffer());
+        assert!(text.contains("Machine: machine-b"), "{text}");
+    }
+
+    #[test]
+    fn a_local_session_from_before_the_machine_stamp_reads_unknown() {
+        let (buffer, _) = draw(loaded(snapshot(vec![entry("plan", 3)]), 0, text("x", false)));
+        let text = pane_text(&buffer);
+        assert!(text.contains("Machine: unknown"), "{text}");
     }
 }

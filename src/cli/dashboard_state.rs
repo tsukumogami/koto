@@ -14,7 +14,8 @@ use crate::session_view::{KeyPreview, Sanitized, SessionViewSnapshot, SnapshotEr
 
 use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
 use crate::cli::dashboard_data::{
-    classify_liveness, derive_label, CachedSession, DetailData, Liveness, SessionTree,
+    classify_liveness, derive_label, parent_key, row_name, CachedSession, DetailData, Liveness,
+    SessionTree,
 };
 
 /// Which tab is active in the detail pane.
@@ -95,10 +96,14 @@ pub struct RowDescriptor {
     /// Tree connector string for display (e.g. "├─ ", "└─ ").
     /// Empty for root/depth-0 rows.
     pub connector: String,
-    /// Session identifier (key in `SessionTree::sessions`).
+    /// Row key in `SessionTree::sessions`: the session name for a local
+    /// row, `name@workspace` for a remote one.
     pub session_id: String,
     /// Human-readable display name derived from the session ID.
     pub display_name: String,
+    /// `@<machine>` for a row read from another machine's summary
+    /// (`@unknown` when it records no machine); `None` for a local row.
+    pub marker: Option<String>,
     /// Current state derived from the event log, or `None` when unknown.
     pub state: Option<String>,
     /// Idle duration (time since last activity), used for the time column.
@@ -252,25 +257,47 @@ impl SessionTabState {
         preview: impl FnOnce(&str, &str) -> KeyPreview,
     ) {
         if self.plan(session, mtime) == SessionLoad::Snapshot {
-            if self.session.as_deref() != Some(session) {
-                self.cursor = 0;
-            }
-            self.snapshot = Some(snapshot(session).map_err(|e| e.reason()));
-            self.session = Some(session.to_string());
-            self.mtime = Some(mtime);
-            self.preview = None;
-            self.cursor = self.cursor.min(self.key_count().saturating_sub(1));
+            self.apply_snapshot(session, mtime, snapshot(session));
         }
         if let SessionLoad::Preview(key) = self.plan(session, mtime) {
             let read = preview(session, &key);
-            self.preview_reads += 1;
-            self.preview = Some(CachedPreview {
-                session: session.to_string(),
-                key,
-                mtime,
-                preview: read,
-            });
+            self.apply_preview(session, key, mtime, read);
         }
+    }
+
+    /// Take `result` as the snapshot of `session` at `mtime`, read
+    /// elsewhere (the loop's session worker, or [`SessionTabState::tick`]).
+    pub fn apply_snapshot(
+        &mut self,
+        session: &str,
+        mtime: SystemTime,
+        result: Result<SessionViewSnapshot, SnapshotError>,
+    ) {
+        if self.session.as_deref() != Some(session) {
+            self.cursor = 0;
+        }
+        self.snapshot = Some(result.map_err(|e| e.reason()));
+        self.session = Some(session.to_string());
+        self.mtime = Some(mtime);
+        self.preview = None;
+        self.cursor = self.cursor.min(self.key_count().saturating_sub(1));
+    }
+
+    /// Take `preview` as the bounded read of `key` in `session` at `mtime`.
+    pub fn apply_preview(
+        &mut self,
+        session: &str,
+        key: String,
+        mtime: SystemTime,
+        preview: KeyPreview,
+    ) {
+        self.preview_reads += 1;
+        self.preview = Some(CachedPreview {
+            session: session.to_string(),
+            key,
+            mtime,
+            preview,
+        });
     }
 
     /// Move the key cursor by `delta`, staying inside the listing.
@@ -488,6 +515,12 @@ impl DashboardAppState {
         let Some(session) = self.tree.sessions.get(&id) else {
             return;
         };
+        // A remote row has no state file here: its detail lives on its own
+        // machine, and nothing is read for it.
+        if session.remote {
+            self.invalidate_detail();
+            return;
+        }
         let (mtime, path) = (Some(session.mtime), session.state_path.clone());
         if self.detail_cache_session.as_deref() != Some(id.as_str())
             || mtime != self.detail_cache_mtime
@@ -530,15 +563,14 @@ impl DashboardAppState {
         }
     }
 
-    /// Check whether a session (by ID) has any children in the tree.
+    /// Check whether a row (by key) has any children in the tree. A child
+    /// names its parent by row key ([`parent_key`]), so a remote child
+    /// counts only under its own machine's parent.
     fn session_has_children(&self, session_id: &str) -> bool {
-        self.tree.sessions.values().any(|s| {
-            s.header
-                .parent_workflow
-                .as_deref()
-                .map(|p| p == session_id)
-                .unwrap_or(false)
-        })
+        self.tree
+            .sessions
+            .values()
+            .any(|s| parent_key(s).as_deref() == Some(session_id))
     }
 
     /// Compute aggregate `TaskCounts` for a root session based on its children.
@@ -550,12 +582,7 @@ impl DashboardAppState {
         let mut blocked = 0;
 
         for s in self.tree.sessions.values() {
-            if s.header
-                .parent_workflow
-                .as_deref()
-                .map(|p| p == root_id)
-                .unwrap_or(false)
-            {
+            if parent_key(s).as_deref() == Some(root_id) {
                 total += 1;
                 if s.is_terminal {
                     if is_failed_state(s.current_state.as_deref()) {
@@ -711,8 +738,11 @@ impl DashboardAppState {
 
         // Leaf label, with parent prefix for child rows (`parent ▸ leaf`).
         let leaf_label = session
-            .map(|s| derive_label(s, session_id))
+            .map(|s| derive_label(s, row_name(session_id, s)))
             .unwrap_or_else(|| session_id.to_string());
+        let marker = session.filter(|s| s.remote).map(|s| {
+            format!("@{}", s.machine.as_deref().unwrap_or("unknown"))
+        });
         let display_name = match parent_label {
             Some(parent) => format!("{parent} \u{25b8} {leaf_label}"),
             None => leaf_label.clone(),
@@ -736,6 +766,7 @@ impl DashboardAppState {
             connector,
             session_id: session_id.to_string(),
             display_name,
+            marker,
             state,
             elapsed,
             liveness,
@@ -749,7 +780,7 @@ impl DashboardAppState {
                 .tree
                 .sessions
                 .iter()
-                .filter(|(_, s)| s.header.parent_workflow.as_deref() == Some(session_id))
+                .filter(|(_, s)| parent_key(s).as_deref() == Some(session_id))
                 .map(|(name, _)| name)
                 .collect();
             children.sort_by_key(|id| {
