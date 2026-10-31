@@ -229,18 +229,91 @@ pub(crate) fn get_hostname() -> String {
 /// The longest machine name koto records.
 pub const MACHINE_NAME_MAX: usize = 64;
 
-/// The name of this machine, recorded on each session it creates: the
-/// `KOTO_MACHINE_NAME` variable when it is set and non-empty, else the
-/// hostname with any domain part removed, coerced by
-/// [`coerce_machine_name`]. Resolved once per process.
+/// The rule a machine name follows, as people read it in a message.
+pub const MACHINE_NAME_RULE: &str =
+    "a machine name is 1 to 64 characters of A-Z, a-z, 0-9, '.', '_' or '-', and is not 'unknown'";
+
+/// Check a machine name against the one rule every source and reader
+/// shares: 1 to [`MACHINE_NAME_MAX`] characters of `[A-Za-z0-9._-]`, never
+/// `unknown` (reserved for sessions that record no machine). The error names
+/// the rule, never the value.
+pub fn validate_machine_name(name: &str) -> std::result::Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= MACHINE_NAME_MAX
+        && name != "unknown"
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(MACHINE_NAME_RULE.to_string())
+    }
+}
+
+/// The `[machine] name` value in the user-level config file, read directly
+/// and never through the user and project merge, so a project's
+/// `.koto/config.toml` can't supply it. `None` when the file, the table or
+/// the key is absent, or the file can't be read. Never writes.
+pub fn user_config_machine_name() -> Option<toml::Value> {
+    let path = crate::config::resolve::user_config_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let doc = crate::config::resolve::load_toml_value(&path).ok()?;
+    doc.get("machine")?.get("name").cloned()
+}
+
+/// Pick this machine's name from its sources, in order: the
+/// `KOTO_MACHINE_NAME` value, then the user-level `machine.name`, then the
+/// hostname coerced by [`coerce_machine_name`]. An empty value counts as
+/// unset. A non-empty value that breaks [`validate_machine_name`] is skipped
+/// for the next source, with one warning line naming the source (never the
+/// value) in the returned list.
+pub fn resolve_machine_name(
+    env: Option<&str>,
+    config: Option<&toml::Value>,
+    hostname: &str,
+) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+    if let Some(name) = env.filter(|n| !n.is_empty()) {
+        if validate_machine_name(name).is_ok() {
+            return (name.to_string(), warnings);
+        }
+        warnings.push(format!(
+            "warning: KOTO_MACHINE_NAME is not a valid machine name ({}); ignoring it",
+            MACHINE_NAME_RULE
+        ));
+    }
+    match config {
+        Some(toml::Value::String(name)) if name.is_empty() => {}
+        Some(toml::Value::String(name)) if validate_machine_name(name).is_ok() => {
+            return (name.clone(), warnings);
+        }
+        Some(_) => warnings.push(format!(
+            "warning: machine.name in the user config file is not a valid machine name ({}); ignoring it",
+            MACHINE_NAME_RULE
+        )),
+        None => {}
+    }
+    (coerce_machine_name(hostname), warnings)
+}
+
+/// The name of this machine, recorded on each session it creates, chosen by
+/// [`resolve_machine_name`] from `KOTO_MACHINE_NAME`, the user-level
+/// `machine.name` and the hostname. Resolved once per process, so a skipped
+/// invalid source warns on stderr once however many sessions it creates.
 pub fn machine_name() -> String {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
-        match std::env::var("KOTO_MACHINE_NAME") {
-            Ok(name) if !name.is_empty() => Some(name),
-            _ => None,
+        let env = std::env::var("KOTO_MACHINE_NAME").ok();
+        let config = user_config_machine_name();
+        let (name, warnings) =
+            resolve_machine_name(env.as_deref(), config.as_ref(), &get_hostname());
+        for warning in warnings {
+            eprintln!("{}", warning);
         }
-        .unwrap_or_else(|| coerce_machine_name(&get_hostname()))
+        name
     })
     .clone()
 }
@@ -605,5 +678,79 @@ mod tests {
         assert_eq!(coerce_machine_name("unknown"), "unknown-host");
         assert_eq!(coerce_machine_name(""), "unknown-host");
         assert_eq!(coerce_machine_name(&"a".repeat(80)).len(), MACHINE_NAME_MAX);
+    }
+
+    fn cfg(name: &str) -> toml::Value {
+        toml::Value::String(name.to_string())
+    }
+
+    #[test]
+    fn machine_name_rule_accepts_up_to_64_and_refuses_the_rest() {
+        assert!(validate_machine_name(&"a".repeat(64)).is_ok());
+        assert!(validate_machine_name("my-host_01.lab").is_ok());
+        assert!(validate_machine_name(&"a".repeat(65)).is_err());
+        assert!(validate_machine_name("unknown").is_err());
+        assert!(validate_machine_name("").is_err());
+        assert!(validate_machine_name("bad name!").is_err());
+        assert!(validate_machine_name("caf\u{e9}").is_err());
+        let err = validate_machine_name("bad name!").unwrap_err();
+        assert!(!err.contains("bad name!"), "{err}");
+    }
+
+    #[test]
+    fn machine_name_resolves_env_then_config_then_hostname() {
+        let host = "my host_01.example.com";
+        let c = cfg("cfg-name");
+        assert_eq!(
+            resolve_machine_name(Some("env-name"), Some(&c), host),
+            ("env-name".to_string(), vec![])
+        );
+        assert_eq!(
+            resolve_machine_name(None, Some(&c), host),
+            ("cfg-name".to_string(), vec![])
+        );
+        assert_eq!(
+            resolve_machine_name(Some(""), Some(&c), host),
+            ("cfg-name".to_string(), vec![])
+        );
+        assert_eq!(
+            resolve_machine_name(None, None, host),
+            ("my-host_01".to_string(), vec![])
+        );
+        assert_eq!(
+            resolve_machine_name(None, Some(&cfg("")), host),
+            ("my-host_01".to_string(), vec![])
+        );
+        assert_eq!(
+            resolve_machine_name(None, None, "unknown").0,
+            "unknown-host"
+        );
+        assert_eq!(
+            resolve_machine_name(None, None, &"h".repeat(80)).0,
+            "h".repeat(64)
+        );
+    }
+
+    #[test]
+    fn machine_name_skips_an_invalid_source_with_one_warning() {
+        let host = "build-vm.example.com";
+        for bad in ["bad name!", "unknown"] {
+            let (name, warnings) = resolve_machine_name(Some(bad), Some(&cfg("cfg-name")), host);
+            assert_eq!(name, "cfg-name");
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("KOTO_MACHINE_NAME"), "{}", warnings[0]);
+            assert!(!warnings[0].contains("bad name!"), "{}", warnings[0]);
+
+            let (name, warnings) = resolve_machine_name(Some(bad), None, host);
+            assert_eq!(name, "build-vm");
+            assert_eq!(warnings.len(), 1);
+        }
+        let (name, warnings) = resolve_machine_name(None, Some(&cfg("bad name!")), host);
+        assert_eq!(name, "build-vm");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("machine.name"), "{}", warnings[0]);
+        let (name, warnings) = resolve_machine_name(None, Some(&toml::Value::Integer(5)), host);
+        assert_eq!(name, "build-vm");
+        assert_eq!(warnings.len(), 1);
     }
 }

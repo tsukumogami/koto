@@ -1649,7 +1649,11 @@ pub enum EventPayload {
     /// which the import copies verbatim, so the log says where everything
     /// before it came from: the workspace path and session name given to
     /// the import, the source's `session_id`, and the importing machine's
-    /// id.
+    /// id and name.
+    ///
+    /// `machine_name` is the importing machine's name, which
+    /// [`producing_machine`] reports for the copy from this event on. It is
+    /// absent from an import made by a release that predates it.
     ///
     /// State derivation ignores it. Additive: it does not move
     /// `CURRENT_SCHEMA_VERSION`, and an older build lands it in
@@ -1659,6 +1663,8 @@ pub enum EventPayload {
         from_session: String,
         from_session_id: String,
         machine_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_name: Option<String>,
     },
     /// The fence `koto init --continues PRED --supersede` appends to the
     /// predecessor's own log: from this event on the session is superseded
@@ -2356,16 +2362,26 @@ pub fn derive_intent(events: &[Event]) -> Option<String> {
 }
 
 /// The machine that produced a session, read from its own events: the
-/// `machine` of its `workflow_initialized` event. `None` when the session
-/// records none (created before the field existed), which every surface
-/// shows as an unknown machine.
+/// `machine_name` of its latest `session_imported` event when it has one,
+/// since an imported copy belongs to the machine that imported it, else the
+/// `machine` of its `workflow_initialized` event. `None` when the deciding
+/// event records none (a session created, or an import made, before the
+/// field existed) or records a name that breaks the machine name rule,
+/// which every surface shows as an unknown machine.
 pub fn producing_machine(events: &[Event]) -> Option<String> {
-    events.iter().find_map(|e| match &e.payload {
-        EventPayload::WorkflowInitialized { machine, .. } => {
-            Some(machine.clone().filter(|m| !m.is_empty()))
-        }
+    let recorded = match events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::SessionImported { machine_name, .. } => Some(machine_name.clone()),
         _ => None,
-    })?
+    }) {
+        Some(imported) => imported,
+        None => events.iter().find_map(|e| match &e.payload {
+            EventPayload::WorkflowInitialized { machine, .. } => Some(machine.clone()),
+            _ => None,
+        })?,
+    }?;
+    crate::session::version::validate_machine_name(&recorded)
+        .is_ok()
+        .then_some(recorded)
 }
 
 /// The session's intent as every surface shows it: the last `IntentUpdated`
@@ -2697,6 +2713,7 @@ impl<'de> Deserialize<'de> for Event {
                     from_session: p.from_session,
                     from_session_id: p.from_session_id,
                     machine_id: p.machine_id,
+                    machine_name: p.machine_name,
                 }
             }
             "session_superseded" => {
@@ -3200,6 +3217,8 @@ struct SessionImportedPayload {
     from_session: String,
     from_session_id: String,
     machine_id: String,
+    #[serde(default)]
+    machine_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5014,6 +5033,69 @@ mod tests {
     }
 
     #[test]
+    fn session_imported_machine_name_round_trips() {
+        use super::Event;
+        let json = r#"{"seq":9,"timestamp":"2026-01-01T00:00:00Z","type":"session_imported","payload":{"from_workspace":"/srv/ws-a","from_session":"coord","from_session_id":"0b1c","machine_id":"a1b2c3d4","machine_name":"machine-b"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    fn machine_name_events(payloads: &[(&str, serde_json::Value)]) -> Vec<super::Event> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(i, (ty, payload))| {
+                serde_json::from_value(serde_json::json!({
+                    "seq": i + 1,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "type": ty,
+                    "payload": payload,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn producing_machine_name_follows_the_latest_import() {
+        use super::producing_machine;
+        use serde_json::json;
+        let init = |m: Option<&str>| {
+            let mut p = json!({"template_path": "/t.json", "variables": {}});
+            if let Some(m) = m {
+                p["machine"] = json!(m);
+            }
+            ("workflow_initialized", p)
+        };
+        let imp = |m: Option<&str>| {
+            let mut p = json!({
+                "from_workspace": "/w",
+                "from_session": "s",
+                "from_session_id": "i",
+                "machine_id": "m",
+            });
+            if let Some(m) = m {
+                p["machine_name"] = json!(m);
+            }
+            ("session_imported", p)
+        };
+        let a = init(Some("machine-a"));
+        let pm = |p: &[(&str, serde_json::Value)]| producing_machine(&machine_name_events(p));
+        assert_eq!(pm(std::slice::from_ref(&a)).as_deref(), Some("machine-a"));
+        let b = imp(Some("machine-b"));
+        assert_eq!(pm(&[a.clone(), b.clone()]).as_deref(), Some("machine-b"));
+        let c = imp(Some("machine-c"));
+        assert_eq!(pm(&[a.clone(), b.clone(), c]).as_deref(), Some("machine-c"));
+        // An import made before the field existed records no machine, even
+        // though the copied init names the source's.
+        assert_eq!(pm(&[a.clone(), b, imp(None)]), None);
+        // A recorded name that breaks the rule reads as no machine.
+        assert_eq!(pm(&[init(Some("bad name!"))]), None);
+        assert_eq!(pm(&[a, imp(Some("unknown"))]), None);
+        assert_eq!(pm(&[init(None)]), None);
+    }
+
+    #[test]
     fn session_imported_roundtrips_byte_for_byte() {
         use super::{Event, EventPayload};
         let json = r#"{"seq":9,"timestamp":"2026-01-01T00:00:00Z","type":"session_imported","payload":{"from_workspace":"/srv/ws-a","from_session":"coord","from_session_id":"0b1c","machine_id":"a1b2c3d4"}}"#;
@@ -5024,7 +5106,9 @@ mod tests {
                 from_session,
                 from_session_id,
                 machine_id,
+                machine_name,
             } => {
+                assert_eq!(machine_name, &None);
                 assert_eq!(from_workspace, "/srv/ws-a");
                 assert_eq!(from_session, "coord");
                 assert_eq!(from_session_id, "0b1c");
@@ -5141,6 +5225,7 @@ mod tests {
                     from_session: "coord".to_string(),
                     from_session_id: "0b1c".to_string(),
                     machine_id: "a1b2c3d4".to_string(),
+                    machine_name: None,
                 },
             ),
         ];

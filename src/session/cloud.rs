@@ -6201,6 +6201,7 @@ impl CloudBackend {
             from_session: source.name.clone(),
             from_session_id: source.log.header.session_id.clone(),
             machine_id: machine_id.to_string(),
+            machine_name: Some(crate::session::version::machine_name()),
         };
         let imported = Event {
             seq: source.log.last_seq + 1,

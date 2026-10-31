@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "name": "gated",
+  "version": "1.0",
+  "initial_state": "check",
+  "states": {
+    "check": {
+      "directive": "Wait for go.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "gates.go.exists": true
+          }
+        }
+      ],
+      "gates": {
+        "go": {
+          "type": "context-exists",
+          "key": "go"
+        }
+      }
+    },
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    }
+  }
+}

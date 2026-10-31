@@ -2963,6 +2963,21 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
     use crate::config;
 
     match subcommand {
+        ConfigCommand::Get { key } if key == "machine.name" => {
+            // User-level only: read straight from the user file, never
+            // through the user and project merge.
+            match crate::session::version::user_config_machine_name() {
+                Some(toml::Value::String(name)) => {
+                    println!("{}", name);
+                    Ok(())
+                }
+                Some(other) => {
+                    println!("{}", other);
+                    Ok(())
+                }
+                None => std::process::exit(1),
+            }
+        }
         ConfigCommand::Get { key } => {
             let resolved = config::resolve::load_config()?;
             config::warn_if_request_store_recursion_reserved(&resolved);
@@ -3005,6 +3020,9 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
+                if key == "machine.name" {
+                    anyhow::bail!("key 'machine.name' can only be set in user config (--user)");
+                }
                 let path = config::resolve::project_config_path();
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)

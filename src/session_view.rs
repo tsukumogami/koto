@@ -265,6 +265,10 @@ pub struct SessionFacts {
     pub anchor: Option<Sanitized>,
     /// The store origin: kind (`local` or `cloud`) and base path.
     pub store: Option<(Sanitized, Sanitized)>,
+    /// The machine that produced the session, read from its own events
+    /// ([`crate::engine::types::producing_machine`]). `None` when it
+    /// records none.
+    pub machine: Option<Sanitized>,
 }
 
 /// Everything [`snapshot`] answers.
@@ -407,6 +411,9 @@ fn facts_from_header(
         execution_dir: None,
         anchor: None,
         store: None,
+        machine: crate::engine::types::producing_machine(events)
+            .as_deref()
+            .map(fact),
     };
     if let Some(h) = header {
         if !h.session_id.is_empty() {

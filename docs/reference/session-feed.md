@@ -488,6 +488,9 @@ events:
       machine_id:
         type: string
         required: true
+      machine_name:
+        type: string
+        required: false
 
   environment_adopted:
     tier: 2
@@ -1184,7 +1187,7 @@ Marks the birth of a session. Written once at `koto init` time.
 | `template_path` | string | Yes | Path to the compiled template JSON in koto's cache directory. |
 | `variables` | object | No | Variable bindings active at init time. String-to-string map holding every declared variable, with the value passed, its default, or the empty string. Absent when the template declares no variables. A declared variable without `rebind: true` keeps this value for the whole session. |
 | `spawn_entry` | object | No | Present only for batch-spawned child sessions. Carries `template` (source path), `vars` (bindings), and `waits_on` (sorted dependency list). Absent for top-level sessions. |
-| `machine` | string | No | The name of the machine that created the session: `KOTO_MACHINE_NAME` when set, else the short hostname. Kept on this append-only event rather than the header, so a header rewrite can't drop it. Absent on sessions created before the field existed, which read as an unknown machine. |
+| `machine` | string | No | The name of the machine that created the session: `KOTO_MACHINE_NAME` when it's set, non-empty and valid, else `machine.name` from the user-level config file, else the short hostname, coerced (see `machine.name` in `docs/guides/cli-usage.md`). Kept on this append-only event rather than the header, so a header rewrite can't drop it. Absent on sessions created before the field existed, which read as an unknown machine. A copy made by `koto session import` keeps the source's value here; its producing machine is the latest `session_imported` event's `machine_name`. |
 
 ---
 
@@ -2156,7 +2159,8 @@ source's remote object; this one records where they came from.
     "from_workspace": "/srv/ws-a",
     "from_session": "coord",
     "from_session_id": "source-session-id",
-    "machine_id": "a1b2c3d4e5f6"
+    "machine_id": "a1b2c3d4e5f6",
+    "machine_name": "machine-b"
   }
 }
 ```
@@ -2167,6 +2171,7 @@ source's remote object; this one records where they came from.
 | `from_session` | string | Yes | The source session's name. |
 | `from_session_id` | string | Yes | The source header's `session_id`. The imported header carries a new one. |
 | `machine_id` | string | Yes | The importing machine's id, from koto's user config. |
+| `machine_name` | string | No | The importing machine's name, chosen the way `workflow_initialized.machine` is. From this event on, the copy's producing machine (the `machine` the dashboard shows) is this name, not the source's. Absent on an import made by a release before the field existed; such a copy reads as having no recorded machine, even though its copied `workflow_initialized` names the source's. |
 
 A log imported more than once carries one of these per import, oldest first.
 
@@ -3046,7 +3051,7 @@ with earlier koto releases; columns 7 and 8, then 9 and 10, were appended additi
 | 6 | `template` | Template name from the header. |
 | 7 | `idle` | **(appended)** Time since the last event (last activity), compact form. |
 | 8 | `liveness` | **(appended)** Read-time liveness token (see vocabulary below). |
-| 9 | `machine` | **(appended)** The machine that created the session, as recorded on its first event (`KOTO_MACHINE_NAME`, else the short hostname). Empty when no machine is recorded, as for a session from before the machine stamp. |
+| 9 | `machine` | **(appended)** The machine that produced the session: the `machine_name` of its latest `session_imported` event when it was imported, else the `machine` on its `workflow_initialized` event (`KOTO_MACHINE_NAME`, else the user-level `machine.name`, else the short hostname). Empty when no machine is recorded, as for a session from before the machine stamp, or when the recorded name breaks the machine name rule. |
 | 10 | `workspace` | **(appended)** The 16-hex workspace prefix the session's copy lives under in the bucket. Empty on the local backend. |
 
 Appended fields are sanitized of tab, carriage-return, and newline characters so the
@@ -3140,12 +3145,16 @@ Top level:
 | `execution_dir` | string | When recorded | The session's execution anchor. |
 | `anchor` | string | When recorded | The origin anchor (creation directory). |
 | `store` | object | When recorded | `{kind, base}` — the store origin. |
+| `machine` | string or null | Always | The machine that produced the session, the same value as `--once` column 9; `null` when the session records none. |
 | `migrated` | object | Migrated sessions only | `{target, workspace}`; `keys` is then absent. |
 | `keys` | array | Non-migrated sessions | Every listed key, lexicographic (see below). |
 | `contentOmittedCount` | integer | With `keys` | Keys past the preview ceiling (1,000) whose content was not read. |
 | `unlistedKeys` | integer | With `keys` | Keys past the metadata ceiling (100,000) not listed at all. |
 
-An absent optional fact is omitted, never `null`: absence is data. Field
+An absent optional fact is omitted, never `null`: absence is data. The one
+exception is `machine`, which is always present and is `null` when the
+session records no machine, so a reader can tell "no machine recorded" from
+an older koto that doesn't print the field. Field
 casing is mixed on purpose: the session facts reuse the snake_case names
 `koto status` and the state-file header already use (`current_state`,
 `created_at`), while the fields this mode adds for its own bookkeeping
