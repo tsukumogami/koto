@@ -24,9 +24,9 @@
 # named release instead, and the recorded-release file isn't read. --version
 # latest asks the registry for the newest release first and checks that one; the
 # version it resolved to is the one every later step and the output name.
-# --evidence
-# scans a local Claude Code executable (one already extracted from a package,
-# say) with no download; it replaces --version.
+#
+# --evidence scans a local Claude Code executable (one already extracted from a
+# package, say) with no download; it replaces --version.
 #
 # --alter <slug> applies that convention's demonstration mutation (a
 # same-length rename, listed in the expectations file) to an in-memory copy of

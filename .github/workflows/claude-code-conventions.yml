@@ -67,8 +67,10 @@ jobs:
 
       # Decides which release this run checks and resolves it to a concrete
       # version, so the cache key and the guard name the same release even if
-      # a newer one ships mid-run. The dispatch input reaches the shell only
-      # through the environment, never interpolated into the script.
+      # a newer one ships mid-run. That is why this step repeats the guard's
+      # version pattern (VERSION_RE) and its latest lookup instead of passing
+      # --version latest; keep the two in step. The dispatch input reaches the
+      # shell only through the environment, never interpolated into the script.
       - name: Choose the release
         id: release
         env:
@@ -86,14 +88,14 @@ jobs:
             # The guard reads the recorded release itself; it is read here
             # only for the cache key.
             version=$(<tests/fixtures/native-workflows/claude-code-release)
-            source=recorded
+            release_source=recorded
           elif [ "$requested" = latest ]; then
             package=$(jq -r .package tests/fixtures/native-workflows/claude-code-conventions.json)
             version=$(cd "$RUNNER_TEMP" && npm view --silent "$package" version) || version=""
-            source=named
+            release_source=named
           else
             version=$requested
-            source=named
+            release_source=named
           fi
           if ! [[ $version =~ $version_re ]]; then
             echo "::error::no MAJOR.MINOR.PATCH Claude Code release to check (requested: ${requested:-the release recorded in tests/fixtures/native-workflows/claude-code-release})"
@@ -102,7 +104,7 @@ jobs:
           mkdir -p "$CACHE_DIR"
           {
             echo "version=$version"
-            echo "source=$source"
+            echo "source=$release_source"
             echo "cache-dir=$CACHE_DIR"
           } >> "$GITHUB_OUTPUT"
 
