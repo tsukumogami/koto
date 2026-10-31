@@ -314,22 +314,22 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         );
     }
 
-    // Trailing note for sessions whose state file failed to parse, so they are
-    // surfaced rather than silently dropped.
-    // Local state files and other machines' summaries alike, and beside
-    // them the migrated sources hidden in favour of their listed copy.
+    // Notes pinned under the rows, across the list's full width: the tally
+    // of sessions that couldn't be read (local state files and other
+    // machines' sessions listed as unknown, so they are surfaced rather than
+    // silently dropped) and of hidden migrated sources, then one status line
+    // while the last feed snapshot couldn't read some or all of the bucket
+    // (the rows it couldn't read stay as they were).
+    let mut notes: Vec<Line<'_>> = Vec::new();
     if let Some(note) = tally_line(&state.tree) {
-        rows.push(Row::new(vec![Cell::from(note)]).style(Style::default().fg(Color::Red)));
+        notes.push(Line::styled(note, Style::default().fg(Color::Red)));
     }
-
-    // One status line while the last feed snapshot couldn't read some or
-    // all of the bucket; the rows it couldn't read stay as they were.
     if let Some(failure) = &state.tree.remote_failure {
         let line = format!(
             "\u{26a0} bucket: {}",
             failure.replace(['\n', '\r', '\t'], " ")
         );
-        rows.push(Row::new(vec![Cell::from(line)]).style(Style::default().fg(Color::Yellow)));
+        notes.push(Line::styled(line, Style::default().fg(Color::Yellow)));
     }
 
     let row_count = rows.len();
@@ -341,27 +341,33 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
             .collect::<Vec<_>>(),
     );
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("koto dashboard"),
-        )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+    // The notes take the bottom lines inside the border; the table the rest.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("koto dashboard");
+    let inner = block.inner(area);
+    let note_height = (notes.len() as u16).min(inner.height.saturating_sub(2));
+    let [table_area, notes_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(note_height)]).areas(inner);
+    f.render_widget(block, area);
+
+    let table = Table::new(rows, widths).header(header).row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut table_state = TableState::default();
     table_state.select(Some(state.cursor_idx + cursor_offset));
 
-    f.render_stateful_widget(table, area, &mut table_state);
+    f.render_stateful_widget(table, table_area, &mut table_state);
+    if note_height > 0 {
+        f.render_widget(Paragraph::new(notes), notes_area);
+    }
 
     // Attach a scrollbar when the row count exceeds the visible area height.
-    // Visible area height minus 3 (border top + header + border bottom).
-    let visible_height = area.height.saturating_sub(3) as usize;
+    // Visible area height minus the header and the notes.
+    let visible_height = table_area.height.saturating_sub(1) as usize;
     if row_count > visible_height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         let mut scrollbar_state =
