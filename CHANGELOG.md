@@ -674,6 +674,23 @@ to `0.9.x`).
 
 ### Fixed
 
+- **The koto-skills start hook opens the anchor in the store the agent
+  session's shells use
+  ([koto#564](https://github.com/tsukumogami/koto/issues/564)).** The hook
+  ran every koto call with the `KOTO_SESSION_*` variables removed, so under
+  a cloud backend configured in the environment alone the anchor was opened
+  in the local store and never reached the bucket, and `koto session import`
+  on another host couldn't find it; with the backend in a config file and
+  the credentials in `KOTO_SESSION_CLOUD_ACCESS_KEY` and
+  `KOTO_SESSION_CLOUD_SECRET_KEY`, the open failed and the session got no
+  anchor. The hook's koto calls now keep those variables, and its watchers
+  inherit the same environment, so the observed marker lands in the store
+  the open used. The hook still removes `KOTO_ANCHOR`,
+  `KOTO_DISPATCHER_ANCHOR` and `CLAUDE_CODE_SESSION_ID` from its koto calls,
+  and its block of `CLAUDE_ENV_FILE` still sets no `KOTO_SESSION_*`
+  variable. The earlier advice to set the backend in a config file for the
+  hook no longer applies.
+
 - **A gate-blocked session's `/workflows` entry reads as blocked on Claude
   Code 2.1.314, and a finished session's last phase reads done
   ([koto#553](https://github.com/tsukumogami/koto/issues/553),
