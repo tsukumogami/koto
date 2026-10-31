@@ -3068,6 +3068,21 @@ another machine appears with that machine's name and its own workspace prefix, a
 ran it. A session this machine has a local copy of appears once, as its own row. The
 `--needs-you`, `--status` and name filters apply to other machines' sessions too.
 
+The interactive dashboard shows the same rows. On the cloud backend a background
+thread reads the bucket and the list updates when each read finishes; key presses
+and redraws never wait on the bucket. Another machine's row ends its name with
+`@<machine>` (`@unknown` when no machine is recorded), and local rows carry no
+marker. When the name doesn't fit, the label is cut first and the marker keeps `@`
+and at least the first 8 characters of the machine name; a narrow list drops the
+Children column, then the State column, to make room. Two machines' sessions with
+the same name show as two rows, and each child nests under its parent on its own
+machine. The Session tab of another machine's row shows `Machine` and `Workspace`
+(the 16-hex workspace id) with the facts its summary carries, and the Summary,
+History and Remaining tabs say the session's detail lives on its own machine. A
+local row's Session tab ends with a `Machine` row: the recorded machine, or
+`unknown` for a session from before the machine stamp. Summaries that couldn't be
+read join the trailing unreadable count.
+
 ### Liveness Vocabulary
 
 `liveness` is one of the following tokens, computed from last-activity recency with

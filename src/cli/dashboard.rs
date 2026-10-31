@@ -5,23 +5,27 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::{
-    event, execute,
+    event::{self, Event},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, buffer::Buffer, Terminal};
 
 use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
 use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
 use crate::cli::dashboard_render::render_frame;
-use crate::cli::dashboard_state::{DashboardAppState, DashboardTab};
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, SessionLoad};
 use crate::cli::DashboardArgs;
+use crate::session::remote_feed::{RemoteFeed, RESCAN_INTERVAL};
+use crate::session_view::{KeyPreview, SessionViewSnapshot, SnapshotError};
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
 struct TerminalGuard;
@@ -455,9 +459,18 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
 ///
 /// Takes the concrete [`Backend`]: the Session tab and the `--detail`
 /// mode reach the context store and the migration check through it
-/// (`crate::session_view`), which no trait object carries. The data
-/// refresh below still consumes it as a `&dyn SessionBackend`.
-pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()> {
+/// (`crate::session_view`), which no trait object carries. The TUI shares
+/// it with the Session tab's worker thread, so it is taken by value.
+///
+/// In the TUI the input and render thread makes no bucket request: it
+/// lists this machine's sessions from the local store only, the remote
+/// rows arrive from a [`RemoteFeed`] thread, and the Session tab's reads
+/// run on a [`SessionLoader`] thread.
+///
+/// [`Backend`]: crate::session::Backend
+pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> {
+    use crate::session::Backend;
+
     // --detail: one JSON object for one session, checked before --once and
     // the TUI so it can never fall into either. clap's `requires` guarantees
     // the positional name is present.
@@ -466,18 +479,18 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
             .name
             .as_deref()
             .expect("clap `requires` guarantees the positional name");
-        run_detail(name, backend);
+        run_detail(name, &backend);
     }
 
     // --once: print tab-separated lines and exit without a TUI.
     if args.once {
         let mut tree = SessionTree::new();
-        dashboard_data::refresh(&mut tree, backend)?;
-        let remote = match backend {
-            crate::session::Backend::Cloud(cloud) => once_remote_rows(cloud, &mut tree),
-            crate::session::Backend::Local(_) => Vec::new(),
+        dashboard_data::refresh(&mut tree, &backend)?;
+        let remote = match &backend {
+            Backend::Cloud(cloud) => once_remote_rows(cloud, &mut tree),
+            Backend::Local(_) => Vec::new(),
         };
-        let cloud = matches!(backend, crate::session::Backend::Cloud(_));
+        let cloud = matches!(backend, Backend::Cloud(_));
         run_once(&args, &tree, &remote, cloud);
         return Ok(());
     }
@@ -485,6 +498,39 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
     // TUI mode: set up terminal, register signal handler, run tick loop.
     let poll_interval_ms = args.interval.unwrap_or(500);
     let mut state = DashboardAppState::new(poll_interval_ms);
+    let backend = Arc::new(backend);
+
+    // The local store only: under the cloud backend the listing it wraps
+    // adds the bucket's sessions with a LIST per call, which this thread
+    // never makes. Sessions found only in the bucket come from the feed.
+    let local = Arc::clone(&backend);
+    let mut refresh_local: LocalRefresh = Box::new(move |tree| match &*local {
+        Backend::Cloud(cloud) => dashboard_data::refresh(tree, cloud.local()),
+        Backend::Local(store) => dashboard_data::refresh(tree, store),
+    });
+
+    // The first local read comes before the feed starts, so its first scan
+    // already leaves this machine's own sessions to their local rows.
+    refresh_local(&mut state.tree)?;
+    let feed = match &*backend {
+        Backend::Cloud(cloud) => match RemoteFeed::spawn(
+            &cloud.bucket_handle(),
+            dashboard_data::local_session_ids(&state.tree),
+            RESCAN_INTERVAL,
+        ) {
+            Ok(feed) => Some(feed),
+            Err(e) => {
+                eprintln!("note: other machines' sessions won't be read: {e}");
+                None
+            }
+        },
+        Backend::Local(_) => None,
+    };
+    let mut sources = LoopSources {
+        refresh_local,
+        feed,
+        sessions: Some(SessionLoader::spawn(Arc::clone(&backend))?),
+    };
 
     // Register SIGINT/SIGTERM handlers using signal-hook so that Ctrl+C from a
     // non-interactive context (e.g. piped stdin) is caught even without a keypress.
@@ -512,58 +558,319 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
     let crossterm_backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(crossterm_backend)?;
 
+    // Quitting returns from here and the process exits; the feed and
+    // Session tab threads are never joined, so a request that never
+    // answers can't hold the exit.
+    run_loop(
+        &mut terminal,
+        &mut state,
+        &mut sources,
+        &mut TerminalEvents,
+        &SystemClock,
+        &shutdown,
+        &mut |_, _, _| {},
+    )
+}
+
+/// How long the loop waits for input on each tick.
+pub const TICK: Duration = Duration::from_millis(50);
+
+/// Where the dashboard loop reads terminal events from.
+pub trait EventSource {
+    /// The next event, waiting at most `timeout`; `None` when none came.
+    fn next_event(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
+}
+
+/// The terminal's own events, read through crossterm.
+pub struct TerminalEvents;
+
+impl EventSource for TerminalEvents {
+    fn next_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        if event::poll(timeout)? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The time the loop stamps each drawn frame with.
+pub trait Clock {
+    /// Now.
+    fn now(&self) -> Instant;
+}
+
+/// The monotonic system clock.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Re-reads this machine's sessions into the tree.
+pub type LocalRefresh = Box<dyn FnMut(&mut SessionTree) -> Result<()>>;
+
+/// What the dashboard loop reads besides the terminal. None of it makes a
+/// request on the loop's thread.
+pub struct LoopSources {
+    /// Re-read this machine's sessions into the tree, from the local store
+    /// only.
+    pub refresh_local: LocalRefresh,
+    /// Other machines' sessions, read on the feed's own thread; `None` on
+    /// the local backend.
+    pub feed: Option<RemoteFeed>,
+    /// The Session tab's reads, on the loader's own thread; `None` leaves
+    /// the tab loading.
+    pub sessions: Option<SessionLoader>,
+}
+
+/// Run the dashboard until a quit key or `shutdown`, drawing into
+/// `terminal`. Each tick waits up to [`TICK`] for one event from `events`,
+/// refreshes local rows every `poll_every_n_ticks`, swaps in the feed's
+/// newest snapshot whole, takes the Session tab's answers, and draws;
+/// `on_frame` sees each frame with the time `clock` gives for it.
+pub fn run_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut DashboardAppState,
+    sources: &mut LoopSources,
+    events: &mut dyn EventSource,
+    clock: &dyn Clock,
+    shutdown: &AtomicBool,
+    on_frame: &mut dyn FnMut(Instant, &Buffer, &DashboardAppState),
+) -> Result<()> {
+    refresh_local_rows(state, sources)?;
     loop {
-        // Poll for keyboard input with a 50ms timeout (one tick).
-        if event::poll(Duration::from_millis(50))? {
-            if let event::Event::Key(key) = event::read()? {
-                state.handle_key(key);
-            }
+        if let Some(Event::Key(key)) = events.next_event(TICK)? {
+            state.handle_key(key);
         }
 
         state.tick_count += 1;
         if state.tick_count >= state.poll_every_n_ticks {
-            dashboard_data::refresh(&mut state.tree, backend)?;
-            state.clamp_cursor();
+            refresh_local_rows(state, sources)?;
             state.tick_count = 0;
+        }
+
+        // The feed hands over complete snapshots; the remote rows are
+        // replaced whole, never patched.
+        if let Some(snapshot) = sources.feed.as_ref().and_then(RemoteFeed::latest) {
+            dashboard_data::replace_remote_rows(&mut state.tree, &snapshot.rows);
+            state.tree.remote_unreadable = snapshot.unreadable;
+            state.clamp_cursor();
         }
 
         // Refresh the detail cache for the focused session on every tick (not
         // only on poll ticks) so opening a session shows its data at once; the
         // session/mtime guard keeps this to a map lookup when nothing changed.
+        // A remote row reads nothing.
         state.refresh_detail(dashboard_data::read_detail);
 
-        // The Session tab loads on every tick but reads only when its plan
-        // says the cached view is stale: the snapshot on entry or a
-        // state-file mtime change, then one bounded preview for the focused
-        // key.
-        if state.active_tab == DashboardTab::Session {
-            if let Some(id) = state.focused_id.clone() {
-                if let Some(mtime) = state.tree.sessions.get(&id).map(|s| s.mtime) {
-                    state.session_tab.tick(
-                        &id,
-                        mtime,
-                        |name| crate::session_view::snapshot(backend, name),
-                        |name, key| {
-                            crate::session_view::read_key_preview(
-                                backend,
-                                name,
-                                key,
-                                crate::session_view::EXCERPT_BOUND,
-                            )
-                        },
-                    );
-                }
-            }
+        if let Some(loader) = sources.sessions.as_mut() {
+            load_session_tab(state, loader);
         }
 
         if state.should_quit || shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        terminal.draw(|f| render_frame(f, &state))?;
+        let frame = terminal.draw(|f| render_frame(f, state))?;
+        on_frame(clock.now(), frame.buffer, state);
     }
 
     Ok(())
+}
+
+/// Re-read local rows and tell the feed which sessions they hold.
+fn refresh_local_rows(state: &mut DashboardAppState, sources: &mut LoopSources) -> Result<()> {
+    (sources.refresh_local)(&mut state.tree)?;
+    state.clamp_cursor();
+    if let Some(feed) = &sources.feed {
+        feed.set_local_ids(dashboard_data::local_session_ids(&state.tree));
+    }
+    Ok(())
+}
+
+/// Take the Session tab worker's answers that still match what the tab
+/// shows, then ask for what its plan says is stale. Only a local row loads:
+/// a remote row's Session tab is drawn from its summary.
+fn load_session_tab(state: &mut DashboardAppState, loader: &mut SessionLoader) {
+    let focused = state.focused_id.clone().and_then(|id| {
+        let s = state.tree.sessions.get(&id)?;
+        (!s.remote).then_some((id, s.mtime))
+    });
+    for answer in loader.answers() {
+        let Some((id, mtime)) = focused.as_ref() else {
+            continue;
+        };
+        match answer {
+            SessionAnswer::Snapshot {
+                session,
+                mtime: at,
+                result,
+            } if session == *id
+                && at == *mtime
+                && state.session_tab.plan(id, *mtime) == SessionLoad::Snapshot =>
+            {
+                state.session_tab.apply_snapshot(id, *mtime, *result);
+            }
+            SessionAnswer::Preview {
+                session,
+                key,
+                mtime: at,
+                preview,
+            } if session == *id
+                && at == *mtime
+                && state.session_tab.plan(id, *mtime) == SessionLoad::Preview(key.clone()) =>
+            {
+                state.session_tab.apply_preview(id, key, *mtime, preview);
+            }
+            _ => {}
+        }
+    }
+    if state.active_tab != DashboardTab::Session {
+        return;
+    }
+    let Some((session, mtime)) = focused else {
+        return;
+    };
+    match state.session_tab.plan(&session, mtime) {
+        SessionLoad::Snapshot => loader.ask(SessionRequest::Snapshot { session, mtime }),
+        SessionLoad::Preview(key) => loader.ask(SessionRequest::Preview {
+            session,
+            key,
+            mtime,
+        }),
+        SessionLoad::Idle => {}
+    }
+}
+
+/// A read the Session tab asks its worker for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionRequest {
+    Snapshot {
+        session: String,
+        mtime: SystemTime,
+    },
+    Preview {
+        session: String,
+        key: String,
+        mtime: SystemTime,
+    },
+}
+
+/// The worker's answer to a [`SessionRequest`].
+enum SessionAnswer {
+    Snapshot {
+        session: String,
+        mtime: SystemTime,
+        result: Box<Result<SessionViewSnapshot, SnapshotError>>,
+    },
+    Preview {
+        session: String,
+        key: String,
+        mtime: SystemTime,
+        preview: KeyPreview,
+    },
+}
+
+impl SessionAnswer {
+    /// The request this answers.
+    fn request(&self) -> SessionRequest {
+        match self {
+            SessionAnswer::Snapshot { session, mtime, .. } => SessionRequest::Snapshot {
+                session: session.clone(),
+                mtime: *mtime,
+            },
+            SessionAnswer::Preview {
+                session,
+                key,
+                mtime,
+                ..
+            } => SessionRequest::Preview {
+                session: session.clone(),
+                key: key.clone(),
+                mtime: *mtime,
+            },
+        }
+    }
+}
+
+/// The Session tab's reads (the snapshot, which under the cloud backend
+/// can probe the bucket and fetch its manifest, and the focused key's
+/// preview), run on a thread of their own so the loop never waits on them.
+/// The tab says "Loading session" until the answer comes. Dropping the
+/// handle ends the thread once its current read returns; nothing waits.
+pub struct SessionLoader {
+    requests: Sender<SessionRequest>,
+    answers: Receiver<SessionAnswer>,
+    in_flight: Option<SessionRequest>,
+}
+
+impl SessionLoader {
+    /// Start the worker on `backend`.
+    pub fn spawn(backend: Arc<crate::session::Backend>) -> io::Result<Self> {
+        let (requests, inbox) = mpsc::channel::<SessionRequest>();
+        let (outbox, answers) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("koto-dashboard-session".to_string())
+            .spawn(move || {
+                for request in inbox {
+                    let answer = match request {
+                        SessionRequest::Snapshot { session, mtime } => SessionAnswer::Snapshot {
+                            result: Box::new(crate::session_view::snapshot(&backend, &session)),
+                            session,
+                            mtime,
+                        },
+                        SessionRequest::Preview {
+                            session,
+                            key,
+                            mtime,
+                        } => SessionAnswer::Preview {
+                            preview: crate::session_view::read_key_preview(
+                                &backend,
+                                &session,
+                                &key,
+                                crate::session_view::EXCERPT_BOUND,
+                            ),
+                            session,
+                            key,
+                            mtime,
+                        },
+                    };
+                    if outbox.send(answer).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests,
+            answers,
+            in_flight: None,
+        })
+    }
+
+    /// Ask for `request` unless it is the one already in flight.
+    fn ask(&mut self, request: SessionRequest) {
+        if self.in_flight.as_ref() == Some(&request) {
+            return;
+        }
+        if self.requests.send(request.clone()).is_ok() {
+            self.in_flight = Some(request);
+        }
+    }
+
+    /// Every answer that has arrived, oldest first. Never blocks.
+    fn answers(&mut self) -> Vec<SessionAnswer> {
+        let mut out = Vec::new();
+        while let Ok(answer) = self.answers.try_recv() {
+            if self.in_flight.as_ref() == Some(&answer.request()) {
+                self.in_flight = None;
+            }
+            out.push(answer);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
