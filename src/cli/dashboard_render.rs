@@ -996,6 +996,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1285,6 +1288,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1570,6 +1576,9 @@ mod tests {
             is_unreadable: false,
             is_batch_task: false,
             is_request_leg: false,
+            machine: None,
+            workspace: None,
+            remote: false,
         }
     }
 

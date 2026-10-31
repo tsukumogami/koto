@@ -456,7 +456,7 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
     // are checked for their compact-duration shape and then replaced. Every
     // other byte of the row, tabs included, must match exactly.
     let mut cols: Vec<String> = row.split('\t').map(str::to_string).collect();
-    assert_eq!(cols.len(), 8, "the eight-column contract");
+    assert_eq!(cols.len(), 10, "the ten-column contract");
     for i in [2, 6] {
         assert!(
             !cols[i].is_empty()
@@ -470,7 +470,7 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
     }
     assert_eq!(
         cols.join("\t"),
-        "wf\t\t<clock>\tunknown\t\t\t<clock>\tpending",
+        "wf\t\t<clock>\tunknown\t\t\t<clock>\tpending\t\t",
         "the feed row for the fixture, golden apart from the clock"
     );
 

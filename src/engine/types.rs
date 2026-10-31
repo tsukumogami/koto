@@ -2355,12 +2355,6 @@ pub fn derive_intent(events: &[Event]) -> Option<String> {
     })
 }
 
-/// The session's intent as every surface shows it: the last `IntentUpdated`
-/// event, falling back to the header's `intent` field. `koto init --intent`
-/// and `koto session update --intent` record intent only as events and leave
-/// the header field empty, so a reader of the header alone never sees it.
-/// The dashboard, the session view and the `/workflows` label all read intent
-/// through this one rule so they cannot drift apart.
 /// The machine that produced a session, read from its own events: the
 /// `machine` of its `workflow_initialized` event. `None` when the session
 /// records none (created before the field existed), which every surface
@@ -2374,6 +2368,12 @@ pub fn producing_machine(events: &[Event]) -> Option<String> {
     })?
 }
 
+/// The session's intent as every surface shows it: the last `IntentUpdated`
+/// event, falling back to the header's `intent` field. `koto init --intent`
+/// and `koto session update --intent` record intent only as events and leave
+/// the header field empty, so a reader of the header alone never sees it.
+/// The dashboard, the session view and the `/workflows` label all read intent
+/// through this one rule so they cannot drift apart.
 pub fn effective_intent(header: &StateFileHeader, events: &[Event]) -> Option<String> {
     derive_intent(events).or_else(|| header.intent.clone())
 }

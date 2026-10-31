@@ -1414,7 +1414,27 @@ fn read_log_inner<H: LogHeader>(
 ) -> anyhow::Result<(H, Vec<Event>)> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    parse_log_content(&content, &path.display().to_string(), report)
+}
 
+/// Parse a session's state log held in memory, as [`read_events`] parses
+/// the file: the same header parse, sequence check and tail recovery, with
+/// the truncated-tail warning suppressed. For a caller that already holds
+/// the bytes it is about to push, such as the summary writer, so it never
+/// reads the log a second time.
+pub fn parse_state_log(bytes: &[u8]) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| EngineError::StateFileCorrupted(format!("state log is not UTF-8: {}", e)))?;
+    parse_log_content(content, "the state log", TailReport::Quiet)
+}
+
+/// The one parse of a log's text, shared by the file and in-memory readers.
+/// `source` names the log in a warning.
+fn parse_log_content<H: LogHeader>(
+    content: &str,
+    source: &str,
+    report: TailReport,
+) -> anyhow::Result<(H, Vec<Event>)> {
     let mut lines: Vec<&str> = content.lines().collect();
     // Remove trailing empty lines
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -1469,7 +1489,7 @@ fn read_log_inner<H: LogHeader>(
                                     "warning: final line in {} holds {} events written with no \
                                      newline between them (seq {}), reading them as separate \
                                      events; the next write to the session splits the line",
-                                    path.display(),
+                                    source,
                                     seqs.len(),
                                     join_seqs(&seqs)
                                 );
@@ -1483,8 +1503,7 @@ fn read_log_inner<H: LogHeader>(
                     if report == TailReport::Warn {
                         eprintln!(
                             "warning: truncated final line in {}, recovering: {}",
-                            path.display(),
-                            e
+                            source, e
                         );
                     }
                     break;
