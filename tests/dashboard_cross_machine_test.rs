@@ -656,10 +656,15 @@ fn tui_frame_after_a_key_press_arrives_within_200ms_when_the_bucket_never_answer
     // with it; the local row is drawn.
     let (at, lines) = &probe.frames[0];
     let waited = at.duration_since(pressed_at(1));
-    assert!(waited < Duration::from_millis(200), "frame after j took {waited:?}");
+    assert!(
+        waited < Duration::from_millis(200),
+        "frame after j took {waited:?}"
+    );
     assert!(lines[0].contains(" mine "), "focused: {:?}", lines[0]);
     assert!(
-        lines.iter().any(|l| l.contains("gated") || l.contains("check")),
+        lines
+            .iter()
+            .any(|l| l.contains("gated") || l.contains("check")),
         "local row drawn: {lines:#?}"
     );
 
@@ -667,7 +672,10 @@ fn tui_frame_after_a_key_press_arrives_within_200ms_when_the_bucket_never_answer
     // the local row still drawn.
     let (at, lines) = &probe.frames[1];
     let waited = at.duration_since(pressed_at(5));
-    assert!(waited < Duration::from_millis(200), "frame after Tab took {waited:?}");
+    assert!(
+        waited < Duration::from_millis(200),
+        "frame after Tab took {waited:?}"
+    );
     let text = lines.join("\n");
     assert!(
         text.contains("Loading session") || text.contains("State:"),

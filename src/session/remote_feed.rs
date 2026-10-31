@@ -302,7 +302,9 @@ impl RemoteFeed {
                     if stopped.load(Ordering::Relaxed) {
                         return;
                     }
-                    std::thread::sleep(STOP_POLL.min(until.saturating_duration_since(Instant::now())));
+                    std::thread::sleep(
+                        STOP_POLL.min(until.saturating_duration_since(Instant::now())),
+                    );
                 }
             })?;
         Ok(Self {

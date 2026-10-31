@@ -227,6 +227,10 @@ pub struct SessionTree {
     /// Surfaced as a trailing note (TUI) / count (`--once`) instead of dropping
     /// the sessions silently.
     pub unreadable: usize,
+    /// Count of other machines' summaries the last feed snapshot listed but
+    /// couldn't read. Kept apart from `unreadable`, which every local refresh
+    /// recomputes; the TUI's note shows the sum.
+    pub remote_unreadable: usize,
 }
 
 impl SessionTree {
@@ -236,6 +240,7 @@ impl SessionTree {
             sessions: HashMap::new(),
             roots: Vec::new(),
             unreadable: 0,
+            remote_unreadable: 0,
         }
     }
 }
@@ -659,7 +664,10 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 /// Replace the tree's remote rows with those of `rows`, a complete feed
 /// snapshot, keyed by [`remote_key`]. A session this machine holds a copy
 /// of stays its local row.
-pub fn replace_remote_rows(tree: &mut SessionTree, rows: &[crate::session::remote_feed::RemoteRow]) {
+pub fn replace_remote_rows(
+    tree: &mut SessionTree,
+    rows: &[crate::session::remote_feed::RemoteRow],
+) {
     tree.sessions.retain(|_, s| !s.remote);
     for row in rows {
         tree.sessions.insert(

@@ -740,9 +740,9 @@ impl DashboardAppState {
         let leaf_label = session
             .map(|s| derive_label(s, row_name(session_id, s)))
             .unwrap_or_else(|| session_id.to_string());
-        let marker = session.filter(|s| s.remote).map(|s| {
-            format!("@{}", s.machine.as_deref().unwrap_or("unknown"))
-        });
+        let marker = session
+            .filter(|s| s.remote)
+            .map(|s| format!("@{}", s.machine.as_deref().unwrap_or("unknown")));
         let display_name = match parent_label {
             Some(parent) => format!("{parent} \u{25b8} {leaf_label}"),
             None => leaf_label.clone(),

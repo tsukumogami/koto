@@ -495,11 +495,10 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
     // adds the bucket's sessions with a LIST per call, which this thread
     // never makes. Sessions found only in the bucket come from the feed.
     let local = Arc::clone(&backend);
-    let mut refresh_local: Box<dyn FnMut(&mut SessionTree) -> Result<()>> =
-        Box::new(move |tree| match &*local {
-            Backend::Cloud(cloud) => dashboard_data::refresh(tree, cloud.local()),
-            Backend::Local(store) => dashboard_data::refresh(tree, store),
-        });
+    let mut refresh_local: LocalRefresh = Box::new(move |tree| match &*local {
+        Backend::Cloud(cloud) => dashboard_data::refresh(tree, cloud.local()),
+        Backend::Local(store) => dashboard_data::refresh(tree, store),
+    });
 
     // The first local read comes before the feed starts, so its first scan
     // already leaves this machine's own sessions to their local rows.
@@ -601,12 +600,15 @@ impl Clock for SystemClock {
     }
 }
 
+/// Re-reads this machine's sessions into the tree.
+pub type LocalRefresh = Box<dyn FnMut(&mut SessionTree) -> Result<()>>;
+
 /// What the dashboard loop reads besides the terminal. None of it makes a
 /// request on the loop's thread.
 pub struct LoopSources {
     /// Re-read this machine's sessions into the tree, from the local store
     /// only.
-    pub refresh_local: Box<dyn FnMut(&mut SessionTree) -> Result<()>>,
+    pub refresh_local: LocalRefresh,
     /// Other machines' sessions, read on the feed's own thread; `None` on
     /// the local backend.
     pub feed: Option<RemoteFeed>,
@@ -645,6 +647,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // replaced whole, never patched.
         if let Some(snapshot) = sources.feed.as_ref().and_then(RemoteFeed::latest) {
             dashboard_data::replace_remote_rows(&mut state.tree, &snapshot.rows);
+            state.tree.remote_unreadable = snapshot.unreadable;
             state.clamp_cursor();
         }
 
@@ -700,7 +703,7 @@ fn load_session_tab(state: &mut DashboardAppState, loader: &mut SessionLoader) {
                 && at == *mtime
                 && state.session_tab.plan(id, *mtime) == SessionLoad::Snapshot =>
             {
-                state.session_tab.apply_snapshot(id, *mtime, result);
+                state.session_tab.apply_snapshot(id, *mtime, *result);
             }
             SessionAnswer::Preview {
                 session,
@@ -752,7 +755,7 @@ enum SessionAnswer {
     Snapshot {
         session: String,
         mtime: SystemTime,
-        result: Result<SessionViewSnapshot, SnapshotError>,
+        result: Box<Result<SessionViewSnapshot, SnapshotError>>,
     },
     Preview {
         session: String,
@@ -806,7 +809,7 @@ impl SessionLoader {
                 for request in inbox {
                     let answer = match request {
                         SessionRequest::Snapshot { session, mtime } => SessionAnswer::Snapshot {
-                            result: crate::session_view::snapshot(&backend, &session),
+                            result: Box::new(crate::session_view::snapshot(&backend, &session)),
                             session,
                             mtime,
                         },

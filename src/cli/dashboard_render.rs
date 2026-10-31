@@ -301,8 +301,10 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
 
     // Trailing note for sessions whose state file failed to parse, so they are
     // surfaced rather than silently dropped.
-    if state.tree.unreadable > 0 {
-        let note = format!("\u{26a0} {} unreadable session(s)", state.tree.unreadable);
+    // Local state files and other machines' summaries alike.
+    let unreadable = state.tree.unreadable + state.tree.remote_unreadable;
+    if unreadable > 0 {
+        let note = format!("\u{26a0} {} unreadable session(s)", unreadable);
         rows.push(Row::new(vec![Cell::from(note)]).style(Style::default().fg(Color::Red)));
     }
 
@@ -442,7 +444,10 @@ fn render_remote_session_tab(
             .unwrap_or_else(|| ABSENT.to_string())
     };
     let facts = [
-        ("Machine", session.machine.as_deref().unwrap_or("unknown").to_string()),
+        (
+            "Machine",
+            session.machine.as_deref().unwrap_or("unknown").to_string(),
+        ),
         ("Workspace", fact(session.workspace.as_deref())),
         ("Session", fact(Some(row_name(key, session)))),
         ("State", fact(session.current_state.as_deref())),
@@ -456,7 +461,10 @@ fn render_remote_session_tab(
         .flat_map(|(label, value)| wrap_fact(label, value, width))
         .collect();
     rows.push(String::new());
-    rows.push(clip("Context keys and history live on that machine.", width));
+    rows.push(clip(
+        "Context keys and history live on that machine.",
+        width,
+    ));
     f.render_widget(
         Paragraph::new(Text::from(
             rows.into_iter().map(Line::from).collect::<Vec<_>>(),
@@ -2679,10 +2687,7 @@ mod tests {
         s.machine = machine.map(str::to_string);
         s.workspace = Some(REMOTE_WS.to_string());
         s.remote = true;
-        (
-            crate::cli::dashboard_data::remote_key(name, REMOTE_WS),
-            s,
-        )
+        (crate::cli::dashboard_data::remote_key(name, REMOTE_WS), s)
     }
 
     /// A local row, live and running.
@@ -2702,7 +2707,9 @@ mod tests {
 
     /// The tree with local and remote rows as the loop holds them after a
     /// local refresh and a feed snapshot.
-    fn tree_state(rows: Vec<(String, crate::cli::dashboard_data::CachedSession)>) -> DashboardAppState {
+    fn tree_state(
+        rows: Vec<(String, crate::cli::dashboard_data::CachedSession)>,
+    ) -> DashboardAppState {
         let mut state = DashboardAppState::new(500);
         for (key, s) in rows {
             state.tree.sessions.insert(key, s);
@@ -2760,7 +2767,11 @@ mod tests {
             "first row: {:?}",
             lines[2]
         );
-        assert!(lines[2].contains('\u{25cf}'), "needs-you glyph: {:?}", lines[2]);
+        assert!(
+            lines[2].contains('\u{25cf}'),
+            "needs-you glyph: {:?}",
+            lines[2]
+        );
         assert!(
             !lines.iter().any(|l| l.contains("Nothing needs you")),
             "{lines:#?}"
@@ -2805,8 +2816,14 @@ mod tests {
 
     #[test]
     fn fit_name_cell_cuts_the_label_before_the_marker() {
-        assert_eq!(fit_name_cell("review", Some("@machine-a"), 40), "review @machine-a");
-        assert_eq!(fit_name_cell("a long label", Some("@m"), 8), "a lo\u{2026} @m");
+        assert_eq!(
+            fit_name_cell("review", Some("@machine-a"), 40),
+            "review @machine-a"
+        );
+        assert_eq!(
+            fit_name_cell("a long label", Some("@m"), 8),
+            "a lo\u{2026} @m"
+        );
         // A marker that can't fit whole keeps @ and 8 characters at least.
         let cell = fit_name_cell("label", Some("@abcdefghijklmnop"), 10);
         assert!(cell.starts_with("@abcdefgh"), "{cell:?}");
@@ -2817,7 +2834,8 @@ mod tests {
     #[test]
     fn same_named_sessions_are_two_rows_and_a_remote_child_nests_under_its_own_parent() {
         let (remote_key, remote) = remote_row("review", Some("machine-a"), Some("review"), false);
-        let (child_key, mut child) = remote_row("review.child", Some("machine-a"), Some("child"), false);
+        let (child_key, mut child) =
+            remote_row("review.child", Some("machine-a"), Some("child"), false);
         child.header.parent_workflow = Some("review".to_string());
         let mut state = tree_state(vec![
             ("review".to_string(), local_row("review", Some("review"))),
@@ -2839,16 +2857,25 @@ mod tests {
         assert_eq!(rows[at].task_counts.as_ref().map(|c| c.total), Some(1));
 
         let lines = frame_lines(&state, 78);
-        assert_eq!(name_cell_of(&lines, "review @machine-a").unwrap(), "review @machine-a");
+        assert_eq!(
+            name_cell_of(&lines, "review @machine-a").unwrap(),
+            "review @machine-a"
+        );
         assert!(
-            lines.iter().any(|l| l.contains("\u{2514}\u{2500} review \u{25b8} child @machine-a")),
+            lines
+                .iter()
+                .any(|l| l.contains("\u{2514}\u{2500} review \u{25b8} child @machine-a")),
             "{lines:#?}"
         );
         let unmarked: Vec<_> = lines
             .iter()
             .filter(|l| l.contains("review") && !l.contains('@'))
             .collect();
-        assert_eq!(unmarked.len(), 1, "B's own review once, unmarked: {lines:#?}");
+        assert_eq!(
+            unmarked.len(),
+            1,
+            "B's own review once, unmarked: {lines:#?}"
+        );
     }
 
     #[test]
@@ -2916,7 +2943,11 @@ mod tests {
 
     #[test]
     fn a_remote_rows_other_tabs_say_its_detail_lives_on_its_own_machine() {
-        for tab in [DashboardTab::Summary, DashboardTab::History, DashboardTab::Remaining] {
+        for tab in [
+            DashboardTab::Summary,
+            DashboardTab::History,
+            DashboardTab::Remaining,
+        ] {
             let buffer = draw_remote(tab.clone());
             // Below the tabs row, one line of text and nothing else.
             let content: Vec<String> = pane_rows(&buffer)
@@ -2953,8 +2984,24 @@ mod tests {
 
     #[test]
     fn a_local_session_from_before_the_machine_stamp_reads_unknown() {
-        let (buffer, _) = draw(loaded(snapshot(vec![entry("plan", 3)]), 0, text("x", false)));
+        let (buffer, _) = draw(loaded(
+            snapshot(vec![entry("plan", 3)]),
+            0,
+            text("x", false),
+        ));
         let text = pane_text(&buffer);
         assert!(text.contains("Machine: unknown"), "{text}");
+    }
+
+    #[test]
+    fn the_unreadable_note_counts_local_and_remote_summaries() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.unreadable = 1;
+        state.tree.remote_unreadable = 2;
+        let lines = frame_lines(&state, 78);
+        assert!(
+            lines.iter().any(|l| l.contains("3 unreadable session(s)")),
+            "{lines:#?}"
+        );
     }
 }
