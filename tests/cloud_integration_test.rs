@@ -537,3 +537,181 @@ fn cloud_config_list_redacts_credentials() {
         .stdout(predicates::str::contains("<set>"))
         .stdout(predicates::str::contains("secret-key-value").not());
 }
+
+/// Deletes exactly the keys a test wrote, and nothing else, when dropped.
+///
+/// Each key is recorded before its PUT is sent, so a PUT that fails after
+/// the object landed is still removed. There is no prefix-wide delete.
+struct ExactKeyCleanup<'a> {
+    bucket: &'a s3::Bucket,
+    keys: Vec<String>,
+}
+
+impl ExactKeyCleanup<'_> {
+    fn put(&mut self, key: &str, body: &[u8]) -> std::time::Duration {
+        self.keys.push(key.to_string());
+        let started = std::time::Instant::now();
+        self.bucket
+            .put_object(key, body)
+            .unwrap_or_else(|e| panic!("PUT {key} failed: {e}"));
+        started.elapsed()
+    }
+
+    fn remove_all(&mut self) {
+        for key in self.keys.drain(..) {
+            if let Err(e) = self.bucket.delete_object(&key) {
+                eprintln!("could not remove probe object {key}: {e}");
+            }
+        }
+    }
+}
+
+impl Drop for ExactKeyCleanup<'_> {
+    fn drop(&mut self) {
+        self.remove_all();
+    }
+}
+
+/// The R2 delimiter probe: koto's dashboard lists each workspace prefix with
+/// the delimiter `/ctx/`, which must return a session's top-level objects
+/// and fold its context tree into one common prefix. If the provider doesn't
+/// honour a multi-character delimiter, the dashboard's layout has to change.
+///
+/// It writes a session-shaped fixture under a fresh 16-hex prefix in the CI
+/// test bucket, lists it, times the `summary.json` PUT made right after the
+/// state PUT, and removes exactly the keys it wrote. It runs only under
+/// GitHub Actions, and refuses a bucket that is koto's default or the one
+/// this environment's live session backend names.
+#[test]
+fn ctx_delimiter_listing_folds_the_context_tree() {
+    let (endpoint, bucket_name) = match s3_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("S3 env not set, skipping");
+            return;
+        }
+    };
+    assert_eq!(
+        env::var("GITHUB_ACTIONS").as_deref(),
+        Ok("true"),
+        "the delimiter probe writes to the bucket and runs only in CI's cloud-integration job"
+    );
+    assert!(
+        !bucket_name.is_empty() && bucket_name != "koto-sessions",
+        "refusing to probe a bucket that isn't the CI test bucket"
+    );
+    if let Ok(live) = env::var("KOTO_SESSION_CLOUD_BUCKET") {
+        assert_ne!(
+            live, bucket_name,
+            "refusing to probe the live session bucket"
+        );
+    }
+
+    let region = s3::Region::Custom {
+        region: "auto".to_string(),
+        endpoint: endpoint.clone(),
+    };
+    let credentials = s3::creds::Credentials::new(
+        Some(&env::var("AWS_ACCESS_KEY_ID").unwrap()),
+        Some(&env::var("AWS_SECRET_ACCESS_KEY").unwrap()),
+        None,
+        None,
+        None,
+    )
+    .expect("credentials");
+    let bucket = s3::Bucket::new(&bucket_name, region, credentials)
+        .expect("bucket client")
+        .with_request_timeout(std::time::Duration::from_secs(10))
+        .expect("bucket client with a timeout");
+
+    // A prefix no other run shares: the run's id, its attempt, this process
+    // and the time, hashed to the 16-hex shape of a workspace prefix.
+    let seed = format!(
+        "ctx-delimiter-probe:{}:{}:{}:{:?}",
+        env::var("GITHUB_RUN_ID").unwrap_or_default(),
+        env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),
+        std::process::id(),
+        std::time::SystemTime::now(),
+    );
+    let workspace = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(seed.as_bytes()))[..16].to_string()
+    };
+    let existing = bucket
+        .list(format!("{workspace}/"), None)
+        .unwrap_or_else(|e| panic!("endpoint {endpoint}: listing {workspace}/ failed: {e}"));
+    assert!(
+        existing.iter().all(|page| page.contents.is_empty()),
+        "prefix {workspace}/ already holds objects; refusing to write there"
+    );
+
+    let dir = format!("{workspace}/probe");
+    let state_key = format!("{dir}/koto-probe.state.jsonl");
+    let summary_key = format!("{dir}/summary.json");
+    let migrated_key = format!("{dir}/migrated.json");
+    let mut cleanup = ExactKeyCleanup {
+        bucket: &bucket,
+        keys: Vec::new(),
+    };
+    cleanup.put(
+        &state_key,
+        b"{\"schema_version\":1,\"workflow\":\"probe\"}\n",
+    );
+    let summary_put = cleanup.put(&summary_key, b"{\"schema\":1}");
+    cleanup.put(&migrated_key, b"{}");
+    cleanup.put(&format!("{dir}/ctx/go"), b"yes");
+    cleanup.put(&format!("{dir}/ctx/nested/key"), b"value");
+    eprintln!(
+        "summary.json PUT latency after the state PUT on {endpoint}: {summary_put:?} (limit 30s)"
+    );
+    assert!(
+        summary_put < std::time::Duration::from_secs(30),
+        "summary.json PUT took {summary_put:?}, over koto's 30 s action limit"
+    );
+
+    let pages = bucket
+        .list(format!("{workspace}/"), Some("/ctx/".to_string()))
+        .unwrap_or_else(|e| panic!("endpoint {endpoint}: /ctx/-delimited listing failed: {e}"));
+    let mut objects: Vec<String> = pages
+        .iter()
+        .flat_map(|page| page.contents.iter().map(|o| o.key.clone()))
+        .collect();
+    objects.sort();
+    let prefixes: Vec<String> = pages
+        .iter()
+        .filter_map(|page| page.common_prefixes.as_ref())
+        .flatten()
+        .map(|cp| cp.prefix.clone())
+        .collect();
+    let mut expected = vec![migrated_key.clone(), state_key.clone(), summary_key.clone()];
+    expected.sort();
+    assert_eq!(
+        (objects, prefixes),
+        (expected, vec![format!("{dir}/ctx/")]),
+        "endpoint {endpoint} does not honour the /ctx/ delimiter: expected the session's \
+         three top-level objects and one ctx/ common prefix"
+    );
+
+    // koto's own reader makes the same listing and sees the same session.
+    let reader = koto::session::remote_feed::RemoteReader::new(&bucket).expect("reader");
+    let sessions = reader
+        .list_workspace(&workspace)
+        .unwrap_or_else(|e| panic!("endpoint {endpoint}: koto's listing failed: {e}"));
+    let names: Vec<&String> = sessions.keys().collect();
+    assert_eq!(names, vec!["probe"], "endpoint {endpoint}: {sessions:?}");
+    let files: Vec<&String> = sessions["probe"].objects.keys().collect();
+    assert_eq!(
+        files,
+        vec!["koto-probe.state.jsonl", "migrated.json", "summary.json"],
+        "endpoint {endpoint}: {sessions:?}"
+    );
+
+    cleanup.remove_all();
+    let after = bucket
+        .list(format!("{workspace}/"), None)
+        .unwrap_or_else(|e| panic!("endpoint {endpoint}: listing after cleanup failed: {e}"));
+    assert!(
+        after.iter().all(|page| page.contents.is_empty()),
+        "probe objects left under {workspace}/"
+    );
+}

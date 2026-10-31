@@ -1519,7 +1519,8 @@ impl CloudBackend {
     /// holds under `state_etag`, after a push of the session's own state
     /// ([`crate::session::summary`]). Internal sessions get none. A failed
     /// PUT warns and never fails the push: the state is already in the
-    /// bucket, and the next push writes the summary again.
+    /// bucket. The summary is written again only when the session's state
+    /// is next pushed; a flush with no state change doesn't retry it.
     fn put_summary(&self, id: &str, data: &[u8], state_etag: Option<&str>) {
         use crate::session::summary::{SessionSummary, SUMMARY_FILE};
         if self.probes.read_only {

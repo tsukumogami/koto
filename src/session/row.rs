@@ -1,8 +1,8 @@
 //! A session's row: the facts the dashboard shows for it, derived from its
 //! header and event log by one pure function.
 //!
-//! The local dashboard reader (`crate::cli::dashboard_data::read_session`)
-//! and the summary a push publishes to the bucket
+//! The local dashboard reader (`read_session` in the CLI's dashboard data
+//! module) and the summary a push publishes to the bucket
 //! ([`crate::session::summary`]) both call [`derive_row`], so a row another
 //! machine reads from a summary equals what the producing machine's own
 //! dashboard derives from the log.
