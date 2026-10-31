@@ -182,7 +182,9 @@ struct ActiveStep {
 /// - running: `progress`.
 ///
 /// `state` is the session's current state; it is cut and escaped like a gate
-/// name before it is joined into the `error` line.
+/// name before it is joined into the `error` line. An empty `state` (a
+/// session that failed before it entered any state) gives the bare
+/// `cancelled` or `failed`, never a line ending in `at `.
 fn active_step(
     status: RenderStatus,
     blocked_gate: Option<&str>,
@@ -201,6 +203,13 @@ fn active_step(
             format!("gate {}: FAIL", gate_name_display(gate)),
         ),
         (RenderStatus::Completed, _) => step("done", false, String::new()),
+        // A session cancelled before it entered any state has no name to
+        // give; it reads the bare reason rather than a dangling `at `.
+        (RenderStatus::Failed, _) if state.is_empty() => step(
+            "error",
+            false,
+            if cancelled { "cancelled" } else { "failed" }.to_string(),
+        ),
         (RenderStatus::Failed, _) => {
             let how = if cancelled { "cancelled" } else { "ended" };
             step(
@@ -812,6 +821,19 @@ mod tests {
         let error = active_step(RenderStatus::Failed, None, false, &long).error;
         assert_eq!(error, format!("ended at {}", gate_name_display(&long)));
         assert!(!error.contains(&long), "the long state name is cut");
+    }
+
+    /// A failed session with no current state never gets an `error` line
+    /// that ends in `at ` with an empty name.
+    #[test]
+    fn active_step_on_a_failed_session_with_no_state_reads_a_reason() {
+        for (cancelled, want) in [(true, "cancelled"), (false, "failed")] {
+            let step = active_step(RenderStatus::Failed, None, cancelled, "");
+            assert_eq!(step.state, "error");
+            assert!(!step.blocked);
+            assert_eq!(step.error, want);
+            assert!(!step.error.trim_end().ends_with(" at"), "{:?}", step.error);
+        }
     }
 
     /// A session cancelled at a non-terminal state writes its active step as

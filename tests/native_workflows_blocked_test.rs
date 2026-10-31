@@ -227,3 +227,246 @@ fn a_control_character_in_the_gate_name_is_escaped() {
         "{summary}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unblocking and edge cases
+// ---------------------------------------------------------------------------
+
+/// Append a state-changing event of `kind` (`transitioned` or `rewound`)
+/// moving the session from `from` to `to`.
+fn move_to(backend: &LocalBackend, kind: &str, from: &str, to: &str) {
+    let body = match kind {
+        "rewound" => serde_json::json!({"from": from, "to": to}),
+        _ => serde_json::json!({"from": from, "to": to, "condition_type": "evidence"}),
+    };
+    backend
+        .append_event(WORKFLOW, &payload(kind, body), "2026-01-01T00:03:00Z")
+        .unwrap();
+}
+
+/// No `workflow_agent` step is flagged blocked and the summary says nothing
+/// about being blocked.
+fn assert_not_blocked(v: &serde_json::Value) {
+    assert_ne!(v["koto"]["status"], "blocked", "{v}");
+    let steps = v["workflowProgress"].as_array().expect("workflowProgress");
+    for step in steps.iter().filter(|n| n["type"] == "workflow_agent") {
+        assert!(step.get("blocked").is_none(), "a blocked step: {step}");
+    }
+    let summary = v["summary"].as_str().unwrap();
+    assert!(!summary.contains("blocked"), "{summary}");
+}
+
+/// A passing evaluation of the gate that blocked the session clears the
+/// reading on the next write.
+#[test]
+fn a_passing_reevaluation_clears_the_blocked_reading() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    evaluate_gate(&backend, "tests-pass", "failed");
+    assert_eq!(read_entry(wf_dir.path())["koto"]["status"], "blocked");
+
+    evaluate_gate(&backend, "tests-pass", "passed");
+
+    let v = read_entry(wf_dir.path());
+    assert_not_blocked(&v);
+    assert_eq!(v["koto"]["status"], "running");
+    assert_eq!(verify_step(&v)["state"], "progress");
+}
+
+/// Advancing out of the blocked state clears the reading.
+#[test]
+fn an_advance_clears_the_blocked_reading() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    evaluate_gate(&backend, "tests-pass", "failed");
+    assert_eq!(read_entry(wf_dir.path())["koto"]["status"], "blocked");
+
+    move_to(&backend, "transitioned", "verify", "review");
+
+    let v = read_entry(wf_dir.path());
+    assert_not_blocked(&v);
+    assert_eq!(v["koto"]["currentState"], "review", "{v}");
+}
+
+/// Rewinding to an earlier state clears the reading.
+#[test]
+fn a_rewind_clears_the_blocked_reading() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    evaluate_gate(&backend, "tests-pass", "failed");
+    assert_eq!(read_entry(wf_dir.path())["koto"]["status"], "blocked");
+
+    move_to(&backend, "rewound", "verify", "implement");
+
+    let v = read_entry(wf_dir.path());
+    assert_not_blocked(&v);
+    assert_eq!(v["status"], "running");
+    assert_eq!(v["koto"]["status"], "running");
+    assert_eq!(v["koto"]["currentState"], "implement", "{v}");
+}
+
+/// Leaving the blocked state and entering it again starts a new epoch: with
+/// no gate evaluated since, the session isn't blocked and the re-entered
+/// step carries no `error`.
+#[test]
+fn reentering_without_a_new_evaluation_clears_the_blocked_reading() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    evaluate_gate(&backend, "tests-pass", "failed");
+    assert_eq!(read_entry(wf_dir.path())["koto"]["status"], "blocked");
+
+    move_to(&backend, "transitioned", "verify", "implement");
+    move_to(&backend, "transitioned", "implement", "verify");
+
+    let v = read_entry(wf_dir.path());
+    assert_not_blocked(&v);
+    assert_eq!(v["koto"]["status"], "running");
+    let step = verify_step(&v);
+    assert_eq!(step["state"], "progress");
+    assert!(step.get("error").is_none(), "{step}");
+    assert_eq!(v["summary"], "koto \u{b7} impl-feature \u{b7} verify");
+}
+
+/// With two gates in one state the last one evaluated decides, and it is
+/// the one named.
+#[test]
+fn the_last_evaluated_of_two_gates_decides_and_is_named() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+
+    evaluate_gate(&backend, "gate-a", "failed");
+    evaluate_gate(&backend, "gate-b", "passed");
+    let v = read_entry(wf_dir.path());
+    assert_not_blocked(&v);
+    assert_eq!(v["koto"]["status"], "running");
+
+    evaluate_gate(&backend, "gate-a", "passed");
+    evaluate_gate(&backend, "gate-b", "failed");
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["koto"]["status"], "blocked");
+    let step = verify_step(&v);
+    assert_eq!(step["blocked"], true);
+    assert_eq!(step["error"], "gate gate-b: FAIL");
+    let summary = v["summary"].as_str().unwrap();
+    assert!(
+        summary.ends_with(" \u{b7} blocked on gate gate-b"),
+        "{summary}"
+    );
+    assert!(!summary.contains("gate-a"), "{summary}");
+}
+
+/// A gate-blocked session whose compiled template can't be read has no phase
+/// list, and still reads blocked through its top-level status, `koto.status`
+/// and summary.
+#[test]
+fn a_blocked_session_without_a_readable_template_still_reads_blocked() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    std::fs::remove_file(backend.session_dir(WORKFLOW).join("template.json")).unwrap();
+
+    evaluate_gate(&backend, "tests-pass", "failed");
+
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["status"], "running");
+    assert_eq!(v["koto"]["status"], "blocked");
+    let summary = v["summary"].as_str().unwrap();
+    assert!(summary.contains("blocked"), "{summary}");
+    assert!(
+        summary.ends_with(" \u{b7} blocked on gate tests-pass"),
+        "{summary}"
+    );
+    assert!(v.get("workflowProgress").is_none(), "{v}");
+}
+
+/// A published target that can't be written (a regular file sits where its
+/// directory should be) never fails the commit: every append succeeds and
+/// the session's state moves as it would with nothing rendered.
+#[test]
+fn an_unwritable_target_never_fails_the_commit() {
+    let base = tempfile::TempDir::new().unwrap();
+    let parent = tempfile::TempDir::new().unwrap();
+    let blocker = parent.path().join("not-a-dir");
+    std::fs::write(&blocker, b"a regular file").unwrap();
+    let target = blocker.join("workflows");
+
+    let backend = session_at_verify(base.path(), &target);
+    evaluate_gate(&backend, "tests-pass", "failed");
+    move_to(&backend, "transitioned", "verify", "review");
+
+    assert!(blocker.is_file(), "the regular file is left as it was");
+    let (_, events) = backend.read_events(WORKFLOW).unwrap();
+    assert_eq!(
+        koto::engine::types::derive_state_from_log(&events).as_deref(),
+        Some("review")
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::GateEvaluated { gate, outcome, .. }
+                if gate == "tests-pass" && outcome == "failed"
+        )),
+        "the gate evaluation was committed"
+    );
+}
+
+/// A session cancelled before it entered any state has no current state; no
+/// step's `error`, phase detail or summary ends in `at ` with an empty name.
+#[test]
+fn a_failed_session_with_no_current_state_writes_no_empty_state_name() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+    let init = event(
+        1,
+        "workflow_initialized",
+        serde_json::json!({"template_path": "template.json", "variables": {}}),
+    );
+    backend
+        .init_state_file(WORKFLOW, header(), vec![init])
+        .unwrap();
+    std::fs::write(
+        backend.session_dir(WORKFLOW).join("template.json"),
+        TEMPLATE,
+    )
+    .unwrap();
+    publish_location(
+        &backend,
+        &backend,
+        WORKFLOW,
+        wf_dir.path().to_str().unwrap(),
+    )
+    .unwrap();
+    backend
+        .append_event(
+            WORKFLOW,
+            &payload(
+                "workflow_cancelled",
+                serde_json::json!({"state": "", "reason": "abandoned"}),
+            ),
+            "2026-01-01T00:01:00Z",
+        )
+        .unwrap();
+
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["status"], "failed");
+    assert_eq!(v["koto"]["status"], "failed");
+    assert!(v["koto"]["currentState"].is_null(), "{v}");
+    for step in v["workflowProgress"].as_array().into_iter().flatten() {
+        if let Some(error) = step.get("error").and_then(|e| e.as_str()) {
+            assert!(!error.is_empty(), "{step}");
+            assert!(!error.trim_end().ends_with(" at"), "{step}");
+        }
+    }
+    for phase in v["phases"].as_array().into_iter().flatten() {
+        let detail = phase["detail"].as_str().unwrap_or("");
+        assert!(!detail.trim_end().ends_with(" at"), "{phase}");
+    }
+    let summary = v["summary"].as_str().unwrap();
+    assert!(!summary.trim_end().ends_with(" at"), "{summary}");
+}
