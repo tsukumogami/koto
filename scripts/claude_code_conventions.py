@@ -27,11 +27,20 @@ Subcommands:
       With --alter, applies that convention's demonstration mutation to a
       private copy-on-write map of the evidence first; the file itself is
       never written.
+  self-test <file>
+      Checks the guard against itself, with no release and no network: builds
+      synthetic evidence from the expectations alone (each probe's anchor
+      followed by its token), requires every convention to pass on it, then
+      applies each convention's demonstration mutation in turn and requires
+      that convention to fail. Exits 1 when any of those doesn't hold, so a
+      probe or a demonstration that no longer catches anything fails here
+      before it can pass a real release silently.
 
-Exit statuses: 0 every convention holds, 1 a convention failed, 2 the package
-could not be read (extract), 3 the expectations file is bad, 64 usage, 70 an
-internal error. A crash must never exit 1, which would read as a convention
-failure, so main() maps any unexpected exception to 70.
+Exit statuses: 0 every convention holds (self-test: the guard caught every
+mutation), 1 a convention failed (self-test: the guard missed one), 2 the
+package or executable could not be read, 3 the expectations file is bad, 64
+usage, 70 an internal error. A crash must never exit 1, which would read as a
+convention failure, so main() maps any unexpected exception to 70.
 """
 
 import json
@@ -146,10 +155,15 @@ def _load_expectations(path):
             isinstance(probes, list) and probes,
             where + ".probes must be a non-empty list",
         )
+        items = set()
         for pi, probe in enumerate(probes):
             pw = "%s.probes[%d]" % (where, pi)
             _require(isinstance(probe, dict), pw + " must be an object")
-            _require(_nonempty_str(probe.get("item")), pw + ".item must be a string")
+            item = probe.get("item")
+            _require(_nonempty_str(item), pw + ".item must be a string")
+            # One probe per item, so a FAIL line names exactly one probe.
+            _require(item not in items, pw + ".item %r is repeated" % item)
+            items.add(item)
             token = probe.get("token")
             _require(_nonempty_str(token), pw + ".token must be a string")
             anchor = probe.get("anchor")
@@ -169,6 +183,23 @@ def _load_expectations(path):
                     and 0 < window <= MAX_WINDOW,
                     pw + ".window must be an integer from 1 to %d" % MAX_WINDOW,
                 )
+        # Fields koto writes that the release doesn't read, each with the
+        # reason. The guard itself ignores them; the offline coverage test
+        # (tests/native_workflows_conventions.rs) accepts a shape-fixture field
+        # that is either a probe's item or listed here, so leaving a field
+        # unprobed is a reviewed choice, never an omission.
+        unread = conv.get("unread", [])
+        _require(isinstance(unread, list), where + ".unread must be a list")
+        fields = set()
+        for ui, entry in enumerate(unread):
+            uw = "%s.unread[%d]" % (where, ui)
+            _require(isinstance(entry, dict), uw + " must be an object")
+            field = entry.get("field")
+            _require(_nonempty_str(field), uw + ".field must be a string")
+            _require(_nonempty_str(entry.get("reason")), uw + ".reason must be a string")
+            _require(field not in fields, uw + ".field %r is repeated" % field)
+            _require(field not in items, uw + ".field %r also has a probe" % field)
+            fields.add(field)
     return data
 
 
@@ -289,36 +320,96 @@ def scan(data, evidence, alter):
                 "altering %s: %s -> %s (%d occurrences)"
                 % (alter_conv["name"], demo["from"], demo["to"], count)
             )
-        anchor_cache = {}
-        results = []
-        for conv in data["conventions"]:
-            ok = True
-            reported_anchors = set()
-            for probe in conv["probes"]:
-                reason = evaluate(m, probe, anchor_cache)
-                if reason is None:
-                    continue
-                ok = False
-                name = conv["name"]
-                if reason == "anchor_missing":
-                    # One line per missing anchor, not per probe that uses it.
-                    if probe["anchor"] not in reported_anchors:
-                        reported_anchors.add(probe["anchor"])
-                        print('FAIL %s: anchor "%s" not found' % (name, probe["anchor"]))
-                elif reason == "not_near":
-                    print(
-                        'FAIL %s: %s not found within %d bytes of "%s"'
-                        % (name, probe["item"], probe["window"], probe["anchor"])
-                    )
-                else:
-                    print("FAIL %s: %s not found" % (name, probe["item"]))
-            results.append((conv["name"], ok))
+        fail_lines, results = check(data, m)
     finally:
         m.close()
 
+    for line in fail_lines:
+        print(line)
     for name, ok in results:
         print("%s: %s" % (name, "ok" if ok else "FAIL"))
     return EXIT_OK if all(ok for _, ok in results) else EXIT_FAIL
+
+
+def check(data, buf):
+    """Evaluates every probe of every convention against `buf`.
+
+    Returns the FAIL lines and a (convention name, ok) pair per convention,
+    in file order. Every convention is evaluated, so one break never hides
+    another. `buf` is a map or a bytes-like object; it is only searched.
+    """
+    anchor_cache = {}
+    fail_lines = []
+    results = []
+    for conv in data["conventions"]:
+        ok = True
+        reported_anchors = set()
+        name = conv["name"]
+        for probe in conv["probes"]:
+            reason = evaluate(buf, probe, anchor_cache)
+            if reason is None:
+                continue
+            ok = False
+            if reason == "anchor_missing":
+                # One line per missing anchor, not per probe that uses it.
+                if probe["anchor"] not in reported_anchors:
+                    reported_anchors.add(probe["anchor"])
+                    fail_lines.append('FAIL %s: anchor "%s" not found' % (name, probe["anchor"]))
+            elif reason == "not_near":
+                fail_lines.append(
+                    'FAIL %s: %s not found within %d bytes of "%s"'
+                    % (name, probe["item"], probe["window"], probe["anchor"])
+                )
+            else:
+                fail_lines.append("FAIL %s: %s not found" % (name, probe["item"]))
+        results.append((name, ok))
+    return fail_lines, results
+
+
+def synthetic_evidence(data):
+    """Evidence built from the expectations alone: every probe passes on it.
+
+    Each probe contributes its anchor directly followed by its token (or the
+    token alone when it has no anchor), so a token sits within any window of
+    at least its own length. Probes are separated by newlines, which no
+    anchor or token in the file needs.
+    """
+    parts = []
+    for conv in data["conventions"]:
+        for probe in conv["probes"]:
+            if probe.get("anchor") is not None:
+                parts.append(probe["anchor"].encode())
+            parts.append(probe["token"].encode())
+    return b"\n".join(parts) + b"\n"
+
+
+def self_test(data):
+    """Checks that the probes pass on synthetic evidence and that each
+    convention's demonstration mutation makes that convention fail."""
+    base = synthetic_evidence(data)
+    fail_lines, results = check(data, base)
+    caught_all = True
+    if all(ok for _, ok in results):
+        print("self-test: unaltered evidence: every convention ok")
+    else:
+        caught_all = False
+        for line in fail_lines:
+            print("self-test: unaltered evidence: %s" % line)
+    for conv in data["conventions"]:
+        buf = bytearray(base)
+        count = apply_demo(buf, conv["demo"])
+        _, results = check(data, buf)
+        failed = [name for name, ok in results if not ok]
+        if conv["name"] in failed:
+            print("self-test: --alter %s: %s FAIL, as expected" % (conv["slug"], conv["name"]))
+        else:
+            caught_all = False
+            print(
+                "self-test: --alter %s left %s passing (%d occurrences of %s rewritten)"
+                % (conv["slug"], conv["name"], count, conv["demo"]["from"])
+            )
+    print("self-test: %s" % ("ok" if caught_all else "FAIL"))
+    return EXIT_OK if caught_all else EXIT_FAIL
 
 
 def _pop_alter(args):
@@ -332,7 +423,7 @@ def _pop_alter(args):
 
 def run(argv):
     if not argv:
-        raise UsageError("expected a subcommand: expectations, extract or scan")
+        raise UsageError("expected a subcommand: expectations, extract, scan or self-test")
     cmd, args = argv[0], argv[1:]
     if cmd == "expectations":
         args, alter = _pop_alter(args)
@@ -355,6 +446,10 @@ def run(argv):
             raise UsageError("scan <file> <evidence> [--alter <slug>]")
         data = load_expectations(args[0])
         return scan(data, args[1], alter)
+    if cmd == "self-test":
+        if len(args) != 1:
+            raise UsageError("self-test <file>")
+        return self_test(load_expectations(args[0]))
     raise UsageError("unknown subcommand %r" % cmd)
 
 
