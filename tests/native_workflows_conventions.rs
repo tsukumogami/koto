@@ -16,6 +16,9 @@
 //! It also checks the recorded release the guard reads by default parses as a
 //! `MAJOR.MINOR.PATCH` version. Nothing here touches the network.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::collections::BTreeSet;
 
 use serde_json::Value;
