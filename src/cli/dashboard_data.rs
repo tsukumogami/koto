@@ -575,7 +575,7 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// status reads `unknown` and it is never shown with a state it may not have.
 pub fn remote_session(row: &RemoteRow) -> CachedSession {
     let s = match &row.status {
-        RowStatus::Shown(summary) => summary,
+        RowStatus::Shown(summary) => summary.as_ref(),
         RowStatus::Unknown {
             state_modified,
             session_id,

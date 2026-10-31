@@ -2921,7 +2921,7 @@ mod tests {
         let row = crate::session::remote_feed::RemoteRow {
             workspace: REMOTE_WS.to_string(),
             name: "mine".to_string(),
-            status: crate::session::remote_feed::RowStatus::Shown(SessionSummary {
+            status: crate::session::remote_feed::RowStatus::Shown(Box::new(SessionSummary {
                 schema: 1,
                 session_id: "mine-local-id".to_string(),
                 name: "mine".to_string(),
@@ -2943,7 +2943,7 @@ mod tests {
                 state_etag: String::new(),
                 machine: Some("machine-b".to_string()),
                 sources: Vec::new(),
-            }),
+            })),
         };
         crate::cli::dashboard_data::apply_snapshot(
             &mut state.tree,

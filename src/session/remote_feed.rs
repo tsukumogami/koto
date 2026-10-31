@@ -118,7 +118,7 @@ pub enum SummaryRead {
     /// `malformed`, `schema`, `key-mismatch`).
     Unreadable(&'static str),
     /// Read and checked against its key.
-    Read(SessionSummary),
+    Read(Box<SessionSummary>),
 }
 
 /// Where a source's `migrated.json` says its copy went.
@@ -176,7 +176,7 @@ pub struct LocalView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowStatus {
     /// From its summary.
-    Shown(SessionSummary),
+    Shown(Box<SessionSummary>),
     /// With status `unknown`: no summary, an unreadable one, or one that no
     /// longer describes the listed state file. Nothing but the listing's own
     /// facts is shown.
@@ -247,7 +247,7 @@ pub fn classify(scan: &[ScannedSession], local: &LocalView, now: SystemTime) -> 
             continue;
         }
         let read = match &session.summary {
-            SummaryRead::Read(summary) => Some(summary),
+            SummaryRead::Read(summary) => Some(summary.as_ref()),
             _ => None,
         };
         let here = (session.workspace.clone(), session.name.clone());
@@ -434,7 +434,7 @@ impl RemoteReader {
         match self.get(workspace, name, SUMMARY_FILE) {
             None => SummaryRead::Unreadable("unfetched"),
             Some(bytes) => match SessionSummary::parse(&bytes, workspace, name) {
-                Ok(summary) => SummaryRead::Read(summary),
+                Ok(summary) => SummaryRead::Read(Box::new(summary)),
                 Err(reason) => SummaryRead::Unreadable(reason),
             },
         }
@@ -694,7 +694,11 @@ mod tests {
     }
 
     fn shown(ws: &str, name: &str, id: &str) -> ScannedSession {
-        session(ws, name, SummaryRead::Read(summary(ws, name, id, "s")))
+        session(
+            ws,
+            name,
+            SummaryRead::Read(Box::new(summary(ws, name, id, "s"))),
+        )
     }
 
     fn names(c: &Classified) -> Vec<(&str, &str, bool)> {
@@ -918,7 +922,11 @@ mod tests {
         assert_eq!(same.unreadable, 0, "a matching ETag is never stale");
 
         // A quoted ETag in the summary matches its unquoted listing.
-        let mut s = session(WS, "q", SummaryRead::Read(summary(WS, "q", "id", "\"s\"")));
+        let mut s = session(
+            WS,
+            "q",
+            SummaryRead::Read(Box::new(summary(WS, "q", "id", "\"s\""))),
+        );
         s.listing
             .objects
             .insert(state_file_name("q"), obj("s", 120));
