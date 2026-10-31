@@ -886,8 +886,9 @@ fn a_removed_session_drops_from_once_and_the_tui() {
 
 /// A failed listing is never read as a removal: the TUI keeps A's row and
 /// shows the failure on one status line, keeps every remote row when the
-/// top-level listing fails, and drops the row once the listing answers and
-/// the session is gone.
+/// top-level listing fails, and on the first snapshot after the listing
+/// answers again drops the row of the session that went meanwhile and the
+/// status line with it.
 #[test]
 fn a_failed_listing_keeps_remote_rows_and_shows_one_status_line() {
     let (s3, a, b) = two_machines();
@@ -933,11 +934,15 @@ fn a_failed_listing_keeps_remote_rows_and_shows_one_status_line() {
                     "\u{26a0} bucket: denied at 127.0.0.1: the bucket couldn't be listed",
                     "{lines:#?}"
                 );
-                s3.clear_faults();
+                // The session goes while the listing still fails, so the
+                // first snapshot that reads the bucket again is the one that
+                // must drop the row and the status line.
                 a.ok(&["session", "cleanup", WF]);
+                s3.clear_faults();
                 phase = 3;
             }
-            3 if !shown && failure.is_none() => {
+            3 if failure.is_none() => {
+                assert!(!shown, "the first clean snapshot drops the row");
                 assert_eq!(status(lines), 0, "{lines:#?}");
                 return true;
             }
@@ -1292,7 +1297,8 @@ fn assert_tui_status(endpoint: &str, b: &Machine, text: &str) {
 /// host, and exits 0, and the TUI shows the local rows and one status line
 /// with the same two facts. A failed top-level listing is the run's last
 /// request: denied, it is asked once; throttled, it is asked koto's usual
-/// three times and nothing follows.
+/// three times and nothing follows. The TUI's feed, too, asks nothing but
+/// top-level listings while they fail.
 #[test]
 fn a_refused_denied_or_throttled_bucket_leaves_local_rows_and_one_classed_line() {
     let s3 = FakeS3::start(BUCKET);
@@ -1319,7 +1325,16 @@ fn a_refused_denied_or_throttled_bucket_leaves_local_rows_and_one_classed_line()
                 .all(|r| r.method == "GET" && r.list_prefix.as_deref() == Some("")),
             "only the top-level listing, nothing after it: {requests:?}"
         );
+        s3.clear_requests();
         assert_tui_status(&s3.endpoint(), &b, &top_level(class));
+        let requests = s3.requests();
+        assert!(
+            !requests.is_empty()
+                && requests
+                    .iter()
+                    .all(|r| r.method == "GET" && r.list_prefix.as_deref() == Some("")),
+            "the TUI's feed made only top-level listings, nothing after one: {requests:?}"
+        );
     }
 }
 

@@ -147,6 +147,26 @@ fn puts(requests: &[Request]) -> Vec<&str> {
         .collect()
 }
 
+/// The local directory of session `name` under `home`: the one directory
+/// holding its state file.
+fn local_dir(home: &Path, name: &str) -> PathBuf {
+    let file = format!("koto-{name}.state.jsonl");
+    let mut found = Vec::new();
+    let mut stack = vec![home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if entry.file_name() == file.as_str() {
+                found.push(dir.clone());
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "one local copy of {name}: {found:?}");
+    found.remove(0)
+}
+
 /// The `state_etag` the summary under `key` names.
 fn summary_state_etag(s3: &FakeS3, key: &str) -> Option<String> {
     let summary: serde_json::Value = serde_json::from_slice(&s3.object(key)?).ok()?;
@@ -262,4 +282,55 @@ fn a_failed_summary_put_is_written_by_the_next_flush() {
         "no PUT: {:?}",
         s3.requests()
     );
+}
+
+/// A summary owed for one state is never PUT for another: while the local
+/// state file isn't the bytes this host last synced (by the stamp's length
+/// and SHA-256), a flush keeps the mark and PUTs nothing; once the file is
+/// those bytes again, the next flush PUTs the summary and clears the mark.
+#[test]
+fn an_owed_summary_waits_while_the_local_state_is_not_the_synced_bytes() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Machine::new(&s3, "machine-a");
+    let ws = a.workspace();
+    let summary_key = format!("{ws}/{WF}/summary.json");
+    std::fs::write(a.dir.join("gated.md"), TEMPLATE).unwrap();
+
+    a.ok(&["init", WF, "--template", "gated.md"]);
+    s3.remove(&summary_key);
+    s3.fail_times("PUT", &summary_key, 500, 2);
+    a.ok(&["next", WF]);
+    assert!(s3.object(&summary_key).is_none(), "no summary went up");
+
+    let dir = local_dir(&a.home, WF);
+    let owed = dir.join("cloud-summary-owed");
+    assert!(owed.exists(), "the failed PUT left the mark in {dir:?}");
+    let state = dir.join(format!("koto-{WF}.state.jsonl"));
+    let synced = std::fs::read(&state).unwrap();
+
+    // Other local bytes: the flush PUTs nothing and the mark stays.
+    let mut other = synced.clone();
+    other.extend_from_slice(b"\n");
+    std::fs::write(&state, &other).unwrap();
+    s3.clear_requests();
+    a.ok(&["session", "flush", WF]);
+    assert!(
+        puts(&s3.requests()).is_empty(),
+        "no PUT for bytes the stamp doesn't name: {:?}",
+        s3.requests()
+    );
+    assert!(s3.object(&summary_key).is_none(), "no summary went up");
+    assert!(owed.exists(), "the mark stays");
+
+    // The synced bytes again: the flush PUTs the summary and clears the mark.
+    std::fs::write(&state, &synced).unwrap();
+    s3.clear_requests();
+    a.ok(&["session", "flush", WF]);
+    assert_eq!(
+        puts(&s3.requests()),
+        vec![summary_key.as_str()],
+        "{:?}",
+        s3.requests()
+    );
+    assert!(!owed.exists(), "the mark is gone");
 }

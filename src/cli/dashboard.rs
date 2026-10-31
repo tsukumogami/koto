@@ -24,7 +24,7 @@ use crate::cli::dashboard_data::{
 use crate::cli::dashboard_render::render_frame;
 use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, SessionLoad};
 use crate::cli::DashboardArgs;
-use crate::session::remote_feed::{RemoteFeed, RESCAN_INTERVAL};
+use crate::session::remote_feed::{ReadFailure, RemoteFeed, RESCAN_INTERVAL};
 use crate::session_view::{KeyPreview, SessionViewSnapshot, SnapshotError};
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
@@ -138,8 +138,13 @@ fn once_remote_rows(
         Ok(reader) => reader.scan(&dashboard_data::local_view_of(tree, |name| {
             !placeholders.contains(name)
         })),
-        Err(e) => {
-            eprintln!("note: other machines' sessions weren't read: {e}");
+        // The bucket client couldn't be built: one classed, sanitized
+        // line, as for a failed top-level listing.
+        Err(failure) => {
+            eprintln!(
+                "note: other machines' sessions weren't read: {}",
+                failure.line()
+            );
             return Vec::new();
         }
     };
@@ -501,7 +506,12 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
     // through one process-wide setting with no per-bucket form. The reader
     // decides itself what to ask again (a throttle, never a timeout), so in
     // this process, which only reads, rust-s3 asks once: a bucket that
-    // never answers costs a pass one request timeout.
+    // never answers costs a pass one request timeout. The reader's docs
+    // promise that bound only because of this call. Being process-wide, it
+    // also takes rust-s3's retry from every other bucket request made here:
+    // the Session tab's reads through the backend are asked once too.
+    // `--detail` keeps rust-s3's retry only because it has already exited
+    // above, before this line.
     s3::set_retries(0);
 
     // --once: print tab-separated lines and exit without a TUI.
@@ -547,10 +557,19 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
             RESCAN_INTERVAL,
         ) {
             Ok(feed) => Some(feed),
-            Err(e) => {
-                eprintln!("note: other machines' sessions won't be read: {e}");
-                None
-            }
+            // The bucket client couldn't be built: the status line says so,
+            // classed and sanitized like a failed read, for as long as the
+            // TUI runs.
+            Err(e) => match e.downcast::<ReadFailure>() {
+                Ok(failure) => {
+                    state.tree.remote_failure = Some(failure);
+                    None
+                }
+                Err(e) => {
+                    eprintln!("note: other machines' sessions won't be read: {e}");
+                    None
+                }
+            },
         },
         Backend::Local(_) => None,
     };

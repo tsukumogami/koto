@@ -766,13 +766,8 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 /// session this machine holds a copy of stays its local row. The tallies
 /// and the failure come from the snapshot.
 pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
-    tree.sessions.retain(|_, s| {
-        !s.remote
-            || snapshot
-                .failure
-                .as_ref()
-                .is_some_and(|f| f.top_level || s.workspace.as_ref().is_some_and(|ws| f.keeps(ws)))
-    });
+    tree.sessions
+        .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
     for row in &snapshot.rows {
         tree.sessions
             .insert(remote_key(&row.name, &row.workspace), remote_session(row));

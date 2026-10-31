@@ -250,7 +250,9 @@ impl FakeS3 {
 
     /// [`FakeS3::fail`] for the next `times` matching requests only; the
     /// ones after are answered normally. rust-s3 retries a failed request
-    /// once, so one failed call by koto is two failed requests here.
+    /// once by default, so one failed call by koto is two failed requests
+    /// here; in a process that called `s3::set_retries(0)`, as
+    /// `koto dashboard` does, it is one.
     pub fn fail_times(&self, method: &str, key: &str, status: u16, times: usize) {
         lock(&self.state).faults.push(Fault {
             method: method.to_string(),
