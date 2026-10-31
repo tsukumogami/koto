@@ -124,7 +124,22 @@ template-derived string, and the docs an operator or agent reads.
 
 ### Step 5: Operators and agents reading the docs see what the version 5 entry does
 
-The verification guide, the session-feed reference, the koto-user skill, the phase-detail design pointer and the CHANGELOG describe the version 5 entry and what Claude Code 2.1.314 shows for it.
+**Goal**: Everything an operator or agent reads about the `/workflows` entry says what the version 5 entry is and what Claude Code 2.1.314 shows for it: a gate-blocked session is counted under "running" with its active step reading Blocked and `gate <name>: FAIL` as the Outcome and a summary saying blocked; a finished session reads done all the way down; `koto.status` carries koto's own classification; the top-level `status` never reads `blocked`. Steps 1 to 4 landed the version 5 shape (`ScreenStatus`, `KotoBlock.status`, the blocked and failed step shapes, escaping through `gate_name_display` and the shared sanitizer) and the verify script's local-backend pin. This step edits only files under `docs/` and `plugins/`, so its verification runs only the map's docs and plugin checks: it changes no source file, no `CHANGELOG.md` and no other file outside those two trees, because any of them would select the full test suite, which this host can't run again. The CHANGELOG entry and three stale source doc comments in `src/workflows_surface/contract.rs` (the version note on `CONTRACT_VERSION`, the doc on `WorkflowFile.summary`, and the comment on `GATE_NAME_DISPLAY_CAP`) are left for a follow-up. `koto.workflow` and `koto.currentState` are still written unescaped; Claude Code 2.1.314 doesn't draw them, and the session-feed reference says so. The live screen check on Claude Code itself is the owning session's, after the pull request is ready; this step changes no behaviour and adds no test beyond what the docs checks need.
+
+**Acceptance Criteria**:
+
+- [ ] In `docs/guides/native-workflows-verification.md`, the blocked manual step says the entry is counted under "running", its active step reads Blocked with the `gate <name>: FAIL` Outcome, and the summary says blocked; the completed manual step says the terminal phase reads `1/1` and no step reads Stopped; both name Claude Code 2.1.314; and the automated section says the script pins koto's local session backend (AC15).
+- [ ] `plugins/koto-skills/skills/koto-user/SKILL.md` and `docs/reference/session-feed.md` say a gate-blocked entry's active step reads Blocked and that `koto.status` carries koto's classification, and neither says the top-level status reads `blocked`; the reference names contract version 5 and lists `koto.status`, the step's `blocked` and `error` fields, and that `koto.workflow` and `koto.currentState` are written unescaped (AC16).
+- [ ] `docs/designs/current/DESIGN-native-workflows-phase-detail.md` links this change's design, `docs/designs/DESIGN-koto-workflows-blocked-status.md`, for the status mapping, in a correction note that says its Fork D's `blocked` render status is replaced (AC16).
+- [ ] The design for this change keeps its section stating the six 2.1.314 run statuses, the two list buckets, that only `running` makes a run active, and that an `error` step with `blocked` true reads Blocked with its `error` as the Outcome (AC18; it exists today, under "What Claude Code 2.1.314 renders", and must still be there).
+- [ ] `cargo test --locked --test doc_names` passes, so every `koto <verb>` and repo path the edited docs name resolves.
+- [ ] The step's commits change only paths under `docs/` and `plugins/`.
+
+**Check**: Read the four documents and see each criterion's wording there. Run `CARGO_BUILD_JOBS=2 scripts/without-session-env.sh cargo test --locked --test doc_names` and see it pass. Do not run `scripts/verify-native-workflows.sh` or the full test suite in this step.
+
+**Dependencies**: Step 4
+
+**Files**: `docs/guides/native-workflows-verification.md`, `docs/reference/session-feed.md`, `plugins/koto-skills/skills/koto-user/SKILL.md`, `docs/designs/current/DESIGN-native-workflows-phase-detail.md`
 
 ## Implementation Sequence
 
