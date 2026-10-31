@@ -15,7 +15,10 @@ use crate::engine::persistence::{
 };
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
-use crate::session::row::derive_row;
+use crate::session::remote_feed::{
+    ImportedSource, LocalView, RemoteRow, RemoteSnapshot, RowStatus,
+};
+use crate::session::row::{derive_row, latest_import};
 use crate::session::{state_file_name, SessionBackend};
 
 pub use liveness::{attention_key, classify_liveness, Liveness};
@@ -214,6 +217,10 @@ pub struct CachedSession {
     /// Read from another machine's summary in the bucket rather than from
     /// this machine's session store. A remote row has no local state file.
     pub remote: bool,
+    /// The source the local session's latest `session_imported` event
+    /// names, which a remote scan hides; `None` for a session never
+    /// imported and for a remote row.
+    pub imported_from: Option<ImportedSource>,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -231,6 +238,12 @@ pub struct SessionTree {
     /// couldn't read. Kept apart from `unreadable`, which every local refresh
     /// recomputes; the TUI's note shows the sum.
     pub remote_unreadable: usize,
+    /// Count of other machines' sessions the last feed snapshot hid as
+    /// migrated sources whose copy is listed.
+    pub remote_hidden: usize,
+    /// Why the last feed snapshot couldn't read some or all of the bucket;
+    /// `None` once a snapshot reads it without failure.
+    pub remote_failure: Option<String>,
 }
 
 impl SessionTree {
@@ -241,6 +254,8 @@ impl SessionTree {
             roots: Vec::new(),
             unreadable: 0,
             remote_unreadable: 0,
+            remote_hidden: 0,
+            remote_failure: None,
         }
     }
 }
@@ -419,6 +434,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             };
         }
     };
@@ -444,6 +460,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             };
         }
     };
@@ -458,6 +475,14 @@ pub fn read_session(path: &Path) -> CachedSession {
         .last_event_at
         .as_deref()
         .and_then(parse_timestamp_to_systemtime);
+
+    // The source this session was imported from, by its workspace prefix:
+    // a remote scan hides that source rather than list it beside its copy.
+    let imported_from = latest_import(&events).map(|record| ImportedSource {
+        prefix: crate::session::local::prefix_for_workspace(Path::new(&record.from_workspace)).ok(),
+        name: record.from_session,
+        session_id: record.from_session_id,
+    });
 
     CachedSession {
         header,
@@ -475,6 +500,7 @@ pub fn read_session(path: &Path) -> CachedSession {
         machine: row.machine,
         workspace: None,
         remote: false,
+        imported_from,
     }
 }
 
@@ -542,8 +568,42 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// A remote row as the dashboard holds it: the summary another machine
 /// published, in the shape a local row has. It has no local state file, so
 /// `state_path` is empty and `mtime` is its last event's time.
-pub fn remote_session(row: &crate::session::remote_feed::RemoteRow) -> CachedSession {
-    let s = &row.summary;
+///
+/// A row listed as unknown carries only the listing's facts: its name, its
+/// workspace and, as `mtime`, the state file's LastModified, which its idle
+/// time is measured from. No state, intent, template or machine, so its
+/// status reads `unknown` and it is never shown with a state it may not have.
+pub fn remote_session(row: &RemoteRow) -> CachedSession {
+    let s = match &row.status {
+        RowStatus::Shown(summary) => summary.as_ref(),
+        RowStatus::Unknown {
+            state_modified,
+            session_id,
+            ..
+        } => {
+            let mut header = make_empty_header();
+            header.workflow = row.name.clone();
+            header.session_id = session_id.clone().unwrap_or_default();
+            return CachedSession {
+                header,
+                current_state: None,
+                is_terminal: false,
+                is_blocked: false,
+                intent: None,
+                mtime: state_modified.unwrap_or(SystemTime::UNIX_EPOCH),
+                state_path: PathBuf::new(),
+                last_event_at: None,
+                salient_var: None,
+                is_unreadable: false,
+                is_batch_task: false,
+                is_request_leg: false,
+                machine: None,
+                workspace: Some(row.workspace.clone()),
+                remote: true,
+                imported_from: None,
+            };
+        }
+    };
     let mut header = make_empty_header();
     header.workflow = s.name.clone();
     header.session_id = s.session_id.clone();
@@ -571,6 +631,7 @@ pub fn remote_session(row: &crate::session::remote_feed::RemoteRow) -> CachedSes
         machine: valid_machine(s.machine.as_deref()),
         workspace: Some(row.workspace.clone()),
         remote: true,
+        imported_from: None,
     }
 }
 
@@ -637,40 +698,88 @@ pub fn parent_key(session: &CachedSession) -> Option<String> {
     })
 }
 
-/// The `session_id`s of the tree's local rows, which a remote scan leaves
-/// to them.
-pub fn local_session_ids(tree: &SessionTree) -> std::collections::HashSet<String> {
-    tree.sessions
-        .values()
-        .filter(|s| !s.remote && !s.header.session_id.is_empty())
-        .map(|s| s.header.session_id.clone())
-        .collect()
+/// What a remote scan needs to know about the tree's local rows: their
+/// `session_id`s, the workspace prefix and name of each one whose home is
+/// known, and the source each imported one names.
+///
+/// The home prefix is the row's `workspace` when the caller set it, else
+/// the prefix its header recorded at creation; nothing here makes a
+/// request.
+pub fn local_view(tree: &SessionTree) -> LocalView {
+    local_view_of(tree, |_| true)
+}
+
+/// [`local_view`] over the local rows `keep` accepts by name.
+pub fn local_view_of(tree: &SessionTree, keep: impl Fn(&str) -> bool) -> LocalView {
+    let mut view = LocalView::default();
+    for (name, s) in &tree.sessions {
+        if s.remote || !keep(name) {
+            continue;
+        }
+        if !s.header.session_id.is_empty() {
+            view.session_ids.insert(s.header.session_id.clone());
+        }
+        let home = s.workspace.clone().or_else(|| {
+            s.header
+                .origin
+                .as_ref()
+                .and_then(|o| o.store.prefix.clone())
+        });
+        if let Some(home) = home {
+            view.homes.insert((home, name.clone()));
+        }
+        if let Some(source) = &s.imported_from {
+            view.imports.push(source.clone());
+        }
+    }
+    view
 }
 
 /// Drop each remote row whose session this machine now holds a copy of,
-/// so the session shows once, as its local row. Returns whether any went.
+/// so the session shows once, as its local row: by `session_id`, or for a
+/// row that has none (no readable summary) by its workspace and name.
+/// Returns whether any went.
 fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
-    let local = local_session_ids(tree);
+    let local = local_view(tree);
     let before = tree.sessions.len();
-    tree.sessions
-        .retain(|_, s| !s.remote || !local.contains(&s.header.session_id));
+    tree.sessions.retain(|key, s| {
+        if !s.remote {
+            return true;
+        }
+        if s.header.session_id.is_empty() {
+            let home = (
+                s.workspace.clone().unwrap_or_default(),
+                row_name(key, s).to_string(),
+            );
+            !local.homes.contains(&home)
+        } else {
+            !local.session_ids.contains(&s.header.session_id)
+        }
+    });
     tree.sessions.len() != before
 }
 
-/// Replace the tree's remote rows with those of `rows`, a complete feed
-/// snapshot, keyed by [`remote_key`]. A session this machine holds a copy
-/// of stays its local row.
-pub fn replace_remote_rows(
-    tree: &mut SessionTree,
-    rows: &[crate::session::remote_feed::RemoteRow],
-) {
-    tree.sessions.retain(|_, s| !s.remote);
-    for row in rows {
-        tree.sessions.insert(
-            remote_key(&row.summary.name, &row.workspace),
-            remote_session(row),
-        );
+/// Take a complete feed snapshot: its rows replace the tree's remote rows,
+/// keyed by [`remote_key`], except that the rows of a workspace whose
+/// listing failed (every workspace, when the top-level listing failed) stay
+/// as they were, since a failed listing says nothing about removal. A
+/// session this machine holds a copy of stays its local row. The tallies
+/// and the failure come from the snapshot.
+pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
+    tree.sessions.retain(|_, s| {
+        !s.remote
+            || snapshot.top_level_failed
+            || s.workspace
+                .as_ref()
+                .is_some_and(|ws| snapshot.failed_workspaces.contains(ws))
+    });
+    for row in &snapshot.rows {
+        tree.sessions
+            .insert(remote_key(&row.name, &row.workspace), remote_session(row));
     }
+    tree.remote_unreadable = snapshot.unreadable;
+    tree.remote_hidden = snapshot.hidden_sources;
+    tree.remote_failure = snapshot.failure.clone();
     drop_shadowed_remote(tree);
     tree.roots = rebuild_roots(&tree.sessions);
 }
@@ -1251,6 +1360,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1290,6 +1400,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1329,6 +1440,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1639,6 +1751,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1734,6 +1847,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
         sessions.insert(
@@ -1754,6 +1868,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1784,6 +1899,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
         sessions.insert(
@@ -1804,6 +1920,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1835,6 +1952,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1943,6 +2061,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 
@@ -2133,6 +2252,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 
@@ -2189,5 +2309,88 @@ mod tests {
         // An empty intent string must not short-circuit the chain.
         let s = label_session(Some(""), Some("work-on"), Some("implement"), None);
         assert_eq!(derive_label(&s, "session-7"), "work-on \u{b7} implement");
+    }
+
+    const WS_A: &str = "aaaaaaaaaaaaaaaa";
+    const WS_B: &str = "bbbbbbbbbbbbbbbb";
+
+    fn unknown_row(ws: &str, name: &str) -> RemoteRow {
+        RemoteRow {
+            workspace: ws.to_string(),
+            name: name.to_string(),
+            status: RowStatus::Unknown {
+                reason: "no-summary",
+                state_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
+                session_id: None,
+            },
+        }
+    }
+
+    fn keys(tree: &SessionTree) -> Vec<String> {
+        let mut keys: Vec<String> = tree.sessions.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn an_unknown_remote_row_carries_only_the_listings_facts() {
+        let s = remote_session(&unknown_row(WS_A, "old"));
+        assert!(s.remote);
+        assert_eq!(s.header.workflow, "old");
+        assert_eq!(s.workspace.as_deref(), Some(WS_A));
+        assert_eq!(s.current_state, None);
+        assert_eq!(s.intent, None);
+        assert_eq!(s.header.template_name, None);
+        assert_eq!(s.machine, None);
+        assert_eq!(s.last_event_at, None);
+        assert_eq!(
+            s.mtime,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+            "idle is measured from the state file's LastModified"
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_keeps_the_rows_of_a_failed_listing() {
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows: vec![unknown_row(WS_A, "a"), unknown_row(WS_B, "b")],
+                unreadable: 2,
+                hidden_sources: 1,
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(keys(&tree), vec![format!("a@{WS_A}"), format!("b@{WS_B}")]);
+        assert_eq!((tree.remote_unreadable, tree.remote_hidden), (2, 1));
+
+        // A's listing fails: its row stays; B's, read and gone, drops.
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                failed_workspaces: vec![WS_A.to_string()],
+                failure: Some("listing failed".to_string()),
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(keys(&tree), vec![format!("a@{WS_A}")]);
+        assert_eq!(tree.remote_failure.as_deref(), Some("listing failed"));
+
+        // The top-level listing fails: every remote row stays.
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                top_level_failed: true,
+                failure: Some("top".to_string()),
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(keys(&tree), vec![format!("a@{WS_A}")]);
+
+        // A clean read without the session drops it and clears the failure.
+        apply_snapshot(&mut tree, &RemoteSnapshot::default());
+        assert!(tree.sessions.is_empty());
+        assert_eq!(tree.remote_failure, None);
     }
 }

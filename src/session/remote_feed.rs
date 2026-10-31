@@ -2,29 +2,37 @@
 //!
 //! [`RemoteReader::scan`] lists the bucket's top level for workspace
 //! prefixes, lists each one with the delimiter `/ctx/`, which returns every
-//! session's top-level objects (state file, `summary.json`, markers) and
-//! folds its whole context tree into one common prefix, and reads each
-//! session's [`SessionSummary`]. It never fetches a state file, so showing
-//! a remote row never costs the size of its history, and it reads nothing
-//! under `ctx/`. The reader has no write method: it lists and gets, and
-//! works with keys that grant only those.
+//! session's top-level objects (state file, `summary.json`, markers) with
+//! their size, ETag and LastModified and folds its whole context tree into
+//! one common prefix, and reads each session's [`SessionSummary`] and its
+//! `migrated.json` marker when the listing shows one. It never fetches a
+//! state file, so showing a remote row never costs the size of its history,
+//! and it reads nothing under `ctx/`. The reader has no write method: it
+//! lists and gets, and works with keys that grant only those.
+//!
+//! What the scan found is then decided by one pure function, [`classify`],
+//! which drops removed, internal and locally held sessions, hides migrated
+//! sources, and lists a session it can't trust a summary for as `unknown`.
 //!
 //! The interactive dashboard reads through a [`RemoteFeed`]: one background
 //! thread that owns its own reader, scans on a fixed interval, and hands each
 //! complete [`RemoteSnapshot`] to the UI thread over a channel, so no key
 //! press or redraw ever waits on the bucket.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use s3::Bucket;
 
-use crate::session::cloud::{is_workspace_prefix, list_retrying};
+use crate::session::cloud::{
+    is_workspace_prefix, list_retrying, marker_target_str, MIGRATED_MARKER,
+};
 use crate::session::state_file_name;
 use crate::session::summary::{is_internal_name, SessionSummary, MAX_SUMMARY_BYTES, SUMMARY_FILE};
+use crate::session::sync_stamp::normalize_etag;
 
 /// The delimiter that folds a session's context tree into one entry.
 pub const CTX_DELIMITER: &str = "/ctx/";
@@ -32,54 +40,57 @@ pub const CTX_DELIMITER: &str = "/ctx/";
 /// How long one bucket request may take before it fails.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a summary may name a state ETag other than the listed one before
+/// the session reads as `unknown`: the ordinary gap between a push's state
+/// PUT and its summary PUT stays inside it, a release that pushed the state
+/// without refreshing the summary doesn't.
+pub const STALE_SUMMARY_WINDOW: Duration = Duration::from_secs(60);
+
+/// The largest `migrated.json` the reader fetches, by listed size and body.
+pub const MAX_MARKER_BYTES: usize = 64 * 1024;
+
 /// How many workspace listings are in flight at once.
 const FANOUT: usize = 64;
 
-/// One workspace's scan: its rows and how many summaries in it couldn't be read.
-type WorkspaceScan = anyhow::Result<(Vec<RemoteRow>, usize)>;
-
-/// One session read from another machine's summary.
+/// One top-level object of a session directory, as the listing reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteRow {
-    /// The workspace id (16-hex prefix) the session's copy lives under.
-    pub workspace: String,
-    /// The summary, checked against the key it was read from.
-    pub summary: SessionSummary,
-}
-
-/// One pass over the bucket.
-#[derive(Debug, Default)]
-pub struct RemoteSnapshot {
-    /// Every session read, in workspace then name order.
-    pub rows: Vec<RemoteRow>,
-    /// Why the pass couldn't read some or all of the bucket, when it
-    /// couldn't.
-    pub failure: Option<String>,
-    /// Sessions whose summary was listed but couldn't be read or parsed.
-    pub unreadable: usize,
+pub struct ListedObject {
+    /// The listed size in bytes.
+    pub size: u64,
+    /// The listed ETag, without its quotes.
+    pub etag: String,
+    /// The listed LastModified; `None` when it didn't parse.
+    pub last_modified: Option<SystemTime>,
 }
 
 /// A session directory as one `/ctx/`-delimited listing shows it: its
-/// top-level objects by file name, with each one's listed size.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// top-level objects by file name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionListing {
-    /// Top-level file name to listed size.
-    pub objects: BTreeMap<String, u64>,
+    /// Top-level file name to what the listing says about it.
+    pub objects: BTreeMap<String, ListedObject>,
+}
+
+impl SessionListing {
+    /// The state file of session `name`, when the listing holds one.
+    pub fn state(&self, name: &str) -> Option<&ListedObject> {
+        self.objects.get(&state_file_name(name))
+    }
 }
 
 /// Group a workspace listing's objects into session directories.
 ///
-/// `keys` are `(key, size)` pairs from listings of `<workspace>/` with the
+/// `keys` are `(key, object)` pairs from listings of `<workspace>/` with the
 /// [`CTX_DELIMITER`]; only objects directly inside a session directory
 /// (`<workspace>/<name>/<file>`) count, so nothing under a deeper path
 /// becomes a row fact.
 pub fn group_sessions<'a>(
     workspace: &str,
-    keys: impl IntoIterator<Item = (&'a str, u64)>,
+    keys: impl IntoIterator<Item = (&'a str, ListedObject)>,
 ) -> BTreeMap<String, SessionListing> {
     let prefix = format!("{workspace}/");
     let mut sessions: BTreeMap<String, SessionListing> = BTreeMap::new();
-    for (key, size) in keys {
+    for (key, object) in keys {
         let Some(rest) = key.strip_prefix(&prefix) else {
             continue;
         };
@@ -93,9 +104,256 @@ pub fn group_sessions<'a>(
             .entry(name.to_string())
             .or_default()
             .objects
-            .insert(file.to_string(), size);
+            .insert(file.to_string(), object);
     }
     sessions
+}
+
+/// What reading a session's `summary.json` gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryRead {
+    /// The listing shows no summary (or none was asked for).
+    Absent,
+    /// Listed but not usable; the reason (`oversized`, `unfetched`,
+    /// `malformed`, `schema`, `key-mismatch`).
+    Unreadable(&'static str),
+    /// Read and checked against its key.
+    Read(Box<SessionSummary>),
+}
+
+/// Where a source's `migrated.json` says its copy went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedTo {
+    /// The copy's workspace prefix.
+    pub prefix: String,
+    /// The copy's session name.
+    pub session: String,
+    /// The copy's `session_id`, when the marker records one.
+    pub session_id: Option<String>,
+}
+
+/// One session directory a scan found, with what was read for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedSession {
+    /// The workspace prefix the directory is under.
+    pub workspace: String,
+    /// The session name (the directory's name).
+    pub name: String,
+    /// Its top-level objects.
+    pub listing: SessionListing,
+    /// Its summary.
+    pub summary: SummaryRead,
+    /// Its `migrated.json`, when one was listed and read.
+    pub marker: Option<MigratedTo>,
+}
+
+/// A source a local session was imported from, by its latest
+/// `session_imported` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedSource {
+    /// The source's workspace prefix; `None` when its workspace path
+    /// couldn't be turned into one.
+    pub prefix: Option<String>,
+    /// The source's session name.
+    pub name: String,
+    /// The source's `session_id`.
+    pub session_id: String,
+}
+
+/// What a scan needs to know about this machine's own sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalView {
+    /// The `session_id` of every local session.
+    pub session_ids: HashSet<String>,
+    /// `(workspace prefix, name)` of every local session whose home prefix
+    /// is known.
+    pub homes: HashSet<(String, String)>,
+    /// The source each imported local session names.
+    pub imports: Vec<ImportedSource>,
+}
+
+/// How a remote row is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowStatus {
+    /// From its summary.
+    Shown(Box<SessionSummary>),
+    /// With status `unknown`: no summary, an unreadable one, or one that no
+    /// longer describes the listed state file. Nothing but the listing's own
+    /// facts is shown.
+    Unknown {
+        /// Why (`no-summary`, `stale`, or the summary's unreadable reason).
+        reason: &'static str,
+        /// The state file's listed LastModified, which the row's idle time
+        /// is measured from.
+        state_modified: Option<SystemTime>,
+        /// The `session_id` a stale summary named; `None` otherwise.
+        session_id: Option<String>,
+    },
+}
+
+/// One session another machine pushed, as the dashboard lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRow {
+    /// The workspace id (16-hex prefix) the session's copy lives under.
+    pub workspace: String,
+    /// The session name.
+    pub name: String,
+    /// What the row shows.
+    pub status: RowStatus,
+}
+
+/// What [`classify`] decided for a scan.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Classified {
+    /// The rows to list, in workspace then name order.
+    pub rows: Vec<RemoteRow>,
+    /// Migrated sources left out in favour of their copy.
+    pub hidden_sources: usize,
+    /// Rows listed as `unknown`.
+    pub unreadable: usize,
+}
+
+/// Decide every session directory of a scan, in this order (the first rule
+/// that matches decides):
+///
+/// 1. no state object: dropped, the session was removed;
+/// 2. an internal name: dropped;
+/// 3. a session this machine holds a copy of: dropped, it shows as its local
+///    row. Matched by `session_id` when its summary was read, else by its
+///    workspace prefix and name;
+/// 4. a migrated source: hidden and counted, when its own `migrated.json`
+///    names another session directory present in this scan (and, when that
+///    copy's summary was read, by the copy's `session_id`), or a local
+///    session's latest `session_imported` names it (by `session_id` when its
+///    summary was read, else by workspace prefix and name);
+/// 5. no summary: `unknown`, counted;
+/// 6. an unreadable summary: `unknown`, counted;
+/// 7. a summary whose `state_etag` isn't the listed state file's ETag, once
+///    that file is more than [`STALE_SUMMARY_WINDOW`] old by `now` (or its
+///    LastModified didn't parse): `unknown`, counted;
+/// 8. otherwise shown from its summary.
+pub fn classify(scan: &[ScannedSession], local: &LocalView, now: SystemTime) -> Classified {
+    let present: HashMap<(&str, &str), &ScannedSession> = scan
+        .iter()
+        .filter(|s| s.listing.state(&s.name).is_some())
+        .map(|s| ((s.workspace.as_str(), s.name.as_str()), s))
+        .collect();
+    let mut out = Classified::default();
+    for session in scan {
+        let Some(state) = session.listing.state(&session.name) else {
+            continue;
+        };
+        if is_internal_name(&session.name) {
+            continue;
+        }
+        let read = match &session.summary {
+            SummaryRead::Read(summary) => Some(summary.as_ref()),
+            _ => None,
+        };
+        let here = (session.workspace.clone(), session.name.clone());
+        let held = match read {
+            Some(summary) => local.session_ids.contains(&summary.session_id),
+            None => local.homes.contains(&here),
+        };
+        if held {
+            continue;
+        }
+        if is_migrated(session, read, &present, local) {
+            out.hidden_sources += 1;
+            continue;
+        }
+        let unknown = |reason, session_id: Option<&str>| RowStatus::Unknown {
+            reason,
+            state_modified: state.last_modified,
+            session_id: session_id.map(str::to_string),
+        };
+        let status = match &session.summary {
+            SummaryRead::Absent => unknown("no-summary", None),
+            SummaryRead::Unreadable(reason) => unknown(reason, None),
+            SummaryRead::Read(summary) if is_stale(summary, state, now) => {
+                unknown("stale", Some(&summary.session_id))
+            }
+            SummaryRead::Read(summary) => RowStatus::Shown(summary.clone()),
+        };
+        if matches!(status, RowStatus::Unknown { .. }) {
+            out.unreadable += 1;
+        }
+        out.rows.push(RemoteRow {
+            workspace: session.workspace.clone(),
+            name: session.name.clone(),
+            status,
+        });
+    }
+    out.rows.sort_by(|a, b| {
+        (a.workspace.as_str(), a.name.as_str()).cmp(&(b.workspace.as_str(), b.name.as_str()))
+    });
+    out
+}
+
+/// Rule 4 of [`classify`]: whether `session` is a source whose copy this
+/// scan or this machine holds.
+fn is_migrated(
+    session: &ScannedSession,
+    read: Option<&SessionSummary>,
+    present: &HashMap<(&str, &str), &ScannedSession>,
+    local: &LocalView,
+) -> bool {
+    let by_marker = session.marker.as_ref().is_some_and(|to| {
+        let is_self = to.prefix == session.workspace && to.session == session.name;
+        !is_self
+            && present
+                .get(&(to.prefix.as_str(), to.session.as_str()))
+                .is_some_and(|copy| match (&copy.summary, &to.session_id) {
+                    (SummaryRead::Read(summary), Some(id)) => &summary.session_id == id,
+                    _ => true,
+                })
+    });
+    by_marker
+        || local.imports.iter().any(|source| match read {
+            Some(summary) => source.session_id == summary.session_id,
+            None => {
+                source.prefix.as_deref() == Some(session.workspace.as_str())
+                    && source.name == session.name
+            }
+        })
+}
+
+/// Rule 7 of [`classify`]: the summary names another state ETag and the
+/// listed state file is older than [`STALE_SUMMARY_WINDOW`].
+fn is_stale(summary: &SessionSummary, state: &ListedObject, now: SystemTime) -> bool {
+    if normalize_etag(&summary.state_etag) == state.etag {
+        return false;
+    }
+    match state.last_modified {
+        Some(modified) => now
+            .duration_since(modified)
+            .is_ok_and(|age| age > STALE_SUMMARY_WINDOW),
+        None => true,
+    }
+}
+
+/// One workspace's scan: the session directories it holds.
+type WorkspaceScan = anyhow::Result<Vec<ScannedSession>>;
+
+/// One pass over the bucket.
+#[derive(Debug, Default)]
+pub struct RemoteSnapshot {
+    /// Every row listed, in workspace then name order.
+    pub rows: Vec<RemoteRow>,
+    /// Why the pass couldn't read some or all of the bucket, when it
+    /// couldn't.
+    pub failure: Option<String>,
+    /// Rows listed as `unknown`: no summary, or one that couldn't be read
+    /// or no longer describes its state file.
+    pub unreadable: usize,
+    /// Migrated sources left out in favour of their copy.
+    pub hidden_sources: usize,
+    /// Workspaces whose listing failed; a holder keeps the rows it last had
+    /// for them.
+    pub failed_workspaces: Vec<String>,
+    /// The top-level listing failed, so no workspace was read; a holder
+    /// keeps every remote row it last had.
+    pub top_level_failed: bool,
 }
 
 /// A bucket reader for the dashboard: a copy of the configured bucket
@@ -146,106 +404,143 @@ impl RemoteReader {
             pages
                 .iter()
                 .flat_map(|page| page.contents.iter())
-                .map(|obj| (obj.key.as_str(), obj.size)),
+                .map(|obj| {
+                    (
+                        obj.key.as_str(),
+                        ListedObject {
+                            size: obj.size,
+                            etag: obj.e_tag.as_deref().map(normalize_etag).unwrap_or_default(),
+                            last_modified: crate::engine::wake::parse_rfc3339_millis(
+                                &obj.last_modified,
+                            ),
+                        },
+                    )
+                }),
         ))
     }
 
-    /// Read one session's summary; `Err` names why it's unreadable.
-    fn read_summary(&self, workspace: &str, name: &str) -> Result<SessionSummary, String> {
-        let key = format!("{workspace}/{name}/{SUMMARY_FILE}");
+    /// GET `<workspace>/<name>/<file>`; `None` when it fails or doesn't
+    /// answer 200.
+    fn get(&self, workspace: &str, name: &str, file: &str) -> Option<Vec<u8>> {
         let response = self
             .bucket
-            .get_object(&key)
-            .map_err(|e| format!("GET {} failed: {}", key, e))?;
-        if response.status_code() != 200 {
-            return Err(format!("GET {} returned {}", key, response.status_code()));
-        }
-        SessionSummary::parse(response.bytes(), workspace, name).map_err(str::to_string)
+            .get_object(format!("{workspace}/{name}/{file}"))
+            .ok()?;
+        (response.status_code() == 200).then(|| response.bytes().to_vec())
     }
 
-    /// The rows of one workspace: every session directory with a state
-    /// object and a readable summary, skipping internal sessions and those
-    /// whose `session_id` is in `local_ids`. Returns the rows and how many
-    /// summaries couldn't be read.
-    fn scan_workspace(&self, workspace: &str, local_ids: &HashSet<String>) -> WorkspaceScan {
-        let mut rows = Vec::new();
-        let mut unreadable = 0;
-        for (name, listing) in self.list_workspace(workspace)? {
-            if is_internal_name(&name) || !listing.objects.contains_key(&state_file_name(&name)) {
-                continue;
-            }
-            let Some(&size) = listing.objects.get(SUMMARY_FILE) else {
-                continue;
-            };
-            if size > MAX_SUMMARY_BYTES as u64 {
-                unreadable += 1;
-                continue;
-            }
-            match self.read_summary(workspace, &name) {
-                Ok(summary) if local_ids.contains(&summary.session_id) => {}
-                Ok(summary) => rows.push(RemoteRow {
-                    workspace: workspace.to_string(),
-                    summary,
-                }),
-                Err(_) => unreadable += 1,
-            }
+    /// Read one session's summary.
+    fn read_summary(&self, workspace: &str, name: &str) -> SummaryRead {
+        match self.get(workspace, name, SUMMARY_FILE) {
+            None => SummaryRead::Unreadable("unfetched"),
+            Some(bytes) => match SessionSummary::parse(&bytes, workspace, name) {
+                Ok(summary) => SummaryRead::Read(Box::new(summary)),
+                Err(reason) => SummaryRead::Unreadable(reason),
+            },
         }
-        Ok((rows, unreadable))
+    }
+
+    /// Read one session's `migrated.json`; `None` when it can't be read or
+    /// doesn't name a copy.
+    fn read_marker(&self, workspace: &str, name: &str) -> Option<MigratedTo> {
+        let bytes = self.get(workspace, name, MIGRATED_MARKER)?;
+        if bytes.len() > MAX_MARKER_BYTES {
+            return None;
+        }
+        Some(MigratedTo {
+            prefix: marker_target_str(&bytes, "prefix")?,
+            session: marker_target_str(&bytes, "session")?,
+            session_id: marker_target_str(&bytes, "session_id"),
+        })
+    }
+
+    /// The session directories of one workspace, with the summary and
+    /// marker of each one that has a state object and isn't internal. A
+    /// summary over [`MAX_SUMMARY_BYTES`] by its listed size isn't fetched.
+    fn scan_workspace(&self, workspace: &str) -> WorkspaceScan {
+        let mut sessions = Vec::new();
+        for (name, listing) in self.list_workspace(workspace)? {
+            let wanted = listing.state(&name).is_some() && !is_internal_name(&name);
+            let summary = match listing.objects.get(SUMMARY_FILE) {
+                Some(_) if !wanted => SummaryRead::Absent,
+                Some(obj) if obj.size > MAX_SUMMARY_BYTES as u64 => {
+                    SummaryRead::Unreadable("oversized")
+                }
+                Some(_) => self.read_summary(workspace, &name),
+                None => SummaryRead::Absent,
+            };
+            let marker = match listing.objects.get(MIGRATED_MARKER) {
+                Some(obj) if wanted && obj.size <= MAX_MARKER_BYTES as u64 => {
+                    self.read_marker(workspace, &name)
+                }
+                _ => None,
+            };
+            sessions.push(ScannedSession {
+                workspace: workspace.to_string(),
+                name,
+                listing,
+                summary,
+                marker,
+            });
+        }
+        Ok(sessions)
     }
 
     /// One pass over the bucket: every workspace prefix, each listed with
-    /// the `/ctx/` delimiter, [`FANOUT`] at a time. Sessions this machine
-    /// holds a copy of (their `session_id` is in `local_ids`) are left out:
-    /// they show as local rows. A failed workspace leaves the others'
-    /// rows standing and is named in `failure`.
-    pub fn scan(&self, local_ids: &HashSet<String>) -> RemoteSnapshot {
+    /// the `/ctx/` delimiter, [`FANOUT`] at a time, then [`classify`]d as a
+    /// whole against `local`. A failed workspace leaves the others' rows
+    /// standing, is named in `failed_workspaces`, and its first failure is
+    /// in `failure`.
+    pub fn scan(&self, local: &LocalView) -> RemoteSnapshot {
         let workspaces = match self.workspaces() {
             Ok(w) => w,
             Err(e) => {
                 return RemoteSnapshot {
                     failure: Some(e.to_string()),
+                    top_level_failed: true,
                     ..RemoteSnapshot::default()
                 }
             }
         };
         let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<WorkspaceScan>> = Mutex::new(Vec::new());
+        let results: Mutex<Vec<(String, WorkspaceScan)>> = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..workspaces.len().min(FANOUT) {
                 scope.spawn(|| {
                     while let Some(ws) = workspaces.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let result = self.scan_workspace(ws, local_ids);
+                        let result = self.scan_workspace(ws);
                         results
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push(result);
+                            .push((ws.clone(), result));
                     }
                 });
             }
         });
         let mut snapshot = RemoteSnapshot::default();
-        let mut failed = 0usize;
-        for result in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        let mut scanned = Vec::new();
+        for (ws, result) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
             match result {
-                Ok((rows, unreadable)) => {
-                    snapshot.rows.extend(rows);
-                    snapshot.unreadable += unreadable;
-                }
+                Ok(sessions) => scanned.extend(sessions),
                 Err(e) => {
-                    failed += 1;
+                    snapshot.failed_workspaces.push(ws);
                     snapshot.failure.get_or_insert_with(|| e.to_string());
                 }
             }
         }
-        if failed > 0 {
-            snapshot.failure = snapshot
-                .failure
-                .map(|first| format!("{failed} workspace(s) couldn't be read; the first: {first}"));
+        if !snapshot.failed_workspaces.is_empty() {
+            snapshot.failed_workspaces.sort();
+            snapshot.failure = snapshot.failure.map(|first| {
+                format!(
+                    "{} workspace(s) couldn't be read; the first: {first}",
+                    snapshot.failed_workspaces.len()
+                )
+            });
         }
-        snapshot.rows.sort_by(|a, b| {
-            (a.workspace.as_str(), a.summary.name.as_str())
-                .cmp(&(b.workspace.as_str(), b.summary.name.as_str()))
-        });
+        let classified = classify(&scanned, local, SystemTime::now());
+        snapshot.rows = classified.rows;
+        snapshot.unreadable = classified.unreadable;
+        snapshot.hidden_sources = classified.hidden_sources;
         snapshot
     }
 }
@@ -267,33 +562,29 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// process.
 pub struct RemoteFeed {
     snapshots: Receiver<RemoteSnapshot>,
-    local_ids: Arc<Mutex<HashSet<String>>>,
+    local: Arc<Mutex<LocalView>>,
     stop: Arc<AtomicBool>,
 }
 
 impl RemoteFeed {
-    /// Start the feed thread on a copy of `bucket`. `local_ids` are the
-    /// `session_id`s of the sessions this machine holds, which every scan
-    /// leaves to their local rows; [`RemoteFeed::set_local_ids`] replaces
-    /// them. Starting makes no request on the calling thread.
-    pub fn spawn(
-        bucket: &Bucket,
-        local_ids: HashSet<String>,
-        interval: Duration,
-    ) -> anyhow::Result<Self> {
+    /// Start the feed thread on a copy of `bucket`. `local` describes the
+    /// sessions this machine holds, which every scan leaves to their local
+    /// rows; [`RemoteFeed::set_local`] replaces it. Starting makes no
+    /// request on the calling thread.
+    pub fn spawn(bucket: &Bucket, local: LocalView, interval: Duration) -> anyhow::Result<Self> {
         let reader = RemoteReader::new(bucket)?;
         let (tx, snapshots) = mpsc::channel();
-        let local_ids = Arc::new(Mutex::new(local_ids));
+        let local = Arc::new(Mutex::new(local));
         let stop = Arc::new(AtomicBool::new(false));
-        let (ids, stopped) = (Arc::clone(&local_ids), Arc::clone(&stop));
+        let (view, stopped) = (Arc::clone(&local), Arc::clone(&stop));
         std::thread::Builder::new()
             .name("koto-remote-feed".to_string())
             .spawn(move || loop {
                 if stopped.load(Ordering::Relaxed) {
                     return;
                 }
-                let ids = ids.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let snapshot = reader.scan(&ids);
+                let view = view.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let snapshot = reader.scan(&view);
                 if stopped.load(Ordering::Relaxed) || tx.send(snapshot).is_err() {
                     return;
                 }
@@ -309,7 +600,7 @@ impl RemoteFeed {
             })?;
         Ok(Self {
             snapshots,
-            local_ids,
+            local,
             stop,
         })
     }
@@ -326,9 +617,9 @@ impl RemoteFeed {
         }
     }
 
-    /// Replace the `session_id`s the next scan leaves to local rows.
-    pub fn set_local_ids(&self, ids: HashSet<String>) {
-        *self.local_ids.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    /// Replace what the next scan knows about this machine's sessions.
+    pub fn set_local(&self, local: LocalView) {
+        *self.local.lock().unwrap_or_else(|e| e.into_inner()) = local;
     }
 }
 
@@ -342,21 +633,330 @@ impl Drop for RemoteFeed {
 mod tests {
     use super::*;
 
+    const WS: &str = "0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210";
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    fn obj(etag: &str, age_secs: u64) -> ListedObject {
+        ListedObject {
+            size: 10,
+            etag: etag.to_string(),
+            last_modified: Some(now() - Duration::from_secs(age_secs)),
+        }
+    }
+
+    fn summary(ws: &str, name: &str, id: &str, state_etag: &str) -> SessionSummary {
+        SessionSummary {
+            schema: crate::session::summary::SUMMARY_SCHEMA,
+            session_id: id.to_string(),
+            name: name.to_string(),
+            home: ws.to_string(),
+            kind: None,
+            parent: None,
+            created_at: "2026-10-31T00:00:00Z".to_string(),
+            template_name: Some("t".to_string()),
+            current_state: Some("check".to_string()),
+            is_terminal: false,
+            is_blocked: true,
+            failed: false,
+            intent: None,
+            salient_var: None,
+            is_batch_task: false,
+            is_request_leg: false,
+            last_event_at: None,
+            last_seq: 2,
+            state_etag: state_etag.to_string(),
+            machine: Some("machine-a".to_string()),
+            sources: Vec::new(),
+        }
+    }
+
+    /// A session directory with a state file (ETag `s`, 600 s old) and,
+    /// when `read` is given, a summary describing it.
+    fn session(ws: &str, name: &str, summary_read: SummaryRead) -> ScannedSession {
+        let mut listing = SessionListing::default();
+        listing.objects.insert(state_file_name(name), obj("s", 600));
+        if !matches!(summary_read, SummaryRead::Absent) {
+            listing
+                .objects
+                .insert(SUMMARY_FILE.to_string(), obj("x", 600));
+        }
+        ScannedSession {
+            workspace: ws.to_string(),
+            name: name.to_string(),
+            listing,
+            summary: summary_read,
+            marker: None,
+        }
+    }
+
+    fn shown(ws: &str, name: &str, id: &str) -> ScannedSession {
+        session(
+            ws,
+            name,
+            SummaryRead::Read(Box::new(summary(ws, name, id, "s"))),
+        )
+    }
+
+    fn names(c: &Classified) -> Vec<(&str, &str, bool)> {
+        c.rows
+            .iter()
+            .map(|r| {
+                (
+                    r.workspace.as_str(),
+                    r.name.as_str(),
+                    matches!(r.status, RowStatus::Shown(_)),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn group_sessions_keeps_only_top_level_objects() {
-        let ws = "0123456789abcdef";
+    fn group_sessions_keeps_only_top_level_objects_with_their_facts() {
+        let o = |size| ListedObject {
+            size,
+            etag: "e".to_string(),
+            last_modified: None,
+        };
         let keys = [
-            ("0123456789abcdef/review/koto-review.state.jsonl", 10),
-            ("0123456789abcdef/review/summary.json", 5),
-            ("0123456789abcdef/review/backrefs/x.json", 1),
-            ("0123456789abcdef/other/koto-other.state.jsonl", 3),
-            ("fedcba9876543210/review/summary.json", 5),
-            ("0123456789abcdef/loose.json", 1),
+            ("0123456789abcdef/review/koto-review.state.jsonl", o(10)),
+            ("0123456789abcdef/review/summary.json", o(5)),
+            ("0123456789abcdef/review/backrefs/x.json", o(1)),
+            ("0123456789abcdef/other/koto-other.state.jsonl", o(3)),
+            ("fedcba9876543210/review/summary.json", o(5)),
+            ("0123456789abcdef/loose.json", o(1)),
         ];
-        let sessions = group_sessions(ws, keys);
+        let sessions = group_sessions(WS, keys);
         assert_eq!(sessions.keys().collect::<Vec<_>>(), vec!["other", "review"]);
         let review = &sessions["review"].objects;
         assert_eq!(review.len(), 2);
-        assert_eq!(review.get("summary.json"), Some(&5));
+        assert_eq!(review.get("summary.json"), Some(&o(5)));
+        assert!(sessions["review"].state("review").is_some());
+    }
+
+    #[test]
+    fn rule_1_a_directory_without_a_state_object_is_dropped() {
+        let mut s = shown(WS, "gone", "id");
+        s.listing.objects.remove(&state_file_name("gone"));
+        let c = classify(&[s], &LocalView::default(), now());
+        assert_eq!(c, Classified::default());
+    }
+
+    #[test]
+    fn rule_2_an_internal_name_is_dropped_even_without_a_summary() {
+        let scan = [
+            session(WS, "wf~1", SummaryRead::Absent),
+            session(WS, "anchor-77d6", SummaryRead::Absent),
+            session(WS, "anchor-77d6-closed", SummaryRead::Absent),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c, Classified::default());
+    }
+
+    #[test]
+    fn rule_3_a_local_copy_is_dropped_by_session_id() {
+        let local = LocalView {
+            session_ids: HashSet::from(["id".to_string()]),
+            ..LocalView::default()
+        };
+        let c = classify(&[shown(WS, "wf", "id")], &local, now());
+        assert_eq!(c, Classified::default());
+    }
+
+    #[test]
+    fn rule_3_a_local_copy_without_a_readable_summary_is_dropped_by_home_and_name() {
+        let local = LocalView {
+            homes: HashSet::from([(WS.to_string(), "wf".to_string())]),
+            ..LocalView::default()
+        };
+        let scan = [
+            session(WS, "wf", SummaryRead::Absent),
+            session(WS, "wf2", SummaryRead::Absent),
+            session(OTHER, "wf", SummaryRead::Absent),
+        ];
+        let c = classify(&scan, &local, now());
+        assert_eq!(names(&c), vec![(WS, "wf2", false), (OTHER, "wf", false)]);
+
+        let truncated = [session(WS, "wf", SummaryRead::Unreadable("malformed"))];
+        assert_eq!(classify(&truncated, &local, now()), Classified::default());
+
+        // A readable summary is matched by session_id only.
+        let c = classify(&[shown(WS, "wf", "other-id")], &local, now());
+        assert_eq!(names(&c), vec![(WS, "wf", true)]);
+    }
+
+    #[test]
+    fn rule_4_a_marker_naming_a_copy_in_the_scan_hides_the_source() {
+        // The source has no summary, so rule 5 would list it as unknown.
+        let mut source = session(WS, "wf", SummaryRead::Absent);
+        source.marker = Some(MigratedTo {
+            prefix: OTHER.to_string(),
+            session: "copy".to_string(),
+            session_id: Some("copy-id".to_string()),
+        });
+        let scan = [source, shown(OTHER, "copy", "copy-id")];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c.hidden_sources, 1);
+        assert_eq!(c.unreadable, 0);
+        assert_eq!(names(&c), vec![(OTHER, "copy", true)]);
+    }
+
+    #[test]
+    fn rule_4_a_marker_whose_copy_is_not_in_the_scan_lists_the_source() {
+        let mut source = shown(WS, "wf", "id");
+        source.marker = Some(MigratedTo {
+            prefix: OTHER.to_string(),
+            session: "copy".to_string(),
+            session_id: None,
+        });
+        // A copy directory with no state object isn't a copy in the scan.
+        let mut stateless = shown(OTHER, "copy", "copy-id");
+        stateless.listing.objects.remove(&state_file_name("copy"));
+        let c = classify(&[source, stateless], &LocalView::default(), now());
+        assert_eq!(c.hidden_sources, 0);
+        assert_eq!(names(&c), vec![(WS, "wf", true)]);
+    }
+
+    #[test]
+    fn rule_4_a_marker_naming_itself_or_a_copy_with_another_id_hides_nothing() {
+        let mut source = shown(WS, "wf", "id");
+        source.marker = Some(MigratedTo {
+            prefix: OTHER.to_string(),
+            session: "copy".to_string(),
+            session_id: Some("copy-id".to_string()),
+        });
+        let mut selfish = shown(WS, "self", "self-id");
+        selfish.marker = Some(MigratedTo {
+            prefix: WS.to_string(),
+            session: "self".to_string(),
+            session_id: None,
+        });
+        let scan = [source, selfish, shown(OTHER, "copy", "someone-else")];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c.hidden_sources, 0);
+        assert_eq!(c.rows.len(), 3);
+    }
+
+    #[test]
+    fn rule_4_a_local_import_hides_its_source() {
+        let local = LocalView {
+            imports: vec![
+                ImportedSource {
+                    prefix: Some("1111111111111111".to_string()),
+                    name: "elsewhere".to_string(),
+                    session_id: "src-id".to_string(),
+                },
+                ImportedSource {
+                    prefix: Some(WS.to_string()),
+                    name: "legacy".to_string(),
+                    session_id: "unknown-to-us".to_string(),
+                },
+            ],
+            ..LocalView::default()
+        };
+        let scan = [
+            shown(WS, "wf", "src-id"),
+            session(WS, "legacy", SummaryRead::Absent),
+            shown(WS, "legacy2", "other"),
+        ];
+        let c = classify(&scan, &local, now());
+        assert_eq!(c.hidden_sources, 2);
+        assert_eq!(names(&c), vec![(WS, "legacy2", true)]);
+    }
+
+    #[test]
+    fn rule_5_no_summary_lists_unknown_with_the_state_files_time() {
+        let c = classify(
+            &[session(WS, "old", SummaryRead::Absent)],
+            &LocalView::default(),
+            now(),
+        );
+        assert_eq!(c.unreadable, 1);
+        assert_eq!(
+            c.rows[0].status,
+            RowStatus::Unknown {
+                reason: "no-summary",
+                state_modified: Some(now() - Duration::from_secs(600)),
+                session_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rule_6_an_unreadable_summary_lists_unknown() {
+        let scan = [
+            session(WS, "a", SummaryRead::Unreadable("malformed")),
+            session(WS, "b", SummaryRead::Unreadable("oversized")),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c.unreadable, 2);
+        assert_eq!(names(&c), vec![(WS, "a", false), (WS, "b", false)]);
+    }
+
+    #[test]
+    fn rule_7_a_stale_summary_reads_unknown_only_past_60_seconds() {
+        let at = |age: u64, etag: &str| {
+            let mut s = shown(WS, "wf", "id");
+            s.listing
+                .objects
+                .insert(state_file_name("wf"), obj(etag, age));
+            classify(&[s], &LocalView::default(), now())
+        };
+        let fresh = at(10, "new");
+        assert_eq!(
+            (fresh.unreadable, names(&fresh)),
+            (0, vec![(WS, "wf", true)])
+        );
+        let edge = at(60, "new");
+        assert_eq!(edge.unreadable, 0, "60 s is still inside the window");
+        let old = at(120, "new");
+        assert_eq!((old.unreadable, names(&old)), (1, vec![(WS, "wf", false)]));
+        assert!(matches!(
+            &old.rows[0].status,
+            RowStatus::Unknown { reason: "stale", session_id: Some(id), .. } if id == "id"
+        ));
+        let same = at(120, "s");
+        assert_eq!(same.unreadable, 0, "a matching ETag is never stale");
+
+        // A quoted ETag in the summary matches its unquoted listing.
+        let mut s = session(
+            WS,
+            "q",
+            SummaryRead::Read(Box::new(summary(WS, "q", "id", "\"s\""))),
+        );
+        s.listing
+            .objects
+            .insert(state_file_name("q"), obj("s", 120));
+        assert_eq!(classify(&[s], &LocalView::default(), now()).unreadable, 0);
+
+        // A LastModified that didn't parse counts as old.
+        let mut s = shown(WS, "wf", "id");
+        s.listing.objects.insert(
+            state_file_name("wf"),
+            ListedObject {
+                size: 1,
+                etag: "new".to_string(),
+                last_modified: None,
+            },
+        );
+        assert_eq!(classify(&[s], &LocalView::default(), now()).unreadable, 1);
+    }
+
+    #[test]
+    fn rule_8_otherwise_the_row_is_shown_from_its_summary_in_order() {
+        let scan = [
+            shown(OTHER, "b", "1"),
+            shown(WS, "z", "2"),
+            shown(WS, "a", "3"),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(
+            names(&c),
+            vec![(WS, "a", true), (WS, "z", true), (OTHER, "b", true)]
+        );
+        assert_eq!((c.unreadable, c.hidden_sources), (0, 0));
     }
 }

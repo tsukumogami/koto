@@ -234,6 +234,21 @@ fn remote_marker(session: &CachedSession) -> Option<String> {
         .then(|| format!("@{}", session.machine.as_deref().unwrap_or("unknown")))
 }
 
+/// The list's trailing tally: sessions that couldn't be read (local state
+/// files, and other machines' sessions listed as unknown) and migrated
+/// sources hidden in favour of their listed copy. `None` when both are 0.
+fn tally_line(tree: &SessionTree) -> Option<String> {
+    let unreadable = tree.unreadable + tree.remote_unreadable;
+    let mut parts = Vec::new();
+    if unreadable > 0 {
+        parts.push(format!("{unreadable} unreadable session(s)"));
+    }
+    if tree.remote_hidden > 0 {
+        parts.push(format!("{} hidden source(s)", tree.remote_hidden));
+    }
+    (!parts.is_empty()).then(|| format!("\u{26a0} {}", parts.join(" \u{00b7} ")))
+}
+
 /// Render the session list as a 4-column table with cursor highlighting and scrollbar.
 fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layout::Rect) {
     let rows_data = state.visible_rows();
@@ -299,13 +314,22 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
         );
     }
 
-    // Trailing note for sessions whose state file failed to parse, so they are
-    // surfaced rather than silently dropped.
-    // Local state files and other machines' summaries alike.
-    let unreadable = state.tree.unreadable + state.tree.remote_unreadable;
-    if unreadable > 0 {
-        let note = format!("\u{26a0} {} unreadable session(s)", unreadable);
-        rows.push(Row::new(vec![Cell::from(note)]).style(Style::default().fg(Color::Red)));
+    // Notes pinned under the rows, across the list's full width: the tally
+    // of sessions that couldn't be read (local state files and other
+    // machines' sessions listed as unknown, so they are surfaced rather than
+    // silently dropped) and of hidden migrated sources, then one status line
+    // while the last feed snapshot couldn't read some or all of the bucket
+    // (the rows it couldn't read stay as they were).
+    let mut notes: Vec<Line<'_>> = Vec::new();
+    if let Some(note) = tally_line(&state.tree) {
+        notes.push(Line::styled(note, Style::default().fg(Color::Red)));
+    }
+    if let Some(failure) = &state.tree.remote_failure {
+        let line = format!(
+            "\u{26a0} bucket: {}",
+            failure.replace(['\n', '\r', '\t'], " ")
+        );
+        notes.push(Line::styled(line, Style::default().fg(Color::Yellow)));
     }
 
     let row_count = rows.len();
@@ -317,27 +341,33 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
             .collect::<Vec<_>>(),
     );
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("koto dashboard"),
-        )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+    // The notes take the bottom lines inside the border; the table the rest.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("koto dashboard");
+    let inner = block.inner(area);
+    let note_height = (notes.len() as u16).min(inner.height.saturating_sub(2));
+    let [table_area, notes_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(note_height)]).areas(inner);
+    f.render_widget(block, area);
+
+    let table = Table::new(rows, widths).header(header).row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut table_state = TableState::default();
     table_state.select(Some(state.cursor_idx + cursor_offset));
 
-    f.render_stateful_widget(table, area, &mut table_state);
+    f.render_stateful_widget(table, table_area, &mut table_state);
+    if note_height > 0 {
+        f.render_widget(Paragraph::new(notes), notes_area);
+    }
 
     // Attach a scrollbar when the row count exceeds the visible area height.
-    // Visible area height minus 3 (border top + header + border bottom).
-    let visible_height = area.height.saturating_sub(3) as usize;
+    // Visible area height minus the header and the notes.
+    let visible_height = table_area.height.saturating_sub(1) as usize;
     if row_count > visible_height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         let mut scrollbar_state =
@@ -1213,6 +1243,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1505,6 +1536,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1793,6 +1825,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 
@@ -2887,7 +2920,8 @@ mod tests {
         // scan not yet known B holds it.
         let row = crate::session::remote_feed::RemoteRow {
             workspace: REMOTE_WS.to_string(),
-            summary: SessionSummary {
+            name: "mine".to_string(),
+            status: crate::session::remote_feed::RowStatus::Shown(Box::new(SessionSummary {
                 schema: 1,
                 session_id: "mine-local-id".to_string(),
                 name: "mine".to_string(),
@@ -2909,9 +2943,15 @@ mod tests {
                 state_etag: String::new(),
                 machine: Some("machine-b".to_string()),
                 sources: Vec::new(),
-            },
+            })),
         };
-        crate::cli::dashboard_data::replace_remote_rows(&mut state.tree, &[row]);
+        crate::cli::dashboard_data::apply_snapshot(
+            &mut state.tree,
+            &crate::session::remote_feed::RemoteSnapshot {
+                rows: vec![row],
+                ..Default::default()
+            },
+        );
         let rows = state.visible_rows();
         let keys: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(keys, vec!["mine"]);
@@ -3004,5 +3044,42 @@ mod tests {
             lines.iter().any(|l| l.contains("3 unreadable session(s)")),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn the_tally_line_counts_hidden_sources_beside_unreadable_ones() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.remote_hidden = 1;
+        let lines = frame_lines(&state, 78);
+        let tally: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("hidden source(s)"))
+            .collect();
+        assert_eq!(tally.len(), 1, "{lines:#?}");
+        assert!(tally[0].contains("1 hidden source(s)"), "{lines:#?}");
+        assert!(!tally[0].contains("unreadable"), "{lines:#?}");
+
+        state.tree.remote_unreadable = 2;
+        let lines = frame_lines(&state, 78);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 unreadable session(s) \u{00b7} 1 hidden source(s)")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_feed_failure_shows_one_status_line_until_it_clears() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.remote_failure = Some("listing x/ failed:\nboom".to_string());
+        let lines = frame_lines(&state, 78);
+        let status: Vec<_> = lines.iter().filter(|l| l.contains("bucket:")).collect();
+        assert_eq!(status.len(), 1, "{lines:#?}");
+        assert!(status[0].contains("listing x/ failed: boom"), "{lines:#?}");
+
+        state.tree.remote_failure = None;
+        let lines = frame_lines(&state, 78);
+        assert!(!lines.iter().any(|l| l.contains("bucket:")), "{lines:#?}");
     }
 }

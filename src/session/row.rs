@@ -127,9 +127,72 @@ pub fn derive_row(
     }
 }
 
+/// Where a session was imported from: the source named by the log's latest
+/// `session_imported` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRecord {
+    /// The source's workspace (its execution anchor), as recorded.
+    pub from_workspace: String,
+    /// The source session's name in that workspace.
+    pub from_session: String,
+    /// The source session's `session_id`.
+    pub from_session_id: String,
+}
+
+/// The source the log's latest `session_imported` event names; `None` for a
+/// session that was never imported.
+pub fn latest_import(events: &[Event]) -> Option<ImportRecord> {
+    events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::SessionImported {
+            from_workspace,
+            from_session,
+            from_session_id,
+            ..
+        } => Some(ImportRecord {
+            from_workspace: from_workspace.clone(),
+            from_session: from_session.clone(),
+            from_session_id: from_session_id.clone(),
+        }),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-10-31T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn imported(from: &str, id: &str) -> EventPayload {
+        EventPayload::SessionImported {
+            from_workspace: "/work/a".to_string(),
+            from_session: from.to_string(),
+            from_session_id: id.to_string(),
+            machine_id: "m".to_string(),
+            machine_name: None,
+        }
+    }
+
+    #[test]
+    fn latest_import_names_the_last_session_imported_source() {
+        assert_eq!(latest_import(&[]), None);
+        let events = [
+            event(1, imported("first", "id-1")),
+            event(2, imported("second", "id-2")),
+        ];
+        let record = latest_import(&events).unwrap();
+        assert_eq!(record.from_session, "second");
+        assert_eq!(record.from_session_id, "id-2");
+        assert_eq!(record.from_workspace, "/work/a");
+    }
 
     #[test]
     fn salient_var_takes_the_first_non_empty_key_in_priority_order() {

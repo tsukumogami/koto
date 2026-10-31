@@ -3065,8 +3065,40 @@ On the local backend both `machine` and `workspace` stay empty and the dashboard
 no network request, even with a bucket configured. On the cloud backend a session from
 another machine appears with that machine's name and its own workspace prefix, and its
 `current_state`, `status`, `intent` and `template` read the same as on the machine that
-ran it. A session this machine has a local copy of appears once, as its own row. The
-`--needs-you`, `--status` and name filters apply to other machines' sessions too.
+ran it. A session this machine has a local copy of appears once, as its own row,
+matched by its `session_id`, or by its workspace prefix and name when its summary can't
+be read. Two machines' sessions with the same name print as two lines, each with its
+own `machine` and `workspace`. The `--needs-you`, `--status` and name filters apply to
+other machines' sessions too.
+
+The dashboard decides each session directory it lists in the bucket in this order:
+
+1. A directory with no state file prints nothing: the session was removed (by cleanup
+   or prune on its own machine), even when a `summary.json` is still there.
+2. A session koto keeps for its own bookkeeping (an epoch branch, an execution anchor
+   or an anchor's close session) prints nothing.
+3. A session this machine has a local copy of prints as its local row only.
+4. A session `koto session import` copied elsewhere prints nothing when its own
+   `migrated.json` names a copy present in the same read of the bucket, or when a
+   local session's latest `session_imported` event names it. Each one left out is
+   counted in a stderr note, `note: N hidden source(s): imported into a copy that is
+   listed`. A marker whose copy isn't in the bucket hides nothing.
+5. A session whose state file has no `summary.json` beside it (as a release before the
+   summary pushes it), whose summary is over 64 KiB, doesn't parse, carries another
+   schema or names another session, or whose summary's `state_etag` isn't the listed
+   state file's ETag once that file is more than 60 seconds old, prints with `status`
+   `unknown`: `current_state`, `intent`, `template` and `machine` are empty, `workspace`
+   holds its prefix, and `idle` is measured from the state file's last-modified time in
+   the bucket. Inside those 60 seconds a differing `state_etag` is the ordinary gap
+   between a push's two writes, and the summary is shown. Such a row's `liveness` is
+   `pending`, so once it is five minutes old only `--all` prints it. It joins the
+   unreadable tally: `note: N unreadable session(s), M listed as unknown` on stderr,
+   where `N` also counts this machine's unreadable sessions. With no such remote row
+   the note keeps its older form, `note: N unreadable session(s) skipped`.
+6. Every other session prints from its summary.
+
+The dashboard reads only listings, `summary.json` and `migrated.json` objects from the
+bucket: never a state file, nothing under a session's `ctx/`, and it writes nothing.
 
 The interactive dashboard shows the same rows. On the cloud backend a background
 thread reads the bucket and the list updates when each read finishes; key presses
@@ -3080,8 +3112,13 @@ machine. The Session tab of another machine's row shows `Machine` and `Workspace
 (the 16-hex workspace id) with the facts its summary carries, and the Summary,
 History and Remaining tabs say the session's detail lives on its own machine. A
 local row's Session tab ends with a `Machine` row: the recorded machine, or
-`unknown` for a session from before the machine stamp. Summaries that couldn't be
-read join the trailing unreadable count.
+`unknown` for a session from before the machine stamp. Rows listed as `unknown` read
+`@unknown` and join the trailing unreadable count, and the same tally line counts the
+hidden sources (`N hidden source(s)`). A session removed from the bucket leaves the
+list when the next read finishes. A failed listing is never read as a removal: when
+the listing of a workspace fails, the rows last read from it stay, and when the
+bucket's top-level listing fails every other machine's row stays; one status line
+(`bucket: ...`) carries the failure until a read succeeds again.
 
 ### Liveness Vocabulary
 
