@@ -544,6 +544,7 @@ fn create_kind_session<S: SessionBackend + ?Sized>(
             template_path: relative,
             variables: Default::default(),
             spawn_entry: None,
+            machine: Some(crate::session::version::machine_name()),
         },
         EventPayload::Transitioned {
             from: None,

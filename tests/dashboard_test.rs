@@ -248,14 +248,21 @@ fn dashboard_once_produces_tab_separated_output_with_running_and_terminal() {
         lines
     );
 
-    // Each line has exactly eight tab-separated fields: the original six plus
-    // the appended idle (7) and liveness (8) columns.
+    // Each line has exactly ten tab-separated fields: the original six, the
+    // appended idle (7) and liveness (8) columns, and machine (9) and
+    // workspace (10), both empty on the local backend.
     for line in &lines {
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields.len(),
-            8,
-            "line '{}' should have 8 tab-separated fields",
+            10,
+            "line '{}' should have 10 tab-separated fields",
+            line
+        );
+        assert_eq!(
+            (fields[8], fields[9]),
+            ("", ""),
+            "machine and workspace are empty on the local backend: '{}'",
             line
         );
         let valid_buckets = ["running", "done", "failed", "blocked", "unknown"];

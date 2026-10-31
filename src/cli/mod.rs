@@ -10995,6 +10995,7 @@ Done.
                 template_path: "/cache/abc.json".to_string(),
                 variables: resolved,
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11027,6 +11028,7 @@ Done.
                     "stale".to_string(),
                 )]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11106,6 +11108,7 @@ Done.
                     "myslug".to_string(),
                 )]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11184,6 +11187,7 @@ Done.
                     "resolved".to_string(),
                 )]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11276,6 +11280,7 @@ Done.
                     "resolved".to_string(),
                 )]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11351,6 +11356,7 @@ Done.
                     ("BLANK".to_string(), String::new()),
                 ]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -11427,6 +11433,7 @@ Done.
                     ("EMPTY".to_string(), String::new()),
                 ]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];

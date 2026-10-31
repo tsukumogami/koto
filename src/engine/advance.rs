@@ -7696,6 +7696,7 @@ mod tests {
                     m
                 },
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];

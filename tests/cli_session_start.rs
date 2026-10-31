@@ -61,6 +61,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         template_path: String::new(),
         variables: Default::default(),
         spawn_entry: None,
+        machine: None,
     };
     let event = Event {
         seq: 1,

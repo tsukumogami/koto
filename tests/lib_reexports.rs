@@ -78,6 +78,7 @@ fn event_resolves_and_constructs() {
             template_path: String::new(),
             variables: HashMap::new(),
             spawn_entry: None,
+            machine: None,
         },
         idempotency_hash: None,
     };

@@ -226,6 +226,50 @@ pub(crate) fn get_hostname() -> String {
     "unknown".to_string()
 }
 
+/// The longest machine name koto records.
+pub const MACHINE_NAME_MAX: usize = 64;
+
+/// The name of this machine, recorded on each session it creates: the
+/// `KOTO_MACHINE_NAME` variable when it is set and non-empty, else the
+/// hostname with any domain part removed, coerced by
+/// [`coerce_machine_name`]. Resolved once per process.
+pub fn machine_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        match std::env::var("KOTO_MACHINE_NAME") {
+            Ok(name) if !name.is_empty() => Some(name),
+            _ => None,
+        }
+        .unwrap_or_else(|| coerce_machine_name(&get_hostname()))
+    })
+    .clone()
+}
+
+/// A hostname as a machine name: the part before the first `.`, with every
+/// character outside `[A-Za-z0-9._-]` replaced by `-`, cut to
+/// [`MACHINE_NAME_MAX`] characters. `unknown` is reserved for sessions that
+/// record no machine, so a host of that name becomes `unknown-host`, and an
+/// empty hostname becomes `unknown-host` too.
+pub fn coerce_machine_name(hostname: &str) -> String {
+    let short = hostname.split('.').next().unwrap_or("");
+    let name: String = short
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(MACHINE_NAME_MAX)
+        .collect();
+    if name.is_empty() || name == "unknown" {
+        "unknown-host".to_string()
+    } else {
+        name
+    }
+}
+
 /// Get or generate the machine ID.
 ///
 /// Reads from the user config file at `~/.koto/config.toml`. If the
@@ -552,5 +596,14 @@ mod tests {
         let id1 = generate_machine_id();
         let id2 = generate_machine_id();
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn coerce_machine_name_takes_the_short_name_and_replaces_other_characters() {
+        assert_eq!(coerce_machine_name("my host_01.example.com"), "my-host_01");
+        assert_eq!(coerce_machine_name("build-vm"), "build-vm");
+        assert_eq!(coerce_machine_name("unknown"), "unknown-host");
+        assert_eq!(coerce_machine_name(""), "unknown-host");
+        assert_eq!(coerce_machine_name(&"a".repeat(80)).len(), MACHINE_NAME_MAX);
     }
 }

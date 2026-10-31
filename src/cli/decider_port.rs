@@ -647,6 +647,7 @@ d
                             template_path: "t.json".to_string(),
                             variables: vars,
                             spawn_entry: None,
+                            machine: None,
                         },
                     ),
                     event(

@@ -1453,7 +1453,8 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     // then wait in its batch (koto#548): its first append checks the
     // version and marks the batch open, and the flush before the tick
     // returns checks for a marker and the version again, pushes the state
-    // file once and `version.json`, and closes the batch.
+    // file once, its `summary.json` and `version.json`, and closes the
+    // batch.
     let version = format!("{}version.json", session);
     let batch_marker = format!("{}batch-open.json", session);
     let expected = vec![
@@ -1465,6 +1466,7 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
         format!("LIST {}", version),
         format!("GET {}", version),
         put,
+        format!("PUT {}summary.json", session),
         format!("PUT {}", version),
         format!("DELETE {}", batch_marker),
     ];

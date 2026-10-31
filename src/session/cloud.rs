@@ -1509,8 +1509,42 @@ impl CloudBackend {
         }
         let response = sent.with_context(|| format!("S3 PUT failed for key: {}", key))?;
         self.forget_probe(id);
-        self.record_synced(id, response_etag(&response).as_deref(), data);
+        let etag = response_etag(&response);
+        self.record_synced(id, etag.as_deref(), data);
+        self.put_summary(id, data, etag.as_deref());
         Ok(())
+    }
+
+    /// PUT `<home>/<id>/summary.json` for the state `data` the bucket now
+    /// holds under `state_etag`, after a push of the session's own state
+    /// ([`crate::session::summary`]). Internal sessions get none. A failed
+    /// PUT warns and never fails the push: the state is already in the
+    /// bucket. The summary is written again only when the session's state
+    /// is next pushed; a flush with no state change doesn't retry it.
+    fn put_summary(&self, id: &str, data: &[u8], state_etag: Option<&str>) {
+        use crate::session::summary::{SessionSummary, SUMMARY_FILE};
+        if self.probes.read_only {
+            return;
+        }
+        let home = self.home(id);
+        let Some(summary) = SessionSummary::build(
+            id,
+            &home,
+            data,
+            &self.local.session_dir(id),
+            state_etag.unwrap_or_default(),
+        ) else {
+            return;
+        };
+        let key = format!("{}/{}/{}", home, id, SUMMARY_FILE);
+        if let Err(e) = self.bucket.put_object(&key, &summary.to_bytes()) {
+            eprintln!(
+                "warning: cloud sync: publishing the summary of session '{}' to {} failed: {}",
+                id,
+                key,
+                without_url_userinfo(&e.to_string())
+            );
+        }
     }
 
     /// One PUT of a state file: on `etag` when given, else only where no
@@ -1565,7 +1599,9 @@ impl CloudBackend {
             .put_object(&key, data)
             .with_context(|| format!("S3 PUT failed for key: {}", key))?;
         self.forget_probe(id);
-        self.record_synced(id, response_etag(&response).as_deref(), data);
+        let etag = response_etag(&response);
+        self.record_synced(id, etag.as_deref(), data);
+        self.put_summary(id, data, etag.as_deref());
         Ok(())
     }
 
@@ -6556,7 +6592,7 @@ impl std::error::Error for ListingFailed {}
 /// time, between asks. A [`HELD_ELSEWHERE_FANOUT`]-wide burst is what an
 /// endpoint is likeliest to throttle, and rust-s3's own single retry a
 /// second later can meet the same throttle.
-fn list_retrying(
+pub(crate) fn list_retrying(
     bucket: &Bucket,
     prefix: String,
     delimiter: Option<&str>,
@@ -7232,6 +7268,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -7291,6 +7328,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -7353,6 +7391,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -8753,6 +8792,7 @@ mod tests {
                 "PUT ctx/notes.md".to_string(),
                 "PUT ctx/manifest.json".to_string(),
                 format!("PUT {}", state_file_name("wf")),
+                "PUT summary.json".to_string(),
                 "PUT version.json".to_string(),
                 "DELETE ctx/gone.md".to_string(),
                 format!("DELETE {}", BATCH_MARKER),

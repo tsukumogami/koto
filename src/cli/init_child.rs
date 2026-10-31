@@ -825,6 +825,7 @@ fn init_child_core(
         template_path: cache_path_str,
         variables,
         spawn_entry,
+        machine: Some(crate::session::version::machine_name()),
     };
     let transition_payload = EventPayload::Transitioned {
         from: None,
@@ -1018,6 +1019,7 @@ pub fn init_inline_into_session(
         template_path: relative_template_path,
         variables,
         spawn_entry: None,
+        machine: Some(crate::session::version::machine_name()),
     };
     let transition_payload = EventPayload::Transitioned {
         from: None,
@@ -1268,6 +1270,7 @@ Done.
                 template_path: "/tmp/unused.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];

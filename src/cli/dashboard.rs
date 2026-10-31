@@ -94,22 +94,100 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// The remote rows `--once` prints under the cloud backend, read in one
+/// synchronous pass over the bucket ([`RemoteReader::scan`]).
+///
+/// Sets each local row's `workspace` to its copy's prefix. A session this
+/// machine holds a copy of is left to its local row (matched by
+/// `session_id`), and the state-less placeholder the cloud listing adds for
+/// a session found only under this directory's own prefix is dropped when
+/// the pass read that session, so it shows once, from its summary. A failed
+/// pass leaves the local rows standing and says why on stderr; summaries
+/// that couldn't be read join the unreadable tally.
+///
+/// [`RemoteReader::scan`]: crate::session::remote_feed::RemoteReader::scan
+fn once_remote_rows(
+    cloud: &crate::session::cloud::CloudBackend,
+    tree: &mut SessionTree,
+) -> Vec<(String, CachedSession)> {
+    use crate::session::remote_feed::RemoteReader;
+
+    let own = cloud.workspace_prefix().to_string();
+    let mut local_ids = std::collections::HashSet::new();
+    let mut placeholders = std::collections::HashSet::new();
+    for (name, session) in tree.sessions.iter_mut() {
+        session.workspace = Some(
+            cloud
+                .home_prefix(name)
+                .map(|home| home.prefix)
+                .unwrap_or_else(|_| own.clone()),
+        );
+        if session.state_path.exists() {
+            if !session.header.session_id.is_empty() {
+                local_ids.insert(session.header.session_id.clone());
+            }
+        } else {
+            placeholders.insert(name.clone());
+        }
+    }
+
+    let snapshot = match RemoteReader::new(&cloud.bucket_handle()) {
+        Ok(reader) => reader.scan(&local_ids),
+        Err(e) => {
+            eprintln!("note: other machines' sessions weren't read: {e}");
+            return Vec::new();
+        }
+    };
+    if let Some(failure) = &snapshot.failure {
+        eprintln!("note: other machines' sessions weren't all read: {failure}");
+    }
+    tree.unreadable += snapshot.unreadable;
+
+    for row in &snapshot.rows {
+        if row.workspace == own && placeholders.contains(&row.summary.name) {
+            tree.sessions.remove(&row.summary.name);
+        }
+    }
+    snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row.summary.name.clone(),
+                dashboard_data::remote_session(row),
+            )
+        })
+        .collect()
+}
+
 /// Print the `--once` tab-separated feed.
 ///
 /// Columns: `id, current_state, elapsed, status, intent, template` (the
 /// original six, unchanged for positional compatibility) plus appended
-/// `idle, liveness` (columns 7-8). Rows are emitted in attention order. The
-/// receded set is excluded by default; `--all` includes it. `--status` /
-/// `--needs-you` filter the rows. Appended fields are sanitized of tabs and
-/// newlines so the tab-separated contract holds.
-fn run_once(args: &DashboardArgs, tree: &SessionTree) {
+/// `idle, liveness` (columns 7-8) and `machine, workspace` (columns 9-10).
+/// `remote` holds the rows read from other machines' summaries; they are
+/// filtered and ordered with the local rows. On the local backend (`cloud`
+/// false) columns 9 and 10 are empty. Rows are emitted in attention order.
+/// The receded set is excluded by default; `--all` includes it. `--status`
+/// / `--needs-you` filter the rows. Appended fields are sanitized of tabs
+/// and newlines so the tab-separated contract holds.
+fn run_once(
+    args: &DashboardArgs,
+    tree: &SessionTree,
+    remote: &[(String, CachedSession)],
+    cloud: bool,
+) {
     use std::time::SystemTime;
 
     let now = SystemTime::now();
 
     // Build (session_id, &session, liveness, idle) tuples, applying filters.
     let mut rows: Vec<(&str, &CachedSession, Liveness, std::time::Duration)> = Vec::new();
-    for (session_id, session) in tree.sessions.iter() {
+    let all = tree
+        .sessions
+        .iter()
+        .chain(remote.iter().map(|(name, session)| (name, session)));
+    for (session_id, session) in all {
         // Optional name filter (matches the legacy behavior).
         if let Some(ref filter) = args.name {
             if session_id != filter {
@@ -140,15 +218,20 @@ fn run_once(args: &DashboardArgs, tree: &SessionTree) {
         rows.push((session_id.as_str(), session, liveness, idle));
     }
 
-    // Attention order; tie-break on session id for determinism.
+    // Attention order; tie-break on session id, then workspace, for
+    // determinism.
     rows.sort_by(|a, b| {
         attention_key(a.2, a.3)
             .cmp(&attention_key(b.2, b.3))
             .then_with(|| a.0.cmp(b.0))
+            .then_with(|| a.1.workspace.cmp(&b.1.workspace))
     });
 
     for (session_id, session, liveness, idle) in rows {
-        println!("{}", format_once_line(session_id, session, liveness, idle));
+        println!(
+            "{}",
+            format_once_line(session_id, session, liveness, idle, cloud)
+        );
     }
 
     // Surface unparseable sessions as a trailing note on stderr so the
@@ -160,12 +243,15 @@ fn run_once(args: &DashboardArgs, tree: &SessionTree) {
 
 /// Build a single `--once` line for a session. First six columns match the
 /// legacy positional contract; columns 7-8 are the appended `idle` and
-/// `liveness`. Appended/interpolated fields are sanitized of tabs/newlines.
+/// `liveness`, and 9-10 the `machine` that produced the session and the
+/// `workspace` id of its copy, both empty unless `cloud` (PRD R20).
+/// Appended/interpolated fields are sanitized of tabs/newlines.
 fn format_once_line(
     session_id: &str,
     session: &CachedSession,
     liveness: Liveness,
     idle: std::time::Duration,
+    cloud: bool,
 ) -> String {
     let current_state = session.current_state.as_deref().unwrap_or("");
     let elapsed_secs = compute_elapsed_since(&session.header.created_at).as_secs();
@@ -173,9 +259,17 @@ fn format_once_line(
     let status_bucket = classify_status(session);
     let idle_str = format_elapsed(idle.as_secs());
     let liveness_str = liveness_token(liveness);
+    let (machine, workspace) = if cloud {
+        (
+            session.machine.as_deref().unwrap_or(""),
+            session.workspace.as_deref().unwrap_or(""),
+        )
+    } else {
+        ("", "")
+    };
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        session_id,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        sanitize_field(session_id),
         sanitize_field(current_state),
         elapsed,
         status_bucket,
@@ -183,6 +277,8 @@ fn format_once_line(
         sanitize_field(session.header.template_name.as_deref().unwrap_or("")),
         sanitize_field(&idle_str),
         liveness_str,
+        sanitize_field(machine),
+        sanitize_field(workspace),
     )
 }
 
@@ -368,7 +464,12 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
     if args.once {
         let mut tree = SessionTree::new();
         dashboard_data::refresh(&mut tree, backend)?;
-        run_once(&args, &tree);
+        let remote = match backend {
+            crate::session::Backend::Cloud(cloud) => once_remote_rows(cloud, &mut tree),
+            crate::session::Backend::Local(_) => Vec::new(),
+        };
+        let cloud = matches!(backend, crate::session::Backend::Cloud(_));
+        run_once(&args, &tree, &remote, cloud);
         return Ok(());
     }
 
@@ -518,6 +619,9 @@ mod tests {
             is_unreadable: false,
             is_batch_task: false,
             is_request_leg: false,
+            machine: None,
+            workspace: None,
+            remote: false,
         }
     }
 
@@ -601,21 +705,40 @@ mod tests {
     }
 
     #[test]
-    fn once_line_keeps_first_six_columns_and_appends_two() {
-        let s = once_session(
+    fn once_line_keeps_first_eight_columns_and_appends_machine_and_workspace() {
+        let mut s = once_session(
             Some("work-on"),
             Some("implement"),
             Some("fix bug"),
             false,
             false,
         );
-        let line = format_once_line("sess-1", &s, Liveness::Active, std::time::Duration::ZERO);
+        s.machine = Some("machine-a".to_string());
+        s.workspace = Some("0123456789abcdef".to_string());
+        let line = format_once_line(
+            "sess-1",
+            &s,
+            Liveness::Active,
+            std::time::Duration::ZERO,
+            true,
+        );
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             cols.len(),
-            8,
-            "must emit exactly eight tab-separated columns"
+            10,
+            "must emit exactly ten tab-separated columns"
         );
+        assert_eq!(cols[8], "machine-a", "column 9 is the machine");
+        assert_eq!(cols[9], "0123456789abcdef", "column 10 is the workspace");
+        // The local backend prints both empty, whatever the row records.
+        let local = format_once_line(
+            "sess-1",
+            &s,
+            Liveness::Active,
+            std::time::Duration::ZERO,
+            false,
+        );
+        assert!(local.ends_with("\tactive\t\t"), "got: {local:?}");
         // First six unchanged from the legacy contract.
         assert_eq!(cols[0], "sess-1");
         assert_eq!(cols[1], "implement");
@@ -635,11 +758,17 @@ mod tests {
             false,
             false,
         );
-        let line = format_once_line("sess-2", &s, Liveness::Active, std::time::Duration::ZERO);
+        let line = format_once_line(
+            "sess-2",
+            &s,
+            Liveness::Active,
+            std::time::Duration::ZERO,
+            false,
+        );
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             cols.len(),
-            8,
+            10,
             "embedded tabs/newlines must not add columns; got: {:?}",
             cols
         );

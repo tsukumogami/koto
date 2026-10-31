@@ -684,6 +684,7 @@ mod tests {
             template_path: "t.json".to_string(),
             variables: Default::default(),
             spawn_entry: None,
+            machine: None,
         }
     }
 

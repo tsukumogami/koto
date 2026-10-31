@@ -380,6 +380,7 @@ pub fn handle_start(
         template_path: String::new(),
         variables: Default::default(),
         spawn_entry: None,
+        machine: Some(crate::session::version::machine_name()),
     };
     let initial_events = vec![Event {
         seq: 1,

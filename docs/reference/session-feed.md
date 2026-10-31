@@ -64,6 +64,9 @@ events:
         type: object
         required: false
         nullable: true
+      machine:
+        type: string
+        required: false
 
   transitioned:
     tier: 1
@@ -1170,7 +1173,8 @@ Marks the birth of a session. Written once at `koto init` time.
   "payload": {
     "template_path": "/home/user/.koto/cache/compiled/abc123.json",
     "variables": {"ISSUE_NUMBER": "42"},
-    "spawn_entry": null
+    "spawn_entry": null,
+    "machine": "laptop"
   }
 }
 ```
@@ -1180,6 +1184,7 @@ Marks the birth of a session. Written once at `koto init` time.
 | `template_path` | string | Yes | Path to the compiled template JSON in koto's cache directory. |
 | `variables` | object | No | Variable bindings active at init time. String-to-string map holding every declared variable, with the value passed, its default, or the empty string. Absent when the template declares no variables. A declared variable without `rebind: true` keeps this value for the whole session. |
 | `spawn_entry` | object | No | Present only for batch-spawned child sessions. Carries `template` (source path), `vars` (bindings), and `waits_on` (sorted dependency list). Absent for top-level sessions. |
+| `machine` | string | No | The name of the machine that created the session: `KOTO_MACHINE_NAME` when set, else the short hostname. Kept on this append-only event rather than the header, so a header rewrite can't drop it. Absent on sessions created before the field existed, which read as an unknown machine. |
 
 ---
 
@@ -3019,14 +3024,17 @@ The attributes a consumer can export from this section and
 ## Dashboard `--once` Feed
 
 `koto dashboard --once` prints one tab-separated line per session and exits (no TUI).
-It is the scripting surface over the session feed. The dashboard derives all of the
-columns below at read time from the data already in this contract (the event log,
-header, and computed current state) — nothing new is written to disk.
+It is the scripting surface over the session feed. The dashboard derives the columns
+of this machine's sessions at read time from the data already in this contract (the
+event log, header, and computed current state); running the dashboard writes nothing.
+On the cloud backend it also lists other machines' sessions from the bucket, reading
+each one's `summary.json`, the small object every push publishes beside the session's
+state file, and never its state file or context.
 
 ### Columns
 
 Lines are tab-separated. The first six columns are stable and positionally compatible
-with earlier koto releases; columns 7 and 8 were appended additively.
+with earlier koto releases; columns 7 and 8, then 9 and 10, were appended additively.
 
 | # | Column | Description |
 |---|--------|-------------|
@@ -3038,13 +3046,22 @@ with earlier koto releases; columns 7 and 8 were appended additively.
 | 6 | `template` | Template name from the header. |
 | 7 | `idle` | **(appended)** Time since the last event (last activity), compact form. |
 | 8 | `liveness` | **(appended)** Read-time liveness token (see vocabulary below). |
+| 9 | `machine` | **(appended)** The machine that created the session, as recorded on its first event (`KOTO_MACHINE_NAME`, else the short hostname). Empty when no machine is recorded, as for a session from before the machine stamp. |
+| 10 | `workspace` | **(appended)** The 16-hex workspace prefix the session's copy lives under in the bucket. Empty on the local backend. |
 
 Appended fields are sanitized of tab, carriage-return, and newline characters so the
 tab-separated contract holds. Rows are emitted in attention order (needs-you band
 first, then active, then idle/fresh-pending), longest-idle first within a band.
 
 A consumer reading only the first six fields is unaffected. A consumer that asserts a
-strict column count must expect eight.
+strict column count must expect ten.
+
+On the local backend both `machine` and `workspace` stay empty and the dashboard makes
+no network request, even with a bucket configured. On the cloud backend a session from
+another machine appears with that machine's name and its own workspace prefix, and its
+`current_state`, `status`, `intent` and `template` read the same as on the machine that
+ran it. A session this machine has a local copy of appears once, as its own row. The
+`--needs-you`, `--status` and name filters apply to other machines' sessions too.
 
 ### Liveness Vocabulary
 

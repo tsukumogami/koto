@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 
 use crate::engine::persistence::{
-    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, is_terminal_state,
-    latest_epoch_gate_failed, read_events, read_header,
+    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
+    read_header,
 };
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
+use crate::session::row::derive_row;
 use crate::session::{state_file_name, SessionBackend};
 
 pub use liveness::{attention_key, classify_liveness, Liveness};
@@ -147,22 +148,9 @@ pub mod liveness {
     // shared implementation (imported above); the `/workflows` projection
     // writer reuses the same function.
 
-    /// Priority list of variable keys to surface as a session's salient var.
-    const SALIENT_KEYS: &[&str] = &["issue", "target", "name", "task", "query"];
-
-    /// Pick the most salient variable value from a `WorkflowInitialized`
-    /// variables map, in key-priority order. Returns `None` when no priority key
-    /// is present (or its value is empty).
-    pub fn salient_var(variables: &std::collections::HashMap<String, String>) -> Option<String> {
-        for key in SALIENT_KEYS {
-            if let Some(value) = variables.get(*key) {
-                if !value.is_empty() {
-                    return Some(value.clone());
-                }
-            }
-        }
-        None
-    }
+    /// The most salient `WorkflowInitialized` variable; the rule lives with
+    /// the shared row derivation ([`crate::session::row::salient_var`]).
+    pub use crate::session::row::salient_var;
 }
 
 /// Lightweight snapshot of one session's derived state, held in the tree.
@@ -217,6 +205,15 @@ pub struct CachedSession {
     /// never the child's own log, so this flag can lag by one refresh of the
     /// state file — the same denormalization the pointer itself documents.
     pub is_request_leg: bool,
+    /// The machine that produced the session, from its own events (a local
+    /// row) or its summary (a remote row); `None` when none is recorded.
+    pub machine: Option<String>,
+    /// The workspace id (16-hex bucket prefix) of this copy, set only under
+    /// the cloud backend; `None` on the local backend.
+    pub workspace: Option<String>,
+    /// Read from another machine's summary in the bucket rather than from
+    /// this machine's session store. A remote row has no local state file.
+    pub remote: bool,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -412,6 +409,9 @@ pub fn read_session(path: &Path) -> CachedSession {
                 is_unreadable: true,
                 is_batch_task: false,
                 is_request_leg,
+                machine: None,
+                workspace: None,
+                remote: false,
             };
         }
     };
@@ -434,76 +434,40 @@ pub fn read_session(path: &Path) -> CachedSession {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg,
+                machine: None,
+                workspace: None,
+                remote: false,
             };
         }
     };
 
-    // Derive current state from the event log.
-    let current_state = derive_state_from_log(&events);
+    // One derivation of the row's facts, shared with the summary a push
+    // publishes, so a remote row equals what this reader shows locally.
+    let row = derive_row(&header, &events, session_dir, is_request_leg);
 
-    // Derive machine state to get the template path for terminal detection.
-    // The state file lives inside the session directory, so its parent is
-    // the resolution base for a session-relative template_path.
-    let is_terminal = match derive_machine_state(&header, &events, session_dir) {
-        Some(machine_state) => {
-            is_terminal_state(&machine_state.template_path, &machine_state.current_state)
-        }
-        None => false,
-    };
-
-    // Detect blocked: non-terminal session whose most recent gate evaluation in
-    // the current epoch did not pass. The epoch-scoped predicate is the shared
-    // `latest_epoch_gate_failed` helper, which the `/workflows` projection
-    // writer also calls so the two classify a blocked session identically.
-    let is_blocked = !is_terminal
-        && current_state
-            .as_ref()
-            .map(|cs| latest_epoch_gate_failed(&events, cs))
-            .unwrap_or(false);
-
-    let intent = crate::engine::types::effective_intent(&header, &events);
-
-    // Capture the tail event's timestamp (already parsed for current_state) so
-    // liveness can measure idle from last activity with no extra IO. For a
-    // rewound session the tail is the post-rewind event, so it reads as fresh.
-    let last_event_at = events
-        .last()
-        .and_then(|e| parse_timestamp_to_systemtime(&e.timestamp));
-
-    // Pick the most salient variable from the WorkflowInitialized event, if any.
-    let salient_var = events.iter().find_map(|e| match &e.payload {
-        crate::engine::types::EventPayload::WorkflowInitialized { variables, .. } => {
-            liveness::salient_var(variables)
-        }
-        _ => None,
-    });
-
-    // Batch membership: a spawn entry on the initialization event is what a
-    // batch scheduler leaves behind, and the only record of it. Taken from
-    // the events already in hand — this is the replay, not a second one.
-    let is_batch_task = events.iter().any(|e| {
-        matches!(
-            &e.payload,
-            crate::engine::types::EventPayload::WorkflowInitialized {
-                spawn_entry: Some(_),
-                ..
-            }
-        )
-    });
+    // Liveness measures idle from the tail event's timestamp, so a rewound
+    // session (whose tail is the post-rewind event) reads as fresh.
+    let last_event_at = row
+        .last_event_at
+        .as_deref()
+        .and_then(parse_timestamp_to_systemtime);
 
     CachedSession {
         header,
-        current_state,
-        is_terminal,
-        is_blocked,
-        intent,
+        current_state: row.current_state,
+        is_terminal: row.is_terminal,
+        is_blocked: row.is_blocked,
+        intent: row.intent,
         mtime,
         state_path: path.to_path_buf(),
         last_event_at,
-        salient_var,
+        salient_var: row.salient_var,
         is_unreadable: false,
-        is_batch_task,
+        is_batch_task: row.is_batch_task,
         is_request_leg,
+        machine: row.machine,
+        workspace: None,
+        remote: false,
     }
 }
 
@@ -557,6 +521,55 @@ pub fn derive_label(session: &CachedSession, session_id: &str) -> String {
 // `is_terminal_state` now lives in `crate::engine::persistence` as the single
 // shared implementation (imported above); the `/workflows` projection writer
 // reuses the same function.
+
+/// A machine name read from the bucket, kept only when it has the shape
+/// koto writes: 1 to 64 characters of `[A-Za-z0-9._-]`, never `unknown`.
+/// Anything else reads as no recorded machine.
+fn valid_machine(name: Option<&str>) -> Option<String> {
+    let name = name?;
+    let valid = !name.is_empty()
+        && name.len() <= crate::session::version::MACHINE_NAME_MAX
+        && name != "unknown"
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    valid.then(|| name.to_string())
+}
+
+/// A remote row as the dashboard holds it: the summary another machine
+/// published, in the shape a local row has. It has no local state file, so
+/// `state_path` is empty and `mtime` is its last event's time.
+pub fn remote_session(row: &crate::session::remote_feed::RemoteRow) -> CachedSession {
+    let s = &row.summary;
+    let mut header = make_empty_header();
+    header.workflow = s.name.clone();
+    header.session_id = s.session_id.clone();
+    header.created_at = s.created_at.clone();
+    header.template_name = s.template_name.clone();
+    header.parent_workflow = s.parent.clone();
+    header.kind = s.kind.clone();
+    let last_event_at = s
+        .last_event_at
+        .as_deref()
+        .and_then(parse_timestamp_to_systemtime);
+    CachedSession {
+        header,
+        current_state: s.current_state.clone(),
+        is_terminal: s.is_terminal,
+        is_blocked: s.is_blocked,
+        intent: s.intent.clone(),
+        mtime: last_event_at.unwrap_or(SystemTime::UNIX_EPOCH),
+        state_path: PathBuf::new(),
+        last_event_at,
+        salient_var: s.salient_var.clone(),
+        is_unreadable: false,
+        is_batch_task: s.is_batch_task,
+        is_request_leg: s.is_request_leg,
+        machine: valid_machine(s.machine.as_deref()),
+        workspace: Some(row.workspace.clone()),
+        remote: true,
+    }
+}
 
 /// Construct an empty `StateFileHeader` for error fallback cases.
 fn make_empty_header() -> StateFileHeader {
@@ -1010,6 +1023,7 @@ mod tests {
                 template_path: "/cache/test.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             "2026-01-01T00:00:00Z",
         )
@@ -1161,6 +1175,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1197,6 +1214,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1233,6 +1253,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1400,6 +1423,7 @@ mod tests {
                     Default::default(),
                     vec![],
                 )),
+                machine: None,
             },
             "2026-01-01T00:00:00Z",
         )
@@ -1539,6 +1563,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1631,6 +1658,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
         sessions.insert(
@@ -1648,6 +1678,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1675,6 +1708,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
         sessions.insert(
@@ -1692,6 +1728,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1720,6 +1759,9 @@ mod tests {
                 is_unreadable: false,
                 is_batch_task: false,
                 is_request_leg: false,
+                machine: None,
+                workspace: None,
+                remote: false,
             },
         );
 
@@ -1825,6 +1867,9 @@ mod tests {
             is_unreadable: false,
             is_batch_task: false,
             is_request_leg: false,
+            machine: None,
+            workspace: None,
+            remote: false,
         }
     }
 
@@ -2012,6 +2057,9 @@ mod tests {
             is_unreadable: false,
             is_batch_task: false,
             is_request_leg: false,
+            machine: None,
+            workspace: None,
+            remote: false,
         }
     }
 

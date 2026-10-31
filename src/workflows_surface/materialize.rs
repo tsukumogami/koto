@@ -532,6 +532,7 @@ mod tests {
                 template_path: "template.json".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         };

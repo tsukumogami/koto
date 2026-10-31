@@ -897,6 +897,9 @@ mod tests {
             is_unreadable: false,
             is_batch_task: false,
             is_request_leg: false,
+            machine: None,
+            workspace: None,
+            remote: false,
         }
     }
 

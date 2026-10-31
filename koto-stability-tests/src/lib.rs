@@ -110,6 +110,7 @@ mod tests {
                 template_path: String::new(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         };
@@ -322,6 +323,7 @@ mod tests {
                 template_path: String::new(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
