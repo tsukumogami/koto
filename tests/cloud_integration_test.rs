@@ -11,6 +11,8 @@
 
 #![cfg(feature = "cloud-integration-tests")]
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 #[path = "support/migration_carrier.rs"]
@@ -661,9 +663,19 @@ fn ctx_delimiter_listing_folds_the_context_tree() {
     cleanup.put(&migrated_key, b"{}");
     cleanup.put(&format!("{dir}/ctx/go"), b"yes");
     cleanup.put(&format!("{dir}/ctx/nested/key"), b"value");
-    eprintln!(
-        "summary.json PUT latency after the state PUT on {endpoint}: {summary_put:?} (limit 30s)"
-    );
+    // Written to the process's stdout directly rather than through
+    // `println!`, which the test harness captures and drops for a passing
+    // test, so the figure reaches the CI log and shows as a notice on the run.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            "::notice title=summary.json PUT latency::{} ms after the state PUT (limit 30000 ms)",
+            summary_put.as_millis()
+        );
+        let _ = out.flush();
+    }
     assert!(
         summary_put < std::time::Duration::from_secs(30),
         "summary.json PUT took {summary_put:?}, over koto's 30 s action limit"

@@ -29,6 +29,9 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many workspace listings are in flight at once.
 const FANOUT: usize = 64;
 
+/// One workspace's scan: its rows and how many summaries in it couldn't be read.
+type WorkspaceScan = anyhow::Result<(Vec<RemoteRow>, usize)>;
+
 /// One session read from another machine's summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRow {
@@ -158,11 +161,7 @@ impl RemoteReader {
     /// object and a readable summary, skipping internal sessions and those
     /// whose `session_id` is in `local_ids`. Returns the rows and how many
     /// summaries couldn't be read.
-    fn scan_workspace(
-        &self,
-        workspace: &str,
-        local_ids: &HashSet<String>,
-    ) -> anyhow::Result<(Vec<RemoteRow>, usize)> {
+    fn scan_workspace(&self, workspace: &str, local_ids: &HashSet<String>) -> WorkspaceScan {
         let mut rows = Vec::new();
         let mut unreadable = 0;
         for (name, listing) in self.list_workspace(workspace)? {
@@ -204,18 +203,17 @@ impl RemoteReader {
             }
         };
         let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<anyhow::Result<(Vec<RemoteRow>, usize)>>> = Mutex::new(Vec::new());
+        let results: Mutex<Vec<WorkspaceScan>> = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..workspaces.len().min(FANOUT) {
-                scope.spawn(|| loop {
-                    let Some(ws) = workspaces.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
-                    let result = self.scan_workspace(ws, local_ids);
-                    results
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(result);
+                scope.spawn(|| {
+                    while let Some(ws) = workspaces.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let result = self.scan_workspace(ws, local_ids);
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(result);
+                    }
                 });
             }
         });
