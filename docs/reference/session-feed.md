@@ -3084,7 +3084,8 @@ The dashboard decides each session directory it lists in the bucket in this orde
    counted in a stderr note, `note: N hidden source(s): imported into a copy that is
    listed`. A marker whose copy isn't in the bucket hides nothing.
 5. A session whose state file has no `summary.json` beside it (as a release before the
-   summary pushes it), whose summary is over 64 KiB, doesn't parse, carries another
+   summary pushes it), whose summary couldn't be fetched (its GET failed or didn't
+   answer 200), is over 64 KiB, doesn't parse, carries another
    schema or names another session, or whose summary's `state_etag` isn't the listed
    state file's ETag once that file is more than 60 seconds old, prints with `status`
    `unknown`: `current_state`, `intent`, `template` and `machine` are empty, `workspace`
@@ -3099,6 +3100,17 @@ The dashboard decides each session directory it lists in the bucket in this orde
 
 The dashboard reads only listings, `summary.json` and `migrated.json` objects from the
 bucket: never a state file, nothing under a session's `ctx/`, and it writes nothing.
+It works with keys that grant only list and get, and creates nothing in this
+machine's session store. This machine's own rows come from its local session store;
+the bucket is read once, by the pass that lists other machines' sessions.
+
+A push writes the state file first and `summary.json` after it. When the summary's
+PUT fails, the push warns (`warning: cloud sync: publishing the summary of session
+'<name>' to <key> failed: ...`) and still succeeds, since the state is already in the
+bucket, and koto marks the session in its local directory. The next flush of that
+session writes the summary, even when it has no state to push, and the mark is
+cleared once a summary PUT succeeds. Until then other machines list the session as
+`unknown` (no summary) or from the summary before it.
 
 The interactive dashboard shows the same rows. On the cloud backend a background
 thread reads the bucket and the list updates when each read finishes; key presses
@@ -3119,6 +3131,52 @@ list when the next read finishes. A failed listing is never read as a removal: w
 the listing of a workspace fails, the rows last read from it stay, and when the
 bucket's top-level listing fails every other machine's row stays; one status line
 (`bucket: ...`) carries the failure until a read succeeds again.
+
+### When the Bucket Fails
+
+Every bucket request the dashboard makes gives up after 10 seconds, and every failure
+it meets falls in one of four classes:
+
+| Class | What the bucket did |
+|-------|---------------------|
+| `unreachable` | The connection was refused or the host didn't resolve, or the answer wasn't a usable reply: an HTTP 5xx other than 503, or a body that isn't the listing asked for. |
+| `denied` | Answered HTTP 401 or 403. |
+| `timeout` | Gave no answer within the 10 seconds. |
+| `throttled` | Answered HTTP 429 or 503, and kept doing so through koto's usual retries. |
+
+An HTTP 500 and a reply koto can't parse are `unreachable`: the endpoint was reached,
+but it didn't serve the request, and a read that hits one can only report that the
+bucket couldn't be read. A listing the bucket throttles is asked again up to three
+times in all, a quarter second and then half a second apart. A request that timed
+out, was refused or was denied isn't asked again, so a bucket that never answers
+costs one read 10 seconds and `--once` against it exits in about that time, well
+inside 15 seconds.
+
+When the listing of the bucket's top level fails, the read makes no further request.
+`--once` prints this machine's rows, writes one stderr line naming the class and the
+endpoint's host, and exits 0:
+
+```
+note: other machines' sessions weren't read: timeout at s3.example.com: the bucket couldn't be listed
+```
+
+When some workspaces' listings fail and others don't, the rows of the readable ones
+print, and the one stderr line says how many workspaces couldn't be read and names
+the class of the first one, in workspace order:
+
+```
+note: other machines' sessions weren't all read: 1 workspace couldn't be read; the first: unreachable at s3.example.com
+```
+
+The interactive dashboard shows the same text on its status line, after `bucket:`,
+wrapped inside the list's width so the host is never cut off. It keeps this
+machine's rows and the remote rows it last read for every workspace it couldn't
+read, and the line is gone after the first read without a failure. With an empty
+bucket there is no status line and no stderr note. The class name and the host pass
+through the dashboard's sanitizer before they are shown, as every other bucket
+string does, and the host is shown without the endpoint's scheme, credentials, port
+or path. A `summary.json` that can't be fetched doesn't count as a failed workspace:
+its session lists as `unknown` and joins the unreadable tally.
 
 ### Liveness Vocabulary
 
