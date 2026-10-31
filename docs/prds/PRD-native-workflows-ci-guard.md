@@ -156,10 +156,11 @@ the expectation) without changing koto's code.
   documented command that runs the guard against an altered input and exits
   non-zero with that convention's name in its output. The implementing pull
   request includes the output of these runs and the commands.
-- **R8. Fixture coverage.** Every field of the workflows file that koto relies
-  on the screen reading, as listed in koto's shape fixture, is covered by the
-  file-shape check's expectation. A field added to the fixture as one the screen
-  reads, without a matching expectation, makes the guard fail.
+- **R8. Fixture coverage.** Every field name in koto's shape fixture outside
+  its `koto` block (the block Claude Code doesn't read) is one koto relies on
+  the screen reading, and the file-shape check's expectation covers each of
+  them. A field added to the fixture outside the `koto` block without a
+  matching expectation makes the guard fail.
 - **R9. The existing shape test.** The test that compares koto's output with
   `tests/fixtures/native-workflows/enriched-shape.json` stays, as the check that
   koto writes the shape it intends to; it is no longer described as the
@@ -179,9 +180,12 @@ the expectation) without changing koto's code.
   fixed set of SessionStart payloads, once with `jq` on the `PATH` and once
   without. On every payload that carries `session_id`, the output is valid JSON
   whose context names the derived workflows directory exactly, including when
-  the path contains a double quote, a backslash or a space. On a payload with
-  no `session_id`, or stdin that isn't JSON, it prints nothing and exits 0. This
-  fixes and closes koto#243.
+  the path contains a double quote, a backslash or a space. The derived
+  directory is `<dirname of transcript_path>/<session_id>/workflows`, or
+  `<cwd>/<session_id>/workflows` when `transcript_path` is absent or empty (the
+  script's current rule, unchanged). On a payload with no `session_id`, or stdin
+  that isn't JSON, it prints nothing and exits 0. This fixes and closes
+  koto#243.
 - **R13. Maintainer procedures.** Maintainer documentation, in a guide under
   `docs/guides/`, gives (a) the steps to extend the guard's expectations when
   koto's file shape changes on purpose, ending with running the R7 command for
@@ -214,9 +218,9 @@ the expectation) without changing koto's code.
 
 - [ ] With unaltered inputs, the guard run against the recorded release exits 0
       and its output names that release. (R1, R2, R5)
-- [ ] Removing the recorded-release file, or replacing its content with
-      `latest`, makes the guard exit non-zero with a message naming the file.
-      (R2)
+- [ ] Removing the recorded-release file, emptying it, or replacing its content
+      with `latest`, makes the guard exit non-zero with a message naming the
+      file. (R2)
 - [ ] Renaming a file-shape item the screen reads (for example `workflowName`)
       in the release evidence makes the guard exit non-zero and print
       `file shape` and the item's name. (R3, R4, R7)
@@ -240,23 +244,30 @@ the expectation) without changing koto's code.
       trigger at least weekly, against the newest published release. (R6)
 - [ ] The implementing pull request's description includes the four R7
       commands and the output of each failing run. (R7)
-- [ ] Adding a new screen-read field to the shape fixture without adding a
-      matching expectation makes the guard exit non-zero, naming the field.
-      (R8)
+- [ ] Adding a new field outside the `koto` block of the shape fixture, without
+      adding a matching expectation, makes the guard exit non-zero, naming the
+      field. Adding one inside the `koto` block doesn't. (R8)
 - [ ] `tests/native_workflows_shape.rs` still passes, and its header no longer
       calls it the future Claude Code guard. (R9)
-- [ ] With `CLAUDE_CODE_DISABLE_WORKFLOWS=1` set, the smoke check reports
-      *unavailable* with its own exit status, not *not rendered*. (R10)
+- [ ] Run by a logged-in maintainer against the recorded release, with koto's
+      entry written, the smoke check reports *rendered*, exits with the
+      *rendered* status and names the Claude Code release. (R10)
 - [ ] Run with no koto entry in the session's workflows directory, the smoke
       check reports *not rendered*. (R10)
+- [ ] With `CLAUDE_CODE_DISABLE_WORKFLOWS=1` set, the smoke check reports
+      *unavailable*, not *not rendered*. (R10)
+- [ ] The smoke check's documentation lists one exit status per outcome, and
+      the three statuses differ. (R10)
 - [ ] The smoke check's documentation contains its command, its prerequisites
       and the output of one real run, including the Claude Code release and the
       outcome. (R10, R11)
 - [ ] The hook CI job passes these payloads, with and without `jq`: a normal
       `session_id` and `transcript_path`; a `transcript_path` whose directory
       contains `"`, `\` and a space; an empty `transcript_path` with `cwd`; no
-      `session_id`; and stdin that isn't JSON. Every non-empty output parses as
-      JSON. (R12)
+      `session_id`; and stdin that isn't JSON. For the first three, the output
+      parses as JSON and its context contains the derived directory R12 names,
+      byte for byte. For the last two, the output is empty and the exit status
+      is 0. (R12)
 - [ ] On the current `session-start-workflows.sh`, the no-`jq` run of the
       quote-and-backslash payload fails the job. (R12)
 - [ ] The implementing pull request closes koto#243. (R12)
