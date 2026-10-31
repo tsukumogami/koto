@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto writes its `/workflows` entry against four Claude Code conventions that
   Claude Code doesn't publish: the workflows file shape, the per-session
@@ -38,7 +38,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
