@@ -1,13 +1,15 @@
-//! Golden-shape guard for the enriched `/workflows` file contract.
+//! koto's own shape check for the enriched `/workflows` file contract.
 //!
 //! The committed fixture at `tests/fixtures/native-workflows/enriched-shape.json`
 //! pins the enriched `koto-<uuid>.json` shape (ordered `phases`, the
 //! `workflowProgress` tree, and the blocked reading: top-level `running`,
-//! `koto.status` `blocked` and a Blocked `error` step) that koto emits. The future
-//! drift-guard adopts this fixture as the anchor for its version/fixture guard over the
-//! undocumented Claude Code surface; this test is the discharge of the
-//! shape-change / drift-guard obligation (whenever the emitted shape changes,
-//! this fixture must change with it, deliberately).
+//! `koto.status` `blocked` and a Blocked `error` step) that koto emits. This test
+//! checks that koto writes the shape it means to: whenever the emitted shape
+//! changes, this fixture must change with it, deliberately. Both sides of the
+//! comparison are koto's, so it can't see Claude Code change. That is the
+//! convention guard's job (`scripts/check-claude-code-conventions.sh`), which
+//! reads a Claude Code release, and `tests/native_workflows_conventions.rs`
+//! keeps every field of this fixture covered by one of the guard's probes.
 
 #[path = "support/host_session.rs"]
 mod host_session;
@@ -124,10 +126,11 @@ fn canonical_enriched_file() -> WorkflowFile {
     })
 }
 
-/// The emitted enriched shape must match the committed golden fixture. Drift
-/// (a renamed field, a dropped node type, a changed status vocabulary) fails
-/// here so the future drift-guard has a stable anchor and the initial readers are not
-/// silently broken.
+/// The emitted enriched shape must match the committed golden fixture. A
+/// koto-side change (a renamed field, a dropped node type, a changed status
+/// vocabulary) fails here, so the readers of earlier versions are not silently
+/// broken and the convention guard's coverage test reads the shape koto
+/// actually writes.
 #[test]
 fn enriched_shape_matches_golden_fixture() {
     let bytes = canonical_enriched_file().to_json_bytes().unwrap();
@@ -140,10 +143,11 @@ fn enriched_shape_matches_golden_fixture() {
     assert_eq!(
         actual, expected,
         "the emitted enriched /workflows shape drifted from the golden fixture \
-         ({FIXTURE}). This fixture is the drift-guard anchor; if the contract \
-         change is intentional, regenerate it with \
-         `cargo test --test native_workflows_shape -- --ignored --nocapture` and \
-         commit the printed JSON."
+         ({FIXTURE}). If the contract change is intentional, regenerate it with \
+         `cargo test --test native_workflows_shape -- --ignored --nocapture`, \
+         commit the printed JSON, and run \
+         `cargo test --test native_workflows_conventions` to see whether a new \
+         field needs a probe in the Claude Code convention guard."
     );
 }
 
