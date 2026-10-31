@@ -1,0 +1,127 @@
+name: claude-code-conventions
+
+# Checks a Claude Code release against the four conventions koto's /workflows
+# entry depends on, by reading the release's shipped executable without
+# running it (scripts/check-claude-code-conventions.sh). Pull requests and
+# pushes that touch something those conventions decide check the release
+# recorded in tests/fixtures/native-workflows/claude-code-release. A weekly
+# schedule checks the newest release, so one that ships while koto sits still
+# is checked anyway, and a manual dispatch checks the release its `version`
+# input names (or the recorded one when it is empty).
+#
+# The job runs no build, holds a read-only token and uses no secret, so a
+# fork's pull request that edits the guard or this file has nothing to take,
+# and the scheduled run can't change the repository. It runs on drafts too:
+# the job is the guard's own check.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'src/workflows_surface/**'
+      - 'src/host_env.rs'
+      - 'tests/fixtures/native-workflows/**'
+      - 'scripts/check-claude-code-conventions.sh'
+      - 'scripts/claude_code_conventions.py'
+      - 'plugins/koto-skills/hooks/session-start-workflows.sh'
+      - '.github/workflows/claude-code-conventions.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/workflows_surface/**'
+      - 'src/host_env.rs'
+      - 'tests/fixtures/native-workflows/**'
+      - 'scripts/check-claude-code-conventions.sh'
+      - 'scripts/claude_code_conventions.py'
+      - 'plugins/koto-skills/hooks/session-start-workflows.sh'
+      - '.github/workflows/claude-code-conventions.yml'
+  schedule:
+    # Mondays 06:00 UTC: the newest Claude Code release.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Claude Code release to check: MAJOR.MINOR.PATCH or latest. Empty checks the recorded release.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  claude-code-conventions:
+    name: claude-code-conventions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The guard checks itself first, with no network, so probes that no
+      # longer catch anything stop the job before any release is checked.
+      - name: Self-test the guard
+        run: scripts/check-claude-code-conventions.sh --self-test
+
+      # Decides which release this run checks and resolves it to a concrete
+      # version, so the cache key and the guard name the same release even if
+      # a newer one ships mid-run. That is why this step repeats the guard's
+      # version pattern (VERSION_RE) and its latest lookup instead of passing
+      # --version latest; keep the two in step. The dispatch input reaches the
+      # shell only through the environment, never interpolated into the script.
+      - name: Choose the release
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          CACHE_DIR: ${{ runner.temp }}/claude-code-cache
+        run: |
+          case "$EVENT_NAME" in
+            schedule) requested=latest ;;
+            workflow_dispatch) requested=$REQUESTED_VERSION ;;
+            *) requested="" ;;
+          esac
+          version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ -z "$requested" ]; then
+            # The guard reads the recorded release itself; it is read here
+            # only for the cache key.
+            version=$(<tests/fixtures/native-workflows/claude-code-release)
+            release_source=recorded
+          elif [ "$requested" = latest ]; then
+            package=$(jq -r .package tests/fixtures/native-workflows/claude-code-conventions.json)
+            version=$(cd "$RUNNER_TEMP" && npm view --silent "$package" version) || version=""
+            release_source=named
+          else
+            version=$requested
+            release_source=named
+          fi
+          if ! [[ $version =~ $version_re ]]; then
+            echo "::error::no MAJOR.MINOR.PATCH Claude Code release to check (requested: ${requested:-the release recorded in tests/fixtures/native-workflows/claude-code-release})"
+            exit 1
+          fi
+          mkdir -p "$CACHE_DIR"
+          {
+            echo "version=$version"
+            echo "source=$release_source"
+            echo "cache-dir=$CACHE_DIR"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cache the release tarball
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.release.outputs.cache-dir }}
+          key: claude-code-linux-x64-${{ steps.release.outputs.version }}
+
+      - name: Check the Claude Code release
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE: ${{ steps.release.outputs.source }}
+          CACHE_DIR: ${{ steps.release.outputs.cache-dir }}
+        run: |
+          if [ "$SOURCE" = named ]; then
+            scripts/check-claude-code-conventions.sh --version "$VERSION" --cache-dir "$CACHE_DIR"
+          else
+            scripts/check-claude-code-conventions.sh --cache-dir "$CACHE_DIR"
+          fi
