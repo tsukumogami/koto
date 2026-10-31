@@ -336,6 +336,7 @@ fn a_migrated_anchor_met_at_a_start_gets_a_linked_successor() {
             from_session: "anchor-s1".to_string(),
             from_session_id: "old".to_string(),
             machine_id: "m".to_string(),
+            machine_name: None,
         },
         &now_iso8601(),
     )

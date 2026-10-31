@@ -4525,6 +4525,7 @@ fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
                 from_session: "wf".into(),
                 from_session_id: "src-id".into(),
                 machine_id: "m".into(),
+                machine_name: None,
             },
         ),
     ];
@@ -4562,6 +4563,7 @@ fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
             from_session: "wf".into(),
             from_session_id: "src-id".into(),
             machine_id: "m".into(),
+            machine_name: None,
         },
     ));
     g.backend
