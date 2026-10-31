@@ -527,13 +527,9 @@ pub fn derive_label(session: &CachedSession, session_id: &str) -> String {
 /// Anything else reads as no recorded machine.
 fn valid_machine(name: Option<&str>) -> Option<String> {
     let name = name?;
-    let valid = !name.is_empty()
-        && name.len() <= crate::session::version::MACHINE_NAME_MAX
-        && name != "unknown"
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    valid.then(|| name.to_string())
+    crate::session::version::validate_machine_name(name)
+        .is_ok()
+        .then(|| name.to_string())
 }
 
 /// A remote row as the dashboard holds it: the summary another machine
