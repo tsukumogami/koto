@@ -1,7 +1,6 @@
 ---
 schema: prd/v1
 status: Accepted
-upstream: docs/briefs/BRIEF-native-workflows-ci-guard.md
 problem: |
   koto's native `/workflows` rendering depends on four Claude Code conventions
   that Claude Code doesn't publish as an interface: the workflows file shape,
@@ -18,6 +17,8 @@ goals: |
   also run a rendered smoke check against a real Claude Code and read whether an
   entry koto wrote renders. The hook script that derives koto's directory is
   tested, and extending the file shape later extends the guard by a written step.
+absorbed:
+  - docs/briefs/BRIEF-native-workflows-ci-guard.md
 ---
 
 # PRD: a CI guard over the Claude Code conventions behind koto's `/workflows` rendering
@@ -26,11 +27,34 @@ goals: |
 
 Accepted
 
-Requirements for the hardening step of koto's native `/workflows` rendering,
-written from the Accepted `BRIEF-native-workflows-ci-guard`. The two questions
-the brief left open, the guard's form and where the rendered smoke check runs,
-are design questions; this PRD fixes what the guard must detect and report and
-what done looks like.
+Absorbed [BRIEF-native-workflows-ci-guard](docs/briefs/BRIEF-native-workflows-ci-guard.md); carried in Absorbed Brief.
+
+Requirements for the hardening step of koto's native `/workflows` rendering.
+The two questions the framing left open, the guard's form and where the
+rendered smoke check runs, are design questions; this PRD fixes what the guard
+must detect and report and what done looks like.
+
+## Absorbed Brief
+
+The feature was framed before these requirements existed. koto's `/workflows`
+rendering rests on four Claude Code conventions nobody promised to keep: the
+file shape the screen reads, the per-session directory layout, the
+`CLAUDE_CODE_SESSION_ID` variable and the SessionStart hook's input. When a
+Claude Code release changes one, koto's CI stays green and an operator meets an
+empty `/workflows` with no error to explain it. The framed outcome: a koto
+maintainer learns from koto's own CI, before a koto release, that a Claude Code
+release broke one of these conventions, with the failing check naming which
+one, and can run a smoke check against a real Claude Code to read whether an
+entry koto wrote actually renders. For operators the result is an absence: no
+more silent empty screens caused by a change nobody noticed. The framing named
+four journeys, carried as this PRD's user stories: a Claude Code release
+changing a convention, a pre-release rendered check, a contributor changing the
+file shape on purpose, and the session-start hook on a host without `jq`. It
+fixed the boundary the Requirements and Out of Scope operationalize: the guard,
+a recorded Claude Code release, the rendered smoke check, hook coverage
+including koto#243 and a fixture extension procedure are in; the list view's
+blocked bucket, fan-out and hierarchy, retention and crash staleness, changes
+to what koto writes, and any coupling to niwa are out.
 
 ## Problem Statement
 
@@ -352,6 +376,6 @@ the expectation) without changing koto's code.
   Claude Code outage or an account that can't see `/workflows`. R14 makes the
   check part of the procedure without making it mechanical.
 - **The guard's form and the smoke check's location are left to the design.**
-  The brief deferred them; the requirements above constrain them (no
+  The framing deferred them; the requirements above constrain them (no
   credentials on pull requests, named failures, a demonstrated failing run, a
   schedule) without choosing.
