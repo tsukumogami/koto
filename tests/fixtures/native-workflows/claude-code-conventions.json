@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "package": "@anthropic-ai/claude-code-linux-x64",
+  "member": "package/claude",
+  "conventions": [
+    {
+      "name": "file shape",
+      "slug": "file-shape",
+      "demo": {"from": "workflowName", "to": "workflowNamX"},
+      "probes": [
+        {
+          "item": "workflowName",
+          "anchor": "Failed to parse workflow snapshot",
+          "token": "workflowName",
+          "window": 6000
+        }
+      ]
+    },
+    {
+      "name": "directory convention",
+      "slug": "directory",
+      "demo": {"from": "\"workflows\"", "to": "\"workflowz\""},
+      "probes": [
+        {
+          "item": "\"workflows\" directory",
+          "anchor": "Failed to parse workflow snapshot",
+          "token": "\"workflows\"",
+          "window": 6000
+        }
+      ]
+    },
+    {
+      "name": "session variable",
+      "slug": "session-variable",
+      "demo": {"from": "CLAUDE_CODE_SESSION_ID", "to": "CLAUDE_CODE_SESSION_IX"},
+      "probes": [
+        {
+          "item": "CLAUDE_CODE_SESSION_ID",
+          "anchor": null,
+          "token": "CLAUDE_CODE_SESSION_ID"
+        }
+      ]
+    },
+    {
+      "name": "SessionStart hook input",
+      "slug": "hook-input",
+      "demo": {"from": "transcript_path", "to": "transcript_patX"},
+      "probes": [
+        {
+          "item": "transcript_path",
+          "anchor": "(\"SessionStart\"),source:",
+          "token": "transcript_path:",
+          "window": 8000
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+name: claude-code-conventions
+
+# Checks a Claude Code release against the four conventions koto's /workflows
+# entry depends on, by reading the release's shipped executable without
+# running it (scripts/check-claude-code-conventions.sh). Pull requests and
+# pushes that touch something those conventions decide check the release
+# recorded in tests/fixtures/native-workflows/claude-code-release.
+#
+# The job runs no build, holds a read-only token and uses no secret, so a
+# fork's pull request that edits the guard or this file has nothing to take.
+# It runs on drafts too: the job is the guard's own check.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'src/workflows_surface/**'
+      - 'src/host_env.rs'
+      - 'tests/fixtures/native-workflows/**'
+      - 'scripts/check-claude-code-conventions.sh'
+      - 'scripts/claude_code_conventions.py'
+      - 'plugins/koto-skills/hooks/session-start-workflows.sh'
+      - '.github/workflows/claude-code-conventions.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/workflows_surface/**'
+      - 'src/host_env.rs'
+      - 'tests/fixtures/native-workflows/**'
+      - 'scripts/check-claude-code-conventions.sh'
+      - 'scripts/claude_code_conventions.py'
+      - 'plugins/koto-skills/hooks/session-start-workflows.sh'
+      - '.github/workflows/claude-code-conventions.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  claude-code-conventions:
+    name: claude-code-conventions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check the recorded Claude Code release
+        run: scripts/check-claude-code-conventions.sh
