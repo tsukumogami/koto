@@ -11,6 +11,7 @@
     "shipped-spec": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
     "evals-exist": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/check-evals-exist.sh"]},
     "inline-evidence": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/check-inline-evidence_test.sh"]},
+    "session-start-workflows-hook": {"run": ["bash", "scripts/without-session-env.sh", "bash", "plugins/koto-skills/hooks/test/session-start-workflows.test.sh"]},
     "run-evals-test": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/run-evals_test.sh"]}
   },
   "entries": [
@@ -20,7 +21,7 @@
     },
     {
       "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh", "scripts/check-inline-evidence.sh", "scripts/check-inline-evidence_test.sh"],
-      "commands": ["doc-names", "plugin-hooks-shape", "evals-exist", "inline-evidence"]
+      "commands": ["doc-names", "plugin-hooks-shape", "evals-exist", "inline-evidence", "session-start-workflows-hook"]
     },
     {
       "paths": ["docs/**"],
