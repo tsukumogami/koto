@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 source_issue: 553
 problem: |
   An operator driving koto sessions inside Claude Code can't tell from the
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-koto-workflows-blocked-status](docs/briefs/BRIEF-koto-workflows-blocked-status.md); carried in Absorbed Brief.
 

@@ -64,8 +64,8 @@ belief that the screen supports that word. Claude Code 2.1.314 doesn't: it
 knows six run statuses, `blocked` isn't one, and it counts every status but
 `running` as completed, so a blocked entry landed in the completed bucket with
 its active step drawn Stopped (tsukumogami/koto#553). The status mapping is now
-[DESIGN-koto-workflows-blocked-status](../DESIGN-koto-workflows-blocked-status.md)
-(`docs/designs/DESIGN-koto-workflows-blocked-status.md`): from contract
+[DESIGN-koto-workflows-blocked-status](./DESIGN-koto-workflows-blocked-status.md)
+(`docs/designs/current/DESIGN-koto-workflows-blocked-status.md`): from contract
 version 5 a gate-blocked session is written top-level `running` with its
 active step as a blocked `error` step, and koto's own classification moves to
 `koto.status`. Fork D's predicate (the most recent current-epoch gate
@@ -254,7 +254,7 @@ model.
 
 *Replaced in part: the top-level `blocked` status this fork chose is replaced
 by the mapping in
-[DESIGN-koto-workflows-blocked-status](../DESIGN-koto-workflows-blocked-status.md);
+[DESIGN-koto-workflows-blocked-status](./DESIGN-koto-workflows-blocked-status.md);
 see the correction under Status. The predicate stands.*
 
 **Chosen: reuse koto's blocked-in-current-epoch classification.** A non-terminal
