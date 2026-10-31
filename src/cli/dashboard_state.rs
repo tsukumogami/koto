@@ -1404,6 +1404,7 @@ mod tests {
                 execution_dir: None,
                 anchor: None,
                 store: None,
+                machine: None,
             },
             migrated: None,
             keys: names.iter().map(|n| key_entry(n)).collect(),

@@ -1902,6 +1902,7 @@ mod tests {
             execution_dir: Some(sanitize("/work")),
             anchor: Some(sanitize("/anchor")),
             store: Some((sanitize("local"), sanitize("/store"))),
+            machine: None,
         }
     }
 

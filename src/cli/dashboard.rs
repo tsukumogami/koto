@@ -368,6 +368,15 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
             serde_json::json!({"kind": kind.as_str(), "base": base.as_str()}),
         );
     }
+    // The one fact printed as `null` rather than left out: a session that
+    // records no machine says so.
+    out.insert(
+        "machine".into(),
+        facts
+            .machine
+            .as_ref()
+            .map_or(serde_json::Value::Null, |m| m.as_str().into()),
+    );
 
     if let Some(m) = &snap.migrated {
         // A migrated session is an answer, not an error: the successor is
