@@ -15,13 +15,16 @@
 # directory is removed on exit, whatever the outcome.
 #
 # Usage:
-#   scripts/check-claude-code-conventions.sh [--version <MAJOR.MINOR.PATCH>] [--alter <slug>]
+#   scripts/check-claude-code-conventions.sh [--version <MAJOR.MINOR.PATCH>|latest] [--cache-dir <dir>] [--alter <slug>]
 #   scripts/check-claude-code-conventions.sh --evidence <file> [--alter <slug>]
 #   scripts/check-claude-code-conventions.sh --self-test
 #
 # With no arguments it checks the release recorded in
 # tests/fixtures/native-workflows/claude-code-release. --version checks the
-# named release instead, and the recorded-release file isn't read. --evidence
+# named release instead, and the recorded-release file isn't read. --version
+# latest asks the registry for the newest release first and checks that one; the
+# version it resolved to is the one every later step and the output name.
+# --evidence
 # scans a local Claude Code executable (one already extracted from a package,
 # say) with no download; it replaces --version.
 #
@@ -30,6 +33,14 @@
 # the evidence first, so the run shows the guard failing on that convention by
 # name. The slugs are file-shape, directory, session-variable and hook-input.
 # It combines with either source.
+#
+# --cache-dir <dir> keeps the downloaded tarball in <dir>, an existing directory
+# outside the repository, under the name npm pack gives it, and nothing else:
+# the executable is still extracted into the temporary directory. A cached
+# tarball is reused only when its sha512 matches the dist.integrity the registry
+# reports for the release; one that doesn't match is named, deleted and fetched
+# again. The check reads a private copy of the tarball, hashed before it is
+# extracted, so a run that reuses the cached file only reads it.
 #
 # --self-test takes no other flag and needs no network: it checks the probes
 # against synthetic evidence built from the expectations file alone, then
@@ -59,7 +70,8 @@ MAX_MEMBER_BYTES=$((1024 * 1024 * 1024))
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 usage() {
-  echo "usage: check-claude-code-conventions.sh [--version <MAJOR.MINOR.PATCH> | --evidence <file>] [--alter <slug>]" >&2
+  echo "usage: check-claude-code-conventions.sh [--version <MAJOR.MINOR.PATCH>|latest] [--cache-dir <dir>] [--alter <slug>]" >&2
+  echo "       check-claude-code-conventions.sh --evidence <file> [--alter <slug>]" >&2
   echo "       check-claude-code-conventions.sh --self-test" >&2
   exit 64
 }
@@ -67,25 +79,28 @@ usage() {
 alter=""
 version=""
 evidence=""
+cache_dir=""
 self_test=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --alter | --version | --evidence)
+    --alter | --version | --evidence | --cache-dir)
       { [ $# -ge 2 ] && [ -n "$2" ]; } || usage
       case "$1" in
         --alter) alter=$2 ;;
         --version) version=$2 ;;
         --evidence) evidence=$2 ;;
+        --cache-dir) cache_dir=$2 ;;
       esac
       shift 2
       ;;
-    --alter=* | --version=* | --evidence=*)
+    --alter=* | --version=* | --evidence=* | --cache-dir=*)
       value=${1#*=}
       [ -n "$value" ] || usage
       case "$1" in
         --alter=*) alter=$value ;;
         --version=*) version=$value ;;
         --evidence=*) evidence=$value ;;
+        --cache-dir=*) cache_dir=$value ;;
       esac
       shift
       ;;
@@ -101,22 +116,41 @@ done
 if [ -n "$alter" ] && ! [[ $alter =~ ^[a-z][a-z0-9-]*$ ]]; then
   usage
 fi
-if [ "$self_test" -eq 1 ] && [ -n "$alter$version$evidence" ]; then
+if [ "$self_test" -eq 1 ] && [ -n "$alter$version$evidence$cache_dir" ]; then
   usage
 fi
-if [ -n "$version" ] && [ -n "$evidence" ]; then
+if [ -n "$evidence" ] && [ -n "$version$cache_dir" ]; then
   usage
 fi
 # The version becomes part of an npm package spec, so it is held to
-# MAJOR.MINOR.PATCH before anything uses it.
-if [ -n "$version" ] && ! [[ $version =~ $VERSION_RE ]]; then
-  echo "check-claude-code-conventions: --version takes a MAJOR.MINOR.PATCH version" >&2
+# MAJOR.MINOR.PATCH (or the one word latest, resolved below to such a version)
+# before anything uses it.
+if [ -n "$version" ] && [ "$version" != latest ] && ! [[ $version =~ $VERSION_RE ]]; then
+  echo "check-claude-code-conventions: --version takes a MAJOR.MINOR.PATCH version or latest" >&2
   exit 64
 fi
 # --evidence is named relative to where the guard was started, not the
 # repository root it moves to below.
 if [ -n "$evidence" ] && [[ $evidence != /* ]]; then
   evidence="$PWD/$evidence"
+fi
+
+# The cache directory must already exist and sit outside the repository, for
+# the same reason as TMPDIR below: a package kept in the checkout could be
+# committed. It is resolved to its physical path before the guard moves, so a
+# relative name means the directory the guard was started in.
+if [ -n "$cache_dir" ]; then
+  if [ ! -d "$cache_dir" ]; then
+    echo "check-claude-code-conventions: --cache-dir $cache_dir is not an existing directory" >&2
+    exit 64
+  fi
+  cache_dir=$(cd "$cache_dir" && pwd -P)
+  case "$cache_dir/" in
+    "$(cd "$REPO_ROOT" && pwd -P)"/*)
+      echo "check-claude-code-conventions: --cache-dir is inside the repository; point it elsewhere" >&2
+      exit 64
+      ;;
+  esac
 fi
 
 # Relative paths from here on, so every message names the file the way the
@@ -170,10 +204,15 @@ if [ -n "$evidence" ]; then
   exit "$status"
 fi
 
-echo "checking Claude Code $version"
-
 work=$(mktemp -d "${TMPDIR:-/tmp}/claude-code-conventions.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+cache_tmp=""
+cleanup() {
+  rm -rf "$work"
+  if [ -n "$cache_tmp" ]; then
+    rm -f "$cache_tmp"
+  fi
+}
+trap cleanup EXIT
 trap 'exit 130' INT TERM
 # A TMPDIR inside the checkout would put the package in the repository.
 case "$(cd "$work" && pwd -P)/" in
@@ -182,24 +221,99 @@ case "$(cd "$work" && pwd -P)/" in
     exit 64
     ;;
 esac
-mkdir "$work/pack"
+mkdir "$work/pack" "$work/npm"
+
+# npm view, like npm pack below, runs from an empty directory so no project
+# .npmrc applies; its answer is used only once it matches the pattern it must.
+npm_view() {
+  (cd "$work/npm" && npm view --silent "$@" 2>"$work/npm.err")
+}
+
+# latest is resolved once, here, and only the concrete version is used from
+# now on: the header, the package spec and the cache all name the same release.
+if [ "$version" = latest ]; then
+  resolved=$(npm_view "$package" version) || resolved=""
+  if ! [[ $resolved =~ $VERSION_RE ]]; then
+    echo "could not obtain Claude Code latest: npm view $package version gave no MAJOR.MINOR.PATCH version" >&2
+    exit 2
+  fi
+  version=$resolved
+fi
+
+echo "checking Claude Code $version"
 
 # npm runs from the empty pack directory so no project .npmrc applies; its
 # output stays in the work directory and is never echoed. An unpublished
 # version, a registry error and no network all land here, and the message
 # names the release and no convention.
-if ! (cd "$work/pack" && npm pack --ignore-scripts --silent "$package@$version" >"$work/npm.out" 2>"$work/npm.err"); then
-  echo "could not obtain Claude Code $version: npm pack $package@$version failed" >&2
-  exit 2
-fi
-tarballs=("$work/pack"/*.tgz)
-if [ "${#tarballs[@]}" -ne 1 ] || [ ! -f "${tarballs[0]}" ]; then
-  echo "could not obtain Claude Code $version: npm pack left no single tarball" >&2
-  exit 2
+fetch() {
+  if ! (cd "$work/pack" && npm pack --ignore-scripts --silent "$package@$version" >"$work/npm.out" 2>"$work/npm.err"); then
+    echo "could not obtain Claude Code $version: npm pack $package@$version failed" >&2
+    exit 2
+  fi
+  local tarballs=("$work/pack"/*.tgz)
+  if [ "${#tarballs[@]}" -ne 1 ] || [ ! -f "${tarballs[0]}" ]; then
+    echo "could not obtain Claude Code $version: npm pack left no single tarball" >&2
+    exit 2
+  fi
+  tarball=${tarballs[0]}
+}
+
+# Prints the file's sha512 integrity string. It runs in a command
+# substitution, so a failure only empties the string, which never matches.
+integrity_of() {
+  python3 -I "$HELPER" integrity "$1"
+}
+
+tarball=""
+if [ -n "$cache_dir" ]; then
+  # The registry's record of the release decides whether a cached tarball is
+  # the published one; a cache hit is never trusted on its name alone.
+  want=$(npm_view "$package@$version" dist.integrity) || want=""
+  if ! [[ $want =~ ^sha512-[A-Za-z0-9+/]+=*$ ]]; then
+    echo "could not obtain Claude Code $version: npm view $package@$version dist.integrity gave no sha512 integrity" >&2
+    exit 2
+  fi
+  # The name npm pack gives the tarball: the scope's @ dropped, / made -.
+  cache_name=${package#@}
+  cache_name="${cache_name//\//-}-$version.tgz"
+  cached="$cache_dir/$cache_name"
+  if [ -L "$cached" ]; then
+    echo "cached tarball $cached is a symbolic link; fetching again"
+    rm -f "$cached"
+  elif [ -e "$cached" ] && [ ! -f "$cached" ]; then
+    echo "check-claude-code-conventions: $cached is in the way and is not a regular file" >&2
+    exit 64
+  elif [ -f "$cached" ]; then
+    # Hash and extract a private copy, so what is checked is exactly what was
+    # verified and the cached file itself is only read.
+    cp "$cached" "$work/cached.tgz"
+    if [ "$(integrity_of "$work/cached.tgz")" = "$want" ]; then
+      tarball=$work/cached.tgz
+    else
+      echo "cached tarball $cached failed its integrity check against $package@$version dist.integrity; fetching again"
+      rm -f "$cached" "$work/cached.tgz"
+    fi
+  fi
+  if [ -z "$tarball" ]; then
+    fetch
+    if [ "$(integrity_of "$tarball")" != "$want" ]; then
+      echo "could not obtain Claude Code $version: the fetched tarball failed its integrity check" >&2
+      exit 2
+    fi
+    # Written under a temporary name and renamed, so an interrupted run never
+    # leaves a partial tarball under the cached name.
+    cache_tmp="$cache_dir/.$cache_name.partial.$$"
+    cp "$tarball" "$cache_tmp"
+    mv -f "$cache_tmp" "$cached"
+    cache_tmp=""
+  fi
+else
+  fetch
 fi
 
 status=0
-reason=$(python3 -I "$HELPER" extract "${tarballs[0]}" "$member" "$work/evidence" "$MAX_MEMBER_BYTES" 2>&1) || status=$?
+reason=$(python3 -I "$HELPER" extract "$tarball" "$member" "$work/evidence" "$MAX_MEMBER_BYTES" 2>&1) || status=$?
 if [ "$status" -ne 0 ]; then
   if [ "$status" -eq 2 ]; then
     echo "could not obtain Claude Code $version: $reason" >&2
@@ -208,8 +322,9 @@ if [ "$status" -ne 0 ]; then
   fi
   exit "$status"
 fi
-# The tarball is no longer needed; free its space before the scan.
-rm -f "${tarballs[0]}"
+# The working copy of the tarball is no longer needed; free its space before
+# the scan. A cached tarball stays where it is.
+rm -f "$tarball"
 
 status=0
 python3 -I "$HELPER" scan "$EXPECTATIONS" "$work/evidence" ${alter_args[@]+"${alter_args[@]}"} || status=$?

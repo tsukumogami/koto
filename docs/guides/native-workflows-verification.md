@@ -75,9 +75,21 @@ recorded in `tests/fixtures/native-workflows/claude-code-release`.
 ```bash
 scripts/check-claude-code-conventions.sh                       # the recorded release
 scripts/check-claude-code-conventions.sh --version 2.1.320     # a named release
+scripts/check-claude-code-conventions.sh --version latest      # the newest release
+scripts/check-claude-code-conventions.sh --cache-dir <dir>     # keep the tarball in <dir> between runs
 scripts/check-claude-code-conventions.sh --evidence <executable>  # a local executable, no download
 scripts/check-claude-code-conventions.sh --self-test           # the guard itself, no network
 ```
+
+`--version latest` asks the registry for the newest release first, and the
+run names the version it got, never the word `latest`. With the registry
+unreachable it exits 2 like any release it can't fetch.
+
+`--cache-dir <dir>` takes an existing directory outside the repository (one
+inside it exits 64) and keeps the release's `.tgz` there, nothing else. A later
+run reuses that tarball only when its sha512 matches the `dist.integrity` the
+registry reports for the release; when it doesn't, the run says so, naming the
+file, and fetches the release again. It combines with `--version`.
 
 A run prints `checking Claude Code <version>`, a `FAIL` line for each probe
 that failed, naming the convention and the item, and then one line per
@@ -102,6 +114,43 @@ cd "$(mktemp -d)"
 npm pack --ignore-scripts @anthropic-ai/claude-code-linux-x64@2.1.316
 tar -xzf anthropic-ai-claude-code-linux-x64-2.1.316.tgz package/claude
 ```
+
+### In CI
+
+The `claude-code-conventions` workflow runs `--self-test` first and then
+checks one release, keeping the tarball in a cache keyed by that release's
+version. Which release depends on what started it:
+
+| Trigger | Release checked |
+|---------|-----------------|
+| A pull request or push that touches the surface | the recorded release |
+| The weekly schedule (Mondays 06:00 UTC) | the newest release |
+| A manual dispatch with `version` empty | the recorded release |
+| A manual dispatch with `version` set | that release, or the newest for `latest` |
+
+To check a named release without a commit:
+
+```bash
+gh workflow run claude-code-conventions.yml -f version=2.1.320
+```
+
+The job has a read-only token and no secret, so no trigger can change the
+repository. GitHub disables a scheduled workflow after 60 days without
+repository activity; if the weekly run stops appearing, re-enable it from the
+Actions tab.
+
+### Moving the recorded release
+
+When a newer Claude Code release should become the one pull requests check:
+
+1. Run `scripts/check-claude-code-conventions.sh --version <new>`.
+2. If a convention fails, update koto, or the probes when the convention still
+   holds under a new spelling (see "When koto's file shape changes" below for
+   finding a probe's anchor), until the run passes.
+3. Write the new version into
+   `tests/fixtures/native-workflows/claude-code-release`.
+4. Open a pull request. The fixture change triggers the workflow, which checks
+   the new recorded release.
 
 ### Showing it fail on each convention
 

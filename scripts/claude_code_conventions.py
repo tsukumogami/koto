@@ -21,6 +21,11 @@ Subcommands:
       a duplicate entry, or a member larger than <max-bytes> (counted while
       streaming, so a compressed bomb stops at the cap). Nothing else in the
       tarball is written anywhere.
+  integrity <file>
+      Prints the file's Subresource Integrity string, `sha512-<base64>`, the
+      form npm reports as a release's `dist.integrity`, so the guard can tell
+      whether a cached tarball is the one the registry published. The file is
+      only read.
   scan <file> <evidence> [--alter <slug>]
       Evaluates every probe of every convention against <evidence> and prints
       a FAIL line per failing probe, then one result line per convention.
@@ -43,6 +48,8 @@ usage, 70 an internal error. A crash must never exit 1, which would read as a
 convention failure, so main() maps any unexpected exception to 70.
 """
 
+import base64
+import hashlib
 import json
 import mmap
 import os
@@ -252,6 +259,21 @@ def extract(tarball, member, out, max_bytes):
         raise ObtainError("the package has no %s" % member)
 
 
+def integrity(path):
+    """Returns `sha512-<base64>` for the file at `path`, read in chunks."""
+    digest = hashlib.sha512()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as e:
+        raise ObtainError("%s could not be read: %s" % (path, e))
+    return "sha512-" + base64.b64encode(digest.digest()).decode("ascii")
+
+
 def find_all(m, needle, limit=None):
     hits = []
     i = m.find(needle)
@@ -423,7 +445,9 @@ def _pop_alter(args):
 
 def run(argv):
     if not argv:
-        raise UsageError("expected a subcommand: expectations, extract, scan or self-test")
+        raise UsageError(
+            "expected a subcommand: expectations, extract, integrity, scan or self-test"
+        )
     cmd, args = argv[0], argv[1:]
     if cmd == "expectations":
         args, alter = _pop_alter(args)
@@ -439,6 +463,11 @@ def run(argv):
         if len(args) != 4 or not args[3].isdigit():
             raise UsageError("extract <tarball> <member> <out> <max-bytes>")
         extract(args[0], args[1], args[2], int(args[3]))
+        return EXIT_OK
+    if cmd == "integrity":
+        if len(args) != 1:
+            raise UsageError("integrity <file>")
+        print(integrity(args[0]))
         return EXIT_OK
     if cmd == "scan":
         args, alter = _pop_alter(args)
