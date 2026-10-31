@@ -105,7 +105,22 @@ template-derived string, and the docs an operator or agent reads.
 
 ### Step 4: Every template-derived string in the entry reaches the screen escaped
 
-Control characters in a directive, gate name, state name, phase title or evidence key show up escaped in every field of the entry, a long gate name is cut without losing the blocked suffix, and no gate output reaches the file.
+**Goal**: Every string in the entry that comes from the template or the event log reaches Claude Code's screen escaped and capped: control and bidi characters in a directive, gate name, state name, phase title or evidence key show up as visible escapes in `promptPreview`, `resultPreview`, phase `title` and `detail`, step `label` and `phaseTitle`, the step `error` and the `summary`; a gate name past the cap is cut in the step's `error` and in the summary with the cut marker, and the blocked summary stays within its cap while keeping its `blocked on gate` suffix; and no gate's captured output reaches the file. Steps 1 to 3 left `gate_name_display` and `GATE_NAME_CAP` in `src/workflows_surface/contract.rs` (used for the gate name in the step's `error` and summary, and for the state name in a failed step's `error`), `WorkflowFile::with_blocked_gate` for the summary, and the shared `sanitize_capped` and `FACT_CAP` from `crate::session_view` for the title and summary; `build_detail`, `phase_detail`, `outcome_line`, `evidence_summary` and `preview` in `src/workflows_surface/materialize.rs` still pass phase titles, labels, directives, gate names in `outcome_line` and evidence keys through unescaped. This step also makes `scripts/verify-native-workflows.sh` pin koto's local session backend: the script sets `KOTO_SESSIONS_BASE` to a scratch directory, but that only isolates the local backend, so on a host whose environment selects another backend its `verify` and `nopub` sessions land in that shared store. Make the script change before running the script at all in this step, and never remove, clean up or prune a session the script left in a shared store: report any leftover instead.
+
+**Acceptance Criteria**:
+
+- [ ] A test with a gate name carrying a control character asserts the active step's `error` and the `summary` carry it as a visible escape, not raw (AC17).
+- [ ] A test with a gate name longer than the fact cap asserts the step's `error` and the `summary` are both cut with the cut marker, the summary still ends with `blocked on gate` text, and the summary's length stays within the cap the other summaries use (AC17).
+- [ ] A test with control characters in a template's directive, a state name (and so its phase title and step label), and an evidence key asserts every one of `promptPreview`, `resultPreview`, phase `title`, phase `detail`, step `label` and step `phaseTitle` in the written entry shows them escaped and carries no raw control or bidi character.
+- [ ] A test whose failing gate's command prints output asserts none of that output appears in the step's `error`, its `resultPreview`, any phase `detail`, or the `summary`.
+- [ ] `scripts/verify-native-workflows.sh` exports `KOTO_SESSION_BACKEND=local` and unsets any cloud session settings before its first koto call, for the main run and for the no-publish run alike, so a run never creates a session outside its own scratch directories; running it twice in a row passes both times.
+- [ ] `cargo test --test native_workflows_shape` still passes against the committed fixture, and the fixture is regenerated in the same change only if the escaping changes a fixture value.
+
+**Check**: Run `cargo test workflows_surface` and `cargo test --test native_workflows_blocked_test`, and see the control-character, over-cap and gate-output tests pass. Run `cargo test --test native_workflows_shape` and see it pass. Then run `cargo build && scripts/verify-native-workflows.sh` twice in a row and see both runs exit 0 with `ALL CHECKS PASSED`.
+
+**Dependencies**: Step 3
+
+**Files**: `src/workflows_surface/materialize.rs`, `src/workflows_surface/contract.rs`, `tests/native_workflows_blocked_test.rs`, `scripts/verify-native-workflows.sh`, `tests/fixtures/native-workflows/enriched-shape.json`
 
 ### Step 5: Operators and agents reading the docs see what the version 5 entry does
 
