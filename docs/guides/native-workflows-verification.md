@@ -6,7 +6,8 @@ from a bare status into the session's real structure (ordered phases with the
 active one marked, the active directive, per-phase evidence/gate outcomes, and a gate-blocked
 session that reads as blocked). This guide covers the automated check, the
 guard that checks a Claude Code release against the conventions koto relies
-on, and the manual live-TUI check.
+on, the rendered smoke check a maintainer runs against a real Claude Code, and
+the manual live-TUI check.
 
 The entry file is at contract version 5. Its top-level `status` uses only the
 words Claude Code's screen knows (`running`, `completed`, `failed`); it never
@@ -196,10 +197,108 @@ file-shape convention's `unread`, with the reason; `id`, `name` and a phase's
 6. Finish with `scripts/check-claude-code-conventions.sh --alter file-shape` and
    see it still exit 1 naming `file shape`.
 
+## The rendered smoke check
+
+The guard shows that a release still has the names koto relies on; it can't
+show that the screen draws the entry. `scripts/smoke-native-workflows-render.sh`
+answers that in about a minute, on a maintainer's machine, against the Claude
+Code installed there. Run it before a release (the release extension asks for
+its outcome in the release notes).
+
+```bash
+cargo build
+scripts/smoke-native-workflows-render.sh                    # write an entry and look for it
+scripts/smoke-native-workflows-render.sh --no-entry         # open /workflows with no koto entry
+scripts/smoke-native-workflows-render.sh --koto <path>      # a koto binary other than target/debug/koto
+```
+
+Without `--koto` it uses `target/debug/koto`, then `target/release/koto`, as
+`scripts/verify-native-workflows.sh` does.
+
+It needs an installed Claude Code that's logged in, `tmux` (3.0 or later),
+`python3` and a built koto. It checks all four before it starts anything; the
+only thing it runs first is `claude --version`, to name the release.
+
+What it does:
+
+1. Makes a scratch directory with `mktemp -d` (mode 700) and, inside it, an
+   empty project directory, also from `mktemp -d`. Because the project
+   directory is empty, trusting it loads no project settings.
+2. Writes a settings file that registers
+   `plugins/koto-skills/hooks/session-start-workflows.sh` as the SessionStart
+   hook, through a wrapper that saves the hook's stdin and output in the
+   scratch directory.
+3. Starts `claude --session-id <uuid> --settings <file>` in a detached tmux
+   session on a private tmux server (`tmux -L koto-smoke-<id> -f /dev/null`),
+   so your own tmux server and configuration aren't touched.
+4. Answers the folder-trust prompt only when the pane shows it, and nothing
+   else. Claude Code 2.1.316 lists "No, exit" first and has it selected, so the
+   harness sends `j` to move the selection and presses Enter only once the
+   pointer is on "Yes, I trust this folder". It waits up to 30 seconds for the
+   hook's saved output.
+5. Reads the session's workflows directory from the hook's output, and checks
+   that it's `<project>/<uuid>/workflows` under
+   `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/`.
+6. Unless `--no-entry` is given, runs koto through
+   `scripts/without-session-env.sh` with `KOTO_HOME` and `KOTO_SESSIONS_BASE`
+   inside the scratch directory and the local session backend: `koto init` on
+   the `hello-koto` test template, `koto workflows publish --dir <that
+   directory>`, `koto next`. Your real koto sessions are never read or
+   written. It reads the entry's `workflowName` back from the file koto wrote.
+7. Types `/workflows`, and presses Enter only when the autocomplete offers the
+   command. An unknown command can be handed to the model, so it's never
+   submitted, and the check sends no prompt to the model. It then reads the
+   pane.
+
+It prints one line, `<outcome>: Claude Code <version>`. On anything but
+`rendered`, the reason and the captured pane follow it.
+
+| Outcome | Exit status | When |
+|---------|-------------|------|
+| `rendered` | 0 | The pane shows the entry's `workflowName` |
+| `not rendered` | 1 | The workflows screen (its list or its empty state) is shown without it; always the case with `--no-entry` |
+| usage | 2 | An unknown option, or `--koto` with no value |
+| `unavailable` | 3 | A prerequisite is missing or `--koto` isn't an executable file; a screen other than the folder-trust prompt came up (a login or onboarding screen, say), or the hook printed nothing within 30 seconds; or `/workflows` is unknown or disabled (`CLAUDE_CODE_DISABLE_WORKFLOWS=1`, a setting or an account policy) |
+
+`unavailable` never reads as `not rendered`: it means the check couldn't tell.
+
+The captured pane and the saved hook payload can hold your email address,
+organization and home path. They're kept only in the scratch directory, and
+the pane is printed to your terminal and nowhere else. Redact a run before you
+paste it anywhere public.
+
+Cleanup runs after every outcome, and on Ctrl-C. It kills the private tmux
+server, waits for Claude Code to exit, and removes the scratch directory.
+Under `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/` it removes only the
+`<uuid>.jsonl` file and `<uuid>/` directory for the run's own session UUID,
+and that project's directory with `rmdir` when it's left empty. The UUID is
+checked against a UUID pattern first, no removal uses a glob, and none follows
+a symlink. Nothing else under that directory is touched.
+
+### A recorded run
+
+This is the full output of a real run, on the host this check was built on.
+That host has Claude Code 2.1.316 but no `tmux`, so the run is `unavailable`
+and names `tmux`, and it exited 3:
+
+```text
+$ scripts/smoke-native-workflows-render.sh
+unavailable: Claude Code 2.1.316
+missing prerequisite:
+  tmux is not on the PATH
+```
+
+The `rendered`, `not rendered`, disabled and no-login runs need `tmux` and a
+logged-in Claude Code, so they're a maintainer's to make on their own machine
+(tsukumogami/koto#582).
+
 ## Manual (live Claude Code TUI)
 
 This confirms the one thing the automated check cannot: that Claude Code renders
-the emitted file.
+the emitted file. The rendered smoke check above automates its first three
+steps: it hands koto the session's directory explicitly (step 1's
+alternative), drives a koto session, and opens `/workflows`. The later steps,
+which advance, block and complete the session, are still done by hand.
 
 1. **Rendering is on by default.** A koto session driven inside a Claude Code
    session self-discovers that session's workflows directory from the
@@ -264,4 +363,5 @@ the emitted file.
   koto-side change to the emitted shape fails loudly. A *Claude Code*-side
   change is what the convention guard above checks for, by reading the
   release. It checks that names are present, not what the screen does with
-  them, so the manual check is still the one that shows the entry renders.
+  them, so the rendered smoke check and the manual check are the ones that
+  show the entry renders.
