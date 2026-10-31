@@ -311,6 +311,20 @@ fn keeper(name: &str, standing: &str) -> Value {
     json!([{"keeper": name, "standing": standing, "path": []}])
 }
 
+/// A remove or removed entry names no keeper; its `detail`, when present,
+/// is the release that let the session go.
+fn assert_names_no_keeper(row: &Value) {
+    for field in KEEPER_FIELDS.iter().filter(|f| **f != "detail") {
+        assert!(row.get(*field).is_none(), "{field} in {row:#}");
+    }
+    if let Some(detail) = row.get("detail") {
+        assert!(
+            detail.as_str().unwrap_or_default().starts_with("released:"),
+            "{row:#}"
+        );
+    }
+}
+
 /// A finished `coordinate-` session with nothing keeping it is removed
 /// once its retention passes, and nothing in its entry names a keeper.
 fn a_coordinator_session_nothing_keeps_is_removed(cloud: bool) {
@@ -327,17 +341,13 @@ fn a_coordinator_session_nothing_keeps_is_removed(cloud: bool) {
     );
     let row = entry(&preview["remove"], "coordinate-x")
         .unwrap_or_else(|| panic!("not in the preview's remove list: {preview:#}"));
-    for field in KEEPER_FIELDS {
-        assert!(row.get(field).is_none(), "{field} in {row:#}");
-    }
+    assert_names_no_keeper(row);
 
     let out = s.prune_apply();
     assert!(entry(&out["kept"], "coordinate-x").is_none(), "{out:#}");
     let row =
         entry(&out["removed"], "coordinate-x").unwrap_or_else(|| panic!("not removed: {out:#}"));
-    for field in KEEPER_FIELDS {
-        assert!(row.get(field).is_none(), "{field} in {row:#}");
-    }
+    assert_names_no_keeper(row);
     s.assert_removed("coordinate-x", &dirs[0]);
 }
 
