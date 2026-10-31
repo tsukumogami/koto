@@ -56,6 +56,8 @@ the step whose behaviour they cover.
 - [ ] That line on B has exactly ten tab-separated fields, with `machine-a` in the ninth (`machine`) and A's 16-hex workspace prefix in the tenth (`workspace`); the same session on A's `--once` shows `machine-a` in its ninth field.
 - [ ] B's run makes only listing and GET requests against the fake bucket (no PUT, DELETE or POST), creates no directory in B's session store, and fetches no object whose key is a state file.
 - [ ] A `/ctx/`-delimited listing of a session-shaped directory against Cloudflare R2 returns the session's top-level objects (state file, `summary.json`, `migrated.json`) and exactly one common prefix for its `ctx/` tree, and reports a clear failure naming the endpoint when it does not.
+- [ ] On B, `--needs-you` keeps A's blocked session and `--status running` drops it; `koto dashboard --once <name>` with A's session name prints its line; and the eight existing columns keep their positions and meanings.
+- [ ] With the local backend selected, even with a bucket configured, every `--once` line over the existing `--once` test fixtures equals the line those tests expect today followed by two empty tab-separated fields, and the run makes no network request.
 - [ ] `docs/reference/session-feed.md` describes the `machine` and `workspace` columns as columns nine and ten, empty when no machine is recorded and empty for `workspace` on the local backend.
 
 **Check**: Run `cargo test --test dashboard_cross_machine_test once_prints_other_machines_blocked_session` and see it pass. The test runs two koto processes against one in-process fake bucket (as `tests/cloud_bound_dir_test.rs` does, using `tests/support/fake_s3.rs`): machine A inits and ticks the fixture template under `KOTO_MACHINE_NAME=machine-a`, machine B runs `koto dashboard --once`, and the assertions are the line's ten fields, its `current_state`, `status`, `intent` and `template_name` equal to A's own `--once` output, `machine-a` in the ninth, A's prefix in the tenth, and a request log with no write and no state-file GET. Then run `cargo test --features cloud-integration-tests --test cloud_integration_test ctx_delimiter -- --test-threads=1` in CI's existing R2 job and see the delimiter probe pass; without the R2 environment variables that test skips, as the other tests in that file do.
@@ -96,7 +98,7 @@ Requests time out at 10 seconds, failures show as unreachable, denied, timeout o
 
 ### Step 6: machine B sees machine A's change within 60 seconds without refetching unchanged sessions
 
-The TUI feed rescans every 55 seconds within its listing budget and fetches only changed summaries, --once finishes within 30 seconds at 200 prefixes and 2,000 sessions, and the cloud sync guide (its listing cost and its superseded index sentence) and the koto-user skill reference describe it (interactive scenario freshness; PRD R20 to R22, R24).
+The TUI feed rescans every 55 seconds within its listing budget and fetches only changed summaries, --once finishes within 30 seconds at 200 prefixes and 2,000 sessions, and the cloud sync guide (its listing cost and its superseded index sentence) and the koto-user skill reference describe it (interactive scenario freshness; PRD R21, R22, R24).
 
 ### Step 7: text and objects another machine wrote can't break or mislead machine B's dashboard
 
@@ -115,8 +117,10 @@ object, which needs tombstones and new deletes) before step 3 starts.
 Which evidence scenario each step advances:
 
 - Step 1: the text scenario (`koto dashboard --once` on B shows A's session,
-  state and origin machine).
-- Step 2: the interactive scenario (the dashboard on B shows the same).
+  state and origin machine); PRD R6, R7, R14 and R20, and the parts of R1
+  and R18 the skeleton needs.
+- Step 2: the interactive scenario (the dashboard on B shows the same);
+  PRD R8, R9 and R10 in the TUI, and R23.
 - Steps 3 to 7: both scenarios, by keeping them true for removed, imported,
   older-release and same-named sessions (3), for the origin name's settings
   and its survival (4), under bucket failures and read-only keys (5), within

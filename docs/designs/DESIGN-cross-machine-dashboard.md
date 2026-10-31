@@ -327,9 +327,14 @@ Key assumptions:
 name at creation, written by `koto init`, a child spawn and an inline init
 on every backend. `session_imported`, which import already appends with the
 importing machine's id, gains an optional `machine_name` field. A
-session's producing machine is the `machine_name` of its latest
-`session_imported` event when it has one, else the `machine` of its
-`workflow_initialized` event, else unknown. Both fields follow the existing
+session's producing machine follows its latest `session_imported` event
+when it has one: that event's `machine_name`, or unknown when the event
+carries none (an import made by a release that predates this feature, whose
+copied `workflow_initialized` still names the source's machine). With no
+`session_imported` event it's the `machine` of the session's
+`workflow_initialized` event, else unknown. Import is otherwise unchanged:
+the two additions are the `machine_name` field and keeping the state PUT's
+ETag for the summary write. Both fields follow the existing
 additive pattern (`#[serde(default, skip_serializing_if = "Option::is_none")]`,
 like `spawn_entry`) and don't move `CURRENT_SCHEMA_VERSION`.
 
@@ -458,16 +463,19 @@ delete paths or `origin`.
   and import; `producing_machine(events) -> Option<String>` reads them back.
 - **Row derivation** (new `src/session/row.rs`, lifted out of
   `read_session` in `src/cli/dashboard_data.rs:381-508`):
-  `derive_row(header, events, template) -> SessionRow` (it needs the event
-  stamp for the producing machine), a pure function
+  `derive_row(header, events, template, sidecars) -> SessionRow` (it needs
+  the event stamp for the producing machine, and `sidecars` carries the flags
+  that live beside the log rather than in it, such as the request-leg
+  marker), a pure function
   returning current state, terminal/blocked/failed flags, intent, template
   name, salient variable, batch and request-leg flags, last event time,
   parent and producing machine. The local dashboard and the summary writer
   both call it.
 - **Summary writer** (`src/session/summary.rs`, called from `put_state`
-  after `record_synced`, from `put_state_if` and `put_state_over`, and once
-  after the import's `push_staged`, which is changed to keep the state PUT's
-  ETag): builds a `SessionSummary` from `derive_row` plus `last_seq`,
+  after `record_synced`, from `put_state_over`, and once after the import's
+  `push_staged`, which is changed to keep the state PUT's ETag; not from
+  `put_state_if`, the conditional-PUT helper `put_state` and `push_fence`
+  call, so a push writes one summary and a fence writes none): builds a `SessionSummary` from `derive_row` plus `last_seq`,
   `state_etag` and `sources`, applies the per-field caps, serializes it
   under the size cap, and PUTs `<home>/<id>/summary.json`. It derives the
   row from the events and template the push already holds in memory, so it
@@ -617,9 +625,9 @@ Deliverables:
 Depends on phases 1 to 3.
 
 Deliverables:
-- `SessionSummary` and the PUT after `put_state`, `put_state_if`,
-  `put_state_over` and import (keeping the import's state ETag), with the
-  per-field caps and the retry on the next flush
+- `SessionSummary` and the PUT after `put_state`, `put_state_over` and
+  import (keeping the import's state ETag), with the per-field caps and the
+  retry on the next flush
 - tests that a tick issues exactly one extra PUT, that internal sessions
   write none, and that cleanup and prune remove the summary
 
