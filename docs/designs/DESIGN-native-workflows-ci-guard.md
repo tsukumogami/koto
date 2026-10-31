@@ -238,7 +238,9 @@ Key assumptions:
   recorded release; `latest` meaning the newest).
 
 The job declares `permissions: contents: read`, references no secret, caches
-the extracted package under a key naming the version, and runs
+the downloaded tarball (never the extracted tree) under a key naming the
+resolved version, checks it against the registry's integrity value before
+extracting, and runs
 `--self-test` before the real check so a broken guard can't pass silently. The
 offline coverage test needs no new job: validate.yml's unit-test job already
 runs every cargo test.
@@ -346,24 +348,37 @@ Key assumptions:
 
 #### Chosen: escape on output, honour escapes on input, test both paths
 
-The script gains a `json_escape` function (backslash, double quote, tab,
-newline and carriage return) applied to the context before the `printf`
-fallback interpolates it. The no-`jq` `read_field` matches a JSON string that
-may contain escapes, `"<name>"\s*:\s*"(([^"\\]|\\.)*)"`, then unescapes
-`\"`, `\\` and `\/`. The derivation rule doesn't change: the directory is
+The script gains a `json_escape` function, covering backslash, double quote
+and every control character below U+0020, applied to the context before the
+`printf` fallback interpolates it. The no-`jq` `read_field` matches a JSON
+string that may contain escapes, `"<name>"\s*:\s*"(([^"\\]|\\.)*)"`, and
+decodes `\"`, `\\` and `\/` in one pass; a value holding any other escape
+(`\n`, `\t`, `\u....`) is refused, which leaves the field empty. The
+derivation rule doesn't change: the directory is
 `<dirname of transcript_path>/<session_id>/workflows`, or
 `<cwd>/<session_id>/workflows` when `transcript_path` is absent or empty, and
 no `session_id` (including stdin that isn't JSON) prints nothing and exits 0.
+Three input rules are new: a `session_id` that doesn't match `[A-Za-z0-9_-]+`
+counts as absent, so it can't add path components; a control character in the
+derived directory makes the hook print nothing; and the `export` line the
+context asks the agent to run quotes the directory for the shell (single
+quotes, with an embedded `'` written `'\''`), because JSON escaping alone would
+let a directory named with `$(...)` or a backtick run a command. The context's
+plain sentence still names the directory unquoted, so the directory appears in
+it byte for byte.
 
 A sibling test, `plugins/koto-skills/hooks/test/session-start-workflows.test.sh`,
 runs a fixed payload matrix twice: once with the normal `PATH` (and asserts
 `jq` is on it), once with a `PATH` built from symlinks to only the commands the
 script needs. The payloads: a plain `session_id` and `transcript_path`; a
-`transcript_path` whose directory contains `"`, `\` and a space; an empty
-`transcript_path` with `cwd`; no `session_id`; and stdin that isn't JSON. For
-the first three it parses the output with `jq` from the test's own `PATH` and
-checks `hookSpecificOutput.additionalContext` contains the derived directory
-byte for byte; for the last two it checks the output is empty and the status
+`transcript_path` whose directory contains `"`, `\` and a space; one whose
+directory contains `$(`, a backtick and `'`; an empty `transcript_path` with
+`cwd`; no `session_id`; a `session_id` containing `/`; and stdin that isn't
+JSON. For the first four it parses the output with `jq` from the test's own
+`PATH`, checks `hookSpecificOutput.additionalContext` contains the derived
+directory byte for byte, and checks that evaluating the export line in a
+subshell sets `KOTO_WORKFLOWS_DIR` to exactly that directory without running
+anything else; for the last three it checks the output is empty and the status
 is 0. validate-plugins.yml's `hook-smoke-test` job runs it as a new step.
 
 #### Alternatives Considered
@@ -616,7 +631,83 @@ block, which the coverage test skips.
 
 ## Security Considerations
 
-<Phase 5 writes this section.>
+### What the guard downloads and how it treats it
+
+The guard fetches a platform package of a Claude Code release from the npm
+registry: third-party code of about 330 MB that the guard never runs, imports
+or decodes. The Python helper, started with `python3 -I`, memory-maps the
+executable and runs plain substring searches, so a malformed or hostile bundle
+can at worst make a probe pass or fail wrongly. The guard's claim is bounded
+the same way: names are present near anchors, nothing more, which is why the
+smoke check exists.
+
+Inputs that reach the package manager and the file system are validated
+first. The package name comes from the committed expectations file and must
+start with `@anthropic-ai/claude-code-`. A version must match
+`MAJOR.MINOR.PATCH`, or be `latest`, which is resolved to a concrete version
+and validated again. In the workflow, the dispatch input reaches the script
+through an environment variable, never interpolated into a command line.
+`npm pack` runs in a fresh directory outside the checkout, with install
+scripts disabled and no credentials. The guard extracts only the expected
+executable, by exact member name, refuses absolute paths, `..` components and
+link members, and checks the result is a regular file of plausible size. The
+job has a timeout, so an oversized archive can't hold a runner.
+
+### Workflow permissions and cache integrity
+
+The workflow declares `permissions: contents: read`, triggers on
+`pull_request` (never `pull_request_target`) and references no secret, so a
+fork's pull request that edits the guard or the workflow runs with a read-only
+token and nothing to take. The cache holds the downloaded tarball under a key
+naming the resolved version, with no restore-key prefix. Every run checks the
+tarball against the sha512 integrity value the registry reports for that
+version and discards the cache on a mismatch. GitHub scopes cache writes to
+the writing ref, so a pull request can't plant an entry the default branch
+reads; the integrity check covers entries written by default-branch and
+dispatch runs. The value comes from the same registry, so it detects a
+tampered cache, not a compromised registry, and because the package never
+runs, a compromised registry could only skew the verdict. Provenance
+verification can be added if Anthropic publishes attestations for the
+package. A pull request that changes the expectations file's `package` field
+deserves a reviewer's attention.
+
+### The session-start hook and hostile input
+
+The hook reads JSON from Claude Code, but the values include directory names
+a user, a cloned repository or a worktree can shape. A `session_id` outside
+`[A-Za-z0-9_-]+` is treated as absent, so it can't add path components. A
+control character in the derived directory makes the hook print nothing.
+Because the context asks the agent to run an `export` line, the directory is
+shell-quoted there as well as JSON-escaped in the envelope; JSON escaping alone
+would let a directory named with `$(...)` or a backtick run a command. The
+no-`jq` reader decodes the escapes it supports in one pass and refuses any
+other. The test matrix covers `$(`, backtick and single-quote paths besides
+quote, backslash and space, and checks both the envelope and the export line.
+
+### The rendered smoke check
+
+The harness runs a real Claude Code with the maintainer's login and
+privileges, from an empty scratch directory made by `mktemp -d`, so accepting
+the folder-trust prompt loads no project settings. It sends keystrokes with
+`tmux send-keys -l` and answers the trust prompt only when the pane shows it.
+Cleanup is narrow: it deletes the transcript file and session directory named
+by the harness's own UUID, validated against a UUID pattern, with every
+variable checked non-empty, no globs and no symlinks followed, and removes the
+project directory with `rmdir`, so it goes only when empty. koto runs through
+`scripts/without-session-env.sh` with its own home and sessions base, so it
+never writes into the maintainer's real sessions.
+
+### Data exposure
+
+The guard adds only anonymous registry requests and prints release numbers,
+probe names and anchors, all public; it never echoes the environment or npm
+configuration, and doesn't run `npm` with debug logging. The smoke harness's
+captured pane and saved hook payload can hold the maintainer's email,
+organization, home path and username. They stay in a mode-700 scratch
+directory removed on exit, and the pane is printed to the terminal only. The
+run recorded in the verification guide is reduced to the outcome line, the
+release and the entry name, or redacted, before it is committed, because the
+repository is public.
 
 ## Consequences
 
