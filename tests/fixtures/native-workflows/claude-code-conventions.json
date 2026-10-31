@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "package": "@anthropic-ai/claude-code-linux-x64",
+  "member": "package/claude",
+  "conventions": [
+    {
+      "name": "file shape",
+      "slug": "file-shape",
+      "demo": {"from": "workflowName", "to": "workflowNamX"},
+      "probes": [
+        {"item": "workflowName", "anchor": "Failed to parse workflow snapshot", "token": ".workflowName", "window": 1000},
+        {"item": "summary", "anchor": "Failed to parse workflow snapshot", "token": ".summary", "window": 1000},
+        {"item": "status", "anchor": "Failed to parse workflow snapshot", "token": ".status", "window": 1000},
+        {"item": "startTime", "anchor": "Failed to parse workflow snapshot", "token": ".startTime", "window": 1000},
+        {"item": "phases", "anchor": "Failed to parse workflow snapshot", "token": ".phases", "window": 1000},
+        {"item": "workflowProgress", "anchor": "Failed to parse workflow snapshot", "token": ".workflowProgress", "window": 1000},
+        {"item": "type", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"type\"", "window": 800},
+        {"item": "workflow_agent", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"workflow_agent\"", "window": 800},
+        {"item": "workflow_phase", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"workflow_phase\"", "window": 800},
+        {"item": "index", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "index:", "window": 800},
+        {"item": "title", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "title:", "window": 800},
+        {"item": "label", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "label:", "window": 800},
+        {"item": "phaseIndex", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "phaseIndex:", "window": 800},
+        {"item": "phaseTitle", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "phaseTitle:", "window": 800},
+        {"item": "state", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "state:", "window": 800},
+        {"item": "promptPreview", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "promptPreview:", "window": 800},
+        {"item": "resultPreview", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "resultPreview:", "window": 800},
+        {"item": "blocked", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "blocked:", "window": 800},
+        {"item": "error", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "error:", "window": 800}
+      ],
+      "unread": [
+        {"field": "id", "reason": "the snapshot reader keys an entry by runId and never reads id; koto writes it for readers of contract version 1"},
+        {"field": "name", "reason": "the screen titles an entry from workflowName, then summary; koto keeps name for readers of contract versions before 4"},
+        {"field": "detail", "reason": "the screen's phase list reads only a phase's title; detail is koto's own text for a phase"}
+      ]
+    },
+    {
+      "name": "directory convention",
+      "slug": "directory",
+      "demo": {"from": "\"workflows\"", "to": "\"workflowz\""},
+      "probes": [
+        {"item": "\"workflows\" directory", "anchor": "Failed to parse workflow snapshot", "token": "\"workflows\"", "window": 1000},
+        {"item": ".json file filter", "anchor": "Failed to parse workflow snapshot", "token": ".endsWith(\".json\")", "window": 1000}
+      ]
+    },
+    {
+      "name": "session variable",
+      "slug": "session-variable",
+      "demo": {"from": "CLAUDE_CODE_SESSION_ID", "to": "CLAUDE_CODE_SESSION_IX"},
+      "probes": [
+        {"item": "CLAUDE_CODE_SESSION_ID", "anchor": null, "token": "CLAUDE_CODE_SESSION_ID"}
+      ]
+    },
+    {
+      "name": "SessionStart hook input",
+      "slug": "hook-input",
+      "demo": {"from": "transcript_path", "to": "transcript_patX"},
+      "probes": [
+        {"item": "session_id", "anchor": "prompt_id:", "token": "session_id:", "window": 200},
+        {"item": "transcript_path", "anchor": "prompt_id:", "token": "transcript_path:", "window": 200},
+        {"item": "cwd", "anchor": "prompt_id:", "token": "cwd:", "window": 200},
+        {"item": "SessionStart event", "anchor": "(\"SessionStart\"),source:", "token": "hook_event_name:", "window": 100}
+      ]
+    }
+  ]
+}

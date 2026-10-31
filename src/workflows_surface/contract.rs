@@ -9,12 +9,19 @@
 //! minimal *valid* projection for the initial render (name, current state, running/done)
 //! that later features add fields to without breaking the initial readers. The
 //! koto-namespaced [`KotoBlock`] identifies the file as koto's and carries a
-//! [`CONTRACT_VERSION`] that the future drift-guard/fixture anchors on.
+//! [`CONTRACT_VERSION`] that the shape fixture
+//! (`tests/fixtures/native-workflows/enriched-shape.json`) pins.
+//!
+//! `scripts/check-claude-code-conventions.sh` checks a Claude Code release for
+//! the names its screen reads from this file, and
+//! `tests/native_workflows_conventions.rs` fails when the fixture gains a field
+//! outside the `koto` block that the guard has no probe for, so adding one here
+//! means adding its probe too (`docs/guides/native-workflows-verification.md`).
 
 use serde::Serialize;
 
-/// Contract version of the koto-namespaced projection block. The future
-/// drift-guard/fixture pins this; later features that add fields bump it.
+/// Contract version of the koto-namespaced projection block. The shape
+/// fixture pins this; later features that add fields bump it.
 ///
 /// Version 2 adds the additive `phases` and `workflowProgress`
 /// fields and wrote a gate-blocked session's top-level `status` as `blocked`;
@@ -483,7 +490,7 @@ mod tests {
     #[test]
     fn contract_version_is_five() {
         // Version 5 moved koto's classification to koto.status and added the
-        // blocked step and summary; the guard/fixture anchors on it.
+        // blocked step and summary; the shape fixture pins it.
         assert_eq!(CONTRACT_VERSION, 5);
     }
 
