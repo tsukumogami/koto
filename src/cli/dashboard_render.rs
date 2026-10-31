@@ -234,6 +234,21 @@ fn remote_marker(session: &CachedSession) -> Option<String> {
         .then(|| format!("@{}", session.machine.as_deref().unwrap_or("unknown")))
 }
 
+/// The list's trailing tally: sessions that couldn't be read (local state
+/// files, and other machines' sessions listed as unknown) and migrated
+/// sources hidden in favour of their listed copy. `None` when both are 0.
+fn tally_line(tree: &SessionTree) -> Option<String> {
+    let unreadable = tree.unreadable + tree.remote_unreadable;
+    let mut parts = Vec::new();
+    if unreadable > 0 {
+        parts.push(format!("{unreadable} unreadable session(s)"));
+    }
+    if tree.remote_hidden > 0 {
+        parts.push(format!("{} hidden source(s)", tree.remote_hidden));
+    }
+    (!parts.is_empty()).then(|| format!("\u{26a0} {}", parts.join(" \u{00b7} ")))
+}
+
 /// Render the session list as a 4-column table with cursor highlighting and scrollbar.
 fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layout::Rect) {
     let rows_data = state.visible_rows();
@@ -301,11 +316,20 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
 
     // Trailing note for sessions whose state file failed to parse, so they are
     // surfaced rather than silently dropped.
-    // Local state files and other machines' summaries alike.
-    let unreadable = state.tree.unreadable + state.tree.remote_unreadable;
-    if unreadable > 0 {
-        let note = format!("\u{26a0} {} unreadable session(s)", unreadable);
+    // Local state files and other machines' summaries alike, and beside
+    // them the migrated sources hidden in favour of their listed copy.
+    if let Some(note) = tally_line(&state.tree) {
         rows.push(Row::new(vec![Cell::from(note)]).style(Style::default().fg(Color::Red)));
+    }
+
+    // One status line while the last feed snapshot couldn't read some or
+    // all of the bucket; the rows it couldn't read stay as they were.
+    if let Some(failure) = &state.tree.remote_failure {
+        let line = format!(
+            "\u{26a0} bucket: {}",
+            failure.replace(['\n', '\r', '\t'], " ")
+        );
+        rows.push(Row::new(vec![Cell::from(line)]).style(Style::default().fg(Color::Yellow)));
     }
 
     let row_count = rows.len();
@@ -1213,6 +1237,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
 
@@ -1505,6 +1530,7 @@ mod tests {
                 machine: None,
                 workspace: None,
                 remote: false,
+                imported_from: None,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1793,6 +1819,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 
@@ -2887,7 +2914,8 @@ mod tests {
         // scan not yet known B holds it.
         let row = crate::session::remote_feed::RemoteRow {
             workspace: REMOTE_WS.to_string(),
-            summary: SessionSummary {
+            name: "mine".to_string(),
+            status: crate::session::remote_feed::RowStatus::Shown(SessionSummary {
                 schema: 1,
                 session_id: "mine-local-id".to_string(),
                 name: "mine".to_string(),
@@ -2909,9 +2937,15 @@ mod tests {
                 state_etag: String::new(),
                 machine: Some("machine-b".to_string()),
                 sources: Vec::new(),
-            },
+            }),
         };
-        crate::cli::dashboard_data::replace_remote_rows(&mut state.tree, &[row]);
+        crate::cli::dashboard_data::apply_snapshot(
+            &mut state.tree,
+            &crate::session::remote_feed::RemoteSnapshot {
+                rows: vec![row],
+                ..Default::default()
+            },
+        );
         let rows = state.visible_rows();
         let keys: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(keys, vec!["mine"]);
@@ -3004,5 +3038,42 @@ mod tests {
             lines.iter().any(|l| l.contains("3 unreadable session(s)")),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn the_tally_line_counts_hidden_sources_beside_unreadable_ones() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.remote_hidden = 1;
+        let lines = frame_lines(&state, 78);
+        let tally: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("hidden source(s)"))
+            .collect();
+        assert_eq!(tally.len(), 1, "{lines:#?}");
+        assert!(tally[0].contains("1 hidden source(s)"), "{lines:#?}");
+        assert!(!tally[0].contains("unreadable"), "{lines:#?}");
+
+        state.tree.remote_unreadable = 2;
+        let lines = frame_lines(&state, 78);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 unreadable session(s) \u{00b7} 1 hidden source(s)")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_feed_failure_shows_one_status_line_until_it_clears() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.remote_failure = Some("listing x/ failed:\nboom".to_string());
+        let lines = frame_lines(&state, 78);
+        let status: Vec<_> = lines.iter().filter(|l| l.contains("bucket:")).collect();
+        assert_eq!(status.len(), 1, "{lines:#?}");
+        assert!(status[0].contains("listing x/ failed: boom"), "{lines:#?}");
+
+        state.tree.remote_failure = None;
+        let lines = frame_lines(&state, 78);
+        assert!(!lines.iter().any(|l| l.contains("bucket:")), "{lines:#?}");
     }
 }
