@@ -1,8 +1,17 @@
 ---
 schema: plan/v2
 status: Active
-execution_mode: single-pr
-split_mode_source: none
+execution_mode: multi-pr
+split_mode_source: flag
+split_rationale: |
+  Hard Constraint, with Incremental Value. This scoping PR merges before any
+  of the build, and the build waits on two answers it can't start without:
+  how the session-continuity work settles the bucket layout around
+  summary.json, and step 1's delimiter probe against R2, which picks the
+  layout steps 3 to 7 build on. Each step then lands in its own pull request,
+  and each lands a usable increment: step 1 alone gives the text evidence
+  scenario, step 2 the interactive one, and each later step one observable
+  behaviour on top.
 tracking_level: none
 upstream: docs/designs/DESIGN-cross-machine-dashboard.md
 milestone: "Sessions from every machine in one dashboard"
@@ -107,7 +116,8 @@ Control, bidirectional and zero-width characters are replaced, oversized or malf
 
 ## Implementation Sequence
 
-The steps run in order, in one pull request. Step 4 needs only step 1 and
+The steps run in order, each in its own pull request after this scoping
+merges, through `/work-on` on this plan. Step 4 needs only step 1 and
 step 5 only step 2, so either can run beside step 3 once its dependency is
 done; steps 6 and 7 both build on step 3's classifier. The plan's owner
 details step 3 after step 2's work reaches its terminal, and each later step
