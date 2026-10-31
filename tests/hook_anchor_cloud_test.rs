@@ -10,7 +10,8 @@
 //! backend in `~/.koto/config.toml` and only the credentials in the
 //! environment, the hook's open must succeed. The hook must still never put
 //! a `KOTO_SESSION_*` variable into the env file the session's shells
-//! source.
+//! source. And the watcher the hook detaches must write to the store the
+//! open used, which is why the open and its watchers share one environment.
 //!
 //! Every command here (the hook and each koto run) starts from an empty
 //! environment: `PATH` with the koto under test first, a scratch `HOME` and
@@ -274,7 +275,24 @@ impl Host {
     /// `<session-env>/<id>/sessionstart-hook-0.sh`, niwa's reap key set (so
     /// no watcher is left behind) and only `env` beyond that.
     fn hook(&self, ws: &Path, id: &str, env: &[(String, String)]) -> HookRun {
-        let dir = self.session_env.join(id);
+        self.hook_with_key(ws, id, env, Some(&format!("key-{id}")))
+    }
+
+    /// The env file directory of agent session `id`.
+    fn env_dir(&self, id: &str) -> PathBuf {
+        self.session_env.join(id)
+    }
+
+    /// `hook`, with niwa's reap key `key`, or none: with none the hook
+    /// detaches the watcher that waits for niwa's key.
+    fn hook_with_key(
+        &self,
+        ws: &Path,
+        id: &str,
+        env: &[(String, String)],
+        key: Option<&str>,
+    ) -> HookRun {
+        let dir = self.env_dir(id);
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join("sessionstart-hook-0.sh");
         let payload = serde_json::json!({
@@ -293,10 +311,12 @@ impl Host {
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)
             .env("CLAUDE_ENV_FILE", &env_path)
-            .env("NIWA_REAP_KEY", format!("key-{id}"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(key) = key {
+            cmd.env("NIWA_REAP_KEY", key);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -503,6 +523,84 @@ fn the_hooks_env_file_block_names_no_session_backend_variable() {
     assert!(
         !run.block().contains("KOTO_SESSION_"),
         "config file: {}",
+        run.describe()
+    );
+}
+
+/// Kills, when dropped, the key watcher the hook detached for `anchor` and
+/// `env_dir`. A watcher that has recorded the marker has already exited; one
+/// that hasn't would otherwise poll, against the scratch `HOME` and the
+/// stand-in endpoint only, until the test process is gone (the process the
+/// hook took for the agent; it checks every two seconds) or the hook's
+/// WATCH_LIMIT passes.
+struct WatcherGuard {
+    pattern: String,
+}
+
+impl WatcherGuard {
+    fn new(anchor: &str, env_dir: &Path) -> Self {
+        WatcherGuard {
+            pattern: format!(
+                "session-start.sh --watch-key {anchor} {}",
+                env_dir.to_str().unwrap()
+            ),
+        }
+    }
+}
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &self.pattern])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Why the hook keeps one environment for the open and its watchers: the
+/// watcher the hook detaches to wait for niwa's reap key records the
+/// anchor's observed marker, and must write it to the store the open created
+/// the anchor in. The watcher inherits the hook's whole environment, so with
+/// the cloud backend configured in the environment alone, the marker lands
+/// in the bucket beside the anchor.
+#[test]
+fn one_environment_for_the_open_and_its_watchers_puts_the_key_watchers_marker_in_the_bucket() {
+    need_jq!();
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new();
+    let ws = h.workspace("ws1");
+    let id = "watchkey";
+
+    // No reap key at the start, so the hook detaches the key watcher.
+    let run = h.hook_with_key(&ws, id, &cloud_env(&s3), None);
+    assert_eq!(run.out.code, Some(0), "{}", run.describe());
+    let anchor = assert_anchor_in_bucket(&s3, &run);
+    let dir = h.env_dir(id);
+    let _watcher = WatcherGuard::new(&anchor, &dir);
+
+    // niwa's own start hook writes the key into a sibling env file later.
+    std::fs::write(
+        dir.join("sessionstart-hook-1.sh"),
+        "export NIWA_REAP_KEY='key-watchkey'\n",
+    )
+    .unwrap();
+
+    let marker = format!("/{anchor}/ctx/koto/anchor/observed");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut found = false;
+    while std::time::Instant::now() < deadline {
+        if s3.keys().iter().any(|k| k.ends_with(&marker)) {
+            found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        found,
+        "the key watcher never marked {anchor} observed in the bucket the open used; \
+         bucket keys under the anchor: {:?}; {}",
+        anchor_keys(&s3, &anchor),
         run.describe()
     );
 }

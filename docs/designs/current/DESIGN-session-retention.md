@@ -379,7 +379,9 @@ for every koto-skills user. `session-start.sh`:
    --anchor <own> --key=<v>`. On `clear` with `observed=no` and `previous=`
    set, detach a watcher that loops `observe --anchor <own> --inherit` until
    `inherit_until`, never longer than 180 seconds. Watchers run with
-   `KOTO_ANCHOR` and `KOTO_SESSION_*` unset, fully detached (new session,
+   `KOTO_ANCHOR` unset and the rest of the open's environment, the
+   `KOTO_SESSION_*` configuration included, so they write to the store the
+   open created the anchor in; fully detached (new session,
    every descriptor redirected), and exit early when the claude process in
    the token is gone.
 7. Exit 0.
