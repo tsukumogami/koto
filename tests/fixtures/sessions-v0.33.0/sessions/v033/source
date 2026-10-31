@@ -1,0 +1,25 @@
+---
+name: gated
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      go:
+        type: context-exists
+        key: go
+    transitions:
+      - target: done
+        when:
+          gates.go.exists: true
+  done:
+    terminal: true
+---
+
+## check
+
+Wait for go.
+
+## done
+
+Done.
