@@ -46,6 +46,7 @@ impl Fixture {
                 template_path: String::new(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
         )];
         if let Some(state) = initial_state {
@@ -3425,6 +3426,7 @@ fn the_journal_pairs_with_the_consultation_the_engine_finds() {
                 template_path: "t.json".into(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -4510,6 +4512,7 @@ fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
                 template_path: String::new(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
         ),
         event(2, transitioned(None, "a")),
@@ -4546,6 +4549,7 @@ fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
                 template_path: String::new(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
         ),
         event(2, transitioned(None, "a")),
@@ -4722,6 +4726,7 @@ fn ten_thousand_event_visit() -> Fixture {
                 template_path: String::new(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
         ),
         event(2, transitioned(None, "a")),

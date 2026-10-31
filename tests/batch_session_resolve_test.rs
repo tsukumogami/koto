@@ -458,6 +458,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
             template_path: child_template_path.to_string_lossy().to_string(),
             variables: Default::default(),
             spawn_entry: None,
+            machine: None,
         },
         idempotency_hash: None,
     };

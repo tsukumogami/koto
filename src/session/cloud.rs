@@ -7232,6 +7232,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -7291,6 +7292,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -7353,6 +7355,7 @@ mod tests {
                 template_path: "/tmp/tpl.md".to_string(),
                 variables: Default::default(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];

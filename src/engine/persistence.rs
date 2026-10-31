@@ -2279,6 +2279,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         )];
         let path = write_state_file(dir.path(), "sv1", &header, &events);
@@ -2296,6 +2297,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         )];
         let path = write_state_file(dir.path(), "sv2", &header, &events);
@@ -2343,6 +2345,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ))
             .unwrap(),
@@ -2375,6 +2378,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -2414,6 +2418,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         );
         // Seq jumps from 1 to 3 (gap at seq 2)
@@ -2475,6 +2480,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         );
 
@@ -2504,6 +2510,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -2541,6 +2548,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -2590,6 +2598,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         )];
         assert_eq!(derive_state_from_log(&events), None);
@@ -2608,6 +2617,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -2687,6 +2697,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -2761,6 +2772,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             "2026-01-01T00:00:00Z",
         )
@@ -2844,6 +2856,7 @@ mod tests {
                     template_path: "t".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 None,
                 None,
@@ -3154,6 +3167,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3190,6 +3204,7 @@ mod tests {
                     template_path: "abc123.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3226,6 +3241,7 @@ mod tests {
                     template_path: String::new(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3345,6 +3361,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
         )];
         // Only init event, no transitioned -- no current state derivable
@@ -3364,6 +3381,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3414,6 +3432,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3474,6 +3493,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -3967,6 +3987,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(
@@ -4030,6 +4051,7 @@ mod tests {
                     template_path: "/cache/abc.json".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
             ),
             make_event(

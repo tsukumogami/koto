@@ -1010,6 +1010,7 @@ mod tests {
                 template_path: "/cache/test.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             "2026-01-01T00:00:00Z",
         )
@@ -1400,6 +1401,7 @@ mod tests {
                     Default::default(),
                     vec![],
                 )),
+                machine: None,
             },
             "2026-01-01T00:00:00Z",
         )

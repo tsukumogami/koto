@@ -1858,6 +1858,7 @@ mod tests {
                     template_path: "/tmp/tpl.md".to_string(),
                     variables: std::collections::HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 idempotency_hash: None,
             },
@@ -1965,6 +1966,7 @@ mod tests {
                         template_path: format!("/tmp/tpl-{}.md", i),
                         variables: std::collections::HashMap::new(),
                         spawn_entry: None,
+                        machine: None,
                     },
                     idempotency_hash: None,
                 }];
@@ -2611,6 +2613,7 @@ mod tests {
             template_path: "test-tmpl".to_string(),
             variables: std::collections::HashMap::new(),
             spawn_entry: None,
+            machine: None,
         };
         backend
             .append_event("src-wf", &payload, "2026-01-01T00:00:01Z")

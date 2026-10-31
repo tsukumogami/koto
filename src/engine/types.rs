@@ -1245,6 +1245,16 @@ pub enum EventPayload {
         /// keeps pre-feature state files round-tripping unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_entry: Option<SpawnEntrySnapshot>,
+        /// The name of the machine that created the session
+        /// ([`crate::session::version::machine_name`]), written by every
+        /// creation path. Kept on the append-only event rather than the
+        /// header, so a release that rewrites the header without knowing
+        /// the field can't drop it. `None` for a session created before the
+        /// field existed, which reads as an unknown machine.
+        ///
+        /// Additive field, like `spawn_entry`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
     },
     Transitioned {
         from: Option<String>,
@@ -2351,6 +2361,19 @@ pub fn derive_intent(events: &[Event]) -> Option<String> {
 /// the header field empty, so a reader of the header alone never sees it.
 /// The dashboard, the session view and the `/workflows` label all read intent
 /// through this one rule so they cannot drift apart.
+/// The machine that produced a session, read from its own events: the
+/// `machine` of its `workflow_initialized` event. `None` when the session
+/// records none (created before the field existed), which every surface
+/// shows as an unknown machine.
+pub fn producing_machine(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|e| match &e.payload {
+        EventPayload::WorkflowInitialized { machine, .. } => {
+            Some(machine.clone().filter(|m| !m.is_empty()))
+        }
+        _ => None,
+    })?
+}
+
 pub fn effective_intent(header: &StateFileHeader, events: &[Event]) -> Option<String> {
     derive_intent(events).or_else(|| header.intent.clone())
 }
@@ -2447,6 +2470,7 @@ impl<'de> Deserialize<'de> for Event {
                     template_path: p.template_path,
                     variables: p.variables,
                     spawn_entry: p.spawn_entry,
+                    machine: p.machine,
                 }
             }
             "transitioned" => {
@@ -2970,6 +2994,8 @@ struct WorkflowInitializedPayload {
     variables: HashMap<String, String>,
     #[serde(default)]
     spawn_entry: Option<SpawnEntrySnapshot>,
+    #[serde(default)]
+    machine: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3640,6 +3666,7 @@ mod tests {
                 template_path: "path/to/template.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         };
@@ -3707,6 +3734,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::new(),
                 spawn_entry: Some(snapshot.clone()),
+                machine: None,
             },
             idempotency_hash: None,
         };

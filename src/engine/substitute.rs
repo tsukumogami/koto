@@ -834,6 +834,7 @@ mod tests {
                     ("REPO".to_string(), "widgets".to_string()),
                 ]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -859,6 +860,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::from([("BAD".to_string(), "value;rm -rf".to_string())]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -883,6 +885,7 @@ mod tests {
                     ("CALENDAR".to_string(), "Weekly Planning".to_string()),
                 ]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -903,6 +906,7 @@ mod tests {
                 template_path: "/cache/abc.json".to_string(),
                 variables: HashMap::from([("PATH".to_string(), "org/repo-name_v1.2".to_string())]),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -927,6 +931,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 spawn_entry: None,
+                machine: None,
             },
             idempotency_hash: None,
         }];
@@ -1074,6 +1079,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             spawn_entry: None,
+            machine: None,
         }
     }
 

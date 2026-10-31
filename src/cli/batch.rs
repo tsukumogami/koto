@@ -5106,6 +5106,7 @@ mod tests {
                     template_path: "child.md".to_string(),
                     variables: std::collections::HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5470,6 +5471,7 @@ mod tests {
                     template_path: "child.md".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 "2026-01-01T00:00:02Z",
             )
@@ -5762,6 +5764,7 @@ mod tests {
                     template_path: "child.md".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 "2026-01-01T00:00:03Z",
             )
@@ -5887,6 +5890,7 @@ mod tests {
                     template_path: "child.md".to_string(),
                     variables: HashMap::new(),
                     spawn_entry: None,
+                    machine: None,
                 },
                 "2026-01-01T00:00:03Z",
             )
