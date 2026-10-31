@@ -5081,7 +5081,7 @@ mod tests {
         };
         let a = init(Some("machine-a"));
         let pm = |p: &[(&str, serde_json::Value)]| producing_machine(&machine_name_events(p));
-        assert_eq!(pm(&[a.clone()]).as_deref(), Some("machine-a"));
+        assert_eq!(pm(std::slice::from_ref(&a)).as_deref(), Some("machine-a"));
         let b = imp(Some("machine-b"));
         assert_eq!(pm(&[a.clone(), b.clone()]).as_deref(), Some("machine-b"));
         let c = imp(Some("machine-c"));
