@@ -104,11 +104,12 @@ fn format_elapsed(secs: u64) -> String {
 /// Sets each local row's `workspace` to its copy's prefix. A session this
 /// machine holds a copy of is left to its local row (matched by
 /// `session_id`, or by workspace and name when its summary can't be read),
-/// a migrated source whose copy is listed or held here is hidden, and the
-/// state-less placeholder the cloud listing adds for a session found only
-/// under this directory's own prefix is dropped when the pass listed that
-/// session, so it shows once, from the pass. A failed pass leaves the local
-/// rows standing and says why on stderr; rows listed as unknown and hidden
+/// a migrated source whose copy is listed or held here is hidden, and a
+/// local row with no state file under this directory's own prefix is
+/// dropped when the pass listed that session, so it shows once, from the
+/// pass. A failed pass leaves the local rows standing and says on one
+/// stderr line which class of failure it met at which host (and, when only
+/// some workspaces failed, how many); rows listed as unknown and hidden
 /// sources are counted in the tree for the stderr notes.
 ///
 /// [`RemoteReader::scan`]: crate::session::remote_feed::RemoteReader::scan
@@ -143,7 +144,11 @@ fn once_remote_rows(
         }
     };
     if let Some(failure) = &snapshot.failure {
-        eprintln!("note: other machines' sessions weren't all read: {failure}");
+        eprintln!(
+            "note: other machines' sessions weren't {}read: {}",
+            if failure.top_level { "" } else { "all " },
+            failure.line()
+        );
     }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
@@ -492,10 +497,23 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
         run_detail(name, &backend);
     }
 
+    // rust-s3 asks every failed request again on its own, a second later,
+    // through one process-wide setting with no per-bucket form. The reader
+    // decides itself what to ask again (a throttle, never a timeout), so in
+    // this process, which only reads, rust-s3 asks once: a bucket that
+    // never answers costs a pass one request timeout.
+    s3::set_retries(0);
+
     // --once: print tab-separated lines and exit without a TUI.
     if args.once {
+        // The local store only, as the TUI reads it: under the cloud
+        // backend the listing it wraps asks the bucket with no request
+        // timeout. The pass below reads the bucket.
         let mut tree = SessionTree::new();
-        dashboard_data::refresh(&mut tree, &backend)?;
+        match &backend {
+            Backend::Cloud(cloud) => dashboard_data::refresh(&mut tree, cloud.local())?,
+            Backend::Local(store) => dashboard_data::refresh(&mut tree, store)?,
+        }
         let remote = match &backend {
             Backend::Cloud(cloud) => once_remote_rows(cloud, &mut tree),
             Backend::Local(_) => Vec::new(),

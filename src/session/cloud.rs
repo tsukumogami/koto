@@ -6598,11 +6598,24 @@ pub(crate) fn list_retrying(
     prefix: String,
     delimiter: Option<&str>,
 ) -> Result<Vec<s3::serde_types::ListBucketResult>, S3Error> {
+    list_retrying_when(bucket, prefix, delimiter, is_transient)
+}
+
+/// [`list_retrying`], asking again only while the failure is one `retry`
+/// accepts. The dashboard's reader asks again after a throttle and never
+/// after a timeout, so a listing that gets no answer costs one request
+/// timeout, not one per ask.
+pub(crate) fn list_retrying_when(
+    bucket: &Bucket,
+    prefix: String,
+    delimiter: Option<&str>,
+    retry: impl Fn(&S3Error) -> bool,
+) -> Result<Vec<s3::serde_types::ListBucketResult>, S3Error> {
     let delimiter = delimiter.map(str::to_string);
     let mut wait = LIST_BACKOFF;
     for _ in 1..LIST_ATTEMPTS {
         match bucket.list(prefix.clone(), delimiter.clone()) {
-            Err(e) if is_transient(&e) => {
+            Err(e) if retry(&e) => {
                 std::thread::sleep(wait);
                 wait *= 2;
             }

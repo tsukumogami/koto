@@ -319,17 +319,18 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     // machines' sessions listed as unknown, so they are surfaced rather than
     // silently dropped) and of hidden migrated sources, then one status line
     // while the last feed snapshot couldn't read some or all of the bucket
-    // (the rows it couldn't read stay as they were).
+    // (the rows it couldn't read stay as they were), naming the failure's
+    // class and the endpoint's host, both sanitized. The status line wraps
+    // inside the list's width rather than losing the host off its end.
     let mut notes: Vec<Line<'_>> = Vec::new();
     if let Some(note) = tally_line(&state.tree) {
         notes.push(Line::styled(note, Style::default().fg(Color::Red)));
     }
     if let Some(failure) = &state.tree.remote_failure {
-        let line = format!(
-            "\u{26a0} bucket: {}",
-            failure.replace(['\n', '\r', '\t'], " ")
-        );
-        notes.push(Line::styled(line, Style::default().fg(Color::Yellow)));
+        let width = area.width.saturating_sub(2) as usize;
+        for row in wrap_fact("\u{26a0} bucket", &failure.line(), width) {
+            notes.push(Line::styled(row, Style::default().fg(Color::Yellow)));
+        }
     }
 
     let row_count = rows.len();
@@ -3072,11 +3073,21 @@ mod tests {
     #[test]
     fn a_feed_failure_shows_one_status_line_until_it_clears() {
         let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
-        state.tree.remote_failure = Some("listing x/ failed:\nboom".to_string());
+        state.tree.remote_failure = Some(crate::session::remote_feed::ReadFailure {
+            class: crate::session::remote_feed::FailureClass::Timeout,
+            host: "x\u{1b}[2J\nhost".to_string(),
+            top_level: true,
+            workspaces: Vec::new(),
+        });
         let lines = frame_lines(&state, 78);
         let status: Vec<_> = lines.iter().filter(|l| l.contains("bucket:")).collect();
         assert_eq!(status.len(), 1, "{lines:#?}");
-        assert!(status[0].contains("listing x/ failed: boom"), "{lines:#?}");
+        // The class and the host, the host's control characters escaped.
+        assert!(
+            status[0].contains("bucket: timeout at x\\u{1B}[2J host"),
+            "{lines:#?}"
+        );
+        assert!(!status[0].contains('\u{1b}'), "{lines:#?}");
 
         state.tree.remote_failure = None;
         let lines = frame_lines(&state, 78);
