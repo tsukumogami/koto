@@ -17,7 +17,8 @@ use serde::Serialize;
 /// drift-guard/fixture pins this; later features that add fields bump it.
 ///
 /// Version 2 adds the additive `phases` and `workflowProgress`
-/// fields and the `blocked` render status. Version 1's fields remain a valid
+/// fields and wrote a gate-blocked session's top-level `status` as `blocked`;
+/// version 5 replaces that word (see below). Version 1's fields remain a valid
 /// subset, so a reader that ignores the new fields still renders the initial
 /// entry. Version 3 adds the `holdings` block. Version 4 adds the top-level
 /// `workflowName` and `summary` fields the `/workflows` screen titles an entry
@@ -83,8 +84,9 @@ pub enum ScreenStatus {
 /// [`GATE_NAME_CAP`] bounds the raw name, but one raw character can escape to
 /// as many as nine (`\u{E007F}`), so a name of control characters would
 /// otherwise grow the blocked summary's suffix past the fact cap. Four times
-/// the raw cap leaves the summary's `koto · <workflow> · <state>` prefix most
-/// of the fact cap, and an ASCII name never reaches it.
+/// the raw cap is half the fact cap, so the summary's
+/// `koto · <workflow> · <state>` prefix keeps about the other half, and an
+/// ASCII name never reaches it.
 pub const GATE_NAME_DISPLAY_CAP: usize = 4 * GATE_NAME_CAP;
 
 /// A gate name as it is written into a step's `error`, a phase's outcome line
@@ -286,7 +288,10 @@ pub struct WorkflowFile {
     #[serde(rename = "workflowName")]
     pub workflow_name: String,
     /// One-line description under the title: `koto · <session> · <state>`,
-    /// sanitized and capped like every printed fact.
+    /// sanitized and capped like every printed fact. A gate-blocked session's
+    /// summary ends `· blocked on gate <name>` (see
+    /// [`WorkflowFile::with_blocked_gate`]), with the prefix cut, never the
+    /// suffix, to stay within the cap.
     pub summary: String,
     /// Running / completed / failed, in the screen's vocabulary; koto's own
     /// classification is `koto.status`.

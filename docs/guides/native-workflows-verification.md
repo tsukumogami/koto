@@ -3,9 +3,17 @@
 The initial render makes a koto session appear as a
 native entry in Claude Code's `/workflows` screen; the phase-detail work enriches that entry
 from a bare status into the session's real structure (ordered phases with the
-active one marked, the active directive, per-phase evidence/gate outcomes, and a
-gate-blocked → `blocked` status). This guide covers both the automated check and
+active one marked, the active directive, per-phase evidence/gate outcomes, and a gate-blocked
+session that reads as blocked). This guide covers both the automated check and
 the manual live-TUI check.
+
+The entry file is at contract version 5. Its top-level `status` uses only the
+words Claude Code's screen knows (`running`, `completed`, `failed`); it never
+reads `blocked`. koto's own classification (`running`, `blocked`, `completed`
+or `failed`) is in `koto.status`. A gate-blocked session is written `running`,
+with its active step as an `error` step carrying `blocked: true` and
+`error: "gate <name>: FAIL"`, and a `summary` ending `· blocked on gate <name>`.
+The manual steps below describe what Claude Code 2.1.314 draws for that file.
 
 ## Automated (CI / CLI)
 
@@ -27,8 +35,17 @@ exercises everything koto owns:
   path untouched), and the atomic `koto-<uuid>.json` filename.
 - **The phase-detail enrichment** — the phases render in order with the active one marked, the
   active phase's directive is legible, a completed phase shows its gate outcome,
-  and a session whose gate did not pass renders as `blocked` (not running, not
-  done).
+  and a session whose gate did not pass writes top-level `running`,
+  `koto.status` `blocked`, a blocked `error` step reading
+  `gate spirit_greeting: FAIL`, and a summary ending
+  `· blocked on gate spirit_greeting`. A finished session writes every
+  `workflow_agent` step `done`, with none left in `progress`.
+
+The script pins koto's local session backend before its first koto call: it
+exports `KOTO_SESSION_BACKEND=local` and unsets every cloud session setting,
+for the main run and the no-publish run alike. Its sessions land only in its
+own scratch directories, never in a shared store, so it can run twice in a row
+on a host whose environment selects the cloud backend.
 
 The `hello-koto` template's `awakening` state carries a command gate that fails
 until a greeting file exists, so the first advance lands on a gate-blocked state
@@ -83,11 +100,16 @@ the emitted file.
    active phase shows its outcome, and the directive updates (refresh-on-open).
 
 5. **Block on a gate and reopen.** Drive the session into a state whose gate
-   does not pass, then reopen `/workflows` — the entry reads *blocked*, not a
-   spinning *running* and not *done*.
+   does not pass, then reopen `/workflows`. On Claude Code 2.1.314 the entry is
+   counted under "running" in the list's summary line, not under "completed".
+   In its detail, the active step reads Blocked (a cross in the permission
+   color) with `gate <name>: FAIL` as its Outcome, naming the gate that failed,
+   and the line under the title ends `· blocked on gate <name>`. No step reads
+   Stopped.
 
 6. **Complete and reopen.** Drive the session to its terminal state, then reopen
-   `/workflows` — the entry reads *done* (completed), not a stuck *running*.
+   `/workflows`. On Claude Code 2.1.314 the header reads done, every phase
+   reads done (the terminal phase `1/1`), and no step reads Stopped.
 
 7. **Negative check.** With rendering opted out (`koto config set
    workflows.native false`) and no `KOTO_WORKFLOWS_DIR`, run a koto session and

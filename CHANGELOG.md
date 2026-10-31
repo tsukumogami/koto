@@ -674,6 +674,26 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A gate-blocked session's `/workflows` entry reads as blocked on Claude
+  Code 2.1.314, and a finished session's last phase reads done
+  ([koto#553](https://github.com/tsukumogami/koto/issues/553),
+  [koto#554](https://github.com/tsukumogami/koto/issues/554)).** koto wrote
+  a gate-blocked session's top-level `status` as `blocked`, a word 2.1.314
+  doesn't know, so the entry was counted as completed and its active step
+  read Stopped with the gate's FAIL hidden; and a completed session's
+  terminal phase read `0/1` with its step Stopped. The entry file is now
+  contract version 5. Its top-level `status` is `running`, `completed` or
+  `failed`, and a gate-blocked session is written `running`, with its
+  active step as an `error` step carrying `blocked: true` and
+  `error: "gate <name>: FAIL"`, which 2.1.314 draws as Blocked with that
+  Outcome, and a summary ending `· blocked on gate <name>`. koto's own
+  classification, `blocked` included, moves to the new `koto.status`. A
+  completed session writes every step `done`; a cancelled or failed one
+  writes its last step as an `error` reading `cancelled at <state>` or
+  `ended at <state>`. Every template-derived string the screen draws is
+  escaped. A reader that took the top-level `status` as koto's
+  classification should read `koto.status` instead.
+
 - **The koto-skills plugin's hook file moved to where Claude Code reads
   it, and registers no hook.** The plugin shipped its hooks in a root
   `hooks.json` with each command directly under its event, a place and a
