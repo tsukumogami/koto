@@ -84,7 +84,7 @@ maintainer hears about it after the break has shipped.
   wrote actually renders, and knows how to run that check and what a passing
   run looks like.
 - The hook script that derives koto's workflows directory produces valid output
-  on every host it supports, and CI would catch it if it didn't.
+  with and without `jq` on the host, and CI would catch it if it didn't.
 - A later, deliberate change to koto's file shape extends the guard in the same
   change, by a written procedure.
 - Operators stop meeting a silent, empty `/workflows` caused by a Claude Code
@@ -96,128 +96,188 @@ maintainer hears about it after the break has shipped.
   changes the workflows file shape, the directory convention or the session
   input, with a message naming the convention, so that I start from the broken
   convention instead of from an operator's report of an empty screen.
+- As a koto maintainer who made no koto change this week, I want a new Claude
+  Code release checked anyway, so that a break shows up as a failed run before
+  the next koto release rather than as an operator's report after it.
 - As a koto maintainer about to cut a release, I want to run a rendered smoke
-  check against an installed Claude Code and read a plain pass or fail for
-  whether koto's entry shows up, so that I know the render works end to end and
-  not only that its inputs look unchanged.
-- As a koto contributor adding a field to the workflows file, I want a written
-  step for extending the guard's fixture, so that the guard keeps describing
-  both what koto writes and what Claude Code reads, and the new field is
-  covered when it lands.
-- As an operator on a host without `jq`, I want the session-start hook to emit
-  valid JSON, so that Claude Code accepts it and koto gets its directory.
-- As a reviewer of the implementing pull request, I want to see the guard fail
-  against a deliberately altered input and to know how to reproduce that, so
+  check against an installed Claude Code and read whether koto's entry showed
+  up, didn't, or couldn't be checked, so that I know the render works end to end
+  and not only that its inputs look unchanged.
+- As a koto contributor adding a field to the workflows file, I want the guard
+  to fail until its expectations cover the new field, and a written step that
+  says how to extend them, so that the new field is checked against Claude Code
+  from the day it lands.
+- As an operator on a host without `jq`, whose project path contains a quote or
+  a space, I want the session-start hook to emit valid JSON, so that Claude Code
+  accepts it and koto gets its directory.
+- As a reviewer of the implementing pull request, I want to run one command per
+  convention that makes the guard fail against a deliberately altered input, so
   that I can trust a green guard means something.
 
 ## Requirements
 
+Two terms recur below. A **convention check** compares koto's *expectation*
+for one convention, kept in koto's repository, with the *release evidence* for
+that convention: what the guard reads from or observes in a specific Claude
+Code release. Whether the evidence comes from the release's shipped files or
+from running it is the design's choice. **Altering an input** means changing
+either side for a test run (removing or renaming the item in the evidence, or in
+the expectation) without changing koto's code.
+
 ### Functional
 
-- **R1. Claude Code reference.** The guard checks koto's conventions against
-  what a Claude Code release actually ships or does, not against koto's own
-  output. A check whose only input is koto's serialized file doesn't satisfy
-  this requirement.
-- **R2. Recorded release.** The repository records, in a machine-readable
-  file, the Claude Code release the conventions were last confirmed against.
-  The guard reads it, and moving it to a newer release is a reviewable change.
-- **R3. Per-convention checks.** The guard has a separate check for each of the
-  four conventions: the file shape, the directory convention, the session
-  variable and the SessionStart hook input fields.
-- **R4. Named failures.** When a check fails, its output names the convention
-  that changed and the specific element that no longer matches (for example, a
-  field name, a directory name, a variable name or a hook input field). A bare
-  "fixture mismatch" or a raw diff with no convention named doesn't satisfy
-  this requirement.
-- **R5. Newer releases.** The guard can be run against a Claude Code release
-  newer than the recorded one, so that a new release is checked without waiting
-  for a koto commit. A maintainer can also name a specific release to check.
-- **R6. Demonstrated failure.** The guard can be shown failing against a
-  deliberately altered input for each convention, by a documented command a
-  reader can run. The implementing pull request shows this happening and says
-  how to reproduce it.
-- **R7. Rendered smoke check.** A rendered smoke check runs a real Claude Code
-  with an entry koto wrote and reports pass or fail for whether the entry
-  renders in `/workflows`. Its documentation says how to run it, what it needs
-  (credentials, an installed Claude Code, a terminal), and shows the result of
-  one run.
-- **R8. Hook coverage.** `session-start-workflows.sh` is exercised in CI with
-  representative SessionStart payloads, on the path where `jq` is available and
-  on the path where it isn't, and every output it prints is valid JSON that
-  carries the derived workflows directory. This fixes and closes koto#243.
-- **R9. Fixture extension procedure.** Written maintainer documentation says
-  how to extend the guard when koto's file shape changes on purpose: what to
-  update, in which order, and how to confirm the extended guard still fails
-  against an altered input.
-- **R10. Confirming a new release.** Written maintainer documentation says how
-  to confirm the conventions against a new Claude Code release and move the
-  recorded release forward.
+- **R1. Evidence from Claude Code.** Every convention check reads release
+  evidence from a published Claude Code release. A check whose only inputs are
+  koto's serialized file and files koto generated doesn't satisfy this
+  requirement.
+- **R2. Recorded release.** The repository records the Claude Code release the
+  conventions were last confirmed against, as a version string of the form
+  `MAJOR.MINOR.PATCH` in a file the guard reads. The guard fails with a message
+  naming that file when it is missing, empty or not a version string.
+- **R3. One check per convention.** The guard has a separate convention check
+  for each of the four conventions: the file shape, the directory convention,
+  the session variable and the SessionStart hook input. All four run and report
+  on every guard run; one failing doesn't stop the others.
+- **R4. Named failures.** A failing convention check prints the convention's
+  name (`file shape`, `directory convention`, `session variable` or
+  `SessionStart hook input`) and the item that no longer matches (a field name,
+  a directory name, a variable name or a hook input field), and the guard exits
+  non-zero.
+- **R5. Choosing the release.** The guard checks the recorded release by
+  default and accepts a version string to check a different release. Its output
+  states which release it checked. When the release can't be obtained (an
+  unpublished version, a registry or network failure), the guard exits non-zero
+  with a message saying the release couldn't be obtained, distinct from every
+  convention-check failure.
+- **R6. Newest release on a schedule.** A scheduled CI run, at least weekly,
+  checks the newest Claude Code release published at run time, with no koto
+  commit needed. Its failure is a failed workflow run on koto's default branch.
+- **R7. Demonstrated failure.** For each of the four conventions there is a
+  documented command that runs the guard against an altered input and exits
+  non-zero with that convention's name in its output. The implementing pull
+  request includes the output of these runs and the commands.
+- **R8. Fixture coverage.** Every field of the workflows file that koto relies
+  on the screen reading, as listed in koto's shape fixture, is covered by the
+  file-shape check's expectation. A field added to the fixture as one the screen
+  reads, without a matching expectation, makes the guard fail.
+- **R9. The existing shape test.** The test that compares koto's output with
+  `tests/fixtures/native-workflows/enriched-shape.json` stays, as the check that
+  koto writes the shape it intends to; it is no longer described as the
+  Claude Code guard. The implementing pull request states whether it closes
+  koto#178.
+- **R10. Rendered smoke check.** A rendered smoke check starts a real Claude
+  Code with an entry koto wrote for that session and reports one of three
+  outcomes, each with its own exit status: *rendered* (the entry's
+  `workflowName` appears in the `/workflows` list Claude Code draws), *not
+  rendered* (the list is shown and the entry isn't in it), or *unavailable*
+  (Claude Code couldn't start, isn't logged in, or `/workflows` is disabled).
+  Its output names the Claude Code release it ran against.
+- **R11. Smoke check documentation.** The rendered smoke check's documentation
+  gives the command, its prerequisites (credentials, an installed Claude Code,
+  a terminal) and the full output of one real run.
+- **R12. Hook coverage.** A CI job runs `session-start-workflows.sh` against a
+  fixed set of SessionStart payloads, once with `jq` on the `PATH` and once
+  without. On every payload that carries `session_id`, the output is valid JSON
+  whose context names the derived workflows directory exactly, including when
+  the path contains a double quote, a backslash or a space. On a payload with
+  no `session_id`, or stdin that isn't JSON, it prints nothing and exits 0. This
+  fixes and closes koto#243.
+- **R13. Maintainer procedures.** Maintainer documentation, in a guide under
+  `docs/guides/`, gives (a) the steps to extend the guard's expectations when
+  koto's file shape changes on purpose, ending with running the R7 command for
+  the file shape, and (b) the steps to confirm the conventions against a new
+  Claude Code release and move the recorded release forward.
+- **R14. Release step.** koto's release procedure gains a step to confirm,
+  before tagging, that the newest scheduled guard run passed and to record the
+  smoke check's outcome for the release being shipped. The step is advisory:
+  it doesn't block a release mechanically.
 
 ### Non-functional
 
-- **R11. No secret on pull requests.** Any check that needs a paid credential
-  or a Claude Code login never runs on pull-request events, and fails with a
-  clear message, rather than passing, when its credential is missing.
-- **R12. Pull-request cost.** Checks that do run on pull requests need no
-  credential and add no more than five minutes to the CI run.
-- **R13. Tool independence.** Neither the guard nor the smoke check requires
-  niwa or any tool outside koto's repository beyond Claude Code itself and
-  standard CI tooling.
-- **R14. Host constraints.** Running the guard locally needs no more than one
-  `cargo` invocation at a time and runs koto with its session environment
-  isolated from the maintainer's real sessions.
+- **R15. No credentials on pull requests.** A job that needs a paid credential
+  or a Claude Code login has neither `pull_request` nor `pull_request_target`
+  among its triggers. Run without its credential, or with the credential set to
+  an empty value, it exits non-zero with a message naming the missing
+  credential.
+- **R16. Pull-request cost.** Guard and hook jobs that run on pull requests
+  reference no secret and finish within five minutes of wall-clock time each on
+  a GitHub-hosted runner, as shown by the job durations in the implementing
+  pull request's CI run.
+- **R17. Tool independence.** The guard and the smoke check don't invoke niwa
+  or read niwa configuration, and pass on a runner where niwa isn't installed.
+- **R18. Host constraints.** The documented local command for the guard runs at
+  most one `cargo` process at a time. Any koto it starts runs with koto's
+  session variables unset and `KOTO_HOME` pointed at a scratch directory, so the
+  maintainer's real sessions aren't read or written.
 
 ## Acceptance Criteria
 
-- [ ] A CI job runs a check whose inputs include material from a published
-      Claude Code release, and that check passes against the recorded release.
-      (R1)
-- [ ] The repository contains a file naming exactly one Claude Code release,
-      and the guard's output states which release it checked. (R2, R5)
-- [ ] Altering the file-shape reference (for example, renaming a field the
-      screen reads) makes the guard fail with a message naming the file shape
-      and the field. (R3, R4, R6)
-- [ ] Altering the directory-convention reference (for example, the
-      `workflows` directory name) makes the guard fail with a message naming
-      the directory convention. (R3, R4, R6)
-- [ ] Altering the session-variable reference (the `CLAUDE_CODE_SESSION_ID`
-      name) makes the guard fail with a message naming the session variable.
-      (R3, R4, R6)
-- [ ] Altering the hook-input reference (for example, removing
-      `transcript_path`) makes the guard fail with a message naming the
-      SessionStart hook input and the field. (R3, R4, R6)
-- [ ] The guard can be pointed at a Claude Code release other than the recorded
-      one by a documented input, and a scheduled or manually triggered run
-      checks the newest published release without a koto commit. (R5)
-- [ ] The implementing pull request shows output from at least one failing run
-      against an altered input and the command a reader runs to reproduce it.
-      (R6)
-- [ ] Documentation for the rendered smoke check gives the command, the
-      prerequisites and the output of one real run, including the Claude Code
-      release it ran against and whether the entry rendered. (R7)
-- [ ] The rendered smoke check reports failure when no koto entry appears in
-      `/workflows`. (R7)
-- [ ] A CI job runs `session-start-workflows.sh` with a payload that has
-      `session_id` and `transcript_path`, once with `jq` on the path and once
-      without, and both outputs parse as JSON and contain the derived
-      workflows directory. (R8)
-- [ ] The same job covers a payload with no `transcript_path` (directory from
-      `cwd`) and one with no `session_id` (no output, exit 0). (R8)
-- [ ] The implementing pull request closes koto#243. (R8)
-- [ ] Maintainer documentation contains a section on extending the guard for a
-      deliberate file-shape change, and a section on confirming a new Claude
-      Code release and moving the recorded release. (R9, R10)
-- [ ] No job that needs a credential has `pull_request` among its triggers, and
-      running it without the credential exits non-zero with a message naming
-      the missing credential. (R11)
-- [ ] The guard's pull-request jobs reference no secret, and the guard's own
-      steps finish in under five minutes on a standard GitHub-hosted runner, as
-      shown by the implementing pull request's CI run. (R12)
-- [ ] The documented local command for the guard runs at most one `cargo`
-      process, and any koto it starts runs with its session variables unset and
-      `KOTO_HOME` pointed at a scratch directory. (R14)
-- [ ] Neither the guard nor the smoke check invokes `niwa` or reads niwa
-      configuration. (R13)
+- [ ] With unaltered inputs, the guard run against the recorded release exits 0
+      and its output names that release. (R1, R2, R5)
+- [ ] Removing the recorded-release file, or replacing its content with
+      `latest`, makes the guard exit non-zero with a message naming the file.
+      (R2)
+- [ ] Renaming a file-shape item the screen reads (for example `workflowName`)
+      in the release evidence makes the guard exit non-zero and print
+      `file shape` and the item's name. (R3, R4, R7)
+- [ ] Renaming the `workflows` directory name in the release evidence makes the
+      guard exit non-zero and print `directory convention` and `workflows`.
+      (R3, R4, R7)
+- [ ] Renaming `CLAUDE_CODE_SESSION_ID` in the release evidence makes the guard
+      exit non-zero and print `session variable` and
+      `CLAUDE_CODE_SESSION_ID`. (R3, R4, R7)
+- [ ] Removing `transcript_path` from the hook-input release evidence makes the
+      guard exit non-zero and print `SessionStart hook input` and
+      `transcript_path`. (R3, R4, R7)
+- [ ] With two conventions altered at once, the guard's output names both.
+      (R3)
+- [ ] Run with an explicit version string, the guard checks that release and
+      its output names it. (R5)
+- [ ] Run with a version string that isn't published (for example `0.0.0`), the
+      guard exits non-zero with a could-not-obtain message that names no
+      convention. (R5)
+- [ ] A workflow file in `.github/workflows/` runs the guard on a `schedule`
+      trigger at least weekly, against the newest published release. (R6)
+- [ ] The implementing pull request's description includes the four R7
+      commands and the output of each failing run. (R7)
+- [ ] Adding a new screen-read field to the shape fixture without adding a
+      matching expectation makes the guard exit non-zero, naming the field.
+      (R8)
+- [ ] `tests/native_workflows_shape.rs` still passes, and its header no longer
+      calls it the future Claude Code guard. (R9)
+- [ ] With `CLAUDE_CODE_DISABLE_WORKFLOWS=1` set, the smoke check reports
+      *unavailable* with its own exit status, not *not rendered*. (R10)
+- [ ] Run with no koto entry in the session's workflows directory, the smoke
+      check reports *not rendered*. (R10)
+- [ ] The smoke check's documentation contains its command, its prerequisites
+      and the output of one real run, including the Claude Code release and the
+      outcome. (R10, R11)
+- [ ] The hook CI job passes these payloads, with and without `jq`: a normal
+      `session_id` and `transcript_path`; a `transcript_path` whose directory
+      contains `"`, `\` and a space; an empty `transcript_path` with `cwd`; no
+      `session_id`; and stdin that isn't JSON. Every non-empty output parses as
+      JSON. (R12)
+- [ ] On the current `session-start-workflows.sh`, the no-`jq` run of the
+      quote-and-backslash payload fails the job. (R12)
+- [ ] The implementing pull request closes koto#243. (R12)
+- [ ] A guide under `docs/guides/` has a section for each of the two procedures
+      in R13, and the file-shape procedure ends with the R7 file-shape command.
+      (R13)
+- [ ] koto's release procedure documentation contains the R14 step. (R14)
+- [ ] No workflow job that reads a credential has `pull_request` or
+      `pull_request_target` among its triggers. (R15)
+- [ ] The credentialed job's script, run with its credential unset and again
+      with it set to an empty string, exits non-zero both times with a message
+      naming the credential. (R15)
+- [ ] The pull-request guard and hook jobs reference no `secrets.` value, and
+      each job's duration in the implementing pull request's CI run is under
+      five minutes. (R16)
+- [ ] The guard's and the smoke check's scripts and workflow files contain no
+      reference to `niwa`, and the guard passes on a GitHub-hosted runner with
+      no niwa installed. (R17)
+- [ ] The documented local guard command starts at most one `cargo` process,
+      and every koto it starts has `KOTO_HOME` set to a scratch directory and
+      `KOTO_SESSION_ID`, `KOTO_SESSIONS_BASE` and `KOTO_ANCHOR` unset. (R18)
 
 ## Out of Scope
 
@@ -232,25 +292,30 @@ maintainer hears about it after the break has shipped.
   recorded, not fixed here.
 - **Registering `session-start-workflows.sh`** in the plugin's `hooks.json`.
   The script stays opt-in; this work tests it, it doesn't turn it on.
+- **Platforms beyond a GitHub-hosted Linux runner** for the CI guard, and
+  beyond the maintainer's own machine for the smoke check.
 - **Any coupling to niwa**, in either direction.
 
 ## Known Limitations
 
 - **A lenient reader.** Claude Code fills in defaults for missing fields and
-  drops unparseable files silently. A static check can confirm that the names
-  koto relies on are still there; it can't prove the screen still draws them
-  the way it did. Only the rendered smoke check gets close to that, and it
-  isn't a pull-request check.
+  drops unparseable files silently. A static convention check can confirm that
+  the names koto relies on are still there; it can't prove the screen still
+  draws them the way it did. Only the rendered smoke check gets close to that,
+  and it isn't a pull-request check.
 - **No headless list.** Claude Code 2.1.316 has no non-interactive command
   that lists workflows, so the rendered smoke check needs a terminal session
   and a real login. That's why it can't run on every pull request.
 - **Feature gating.** `/workflows` can be disabled by setting, environment
-  variable or account policy. A smoke check run under an account where it's off
-  fails for a reason unrelated to koto, and its output should make that
-  distinguishable.
+  variable or account policy. R10's *unavailable* outcome keeps that from
+  reading as a koto failure, but it also means a run under such an account
+  says nothing about koto.
 - **Things the guard will see but koto doesn't handle.** Claude Code 2.1.316
   can send an empty `transcript_path` in some storage modes, and it resets
-  `CLAUDE_CODE_SESSION_ID` on `/clear`. Neither is in scope to fix here.
+  `CLAUDE_CODE_SESSION_ID` on `/clear`. Neither is in scope to fix here; R12
+  only requires the hook to stay well-formed when `transcript_path` is empty.
+- **A weekly window.** A Claude Code release that breaks a convention can reach
+  operators in the days before the next scheduled run.
 
 ## Decisions and Trade-offs
 
@@ -258,17 +323,24 @@ maintainer hears about it after the break has shipped.
   string literals in the Claude Code release itself, which can be fetched
   without credentials, while seeing the actual render needs a terminal and a
   login. The requirements therefore split a credential-free guard that can run
-  often (R1 to R6, R12) from a rendered smoke check that runs with credentials
-  and off pull requests (R7, R11). A single live check on every pull request
+  often (R1 to R8, R16) from a rendered smoke check that runs with credentials
+  and off pull requests (R10, R15). A single live check on every pull request
   was rejected for cost, secrets exposure on fork pull requests, and
   flakiness.
+- **A schedule, not only pull requests.** Claude Code changes without a koto
+  commit, so a guard that runs only on koto's pull requests would see a new
+  release late or never. R6 adds a weekly run against the newest release.
 - **koto#243 is in.** The hook script is how koto receives the SessionStart
   input and the directory, so it is part of the session-input convention the
   guard covers. Testing it without fixing the invalid-JSON fallback would leave
   a known failure in the path the guard is meant to protect.
-- **Run against newer releases, not only the recorded one.** Checking only the
-  recorded release would pass forever, like the fixture it replaces. R5 makes
-  a new Claude Code release something the guard looks at before a koto release.
+- **The old shape test stays.** It still catches koto changing its own output
+  by accident, which the new guard doesn't; R9 keeps it and stops calling it
+  the Claude Code guard.
+- **The release step is advisory.** A hard gate would block a koto release on a
+  Claude Code outage or an account that can't see `/workflows`. R14 makes the
+  check part of the procedure without making it mechanical.
 - **The guard's form and the smoke check's location are left to the design.**
-  The brief deferred them; the requirements above constrain them (no secret on
-  pull requests, named failures, a demonstrated failing run) without choosing.
+  The brief deferred them; the requirements above constrain them (no
+  credentials on pull requests, named failures, a demonstrated failing run, a
+  schedule) without choosing.
