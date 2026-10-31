@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 upstream: docs/briefs/BRIEF-native-workflows-ci-guard.md
 problem: |
   koto's native `/workflows` rendering depends on four Claude Code conventions
@@ -24,7 +24,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 Requirements for the hardening step of koto's native `/workflows` rendering,
 written from the Accepted `BRIEF-native-workflows-ci-guard`. The two questions
