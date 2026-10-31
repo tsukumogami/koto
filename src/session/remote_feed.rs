@@ -26,7 +26,7 @@
 //! asks every failed request again on its own, a second later, unless the
 //! process has called `s3::set_retries(0)`. That setting is process-wide,
 //! with no per-bucket form, and the reader can't set it: `koto dashboard`
-//! does ([`crate::cli::dashboard::run`]). Only with it does a bucket that
+//! does, in its `run` in `src/cli/dashboard.rs`. Only with it does a bucket that
 //! never answers cost a pass one request timeout; without it, each ask is
 //! two requests and a timeout costs two.
 
