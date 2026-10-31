@@ -114,8 +114,8 @@ failed if it weren't.
 - A rendered smoke check against a real Claude Code that reports whether a
   koto-written entry renders, with instructions for running it and one recorded
   result.
-- Test coverage for the SessionStart hook script that derives the workflows
-  directory, including its no-`jq` path (koto#243).
+- Test coverage for the session-start hook that derives the workflows
+  directory, including its fallback on hosts that lack a JSON tool (koto#243).
 - A written procedure for extending the guard's fixture when koto's file shape
   changes on purpose.
 
