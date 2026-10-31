@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Runs a command with no koto session store variable in its environment:
-# KOTO_SESSIONS_BASE and every KOTO_SESSION_* variable.
+# Runs a command with none of koto's session, anchor or authority variables
+# in its environment: KOTO_SESSIONS_BASE, every KOTO_SESSION_* variable,
+# KOTO_ANCHOR, KOTO_DISPATCHER_ANCHOR and KOTO_AUTHORITY. That is the
+# environment hosted CI gives a suite.
 #
 # Every command in .claude/shirabe-extensions/verification-map.json runs
 # through this script. The koto driving a /work-on run sets
 # KOTO_SESSIONS_BASE on every command its gate starts, and passes on the
 # KOTO_SESSION_* values that chose its backend, so a suite started there
-# would otherwise run against that run's store.
+# would otherwise run against that run's store. A session started through
+# a workspace manager can also export the anchor variables, and a test that
+# inherits them reads the caller's anchor instead of its own fixture.
 #
 #   without-session-env.sh <command> [<arg>...]
 #       removes the variables, then runs --check on the result.
@@ -36,7 +40,9 @@ session_names() {
   fi
   while IFS= read -r -d '' entry; do
     case "${entry%%=*}" in
-      KOTO_SESSIONS_BASE | KOTO_SESSION_*) printf '%s\n' "${entry%%=*}" ;;
+      KOTO_SESSIONS_BASE | KOTO_SESSION_* | KOTO_ANCHOR | KOTO_DISPATCHER_ANCHOR | KOTO_AUTHORITY)
+        printf '%s\n' "${entry%%=*}"
+        ;;
     esac
   done <"$listing"
   rm -f "$listing"

@@ -15,9 +15,10 @@ together.** The JSON carries only the commands PR CI runs, plus the decider puri
 source changes. It has no entry for `.github/**`, `scripts/**`, `test/functional/**`,
 `.tsuku-recipes/**` or `benches/**`-only checks, so a change confined to those paths falls to its
 default list and passes the gate without the checks this file names for them: run those by hand.
-Each JSON command runs through `scripts/without-session-env.sh`, which removes `KOTO_SESSIONS_BASE`
-and every `KOTO_SESSION_*` variable and refuses to start the command while any is still set, since
-the koto driving the gate sets them; the commands below are listed without it.
+Each JSON command runs through `scripts/without-session-env.sh`, which removes `KOTO_SESSIONS_BASE`,
+every `KOTO_SESSION_*` variable, `KOTO_ANCHOR`, `KOTO_DISPATCHER_ANCHOR` and `KOTO_AUTHORITY` and
+refuses to start the command while any is still set, since the koto driving the gate or the session
+around it can set them; the commands below are listed without it.
 
 ## Verification map
 
