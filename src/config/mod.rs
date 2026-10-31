@@ -765,6 +765,15 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
             let decider_table = decider.as_table_mut().ok_or("decider is not a table")?;
             decider_table.insert(field.to_string(), toml_value);
         }
+        "machine.name" => {
+            crate::session::version::validate_machine_name(value)
+                .map_err(|rule| format!("invalid machine.name: {}", rule))?;
+            let machine = table
+                .entry("machine")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let machine_table = machine.as_table_mut().ok_or("machine is not a table")?;
+            machine_table.insert("name".to_string(), toml::Value::String(value.to_string()));
+        }
         _ => return Err(format!("unknown config key: {}", key)),
     }
     Ok(())
@@ -875,6 +884,14 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
+        "machine.name" => {
+            if let Some(machine) = table.get_mut("machine") {
+                if let Some(t) = machine.as_table_mut() {
+                    return Ok(t.remove("name").is_some());
+                }
+            }
+            Ok(false)
+        }
         _ => Err(format!("unknown config key: {}", key)),
     }
 }
@@ -911,6 +928,7 @@ pub const ALL_KEYS: &[&str] = &[
     "decider.api_key",
     "decider.endpoint",
     "decider.timeout_ms",
+    "machine.name",
 ];
 
 /// Produce a redacted copy of the config for display.
@@ -1344,6 +1362,26 @@ mod tests {
         }
         let cfg: KotoConfig = doc.try_into().unwrap();
         assert_eq!(cfg.run_journal, RunJournalConfig::default());
+    }
+
+    #[test]
+    fn test_machine_name_set_validates_and_keeps_machine_id() {
+        assert!(ALL_KEYS.contains(&"machine.name"));
+        let mut doc: toml::Value = toml::from_str("[machine]\nid = \"abc\"\n").unwrap();
+        let long = "a".repeat(64);
+        set_value_in_toml(&mut doc, "machine.name", &long).unwrap();
+        assert_eq!(doc["machine"]["name"].as_str(), Some(long.as_str()));
+        assert_eq!(doc["machine"]["id"].as_str(), Some("abc"));
+        let before = doc.clone();
+        for bad in [&"a".repeat(65), "unknown", "", "bad name!"] {
+            let err = set_value_in_toml(&mut doc, "machine.name", bad).unwrap_err();
+            assert!(err.contains("machine.name"), "{err}");
+            assert_eq!(doc, before, "{bad}");
+        }
+        assert!(unset_value_in_toml(&mut doc, "machine.name").unwrap());
+        assert!(!unset_value_in_toml(&mut doc, "machine.name").unwrap());
+        assert_eq!(doc["machine"]["id"].as_str(), Some("abc"));
+        assert!(crate::config::validate::validate_project_key("machine.name").is_err());
     }
 
     #[test]
