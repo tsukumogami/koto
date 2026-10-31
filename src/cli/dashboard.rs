@@ -103,11 +103,13 @@ fn format_elapsed(secs: u64) -> String {
 ///
 /// Sets each local row's `workspace` to its copy's prefix. A session this
 /// machine holds a copy of is left to its local row (matched by
-/// `session_id`), and the state-less placeholder the cloud listing adds for
-/// a session found only under this directory's own prefix is dropped when
-/// the pass read that session, so it shows once, from its summary. A failed
-/// pass leaves the local rows standing and says why on stderr; summaries
-/// that couldn't be read join the unreadable tally.
+/// `session_id`, or by workspace and name when its summary can't be read),
+/// a migrated source whose copy is listed or held here is hidden, and the
+/// state-less placeholder the cloud listing adds for a session found only
+/// under this directory's own prefix is dropped when the pass listed that
+/// session, so it shows once, from the pass. A failed pass leaves the local
+/// rows standing and says why on stderr; rows listed as unknown and hidden
+/// sources are counted in the tree for the stderr notes.
 ///
 /// [`RemoteReader::scan`]: crate::session::remote_feed::RemoteReader::scan
 fn once_remote_rows(
@@ -117,7 +119,6 @@ fn once_remote_rows(
     use crate::session::remote_feed::RemoteReader;
 
     let own = cloud.workspace_prefix().to_string();
-    let mut local_ids = std::collections::HashSet::new();
     let mut placeholders = std::collections::HashSet::new();
     for (name, session) in tree.sessions.iter_mut() {
         session.workspace = Some(
@@ -126,17 +127,16 @@ fn once_remote_rows(
                 .map(|home| home.prefix)
                 .unwrap_or_else(|_| own.clone()),
         );
-        if session.state_path.exists() {
-            if !session.header.session_id.is_empty() {
-                local_ids.insert(session.header.session_id.clone());
-            }
-        } else {
+        if !session.state_path.exists() {
             placeholders.insert(name.clone());
         }
     }
 
     let snapshot = match RemoteReader::new(&cloud.bucket_handle()) {
-        Ok(reader) => reader.scan(&local_ids),
+        // A placeholder has no local state file: it isn't a local copy.
+        Ok(reader) => reader.scan(&dashboard_data::local_view_of(tree, |name| {
+            !placeholders.contains(name)
+        })),
         Err(e) => {
             eprintln!("note: other machines' sessions weren't read: {e}");
             return Vec::new();
@@ -145,22 +145,18 @@ fn once_remote_rows(
     if let Some(failure) = &snapshot.failure {
         eprintln!("note: other machines' sessions weren't all read: {failure}");
     }
-    tree.unreadable += snapshot.unreadable;
+    tree.remote_unreadable = snapshot.unreadable;
+    tree.remote_hidden = snapshot.hidden_sources;
 
     for row in &snapshot.rows {
-        if row.workspace == own && placeholders.contains(&row.summary.name) {
-            tree.sessions.remove(&row.summary.name);
+        if row.workspace == own && placeholders.contains(&row.name) {
+            tree.sessions.remove(&row.name);
         }
     }
     snapshot
         .rows
         .iter()
-        .map(|row| {
-            (
-                row.summary.name.clone(),
-                dashboard_data::remote_session(row),
-            )
-        })
+        .map(|row| (row.name.clone(), dashboard_data::remote_session(row)))
         .collect()
 }
 
@@ -240,8 +236,22 @@ fn run_once(
 
     // Surface unparseable sessions as a trailing note on stderr so the
     // tab-separated stdout contract stays clean for positional readers.
-    if tree.unreadable > 0 {
-        eprintln!("note: {} unreadable session(s) skipped", tree.unreadable);
+    // Other machines' sessions without a readable, current summary are
+    // listed as unknown rather than skipped, and join the same tally.
+    let unreadable = tree.unreadable + tree.remote_unreadable;
+    if tree.remote_unreadable > 0 {
+        eprintln!(
+            "note: {} unreadable session(s), {} listed as unknown",
+            unreadable, tree.remote_unreadable
+        );
+    } else if unreadable > 0 {
+        eprintln!("note: {} unreadable session(s) skipped", unreadable);
+    }
+    if tree.remote_hidden > 0 {
+        eprintln!(
+            "note: {} hidden source(s): imported into a copy that is listed",
+            tree.remote_hidden
+        );
     }
 }
 
@@ -515,7 +525,7 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
     let feed = match &*backend {
         Backend::Cloud(cloud) => match RemoteFeed::spawn(
             &cloud.bucket_handle(),
-            dashboard_data::local_session_ids(&state.tree),
+            dashboard_data::local_view(&state.tree),
             RESCAN_INTERVAL,
         ) {
             Ok(feed) => Some(feed),
@@ -653,10 +663,10 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         }
 
         // The feed hands over complete snapshots; the remote rows are
-        // replaced whole, never patched.
+        // replaced whole, never patched, except a failed listing's, which
+        // stay as they were.
         if let Some(snapshot) = sources.feed.as_ref().and_then(RemoteFeed::latest) {
-            dashboard_data::replace_remote_rows(&mut state.tree, &snapshot.rows);
-            state.tree.remote_unreadable = snapshot.unreadable;
+            dashboard_data::apply_snapshot(&mut state.tree, &snapshot);
             state.clamp_cursor();
         }
 
@@ -686,7 +696,7 @@ fn refresh_local_rows(state: &mut DashboardAppState, sources: &mut LoopSources) 
     (sources.refresh_local)(&mut state.tree)?;
     state.clamp_cursor();
     if let Some(feed) = &sources.feed {
-        feed.set_local_ids(dashboard_data::local_session_ids(&state.tree));
+        feed.set_local(dashboard_data::local_view(&state.tree));
     }
     Ok(())
 }
@@ -938,6 +948,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 

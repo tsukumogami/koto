@@ -451,7 +451,7 @@ fn tui_lists_other_machines_blocked_session_marked_with_its_machine() {
     let (store, tree) = local_rows(&b);
     let feed = RemoteFeed::spawn(
         &bucket_at(&s3.endpoint()),
-        dashboard_data::local_session_ids(&tree),
+        dashboard_data::local_view(&tree),
         RESCAN_INTERVAL,
     )
     .unwrap();
@@ -593,12 +593,8 @@ fn tui_frame_after_a_key_press_arrives_within_200ms_when_the_bucket_never_answer
     let (store, tree) = local_rows(&b);
     assert_eq!(tree.sessions.len(), 1);
     let bucket = bucket_at(&endpoint);
-    let feed = RemoteFeed::spawn(
-        &bucket,
-        dashboard_data::local_session_ids(&tree),
-        RESCAN_INTERVAL,
-    )
-    .unwrap();
+    let feed =
+        RemoteFeed::spawn(&bucket, dashboard_data::local_view(&tree), RESCAN_INTERVAL).unwrap();
     // The Session tab's reads go to the dead endpoint too.
     let cloud = koto::session::cloud::CloudBackend::with_parts(
         LocalBackend::with_base_dir(b.sessions()),
@@ -684,4 +680,473 @@ fn tui_frame_after_a_key_press_arrives_within_200ms_when_the_bucket_never_answer
         "the Session tab: {text}"
     );
     assert!(text.contains("check"), "local row drawn: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// Removed, imported, older-release and same-named sessions on machine B.
+// ---------------------------------------------------------------------------
+
+/// A template whose one state takes evidence and moves to its terminal
+/// state, so a session can be stopped and imported.
+const WORK: &str = r#"---
+name: cross-work
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done]
+    transitions:
+      - target: done
+        when:
+          marker: done
+  done:
+    terminal: true
+---
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#;
+
+/// The retention settings an import of a just-stopped session needs.
+const RETENTION: &[(&str, &str)] = &[
+    ("KOTO_RETENTION_KEEP", "1s"),
+    ("KOTO_RETENTION_IDLE_PERIOD", "1h"),
+    ("KOTO_RETENTION_STALE_AFTER", "2h"),
+];
+
+impl Machine {
+    /// `ok`, with `env` added to the machine's environment.
+    fn ok_env(&self, args: &[&str], env: &[(&str, &str)]) -> Out {
+        let mut cmd = self.cmd(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let o = cmd.output().unwrap();
+        let out = Out {
+            code: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        };
+        assert_eq!(out.code, Some(0), "koto {:?}: {}", args, out.describe());
+        out
+    }
+}
+
+/// The bucket key of `file` in session `name` under `workspace`.
+fn key_of(workspace: &str, name: &str, file: &str) -> String {
+    format!("{workspace}/{name}/{file}")
+}
+
+fn state_key(workspace: &str, name: &str) -> String {
+    key_of(workspace, name, &format!("koto-{name}.state.jsonl"))
+}
+
+/// Every row named `name`.
+fn rows_named<'a>(rows: &'a [Vec<String>], name: &str) -> Vec<&'a Vec<String>> {
+    rows.iter().filter(|r| r[0] == name).collect()
+}
+
+/// The dashboard read the bucket and nothing else: listings and GETs only,
+/// every GET of a `summary.json` or `migrated.json`, and no request for a
+/// key, or a listing of a prefix, under any `ctx/`.
+fn assert_read_only(s3: &FakeS3) {
+    let requests = s3.requests();
+    assert!(!requests.is_empty(), "the bucket was read");
+    for r in &requests {
+        assert_eq!(r.method, "GET", "only listings and GETs: {r:?}");
+        assert!(!r.key.contains("ctx/"), "nothing under ctx/: {r:?}");
+        match &r.list_prefix {
+            Some(prefix) => assert!(!prefix.contains("ctx/"), "no ctx/ listing: {r:?}"),
+            None => assert!(
+                r.key.ends_with("/summary.json") || r.key.ends_with("/migrated.json"),
+                "only summaries and markers are fetched: {r:?}"
+            ),
+        }
+    }
+}
+
+/// B's `--once` with `args` appended, its request log checked read-only.
+fn once_on(s3: &FakeS3, b: &Machine, args: &[&str]) -> Out {
+    s3.clear_requests();
+    let mut all = vec!["dashboard", "--once"];
+    all.extend_from_slice(args);
+    let out = b.ok(&all);
+    assert_read_only(s3);
+    out
+}
+
+/// Draw B's interactive dashboard in process, its feed rescanning every
+/// 200 ms, and call `step` with each frame's lines until it returns true.
+/// Panics after 60 s.
+fn drive_tui(
+    s3: &FakeS3,
+    b: &Machine,
+    step: &mut dyn FnMut(&[String], &DashboardAppState) -> bool,
+) {
+    let (store, tree) = local_rows(b);
+    let feed = RemoteFeed::spawn(
+        &bucket_at(&s3.endpoint()),
+        dashboard_data::local_view(&tree),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let mut state = DashboardAppState::new(500);
+    state.tree = tree;
+    let mut sources = LoopSources {
+        refresh_local: Box::new(move |tree| dashboard_data::refresh(tree, &store)),
+        feed: Some(feed),
+        sessions: None,
+    };
+    let shutdown = AtomicBool::new(false);
+    let started = Instant::now();
+    let mut done = false;
+    let mut last: (Vec<String>, Vec<String>, usize, usize) = Default::default();
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    run_loop(
+        &mut terminal,
+        &mut state,
+        &mut sources,
+        &mut NoInput,
+        &SystemClock,
+        &shutdown,
+        &mut |_, buffer, state| {
+            let lines = buffer_lines(buffer);
+            if step(&lines, state) {
+                done = true;
+                shutdown.store(true, Ordering::SeqCst);
+            } else if started.elapsed() > Duration::from_secs(60) {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            let mut keys: Vec<String> = state.tree.sessions.keys().cloned().collect();
+            keys.sort();
+            last = (
+                lines,
+                keys,
+                state.tree.remote_unreadable,
+                state.tree.remote_hidden,
+            );
+        },
+    )
+    .unwrap();
+    assert!(
+        done,
+        "the TUI reached every step within 60 s; last frame, rows, unreadable \
+         and hidden: {last:#?}"
+    );
+}
+
+/// After `koto session cleanup` on A, B's `--once --all` no longer prints the
+/// session and B's running TUI drops its row on a later snapshot. A session
+/// directory holding a summary but no state file prints nothing.
+#[test]
+fn a_removed_session_drops_from_once_and_the_tui() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    let summary = s3.object(&key_of(&ws, WF, "summary.json")).unwrap();
+    s3.put(&key_of(&ws, "orphan", "summary.json"), &summary);
+
+    let rows = once_on(&s3, &b, &["--all"]).rows();
+    assert!(row_of(&rows, WF, &ws).is_some(), "{rows:?}");
+    assert!(rows_named(&rows, "orphan").is_empty(), "{rows:?}");
+
+    let remote = dashboard_data::remote_key(WF, &ws);
+    let mut cleaned = false;
+    drive_tui(&s3, &b, &mut |_, state| {
+        let shown = state.tree.sessions.contains_key(&remote);
+        if !cleaned && shown {
+            a.ok(&["session", "cleanup", WF]);
+            assert!(s3.keys_under(&format!("{ws}/{WF}/")).is_empty());
+            cleaned = true;
+        }
+        cleaned && !shown
+    });
+
+    let rows = once_on(&s3, &b, &["--all"]).rows();
+    assert!(rows_named(&rows, WF).is_empty(), "{rows:?}");
+    assert!(rows_named(&rows, "orphan").is_empty(), "{rows:?}");
+}
+
+/// A failed listing is never read as a removal: the TUI keeps A's row and
+/// shows the failure on one status line, keeps every remote row when the
+/// top-level listing fails, and drops the row once the listing answers and
+/// the session is gone.
+#[test]
+fn a_failed_listing_keeps_remote_rows_and_shows_one_status_line() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    let remote = dashboard_data::remote_key(WF, &ws);
+    let status = |lines: &[String]| -> usize {
+        lines
+            .iter()
+            .filter(|l| l.contains("\u{26a0} bucket:"))
+            .count()
+    };
+    let mut phase = 0;
+    drive_tui(&s3, &b, &mut |lines, state| {
+        let shown = state.tree.sessions.contains_key(&remote);
+        let failure = state.tree.remote_failure.clone().unwrap_or_default();
+        match phase {
+            0 if shown => {
+                assert_eq!(status(lines), 0, "{lines:#?}");
+                s3.fail("LIST", &format!("{ws}/"), 403);
+                phase = 1;
+            }
+            1 if !failure.is_empty() => {
+                assert!(shown, "A's row stays while its listing fails");
+                assert_eq!(status(lines), 1, "{lines:#?}");
+                assert!(lines.iter().any(|l| l.contains("@machine-a")), "{lines:#?}");
+                s3.clear_faults();
+                s3.fail("LIST", "", 403);
+                phase = 2;
+            }
+            2 if failure.contains("workspace prefixes") => {
+                assert!(shown, "every remote row stays");
+                assert_eq!(status(lines), 1, "{lines:#?}");
+                s3.clear_faults();
+                a.ok(&["session", "cleanup", WF]);
+                phase = 3;
+            }
+            3 if !shown && failure.is_empty() => {
+                assert_eq!(status(lines), 0, "{lines:#?}");
+                return true;
+            }
+            _ => {}
+        }
+        false
+    });
+}
+
+/// After `koto session import` of A's session on B, B lists the copy once,
+/// as its local row, never the source, and counts one hidden source on
+/// stderr and on the TUI's tally line.
+#[test]
+fn an_imported_source_is_hidden_and_counted() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Machine::new(&s3, "machine-a");
+    let b = Machine::new(&s3, "machine-b");
+    std::fs::write(a.dir.join("work.md"), WORK).unwrap();
+    std::fs::write(b.dir.join("work.md"), WORK).unwrap();
+    a.ok(&["init", "imp", "--template", "work.md"]);
+    a.ok_env(
+        &[
+            "next",
+            "imp",
+            "--with-data",
+            r#"{"marker":"done"}"#,
+            "--no-cleanup",
+        ],
+        RETENTION,
+    );
+    b.ok(&["template", "compile", "work.md"]);
+    // Wait out the one-second retention.
+    std::thread::sleep(Duration::from_millis(1300));
+    let from = a.dir.to_string_lossy().into_owned();
+    b.ok_env(&["session", "import", "imp", "--from", &from], RETENTION);
+    let (wa, wb) = (a.workspace(), b.workspace());
+    assert!(s3.object(&key_of(&wa, "imp", "migrated.json")).is_some());
+    assert!(
+        s3.object(&state_key(&wa, "imp")).is_some(),
+        "the source stays"
+    );
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let imp = rows_named(&rows, "imp");
+    assert_eq!(imp.len(), 1, "the copy once: {rows:?}");
+    assert_eq!(imp[0][8], "machine-b", "{rows:?}");
+    assert_eq!(imp[0][9], wb, "{rows:?}");
+    let hidden: Vec<_> = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("hidden source(s)"))
+        .collect();
+    assert_eq!(hidden.len(), 1, "{}", out.stderr);
+    assert!(
+        hidden[0].contains("note: 1 hidden source(s)"),
+        "{}",
+        out.stderr
+    );
+
+    let source = dashboard_data::remote_key("imp", &wa);
+    drive_tui(&s3, &b, &mut |lines, state| {
+        state.tree.remote_hidden == 1
+            && lines.iter().any(|l| l.contains("1 hidden source(s)"))
+            && !state.tree.sessions.contains_key(&source)
+    });
+}
+
+/// A source whose `migrated.json` names a copy that isn't in the bucket,
+/// and that no local import names, is listed from its own summary.
+#[test]
+fn a_marker_naming_an_absent_copy_lists_the_source() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    s3.put(
+        &key_of(&ws, WF, "migrated.json"),
+        br#"{"schema":1,"target":{"session":"gone","session_id":"x","workspace":"/nowhere","prefix":"0000000000000000"},"machine_id":"m","migrated_at":"2026-10-31T00:00:00Z"}"#,
+    );
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let row = row_of(&rows, WF, &ws).unwrap_or_else(|| panic!("listed: {rows:?}"));
+    assert_eq!(row[1], "check");
+    assert_eq!(row[3], "blocked");
+    assert!(!out.stderr.contains("hidden source"), "{}", out.stderr);
+    let marker = key_of(&ws, WF, "migrated.json");
+    assert!(
+        s3.requests().iter().any(|r| r.key == marker),
+        "the marker was read"
+    );
+}
+
+/// A session pushed with no `summary.json` beside its state file, and one
+/// whose summary is truncated mid-record, list as `unknown` with only the
+/// listing's facts, are counted as unreadable, and read `@unknown` in the
+/// TUI.
+#[test]
+fn a_session_without_a_readable_summary_lists_unknown() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    a.start_blocked("legacy");
+    a.start_blocked("trunc");
+    s3.remove(&key_of(&ws, "legacy", "summary.json"));
+    let summary = s3.object(&key_of(&ws, "trunc", "summary.json")).unwrap();
+    s3.put(
+        &key_of(&ws, "trunc", "summary.json"),
+        &summary[..summary.len() / 2],
+    );
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    for name in ["legacy", "trunc"] {
+        let row = row_of(&rows, name, &ws).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(row.len(), 10, "{row:?}");
+        assert_eq!(row[3], "unknown", "{row:?}");
+        for (i, column) in [
+            (1, "current_state"),
+            (4, "intent"),
+            (5, "template"),
+            (8, "machine"),
+        ] {
+            assert_eq!(row[i], "", "{name}'s {column} is empty: {row:?}");
+        }
+    }
+    assert_eq!(row_of(&rows, WF, &ws).unwrap()[3], "blocked");
+    assert!(
+        out.stderr
+            .contains("note: 2 unreadable session(s), 2 listed as unknown"),
+        "{}",
+        out.stderr
+    );
+
+    drive_tui(&s3, &b, &mut |lines, state| {
+        state.tree.remote_unreadable == 2
+            && ["legacy", "trunc"].iter().all(|name| {
+                lines
+                    .iter()
+                    .any(|l| l.contains(name) && l.contains("@unknown"))
+            })
+            && lines.iter().any(|l| l.contains("2 unreadable session(s)"))
+    });
+}
+
+/// A summary whose `state_etag` isn't the listed state file's ETag reads as
+/// `unknown` once the state file is more than 60 seconds old, and from the
+/// summary inside that window.
+#[test]
+fn a_stale_summary_reads_unknown_only_past_60_seconds() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    a.start_blocked("stale");
+    a.start_blocked("fresh");
+    let now = std::time::SystemTime::now();
+    for (name, age) in [("stale", 120), ("fresh", 10)] {
+        // An older release's push: the state changes, the summary doesn't.
+        let key = state_key(&ws, name);
+        let mut state = s3.object(&key).unwrap();
+        state.extend_from_slice(b"\n");
+        s3.put(&key, &state);
+        s3.set_last_modified(&key, now - Duration::from_secs(age));
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let stale = row_of(&rows, "stale", &ws).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!((stale[1].as_str(), stale[3].as_str()), ("", "unknown"));
+    let fresh = row_of(&rows, "fresh", &ws).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!((fresh[1].as_str(), fresh[3].as_str()), ("check", "blocked"));
+    assert!(
+        out.stderr
+            .contains("note: 1 unreadable session(s), 1 listed as unknown"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// A session B holds a local copy of shows once, as its local row, even when
+/// its bucket copy has no summary; a no-summary `review` under A's prefix
+/// still prints beside B's own `review`.
+#[test]
+fn a_local_copy_without_a_summary_shows_once_beside_a_remote_namesake() {
+    let (s3, a, b) = two_machines();
+    let (wa, wb) = (a.workspace(), b.workspace());
+    b.start_blocked("mine");
+    s3.remove(&key_of(&wb, "mine", "summary.json"));
+    a.start_blocked("review");
+    s3.remove(&key_of(&wa, "review", "summary.json"));
+    b.start_blocked("review");
+
+    let rows = once_on(&s3, &b, &["--all"]).rows();
+    let mine = rows_named(&rows, "mine");
+    assert_eq!(mine.len(), 1, "{rows:?}");
+    assert_eq!(
+        (
+            mine[0][3].as_str(),
+            mine[0][8].as_str(),
+            mine[0][9].as_str()
+        ),
+        ("blocked", "machine-b", wb.as_str())
+    );
+    assert_eq!(rows_named(&rows, "review").len(), 2, "{rows:?}");
+    let ours = row_of(&rows, "review", &wb).unwrap();
+    assert_eq!(
+        (ours[3].as_str(), ours[8].as_str()),
+        ("blocked", "machine-b")
+    );
+    let theirs = row_of(&rows, "review", &wa).unwrap();
+    assert_eq!((theirs[3].as_str(), theirs[8].as_str()), ("unknown", ""));
+}
+
+/// With sessions named `review` on A and on B, B's `--once review` prints
+/// both, each with its own machine and workspace.
+#[test]
+fn once_by_name_prints_both_machines_same_named_sessions() {
+    let (s3, a, b) = two_machines();
+    a.start_blocked("review");
+    b.start_blocked("review");
+    let rows = once_on(&s3, &b, &["review"]).rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let mut seen: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            assert_eq!((r.len(), r[0].as_str()), (10, "review"), "{r:?}");
+            (r[8].clone(), r[9].clone())
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("machine-a".to_string(), a.workspace()),
+            ("machine-b".to_string(), b.workspace()),
+        ]
+    );
 }

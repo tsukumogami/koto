@@ -931,6 +931,7 @@ mod tests {
             machine: None,
             workspace: None,
             remote: false,
+            imported_from: None,
         }
     }
 

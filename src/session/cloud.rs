@@ -6759,10 +6759,16 @@ fn migrated_from_marker(id: &str, bytes: &[u8]) -> SessionMigrated {
 /// that doesn't parse, or a field that is missing or of another shape,
 /// reads as `unknown`.
 fn marker_target_field(bytes: &[u8], name: &str) -> String {
+    marker_target_str(bytes, name).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The string field `name` of a marker's `target` (`session`, `session_id`,
+/// `workspace` or `prefix`); `None` when the marker doesn't parse or the
+/// field is missing or of another shape.
+pub(crate) fn marker_target_str(bytes: &[u8], name: &str) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
         .and_then(|m| m.get("target")?.get(name)?.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// An in-memory S3 stand-in and the fixtures that point a `CloudBackend` at
