@@ -3189,6 +3189,41 @@ but never listed in `keys` (so `keyCount` can exceed the list length with
 `keysTruncated` still false), and anchor and store strings are sanitized and
 length-capped before they are written.
 
+From contract version 5 (the current version, `koto.contractVersion: 5`) the
+file separates the screen's word from koto's:
+
+- **Top-level `status`** is written in the vocabulary Claude Code 2.1.314
+  knows: `running`, `completed` or `failed`. It never reads `blocked`. That
+  screen counts only `running` under "running" and treats any other word,
+  `blocked` included, as completed, so a gate-blocked session is written
+  `running`.
+- **`koto.status`** carries koto's own classification of the session,
+  `running`, `blocked`, `completed` or `failed`, on every entry. `blocked`
+  means a non-terminal session whose most recent gate evaluation in the
+  current epoch failed, the same predicate the dashboard's `blocked` bucket
+  uses. Read this field, not the top-level `status`, for koto's view.
+- **The active `workflow_agent` step** follows the classification. A running
+  session's step has `state` `progress` and no `blocked` or `error` field. A
+  blocked session's step has `state` `error`, `blocked: true` and
+  `error: "gate <name>: FAIL"`, naming the gate that failed; on 2.1.314 it
+  reads Blocked with that text as its Outcome. A completed session writes
+  every step `done`. A failed session's step has `state` `error`, no `blocked`
+  field, and an `error` of `cancelled at <state>` or `ended at <state>`.
+- **`summary`** is `koto · <workflow> · <state>`, and on a blocked session it
+  ends `· blocked on gate <name>`. A long workflow or state name is what gets
+  cut to keep the line within the fact cap; the suffix stays.
+
+The step's `blocked` and `error` fields are optional and omitted when they
+don't apply. Every string the screen draws that comes from the template or
+the event log (`summary`, `workflowName`, phase `title` and `detail`, step
+`label` and `phaseTitle`, the step's `error`, `promptPreview` and
+`resultPreview`) passes the shared sanitizer, so control and bidi characters
+appear as visible `\u{XXXX}` escapes. A gate name, and the state name in a
+failed step's `error`, is cut at 128 characters with the cut marker. A gate's captured output never reaches the
+file. `koto.workflow` and `koto.currentState` are the exception: they are
+written unescaped, as the session records them. Claude Code 2.1.314 doesn't
+draw them, but a reader of the file must treat them as untrusted text.
+
 ## Lifecycle Metadata Surface
 
 Session-level liveness — whether a session is active, idle, blocked, stalled, failed,

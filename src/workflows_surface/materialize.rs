@@ -21,7 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
 
-use super::contract::{workflow_filename, Phase, ProgressNode, WorkflowFile};
+use super::contract::{
+    cut_escaped, gate_name_display, workflow_filename, Phase, ProgressNode, RenderStatus,
+    WorkflowFile,
+};
 use super::discover;
 use super::project::{self, PhaseEntry, PhaseStatus, StateOutcome};
 
@@ -131,8 +134,14 @@ fn try_materialize(
 
     let target = dir.join(workflow_filename(&proj.session_id));
     let start_time = stable_start_time(&target);
-    let (phases, progress) = build_detail(&enriched.phases);
-    let file = WorkflowFile::new(
+    let active = active_step(
+        proj.status,
+        enriched.blocked_gate.as_deref(),
+        proj.cancelled,
+        proj.current_state.as_deref().unwrap_or(""),
+    );
+    let (phases, progress) = build_detail(&enriched.phases, &active);
+    let mut file = WorkflowFile::new(
         &proj.session_id,
         &proj.workflow,
         proj.display_name.clone(),
@@ -142,69 +151,164 @@ fn try_materialize(
     )
     .with_detail(phases, progress)
     .with_holdings(enriched.holdings.clone());
+    // The summary names the gate even when the template can't be read and
+    // there is no phase list to carry a Blocked step.
+    if let Some(gate) = enriched.blocked_gate.as_deref() {
+        file = file.with_blocked_gate(gate);
+    }
     let bytes = file.to_json_bytes()?;
     atomic_write(&dir, &target, &bytes)
+}
+
+/// The shape of the active phase's `workflow_agent` step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveStep {
+    state: &'static str,
+    blocked: bool,
+    error: String,
+}
+
+/// The active step for a session's classification.
+///
+/// Claude Code 2.1.314 draws a `progress` step on a run that isn't running as
+/// Stopped and counts a phase's `done` steps over all its steps, so the step
+/// follows the classification rather than the phase's position:
+///
+/// - blocked: an `error` flagged `blocked`, drawn Blocked with the failing
+///   gate as its Outcome;
+/// - completed: `done`, so the terminal phase reads 1/1 and nothing reads
+///   Stopped;
+/// - failed: an `error` without the flag, drawn failed, saying it was
+///   cancelled at `state` (`cancelled`) or that it ended at `state`;
+/// - running: `progress`.
+///
+/// `state` is the session's current state; it is cut and escaped like a gate
+/// name before it is joined into the `error` line. An empty `state` (a
+/// session that failed before it entered any state) gives the bare
+/// `cancelled` or `failed`, never a line ending in `at `.
+fn active_step(
+    status: RenderStatus,
+    blocked_gate: Option<&str>,
+    cancelled: bool,
+    state: &str,
+) -> ActiveStep {
+    let step = |state: &'static str, blocked: bool, error: String| ActiveStep {
+        state,
+        blocked,
+        error,
+    };
+    match (status, blocked_gate) {
+        (RenderStatus::Blocked, Some(gate)) => step(
+            "error",
+            true,
+            format!("gate {}: FAIL", gate_name_display(gate)),
+        ),
+        (RenderStatus::Completed, _) => step("done", false, String::new()),
+        // A session cancelled before it entered any state has no name to
+        // give; it reads the bare reason rather than a dangling `at `.
+        (RenderStatus::Failed, _) if state.is_empty() => step(
+            "error",
+            false,
+            if cancelled { "cancelled" } else { "failed" }.to_string(),
+        ),
+        (RenderStatus::Failed, _) => {
+            let how = if cancelled { "cancelled" } else { "ended" };
+            step(
+                "error",
+                false,
+                format!("{how} at {}", gate_name_display(state)),
+            )
+        }
+        _ => step("progress", false, String::new()),
+    }
 }
 
 /// Map the enriched phase list onto the `/workflows` `phases` and
 /// `workflowProgress` fields: one `Phase` per phase, a `workflow_phase` marker
 /// per phase, and a `workflow_agent` step per visited/active phase (carrying
 /// the phase's directive as `promptPreview` and its outcome as `resultPreview`).
-fn build_detail(phases: &[PhaseEntry]) -> (Vec<Phase>, Vec<ProgressNode>) {
+/// The active phase's step takes its shape from `active`.
+///
+/// Every string here comes from the template or the event log and is drawn by
+/// Claude Code's own screen, so each is escaped exactly once on its way in:
+/// the title (a humanized state name) here, the directive in [`preview`], and
+/// the gate name and evidence keys in [`outcome_line`], whose line is already
+/// escaped by the time [`phase_detail`] and [`cap_preview`] cut it.
+fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<ProgressNode>) {
+    use crate::session_view::{sanitize_capped, FACT_CAP};
     let mut out_phases = Vec::with_capacity(phases.len());
     let mut progress = Vec::new();
     let mut step_index: u32 = 0;
 
     for (i, entry) in phases.iter().enumerate() {
         let phase_index = (i + 1) as u32;
+        let title = sanitize_capped(&entry.title, FACT_CAP).into_string();
         out_phases.push(Phase {
-            title: entry.title.clone(),
-            detail: phase_detail(entry),
+            title: title.clone(),
+            detail: phase_detail(entry, active),
         });
         progress.push(ProgressNode::WorkflowPhase {
             index: phase_index,
-            title: entry.title.clone(),
+            title: title.clone(),
         });
         // A step is emitted only for phases the session has entered (done) or
         // is in (active); upcoming phases render as a bare marker.
-        let state = match entry.status {
-            PhaseStatus::Done => "done",
-            PhaseStatus::Active => "progress",
+        let (state, blocked, error) = match entry.status {
+            PhaseStatus::Done => ("done", false, String::new()),
+            PhaseStatus::Active => (active.state, active.blocked, active.error.clone()),
             PhaseStatus::Upcoming => continue,
         };
         step_index += 1;
         progress.push(ProgressNode::WorkflowAgent {
             index: step_index,
-            label: entry.title.clone(),
+            label: title.clone(),
             phase_index,
-            phase_title: entry.title.clone(),
+            phase_title: title,
             state: state.to_string(),
             prompt_preview: preview(&entry.directive),
-            result_preview: preview(&outcome_line(&entry.outcome)),
+            result_preview: cap_preview(&outcome_line(&entry.outcome)),
+            blocked,
+            error,
         });
     }
 
     (out_phases, progress)
 }
 
-/// The subtitle line for a phase in the `phases` array.
-fn phase_detail(entry: &PhaseEntry) -> String {
+/// The subtitle line for a phase in the `phases` array. A phase's own gate or
+/// evidence line wins; with none, the active phase reads what its step says:
+/// `done` on a completed session, the failure line on a failed one, and
+/// `in progress` otherwise.
+///
+/// The outcome line arrives escaped from [`outcome_line`]; it is only cut
+/// here, at the fact cap, never escaped again.
+fn phase_detail(entry: &PhaseEntry, active: &ActiveStep) -> String {
+    use crate::session_view::{CUT_MARKER, FACT_CAP};
     let line = outcome_line(&entry.outcome);
     match entry.status {
-        PhaseStatus::Active if line.is_empty() => "in progress".to_string(),
+        PhaseStatus::Active if line.is_empty() => match active.state {
+            "done" => "done".to_string(),
+            "error" if !active.blocked => active.error.clone(),
+            _ => "in progress".to_string(),
+        },
         PhaseStatus::Done if line.is_empty() => "done".to_string(),
         PhaseStatus::Upcoming => String::new(),
-        _ => line,
+        _ => match cut_escaped(&line, FACT_CAP) {
+            (kept, true) => kept + CUT_MARKER,
+            (kept, false) => kept,
+        },
     }
 }
 
 /// A one-line summary of what a phase produced: its gate outcome if a gate was
-/// evaluated, else its evidence field names, else empty.
+/// evaluated, else its evidence field names, else empty. Escaped: the gate name
+/// goes through [`gate_name_display`] and each evidence key through the shared
+/// sanitizer. The gate's captured output is never part of it.
 fn outcome_line(outcome: &StateOutcome) -> String {
     if let Some(gate) = &outcome.gate {
         return format!(
             "gate {}: {}",
-            gate.name,
+            gate_name_display(&gate.name),
             if gate.passed { "PASS" } else { "FAIL" }
         );
     }
@@ -215,15 +319,16 @@ fn outcome_line(outcome: &StateOutcome) -> String {
 }
 
 /// Summarize submitted evidence by its field names, e.g.
-/// `evidence: acknowledgement, diff`. Falls back to a plain marker when the
-/// field-sets carry no keys.
+/// `evidence: acknowledgement, diff`, each name escaped. Falls back to a plain
+/// marker when the field-sets carry no keys.
 fn evidence_summary(evidence: &[serde_json::Value]) -> String {
-    let mut keys: Vec<String> = Vec::new();
+    use crate::session_view::sanitize_one_line;
+    let mut keys: Vec<&str> = Vec::new();
     for entry in evidence {
         if let Some(obj) = entry.as_object() {
             for k in obj.keys() {
-                if !keys.iter().any(|seen| seen == k) {
-                    keys.push(k.clone());
+                if !keys.contains(&k.as_str()) {
+                    keys.push(k);
                 }
             }
         }
@@ -231,19 +336,32 @@ fn evidence_summary(evidence: &[serde_json::Value]) -> String {
     if keys.is_empty() {
         "evidence submitted".to_string()
     } else {
-        format!("evidence: {}", keys.join(", "))
+        let shown: Vec<String> = keys
+            .iter()
+            .map(|k| sanitize_one_line(k).into_string())
+            .collect();
+        format!("evidence: {}", shown.join(", "))
     }
 }
 
-/// Collapse a directive/outcome into a single-line, length-bounded preview.
+/// Collapse raw text (a directive) into a single-line, escaped,
+/// length-bounded preview.
 fn preview(s: &str) -> String {
+    use crate::session_view::sanitize_one_line;
     let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= PREVIEW_MAX {
-        return one_line;
+    cap_preview(sanitize_one_line(&one_line).as_str())
+}
+
+/// Bound an already-escaped one-line text at [`PREVIEW_MAX`] characters with
+/// an ellipsis, without splitting an escape.
+fn cap_preview(escaped: &str) -> String {
+    match cut_escaped(escaped, PREVIEW_MAX) {
+        (mut kept, true) => {
+            kept.push('\u{2026}'); // ellipsis
+            kept
+        }
+        (kept, false) => kept,
     }
-    let mut out: String = one_line.chars().take(PREVIEW_MAX).collect();
-    out.push('\u{2026}'); // ellipsis
-    out
 }
 
 /// Resolve the target `/workflows` directory, applying the render gate.
@@ -587,8 +705,10 @@ mod tests {
             .any(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Review"));
     }
 
-    /// AC3: a session whose latest current-epoch gate did not pass renders
-    /// `blocked` -- not running, not done.
+    /// AC3: a session whose latest current-epoch gate did not pass is written
+    /// top-level `running` (the only status Claude Code doesn't count as
+    /// completed), with `koto.status` `blocked`, its active step an `error`
+    /// flagged `blocked` that names the gate, and a summary saying so.
     #[test]
     fn ac3_gate_blocked_renders_blocked() {
         let base = TempDir::new().unwrap();
@@ -604,7 +724,24 @@ mod tests {
         evaluate_gate(&backend, "solo", "verify", "tests-pass", "failed");
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
-        assert_eq!(v["status"], "blocked");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "blocked");
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} solo \u{b7} verify \u{b7} blocked on gate tests-pass"
+        );
+
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Verify")
+            .expect("active verify step")
+            .clone();
+        assert_eq!(step["state"], "error");
+        assert_eq!(step["blocked"], true);
+        assert_eq!(step["error"], "gate tests-pass: FAIL");
+        assert_eq!(step["resultPreview"], "gate tests-pass: FAIL");
 
         // The active phase's outcome shows the failed gate.
         let verify_detail = v["phases"]
@@ -637,10 +774,214 @@ mod tests {
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
         assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "running");
+        assert_eq!(v["summary"], "koto \u{b7} solo \u{b7} verify");
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Verify")
+            .expect("active verify step")
+            .clone();
+        assert_eq!(step["state"], "progress");
+        assert!(step.get("blocked").is_none());
+        assert!(step.get("error").is_none());
+    }
+
+    #[test]
+    fn active_step_follows_the_classification() {
+        assert_eq!(
+            active_step(RenderStatus::Blocked, Some("tests-pass"), false, "verify"),
+            ActiveStep {
+                state: "error",
+                blocked: true,
+                error: "gate tests-pass: FAIL".to_string(),
+            }
+        );
+        let running = ActiveStep {
+            state: "progress",
+            blocked: false,
+            error: String::new(),
+        };
+        assert_eq!(
+            active_step(RenderStatus::Running, None, false, "verify"),
+            running
+        );
+        // A gate name with a control character is escaped in the error.
+        assert_eq!(
+            active_step(RenderStatus::Blocked, Some("a\u{7}b"), false, "verify").error,
+            "gate a\\u{7}b: FAIL"
+        );
+    }
+
+    #[test]
+    fn active_step_on_a_completed_session_is_done() {
+        assert_eq!(
+            active_step(RenderStatus::Completed, None, false, "review"),
+            ActiveStep {
+                state: "done",
+                blocked: false,
+                error: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn active_step_on_a_failed_session_says_why() {
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, true, "verify"),
+            ActiveStep {
+                state: "error",
+                blocked: false,
+                error: "cancelled at verify".to_string(),
+            }
+        );
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, false, "failed"),
+            ActiveStep {
+                state: "error",
+                blocked: false,
+                error: "ended at failed".to_string(),
+            }
+        );
+        // The state name is escaped and cut at the shared gate-name cap.
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, true, "a\u{7}b").error,
+            "cancelled at a\\u{7}b"
+        );
+        let long = "s".repeat(crate::workflows_surface::GATE_NAME_CAP + 10);
+        let error = active_step(RenderStatus::Failed, None, false, &long).error;
+        assert_eq!(error, format!("ended at {}", gate_name_display(&long)));
+        assert!(!error.contains(&long), "the long state name is cut");
+    }
+
+    /// A failed session with no current state never gets an `error` line
+    /// that ends in `at ` with an empty name.
+    #[test]
+    fn active_step_on_a_failed_session_with_no_state_reads_a_reason() {
+        for (cancelled, want) in [(true, "cancelled"), (false, "failed")] {
+            let step = active_step(RenderStatus::Failed, None, cancelled, "");
+            assert_eq!(step.state, "error");
+            assert!(!step.blocked);
+            assert_eq!(step.error, want);
+            assert!(!step.error.trim_end().ends_with(" at"), "{:?}", step.error);
+        }
+    }
+
+    /// A session cancelled at a non-terminal state writes its active step as
+    /// an unflagged `error` naming the state, and the phase shows that line.
+    #[test]
+    fn a_cancelled_session_renders_its_active_step_failed() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "implement");
+        backend
+            .append_event(
+                "solo",
+                &EventPayload::WorkflowCancelled {
+                    state: "implement".to_string(),
+                    reason: "operator".to_string(),
+                },
+                "2026-01-01T00:02:00Z",
+            )
+            .expect("append cancel");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["koto"]["status"], "failed");
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Implement")
+            .expect("active implement step")
+            .clone();
+        assert_eq!(step["state"], "error");
+        assert!(step.get("blocked").is_none());
+        assert_eq!(step["error"], "cancelled at implement");
+        let detail = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["title"] == "Implement")
+            .unwrap()["detail"]
+            .clone();
+        assert_eq!(detail, "cancelled at implement");
+    }
+
+    /// A session that ended at a failure-named terminal state writes its
+    /// active step as an unflagged `error` saying where it ended.
+    #[test]
+    fn a_failure_terminal_renders_its_active_step_failed() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(
+            &backend,
+            "solo",
+            r#"{"format_version":1,"name":"n","version":"1","initial_state":"build",
+                "states":{
+                  "build":{"directive":"Build it.","transitions":[{"target":"failed"}]},
+                  "failed":{"directive":"It failed.","terminal":true}
+                }}"#,
+        );
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "failed");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["koto"]["status"], "failed");
+        let progress = v["workflowProgress"].as_array().unwrap();
+        let step = progress
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Failed")
+            .expect("active failed step");
+        assert_eq!(step["state"], "error");
+        assert!(step.get("blocked").is_none());
+        assert_eq!(step["error"], "ended at failed");
+        let build = progress
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Build")
+            .expect("done build step");
+        assert_eq!(build["state"], "done");
+    }
+
+    /// A blocked session whose template can't be read has no phase list, but
+    /// its summary still names the gate.
+    #[test]
+    fn a_blocked_session_without_a_template_names_the_gate_in_its_summary() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "verify");
+        evaluate_gate(&backend, "solo", "verify", "tests-pass", "failed");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["status"], "blocked");
+        assert!(v.get("workflowProgress").is_none());
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} solo \u{b7} verify \u{b7} blocked on gate tests-pass"
+        );
     }
 
     /// Reaching the terminal state renders `completed` and still carries the
-    /// full ordered phase list.
+    /// full ordered phase list, with every step `done`: the terminal phase
+    /// reads finished, not `in progress` (koto#554).
     #[test]
     fn terminal_renders_completed_with_phases() {
         let base = TempDir::new().unwrap();
@@ -658,15 +999,29 @@ mod tests {
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
         assert_eq!(v["status"], "completed");
+        assert_eq!(v["koto"]["status"], "completed");
         assert_eq!(v["phases"].as_array().unwrap().len(), 4);
-        // The terminal phase is the active one now.
-        let review = v["workflowProgress"]
-            .as_array()
-            .unwrap()
+        // The terminal phase is the active one now, and it reads done.
+        let progress = v["workflowProgress"].as_array().unwrap();
+        let review = progress
             .iter()
             .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Review")
             .expect("review step");
-        assert_eq!(review["state"], "progress");
+        assert_eq!(review["state"], "done");
+        assert!(review.get("blocked").is_none());
+        assert!(review.get("error").is_none());
+        assert!(progress
+            .iter()
+            .filter(|n| n["type"] == "workflow_agent")
+            .all(|n| n["state"] == "done"));
+        let review_detail = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["title"] == "Review")
+            .unwrap()["detail"]
+            .clone();
+        assert_eq!(review_detail, "done");
     }
 
     /// The enriched file carries the holdings summary -- key names and sizes

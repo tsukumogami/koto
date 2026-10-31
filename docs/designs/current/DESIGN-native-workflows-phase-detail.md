@@ -58,6 +58,19 @@ foundation (commit-funnel hook, context-store publish/discover, extensible contr
 atomic write, opt-in) are settled and are not reopened here; this design pins
 the derivation and the on-disk field mapping this change adds on top.
 
+**Correction, the `blocked` render status is replaced.** Fork D below chose
+to write a gate-blocked session's top-level `status` as `blocked`, on the
+belief that the screen supports that word. Claude Code 2.1.314 doesn't: it
+knows six run statuses, `blocked` isn't one, and it counts every status but
+`running` as completed, so a blocked entry landed in the completed bucket with
+its active step drawn Stopped (tsukumogami/koto#553). The status mapping is now
+[DESIGN-koto-workflows-blocked-status](./DESIGN-koto-workflows-blocked-status.md)
+(`docs/designs/current/DESIGN-koto-workflows-blocked-status.md`): from contract
+version 5 a gate-blocked session is written top-level `running` with its
+active step as a blocked `error` step, and koto's own classification moves to
+`koto.status`. Fork D's predicate (the most recent current-epoch gate
+evaluation failed) and everything else this design settled stand.
+
 ## Context and Problem Statement
 
 The initial render shipped the `workflows_surface` module (koto working tree):
@@ -238,6 +251,11 @@ model.
   drift the "single source of truth" driver forbids.
 
 ### Fork D -- Blocked-status mapping
+
+*Replaced in part: the top-level `blocked` status this fork chose is replaced
+by the mapping in
+[DESIGN-koto-workflows-blocked-status](./DESIGN-koto-workflows-blocked-status.md);
+see the correction under Status. The predicate stands.*
 
 **Chosen: reuse koto's blocked-in-current-epoch classification.** A non-terminal
 session whose most recent current-epoch `GateEvaluated` outcome is not `passed`

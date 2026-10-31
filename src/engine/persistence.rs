@@ -2127,17 +2127,27 @@ pub(crate) fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &
 /// separate answers to separate questions and a change to one must not move the
 /// other.
 pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
+    latest_epoch_gate(events, current_state).is_some_and(|(_, passed)| !passed)
+}
+
+/// The most recent gate evaluated in `current_state`'s current epoch: its
+/// name and whether it passed, or `None` when the epoch holds no gate
+/// evaluation.
+///
+/// This is the read [`latest_epoch_gate_failed`] is built on, so a caller
+/// that names the gate a session is blocked on names the same gate the
+/// blocked classification decided on.
+pub fn latest_epoch_gate(events: &[Event], current_state: &str) -> Option<(String, bool)> {
     epoch_slice(events, current_state)
         .iter()
         .rev()
         .find_map(|e| {
-            if let EventPayload::GateEvaluated { outcome, .. } = &e.payload {
-                Some(outcome != "passed")
+            if let EventPayload::GateEvaluated { gate, outcome, .. } = &e.payload {
+                Some((gate.clone(), outcome == "passed"))
             } else {
                 None
             }
         })
-        .unwrap_or(false)
 }
 
 /// Whether `current_state`'s instructions have already been delivered to a
@@ -4284,6 +4294,52 @@ mod tests {
         events.push(transitioned(5, Some("review"), "review"));
         assert!(!latest_epoch_gate_failed(&events, "review"));
         assert!(instructions_delivered_this_window(&events, "review"));
+    }
+
+    #[test]
+    fn latest_epoch_gate_names_the_latest_gate_and_its_outcome() {
+        let events = vec![
+            transitioned(1, None, "gather"),
+            transitioned(2, Some("gather"), "review"),
+            gate_evaluated(3, "review", "lint", "passed"),
+            gate_evaluated(4, "review", "approval", "failed"),
+        ];
+        assert_eq!(
+            latest_epoch_gate(&events, "review"),
+            Some(("approval".to_string(), false))
+        );
+        assert!(latest_epoch_gate_failed(&events, "review"));
+
+        let mut events = events;
+        events.push(gate_evaluated(5, "review", "approval", "passed"));
+        assert_eq!(
+            latest_epoch_gate(&events, "review"),
+            Some(("approval".to_string(), true))
+        );
+        assert!(!latest_epoch_gate_failed(&events, "review"));
+    }
+
+    #[test]
+    fn latest_epoch_gate_is_none_without_a_gate_in_the_epoch() {
+        let events = vec![
+            transitioned(1, None, "gather"),
+            transitioned(2, Some("gather"), "review"),
+        ];
+        assert_eq!(latest_epoch_gate(&events, "review"), None);
+    }
+
+    #[test]
+    fn latest_epoch_gate_ignores_an_earlier_epoch() {
+        // A gate that failed on an earlier visit to the state drops out once
+        // the state is entered again.
+        let events = vec![
+            transitioned(1, None, "review"),
+            gate_evaluated(2, "review", "approval", "failed"),
+            transitioned(3, Some("review"), "gather"),
+            transitioned(4, Some("gather"), "review"),
+        ];
+        assert_eq!(latest_epoch_gate(&events, "review"), None);
+        assert!(!latest_epoch_gate_failed(&events, "review"));
     }
 
     #[test]
