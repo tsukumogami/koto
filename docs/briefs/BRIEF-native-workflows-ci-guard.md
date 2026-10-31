@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   koto's /workflows rendering rests on Claude Code internals nobody promised to
   keep: the file shape, the per-session directory layout, and the session
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 Framing for the hardening step of koto's native `/workflows` rendering. The
 render itself, its phase detail and its blocked status have landed; this
