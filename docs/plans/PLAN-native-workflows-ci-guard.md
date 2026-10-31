@@ -106,11 +106,31 @@ rendered smoke check.
 
 ### Step 4: the session-start hook prints valid JSON naming the right directory with and without jq
 
-The session-start hook escapes its output, decodes escaped input, shell-quotes its export line and refuses hostile values, shown by a payload-matrix test in the plugin CI job, closing koto#243.
+**Goal**: An operator on a host without `jq` gets the same working hook as one with it. `plugins/koto-skills/hooks/session-start-workflows.sh` gains a `json_escape` function (backslash, double quote and every control character below U+0020) applied to the context before the `printf` fallback interpolates it, and an escape-aware no-`jq` `read_field` that decodes `\"`, `\\` and `\/` in one pass and refuses any other escape. A `session_id` outside `[A-Za-z0-9_-]+` counts as absent, a control character or DEL in the derived directory makes the hook print nothing, and the `export` line in the context single-quotes the directory for the shell. The derivation rule and the output contract don't change, and the script stays unregistered. A sibling test runs a fixed payload matrix with `jq` on the `PATH` and again with a `PATH` holding only the commands the script needs, and the plugin CI job runs it. The pull request body, not this entry, carries `Closes #243`.
+
+**Acceptance Criteria**:
+
+- [ ] For `{"session_id":"abc123","transcript_path":"/work/proj/t.jsonl"}`, run once with `jq` on the `PATH` and once with a `PATH` of symlinks to only `bash`, `cat`, `dirname`, `grep`, `sed` and `head` (where `command -v jq` fails), the hook exits 0 and prints one JSON object that `jq` parses, with `hookSpecificOutput.hookEventName` equal to `SessionStart` and `additionalContext` containing `/work/proj/abc123/workflows`.
+- [ ] For a `transcript_path` whose directory contains `"`, `\` and a space, and for one whose directory contains `$(`, a backtick and `'`, both runs print JSON that `jq` parses, `additionalContext` contains `<dirname of transcript_path>/<session_id>/workflows` byte for byte in its plain sentence, and the two runs' `additionalContext` values are identical.
+- [ ] For an empty or absent `transcript_path` with a `cwd`, both runs name `<cwd>/<session_id>/workflows` the same way.
+- [ ] The context's export line reads `export KOTO_WORKFLOWS_DIR='<dir>'`, with each `'` in the directory written `'\''`. Evaluated in a subshell for each of the cases above, it sets `KOTO_WORKFLOWS_DIR` to exactly the derived directory and runs nothing else: a directory containing `$(touch <sentinel>)` or a backtick form of it leaves no sentinel file.
+- [ ] Each of these prints nothing and exits 0 in both runs: a payload with no `session_id`; a `session_id` containing `/` (for example `../x`); a `transcript_path` whose directory holds a raw DEL byte; and stdin that isn't JSON.
+- [ ] Without `jq`, a `transcript_path` written with `\/` resolves as `/`, while one holding any other escape (`\n`, `\t` or `A`) makes the hook print nothing and exit 0 even when the payload has a usable `cwd`, so a refused field never falls back to another. With `jq`, a `\n` in the directory also prints nothing, through the control-character rule.
+- [ ] `plugins/koto-skills/hooks/test/session-start-workflows.test.sh` runs the whole matrix in both passes. It fails if `jq` is missing from the normal `PATH` or present on the restricted one, exits 0 when every case passes, and otherwise exits non-zero with each failing case named by payload and pass.
+- [ ] Run against the script as it is on `origin/main`, the test exits non-zero, and its failures include the no-`jq` pass of the quote-and-backslash payload.
+- [ ] `.github/workflows/validate-plugins.yml`'s `hook-smoke-test` job has a new step that runs `bash plugins/koto-skills/hooks/test/session-start-workflows.test.sh`, carrying the same "Copied into .claude/shirabe-extensions/work-on.md" comment as its neighbours, and on the implementing pull request that step runs and passes.
+- [ ] `.claude/shirabe-extensions/work-on.md` lists the same command under its `plugins/**` entry, and its no-local-check entry excepts `session-start-workflows.sh` alongside `session-start.sh`, so a change to the script runs the test rather than stopping for a person.
+- [ ] The script stays unregistered: `plugins/koto-skills/hooks/hooks.json` is unchanged, the script's header still says it isn't registered and no longer says the context has no quotes to escape, and `cargo test --test plugin_hooks_shape` passes.
+
+**Check**: From the repository root, run `bash plugins/koto-skills/hooks/test/session-start-workflows.test.sh` and see both passes report every case passing, exit 0. Then exercise the no-`jq` path by hand: `d=$(mktemp -d); for c in bash cat dirname grep sed head; do ln -s "$(command -v "$c")" "$d/$c"; done`, then `printf '%s' '{"session_id":"abc123","transcript_path":"/tmp/a \"b\\c d/t.jsonl"}' | PATH="$d" "$d/bash" plugins/koto-skills/hooks/session-start-workflows.sh | jq -r .hookSpecificOutput.additionalContext` and see `/tmp/a "b\c d/abc123/workflows` in the sentence and `export KOTO_WORKFLOWS_DIR='/tmp/a "b\c d/abc123/workflows'` in the export line. Run `printf '%s' '{"session_id":"../x","transcript_path":"/tmp/p/t.jsonl"}' | bash plugins/koto-skills/hooks/session-start-workflows.sh | wc -c` and see `0`, exit 0. To see the test catch the old bug, copy the fixed script aside, write `git show origin/main:plugins/koto-skills/hooks/session-start-workflows.sh` over it, run the test and see it exit non-zero naming the no-`jq` quote-and-backslash case, then copy the fixed script back. Run `git diff --exit-code origin/main -- plugins/koto-skills/hooks/hooks.json`, `CARGO_BUILD_JOBS=2 cargo test --test plugin_hooks_shape` and `actionlint .github/workflows/validate-plugins.yml` and see exit 0 from each. On the pull request, open the `hook-smoke-test` job and see the new step pass.
+
+**Dependencies**: Step 3
+
+**Files**: `plugins/koto-skills/hooks/session-start-workflows.sh`, `plugins/koto-skills/hooks/test/session-start-workflows.test.sh`, `.github/workflows/validate-plugins.yml`, `.claude/shirabe-extensions/work-on.md`
 
 ### Step 5: a maintainer can see whether koto's entry renders in a real Claude Code
 
-A maintainer-run tmux harness drives a real Claude Code and reports rendered, not rendered or unavailable with distinct exit statuses, with one recorded run in the guide and a before-release step that records the outcome.
+A maintainer-run tmux harness drives a real Claude Code and reports rendered, not rendered or unavailable with distinct exit statuses, with one recorded run in the guide and a before-release step that confirms the newest scheduled guard run passed and records the smoke check's outcome.
 
 ## Implementation Sequence
 
