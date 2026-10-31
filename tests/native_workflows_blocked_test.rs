@@ -470,3 +470,290 @@ fn a_failed_session_with_no_current_state_writes_no_empty_state_name() {
     let summary = v["summary"].as_str().unwrap();
     assert!(!summary.trim_end().ends_with(" at"), "{summary}");
 }
+
+// ---------------------------------------------------------------------------
+// Escaping every template- and log-derived string
+// ---------------------------------------------------------------------------
+
+/// The fact cap the other summaries are written within.
+const FACT_CAP: usize = koto::session_view::FACT_CAP;
+const CUT_MARKER: &str = koto::session_view::CUT_MARKER;
+
+/// Whether `text` holds a raw control or bidi character the screen would
+/// act on rather than show.
+fn has_raw_control(text: &str) -> bool {
+    text.chars().any(|c| {
+        (c.is_control() && c != '\n' && c != '\t')
+            || ('\u{202A}'..='\u{202E}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+    })
+}
+
+/// A gate name longer than the fact cap is cut with the cut marker in both
+/// the step's `error` and the summary, and the summary keeps its
+/// `blocked on gate` text within the cap.
+#[test]
+fn an_over_cap_gate_name_is_cut_in_the_error_and_the_summary() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    let gate = "g".repeat(FACT_CAP + 10);
+    evaluate_gate(&backend, &gate, "failed");
+
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["koto"]["status"], "blocked");
+    let step = verify_step(&v);
+    let error = step["error"].as_str().unwrap();
+    assert!(error.starts_with("gate g"), "{error}");
+    assert!(error.ends_with(&format!("{CUT_MARKER}: FAIL")), "{error}");
+    assert!(
+        error.chars().count() < FACT_CAP,
+        "{}",
+        error.chars().count()
+    );
+
+    let summary = v["summary"].as_str().unwrap();
+    assert!(summary.contains(" \u{b7} blocked on gate g"), "{summary}");
+    assert!(summary.ends_with(CUT_MARKER), "{summary}");
+    assert!(
+        summary.chars().count() <= FACT_CAP,
+        "{}",
+        summary.chars().count()
+    );
+}
+
+/// A gate name of characters that each escape to several is bounded after
+/// escaping too: the summary stays within the cap and still says it is
+/// blocked on the gate.
+#[test]
+fn an_escaped_over_cap_gate_name_keeps_the_summary_within_the_cap() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    let gate = "\u{202E}\u{1B}".repeat(FACT_CAP);
+    evaluate_gate(&backend, &gate, "failed");
+
+    let v = read_entry(wf_dir.path());
+    let step = verify_step(&v);
+    let error = step["error"].as_str().unwrap();
+    let summary = v["summary"].as_str().unwrap();
+    for text in [error, summary] {
+        assert!(!has_raw_control(text), "raw control in {text:?}");
+        assert!(text.contains("\\u{202E}\\u{1B}"), "{text}");
+    }
+    assert!(error.ends_with(&format!("{CUT_MARKER}: FAIL")), "{error}");
+    assert!(
+        summary.starts_with("koto \u{b7} impl-feature \u{b7} verify \u{b7} blocked on gate "),
+        "{summary}"
+    );
+    assert!(summary.ends_with(CUT_MARKER), "{summary}");
+    assert!(
+        summary.chars().count() <= FACT_CAP,
+        "{}",
+        summary.chars().count()
+    );
+}
+
+/// A template whose directives, state names and gate name carry control and
+/// bidi characters: intake (evidence) -> a hostile phase (failing gate) ->
+/// done.
+const HOSTILE_TEMPLATE: &str = r#"{
+    "format_version": 1,
+    "name": "impl-feature",
+    "version": "1.0",
+    "initial_state": "intake\u202e_x",
+    "states": {
+        "intake\u202e_x": {
+            "directive": "Read\u001b]0;pwned\u0007 the issue \u2066now\u2069.",
+            "transitions": [{"target": "evil\u001b[2J_phase"}]
+        },
+        "evil\u001b[2J_phase": {
+            "directive": "Run\u001b[31m the \u202eprobe\u202c.",
+            "transitions": [{"target": "done"}],
+            "gates": {"probe\u0007": {"type": "command", "command": "true"}}
+        },
+        "done": {"directive": "Finish.", "terminal": true}
+    }
+}"#;
+
+/// Every string the entry takes from the template or the log (directives,
+/// state names as phase titles and step labels, gate names and evidence keys)
+/// reaches the file escaped, with no raw control or bidi character.
+#[test]
+fn template_and_log_strings_reach_every_field_escaped() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+    let init = event(
+        1,
+        "workflow_initialized",
+        serde_json::json!({"template_path": "template.json", "variables": {}}),
+    );
+    backend
+        .init_state_file(WORKFLOW, header(), vec![init])
+        .unwrap();
+    std::fs::write(
+        backend.session_dir(WORKFLOW).join("template.json"),
+        HOSTILE_TEMPLATE,
+    )
+    .unwrap();
+    publish_location(
+        &backend,
+        &backend,
+        WORKFLOW,
+        wf_dir.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let append = |kind: &str, body: serde_json::Value| {
+        backend
+            .append_event(WORKFLOW, &payload(kind, body), "2026-01-01T00:01:00Z")
+            .unwrap();
+    };
+    append(
+        "transitioned",
+        serde_json::json!({"from": null, "to": "intake\u{202E}_x", "condition_type": "evidence"}),
+    );
+    append(
+        "evidence_submitted",
+        serde_json::json!({"state": "intake\u{202E}_x", "fields": {"ack\u{1B}[1m": "yes"}}),
+    );
+    append(
+        "transitioned",
+        serde_json::json!({
+            "from": "intake\u{202E}_x",
+            "to": "evil\u{1B}[2J_phase",
+            "condition_type": "evidence",
+        }),
+    );
+    append(
+        "gate_evaluated",
+        serde_json::json!({
+            "state": "evil\u{1B}[2J_phase",
+            "gate": "probe\u{7}",
+            "output": {"exit_code": 1},
+            "outcome": "failed",
+            "timestamp": "2026-01-01T00:02:00Z",
+        }),
+    );
+
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["koto"]["status"], "blocked", "{v}");
+
+    let phases = v["phases"].as_array().expect("phases written");
+    let titles: Vec<&str> = phases
+        .iter()
+        .map(|p| p["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Intake\\u{202E} x", "Evil\\u{1B}[2J phase", "Done"],
+        "{titles:?}"
+    );
+    // The intake phase's detail is its evidence line, with the key escaped;
+    // the active phase's detail is its gate line, with the name escaped.
+    assert_eq!(phases[0]["detail"], "evidence: ack\\u{1B}[1m");
+    assert_eq!(phases[1]["detail"], "gate probe\\u{7}: FAIL");
+
+    let progress = v["workflowProgress"].as_array().unwrap();
+    let markers: Vec<&str> = progress
+        .iter()
+        .filter(|n| n["type"] == "workflow_phase")
+        .map(|n| n["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(markers, titles);
+    let steps: Vec<&serde_json::Value> = progress
+        .iter()
+        .filter(|n| n["type"] == "workflow_agent")
+        .collect();
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    for (step, title) in steps.iter().zip(&titles) {
+        assert_eq!(step["label"], *title);
+        assert_eq!(step["phaseTitle"], *title);
+    }
+    assert_eq!(
+        steps[0]["promptPreview"],
+        "Read\\u{1B}]0;pwned\\u{7} the issue \\u{2066}now\\u{2069}."
+    );
+    assert_eq!(steps[0]["resultPreview"], "evidence: ack\\u{1B}[1m");
+    assert_eq!(
+        steps[1]["promptPreview"],
+        "Run\\u{1B}[31m the \\u{202E}probe\\u{202C}."
+    );
+    assert_eq!(steps[1]["resultPreview"], "gate probe\\u{7}: FAIL");
+    assert_eq!(steps[1]["error"], "gate probe\\u{7}: FAIL");
+    let summary = v["summary"].as_str().unwrap();
+    assert!(
+        summary.ends_with(" \u{b7} blocked on gate probe\\u{7}"),
+        "{summary}"
+    );
+
+    // No field the screen draws carries a raw control or bidi character.
+    let mut drawn: Vec<&str> = vec![summary];
+    for p in phases {
+        drawn.push(p["title"].as_str().unwrap());
+        drawn.push(p["detail"].as_str().unwrap_or(""));
+    }
+    for n in progress {
+        for key in [
+            "title",
+            "label",
+            "phaseTitle",
+            "promptPreview",
+            "resultPreview",
+            "error",
+        ] {
+            drawn.push(n[key].as_str().unwrap_or(""));
+        }
+    }
+    for text in drawn {
+        assert!(!has_raw_control(text), "raw control in {text:?}");
+    }
+}
+
+/// A failing gate's command output is captured in the log, and none of it
+/// reaches the step's `error`, its `resultPreview`, any phase's `detail` or
+/// the summary.
+#[test]
+fn a_failing_gates_output_never_reaches_the_entry() {
+    let base = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let backend = session_at_verify(base.path(), wf_dir.path());
+    backend
+        .append_event(
+            WORKFLOW,
+            &payload(
+                "gate_evaluated",
+                serde_json::json!({
+                    "state": "verify",
+                    "gate": "tests-pass",
+                    "output": {
+                        "exit_code": 101,
+                        "stdout": "PRINTED-ON-STDOUT test result: FAILED",
+                        "stderr": "PRINTED-ON-STDERR thread panicked",
+                    },
+                    "outcome": "failed",
+                    "timestamp": "2026-01-01T00:02:00Z",
+                }),
+            ),
+            "2026-01-01T00:02:00Z",
+        )
+        .unwrap();
+
+    let v = read_entry(wf_dir.path());
+    assert_eq!(v["koto"]["status"], "blocked");
+    let step = verify_step(&v);
+    assert_eq!(step["error"], "gate tests-pass: FAIL");
+    let mut drawn: Vec<&str> = vec![
+        step["error"].as_str().unwrap_or(""),
+        step["resultPreview"].as_str().unwrap_or(""),
+        v["summary"].as_str().unwrap(),
+    ];
+    for p in v["phases"].as_array().unwrap() {
+        drawn.push(p["detail"].as_str().unwrap_or(""));
+    }
+    for text in drawn {
+        assert!(!text.contains("PRINTED-ON"), "gate output in {text:?}");
+    }
+    let whole = serde_json::to_string(&v).unwrap();
+    assert!(!whole.contains("PRINTED-ON"), "{whole}");
+}

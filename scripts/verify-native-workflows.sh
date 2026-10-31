@@ -49,6 +49,20 @@ SESSIONS="$(mktemp -d)"
 WF_DIR="$WORKDIR/claude-session/workflows"
 trap 'rm -rf "$WORKDIR" "$SESSIONS"' EXIT
 
+# Pin koto's local session backend before the first koto call, for every koto
+# command below: the main run and the no-publish run both inherit it
+# (tsukumogami/koto#562: the script inherited the caller's session backend and
+# uses fixed session names). KOTO_SESSIONS_BASE only isolates the local
+# backend: on a host whose environment or user config selects the cloud
+# backend, the `verify` and `nopub` sessions would land in that shared store
+# and a second run would collide with the first. The environment outranks the
+# config files, so setting the backend here and dropping every cloud setting
+# keeps both runs inside their scratch directories.
+export KOTO_SESSION_BACKEND=local
+unset KOTO_SESSION_CLOUD_ENDPOINT KOTO_SESSION_CLOUD_BUCKET \
+  KOTO_SESSION_CLOUD_REGION KOTO_SESSION_CLOUD_PATH_STYLE \
+  KOTO_SESSION_CLOUD_ACCESS_KEY KOTO_SESSION_CLOUD_SECRET_KEY \
+  KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS KOTO_SESSION_CLOUD_MARKER_RETAIN_DAYS
 export KOTO_SESSIONS_BASE="$SESSIONS"
 cd "$WORKDIR"
 

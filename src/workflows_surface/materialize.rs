@@ -22,7 +22,8 @@ use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
 
 use super::contract::{
-    gate_name_display, workflow_filename, Phase, ProgressNode, RenderStatus, WorkflowFile,
+    cut_escaped, gate_name_display, workflow_filename, Phase, ProgressNode, RenderStatus,
+    WorkflowFile,
 };
 use super::discover;
 use super::project::{self, PhaseEntry, PhaseStatus, StateOutcome};
@@ -227,20 +228,28 @@ fn active_step(
 /// per phase, and a `workflow_agent` step per visited/active phase (carrying
 /// the phase's directive as `promptPreview` and its outcome as `resultPreview`).
 /// The active phase's step takes its shape from `active`.
+///
+/// Every string here comes from the template or the event log and is drawn by
+/// Claude Code's own screen, so each is escaped exactly once on its way in:
+/// the title (a humanized state name) here, the directive in [`preview`], and
+/// the gate name and evidence keys in [`outcome_line`], whose line is already
+/// escaped by the time [`phase_detail`] and [`cap_preview`] cut it.
 fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<ProgressNode>) {
+    use crate::session_view::{sanitize_capped, FACT_CAP};
     let mut out_phases = Vec::with_capacity(phases.len());
     let mut progress = Vec::new();
     let mut step_index: u32 = 0;
 
     for (i, entry) in phases.iter().enumerate() {
         let phase_index = (i + 1) as u32;
+        let title = sanitize_capped(&entry.title, FACT_CAP).into_string();
         out_phases.push(Phase {
-            title: entry.title.clone(),
+            title: title.clone(),
             detail: phase_detail(entry, active),
         });
         progress.push(ProgressNode::WorkflowPhase {
             index: phase_index,
-            title: entry.title.clone(),
+            title: title.clone(),
         });
         // A step is emitted only for phases the session has entered (done) or
         // is in (active); upcoming phases render as a bare marker.
@@ -252,12 +261,12 @@ fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<
         step_index += 1;
         progress.push(ProgressNode::WorkflowAgent {
             index: step_index,
-            label: entry.title.clone(),
+            label: title.clone(),
             phase_index,
-            phase_title: entry.title.clone(),
+            phase_title: title,
             state: state.to_string(),
             prompt_preview: preview(&entry.directive),
-            result_preview: preview(&outcome_line(&entry.outcome)),
+            result_preview: cap_preview(&outcome_line(&entry.outcome)),
             blocked,
             error,
         });
@@ -270,7 +279,11 @@ fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<
 /// evidence line wins; with none, the active phase reads what its step says:
 /// `done` on a completed session, the failure line on a failed one, and
 /// `in progress` otherwise.
+///
+/// The outcome line arrives escaped from [`outcome_line`]; it is only cut
+/// here, at the fact cap, never escaped again.
 fn phase_detail(entry: &PhaseEntry, active: &ActiveStep) -> String {
+    use crate::session_view::{CUT_MARKER, FACT_CAP};
     let line = outcome_line(&entry.outcome);
     match entry.status {
         PhaseStatus::Active if line.is_empty() => match active.state {
@@ -280,17 +293,22 @@ fn phase_detail(entry: &PhaseEntry, active: &ActiveStep) -> String {
         },
         PhaseStatus::Done if line.is_empty() => "done".to_string(),
         PhaseStatus::Upcoming => String::new(),
-        _ => line,
+        _ => match cut_escaped(&line, FACT_CAP) {
+            (kept, true) => kept + CUT_MARKER,
+            (kept, false) => kept,
+        },
     }
 }
 
 /// A one-line summary of what a phase produced: its gate outcome if a gate was
-/// evaluated, else its evidence field names, else empty.
+/// evaluated, else its evidence field names, else empty. Escaped: the gate name
+/// goes through [`gate_name_display`] and each evidence key through the shared
+/// sanitizer. The gate's captured output is never part of it.
 fn outcome_line(outcome: &StateOutcome) -> String {
     if let Some(gate) = &outcome.gate {
         return format!(
             "gate {}: {}",
-            gate.name,
+            gate_name_display(&gate.name),
             if gate.passed { "PASS" } else { "FAIL" }
         );
     }
@@ -301,15 +319,16 @@ fn outcome_line(outcome: &StateOutcome) -> String {
 }
 
 /// Summarize submitted evidence by its field names, e.g.
-/// `evidence: acknowledgement, diff`. Falls back to a plain marker when the
-/// field-sets carry no keys.
+/// `evidence: acknowledgement, diff`, each name escaped. Falls back to a plain
+/// marker when the field-sets carry no keys.
 fn evidence_summary(evidence: &[serde_json::Value]) -> String {
-    let mut keys: Vec<String> = Vec::new();
+    use crate::session_view::sanitize_one_line;
+    let mut keys: Vec<&str> = Vec::new();
     for entry in evidence {
         if let Some(obj) = entry.as_object() {
             for k in obj.keys() {
-                if !keys.iter().any(|seen| seen == k) {
-                    keys.push(k.clone());
+                if !keys.contains(&k.as_str()) {
+                    keys.push(k);
                 }
             }
         }
@@ -317,19 +336,32 @@ fn evidence_summary(evidence: &[serde_json::Value]) -> String {
     if keys.is_empty() {
         "evidence submitted".to_string()
     } else {
-        format!("evidence: {}", keys.join(", "))
+        let shown: Vec<String> = keys
+            .iter()
+            .map(|k| sanitize_one_line(k).into_string())
+            .collect();
+        format!("evidence: {}", shown.join(", "))
     }
 }
 
-/// Collapse a directive/outcome into a single-line, length-bounded preview.
+/// Collapse raw text (a directive) into a single-line, escaped,
+/// length-bounded preview.
 fn preview(s: &str) -> String {
+    use crate::session_view::sanitize_one_line;
     let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= PREVIEW_MAX {
-        return one_line;
+    cap_preview(sanitize_one_line(&one_line).as_str())
+}
+
+/// Bound an already-escaped one-line text at [`PREVIEW_MAX`] characters with
+/// an ellipsis, without splitting an escape.
+fn cap_preview(escaped: &str) -> String {
+    match cut_escaped(escaped, PREVIEW_MAX) {
+        (mut kept, true) => {
+            kept.push('\u{2026}'); // ellipsis
+            kept
+        }
+        (kept, false) => kept,
     }
-    let mut out: String = one_line.chars().take(PREVIEW_MAX).collect();
-    out.push('\u{2026}'); // ellipsis
-    out
 }
 
 /// Resolve the target `/workflows` directory, applying the render gate.

@@ -78,19 +78,61 @@ pub enum ScreenStatus {
     Failed,
 }
 
-/// A gate name as it is written into a step's `error` and a blocked
-/// `summary`: cut at [`GATE_NAME_CAP`] raw characters with the cut marker,
-/// then escaped.
+/// Longest escaped gate name, in characters, written before the cut marker.
+///
+/// [`GATE_NAME_CAP`] bounds the raw name, but one raw character can escape to
+/// as many as nine (`\u{E007F}`), so a name of control characters would
+/// otherwise grow the blocked summary's suffix past the fact cap. Four times
+/// the raw cap leaves the summary's `koto · <workflow> · <state>` prefix most
+/// of the fact cap, and an ASCII name never reaches it.
+pub const GATE_NAME_DISPLAY_CAP: usize = 4 * GATE_NAME_CAP;
+
+/// A gate name as it is written into a step's `error`, a phase's outcome line
+/// and a blocked `summary`: cut at [`GATE_NAME_CAP`] raw characters, escaped,
+/// then bounded at [`GATE_NAME_DISPLAY_CAP`] escaped characters, with one cut
+/// marker when either cut applied. The raw cut comes first, so neither cut
+/// ever splits an escape sequence.
 pub fn gate_name_display(name: &str) -> String {
     use crate::session_view::{sanitize_one_line, CUT_MARKER};
-    let cut = if name.chars().count() > GATE_NAME_CAP {
-        let mut c: String = name.chars().take(GATE_NAME_CAP).collect();
-        c.push_str(CUT_MARKER);
-        c
-    } else {
-        name.to_string()
-    };
-    sanitize_one_line(&cut).into_string()
+    let raw_cut = name.chars().count() > GATE_NAME_CAP;
+    let kept: String = name.chars().take(GATE_NAME_CAP).collect();
+    let escaped = sanitize_one_line(&kept).into_string();
+    let (mut shown, display_cut) = cut_escaped(&escaped, GATE_NAME_DISPLAY_CAP);
+    if raw_cut || display_cut {
+        shown.push_str(CUT_MARKER);
+    }
+    shown
+}
+
+/// Cut already-escaped text to at most `cap` characters without splitting a
+/// `\u{...}` escape; returns the kept text and whether anything was cut.
+///
+/// The sanitizer escapes a literal backslash that would read as `\u{`, so in
+/// its output every `\u{` opens an escape: when the cut lands inside one, the
+/// whole escape is dropped rather than left half-written.
+pub(crate) fn cut_escaped(escaped: &str, cap: usize) -> (String, bool) {
+    if escaped.chars().count() <= cap {
+        return (escaped.to_string(), false);
+    }
+    // Byte offset of the cut, then the last escape that opens before it: when
+    // that escape closes at or past the cut, the cut lands inside it (even
+    // between its `\` and its `u{`), so it goes whole.
+    let end = escaped
+        .char_indices()
+        .nth(cap)
+        .map_or(escaped.len(), |(i, _)| i);
+    let mut keep_to = end;
+    if let Some((open, _)) = escaped
+        .match_indices("\\u{")
+        .take_while(|(i, _)| *i < end)
+        .last()
+    {
+        let closes_at = escaped[open..].find('}').map(|j| open + j);
+        if closes_at.is_none_or(|c| c >= end) {
+            keep_to = open;
+        }
+    }
+    (escaped[..keep_to].to_string(), true)
 }
 
 /// A single phase in the `/workflows` ordered phase list. Each koto template
@@ -513,6 +555,51 @@ mod tests {
         let shown = gate_name_display(&gate);
         assert!(shown.contains("\\u{1B}"), "{shown}");
         assert_eq!(shown.matches("\\u{1B}").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn an_escaped_gate_name_is_bounded_and_keeps_the_summary_within_the_cap() {
+        use crate::session_view::{CUT_MARKER, FACT_CAP};
+        // Every raw character escapes to nine: the raw cut alone would leave
+        // 1152 characters, more than the whole fact cap.
+        let gate = "\u{E007F}".repeat(GATE_NAME_CAP);
+        let shown = gate_name_display(&gate);
+        assert!(shown.ends_with(CUT_MARKER), "{shown}");
+        assert!(
+            shown.chars().count() <= GATE_NAME_DISPLAY_CAP + CUT_MARKER.chars().count(),
+            "{}",
+            shown.chars().count()
+        );
+        let body = shown.strip_suffix(CUT_MARKER).unwrap();
+        assert_eq!(body.matches("\\u{E007F}").count() * 9, body.chars().count());
+
+        let v = blocked_file("wf", "verify", &gate);
+        let summary = v["summary"].as_str().unwrap();
+        assert!(summary.chars().count() <= FACT_CAP, "{}", summary.len());
+        assert!(
+            summary.starts_with("koto \u{b7} wf \u{b7} verify"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(" \u{b7} blocked on gate \\u{E007F}"),
+            "{summary}"
+        );
+        assert!(summary.ends_with(CUT_MARKER), "{summary}");
+    }
+
+    #[test]
+    fn cut_escaped_drops_a_split_escape_whole() {
+        assert_eq!(cut_escaped("abc", 3), ("abc".to_string(), false));
+        assert_eq!(cut_escaped("ab\\u{1B}c", 4), ("ab".to_string(), true));
+        assert_eq!(
+            cut_escaped("ab\\u{1B}cd", 9),
+            ("ab\\u{1B}c".to_string(), true)
+        );
+        // A sanitized literal `\u{` (written `\u{5C}u{`) is not an open escape.
+        assert_eq!(
+            cut_escaped("\\u{5C}u{1Bxyz", 10),
+            ("\\u{5C}u{1B".to_string(), true)
+        );
     }
 
     #[test]
