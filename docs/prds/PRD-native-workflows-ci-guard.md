@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto's native `/workflows` rendering depends on four Claude Code conventions
   that Claude Code doesn't publish as an interface: the workflows file shape,
@@ -25,7 +25,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-native-workflows-ci-guard](docs/briefs/BRIEF-native-workflows-ci-guard.md); carried in Absorbed Brief.
 
