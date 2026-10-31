@@ -133,7 +133,12 @@ fn try_materialize(
 
     let target = dir.join(workflow_filename(&proj.session_id));
     let start_time = stable_start_time(&target);
-    let active = active_step(proj.status, enriched.blocked_gate.as_deref());
+    let active = active_step(
+        proj.status,
+        enriched.blocked_gate.as_deref(),
+        proj.cancelled,
+        proj.current_state.as_deref().unwrap_or(""),
+    );
     let (phases, progress) = build_detail(&enriched.phases, &active);
     let mut file = WorkflowFile::new(
         &proj.session_id,
@@ -162,22 +167,49 @@ struct ActiveStep {
     error: String,
 }
 
-/// The active step for a session's classification. A blocked session's step
-/// is an `error` flagged `blocked`, which Claude Code draws as Blocked with
-/// `error` as its Outcome, under any run status; every other session keeps
-/// the `progress` step.
-fn active_step(status: RenderStatus, blocked_gate: Option<&str>) -> ActiveStep {
+/// The active step for a session's classification.
+///
+/// Claude Code 2.1.314 draws a `progress` step on a run that isn't running as
+/// Stopped and counts a phase's `done` steps over all its steps, so the step
+/// follows the classification rather than the phase's position:
+///
+/// - blocked: an `error` flagged `blocked`, drawn Blocked with the failing
+///   gate as its Outcome;
+/// - completed: `done`, so the terminal phase reads 1/1 and nothing reads
+///   Stopped;
+/// - failed: an `error` without the flag, drawn failed, saying it was
+///   cancelled at `state` (`cancelled`) or that it ended at `state`;
+/// - running: `progress`.
+///
+/// `state` is the session's current state; it is cut and escaped like a gate
+/// name before it is joined into the `error` line.
+fn active_step(
+    status: RenderStatus,
+    blocked_gate: Option<&str>,
+    cancelled: bool,
+    state: &str,
+) -> ActiveStep {
+    let step = |state: &'static str, blocked: bool, error: String| ActiveStep {
+        state,
+        blocked,
+        error,
+    };
     match (status, blocked_gate) {
-        (RenderStatus::Blocked, Some(gate)) => ActiveStep {
-            state: "error",
-            blocked: true,
-            error: format!("gate {}: FAIL", gate_name_display(gate)),
-        },
-        _ => ActiveStep {
-            state: "progress",
-            blocked: false,
-            error: String::new(),
-        },
+        (RenderStatus::Blocked, Some(gate)) => step(
+            "error",
+            true,
+            format!("gate {}: FAIL", gate_name_display(gate)),
+        ),
+        (RenderStatus::Completed, _) => step("done", false, String::new()),
+        (RenderStatus::Failed, _) => {
+            let how = if cancelled { "cancelled" } else { "ended" };
+            step(
+                "error",
+                false,
+                format!("{how} at {}", gate_name_display(state)),
+            )
+        }
+        _ => step("progress", false, String::new()),
     }
 }
 
@@ -195,7 +227,7 @@ fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<
         let phase_index = (i + 1) as u32;
         out_phases.push(Phase {
             title: entry.title.clone(),
-            detail: phase_detail(entry),
+            detail: phase_detail(entry, active),
         });
         progress.push(ProgressNode::WorkflowPhase {
             index: phase_index,
@@ -225,11 +257,18 @@ fn build_detail(phases: &[PhaseEntry], active: &ActiveStep) -> (Vec<Phase>, Vec<
     (out_phases, progress)
 }
 
-/// The subtitle line for a phase in the `phases` array.
-fn phase_detail(entry: &PhaseEntry) -> String {
+/// The subtitle line for a phase in the `phases` array. A phase's own gate or
+/// evidence line wins; with none, the active phase reads what its step says:
+/// `done` on a completed session, the failure line on a failed one, and
+/// `in progress` otherwise.
+fn phase_detail(entry: &PhaseEntry, active: &ActiveStep) -> String {
     let line = outcome_line(&entry.outcome);
     match entry.status {
-        PhaseStatus::Active if line.is_empty() => "in progress".to_string(),
+        PhaseStatus::Active if line.is_empty() => match active.state {
+            "done" => "done".to_string(),
+            "error" if !active.blocked => active.error.clone(),
+            _ => "in progress".to_string(),
+        },
         PhaseStatus::Done if line.is_empty() => "done".to_string(),
         PhaseStatus::Upcoming => String::new(),
         _ => line,
@@ -711,7 +750,7 @@ mod tests {
     #[test]
     fn active_step_follows_the_classification() {
         assert_eq!(
-            active_step(RenderStatus::Blocked, Some("tests-pass")),
+            active_step(RenderStatus::Blocked, Some("tests-pass"), false, "verify"),
             ActiveStep {
                 state: "error",
                 blocked: true,
@@ -723,12 +762,143 @@ mod tests {
             blocked: false,
             error: String::new(),
         };
-        assert_eq!(active_step(RenderStatus::Running, None), running);
+        assert_eq!(
+            active_step(RenderStatus::Running, None, false, "verify"),
+            running
+        );
         // A gate name with a control character is escaped in the error.
         assert_eq!(
-            active_step(RenderStatus::Blocked, Some("a\u{7}b")).error,
+            active_step(RenderStatus::Blocked, Some("a\u{7}b"), false, "verify").error,
             "gate a\\u{7}b: FAIL"
         );
+    }
+
+    #[test]
+    fn active_step_on_a_completed_session_is_done() {
+        assert_eq!(
+            active_step(RenderStatus::Completed, None, false, "review"),
+            ActiveStep {
+                state: "done",
+                blocked: false,
+                error: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn active_step_on_a_failed_session_says_why() {
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, true, "verify"),
+            ActiveStep {
+                state: "error",
+                blocked: false,
+                error: "cancelled at verify".to_string(),
+            }
+        );
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, false, "failed"),
+            ActiveStep {
+                state: "error",
+                blocked: false,
+                error: "ended at failed".to_string(),
+            }
+        );
+        // The state name is escaped and cut at the shared gate-name cap.
+        assert_eq!(
+            active_step(RenderStatus::Failed, None, true, "a\u{7}b").error,
+            "cancelled at a\\u{7}b"
+        );
+        let long = "s".repeat(crate::workflows_surface::GATE_NAME_CAP + 10);
+        let error = active_step(RenderStatus::Failed, None, false, &long).error;
+        assert_eq!(error, format!("ended at {}", gate_name_display(&long)));
+        assert!(!error.contains(&long), "the long state name is cut");
+    }
+
+    /// A session cancelled at a non-terminal state writes its active step as
+    /// an unflagged `error` naming the state, and the phase shows that line.
+    #[test]
+    fn a_cancelled_session_renders_its_active_step_failed() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "implement");
+        backend
+            .append_event(
+                "solo",
+                &EventPayload::WorkflowCancelled {
+                    state: "implement".to_string(),
+                    reason: "operator".to_string(),
+                },
+                "2026-01-01T00:02:00Z",
+            )
+            .expect("append cancel");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["koto"]["status"], "failed");
+        let step = v["workflowProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Implement")
+            .expect("active implement step")
+            .clone();
+        assert_eq!(step["state"], "error");
+        assert!(step.get("blocked").is_none());
+        assert_eq!(step["error"], "cancelled at implement");
+        let detail = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["title"] == "Implement")
+            .unwrap()["detail"]
+            .clone();
+        assert_eq!(detail, "cancelled at implement");
+    }
+
+    /// A session that ended at a failure-named terminal state writes its
+    /// active step as an unflagged `error` saying where it ended.
+    #[test]
+    fn a_failure_terminal_renders_its_active_step_failed() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(
+            &backend,
+            "solo",
+            r#"{"format_version":1,"name":"n","version":"1","initial_state":"build",
+                "states":{
+                  "build":{"directive":"Build it.","transitions":[{"target":"failed"}]},
+                  "failed":{"directive":"It failed.","terminal":true}
+                }}"#,
+        );
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        transition(&backend, "solo", "failed");
+
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["koto"]["status"], "failed");
+        let progress = v["workflowProgress"].as_array().unwrap();
+        let step = progress
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Failed")
+            .expect("active failed step");
+        assert_eq!(step["state"], "error");
+        assert!(step.get("blocked").is_none());
+        assert_eq!(step["error"], "ended at failed");
+        let build = progress
+            .iter()
+            .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Build")
+            .expect("done build step");
+        assert_eq!(build["state"], "done");
     }
 
     /// A blocked session whose template can't be read has no phase list, but
@@ -756,7 +926,8 @@ mod tests {
     }
 
     /// Reaching the terminal state renders `completed` and still carries the
-    /// full ordered phase list.
+    /// full ordered phase list, with every step `done`: the terminal phase
+    /// reads finished, not `in progress` (koto#554).
     #[test]
     fn terminal_renders_completed_with_phases() {
         let base = TempDir::new().unwrap();
@@ -774,15 +945,29 @@ mod tests {
 
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
         assert_eq!(v["status"], "completed");
+        assert_eq!(v["koto"]["status"], "completed");
         assert_eq!(v["phases"].as_array().unwrap().len(), 4);
-        // The terminal phase is the active one now.
-        let review = v["workflowProgress"]
-            .as_array()
-            .unwrap()
+        // The terminal phase is the active one now, and it reads done.
+        let progress = v["workflowProgress"].as_array().unwrap();
+        let review = progress
             .iter()
             .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Review")
             .expect("review step");
-        assert_eq!(review["state"], "progress");
+        assert_eq!(review["state"], "done");
+        assert!(review.get("blocked").is_none());
+        assert!(review.get("error").is_none());
+        assert!(progress
+            .iter()
+            .filter(|n| n["type"] == "workflow_agent")
+            .all(|n| n["state"] == "done"));
+        let review_detail = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["title"] == "Review")
+            .unwrap()["detail"]
+            .clone();
+        assert_eq!(review_detail, "done");
     }
 
     /// The enriched file carries the holdings summary -- key names and sizes

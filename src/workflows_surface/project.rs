@@ -34,6 +34,10 @@ pub struct Projection {
     pub current_state: Option<String>,
     /// Running / completed / failed.
     pub status: RenderStatus,
+    /// The session was cancelled and is not at a terminal state: what made
+    /// it `Failed`. A session at a terminal state is classified by the state
+    /// it ended at even when it was also cancelled, so this is `false` there.
+    pub cancelled: bool,
 }
 
 /// Derive the minimal projection for `session_id`, reading through `backend`.
@@ -103,6 +107,7 @@ fn project_from_log(
         display_name,
         current_state,
         status,
+        cancelled: cancelled && !is_terminal,
     }
 }
 

@@ -141,6 +141,12 @@ pass "AC1: completed phase shows its gate outcome"
 [ "$(field "$F" status)" = "completed" ] || fail "render#3: terminal status != completed (got '$(field "$F" status)')"
 [ "$(field "$F" startTime)" = "$START1" ] || fail "render#3: startTime not preserved across rewrites"
 pass "render#3: terminal renders as completed; startTime stable"
+# Claude Code counts a phase's done steps over all its steps and draws a
+# progress step on a finished run as Stopped, so every step must be done.
+NOT_DONE="$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));s=[n for n in d.get('workflowProgress',[]) if n.get('type')=='workflow_agent'];print('none' if not s else ','.join(n.get('label','?')+'='+str(n.get('state')) for n in s if n.get('state')!='done'))" "$F")"
+[ "$NOT_DONE" != "none" ] || fail "render#3: no workflow_agent steps written"
+[ -z "$NOT_DONE" ] || fail "render#3: finished session has steps not done ($NOT_DONE)"
+pass "render#3: every workflow_agent step is done, none progress"
 
 # ---- render #4: with no published location, koto writes nothing ----
 NOPUB_SESSIONS="$(mktemp -d)"; NOPUB_WF="$(mktemp -d)"
