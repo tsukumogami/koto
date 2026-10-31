@@ -214,6 +214,29 @@ const HELD_ELSEWHERE_FANOUT: usize = 64;
 /// and its own one retry, a second apart.
 const LIST_ATTEMPTS: u32 = 3;
 
+/// File name, in a session's local directory, of the mark a failed
+/// `summary.json` PUT leaves: the next flush writes the summary even when
+/// the state didn't change, and a PUT that succeeds removes the mark. The
+/// file is host-local; no flush uploads it.
+pub(crate) const SUMMARY_OWED_FILE: &str = "cloud-summary-owed";
+
+/// Mark the session in `dir` as owing its summary. Best-effort.
+fn mark_summary_owed(dir: &Path) {
+    if dir.is_dir() {
+        let _ = std::fs::write(dir.join(SUMMARY_OWED_FILE), b"");
+    }
+}
+
+/// Whether the session in `dir` owes its summary.
+fn summary_owed(dir: &Path) -> bool {
+    dir.join(SUMMARY_OWED_FILE).exists()
+}
+
+/// Clear the mark [`mark_summary_owed`] left in `dir`, if any.
+fn clear_summary_owed(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(SUMMARY_OWED_FILE));
+}
+
 /// [`list_retrying`]'s wait before its second ask, doubled before each ask
 /// after that.
 const LIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1519,32 +1542,53 @@ impl CloudBackend {
     /// holds under `state_etag`, after a push of the session's own state
     /// ([`crate::session::summary`]). Internal sessions get none. A failed
     /// PUT warns and never fails the push: the state is already in the
-    /// bucket. The summary is written again only when the session's state
-    /// is next pushed; a flush with no state change doesn't retry it.
+    /// bucket. It leaves [`SUMMARY_OWED_FILE`] in the session's local
+    /// directory, so the next flush writes the summary even when the state
+    /// didn't change ([`CloudBackend::put_owed_summary`]); a PUT that
+    /// succeeds removes it.
     fn put_summary(&self, id: &str, data: &[u8], state_etag: Option<&str>) {
         use crate::session::summary::{SessionSummary, SUMMARY_FILE};
         if self.probes.read_only {
             return;
         }
         let home = self.home(id);
-        let Some(summary) = SessionSummary::build(
-            id,
-            &home,
-            data,
-            &self.local.session_dir(id),
-            state_etag.unwrap_or_default(),
-        ) else {
+        let dir = self.local.session_dir(id);
+        let Some(summary) =
+            SessionSummary::build(id, &home, data, &dir, state_etag.unwrap_or_default())
+        else {
+            clear_summary_owed(&dir);
             return;
         };
         let key = format!("{}/{}/{}", home, id, SUMMARY_FILE);
-        if let Err(e) = self.bucket.put_object(&key, &summary.to_bytes()) {
-            eprintln!(
-                "warning: cloud sync: publishing the summary of session '{}' to {} failed: {}",
-                id,
-                key,
-                without_url_userinfo(&e.to_string())
-            );
+        match self.bucket.put_object(&key, &summary.to_bytes()) {
+            Ok(_) => clear_summary_owed(&dir),
+            Err(e) => {
+                eprintln!(
+                    "warning: cloud sync: publishing the summary of session '{}' to {} failed: {}",
+                    id,
+                    key,
+                    without_url_userinfo(&e.to_string())
+                );
+                mark_summary_owed(&dir);
+            }
         }
+    }
+
+    /// The summary a failed PUT left owed ([`SUMMARY_OWED_FILE`]), PUT for
+    /// the local state file and the state ETag this host last synced, by a
+    /// flush that has no state to push. No state file goes up, and with
+    /// nothing owed nothing is asked of the bucket.
+    fn put_owed_summary(&self, id: &str) {
+        let dir = self.local.session_dir(id);
+        if self.probes.read_only || !summary_owed(&dir) {
+            return;
+        }
+        let Ok(data) = std::fs::read(dir.join(state_file_name(id))) else {
+            clear_summary_owed(&dir);
+            return;
+        };
+        let state_etag = self.stamp(id).and_then(|s| s.state_etag);
+        self.put_summary(id, &data, state_etag.as_deref());
     }
 
     /// One PUT of a state file: on `etag` when given, else only where no
@@ -3237,8 +3281,10 @@ impl CloudBackend {
         let journal = self.journal(id);
         if !journal.is_open() {
             // Nothing is owed: a marker this can't delete yet is a warning,
-            // and the opening file stays for the next command.
+            // and the opening file stays for the next command. A summary a
+            // failed PUT left owed goes up on its own.
             self.try_clear_unopened_batch(id);
+            self.put_owed_summary(id);
             return Ok(());
         }
         let Some(lock) = journal.lock()? else {
@@ -3246,6 +3292,7 @@ impl CloudBackend {
         };
         // Another process flushed it while this one waited for the lock.
         let Some(pending) = journal.pending()? else {
+            self.put_owed_summary(id);
             return Ok(());
         };
         self.local_guard(id)?;
