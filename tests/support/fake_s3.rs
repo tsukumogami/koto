@@ -42,7 +42,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One request as the endpoint received it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +96,9 @@ struct Hold {
 #[derive(Debug, Default)]
 struct State {
     objects: BTreeMap<String, Vec<u8>>,
+    /// When each object was last written, which listings report as its
+    /// LastModified.
+    modified: BTreeMap<String, SystemTime>,
     requests: Vec<Request>,
     faults: Vec<Fault>,
     triggers: Vec<Trigger>,
@@ -168,9 +171,15 @@ impl FakeS3 {
 
     /// Store `bytes` under `key` directly, as another writer would.
     pub fn put(&self, key: &str, bytes: &[u8]) {
-        lock(&self.state)
-            .objects
-            .insert(key.to_string(), bytes.to_vec());
+        let mut st = lock(&self.state);
+        st.modified.insert(key.to_string(), SystemTime::now());
+        st.objects.insert(key.to_string(), bytes.to_vec());
+    }
+
+    /// Set the LastModified listings report for `key`, as an object written
+    /// at `at` would carry.
+    pub fn set_last_modified(&self, key: &str, at: SystemTime) {
+        lock(&self.state).modified.insert(key.to_string(), at);
     }
 
     /// Remove `key` directly.
@@ -463,6 +472,7 @@ fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
         .partition(|t| t.method == req.method && t.key == key);
     st.triggers = kept;
     for t in fired {
+        st.modified.insert(t.put_key.clone(), SystemTime::now());
         st.objects.insert(t.put_key, t.bytes);
     }
 }
@@ -517,6 +527,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
             }
         }
         if fault.store {
+            st.modified.insert(key.clone(), SystemTime::now());
             st.objects.insert(key.clone(), req.body.clone());
         }
         if fault.garble {
@@ -532,6 +543,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         return Reply::ok(list_xml(
             bucket,
             &st.objects,
+            &st.modified,
             &prefix,
             delimiter.as_deref(),
             after.as_deref(),
@@ -575,6 +587,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
                 );
             }
             let tag = etag(&req.body);
+            st.modified.insert(key.clone(), SystemTime::now());
             st.objects.insert(key, req.body.clone());
             Reply {
                 status: 200,
@@ -605,6 +618,7 @@ const PAGE_KEYS: usize = 1000;
 fn list_xml(
     bucket: &str,
     objects: &BTreeMap<String, Vec<u8>>,
+    modified: &BTreeMap<String, SystemTime>,
     prefix: &str,
     delimiter: Option<&str>,
     after_token: Option<&str>,
@@ -634,7 +648,11 @@ fn list_xml(
                 common
                     .last()
                     .into_iter()
-                    .chain(contents.last().map(|(k, _, _): &(String, usize, String)| k))
+                    .chain(
+                        contents
+                            .last()
+                            .map(|(k, _, _, _): &(String, usize, String, String)| k),
+                    )
                     .max()
                     .cloned()
                     .unwrap_or_default(),
@@ -644,7 +662,12 @@ fn list_xml(
         entries += 1;
         match entry {
             Some(rolled) => common.push(rolled),
-            None => contents.push((key.clone(), bytes.len(), etag(bytes))),
+            None => contents.push((
+                key.clone(),
+                bytes.len(),
+                etag(bytes),
+                rfc3339_millis(modified.get(key).copied().unwrap_or(UNIX_EPOCH)),
+            )),
         }
     }
 
@@ -668,12 +691,13 @@ fn list_xml(
             xml_escape(token)
         ));
     }
-    for (key, size, tag) in &contents {
+    for (key, size, tag, modified) in &contents {
         xml.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
              <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>\
              </Contents>",
             xml_escape(key),
+            modified,
             xml_escape(tag),
             size
         ));
@@ -686,6 +710,30 @@ fn list_xml(
     }
     xml.push_str("</ListBucketResult>");
     xml.into_bytes()
+}
+
+/// `at` as S3 lists a LastModified: `YYYY-MM-DDTHH:MM:SS.sssZ`, UTC.
+fn rfc3339_millis(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs();
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since the epoch to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60,
+        since.subsec_millis()
+    )
 }
 
 fn xml_escape(s: &str) -> String {
