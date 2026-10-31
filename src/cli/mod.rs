@@ -2953,7 +2953,7 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Dashboard(args) => {
             let backend = build_backend()?;
-            dashboard::run(args, &backend)
+            dashboard::run(args, backend)
         }
     }
 }

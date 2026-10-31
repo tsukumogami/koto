@@ -8,11 +8,17 @@
 //! a remote row never costs the size of its history, and it reads nothing
 //! under `ctx/`. The reader has no write method: it lists and gets, and
 //! works with keys that grant only those.
+//!
+//! The interactive dashboard reads through a [`RemoteFeed`]: one background
+//! thread that owns its own reader, scans on a fixed interval, and hands each
+//! complete [`RemoteSnapshot`] to the UI thread over a channel, so no key
+//! press or redraw ever waits on the bucket.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use s3::Bucket;
 
@@ -241,6 +247,94 @@ impl RemoteReader {
                 .cmp(&(b.workspace.as_str(), b.summary.name.as_str()))
         });
         snapshot
+    }
+}
+
+/// How long the feed thread waits between the end of one scan and the
+/// start of the next.
+pub const RESCAN_INTERVAL: Duration = Duration::from_secs(55);
+
+/// How often a waiting feed thread looks at its stop flag.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// The interactive dashboard's view of the bucket: a background thread that
+/// scans at start and then every `interval`, and sends each complete
+/// snapshot to the thread holding this handle.
+///
+/// The thread owns its own [`RemoteReader`]; the holder never touches a
+/// bucket. Dropping the handle tells the thread to stop, and nothing waits
+/// for it: a thread stuck in a request that never answers ends with the
+/// process.
+pub struct RemoteFeed {
+    snapshots: Receiver<RemoteSnapshot>,
+    local_ids: Arc<Mutex<HashSet<String>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl RemoteFeed {
+    /// Start the feed thread on a copy of `bucket`. `local_ids` are the
+    /// `session_id`s of the sessions this machine holds, which every scan
+    /// leaves to their local rows; [`RemoteFeed::set_local_ids`] replaces
+    /// them. Starting makes no request on the calling thread.
+    pub fn spawn(
+        bucket: &Bucket,
+        local_ids: HashSet<String>,
+        interval: Duration,
+    ) -> anyhow::Result<Self> {
+        let reader = RemoteReader::new(bucket)?;
+        let (tx, snapshots) = mpsc::channel();
+        let local_ids = Arc::new(Mutex::new(local_ids));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ids, stopped) = (Arc::clone(&local_ids), Arc::clone(&stop));
+        std::thread::Builder::new()
+            .name("koto-remote-feed".to_string())
+            .spawn(move || loop {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                let ids = ids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let snapshot = reader.scan(&ids);
+                if stopped.load(Ordering::Relaxed) || tx.send(snapshot).is_err() {
+                    return;
+                }
+                let until = Instant::now() + interval;
+                while Instant::now() < until {
+                    if stopped.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(
+                        STOP_POLL.min(until.saturating_duration_since(Instant::now())),
+                    );
+                }
+            })?;
+        Ok(Self {
+            snapshots,
+            local_ids,
+            stop,
+        })
+    }
+
+    /// The newest snapshot the thread has sent since the last call, if any;
+    /// older ones still queued are dropped. Never blocks.
+    pub fn latest(&self) -> Option<RemoteSnapshot> {
+        let mut latest = None;
+        loop {
+            match self.snapshots.try_recv() {
+                Ok(snapshot) => latest = Some(snapshot),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest,
+            }
+        }
+    }
+
+    /// Replace the `session_id`s the next scan leaves to local rows.
+    pub fn set_local_ids(&self, ids: HashSet<String>) {
+        *self.local_ids.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+}
+
+impl Drop for RemoteFeed {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
