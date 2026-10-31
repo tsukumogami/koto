@@ -143,11 +143,12 @@ variable, else the `machine.name` key in the user-level configuration
 (`koto config set --user machine.name <name>`), else the hostname as the
 operating system reports it with any domain part (from the first `.`)
 removed. An empty value counts as unset. A name is
-1 to 64 characters from letters, digits, `.`, `-` and `_`. `koto config set`
-refuses any other value; an environment value that breaks the rule is
+1 to 64 characters from letters, digits, `.`, `-` and `_`, and the name
+`unknown` is reserved for sessions with no recorded machine. `koto config
+set` refuses any other value; an environment value that breaks the rule is
 ignored with one warning on stderr and the next source is used; a hostname
 that breaks it has each other character replaced by `-` and is cut to 64
-characters.
+characters, and a hostname of `unknown` is recorded as `unknown-host`.
 
 **R3. The recorded machine survives the operations that rewrite a session.**
 A rebind, a cloud push or pull, a resolve, and a header rewrite by any koto
@@ -325,6 +326,9 @@ records every request.
 - [ ] A 64-character `machine.name` is accepted and a 65-character one is
   refused; a hostname `my host_01.example.com` is recorded as
   `my-host_01`. (R2)
+- [ ] `koto config set --user machine.name unknown` exits non-zero and
+  changes nothing, and on a host named `unknown` with no configured name a
+  new session records `unknown-host`. (R2)
 - [ ] `koto config set --user machine.name "bad name!"` exits non-zero and
   changes nothing; `KOTO_MACHINE_NAME="bad name!"` produces one stderr
   warning and the session records the next source's value. (R2)

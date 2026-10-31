@@ -472,8 +472,9 @@ delete paths or `origin`.
   parent and producing machine. The local dashboard and the summary writer
   both call it.
 - **Summary writer** (`src/session/summary.rs`, called from `put_state`
-  after `record_synced`, from `put_state_over`, and once after the import's
-  `push_staged`, which is changed to keep the state PUT's ETag; not from
+  after `record_synced`, from `put_state_over`, and once after
+  `push_staged` (shared by import and the takeover path), which is changed
+  to keep the state PUT's ETag; not from
   `put_state_if`, the conditional-PUT helper `put_state` and `push_fence`
   call, so a push writes one summary and a fence writes none): builds a `SessionSummary` from `derive_row` plus `last_seq`,
   `state_etag` and `sources`, applies the per-field caps, serializes it

@@ -56,6 +56,7 @@ the step whose behaviour they cover.
 - [ ] That line on B has exactly ten tab-separated fields, with `machine-a` in the ninth (`machine`) and A's 16-hex workspace prefix in the tenth (`workspace`); the same session on A's `--once` shows `machine-a` in its ninth field.
 - [ ] B's run makes only listing and GET requests against the fake bucket (no PUT, DELETE or POST), creates no directory in B's session store, and fetches no object whose key is a state file.
 - [ ] A `/ctx/`-delimited listing of a session-shaped directory against Cloudflare R2 returns the session's top-level objects (state file, `summary.json`, `migrated.json`) and exactly one common prefix for its `ctx/` tree, and reports a clear failure naming the endpoint when it does not.
+- [ ] A session B created itself, whose copy is also in the bucket, appears exactly once in B's `--once` output, as B's own row with B's machine.
 - [ ] On B, `--needs-you` keeps A's blocked session and `--status running` drops it; `koto dashboard --once <name>` with A's session name prints its line; and the eight existing columns keep their positions and meanings.
 - [ ] With the local backend selected, even with a bucket configured, every `--once` line over the existing `--once` test fixtures equals the line those tests expect today followed by two empty tab-separated fields, and the run makes no network request.
 - [ ] `docs/reference/session-feed.md` describes the `machine` and `workspace` columns as columns nine and ten, empty when no machine is recorded and empty for `workspace` on the local backend.
@@ -90,7 +91,7 @@ Removed sessions drop, an import's migrated source is hidden and counted, sessio
 
 ### Step 4: the machine name follows KOTO_MACHINE_NAME and machine.name and survives every rewrite
 
-The name follows the environment, then user-level machine.name, then the short hostname, with validation; it survives rebind, push and pull, resolve and an older release's header rewrite, an import records the importing machine, --detail reports it, and the guides document it (the origin both evidence scenarios name; PRD R1 to R5, R16).
+The name follows the environment, then user-level machine.name, then the short hostname, with validation and `unknown` reserved; it survives rebind, push and pull, resolve and an older release's header rewrite, an import records the importing machine, --detail reports it, and the guides document it (the origin both evidence scenarios name; PRD R1 to R5, R16).
 
 ### Step 5: a slow, failing or read-only bucket leaves machine B's local sessions visible with one classed notice
 
@@ -117,7 +118,7 @@ object, which needs tombstones and new deletes) before step 3 starts.
 Which evidence scenario each step advances:
 
 - Step 1: the text scenario (`koto dashboard --once` on B shows A's session,
-  state and origin machine); PRD R6, R7, R14 and R20, and the parts of R1
+  state and origin machine); PRD R6, R7, R14 and R20, R10 in `--once`, and the parts of R1
   and R18 the skeleton needs.
 - Step 2: the interactive scenario (the dashboard on B shows the same);
   PRD R8, R9 and R10 in the TUI, and R23.
