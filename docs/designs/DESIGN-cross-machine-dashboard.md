@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto's dashboard reads only this machine's session store and the current
   directory's bucket prefix, so a session another machine wrote is a
@@ -40,7 +40,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
