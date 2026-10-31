@@ -5,6 +5,11 @@
 //! `KOTO_SESSIONS_BASE` on every command its gate starts, so a suite started
 //! there would otherwise run against that run's store.
 //!
+//! It removes `KOTO_ANCHOR`, `KOTO_DISPATCHER_ANCHOR` and `KOTO_AUTHORITY`
+//! the same way. A session started through a workspace manager can export
+//! them, and a suite that inherits them reads the caller's anchor instead
+//! of its own fixture, so a test could write under the caller's real state.
+//!
 //! The first test reads the map and fails on a command that doesn't start
 //! with the wrapper. The others run the wrapper with the variables set to
 //! scratch values: once to show the command it starts sees none of them,
@@ -98,6 +103,65 @@ fn the_check_refuses_a_set_variable_without_starting_the_command() {
         let ran = scratch.path().join("ran");
         let out = wrapper(&["--check", "touch", ran.to_str().unwrap()])
             .env(name, scratch.path().join("sessions"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "the check didn't refuse with {name} set: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{name} is set")),
+            "the refusal doesn't name {name}: {stderr}"
+        );
+        assert!(
+            !ran.exists(),
+            "the check started the command with {name} set"
+        );
+    }
+}
+
+/// The anchor and authority variables the wrapper removes along with the
+/// store variables. Hosted CI sets none of them.
+const ANCHOR_NAMES: [&str; 3] = ["KOTO_ANCHOR", "KOTO_DISPATCHER_ANCHOR", "KOTO_AUTHORITY"];
+
+#[test]
+fn the_wrapper_starts_its_command_with_no_anchor_or_authority_variable() {
+    let mut cmd = wrapper(&["sh", "-c", "env | cut -d= -f1"]);
+    for name in ANCHOR_NAMES {
+        cmd.env(name, "scratch-anchor");
+    }
+    let out = cmd.env("KOTO_TEST_WRAPPER_KEPT", "1").output().unwrap();
+    assert!(
+        out.status.success(),
+        "the wrapper failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names = String::from_utf8_lossy(&out.stdout);
+    let names: Vec<&str> = names.lines().collect();
+    assert!(
+        names.contains(&"KOTO_TEST_WRAPPER_KEPT"),
+        "the command didn't see a variable the wrapper leaves alone, so an \
+         empty result proves nothing: {names:?}"
+    );
+    let left: Vec<&&str> = names
+        .iter()
+        .filter(|name| ANCHOR_NAMES.contains(name))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the command the wrapper started still has {left:?}"
+    );
+}
+
+#[test]
+fn the_check_refuses_a_set_anchor_or_authority_variable() {
+    for name in ANCHOR_NAMES {
+        let scratch = tempfile::tempdir().unwrap();
+        let ran = scratch.path().join("ran");
+        let out = wrapper(&["--check", "touch", ran.to_str().unwrap()])
+            .env(name, "scratch-anchor")
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
