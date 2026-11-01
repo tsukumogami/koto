@@ -141,7 +141,27 @@ the step whose behaviour they cover.
 
 ### Step 5: a slow, failing or read-only bucket leaves machine B's local sessions visible with one classed notice
 
-Requests time out at 10 seconds, failures show as unreachable, denied, timeout or throttled on one status line or stderr note while local rows stay visible and the TUI keeps responding, partial failures name a count, and list-and-get keys work with nothing written (both evidence scenarios under failure; PRD R17 to R19, R23).
+**Goal**: Every bucket request the dashboard's reader makes times out after 10 seconds, a timed-out request isn't retried, and every failure the reader meets falls in one of four classes: `unreachable` (connection refused, host not resolved, or any other answer that isn't a usable reply), `denied` (HTTP 401 or 403), `timeout` (no answer within 10 seconds), and `throttled` (HTTP 429 or 503 after koto's usual retries). `RemoteSnapshot.failure` becomes that classed value (class, endpoint host, failed workspaces) instead of free text. When the top-level listing fails, the run makes no further bucket request, the TUI keeps its local rows and the remote rows it last had and shows one status line naming the class and the endpoint's host, and `--once` prints its local rows, writes one stderr line with the same two facts and exits 0. When some prefixes fail, rows from the readable ones show and the one line says how many workspaces couldn't be read and names the first failure's class; the rows step 3 kept for the failed workspaces stay. A summary GET that fails is counted in the unreadable tally. The status line clears on the first snapshot read without failure. The reader works with keys that grant only list and get: it writes nothing to the bucket and creates nothing in the session store. On the writing side, a failed `summary.json` PUT after a state push warns as before and marks the session, so the next flush writes the summary even when the state didn't change, and clears the mark once a summary PUT succeeds. Step 3 kept prior rows and showed a failed listing as unclassed text; this step classes it and bounds its timing. No row fact comes from `ctx/`, no owner field is added, and project config loading and how koto resolves the bucket and credentials don't change.
+
+**Acceptance Criteria**:
+
+- [ ] With an endpoint that refuses connections, B's `koto dashboard --once --all` prints its local rows, writes exactly one stderr line containing `unreachable` and the endpoint's host, and exits 0; B's TUI shows its local rows and one status line with the same two facts. With every request answered 403 the class is `denied`, and with every request answered 429 through koto's retries it is `throttled`.
+- [ ] With the top-level listing failing, the fake bucket's request log shows no request after that listing.
+- [ ] With an endpoint that accepts connections and never answers, B's TUI frame after a key press reflects it within 200 ms, and B's `--once` exits 0 within 15 seconds with one stderr line containing `timeout` and the host.
+- [ ] With one of three workspace prefixes answering 500 on its listing, B's `--once` prints the other two prefixes' sessions and one stderr line saying 1 workspace couldn't be read and naming the class; the TUI's status line says the same and keeps the rows it last had for that workspace.
+- [ ] A session whose listing succeeds but whose `summary.json` GET answers 500 prints with status `unknown` and is counted in the unreadable tally.
+- [ ] With B's TUI showing the failure status line, once the endpoint answers normally again the line is gone after the feed's next snapshot.
+- [ ] With an empty bucket, B shows its local rows and no status line.
+- [ ] With the fake bucket refusing every PUT and DELETE with 403 (keys that grant only list and get), B's TUI and `--once` list A's sessions, the request log shows no write request, and B's session store gains no directory.
+- [ ] With the fake bucket failing the `summary.json` PUT once, a tick on A prints the existing warning and succeeds; the next flush on A that changes nothing in the state PUTs `summary.json` (and no state file), after which B's `--once` shows the session from its summary. A further unchanged flush PUTs nothing.
+- [ ] A tick on A that pushes state also PUTs `summary.json` within the 30-second action limit; the test prints the summary PUT's latency after the state push.
+- [ ] Every class name and the host in the status line and stderr note pass through the dashboard's sanitizer.
+
+**Check**: Run `cargo test --test dashboard_cross_machine_test` and see the new failure cases pass beside steps 1 to 3's. They run `koto` processes against the in-process fake bucket (`tests/support/fake_s3.rs`), a listener that refuses connections, and the file's never-answering endpoint, and assert `--once`'s stdout, its one stderr line and exit code, the TUI's rendered buffer and status line (ratatui `TestBackend`, feed on a short test interval) and the request log. Then run `cargo test --test cloud_summary_retry_test` for the summary retry on the next flush, and `cargo test remote_feed` for the unit tests of the failure classifier, one per class.
+
+**Dependencies**: Step 2
+
+**Files**: `src/session/remote_feed.rs`, `src/session/cloud.rs`, `src/cli/dashboard_data.rs`, `src/cli/dashboard.rs`, `src/cli/dashboard_render.rs`, `tests/dashboard_cross_machine_test.rs`, `tests/cloud_summary_retry_test.rs`, `tests/support/fake_s3.rs`, `docs/reference/session-feed.md`
 
 ### Step 6: machine B sees machine A's change within 60 seconds without refetching unchanged sessions
 

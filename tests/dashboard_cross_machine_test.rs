@@ -792,9 +792,18 @@ fn drive_tui(
     b: &Machine,
     step: &mut dyn FnMut(&[String], &DashboardAppState) -> bool,
 ) {
+    drive_tui_at(&s3.endpoint(), b, step)
+}
+
+/// [`drive_tui`] with the feed reading the bucket at `endpoint`.
+fn drive_tui_at(
+    endpoint: &str,
+    b: &Machine,
+    step: &mut dyn FnMut(&[String], &DashboardAppState) -> bool,
+) {
     let (store, tree) = local_rows(b);
     let feed = RemoteFeed::spawn(
-        &bucket_at(&s3.endpoint()),
+        &bucket_at(endpoint),
         dashboard_data::local_view(&tree),
         Duration::from_millis(200),
     )
@@ -877,8 +886,9 @@ fn a_removed_session_drops_from_once_and_the_tui() {
 
 /// A failed listing is never read as a removal: the TUI keeps A's row and
 /// shows the failure on one status line, keeps every remote row when the
-/// top-level listing fails, and drops the row once the listing answers and
-/// the session is gone.
+/// top-level listing fails, and on the first snapshot after the listing
+/// answers again drops the row of the session that went meanwhile and the
+/// status line with it.
 #[test]
 fn a_failed_listing_keeps_remote_rows_and_shows_one_status_line() {
     let (s3, a, b) = two_machines();
@@ -890,32 +900,49 @@ fn a_failed_listing_keeps_remote_rows_and_shows_one_status_line() {
             .filter(|l| l.contains("\u{26a0} bucket:"))
             .count()
     };
+    let has = |lines: &[String], text: &str| lines.iter().any(|l| l.contains(text));
     let mut phase = 0;
     drive_tui(&s3, &b, &mut |lines, state| {
         let shown = state.tree.sessions.contains_key(&remote);
-        let failure = state.tree.remote_failure.clone().unwrap_or_default();
+        let failure = state.tree.remote_failure.clone();
+        let top_level = failure.as_ref().is_some_and(|f| f.top_level);
         match phase {
             0 if shown => {
                 assert_eq!(status(lines), 0, "{lines:#?}");
                 s3.fail("LIST", &format!("{ws}/"), 403);
                 phase = 1;
             }
-            1 if !failure.is_empty() => {
+            1 if failure.is_some() => {
                 assert!(shown, "A's row stays while its listing fails");
                 assert_eq!(status(lines), 1, "{lines:#?}");
-                assert!(lines.iter().any(|l| l.contains("@machine-a")), "{lines:#?}");
+                assert_eq!(
+                    status_text(lines),
+                    "\u{26a0} bucket: 1 workspace couldn't be read; the first: denied at \
+                     127.0.0.1",
+                    "{lines:#?}"
+                );
+                assert!(has(lines, "@machine-a"), "{lines:#?}");
                 s3.clear_faults();
                 s3.fail("LIST", "", 403);
                 phase = 2;
             }
-            2 if failure.contains("workspace prefixes") => {
+            2 if top_level => {
                 assert!(shown, "every remote row stays");
                 assert_eq!(status(lines), 1, "{lines:#?}");
-                s3.clear_faults();
+                assert_eq!(
+                    status_text(lines),
+                    "\u{26a0} bucket: denied at 127.0.0.1: the bucket couldn't be listed",
+                    "{lines:#?}"
+                );
+                // The session goes while the listing still fails, so the
+                // first snapshot that reads the bucket again is the one that
+                // must drop the row and the status line.
                 a.ok(&["session", "cleanup", WF]);
+                s3.clear_faults();
                 phase = 3;
             }
-            3 if !shown && failure.is_empty() => {
+            3 if failure.is_none() => {
+                assert!(!shown, "the first clean snapshot drops the row");
                 assert_eq!(status(lines), 0, "{lines:#?}");
                 return true;
             }
@@ -1149,4 +1176,327 @@ fn once_by_name_prints_both_machines_same_named_sessions() {
             ("machine-b".to_string(), b.workspace()),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// A slow, failing or read-only bucket (PLAN step 5).
+// ---------------------------------------------------------------------------
+
+/// The host of every endpoint these tests stand up.
+const HOST: &str = "127.0.0.1";
+
+/// An endpoint that refuses connections: a port bound and let go.
+fn refusing() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    endpoint
+}
+
+impl Machine {
+    /// `--once` with `args` appended, against the bucket at `endpoint`
+    /// instead of the fake one, and how long it took.
+    fn once_at(&self, endpoint: &str, args: &[&str]) -> (Out, Duration) {
+        let mut all = vec!["dashboard", "--once"];
+        all.extend_from_slice(args);
+        let mut cmd = self.cmd(&all);
+        cmd.env("KOTO_SESSION_CLOUD_ENDPOINT", endpoint);
+        let started = Instant::now();
+        let o = cmd.output().unwrap();
+        let took = started.elapsed();
+        let out = Out {
+            code: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        };
+        (out, took)
+    }
+
+    /// The names of the entries in this machine's session store.
+    fn store_entries(&self) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(self.sessions())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The one line `out` wrote to stderr.
+fn only_note(out: &Out) -> String {
+    let lines: Vec<&str> = out.stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "one stderr line: {}", out.describe());
+    lines[0].to_string()
+}
+
+/// The `--once` stderr line for a failed top-level listing of class
+/// `class`.
+fn top_level_note(class: &str) -> String {
+    format!(
+        "note: other machines' sessions weren't read: {class} at {HOST}: the bucket couldn't be \
+         listed"
+    )
+}
+
+/// `--once` printed B's own `mine` and nothing else, exited 0, and wrote
+/// the one stderr line for a failed top-level listing of class `class`.
+fn assert_local_rows_and_note(out: &Out, class: &str) {
+    assert_eq!(out.code, Some(0), "{}", out.describe());
+    let rows = out.rows();
+    assert_eq!(rows.len(), 1, "B's local row only: {}", out.describe());
+    assert_eq!(
+        (rows[0][0].as_str(), rows[0][8].as_str()),
+        ("mine", "machine-b")
+    );
+    assert_eq!(only_note(out), top_level_note(class));
+}
+
+/// The TUI's status lines in `lines`.
+fn status_lines(lines: &[String]) -> Vec<&String> {
+    lines
+        .iter()
+        .filter(|l| l.contains("\u{26a0} bucket:"))
+        .collect()
+}
+
+/// The text of the TUI's status line, which wraps inside the list pane:
+/// its rows, from the one that starts it to the pane's bottom border,
+/// each trimmed and joined with a space. Empty when no status line shows.
+fn status_text(lines: &[String]) -> String {
+    let Some(start) = lines.iter().position(|l| l.contains("\u{26a0} bucket:")) else {
+        return String::new();
+    };
+    lines[start..]
+        .iter()
+        .take_while(|l| !l.starts_with('\u{2514}'))
+        .filter_map(|l| l.split('\u{2502}').nth(1))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `lines` show B's local row, which is blocked at `check` and
+/// carries no `@<machine>` marker.
+fn shows_local_row(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("check") && !l.contains('@'))
+}
+
+/// B's TUI, its feed reading `endpoint`, comes to show B's local row and
+/// one status line holding `text`.
+fn assert_tui_status(endpoint: &str, b: &Machine, text: &str) {
+    drive_tui_at(endpoint, b, &mut |lines, _| {
+        status_lines(lines).len() == 1
+            && status_text(lines).contains(text)
+            && shows_local_row(lines)
+    });
+}
+
+/// With an endpoint that refuses connections, every request answered 403,
+/// or every request answered 429 through koto's retries, B's `--once`
+/// prints its local rows, writes one stderr line naming the class and the
+/// host, and exits 0, and the TUI shows the local rows and one status line
+/// with the same two facts. A failed top-level listing is the run's last
+/// request: denied, it is asked once; throttled, it is asked koto's usual
+/// three times and nothing follows. The TUI's feed, too, asks nothing but
+/// top-level listings while they fail.
+#[test]
+fn a_refused_denied_or_throttled_bucket_leaves_local_rows_and_one_classed_line() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let top_level = |class: &str| format!("{class} at {HOST}: the bucket couldn't be listed");
+
+    let refused = refusing();
+    let (out, _) = b.once_at(&refused, &["--all"]);
+    assert_local_rows_and_note(&out, "unreachable");
+    assert_tui_status(&refused, &b, &top_level("unreachable"));
+
+    for (status, class, asks) in [(403, "denied", 1), (429, "throttled", 3)] {
+        s3.clear_faults();
+        s3.fail_all(status);
+        s3.clear_requests();
+        let (out, _) = b.once_at(&s3.endpoint(), &["--all"]);
+        assert_local_rows_and_note(&out, class);
+        let requests = s3.requests();
+        assert_eq!(requests.len(), asks, "{status}: {requests:?}");
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method == "GET" && r.list_prefix.as_deref() == Some("")),
+            "only the top-level listing, nothing after it: {requests:?}"
+        );
+        s3.clear_requests();
+        assert_tui_status(&s3.endpoint(), &b, &top_level(class));
+        let requests = s3.requests();
+        assert!(
+            !requests.is_empty()
+                && requests
+                    .iter()
+                    .all(|r| r.method == "GET" && r.list_prefix.as_deref() == Some("")),
+            "the TUI's feed made only top-level listings, nothing after one: {requests:?}"
+        );
+    }
+}
+
+/// With an endpoint that accepts connections and never answers, B's
+/// `--once` exits 0 within 15 seconds with one stderr line naming `timeout`
+/// and the host, having asked once: a timed-out request isn't asked again.
+#[test]
+fn once_against_a_bucket_that_never_answers_exits_within_15s_with_one_timeout_line() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let (endpoint, dialled) = never_answering();
+
+    let (out, took) = b.once_at(&endpoint, &["--all"]);
+    println!("--once against a bucket that never answers took {took:?}");
+    assert!(took < Duration::from_secs(15), "took {took:?}");
+    assert_local_rows_and_note(&out, "timeout");
+    assert_eq!(dialled.load(Ordering::SeqCst), 1, "asked once");
+}
+
+/// With one of three workspace prefixes answering 500 on its listing, B's
+/// `--once` prints the other two prefixes' sessions and one stderr line
+/// saying 1 workspace couldn't be read and naming the class; the TUI's
+/// status line says the same and keeps the row it last had for that
+/// workspace, and the line is gone after the first snapshot once the
+/// listing answers again.
+#[test]
+fn one_failed_workspace_of_three_leaves_the_others_rows_and_one_line() {
+    let s3 = FakeS3::start(BUCKET);
+    let machines = ["machine-a1", "machine-a2", "machine-a3"].map(|name| Machine::new(&s3, name));
+    for m in &machines {
+        m.start_blocked(WF);
+    }
+    let b = Machine::new(&s3, "machine-b");
+    let workspaces: Vec<String> = machines.iter().map(Machine::workspace).collect();
+    let failing = workspaces[1].clone();
+    let partial = format!("1 workspace couldn't be read; the first: unreachable at {HOST}");
+
+    s3.fail("LIST", &format!("{failing}/"), 500);
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    for (ws, listed) in workspaces.iter().zip([true, false, true]) {
+        assert_eq!(row_of(&rows, WF, ws).is_some(), listed, "{ws}: {rows:?}");
+    }
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        only_note(&out),
+        format!("note: other machines' sessions weren't all read: {partial}")
+    );
+    s3.clear_faults();
+
+    let keys: Vec<String> = workspaces
+        .iter()
+        .map(|ws| dashboard_data::remote_key(WF, ws))
+        .collect();
+    let mut phase = 0;
+    drive_tui(&s3, &b, &mut |lines, state| {
+        let all_shown = keys.iter().all(|k| state.tree.sessions.contains_key(k));
+        let failed = state.tree.remote_failure.is_some();
+        match phase {
+            0 if all_shown && !failed => {
+                assert!(status_lines(lines).is_empty(), "{lines:#?}");
+                s3.fail("LIST", &format!("{failing}/"), 500);
+                phase = 1;
+            }
+            1 if failed => {
+                assert!(all_shown, "the failed workspace's row stays");
+                assert_eq!(status_lines(lines).len(), 1, "{lines:#?}");
+                assert_eq!(
+                    status_text(lines),
+                    format!("\u{26a0} bucket: {partial}"),
+                    "{lines:#?}"
+                );
+                s3.clear_faults();
+                phase = 2;
+            }
+            2 if !failed => {
+                assert!(all_shown);
+                assert!(status_lines(lines).is_empty(), "{lines:#?}");
+                return true;
+            }
+            _ => {}
+        }
+        false
+    });
+}
+
+/// A session whose listing succeeds but whose `summary.json` GET answers
+/// 500 prints with status `unknown` and is counted in the unreadable tally;
+/// no workspace counts as unread.
+#[test]
+fn a_summary_get_that_fails_lists_unknown_and_is_counted() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    s3.fail("GET", &key_of(&ws, WF, "summary.json"), 500);
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let row = row_of(&rows, WF, &ws).unwrap_or_else(|| panic!("{}", out.describe()));
+    assert_eq!((row[1].as_str(), row[3].as_str()), ("", "unknown"));
+    assert_eq!(
+        only_note(&out),
+        "note: 1 unreadable session(s), 1 listed as unknown"
+    );
+}
+
+/// With an empty bucket, B's `--once` prints its local rows and no stderr
+/// line, and the TUI shows them with no status line after its scans.
+#[test]
+fn an_empty_bucket_shows_local_rows_and_no_status_line() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    for key in s3.keys() {
+        s3.remove(&key);
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_eq!(rows.len(), 1, "{}", out.describe());
+    assert_eq!(rows[0][0], "mine");
+    assert!(out.stderr.trim().is_empty(), "{}", out.describe());
+
+    s3.clear_requests();
+    drive_tui(&s3, &b, &mut |lines, state| {
+        // Three top-level listings: at least two scans' snapshots are in.
+        let scans = s3
+            .requests()
+            .iter()
+            .filter(|r| r.list_prefix.as_deref() == Some(""))
+            .count();
+        if scans < 3 {
+            return false;
+        }
+        assert!(state.tree.remote_failure.is_none());
+        assert!(status_lines(lines).is_empty(), "{lines:#?}");
+        assert!(shows_local_row(lines), "{lines:#?}");
+        true
+    });
+}
+
+/// With every PUT and DELETE refused with 403, as keys that grant only list
+/// and get would, B's `--once` and TUI list A's session, the request log
+/// shows no write, and B's session store gains no entry.
+#[test]
+fn keys_that_grant_only_list_and_get_still_list_other_machines_sessions() {
+    let (s3, a, b) = two_machines();
+    let ws = a.workspace();
+    s3.fail_writes(403);
+    let before = b.store_entries();
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let row = row_of(&rows, WF, &ws).unwrap_or_else(|| panic!("{}", out.describe()));
+    assert_eq!((row[1].as_str(), row[3].as_str()), ("check", "blocked"));
+    assert!(out.stderr.trim().is_empty(), "{}", out.describe());
+
+    s3.clear_requests();
+    let remote = dashboard_data::remote_key(WF, &ws);
+    drive_tui(&s3, &b, &mut |_, state| {
+        state.tree.sessions.contains_key(&remote) && state.tree.remote_failure.is_none()
+    });
+    assert_read_only(&s3);
+    assert_eq!(b.store_entries(), before, "B's session store is unchanged");
 }

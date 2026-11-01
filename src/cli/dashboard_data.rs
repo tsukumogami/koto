@@ -16,7 +16,7 @@ use crate::engine::persistence::{
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::remote_feed::{
-    ImportedSource, LocalView, RemoteRow, RemoteSnapshot, RowStatus,
+    ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot, RowStatus,
 };
 use crate::session::row::{derive_row, latest_import};
 use crate::session::{state_file_name, SessionBackend};
@@ -243,7 +243,7 @@ pub struct SessionTree {
     pub remote_hidden: usize,
     /// Why the last feed snapshot couldn't read some or all of the bucket;
     /// `None` once a snapshot reads it without failure.
-    pub remote_failure: Option<String>,
+    pub remote_failure: Option<ReadFailure>,
 }
 
 impl SessionTree {
@@ -766,13 +766,8 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 /// session this machine holds a copy of stays its local row. The tallies
 /// and the failure come from the snapshot.
 pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
-    tree.sessions.retain(|_, s| {
-        !s.remote
-            || snapshot.top_level_failed
-            || s.workspace
-                .as_ref()
-                .is_some_and(|ws| snapshot.failed_workspaces.contains(ws))
-    });
+    tree.sessions
+        .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
     for row in &snapshot.rows {
         tree.sessions
             .insert(remote_key(&row.name, &row.workspace), remote_session(row));
@@ -2366,23 +2361,31 @@ mod tests {
         assert_eq!((tree.remote_unreadable, tree.remote_hidden), (2, 1));
 
         // A's listing fails: its row stays; B's, read and gone, drops.
+        let failed = ReadFailure {
+            class: crate::session::remote_feed::FailureClass::Unreachable,
+            host: "127.0.0.1".to_string(),
+            top_level: false,
+            workspaces: vec![WS_A.to_string()],
+        };
         apply_snapshot(
             &mut tree,
             &RemoteSnapshot {
-                failed_workspaces: vec![WS_A.to_string()],
-                failure: Some("listing failed".to_string()),
+                failure: Some(failed.clone()),
                 ..RemoteSnapshot::default()
             },
         );
         assert_eq!(keys(&tree), vec![format!("a@{WS_A}")]);
-        assert_eq!(tree.remote_failure.as_deref(), Some("listing failed"));
+        assert_eq!(tree.remote_failure.as_ref(), Some(&failed));
 
         // The top-level listing fails: every remote row stays.
         apply_snapshot(
             &mut tree,
             &RemoteSnapshot {
-                top_level_failed: true,
-                failure: Some("top".to_string()),
+                failure: Some(ReadFailure {
+                    top_level: true,
+                    workspaces: Vec::new(),
+                    ..failed
+                }),
                 ..RemoteSnapshot::default()
             },
         );

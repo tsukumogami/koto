@@ -33,7 +33,9 @@ use crate::session::context::{is_host_local_key, is_pin_record_key, ContextStore
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::state_log;
 use crate::session::sync::{self, ManifestCache};
-use crate::session::sync_stamp::{self, Stamp};
+use crate::session::sync_stamp::{
+    self, clear_summary_owed, mark_summary_owed, summary_owed, Stamp,
+};
 use crate::session::{
     state_file_name, Fallback, Home, HomeSource, SessionBackend, SessionError, SessionInfo,
     SessionLock, SessionMigrated, Unlocated, UnlocatedReason,
@@ -210,8 +212,9 @@ pub(crate) fn is_workspace_prefix(prefix: &str) -> bool {
 const HELD_ELSEWHERE_FANOUT: usize = 64;
 
 /// How many times [`list_retrying`] asks for a listing the bucket throttled
-/// or failed to answer, the first included. Each ask is rust-s3's request
-/// and its own one retry, a second apart.
+/// or failed to answer, the first included. Each ask is one request plus
+/// rust-s3's own retries of it, a second apart: one retry by default, none
+/// in a process that called `s3::set_retries(0)`, as `koto dashboard` does.
 const LIST_ATTEMPTS: u32 = 3;
 
 /// [`list_retrying`]'s wait before its second ask, doubled before each ask
@@ -1519,32 +1522,58 @@ impl CloudBackend {
     /// holds under `state_etag`, after a push of the session's own state
     /// ([`crate::session::summary`]). Internal sessions get none. A failed
     /// PUT warns and never fails the push: the state is already in the
-    /// bucket. The summary is written again only when the session's state
-    /// is next pushed; a flush with no state change doesn't retry it.
+    /// bucket. It leaves [`sync_stamp::SUMMARY_OWED_FILE`] in the session's
+    /// local directory, so the next flush writes the summary even when the
+    /// state didn't change ([`CloudBackend::put_owed_summary`]); a PUT that
+    /// succeeds removes it.
     fn put_summary(&self, id: &str, data: &[u8], state_etag: Option<&str>) {
         use crate::session::summary::{SessionSummary, SUMMARY_FILE};
         if self.probes.read_only {
             return;
         }
         let home = self.home(id);
-        let Some(summary) = SessionSummary::build(
-            id,
-            &home,
-            data,
-            &self.local.session_dir(id),
-            state_etag.unwrap_or_default(),
-        ) else {
+        let dir = self.local.session_dir(id);
+        let Some(summary) =
+            SessionSummary::build(id, &home, data, &dir, state_etag.unwrap_or_default())
+        else {
+            clear_summary_owed(&dir);
             return;
         };
         let key = format!("{}/{}/{}", home, id, SUMMARY_FILE);
-        if let Err(e) = self.bucket.put_object(&key, &summary.to_bytes()) {
-            eprintln!(
-                "warning: cloud sync: publishing the summary of session '{}' to {} failed: {}",
-                id,
-                key,
-                without_url_userinfo(&e.to_string())
-            );
+        match self.bucket.put_object(&key, &summary.to_bytes()) {
+            Ok(_) => clear_summary_owed(&dir),
+            Err(e) => {
+                eprintln!(
+                    "warning: cloud sync: publishing the summary of session '{}' to {} failed: {}",
+                    id,
+                    key,
+                    without_url_userinfo(&e.to_string())
+                );
+                mark_summary_owed(&dir);
+            }
         }
+    }
+
+    /// The summary a failed PUT left owed ([`sync_stamp::SUMMARY_OWED_FILE`]),
+    /// PUT for the local state file and the state ETag this host last
+    /// synced, by a flush that has no state to push. No state file goes up,
+    /// and with nothing owed nothing is asked of the bucket. The ETag names the
+    /// stamped bytes only, so a local state file that isn't them (by length
+    /// and SHA-256) keeps the mark and PUTs nothing: the push that sends
+    /// those bytes writes their summary.
+    fn put_owed_summary(&self, id: &str) {
+        let dir = self.local.session_dir(id);
+        if self.probes.read_only || !summary_owed(&dir) {
+            return;
+        }
+        let Ok(data) = std::fs::read(dir.join(state_file_name(id))) else {
+            clear_summary_owed(&dir);
+            return;
+        };
+        let Some(stamp) = self.stamp(id).filter(|s| s.matches(&data)) else {
+            return;
+        };
+        self.put_summary(id, &data, stamp.state_etag.as_deref());
     }
 
     /// One PUT of a state file: on `etag` when given, else only where no
@@ -3237,8 +3266,10 @@ impl CloudBackend {
         let journal = self.journal(id);
         if !journal.is_open() {
             // Nothing is owed: a marker this can't delete yet is a warning,
-            // and the opening file stays for the next command.
+            // and the opening file stays for the next command. A summary a
+            // failed PUT left owed goes up on its own.
             self.try_clear_unopened_batch(id);
+            self.put_owed_summary(id);
             return Ok(());
         }
         let Some(lock) = journal.lock()? else {
@@ -3246,6 +3277,7 @@ impl CloudBackend {
         };
         // Another process flushed it while this one waited for the lock.
         let Some(pending) = journal.pending()? else {
+            self.put_owed_summary(id);
             return Ok(());
         };
         self.local_guard(id)?;
@@ -6557,7 +6589,10 @@ fn is_precondition_failed(e: &S3Error) -> bool {
 
 /// Whether the bucket answered a failed request with a throttle (429, or
 /// 503 `SlowDown`) or a failure on its side (500, 502, 504): it was
-/// reached, and asked again it may answer.
+/// reached, and asked again it may answer. The dashboard's reader classes
+/// a 500 `unreachable`, not with the throttles
+/// ([`crate::session::remote_feed::failure_class`]): it asks again only
+/// after a throttle, so a 500 there is an answer it can only report.
 fn is_answered_failure(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(429 | 500 | 502 | 503 | 504, _))
 }
@@ -6598,18 +6633,40 @@ pub(crate) fn list_retrying(
     prefix: String,
     delimiter: Option<&str>,
 ) -> Result<Vec<s3::serde_types::ListBucketResult>, S3Error> {
+    list_retrying_when(bucket, prefix, delimiter, is_transient).map_err(|(e, _)| e)
+}
+
+/// [`list_retrying`], asking again only while the failure is one `retry`
+/// accepts; a failure carries how long its ask took. The dashboard's reader
+/// asks again after a throttle and never after a timeout, so a listing that
+/// gets no answer is asked once. That costs one request timeout only where
+/// rust-s3 doesn't ask again on its own: in a process that called
+/// `s3::set_retries(0)`, as `koto dashboard` does. Elsewhere each ask is a
+/// request and rust-s3's retry of it a second later, so it costs two.
+pub(crate) fn list_retrying_when(
+    bucket: &Bucket,
+    prefix: String,
+    delimiter: Option<&str>,
+    retry: impl Fn(&S3Error) -> bool,
+) -> Result<Vec<s3::serde_types::ListBucketResult>, (S3Error, std::time::Duration)> {
     let delimiter = delimiter.map(str::to_string);
+    let ask = || {
+        let started = std::time::Instant::now();
+        bucket
+            .list(prefix.clone(), delimiter.clone())
+            .map_err(|e| (e, started.elapsed()))
+    };
     let mut wait = LIST_BACKOFF;
     for _ in 1..LIST_ATTEMPTS {
-        match bucket.list(prefix.clone(), delimiter.clone()) {
-            Err(e) if is_transient(&e) => {
+        match ask() {
+            Err((e, _)) if retry(&e) => {
                 std::thread::sleep(wait);
                 wait *= 2;
             }
             result => return result,
         }
     }
-    bucket.list(prefix, delimiter)
+    ask()
 }
 
 /// A response's `ETag` header, without its quotes; `None` when it has none.

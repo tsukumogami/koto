@@ -18,6 +18,17 @@
 //! thread that owns its own reader, scans on a fixed interval, and hands each
 //! complete [`RemoteSnapshot`] to the UI thread over a channel, so no key
 //! press or redraw ever waits on the bucket.
+//!
+//! Every request the reader makes fails after [`REQUEST_TIMEOUT`], and every
+//! failure falls in one [`FailureClass`] ([`failure_class_after`]). A failed
+//! top-level listing ends the pass with no further request. The reader asks
+//! a listing again only after a throttle, never after a timeout, but rust-s3
+//! asks every failed request again on its own, a second later, unless the
+//! process has called `s3::set_retries(0)`. That setting is process-wide,
+//! with no per-bucket form, and the reader can't set it: `koto dashboard`
+//! does, in its `run` in `src/cli/dashboard.rs`. Only with it does a bucket that
+//! never answers cost a pass one request timeout; without it, each ask is
+//! two requests and a timeout costs two.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -25,14 +36,17 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use s3::error::S3Error;
+use s3::serde_types::ListBucketResult;
 use s3::Bucket;
 
 use crate::session::cloud::{
-    is_workspace_prefix, list_retrying, marker_target_str, MIGRATED_MARKER,
+    is_workspace_prefix, list_retrying_when, marker_target_str, MIGRATED_MARKER,
 };
 use crate::session::state_file_name;
 use crate::session::summary::{is_internal_name, SessionSummary, MAX_SUMMARY_BYTES, SUMMARY_FILE};
 use crate::session::sync_stamp::normalize_etag;
+use crate::session_view::sanitize_capped;
 
 /// The delimiter that folds a session's context tree into one entry.
 pub const CTX_DELIMITER: &str = "/ctx/";
@@ -333,7 +347,189 @@ fn is_stale(summary: &SessionSummary, state: &ListedObject, now: SystemTime) -> 
 }
 
 /// One workspace's scan: the session directories it holds.
-type WorkspaceScan = anyhow::Result<Vec<ScannedSession>>;
+type WorkspaceScan = Result<Vec<ScannedSession>, ListFailure>;
+
+/// How a bucket request the reader made failed. Every failure is one of
+/// these four; [`failure_class_after`] decides which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The connection was refused, the host didn't resolve, or the answer
+    /// wasn't a usable reply: a 5xx other than 503, or a body that isn't
+    /// the listing asked for.
+    Unreachable,
+    /// HTTP 401 or 403.
+    Denied,
+    /// No answer within [`REQUEST_TIMEOUT`].
+    Timeout,
+    /// HTTP 429 or 503, after koto's usual retries.
+    Throttled,
+}
+
+impl FailureClass {
+    /// The class as the status line and the stderr note name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            FailureClass::Unreachable => "unreachable",
+            FailureClass::Denied => "denied",
+            FailureClass::Timeout => "timeout",
+            FailureClass::Throttled => "throttled",
+        }
+    }
+}
+
+/// The class of a failed bucket request: 401 and 403 are `denied`, 429 and
+/// 503 `throttled`, a connection that timed out (the request deadline, or a
+/// read that waited out its socket timeout) `timeout`, and anything else,
+/// a refused connection, a host that didn't resolve, another 5xx or a reply
+/// that didn't parse, `unreachable`.
+///
+/// It parts from [`crate::session::cloud`]'s `is_answered_failure` on 500:
+/// a sync asks a 500 again because the next ask may answer, while here a
+/// 500 is a reply the reader can only report, so it isn't `throttled`.
+pub fn failure_class(e: &S3Error) -> FailureClass {
+    match e {
+        S3Error::HttpFailWithBody(401 | 403, _) => FailureClass::Denied,
+        S3Error::HttpFailWithBody(429 | 503, _) => FailureClass::Throttled,
+        S3Error::Atto(e) => match e.kind() {
+            attohttpc::ErrorKind::Io(io) if is_timed_out(io) => FailureClass::Timeout,
+            _ => FailureClass::Unreachable,
+        },
+        S3Error::Io(io) if is_timed_out(io) => FailureClass::Timeout,
+        _ => FailureClass::Unreachable,
+    }
+}
+
+/// [`failure_class`] for a request that failed after `took`: a transport
+/// failure (no HTTP answer) that arrives once [`REQUEST_TIMEOUT`] has
+/// passed is `timeout`, whatever error the connection's end gave. The
+/// request deadline ends a stalled TLS handshake by shutting its socket,
+/// which the handshake reports as an unexpected end of file, not a timeout.
+pub fn failure_class_after(e: &S3Error, took: Duration) -> FailureClass {
+    match failure_class(e) {
+        FailureClass::Unreachable
+            if took >= REQUEST_TIMEOUT && matches!(e, S3Error::Atto(_) | S3Error::Io(_)) =>
+        {
+            FailureClass::Timeout
+        }
+        class => class,
+    }
+}
+
+/// Whether an I/O error is a wait that ran out: the request deadline
+/// (`TimedOut`) or a socket read timeout (`WouldBlock` on Unix).
+fn is_timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// A listing the reader gave up on: the last ask's error, and how long that
+/// ask took (all its pages, and rust-s3's own retry when the process has
+/// one).
+#[derive(Debug)]
+pub struct ListFailure {
+    /// The last ask's error.
+    pub error: S3Error,
+    /// How long the last ask took.
+    pub took: Duration,
+}
+
+impl ListFailure {
+    /// The failure's class ([`failure_class_after`]).
+    pub fn class(&self) -> FailureClass {
+        failure_class_after(&self.error, self.took)
+    }
+}
+
+impl std::fmt::Display for ListFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ListFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The longest a host is shown, in characters.
+const HOST_CAP: usize = 256;
+
+/// The host of an endpoint as [`s3::Region::host`] gives it: no scheme, no
+/// userinfo, no path, no port. Unsanitized. Everything up to the last `@`
+/// goes before the path is cut, so a secret holding `/`, `?` or `#` in the
+/// userinfo never shows.
+fn host_of(endpoint: &str) -> String {
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => match rest.find(']') {
+            Some(end) => &authority[..end + 2],
+            None => authority,
+        },
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => authority,
+        },
+    };
+    host.to_string()
+}
+
+/// Why a pass couldn't read some or all of the bucket: the failure's class,
+/// the endpoint's host, and which workspaces it left unread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFailure {
+    /// The top-level listing's class, or the first failed workspace's (in
+    /// workspace order).
+    pub class: FailureClass,
+    /// The endpoint's host, as configured. Shown only through
+    /// [`ReadFailure::line`], which sanitizes it.
+    pub host: String,
+    /// The top-level listing failed, so no workspace was read; a holder
+    /// keeps every remote row it last had.
+    pub top_level: bool,
+    /// Workspaces whose listing failed, sorted; a holder keeps the rows it
+    /// last had for them. Empty when `top_level`.
+    pub workspaces: Vec<String>,
+}
+
+impl ReadFailure {
+    /// Whether a holder keeps the rows it last had for `workspace`.
+    pub fn keeps(&self, workspace: &str) -> bool {
+        self.top_level || self.workspaces.iter().any(|w| w == workspace)
+    }
+
+    /// The failure on one line, its class and host passed through the
+    /// dashboard's sanitizer: `<class> at <host>: the bucket couldn't be
+    /// listed` when the top-level listing failed, else `<n> workspace(s)
+    /// couldn't be read; the first: <class> at <host>`.
+    pub fn line(&self) -> String {
+        let class = sanitize_capped(self.class.name(), HOST_CAP);
+        let host = sanitize_capped(&self.host, HOST_CAP);
+        if self.top_level {
+            return format!("{class} at {host}: the bucket couldn't be listed");
+        }
+        let n = self.workspaces.len();
+        format!(
+            "{n} workspace{} couldn't be read; the first: {class} at {host}",
+            if n == 1 { "" } else { "s" }
+        )
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    /// [`ReadFailure::line`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.line())
+    }
+}
+
+impl std::error::Error for ReadFailure {}
 
 /// One pass over the bucket.
 #[derive(Debug, Default)]
@@ -342,18 +538,20 @@ pub struct RemoteSnapshot {
     pub rows: Vec<RemoteRow>,
     /// Why the pass couldn't read some or all of the bucket, when it
     /// couldn't.
-    pub failure: Option<String>,
+    pub failure: Option<ReadFailure>,
     /// Rows listed as `unknown`: no summary, or one that couldn't be read
     /// or no longer describes its state file.
     pub unreadable: usize,
     /// Migrated sources left out in favour of their copy.
     pub hidden_sources: usize,
-    /// Workspaces whose listing failed; a holder keeps the rows it last had
-    /// for them.
-    pub failed_workspaces: Vec<String>,
-    /// The top-level listing failed, so no workspace was read; a holder
-    /// keeps every remote row it last had.
-    pub top_level_failed: bool,
+}
+
+impl RemoteSnapshot {
+    /// Whether a holder keeps the rows it last had for `workspace`: its
+    /// listing, or the top-level one, failed.
+    pub fn keeps(&self, workspace: &str) -> bool {
+        self.failure.as_ref().is_some_and(|f| f.keeps(workspace))
+    }
 }
 
 /// A bucket reader for the dashboard: a copy of the configured bucket
@@ -361,25 +559,58 @@ pub struct RemoteSnapshot {
 /// listings and GETs.
 pub struct RemoteReader {
     bucket: Box<Bucket>,
+    host: String,
 }
 
 impl RemoteReader {
     /// A reader of `bucket`, the client koto already resolved from its
-    /// configuration. Constructing it makes no request.
-    pub fn new(bucket: &Bucket) -> anyhow::Result<Self> {
-        Ok(Self {
-            bucket: bucket.with_request_timeout(REQUEST_TIMEOUT)?,
+    /// configuration. Constructing it makes no request. A client that can't
+    /// be copied with the timeout is a failure of the whole bucket, classed
+    /// `unreachable` at the endpoint's host, so it reads like any other.
+    ///
+    /// The reader bounds a timed-out listing at one request only in a
+    /// process that has called `s3::set_retries(0)`, as `koto dashboard`
+    /// does; elsewhere rust-s3 asks each failed request once more on its
+    /// own (see the module documentation).
+    pub fn new(bucket: &Bucket) -> Result<Self, ReadFailure> {
+        let host = host_of(&bucket.region().host());
+        match bucket.with_request_timeout(REQUEST_TIMEOUT) {
+            Ok(bucket) => Ok(Self { bucket, host }),
+            Err(_) => Err(ReadFailure {
+                class: FailureClass::Unreachable,
+                host,
+                top_level: true,
+                workspaces: Vec::new(),
+            }),
+        }
+    }
+
+    /// A listing of `prefix`, asked again only while the bucket throttles
+    /// it (koto's usual retries), never after a timeout or a refusal.
+    fn list(
+        &self,
+        prefix: String,
+        delimiter: Option<&str>,
+    ) -> Result<Vec<ListBucketResult>, ListFailure> {
+        list_retrying_when(&self.bucket, prefix, delimiter, |e| {
+            failure_class(e) == FailureClass::Throttled
         })
+        .map_err(|(error, took)| ListFailure { error, took })
+    }
+
+    /// A failure of this reader's bucket.
+    fn failure(&self, class: FailureClass, workspaces: Vec<String>) -> ReadFailure {
+        ReadFailure {
+            class,
+            host: self.host.clone(),
+            top_level: workspaces.is_empty(),
+            workspaces,
+        }
     }
 
     /// The bucket's workspace prefixes, from one top-level listing.
-    fn workspaces(&self) -> anyhow::Result<Vec<String>> {
-        let pages = list_retrying(&self.bucket, String::new(), Some("/")).map_err(|e| {
-            anyhow::anyhow!(
-                "listing the bucket's workspace prefixes failed: {}",
-                crate::session::cloud::without_url_userinfo(&e.to_string())
-            )
-        })?;
+    fn workspaces(&self) -> Result<Vec<String>, ListFailure> {
+        let pages = self.list(String::new(), Some("/"))?;
         Ok(pages
             .iter()
             .filter_map(|page| page.common_prefixes.as_ref())
@@ -395,10 +626,8 @@ impl RemoteReader {
     pub fn list_workspace(
         &self,
         workspace: &str,
-    ) -> anyhow::Result<BTreeMap<String, SessionListing>> {
-        let prefix = format!("{workspace}/");
-        let pages = list_retrying(&self.bucket, prefix.clone(), Some(CTX_DELIMITER))
-            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", prefix, e))?;
+    ) -> Result<BTreeMap<String, SessionListing>, ListFailure> {
+        let pages = self.list(format!("{workspace}/"), Some(CTX_DELIMITER))?;
         Ok(group_sessions(
             workspace,
             pages
@@ -488,16 +717,16 @@ impl RemoteReader {
 
     /// One pass over the bucket: every workspace prefix, each listed with
     /// the `/ctx/` delimiter, [`FANOUT`] at a time, then [`classify`]d as a
-    /// whole against `local`. A failed workspace leaves the others' rows
-    /// standing, is named in `failed_workspaces`, and its first failure is
-    /// in `failure`.
+    /// whole against `local`. A failed top-level listing ends the pass with
+    /// no further request. A failed workspace leaves the others' rows
+    /// standing and is named in `failure`, which carries the class of the
+    /// first one in workspace order.
     pub fn scan(&self, local: &LocalView) -> RemoteSnapshot {
         let workspaces = match self.workspaces() {
             Ok(w) => w,
             Err(e) => {
                 return RemoteSnapshot {
-                    failure: Some(e.to_string()),
-                    top_level_failed: true,
+                    failure: Some(self.failure(e.class(), Vec::new())),
                     ..RemoteSnapshot::default()
                 }
             }
@@ -519,23 +748,17 @@ impl RemoteReader {
         });
         let mut snapshot = RemoteSnapshot::default();
         let mut scanned = Vec::new();
+        let mut failed: Vec<(String, FailureClass)> = Vec::new();
         for (ws, result) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
             match result {
                 Ok(sessions) => scanned.extend(sessions),
-                Err(e) => {
-                    snapshot.failed_workspaces.push(ws);
-                    snapshot.failure.get_or_insert_with(|| e.to_string());
-                }
+                Err(e) => failed.push((ws, e.class())),
             }
         }
-        if !snapshot.failed_workspaces.is_empty() {
-            snapshot.failed_workspaces.sort();
-            snapshot.failure = snapshot.failure.map(|first| {
-                format!(
-                    "{} workspace(s) couldn't be read; the first: {first}",
-                    snapshot.failed_workspaces.len()
-                )
-            });
+        failed.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(&(_, class)) = failed.first() {
+            let workspaces = failed.into_iter().map(|(ws, _)| ws).collect();
+            snapshot.failure = Some(self.failure(class, workspaces));
         }
         let classified = classify(&scanned, local, SystemTime::now());
         snapshot.rows = classified.rows;
@@ -570,7 +793,8 @@ impl RemoteFeed {
     /// Start the feed thread on a copy of `bucket`. `local` describes the
     /// sessions this machine holds, which every scan leaves to their local
     /// rows; [`RemoteFeed::set_local`] replaces it. Starting makes no
-    /// request on the calling thread.
+    /// request on the calling thread. When the reader can't be built
+    /// ([`RemoteReader::new`]) the error is its [`ReadFailure`].
     pub fn spawn(bucket: &Bucket, local: LocalView, interval: Duration) -> anyhow::Result<Self> {
         let reader = RemoteReader::new(bucket)?;
         let (tx, snapshots) = mpsc::channel();
@@ -958,5 +1182,237 @@ mod tests {
             vec![(WS, "a", true), (WS, "z", true), (OTHER, "b", true)]
         );
         assert_eq!((c.unreadable, c.hidden_sources), (0, 0));
+    }
+
+    // -- failure classes ----------------------------------------------------
+
+    fn atto(kind: std::io::ErrorKind) -> S3Error {
+        S3Error::Atto(attohttpc::Error::from(std::io::Error::from(kind)))
+    }
+
+    /// A client of a bucket at `endpoint` whose requests fail after
+    /// `timeout`.
+    fn bucket_at(endpoint: &str, timeout: Duration) -> Box<Bucket> {
+        let region = s3::Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: endpoint.to_string(),
+        };
+        let credentials =
+            s3::creds::Credentials::new(Some("k"), Some("s"), None, None, None).unwrap();
+        Bucket::new("b", region, credentials)
+            .unwrap()
+            .with_path_style()
+            .with_request_timeout(timeout)
+            .unwrap()
+    }
+
+    fn list_error(bucket: &Bucket) -> S3Error {
+        bucket
+            .list(String::new(), Some("/".to_string()))
+            .expect_err("the listing fails")
+    }
+
+    #[test]
+    fn failure_class_unreachable_for_a_refused_connection_dns_a_5xx_or_a_bad_body() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let refused = list_error(&bucket_at(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_secs(5),
+        ));
+        assert!(matches!(refused, S3Error::Atto(_)), "{refused:?}");
+        for e in [
+            refused,
+            atto(std::io::ErrorKind::ConnectionRefused),
+            S3Error::Atto(attohttpc::Error::from(std::io::Error::other(
+                "failed to lookup address information",
+            ))),
+            S3Error::HttpFailWithBody(500, String::new()),
+            S3Error::HttpFailWithBody(502, String::new()),
+            S3Error::HttpFailWithBody(504, String::new()),
+            S3Error::HttpFail,
+            S3Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+        ] {
+            assert_eq!(failure_class(&e), FailureClass::Unreachable, "{e:?}");
+        }
+        assert_eq!(FailureClass::Unreachable.name(), "unreachable");
+    }
+
+    #[test]
+    fn failure_class_denied_for_401_and_403() {
+        for status in [401, 403] {
+            let e = S3Error::HttpFailWithBody(status, "<Error/>".to_string());
+            assert_eq!(failure_class(&e), FailureClass::Denied, "{status}");
+        }
+        assert_eq!(FailureClass::Denied.name(), "denied");
+    }
+
+    #[test]
+    fn failure_class_timeout_for_a_request_that_gets_no_answer() {
+        // A listener that accepts and never answers: the request deadline
+        // ends the request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(4).collect();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+        let silent = list_error(&bucket_at(&endpoint, Duration::from_millis(200)));
+        for e in [
+            silent,
+            atto(std::io::ErrorKind::TimedOut),
+            atto(std::io::ErrorKind::WouldBlock),
+            S3Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ] {
+            assert_eq!(failure_class(&e), FailureClass::Timeout, "{e:?}");
+        }
+        assert_eq!(FailureClass::Timeout.name(), "timeout");
+    }
+
+    #[test]
+    fn a_transport_failure_once_the_request_timeout_passed_is_a_timeout() {
+        // A stalled TLS handshake the deadline ends by shutting its socket.
+        let eof = || atto(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            failure_class_after(&eof(), REQUEST_TIMEOUT),
+            FailureClass::Timeout
+        );
+        assert_eq!(
+            failure_class_after(&eof(), REQUEST_TIMEOUT + Duration::from_secs(11)),
+            FailureClass::Timeout
+        );
+        assert_eq!(
+            failure_class_after(
+                &S3Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+                REQUEST_TIMEOUT
+            ),
+            FailureClass::Timeout
+        );
+        // Before the deadline the same failure is unreachable.
+        assert_eq!(
+            failure_class_after(&eof(), REQUEST_TIMEOUT - Duration::from_millis(1)),
+            FailureClass::Unreachable
+        );
+        // An answer is classed by its status however long it took.
+        for (e, class) in [
+            (
+                S3Error::HttpFailWithBody(500, String::new()),
+                FailureClass::Unreachable,
+            ),
+            (
+                S3Error::HttpFailWithBody(403, String::new()),
+                FailureClass::Denied,
+            ),
+            (
+                S3Error::HttpFailWithBody(503, String::new()),
+                FailureClass::Throttled,
+            ),
+            (S3Error::HttpFail, FailureClass::Unreachable),
+        ] {
+            assert_eq!(failure_class_after(&e, REQUEST_TIMEOUT * 2), class, "{e:?}");
+        }
+        let failure = ListFailure {
+            error: eof(),
+            took: REQUEST_TIMEOUT,
+        };
+        assert_eq!(failure.class(), FailureClass::Timeout);
+    }
+
+    #[test]
+    fn failure_class_throttled_for_429_and_503() {
+        for status in [429, 503] {
+            let e = S3Error::HttpFailWithBody(status, "<Error/>".to_string());
+            assert_eq!(failure_class(&e), FailureClass::Throttled, "{status}");
+        }
+        assert_eq!(FailureClass::Throttled.name(), "throttled");
+    }
+
+    #[test]
+    fn host_of_drops_userinfo_port_and_path() {
+        assert_eq!(host_of("127.0.0.1:9000"), "127.0.0.1");
+        assert_eq!(
+            host_of("user:secret@minio.example:9000/base"),
+            "minio.example"
+        );
+        assert_eq!(host_of("s3.amazonaws.com"), "s3.amazonaws.com");
+        assert_eq!(host_of("[::1]:9000"), "[::1]");
+        assert_eq!(
+            host_of(
+                &bucket_at("http://k:s@10.0.0.7:9000/", REQUEST_TIMEOUT)
+                    .region()
+                    .host()
+            ),
+            "10.0.0.7"
+        );
+    }
+
+    #[test]
+    fn host_of_never_shows_a_userinfo_fragment_holding_a_path_delimiter() {
+        for endpoint in [
+            "AKIA:abc/def@host/",
+            "AKIA:abc?def@host:9000/x",
+            "AKIA:abc#def@host",
+            "https://AKIA:abc/def@host/",
+            "AKIA:a@b/c@host:9000",
+        ] {
+            assert_eq!(host_of(endpoint), "host", "{endpoint}");
+        }
+        let host = host_of(
+            &bucket_at("https://AKIA:abc/def@10.0.0.7:9000/", REQUEST_TIMEOUT)
+                .region()
+                .host(),
+        );
+        assert!(
+            !host.contains("AKIA") && !host.contains("abc") && !host.contains("def"),
+            "{host}"
+        );
+    }
+
+    #[test]
+    fn a_reader_failure_reads_as_its_line() {
+        let failure = ReadFailure {
+            class: FailureClass::Unreachable,
+            host: "10.0.0.7".to_string(),
+            top_level: true,
+            workspaces: Vec::new(),
+        };
+        assert_eq!(failure.to_string(), failure.line());
+    }
+
+    #[test]
+    fn a_read_failure_line_names_the_class_and_the_sanitized_host() {
+        let top = ReadFailure {
+            class: FailureClass::Denied,
+            host: "evil\u{1b}[2J\u{202e}host\nx".to_string(),
+            top_level: true,
+            workspaces: Vec::new(),
+        };
+        let line = top.line();
+        assert_eq!(
+            line,
+            "denied at evil\\u{1B}[2J\\u{202E}host x: the bucket couldn't be listed"
+        );
+        assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+        assert!(top.keeps(WS) && top.keeps(OTHER));
+
+        let some = ReadFailure {
+            class: FailureClass::Unreachable,
+            host: "127.0.0.1".to_string(),
+            top_level: false,
+            workspaces: vec![WS.to_string()],
+        };
+        assert_eq!(
+            some.line(),
+            "1 workspace couldn't be read; the first: unreachable at 127.0.0.1"
+        );
+        assert!(some.keeps(WS) && !some.keeps(OTHER));
+        let two = ReadFailure {
+            workspaces: vec![WS.to_string(), OTHER.to_string()],
+            ..some
+        };
+        assert!(two.line().starts_with("2 workspaces couldn't be read"));
     }
 }
