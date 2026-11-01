@@ -1,7 +1,7 @@
 //! What this host last knew of a session's copy in the bucket, so a cloud
 //! read whose local copy is current transfers nothing (koto#428).
 //!
-//! Four host-local files in a session's local directory, none of them ever
+//! Host-local files in a session's local directory, none of them ever
 //! uploaded:
 //!
 //! - `cloud-sync.json` ([`Stamp`]): the bucket's ETag for the state file and
@@ -21,6 +21,9 @@
 //! - `cloud-ctx-synced.json` ([`SyncedKeys`]): for each context key, the
 //!   hash this host last knew the session's home to hold, so which of two
 //!   differing copies moved is read from hashes, not host clocks (koto#524).
+//! - `cloud-summary-owed` ([`SUMMARY_OWED_FILE`]): left by a failed
+//!   `summary.json` PUT, so the next flush writes the summary for the
+//!   stamped bytes, and removed by a PUT that succeeds.
 //!
 //! A read probes the bucket once per session per process: one listing of
 //! the session's prefix says whether the migration marker is there and
@@ -56,6 +59,11 @@ pub const CHECK_FILE: &str = "cloud-check.json";
 /// File name of the context hashes this host last synced with a session's
 /// home.
 pub const SYNCED_FILE: &str = "cloud-ctx-synced.json";
+
+/// File name of the mark a failed `summary.json` PUT leaves: the next flush
+/// writes the summary even when the state didn't change, and a PUT that
+/// succeeds removes the mark.
+pub const SUMMARY_OWED_FILE: &str = "cloud-summary-owed";
 
 /// The hash of each context key this host last knew the session's home to
 /// hold: the copy it pushed there, pulled from there, or found there equal
@@ -284,6 +292,24 @@ pub fn forget_check(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(CHECK_FILE));
 }
 
+/// Mark the session in `dir` as owing its summary ([`SUMMARY_OWED_FILE`]).
+/// Best-effort.
+pub fn mark_summary_owed(dir: &Path) {
+    if dir.is_dir() {
+        let _ = std::fs::write(dir.join(SUMMARY_OWED_FILE), b"");
+    }
+}
+
+/// Whether the session in `dir` owes its summary.
+pub fn summary_owed(dir: &Path) -> bool {
+    dir.join(SUMMARY_OWED_FILE).exists()
+}
+
+/// Clear the mark [`mark_summary_owed`] left in `dir`, if any.
+pub fn clear_summary_owed(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(SUMMARY_OWED_FILE));
+}
+
 /// An ETag as a header or a listing gives it, without its quotes.
 pub fn normalize_etag(etag: &str) -> String {
     etag.trim().trim_matches('"').to_string()
@@ -338,6 +364,22 @@ fn write_replacing(dir: &Path, name: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_summary_owed_mark_is_left_and_cleared_only_in_an_existing_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!summary_owed(dir.path()));
+        mark_summary_owed(dir.path());
+        assert!(summary_owed(dir.path()));
+        assert!(dir.path().join(SUMMARY_OWED_FILE).exists());
+        clear_summary_owed(dir.path());
+        assert!(!summary_owed(dir.path()));
+        clear_summary_owed(dir.path());
+
+        let gone = dir.path().join("gone");
+        mark_summary_owed(&gone);
+        assert!(!gone.exists(), "no directory is made for the mark");
+    }
 
     #[test]
     fn a_stamp_round_trips_and_matches_only_its_bytes() {

@@ -15,6 +15,8 @@
 //! Every request is recorded as (method, key) in arrival order, so a
 //! test can assert exactly what a command wrote where. [`FakeS3::fail`]
 //! makes every matching request answer with a given status instead,
+//! [`FakeS3::fail_all`] does so for every request and
+//! [`FakeS3::fail_writes`] for every PUT and DELETE,
 //! [`FakeS3::garble_listing`] answers a listing with a body that isn't one,
 //! and
 //! [`FakeS3::put_after`] stores an object as soon as a given request has
@@ -66,8 +68,11 @@ pub struct Request {
 
 #[derive(Debug, Clone)]
 struct Fault {
+    /// A method, `LIST` for a listing, [`ANY_METHOD`] for every request or
+    /// [`WRITE_METHODS`] for every PUT and DELETE.
     method: String,
-    key: String,
+    /// The exact key (a listing's prefix); `None` matches every key.
+    key: Option<String>,
     status: u16,
     /// Store a PUT's body before answering with the failure, as an
     /// endpoint that wrote the object and lost the reply would.
@@ -76,6 +81,23 @@ struct Fault {
     garble: bool,
     /// How many more matching requests fail; `None` fails them all.
     remaining: Option<usize>,
+}
+
+/// A [`Fault`] method matching every request, listings included.
+const ANY_METHOD: &str = "*";
+
+/// A [`Fault`] method matching every PUT and DELETE.
+const WRITE_METHODS: &str = "PUT|DELETE";
+
+impl Fault {
+    fn matches(&self, method: &str, key: &str) -> bool {
+        let method_matches = match self.method.as_str() {
+            ANY_METHOD => true,
+            WRITE_METHODS => method == "PUT" || method == "DELETE",
+            m => m == method,
+        };
+        method_matches && self.key.as_deref().is_none_or(|k| k == key)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +226,7 @@ impl FakeS3 {
     pub fn fail(&self, method: &str, key: &str, status: u16) {
         lock(&self.state).faults.push(Fault {
             method: method.to_string(),
-            key: key.to_string(),
+            key: Some(key.to_string()),
             status,
             store: false,
             garble: false,
@@ -218,7 +240,7 @@ impl FakeS3 {
     pub fn garble_listing(&self, prefix: &str) {
         lock(&self.state).faults.push(Fault {
             method: "LIST".to_string(),
-            key: prefix.to_string(),
+            key: Some(prefix.to_string()),
             status: 200,
             store: false,
             garble: true,
@@ -228,11 +250,13 @@ impl FakeS3 {
 
     /// [`FakeS3::fail`] for the next `times` matching requests only; the
     /// ones after are answered normally. rust-s3 retries a failed request
-    /// once, so one failed call by koto is two failed requests here.
+    /// once by default, so one failed call by koto is two failed requests
+    /// here; in a process that called `s3::set_retries(0)`, as
+    /// `koto dashboard` does, it is one.
     pub fn fail_times(&self, method: &str, key: &str, status: u16, times: usize) {
         lock(&self.state).faults.push(Fault {
             method: method.to_string(),
-            key: key.to_string(),
+            key: Some(key.to_string()),
             status,
             store: false,
             garble: false,
@@ -245,12 +269,44 @@ impl FakeS3 {
     pub fn fail_after_storing(&self, key: &str, status: u16) {
         lock(&self.state).faults.push(Fault {
             method: "PUT".to_string(),
-            key: key.to_string(),
+            key: Some(key.to_string()),
             status,
             store: true,
             garble: false,
             remaining: None,
         });
+    }
+
+    /// Answer every request, listings included, with `status` from now on,
+    /// as an endpoint that refuses or throttles everything would.
+    pub fn fail_all(&self, status: u16) {
+        self.push_fault(ANY_METHOD, status);
+    }
+
+    /// Answer every PUT and DELETE with `status` from now on, storing and
+    /// removing nothing, as keys that grant only list and get would.
+    pub fn fail_writes(&self, status: u16) {
+        self.push_fault(WRITE_METHODS, status);
+    }
+
+    fn push_fault(&self, method: &str, status: u16) {
+        lock(&self.state).faults.push(Fault {
+            method: method.to_string(),
+            key: None,
+            status,
+            store: false,
+            garble: false,
+            remaining: None,
+        });
+    }
+
+    /// The ETag the endpoint gives the object under `key`, without its
+    /// quotes, as a listing, GET or PUT reply carries it.
+    pub fn etag_of(&self, key: &str) -> Option<String> {
+        lock(&self.state)
+            .objects
+            .get(key)
+            .map(|bytes| etag(bytes).trim_matches('"').to_string())
     }
 
     /// Stop failing requests: undo every [`FakeS3::fail`].
@@ -516,7 +572,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
     if let Some(at) = st
         .faults
         .iter()
-        .position(|f| f.method == fault_method && f.key == fault_key)
+        .position(|f| f.matches(&fault_method, &fault_key))
     {
         let fault = st.faults[at].clone();
         if let Some(n) = fault.remaining {
