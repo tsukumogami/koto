@@ -1500,3 +1500,302 @@ fn keys_that_grant_only_list_and_get_still_list_other_machines_sessions() {
     assert_read_only(&s3);
     assert_eq!(b.store_entries(), before, "B's session store is unchanged");
 }
+
+// --- PLAN step 6: the feed's ETag cache, its prefix budget and freshness ---
+
+use koto::session::remote_feed::{FeedCache, LocalView, RemoteReader, RemoteSnapshot, RowStatus};
+
+/// Satisfy the fixture's gate on `machine` and tick `name` past it, so its
+/// state moves from `check` to `done` (kept, not cleaned up, at the terminal).
+fn advance(machine: &Machine, name: &str) {
+    let o = machine
+        .cmd(&["context", "add", name, "go"])
+        .write_stdin(b"go".to_vec())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "context add: {o:?}");
+    machine.ok(&["next", name, "--no-cleanup"]);
+}
+
+/// Every object GET in the request log (listings left out).
+fn object_gets(s3: &FakeS3) -> Vec<String> {
+    s3.requests()
+        .into_iter()
+        .filter(|r| r.method == "GET" && r.list_prefix.is_none())
+        .map(|r| r.key)
+        .collect()
+}
+
+/// The workspace prefixes listed in the request log (the top level left out).
+fn listed_prefixes(s3: &FakeS3) -> Vec<String> {
+    s3.requests()
+        .into_iter()
+        .filter_map(|r| r.list_prefix)
+        .filter_map(|p| p.strip_suffix('/').map(str::to_string))
+        .collect()
+}
+
+/// The current state `snapshot` shows for `name` under `workspace`; `None`
+/// when the row is missing or unknown.
+fn shown_state(snapshot: &RemoteSnapshot, workspace: &str, name: &str) -> Option<String> {
+    snapshot
+        .rows
+        .iter()
+        .find(|r| r.workspace == workspace && r.name == name)
+        .and_then(|r| match &r.status {
+            RowStatus::Shown(s) => s.current_state.clone(),
+            RowStatus::Unknown { .. } => None,
+        })
+}
+
+/// One cached scan of the fake bucket as the feed thread runs it, its
+/// request log starting empty.
+fn cached_scan(s3: &FakeS3, reader: &RemoteReader, cache: &mut FeedCache) -> RemoteSnapshot {
+    s3.clear_requests();
+    reader.scan_cached(&LocalView::default(), cache)
+}
+
+/// With nothing changed on A, a cached scan after the first reads listings
+/// only; after a tick on A changes one session, the next scan GETs that
+/// session's summary and no other, and shows the new state.
+#[test]
+fn remote_feed_cache_reads_listings_only_until_a_session_changes() {
+    let (s3, a, _b) = two_machines();
+    a.start_blocked("wf2");
+    let ws = a.workspace();
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+
+    let first = cached_scan(&s3, &reader, &mut cache);
+    assert_eq!(shown_state(&first, &ws, WF).as_deref(), Some("check"));
+    assert_eq!(
+        object_gets(&s3).len(),
+        2,
+        "the first scan reads both summaries"
+    );
+    for _ in 0..2 {
+        let again = cached_scan(&s3, &reader, &mut cache);
+        assert!(object_gets(&s3).is_empty(), "{:?}", s3.requests());
+        assert!(!listed_prefixes(&s3).is_empty(), "a later scan still lists");
+        assert_eq!(shown_state(&again, &ws, WF).as_deref(), Some("check"));
+        assert_eq!(shown_state(&again, &ws, "wf2").as_deref(), Some("check"));
+    }
+
+    advance(&a, WF);
+    let after = cached_scan(&s3, &reader, &mut cache);
+    assert_eq!(object_gets(&s3), vec![key_of(&ws, WF, "summary.json")]);
+    assert_eq!(shown_state(&after, &ws, WF).as_deref(), Some("done"));
+    assert_eq!(shown_state(&after, &ws, "wf2").as_deref(), Some("check"));
+}
+
+/// A summary whose GET failed, or whose body didn't parse, is asked for
+/// again on the next scan, and shows once a GET succeeds.
+#[test]
+fn remote_feed_cache_asks_a_failed_or_unparsed_summary_again() {
+    let (s3, a, _b) = two_machines();
+    let ws = a.workspace();
+    let key = key_of(&ws, WF, "summary.json");
+    let good = s3.object(&key).unwrap();
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+
+    s3.fail("GET", &key, 500);
+    for _ in 0..2 {
+        let snapshot = cached_scan(&s3, &reader, &mut cache);
+        assert_eq!(shown_state(&snapshot, &ws, WF), None);
+        let gets = object_gets(&s3);
+        assert!(
+            !gets.is_empty() && gets.iter().all(|k| *k == key),
+            "{gets:?}"
+        );
+    }
+    s3.clear_faults();
+    let snapshot = cached_scan(&s3, &reader, &mut cache);
+    assert_eq!(shown_state(&snapshot, &ws, WF).as_deref(), Some("check"));
+
+    s3.put(&key, b"{not json");
+    for _ in 0..2 {
+        let snapshot = cached_scan(&s3, &reader, &mut cache);
+        assert_eq!(shown_state(&snapshot, &ws, WF), None);
+        let gets = object_gets(&s3);
+        assert!(
+            !gets.is_empty() && gets.iter().all(|k| *k == key),
+            "{gets:?}"
+        );
+    }
+    s3.put(&key, &good);
+    let snapshot = cached_scan(&s3, &reader, &mut cache);
+    assert_eq!(shown_state(&snapshot, &ws, WF).as_deref(), Some("check"));
+    cached_scan(&s3, &reader, &mut cache);
+    assert!(object_gets(&s3).is_empty(), "a parsed summary is cached");
+}
+
+/// While A's workspace listing fails, the cache keeps A's session and no
+/// GET is asked for it; after `koto session cleanup` on A, the next scan
+/// drops the row and its cache entry.
+#[test]
+fn remote_feed_cache_keeps_a_failed_workspace_and_drops_a_cleaned_session() {
+    let (s3, a, _b) = two_machines();
+    let ws = a.workspace();
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+    cached_scan(&s3, &reader, &mut cache);
+    assert!(cache.sessions(&ws).is_some_and(|s| s.contains_key(WF)));
+
+    s3.fail("LIST", &format!("{ws}/"), 500);
+    let failed = cached_scan(&s3, &reader, &mut cache);
+    assert!(failed.keeps(&ws), "the holder keeps A's row");
+    assert!(object_gets(&s3).is_empty(), "{:?}", s3.requests());
+    assert!(cache.sessions(&ws).is_some_and(|s| s.contains_key(WF)));
+
+    s3.clear_faults();
+    a.ok(&["session", "cleanup", WF]);
+    let cleaned = cached_scan(&s3, &reader, &mut cache);
+    assert!(
+        cleaned.rows.iter().all(|r| r.name != WF),
+        "{:?}",
+        cleaned.rows
+    );
+    assert!(!cache.sessions(&ws).is_some_and(|s| s.contains_key(WF)));
+}
+
+/// A 16-hex workspace prefix, the `i`th.
+fn prefix_n(i: usize) -> String {
+    format!("{:016x}", 0xa000_0000_0000_0000u64 + i as u64)
+}
+
+/// With 250 workspace prefixes, idle for two hours, no cached scan lists
+/// more than 200; a prefix created after the first scan is listed on the
+/// next one; every prefix is listed in any two consecutive scans; and a
+/// prefix left out of a scan keeps its row.
+#[test]
+fn remote_feed_budget_lists_at_most_200_prefixes_and_rotates() {
+    let s3 = FakeS3::start(BUCKET);
+    let idle = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    let seed = |ws: &str| {
+        let key = state_key(ws, "s");
+        s3.put(&key, b"{}\n");
+        s3.set_last_modified(&key, idle);
+    };
+    let mut all: Vec<String> = (0..250).map(prefix_n).collect();
+    all.iter().for_each(|ws| seed(ws));
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+
+    let mut listed = Vec::new();
+    for scan in 0..3 {
+        if scan == 1 {
+            all.push(prefix_n(999));
+            seed(&all[250]);
+        }
+        let snapshot = cached_scan(&s3, &reader, &mut cache);
+        let these: std::collections::HashSet<String> = listed_prefixes(&s3).into_iter().collect();
+        assert!(these.len() <= 200, "scan {scan} listed {}", these.len());
+        if scan == 1 {
+            assert!(these.contains(&all[250]), "a new prefix is listed at once");
+        }
+        if scan > 0 {
+            assert_eq!(
+                snapshot.rows.len(),
+                all.len(),
+                "a prefix left out keeps its row"
+            );
+        }
+        listed.push(these);
+    }
+    for pair in listed.windows(2) {
+        for ws in &all[..250] {
+            assert!(
+                pair[0].contains(ws) || pair[1].contains(ws),
+                "{ws} unlisted two scans running"
+            );
+        }
+    }
+}
+
+/// `--once` keeps nothing: two runs against an unchanged bucket each GET
+/// the summary.
+#[test]
+fn remote_feed_once_reads_every_summary_on_every_run() {
+    let (s3, a, b) = two_machines();
+    let key = key_of(&a.workspace(), WF, "summary.json");
+    for _ in 0..2 {
+        once_on(&s3, &b, &["--all"]);
+        assert_eq!(object_gets(&s3), vec![key.clone()]);
+    }
+}
+
+/// B's TUI, its feed rescanning every 200 ms, shows A's new state within
+/// one interval of the tick that PUT the summary, plus one scan's time.
+#[test]
+fn remote_feed_tui_shows_a_change_within_one_interval() {
+    let (s3, a, b) = two_machines();
+    let remote = dashboard_data::remote_key(WF, &a.workspace());
+    let mut ticked: Option<Instant> = None;
+    let mut elapsed = Duration::ZERO;
+    drive_tui(&s3, &b, &mut |_, state| {
+        let current = state
+            .tree
+            .sessions
+            .get(&remote)
+            .and_then(|s| s.current_state.clone());
+        match ticked {
+            None if current.as_deref() == Some("check") => {
+                advance(&a, WF);
+                ticked = Some(Instant::now());
+                false
+            }
+            Some(at) if current.as_deref() == Some("done") => {
+                elapsed = at.elapsed();
+                true
+            }
+            _ => false,
+        }
+    });
+    println!("A's change showed on B {elapsed:?} after its summary PUT");
+    assert!(elapsed < Duration::from_millis(200 + 1000), "{elapsed:?}");
+}
+
+/// With 200 prefixes holding 2,000 sessions and every request answered
+/// after 50 ms, B's `--once --all` prints all 2,000 rows within 30 s.
+#[test]
+fn remote_feed_once_at_200_prefixes_and_2000_sessions() {
+    let (s3, a, b) = two_machines();
+    let template: serde_json::Value = serde_json::from_slice(
+        &s3.object(&key_of(&a.workspace(), WF, "summary.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    for keyp in s3.keys_under(&format!("{}/", a.workspace())) {
+        s3.remove(&keyp);
+    }
+    for p in 0..200 {
+        let ws = prefix_n(p);
+        for n in 0..10 {
+            let name = format!("s{n}");
+            let state = state_key(&ws, &name);
+            s3.put(&state, b"{}\n");
+            let mut summary = template.clone();
+            summary["home"] = ws.clone().into();
+            summary["name"] = name.clone().into();
+            summary["session_id"] = format!("id-{p}-{n}").into();
+            summary["state_etag"] = s3.etag_of(&state).unwrap().into();
+            s3.put(
+                &key_of(&ws, &name, "summary.json"),
+                summary.to_string().as_bytes(),
+            );
+        }
+    }
+    s3.set_latency(Duration::from_millis(50));
+    let started = Instant::now();
+    let out = b.ok(&["dashboard", "--once", "--all"]);
+    let elapsed = started.elapsed();
+    println!("--once read 200 prefixes and 2,000 sessions in {elapsed:?}");
+    let rows = out.rows();
+    let shown = rows
+        .iter()
+        .filter(|r| r.get(1).is_some_and(|s| s == "check"))
+        .count();
+    assert_eq!(shown, 2000, "{}", out.describe());
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+}

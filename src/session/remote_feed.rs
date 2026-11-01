@@ -17,7 +17,10 @@
 //! The interactive dashboard reads through a [`RemoteFeed`]: one background
 //! thread that owns its own reader, scans on a fixed interval, and hands each
 //! complete [`RemoteSnapshot`] to the UI thread over a channel, so no key
-//! press or redraw ever waits on the bucket.
+//! press or redraw ever waits on the bucket. That thread scans through a
+//! [`FeedCache`] ([`RemoteReader::scan_cached`]): a summary is fetched again
+//! only when its listed ETag changed, and at most [`PREFIX_BUDGET`] prefixes
+//! are listed per pass. `koto dashboard --once` scans uncached.
 //!
 //! Every request the reader makes fails after [`REQUEST_TIMEOUT`], and every
 //! failure falls in one [`FailureClass`] ([`failure_class_after`]). A failed
@@ -554,6 +557,87 @@ impl RemoteSnapshot {
     }
 }
 
+/// The most workspace prefixes one cached scan lists.
+pub const PREFIX_BUDGET: usize = 200;
+
+/// A prefix whose newest listed object is younger than this is listed on
+/// every cached scan, whatever the budget's rotation says.
+pub const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// What the feed thread remembers between scans, in memory only.
+///
+/// Per workspace prefix: the sessions its last answered listing found, with
+/// the summaries and markers read for them, each held against the ETag the
+/// listing gave its object, so a later scan reuses a read whose object's
+/// listed ETag is unchanged instead of fetching it again. Only a summary
+/// that was read and parsed is reused; anything else is asked again. The
+/// cache also records when each prefix was last listed and the newest
+/// LastModified its listing showed, which [`choose_prefixes`] reads to
+/// spend the [`PREFIX_BUDGET`].
+#[derive(Debug, Default)]
+pub struct FeedCache {
+    workspaces: HashMap<String, CachedWorkspace>,
+    /// How many cached scans have started; a prefix's `listed_at` is the
+    /// scan that last listed it.
+    scans: u64,
+}
+
+#[derive(Debug, Default)]
+struct CachedWorkspace {
+    /// The scan that last asked for this prefix's listing.
+    listed_at: u64,
+    /// The newest LastModified the last answered listing showed.
+    newest: Option<SystemTime>,
+    /// The sessions the last answered listing found, by name.
+    sessions: BTreeMap<String, ScannedSession>,
+}
+
+impl FeedCache {
+    /// An empty cache: the first scan through it reads everything.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sessions cached for `workspace`, by name.
+    pub fn sessions(&self, workspace: &str) -> Option<&BTreeMap<String, ScannedSession>> {
+        self.workspaces.get(workspace).map(|w| &w.sessions)
+    }
+}
+
+/// The prefixes a cached scan lists out of `all`, the top-level listing's
+/// prefixes: every one while there are at most `budget`; above that, every
+/// prefix the cache has never listed, then every prefix whose newest listed
+/// object is younger than [`ACTIVE_WINDOW`] at `now`, then the rest in
+/// rotation, longest since listed first, until `budget` are chosen.
+pub fn choose_prefixes(
+    all: &[String],
+    cache: &FeedCache,
+    now: SystemTime,
+    budget: usize,
+) -> Vec<String> {
+    if all.len() <= budget {
+        return all.to_vec();
+    }
+    let active = |w: &CachedWorkspace| {
+        w.newest
+            .is_some_and(|t| now.duration_since(t).unwrap_or_default() < ACTIVE_WINDOW)
+    };
+    let mut ranked: Vec<(u8, u64, &String)> = all
+        .iter()
+        .map(|ws| match cache.workspaces.get(ws) {
+            None => (0, 0, ws),
+            Some(w) if active(w) => (1, 0, ws),
+            Some(w) => (2, w.listed_at, ws),
+        })
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(budget)
+        .map(|(_, _, ws)| ws.clone())
+        .collect()
+}
+
 /// A bucket reader for the dashboard: a copy of the configured bucket
 /// client with a [`REQUEST_TIMEOUT`] on every request, reached only through
 /// listings and GETs.
@@ -686,21 +770,44 @@ impl RemoteReader {
     /// The session directories of one workspace, with the summary and
     /// marker of each one that has a state object and isn't internal. A
     /// summary over [`MAX_SUMMARY_BYTES`] by its listed size isn't fetched.
-    fn scan_workspace(&self, workspace: &str) -> WorkspaceScan {
+    ///
+    /// `previous` is what the last answered listing of this workspace found,
+    /// when the caller keeps a [`FeedCache`]: a summary that was read and
+    /// parsed, or a marker that named a copy, is reused without a GET while
+    /// its object's listed ETag is the one it was read under.
+    fn scan_workspace(
+        &self,
+        workspace: &str,
+        previous: Option<&BTreeMap<String, ScannedSession>>,
+    ) -> WorkspaceScan {
         let mut sessions = Vec::new();
         for (name, listing) in self.list_workspace(workspace)? {
             let wanted = listing.state(&name).is_some() && !is_internal_name(&name);
+            let before = previous.and_then(|p| p.get(&name));
+            let unchanged = |file: &str| match (
+                before.and_then(|b| b.listing.objects.get(file)),
+                listing.objects.get(file),
+            ) {
+                (Some(was), Some(now)) => !now.etag.is_empty() && was.etag == now.etag,
+                _ => false,
+            };
             let summary = match listing.objects.get(SUMMARY_FILE) {
                 Some(_) if !wanted => SummaryRead::Absent,
                 Some(obj) if obj.size > MAX_SUMMARY_BYTES as u64 => {
                     SummaryRead::Unreadable("oversized")
                 }
-                Some(_) => self.read_summary(workspace, &name),
+                Some(_) => match before.map(|b| &b.summary) {
+                    Some(read @ SummaryRead::Read(_)) if unchanged(SUMMARY_FILE) => read.clone(),
+                    _ => self.read_summary(workspace, &name),
+                },
                 None => SummaryRead::Absent,
             };
             let marker = match listing.objects.get(MIGRATED_MARKER) {
                 Some(obj) if wanted && obj.size <= MAX_MARKER_BYTES as u64 => {
-                    self.read_marker(workspace, &name)
+                    match before.and_then(|b| b.marker.as_ref()) {
+                        Some(m) if unchanged(MIGRATED_MARKER) => Some(m.clone()),
+                        _ => self.read_marker(workspace, &name),
+                    }
                 }
                 _ => None,
             };
@@ -720,9 +827,27 @@ impl RemoteReader {
     /// whole against `local`. A failed top-level listing ends the pass with
     /// no further request. A failed workspace leaves the others' rows
     /// standing and is named in `failure`, which carries the class of the
-    /// first one in workspace order.
+    /// first one in workspace order. Nothing is kept: every summary listed
+    /// is fetched, as `koto dashboard --once` needs.
     pub fn scan(&self, local: &LocalView) -> RemoteSnapshot {
-        let workspaces = match self.workspaces() {
+        self.scan_with(local, None)
+    }
+
+    /// [`RemoteReader::scan`] through `cache`, as the feed thread runs it.
+    /// At most [`PREFIX_BUDGET`] prefixes are listed ([`choose_prefixes`]);
+    /// a prefix left out this pass keeps what the cache holds, and its
+    /// cached sessions are classified with the rest so its rows stand. A
+    /// workspace whose listing failed keeps its cache entry and is left to
+    /// the holder's kept rows, as without a cache. A summary or marker whose
+    /// listed ETag is unchanged is reused, not fetched. A session gone from
+    /// an answered listing, and a prefix gone from the top level, leave the
+    /// cache.
+    pub fn scan_cached(&self, local: &LocalView, cache: &mut FeedCache) -> RemoteSnapshot {
+        self.scan_with(local, Some(cache))
+    }
+
+    fn scan_with(&self, local: &LocalView, mut cache: Option<&mut FeedCache>) -> RemoteSnapshot {
+        let all = match self.workspaces() {
             Ok(w) => w,
             Err(e) => {
                 return RemoteSnapshot {
@@ -731,13 +856,19 @@ impl RemoteReader {
                 }
             }
         };
+        let now = SystemTime::now();
+        let workspaces = match cache.as_deref() {
+            Some(cache) => choose_prefixes(&all, cache, now, PREFIX_BUDGET),
+            None => all.clone(),
+        };
         let next = AtomicUsize::new(0);
         let results: Mutex<Vec<(String, WorkspaceScan)>> = Mutex::new(Vec::new());
+        let previous = cache.as_deref();
         std::thread::scope(|scope| {
             for _ in 0..workspaces.len().min(FANOUT) {
                 scope.spawn(|| {
                     while let Some(ws) = workspaces.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let result = self.scan_workspace(ws);
+                        let result = self.scan_workspace(ws, previous.and_then(|c| c.sessions(ws)));
                         results
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -749,10 +880,43 @@ impl RemoteReader {
         let mut snapshot = RemoteSnapshot::default();
         let mut scanned = Vec::new();
         let mut failed: Vec<(String, FailureClass)> = Vec::new();
-        for (ws, result) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            match result {
-                Ok(sessions) => scanned.extend(sessions),
-                Err(e) => failed.push((ws, e.class())),
+        let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+        match cache.as_deref_mut() {
+            None => {
+                for (ws, result) in results {
+                    match result {
+                        Ok(sessions) => scanned.extend(sessions),
+                        Err(e) => failed.push((ws, e.class())),
+                    }
+                }
+            }
+            Some(cache) => {
+                cache.scans += 1;
+                let scan = cache.scans;
+                cache.workspaces.retain(|ws, _| all.contains(ws));
+                for (ws, result) in results {
+                    let entry = cache.workspaces.entry(ws.clone()).or_default();
+                    entry.listed_at = scan;
+                    match result {
+                        Ok(sessions) => {
+                            entry.newest = sessions
+                                .iter()
+                                .flat_map(|s| s.listing.objects.values())
+                                .filter_map(|o| o.last_modified)
+                                .max();
+                            entry.sessions =
+                                sessions.into_iter().map(|s| (s.name.clone(), s)).collect();
+                        }
+                        Err(e) => failed.push((ws, e.class())),
+                    }
+                }
+                let failed_now: HashSet<&str> = failed.iter().map(|(ws, _)| ws.as_str()).collect();
+                for (ws, entry) in &cache.workspaces {
+                    if !failed_now.contains(ws.as_str()) {
+                        scanned.extend(entry.sessions.values().cloned());
+                    }
+                }
+                scanned.sort_by(|a, b| (&a.workspace, &a.name).cmp(&(&b.workspace, &b.name)));
             }
         }
         failed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -760,7 +924,7 @@ impl RemoteReader {
             let workspaces = failed.into_iter().map(|(ws, _)| ws).collect();
             snapshot.failure = Some(self.failure(class, workspaces));
         }
-        let classified = classify(&scanned, local, SystemTime::now());
+        let classified = classify(&scanned, local, now);
         snapshot.rows = classified.rows;
         snapshot.unreadable = classified.unreadable;
         snapshot.hidden_sources = classified.hidden_sources;
@@ -801,6 +965,7 @@ impl RemoteFeed {
         let local = Arc::new(Mutex::new(local));
         let stop = Arc::new(AtomicBool::new(false));
         let (view, stopped) = (Arc::clone(&local), Arc::clone(&stop));
+        let mut cache = FeedCache::new();
         std::thread::Builder::new()
             .name("koto-remote-feed".to_string())
             .spawn(move || loop {
@@ -808,7 +973,7 @@ impl RemoteFeed {
                     return;
                 }
                 let view = view.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let snapshot = reader.scan(&view);
+                let snapshot = reader.scan_cached(&view, &mut cache);
                 if stopped.load(Ordering::Relaxed) || tx.send(snapshot).is_err() {
                     return;
                 }
@@ -1414,5 +1579,99 @@ mod tests {
             ..some
         };
         assert!(two.line().starts_with("2 workspaces couldn't be read"));
+    }
+
+    /// A cache that last listed each `(prefix, scan, newest age in secs)`.
+    fn cache_of(entries: &[(&str, u64, u64)]) -> FeedCache {
+        let mut cache = FeedCache::new();
+        for &(ws, listed_at, age) in entries {
+            cache.workspaces.insert(
+                ws.to_string(),
+                CachedWorkspace {
+                    listed_at,
+                    newest: Some(now() - Duration::from_secs(age)),
+                    sessions: BTreeMap::new(),
+                },
+            );
+        }
+        cache.scans = entries.iter().map(|e| e.1).max().unwrap_or(0);
+        cache
+    }
+
+    fn prefixes(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{i:016x}")).collect()
+    }
+
+    #[test]
+    fn remote_feed_budget_lists_every_prefix_at_or_under_it() {
+        let all = prefixes(3);
+        let cache = cache_of(&[(&all[0], 1, 7200)]);
+        assert_eq!(choose_prefixes(&all, &cache, now(), 3), all);
+    }
+
+    #[test]
+    fn remote_feed_budget_puts_new_then_active_then_longest_unlisted() {
+        let all = prefixes(6);
+        // 0 and 1 never listed; 2 active (changed 60 s ago); 3, 4, 5 idle,
+        // listed at scans 3, 1 and 2.
+        let cache = cache_of(&[
+            (&all[2], 3, 60),
+            (&all[3], 3, 7200),
+            (&all[4], 1, 7200),
+            (&all[5], 2, 7200),
+        ]);
+        let chosen = choose_prefixes(&all, &cache, now(), 4);
+        assert_eq!(
+            chosen,
+            vec![
+                all[0].clone(),
+                all[1].clone(),
+                all[2].clone(),
+                all[4].clone()
+            ]
+        );
+        let chosen = choose_prefixes(&all, &cache, now(), 5);
+        assert_eq!(chosen[4], all[5]);
+    }
+
+    #[test]
+    fn remote_feed_budget_never_exceeds_it_and_rotates_idle_prefixes() {
+        let all = prefixes(250);
+        let mut cache = FeedCache::new();
+        let mut seen: Vec<HashSet<String>> = Vec::new();
+        for scan in 1..=3u64 {
+            let chosen = choose_prefixes(&all, &cache, now(), PREFIX_BUDGET);
+            assert_eq!(chosen.len(), PREFIX_BUDGET, "scan {scan}");
+            for ws in &chosen {
+                let entry = cache.workspaces.entry(ws.clone()).or_default();
+                entry.listed_at = scan;
+                entry.newest = Some(now() - Duration::from_secs(7200));
+            }
+            seen.push(chosen.into_iter().collect());
+        }
+        // The 50 left out of the first scan are listed on the second, and
+        // every prefix is listed in any two consecutive scans.
+        for pair in seen.windows(2) {
+            for ws in &all {
+                assert!(
+                    pair[0].contains(ws) || pair[1].contains(ws),
+                    "{ws} unlisted for two scans"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_feed_budget_lists_a_changed_idle_prefix_every_scan() {
+        let mut all = prefixes(201);
+        let cache = cache_of(
+            &all.iter()
+                .enumerate()
+                .map(|(i, ws)| (ws.as_str(), 5, if i == 200 { 10 } else { 7200 }))
+                .collect::<Vec<_>>(),
+        );
+        assert!(choose_prefixes(&all, &cache, now(), 200).contains(&all[200]));
+        all.push("ffffffffffffffff".to_string());
+        assert!(choose_prefixes(&all, &cache, now(), 200).contains(&all[201]));
     }
 }
