@@ -12,6 +12,8 @@
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -89,6 +91,7 @@ impl Ws {
     fn project_file(&self, text: &str) {
         std::fs::create_dir_all(self.path("proj/.koto")).unwrap();
         std::fs::write(self.path("proj/.koto/config.toml"), text).unwrap();
+        project_trust::trust(&self.path("home/.koto"), &self.path("proj"));
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Out {

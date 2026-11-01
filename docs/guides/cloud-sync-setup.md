@@ -27,6 +27,8 @@ koto config set session.cloud.bucket my-koto-sessions
 koto config set session.cloud.region auto
 ```
 
+A project config applies only once it's trusted on each machine. The file `koto config set` creates is trusted as written. A teammate who clones the repository gets a note on stderr that the file is ignored until they check where it sends session state and run `koto config trust` in their checkout, and any later change to the file needs that again. See [config](cli-usage.md#config).
+
 To keep the settings to your own machine instead, add `--user`, which writes `$HOME/.koto/config.toml`:
 
 ```bash
@@ -440,7 +442,7 @@ Context keys are compared one at a time when they're read. When this host's copy
 | `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
 | `machine.name` | `KOTO_MACHINE_NAME` | The name this machine records on the sessions it creates and publishes to the bucket (see [The machine name](#the-machine-name)) | short hostname | No (user/env only) |
 
-Precedence for each setting: its variable, then project config, then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config. `machine.name` has no project level: its variable, then user config, then the hostname.
+Precedence for each setting: its variable, then project config (once trusted), then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config. `machine.name` has no project level: its variable, then user config, then the hostname.
 
 ### The machine name
 

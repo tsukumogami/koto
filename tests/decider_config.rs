@@ -4,6 +4,8 @@
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -100,6 +102,7 @@ fn list_without_decider_has_no_decider_key() {
         v.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
         vec![
             "origins",
+            "project_config",
             "request_store",
             "retention",
             "run_journal",
@@ -122,6 +125,8 @@ fn project_key_endpoint_timeout_dropped_at_load() {
             "[decider]\nmode = \"auto\"\napi_key = \"{KEY}\"\nendpoint = \"https://proj-endpoint.example/d\"\ntimeout_ms = 7777\n"
         ),
     );
+    // Trusted, so what's checked is the drop at load, not the trust gate.
+    project_trust::trust(&d.home.join(".koto"), &d.cwd);
 
     let out = run(koto(&d), &["config", "get", "decider.api_key"]);
     assert_eq!(out.code, 1);
@@ -327,6 +332,7 @@ fn malformed_decider_tables_do_not_break_config() {
         &project_config(&d),
         "[session]\nbackend = \"local\"\n\n[decider]\nmode = [1, 2]\napi_key = 5\n",
     );
+    project_trust::trust(&d.home.join(".koto"), &d.cwd);
     let out = run(koto(&d), &["config", "get", "workflows.native"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(out.stdout.trim(), "false");

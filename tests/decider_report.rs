@@ -1996,10 +1996,16 @@ const LEAKED: &str = "sk-LEAKME-123";
 /// Config bodies that fail to parse on a line holding [`LEAKED`]: an
 /// unterminated string (a syntax error) and a string where a table belongs
 /// (a shape error, whose serde message quotes the value).
-fn broken_configs() -> [(&'static str, String); 2] {
+fn broken_configs() -> [(&'static str, String); 3] {
     [
         ("syntax", format!("[decider]\napi_key = \"{}\n", LEAKED)),
         ("shape", format!("[session]\ncloud = \"{}\"\n", LEAKED)),
+        // A wrong-shaped key project config may set: kept from a trusted
+        // project file, so it fails the load there too.
+        (
+            "allowed-shape",
+            format!("[session.cloud]\nbucket = [\"{}\"]\n", LEAKED),
+        ),
     ]
 }
 
@@ -2060,14 +2066,33 @@ fn a_config_parse_error_never_prints_the_file_content() {
                 assert!(!se.contains("sk-"), "{}: {}", case, se);
                 // `config set/unset` edit the raw TOML, so a well-formed
                 // file with a wrong-shaped value doesn't stop them.
-                if kind == "shape"
+                if kind != "syntax"
                     && (name.starts_with("config set") || name.starts_with("config unset"))
                 {
                     assert_eq!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
                     continue;
                 }
+                // In project config the wrong-shaped key isn't one project
+                // config may set, so it's dropped by name, never by value,
+                // and nothing fails.
+                if kind == "shape" && !user {
+                    assert_eq!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
+                    if name == "next" {
+                        assert!(
+                            se.contains("1 unrecognized key(s) ignored"),
+                            "{}: {}",
+                            case,
+                            se
+                        );
+                    }
+                    continue;
+                }
                 assert_ne!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
-                assert!(se.contains(line), "{}: no position: {}", case, se);
+                // A project file is checked after its keys are reduced, so
+                // a wrong-shaped value there has no line to point at.
+                if user || kind == "syntax" {
+                    assert!(se.contains(line), "{}: no position: {}", case, se);
+                }
                 // The path is named; `config set/unset` read the file
                 // directly, so it's shown as given.
                 let shown = if user {
@@ -2077,7 +2102,11 @@ fn a_config_parse_error_never_prints_the_file_content() {
                 };
                 assert!(se.contains(&shown), "{}: no path: {}", case, se);
             }
-            assert_eq!(h.stub.request_count(), 0, "{} {}", layer, kind);
+            // A trusted project file with a wrong-shaped key loads without
+            // it, so the opted-in decider is consulted as usual.
+            if user || kind != "shape" {
+                assert_eq!(h.stub.request_count(), 0, "{} {}", layer, kind);
+            }
         }
     }
 }

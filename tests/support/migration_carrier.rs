@@ -11,7 +11,8 @@
 //! A simulated host is a [`Host`]: its own `HOME` (so its own session store
 //! and machine config), its own `XDG_CACHE_HOME` (so its own template
 //! cache) and its own workspace directory, whose `.koto/config.toml` points
-//! the cloud backend at a shared bucket. Hosts share nothing else.
+//! the cloud backend at a shared bucket and is trusted in the host's koto
+//! root. Hosts share nothing else.
 //!
 //! The steps are functions on [`Carrier`] so a test can put its own checks
 //! between them; `tests/session_migration_test.rs` runs them against an
@@ -19,6 +20,9 @@
 //! bucket. Every failure names its step: `[<step>] <what went wrong>`.
 
 #![allow(dead_code)]
+
+#[path = "project_trust.rs"]
+pub mod project_trust;
 
 use assert_cmd::Command;
 use sha2::{Digest, Sha256};
@@ -187,6 +191,7 @@ impl Host {
             config.push_str("path_style = true\n");
         }
         std::fs::write(ws.join(".koto").join("config.toml"), config).unwrap();
+        project_trust::trust(&home.join(".koto"), &ws);
         std::fs::write(ws.join(TEMPLATE_FILE), TEMPLATE).unwrap();
 
         Host {

@@ -16,6 +16,8 @@
 mod fake_s3;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use fake_s3::FakeS3;
 use std::path::PathBuf;
@@ -124,6 +126,7 @@ impl Box_ {
         let dir = self.ws.join(".koto");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), body).unwrap();
+        project_trust::trust(&self.home.join(".koto"), &self.ws);
     }
 
     fn koto(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
@@ -302,6 +305,7 @@ fn toml_output_parses_to_the_same_tables_with_origin_comments() {
     let parsed: toml::Value = text.parse().expect("valid TOML");
     let mut json = list_json(&b, &[("KOTO_SESSION_CLOUD_BUCKET", "b")]);
     json.as_object_mut().unwrap().remove("origins");
+    json.as_object_mut().unwrap().remove("project_config");
     let as_json: serde_json::Value = serde_json::to_value(&parsed).unwrap();
     let strip_nulls = |v: &serde_json::Value| -> serde_json::Value {
         fn walk(v: &serde_json::Value) -> serde_json::Value {

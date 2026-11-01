@@ -4,10 +4,12 @@ use url::{Host, Url};
 
 use crate::decider::GlobalMode;
 
-/// Keys allowed in project config (.koto/config.toml).
-/// Credential keys are intentionally excluded to prevent secrets from being
-/// committed to version control.
-const PROJECT_ALLOWLIST: &[&str] = &[
+/// Keys allowed in project config (.koto/config.toml): the keys
+/// `koto config set` writes there and the only keys `load_config` takes
+/// from a trusted project file. Credential keys are intentionally excluded
+/// to prevent secrets from being committed to version control, and a key
+/// added to koto later stays out of project config until it is added here.
+pub const PROJECT_ALLOWLIST: &[&str] = &[
     "session.backend",
     "session.cloud.endpoint",
     "session.cloud.bucket",
@@ -51,6 +53,164 @@ pub fn validate_project_key(key: &str) -> Result<(), String> {
     } else {
         Err(format!("key '{}' is not allowed in project config", key))
     }
+}
+
+/// Validate a value for an allowed project config key: an endpoint that
+/// carries user information before `@` holds a credential.
+pub fn validate_project_value(key: &str, value: &str) -> Result<(), String> {
+    if key == "session.cloud.endpoint" && raw_has_userinfo(value) {
+        return Err(format!(
+            "an endpoint with credentials before '@' can't be stored in project config ('{}')",
+            key
+        ));
+    }
+    Ok(())
+}
+
+/// The keys koto reads from a config file. A dropped key on this list is
+/// named in warnings; any other dropped key is only counted, since its name
+/// is text the file's author chose.
+const KNOWN_KEYS: &[&str] = &[
+    "session.backend",
+    "session.cloud.endpoint",
+    "session.cloud.bucket",
+    "session.cloud.region",
+    "session.cloud.access_key",
+    "session.cloud.secret_key",
+    "session.cloud.path_style",
+    "session.cloud.marker_retain_days",
+    "session.cloud.check_window_secs",
+    "request_store.stale_claim_timeout_seconds",
+    "request_store.stale_dispatch_timeout_seconds",
+    "request_store.redelegation_cap",
+    "request_store.coord_cursor_ttl_days",
+    "request_store.terminal_index_compact_lines",
+    "request_store.compact_lock_timeout_seconds",
+    "request_store.directive_batch_size",
+    "request_store.respawn_generation_cap",
+    "request_store.request_leg_append_cap",
+    "request_store.request_leg_cap",
+    "workflows.native",
+    "run_journal.rotate_bytes",
+    "run_journal.retain_days",
+    "run_journal.reader_stale_days",
+    "retention.keep",
+    "retention.idle_period",
+    "retention.stale_after",
+    "decider.mode",
+    "decider.api_key",
+    "decider.endpoint",
+    "decider.timeout_ms",
+    "machine.name",
+];
+
+/// A reserved table koto knows by name but whose keys it doesn't read: a
+/// key under it is reported as the table, never by its own name.
+const RESERVED_TABLE: &str = "request_store.recursion";
+
+/// What a trusted project config file contributes: its table reduced to
+/// the [`PROJECT_ALLOWLIST`] keys, and what was dropped.
+#[derive(Debug, Clone)]
+pub struct ProjectLayer {
+    /// The file's table with only allowed keys left.
+    pub kept: toml::Value,
+    /// Dotted names of the dropped keys koto recognizes (a reserved table
+    /// by its own name), in file order.
+    pub dropped: Vec<String>,
+    /// How many dropped keys koto doesn't recognize.
+    pub unknown: usize,
+}
+
+/// Reduce a project config file's raw table to the keys project config may
+/// set. The raw table is filtered rather than the typed config, so a key
+/// the config struct doesn't know is dropped and counted too. An endpoint
+/// carrying user information is dropped as a credential.
+pub fn filter_project_layer(raw: &toml::Value) -> ProjectLayer {
+    let mut kept = toml::map::Map::new();
+    let mut dropped = Vec::new();
+    let mut unknown = 0;
+    let mut leaves = Vec::new();
+    if let Some(table) = raw.as_table() {
+        flatten(&mut Vec::new(), table, &mut leaves);
+    }
+    for (path, value) in leaves {
+        // A quoted key with a dot in it is one key, not a path.
+        let plain = path.iter().all(|s| !s.contains('.'));
+        let key = path.join(".");
+        let allowed = plain
+            && PROJECT_ALLOWLIST.contains(&key.as_str())
+            && !(key == "session.cloud.endpoint" && value.as_str().is_some_and(raw_has_userinfo));
+        let reserved = plain && key.starts_with(&format!("{RESERVED_TABLE}."));
+        if allowed {
+            insert_path(&mut kept, &path, value.clone());
+        } else if plain && KNOWN_KEYS.contains(&key.as_str()) {
+            dropped.push(key);
+        } else if reserved {
+            if !dropped.iter().any(|k| k == RESERVED_TABLE) {
+                dropped.push(RESERVED_TABLE.to_string());
+            }
+        } else {
+            unknown += 1;
+        }
+    }
+    ProjectLayer {
+        kept: toml::Value::Table(kept),
+        dropped,
+        unknown,
+    }
+}
+
+/// The allowed settings in a filtered table, as `key -> value`, for a
+/// trust grant's record of what it granted.
+pub fn settings_snapshot(kept: &toml::Value) -> std::collections::BTreeMap<String, String> {
+    let mut leaves = Vec::new();
+    if let Some(table) = kept.as_table() {
+        flatten(&mut Vec::new(), table, &mut leaves);
+    }
+    leaves
+        .into_iter()
+        .map(|(path, value)| {
+            let shown = match value {
+                toml::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (path.join("."), shown)
+        })
+        .collect()
+}
+
+/// Every non-table value under `table`, with its path of keys.
+fn flatten<'a>(
+    prefix: &mut Vec<String>,
+    table: &'a toml::map::Map<String, toml::Value>,
+    out: &mut Vec<(Vec<String>, &'a toml::Value)>,
+) {
+    for (key, value) in table {
+        prefix.push(key.clone());
+        match value {
+            toml::Value::Table(inner) => flatten(prefix, inner, out),
+            leaf => out.push((prefix.clone(), leaf)),
+        }
+        prefix.pop();
+    }
+}
+
+/// Put `value` at `path` in `table`, creating the tables on the way.
+fn insert_path(
+    table: &mut toml::map::Map<String, toml::Value>,
+    path: &[String],
+    value: toml::Value,
+) {
+    let (last, parents) = path.split_last().expect("a key path has a key");
+    let mut at = table;
+    for key in parents {
+        at = at
+            .entry(key.clone())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .expect("only tables are created on a key path");
+    }
+    at.insert(last.clone(), value);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +421,89 @@ pub fn validate_decider_api_key_value(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer(text: &str) -> ProjectLayer {
+        filter_project_layer(&text.parse::<toml::Value>().unwrap())
+    }
+
+    #[test]
+    fn every_allowed_project_key_is_a_known_key() {
+        for key in PROJECT_ALLOWLIST {
+            assert!(KNOWN_KEYS.contains(key), "{key} is allowed but not known");
+        }
+    }
+
+    #[test]
+    fn every_settable_key_is_a_known_key() {
+        for key in crate::config::ALL_KEYS {
+            assert!(KNOWN_KEYS.contains(key), "{key} is settable but not known");
+        }
+    }
+
+    #[test]
+    fn a_trusted_project_file_names_and_drops_machine_name() {
+        let layer = layer("[machine]\nname = \"proj-name\"\n");
+        assert_eq!(layer.dropped, vec!["machine.name".to_string()]);
+        assert_eq!(layer.unknown, 0);
+        assert!(layer.kept.as_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_project_layer_keeps_only_allowed_keys() {
+        let l = layer(
+            "[session]\nbackend = \"cloud\"\n[session.cloud]\nbucket = \"b\"\n\
+             access_key = \"k\"\ncheck_window_secs = 60\n[retention]\nkeep = \"7d\"\n\
+             [decider]\nmode = \"shadow\"\nendpoint = \"https://d.example\"\n\
+             [request_store]\nredelegation_cap = 9\n[workflows]\nnative = false\n",
+        );
+        let kept = settings_snapshot(&l.kept);
+        let keys: Vec<&str> = kept.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "decider.mode",
+                "retention.keep",
+                "session.backend",
+                "session.cloud.bucket"
+            ]
+        );
+        let mut dropped = l.dropped.clone();
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            [
+                "decider.endpoint",
+                "request_store.redelegation_cap",
+                "session.cloud.access_key",
+                "session.cloud.check_window_secs",
+                "workflows.native"
+            ]
+        );
+        assert_eq!(l.unknown, 0);
+    }
+
+    #[test]
+    fn unrecognized_keys_are_counted_not_named() {
+        let l = layer(
+            "[made_up]\nx = 1\n[session]\n\"cloud.bucket\" = \"b\"\n\
+             \"some key with spaces\" = 1\n",
+        );
+        assert!(settings_snapshot(&l.kept).is_empty());
+        assert!(l.dropped.is_empty(), "{:?}", l.dropped);
+        assert_eq!(l.unknown, 3);
+    }
+
+    #[test]
+    fn an_endpoint_with_credentials_is_dropped_and_refused() {
+        let l = layer("[session.cloud]\nendpoint = \"https://u:p@store.example\"\n");
+        assert!(settings_snapshot(&l.kept).is_empty());
+        assert_eq!(l.dropped, ["session.cloud.endpoint"]);
+        assert!(
+            validate_project_value("session.cloud.endpoint", "https://u:p@store.example").is_err()
+        );
+        assert!(validate_project_value("session.cloud.endpoint", "https://store.example").is_ok());
+        assert!(validate_project_value("session.cloud.bucket", "a@b").is_ok());
+    }
 
     #[test]
     fn test_allowed_keys() {

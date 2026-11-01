@@ -8,6 +8,8 @@
 mod fake_s3;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use std::path::{Path, PathBuf};
 
@@ -306,6 +308,7 @@ fn a_bucket_only_session_is_left_out_and_counted() {
         ),
     )
     .unwrap();
+    project_trust::trust(&env.home.join(".koto"), &w);
     let prefix = {
         let digest = Sha256::digest(w.to_string_lossy().as_bytes());
         hex::encode(digest)[..16].to_string()

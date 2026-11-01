@@ -12,6 +12,8 @@
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -490,13 +492,15 @@ fn only_the_roots_own_config_selects_the_cloud_backend_under_koto_home() {
         .collect();
     let template = env.template.to_str().unwrap();
 
-    // A project config asking for cloud is ignored under KOTO_HOME.
+    // A project config asking for cloud is ignored under KOTO_HOME, even
+    // trusted in the root.
     std::fs::create_dir_all(env.work.join(".koto")).unwrap();
     std::fs::write(
         env.work.join(".koto/config.toml"),
         "[session]\nbackend = \"cloud\"\n",
     )
     .unwrap();
+    project_trust::trust(&env.koto_home, &env.work);
     let report = env.dir_report(&located);
     assert_eq!(report["backend"], "local");
     assert_eq!(report["backend_ignored"], "project config");

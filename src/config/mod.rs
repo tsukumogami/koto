@@ -1,6 +1,7 @@
 pub mod resolve;
 pub mod retention;
 pub mod session_env;
+pub mod trust;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,12 @@ pub struct KotoConfig {
     /// serialized; `koto config list` prints it beside the tables.
     #[serde(skip)]
     pub session_env: session_env::SessionEnv,
+    /// Whether the working directory's project config file applied: absent,
+    /// ignored because it isn't trusted or changed since it was, or trusted,
+    /// with the keys it may not set. Filled by `resolve::load_config`, never
+    /// serialized; `koto config list` and `koto session dir` print it.
+    #[serde(skip)]
+    pub project_config: trust::ProjectConfigState,
 }
 
 /// Provenance of koto's secret settings, for redaction.
