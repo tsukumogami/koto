@@ -146,6 +146,18 @@ pub struct RemoveEntry {
     /// When the session stopped, as the retention engine reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
+    /// For a session whose hierarchy was released by a member's stop: why,
+    /// naming that member, how it stopped and when the retention passed
+    /// (`hierarchy::reason_text`). In `removed`, from the judgment made
+    /// under the lock. Absent for a finished record and for a hierarchy with
+    /// no stop of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The release beside `detail`, in the shape a kept entry's
+    /// `hierarchy.retention` has: `release` (`at`, `member`, `close_kind`)
+    /// and `passes_at` (`hierarchy::retention_json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<serde_json::Value>,
 }
 
 impl RemoveEntry {
@@ -605,24 +617,29 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
             backend,
         ) {
             Some(entry) => kept.push(entry),
-            None => remove.push(RemoveEntry {
-                kind: KIND_SESSION.to_string(),
-                name: name.clone(),
-                session_id: session.header.as_ref().and_then(|h| h.session_id.clone()),
-                status: Some(session.seen.status),
-                state: session.seen.state.clone(),
-                failure: session.seen.failure,
-                finished_at: session.seen.finished_at.clone(),
-                execution_dir: session
-                    .header
-                    .as_ref()
-                    .and_then(|h| h.execution_dir.clone()),
-                session_kind: member
-                    .map(|m| m.kind)
-                    .filter(|k| *k != MemberKind::KotoSession)
-                    .map(|k| k.as_str().to_string()),
-                stopped_at,
-            }),
+            None => {
+                let (detail, retention) = release_fields(&judgment.verdict);
+                remove.push(RemoveEntry {
+                    kind: KIND_SESSION.to_string(),
+                    name: name.clone(),
+                    session_id: session.header.as_ref().and_then(|h| h.session_id.clone()),
+                    status: Some(session.seen.status),
+                    state: session.seen.state.clone(),
+                    failure: session.seen.failure,
+                    finished_at: session.seen.finished_at.clone(),
+                    execution_dir: session
+                        .header
+                        .as_ref()
+                        .and_then(|h| h.execution_dir.clone()),
+                    session_kind: member
+                        .map(|m| m.kind)
+                        .filter(|k| *k != MemberKind::KotoSession)
+                        .map(|k| k.as_str().to_string()),
+                    stopped_at,
+                    detail,
+                    retention,
+                });
+            }
         }
     }
     // A close session goes only with its anchor: one whose anchor stays in
@@ -675,6 +692,8 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
             execution_dir: record.execution_dir.clone(),
             session_kind: None,
             stopped_at: None,
+            detail: None,
+            retention: None,
         });
     }
     let token = plan_token(&remove);
@@ -683,6 +702,19 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
         kept,
         stale,
         token,
+    }
+}
+
+/// The `detail` and `retention` of a remove entry whose hierarchy `verdict`
+/// released: why, naming the member whose stop released it, and that
+/// release as JSON. Both `None` for a verdict with no release of its own.
+fn release_fields(verdict: &Hierarchy) -> (Option<String>, Option<serde_json::Value>) {
+    match verdict {
+        Hierarchy::Release { release: Some(r) } => (
+            Some(hierarchy::reason_text(verdict)),
+            Some(hierarchy::retention_json(r)),
+        ),
+        _ => (None, None),
     }
 }
 
@@ -1182,6 +1214,9 @@ fn apply_component(
             return;
         }
     };
+    // A removed entry names the release this judgment, made under the
+    // lock, let it go by, which may be later than the preview's.
+    let (detail, retention) = release_fields(&judgment.verdict);
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
     for (entry, lock) in &locked {
@@ -1223,8 +1258,13 @@ fn apply_component(
         };
         if result.is_ok() {
             removed.insert(entry.name.clone());
+            let mut entry = (*entry).clone();
+            entry.detail = detail.clone();
+            entry.retention = retention.clone();
+            record_result(outcome, &entry, result);
+        } else {
+            record_result(outcome, entry, result);
         }
-        record_result(outcome, entry, result);
     }
 }
 
@@ -1562,6 +1602,8 @@ mod tests {
             execution_dir: None,
             session_kind: None,
             stopped_at: None,
+            detail: None,
+            retention: None,
         }
     }
 

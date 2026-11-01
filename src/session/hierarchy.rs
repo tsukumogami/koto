@@ -68,7 +68,7 @@ pub use relation::{RelationKeeper, RelationVerdict, Standing, Unchecked, Uncheck
 pub use render::{
     close_command, display_text, keeper_json, keeper_line, pin_fields, pin_json, pin_text,
     query_json, query_text, reason_text, relation_json, relation_report_json, relation_text,
-    release_json, render_text, sanitize, to_json,
+    release_json, render_text, retention_json, sanitize, to_json,
 };
 pub use settings::{RetentionSettings, Setting, SettingError};
 

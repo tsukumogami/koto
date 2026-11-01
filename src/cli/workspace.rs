@@ -256,6 +256,7 @@ pub fn handle_prune(
     //     `koto workflows`. Each is judged again under its own lock first.
     let Reclaimed {
         removed,
+        released,
         skipped,
         failed,
     } = reclaim(backend, &graph, &settings, now, &root, &plan.remove);
@@ -286,6 +287,7 @@ pub fn handle_prune(
             "pruned": root_removed,
             "descendants_removed": removed.iter().filter(|n| **n != root).count(),
             "removed": removed,
+            "released": released,
             "kept": plan.kept.iter().map(KeptMember::to_json).collect::<Vec<_>>(),
             "skipped": skipped,
             "failed": failed,
@@ -305,6 +307,11 @@ struct ReleasedMember {
     name: String,
     session_id: Option<String>,
     kind: MemberKind,
+    /// Why the rule lets it go (`hierarchy::reason_text`), naming the
+    /// member whose stop released its hierarchy when one did: the preview's
+    /// remove line. The report's `released` comes from the judgment made
+    /// again under the lock instead.
+    reason: String,
 }
 
 /// One subtree member the rule or its own pin keeps, with why.
@@ -468,6 +475,7 @@ fn judge_subtree(
                             .find(|m| m.name == member)
                             .map(|m| m.kind)
                             .unwrap_or(MemberKind::KotoSession),
+                        reason: hierarchy::reason_text(&j.verdict),
                     });
                 }
             }
@@ -533,8 +541,20 @@ fn keep_bucket_pinned(backend: &crate::session::Backend, plan: &mut SubtreePlan)
 /// What the reclaim did with each released member.
 struct Reclaimed {
     removed: Vec<String>,
+    /// For each removed member whose hierarchy a member's stop released, as
+    /// judged again under its lock: `reason` and `retention`.
+    released: serde_json::Map<String, serde_json::Value>,
     skipped: Vec<serde_json::Value>,
     failed: Vec<serde_json::Value>,
+}
+
+/// The release `verdict` lets its hierarchy go by, as JSON; `None` for a
+/// verdict that keeps it or a hierarchy no member's stop released.
+fn release_retention(verdict: &Verdict) -> Option<serde_json::Value> {
+    match verdict {
+        Verdict::Release { release: Some(r) } => Some(hierarchy::retention_json(r)),
+        _ => None,
+    }
 }
 
 /// Remove the released members, in `members`' order (deepest first, the
@@ -554,6 +574,7 @@ fn reclaim(
     use crate::session::SessionError;
     let mut out = Reclaimed {
         removed: Vec::new(),
+        released: serde_json::Map::new(),
         skipped: Vec::new(),
         failed: Vec::new(),
     };
@@ -608,6 +629,16 @@ fn reclaim(
             Ok((_, Some(related))) => hierarchy::relation_json(related),
             _ => serde_json::Map::new(),
         };
+        // The release this judgment lets the member go by, for the report.
+        let released = match &judged {
+            Ok((j, _)) => release_retention(&j.verdict).map(|retention| {
+                json!({
+                    "reason": hierarchy::reason_text(&j.verdict),
+                    "retention": retention,
+                })
+            }),
+            Err(_) => None,
+        };
         let refusal = match judged {
             Ok((j, _)) if j.verdict.is_kept() => {
                 Some(format!("now {}", hierarchy::reason_text(&j.verdict)))
@@ -645,11 +676,11 @@ fn reclaim(
                     }
                 }
             }
-            None => cleared.push((member, lock)),
+            None => cleared.push((member, lock, released)),
         }
     }
 
-    for (member, lock) in cleared {
+    for (member, lock, released) in cleared {
         let name = member.name.as_str();
         if let Some(below) = left.iter().find(|l| descends_from(graph, l, name)) {
             let reason = format!(
@@ -668,7 +699,12 @@ fn reclaim(
         match crate::session::pin::remove_by_rule_with(backend, name, &lock, || {
             backend.cleanup(name)
         }) {
-            Ok(crate::session::pin::Removal::Removed) => out.removed.push(name.to_string()),
+            Ok(crate::session::pin::Removal::Removed) => {
+                out.removed.push(name.to_string());
+                if let Some(released) = released {
+                    out.released.insert(name.to_string(), released);
+                }
+            }
             Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
                 let mut entry = json!({
                     "name": name,
@@ -1438,7 +1474,11 @@ fn print_preview(
     } else {
         println!("remove ({}, in this order):", plan.remove.len());
         for m in &plan.remove {
-            println!("  {}", hierarchy::sanitize(&m.name));
+            println!(
+                "  {}: {}",
+                hierarchy::sanitize(&m.name),
+                hierarchy::sanitize(&m.reason)
+            );
         }
     }
     if !plan.kept.is_empty() {
