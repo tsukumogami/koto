@@ -310,7 +310,9 @@ pub fn keeper_json(k: &Keeper) -> Value {
     v
 }
 
-fn retention_json(r: &Retention) -> Value {
+/// A retention as JSON: the release (when, which member stopped, and how)
+/// and when the retention passes, or passed.
+pub fn retention_json(r: &Retention) -> Value {
     json!({
         "release": {
             "at": r.release.at,

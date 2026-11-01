@@ -674,6 +674,22 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A prune says which stop released each session it removes
+  ([koto#565](https://github.com/tsukumogami/koto/issues/565)).** Inside the
+  retention, a kept session's `detail` named the member whose stop released
+  its hierarchy and how it stopped, but once the retention passed the
+  session moved to `remove` (or `removed`) with nothing saying what let it
+  go, so an anchor that went quiet past `retention.idle_period` couldn't be
+  told from one closed by its close command. Each session entry in
+  `koto session prune`'s `remove` and `removed` now carries `detail`, the
+  released verdict naming that member, its close kind and when the
+  retention passed, and `retention`, the same release in the shape a kept
+  entry's `hierarchy.retention` has. `koto workspace prune` adds a
+  `released` map from each removed member to its `reason` and `retention`,
+  and its preview's remove lines give each member's reason the way the keep
+  lines do. In an apply both come from the judgment made under the lock
+  just before the removal. Plan tokens are unchanged.
+
 - **The koto-skills start hook opens the anchor in the store the agent
   session's shells use
   ([koto#564](https://github.com/tsukumogami/koto/issues/564)).** The hook

@@ -158,6 +158,10 @@ impl Env {
             .env_remove("KOTO_ANCHOR")
             .env_remove("KOTO_DISPATCHER_ANCHOR")
             .env_remove("KOTO_SESSION_BACKEND")
+            .env_remove("KOTO_HOME")
+            .env_remove("KOTO_AUTHORITY")
+            .env_remove("KOTO_TICK_SESSION")
+            .env_remove("KOTO_WORKFLOWS_HOST_SESSION")
             .env_remove("CLAUDE_CODE_SESSION_ID");
         for (k, v) in FAST {
             cmd.env(k, v);
@@ -2055,4 +2059,183 @@ fn a_stale_observed_anchor_is_listed_with_its_close_command_and_closes_nothing()
         names(&v["removed"]),
         vec![anchor.clone(), format!("{anchor}-closed"), "b".to_string()]
     );
+}
+
+// ===== Which close released a removed session (koto#565) =====
+
+/// The idle period and retention the idle-close tests run with: an
+/// unobserved anchor stops after a second of quiet, and its hierarchy's
+/// retention passes a second after that.
+const IDLE: [(&str, &str); 2] = [
+    ("KOTO_RETENTION_IDLE_PERIOD", "1s"),
+    ("KOTO_RETENTION_KEEP", "1s"),
+];
+
+/// Fail unless `koto session dir` resolves under this test's scratch root,
+/// so no command the test runs reaches the store of the host it runs on.
+fn assert_contained(env: &Env) {
+    let out = env.run_env(&["session", "dir"], &[]);
+    assert!(
+        out.status.success(),
+        "koto session dir failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert!(
+        dir.starts_with(&env.root),
+        "koto session dir is {dir:?}, outside the test's tempdir {:?}",
+        env.root
+    );
+}
+
+/// An unobserved anchor for harness session `harness`, which only an idle
+/// close stops.
+fn idle_anchor(env: &Env, harness: &str) -> String {
+    env.ok(&[
+        "session",
+        "anchor",
+        "open",
+        "--harness-session",
+        harness,
+        "--source",
+        "startup",
+    ]);
+    format!("anchor-{harness}")
+}
+
+/// `name`'s entry in `v[list]`.
+fn listed_entry<'a>(v: &'a Value, list: &str, name: &str) -> &'a Value {
+    v[list]
+        .as_array()
+        .unwrap_or_else(|| panic!("{list} isn't a list: {v:#}"))
+        .iter()
+        .find(|e| e["name"] == name)
+        .unwrap_or_else(|| panic!("{name} isn't in {list}: {v:#}"))
+}
+
+/// Assert that a `remove` or `removed` entry names the close that released
+/// it: `retention` carries the release by `member` of kind `kind` and when
+/// the retention passed, and `detail` says it. `why` heads every message.
+fn assert_names_release(entry: &Value, list: &str, member: &str, kind: &str, why: &str) {
+    assert_eq!(
+        entry["retention"]["release"]["member"], member,
+        "{list}: {why}: {entry:#}"
+    );
+    assert_eq!(
+        entry["retention"]["release"]["close_kind"], kind,
+        "{list}: {why}: {entry:#}"
+    );
+    assert!(
+        entry["retention"]["release"]["at"].is_string(),
+        "{list}: {why}: {entry:#}"
+    );
+    assert!(
+        entry["retention"]["passes_at"].is_string(),
+        "{list}: {why}: {entry:#}"
+    );
+    let detail = entry["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&format!("when {member} stopped ({kind})")),
+        "{list}: {why}: {entry:#}"
+    );
+    assert!(
+        detail.contains("the retention passed at"),
+        "{list}: {why}: {entry:#}"
+    );
+}
+
+#[test]
+fn a_removed_session_names_the_idle_close_that_released_it() {
+    let env = Env::new();
+    assert_contained(&env);
+    let anchor = idle_anchor(&env, "S1");
+    env.init_with("b", &[], &[("KOTO_ANCHOR", anchor.as_str())]);
+    env.finish("b", "yes");
+    // Past the idle period that stops the anchor and the retention after it.
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+
+    let preview = env.ok_env(&["session", "prune"], &IDLE);
+    assert_names_release(
+        listed_entry(&preview, "remove", "b"),
+        "remove",
+        &anchor,
+        "idle",
+        "b's entry names the idle close that released it",
+    );
+    let out = env.ok_env(&["session", "prune", "--apply", "--all"], &IDLE);
+    assert_names_release(
+        listed_entry(&out, "removed", "b"),
+        "removed",
+        &anchor,
+        "idle",
+        "b's entry names the idle close that released it",
+    );
+    assert!(!env.sessions().join("b").exists());
+}
+
+#[test]
+fn a_removed_session_names_the_observed_close_that_released_it() {
+    let env = Env::new();
+    assert_contained(&env);
+    let anchor = env.anchor("S1", "K1");
+    env.init_with("b", &[], &[("KOTO_ANCHOR", anchor.as_str())]);
+    env.finish("b", "yes");
+    env.close_anchor("S1", "K1");
+    settle();
+
+    let preview = env.prune_ok(&[]);
+    assert_names_release(
+        listed_entry(&preview, "remove", "b"),
+        "remove",
+        &anchor,
+        "observed",
+        "b's entry names the observed close that released it",
+    );
+    let out = env.prune_ok(&["--apply", "--all"]);
+    assert_names_release(
+        listed_entry(&out, "removed", "b"),
+        "removed",
+        &anchor,
+        "observed",
+        "b's entry names the observed close that released it",
+    );
+    assert!(!env.sessions().join("b").exists());
+}
+
+/// b runs under an anchor that has stopped (by an idle close, or by an
+/// observed close when `observed`) and is ticked to its terminal without
+/// `--no-cleanup`: the tick keeps it for its hierarchy, and only a prune
+/// past the retention removes it.
+fn the_terminal_tick_keeps_an_anchor_released_session(observed: bool) {
+    let env = Env::new();
+    assert_contained(&env);
+    let anchor = if observed {
+        env.anchor("S1", "K1")
+    } else {
+        idle_anchor(&env, "S1")
+    };
+    env.init_with("b", &[], &[("KOTO_ANCHOR", anchor.as_str())]);
+    if observed {
+        env.close_anchor("S1", "K1");
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(2300));
+    }
+
+    let v = env.ok_env(&["next", "b", "--with-data", r#"{"go": "yes"}"#], &IDLE);
+    assert_eq!(v["action"], "done", "{v:#}");
+    if let Some(retention) = v.get("retention") {
+        assert_eq!(retention["retained"], true, "{v:#}");
+        assert_eq!(retention["reason"], "hierarchy", "{v:#}");
+    }
+    assert!(env.state_path("b").is_file(), "the tick removed b: {v:#}");
+}
+
+#[test]
+fn the_terminal_tick_never_removes_a_session_its_idle_anchor_released() {
+    the_terminal_tick_keeps_an_anchor_released_session(false);
+}
+
+#[test]
+fn the_terminal_tick_never_removes_a_session_its_observed_anchor_released() {
+    the_terminal_tick_keeps_an_anchor_released_session(true);
 }

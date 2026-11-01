@@ -167,6 +167,10 @@ impl Env {
             .env_remove("KOTO_ANCHOR")
             .env_remove("KOTO_DISPATCHER_ANCHOR")
             .env_remove("KOTO_SESSION_BACKEND")
+            .env_remove("KOTO_HOME")
+            .env_remove("KOTO_AUTHORITY")
+            .env_remove("KOTO_TICK_SESSION")
+            .env_remove("KOTO_WORKFLOWS_HOST_SESSION")
             .env_remove("CLAUDE_CODE_SESSION_ID");
         for (k, v) in FAST {
             cmd.env(k, v);
@@ -1337,4 +1341,66 @@ fn under_the_cloud_backend_a_failed_old_prefix_delete_rolls_forward() {
     assert_eq!(v["undeleted_remote_prefixes"][0]["name"], "b", "{v:#}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("old remote prefix"));
     assert!(env.exists("b_r1") && env.exists("b"));
+}
+
+// ===== Which close released a pruned root (koto#565) =====
+
+#[test]
+fn workspace_prune_names_the_idle_close_that_released_its_root() {
+    let env = Env::new();
+    // No command here may reach the store of the host the suite runs on.
+    let out = env.run(&["session", "dir"], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert!(
+        dir.starts_with(&env.root),
+        "koto session dir is {dir:?}, outside the test's tempdir {:?}",
+        env.root
+    );
+
+    // An unobserved anchor stops after a second of quiet, and the retention
+    // passes a second after that.
+    let idle = [
+        ("KOTO_RETENTION_IDLE_PERIOD", "1s"),
+        ("KOTO_RETENTION_KEEP", "1s"),
+    ];
+    env.ok(&[
+        "session",
+        "anchor",
+        "open",
+        "--harness-session",
+        "S1",
+        "--source",
+        "startup",
+    ]);
+    env.init_with("r", &[], &[("KOTO_ANCHOR", "anchor-S1")]);
+    env.tick("r", true);
+    std::thread::sleep(Duration::from_millis(2300));
+
+    let out = env.workspace_prune("r", &idle);
+    assert_eq!(listed(&out, "removed"), vec!["r"], "{out:#}");
+    let released = &out["released"]["r"];
+    assert_eq!(
+        released["retention"]["release"]["close_kind"], "idle",
+        "the report names the idle close that released it: {out:#}"
+    );
+    assert_eq!(
+        released["retention"]["release"]["member"], "anchor-S1",
+        "the report names the idle close that released it: {out:#}"
+    );
+    assert!(
+        released["retention"]["passes_at"].is_string(),
+        "the report names the idle close that released it: {out:#}"
+    );
+    assert!(
+        released["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stopped (idle)"),
+        "the report names the idle close that released it: {out:#}"
+    );
 }
