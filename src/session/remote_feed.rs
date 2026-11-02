@@ -846,7 +846,7 @@ impl RemoteReader {
         self.scan_with(local, Some(cache))
     }
 
-    fn scan_with(&self, local: &LocalView, mut cache: Option<&mut FeedCache>) -> RemoteSnapshot {
+    fn scan_with(&self, local: &LocalView, cache: Option<&mut FeedCache>) -> RemoteSnapshot {
         let all = match self.workspaces() {
             Ok(w) => w,
             Err(e) => {
@@ -881,7 +881,7 @@ impl RemoteReader {
         let mut scanned = Vec::new();
         let mut failed: Vec<(String, FailureClass)> = Vec::new();
         let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
-        match cache.as_deref_mut() {
+        match cache {
             None => {
                 for (ws, result) in results {
                     match result {
