@@ -165,7 +165,25 @@ the step whose behaviour they cover.
 
 ### Step 6: machine B sees machine A's change within 60 seconds without refetching unchanged sessions
 
-The TUI feed rescans every 55 seconds within its listing budget and fetches only changed summaries, --once finishes within 30 seconds at 200 prefixes and 2,000 sessions, and the cloud sync guide (its listing cost and its superseded index sentence) and the koto-user skill reference describe it (interactive scenario freshness; PRD R21, R22, R24).
+**Goal**: The TUI's feed keeps a per-session ETag cache in memory, owned by its one fetcher thread and keyed by workspace and session: an entry holds the `summary.json` ETag the workspace listing gave and the row read from that object. A scan GETs a session's summary only when its listed ETag differs from the cached one or the session has no entry, and reuses the cached row otherwise, so a refresh in which no remote session changed reads no object data (listing requests aside). Only a summary that was read and parsed is cached; a failed or unreadable GET is asked again on the next scan. A session gone from a workspace listing that answered loses its entry; a workspace whose listing failed keeps its entries and the rows step 5 keeps. The feed rescans 55 seconds after each scan ends. Each refresh lists at most 200 workspace prefixes: at 200 or fewer, every prefix every refresh; above 200, every new prefix and every prefix whose newest listed object changed in the last 30 minutes, then idle prefixes in rotation, oldest-listed first, up to the budget, keeping their last rows meanwhile. `--once` keeps no cache and reads the bucket's current state on every run, and with 200 prefixes, 2,000 sessions and every request answered in 50 ms it finishes within 30 seconds. The cloud sync guide replaces its sentence that bounding the scan would need an index of session names with the dashboard's listing cost (one top-level listing plus one listing per prefix, at most 200 per TUI refresh, and GETs only for changed summaries), and the koto-user skill's command reference describes `koto dashboard --once` and its remote rows. No row fact comes from `ctx/`, no owner field is added, and project config loading and how koto resolves the bucket and credentials don't change.
+
+**Acceptance Criteria**:
+
+- [ ] With B's TUI feed on a test interval and A's sessions unchanged, the fake bucket's request log for the second and every later scan holds listings only, no GET.
+- [ ] After a tick on A changes one session's state, the next scan GETs that session's `summary.json` and no other summary, and B's TUI shows the new state.
+- [ ] With the feed's interval under test control, B's TUI shows A's new state at most one interval after the tick's summary PUT; the production interval is 55 seconds, so the bound is within 60 seconds of the object's last-modified time.
+- [ ] A session whose summary GET failed or didn't parse on one scan is asked again on the next, and shows its state once the GET succeeds.
+- [ ] After `koto session cleanup` on A, B's next scan drops the row and its cache entry; while A's workspace listing fails, B keeps the row and asks no GET for it.
+- [ ] With 250 workspace prefixes in the bucket, no TUI scan lists more than 200 prefixes; a prefix created after the first scan is listed on the next one, and every idle prefix is listed within two scans' rotation.
+- [ ] Two `--once` runs in a row against an unchanged bucket each GET every session's summary.
+- [ ] With 200 prefixes holding 2,000 sessions and the fake bucket answering every request after 50 ms, B's `koto dashboard --once --all` prints all 2,000 rows and exits 0 within 30 seconds; the test prints the elapsed time.
+- [ ] `docs/guides/cloud-sync-setup.md` no longer says bounding the scan would need an index of session names, and states the listing cost above; the koto-user command reference describes `--once` and remote rows.
+
+**Check**: Run `cargo test --test dashboard_cross_machine_test` and see the cache, freshness and budget cases pass beside steps 1 to 5's, reading the fake bucket's request log (`tests/support/fake_s3.rs`) and the TUI's rendered buffer with the feed on a short test interval. Run the scale case (200 prefixes, 2,000 sessions, `set_latency` of 50 ms) and read its printed elapsed time. Run `cargo test remote_feed` for the unit tests of the cache and of the budget's prefix choice, and `cargo test --test doc_names` for the guide and skill text.
+
+**Dependencies**: Step 3
+
+**Files**: `src/session/remote_feed.rs`, `src/cli/dashboard.rs`, `tests/dashboard_cross_machine_test.rs`, `tests/support/fake_s3.rs`, `docs/guides/cloud-sync-setup.md`, `docs/reference/session-feed.md`, `plugins/koto-skills/skills/koto-user/references/command-reference.md`
 
 ### Step 7: text and objects another machine wrote can't break or mislead machine B's dashboard
 

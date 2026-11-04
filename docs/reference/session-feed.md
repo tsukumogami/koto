@@ -3036,6 +3036,13 @@ On the cloud backend it also lists other machines' sessions from the bucket, rea
 each one's `summary.json`, the small object every push publishes beside the session's
 state file, and never its state file or context.
 
+Each `--once` run reads the bucket's current state and keeps nothing between runs: one
+top-level listing, one listing per workspace prefix, and one `summary.json` read per
+session. The interactive dashboard keeps what it read in memory and reads a summary
+again only when its listed ETag changed, rescans 55 seconds after each scan ends, and
+lists at most 200 workspace prefixes per refresh; `docs/guides/cloud-sync-setup.md`
+states the full cost.
+
 ### Columns
 
 Lines are tab-separated. The first six columns are stable and positionally compatible
