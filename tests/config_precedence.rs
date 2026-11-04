@@ -1,9 +1,12 @@
 //! Integration tests for the `request_store` config precedence cascade.
 //!
-//! Validates the five-level resolution order from DESIGN-koto-request-store
-//! Decision 4: CLI flag > env-var > project config > user config > built-in
-//! default. Also covers the `[request_store.recursion]` reserved-but-ignored namespace
-//! warn behavior on `koto config get` and `koto next` startup.
+//! Validates the resolution order from DESIGN-koto-request-store Decision 4,
+//! CLI flag > env-var > user config > built-in default. Project config no
+//! longer sets request-store dimensions: a trusted project file applies only
+//! the keys `koto config set` allows there, and these aren't among them.
+//!
+//! Also covers the `[request_store.recursion]` reserved-but-ignored
+//! namespace warn behavior on `koto config get` and `koto next` startup.
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
@@ -135,11 +138,24 @@ fn user_config_overrides_default() {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 3: project config overrides user
+// Layer 3: project config doesn't set request-store dimensions
 // ---------------------------------------------------------------------------
 
+/// Trust the project config in `cwd_dir`, as its owner would.
+fn trust_project(home_dir: &Path, cwd_dir: &Path) {
+    let output = koto_cmd(home_dir, cwd_dir)
+        .args(["config", "trust"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "koto config trust failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
-fn project_config_overrides_user() {
+fn trusted_project_config_does_not_override_user_request_store() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
@@ -154,13 +170,21 @@ fn project_config_overrides_user() {
         &cwd_dir,
         "[request_store]\nstale_claim_timeout_seconds = 1800\n",
     );
+    trust_project(&home_dir, &cwd_dir);
 
-    let (_, stdout, _) = config_get(
+    // Project config may set only the keys `koto config set` allows there;
+    // the request-store dimensions come from user config or the environment.
+    let (_, stdout, stderr) = config_get(
         &home_dir,
         &cwd_dir,
         "request_store.stale_claim_timeout_seconds",
     );
-    assert_eq!(stdout.trim(), "1800");
+    assert_eq!(stdout.trim(), "1200");
+    assert!(
+        stderr.contains("request_store.stale_claim_timeout_seconds is ignored in project config"),
+        "stderr was:\n{}",
+        stderr
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -316,21 +340,22 @@ fn request_store_recursion_table_emits_warn_on_koto_next_startup() {
 }
 
 #[test]
-fn request_store_recursion_project_table_also_warns() {
+fn request_store_recursion_project_table_is_dropped_with_a_warning() {
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
     let cwd_dir = tmp.path().join("proj");
     std::fs::create_dir_all(&home_dir).unwrap();
     std::fs::create_dir_all(&cwd_dir).unwrap();
 
-    // Reserved-namespace warn must fire when the table is in project
-    // config too (not only user config).
+    // In a trusted project file the table is dropped like any other key
+    // project config may not set, and the warning names it.
     write_project_config(&cwd_dir, "[request_store.recursion]\nmax_depth_soft = 7\n");
+    trust_project(&home_dir, &cwd_dir);
 
     let (_, _, stderr) = config_get(&home_dir, &cwd_dir, "request_store.redelegation_cap");
     assert!(
-        stderr.contains("[request_store.recursion]"),
-        "project config [request_store.recursion] should also trigger the warn; stderr was:\n{}",
+        stderr.contains("request_store.recursion is ignored in project config"),
+        "project config [request_store.recursion] should be reported dropped; stderr was:\n{}",
         stderr
     );
 }

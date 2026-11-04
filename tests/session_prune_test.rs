@@ -10,6 +10,8 @@ mod fake_s3;
 mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -128,6 +130,7 @@ impl Env {
             ),
         )
         .unwrap();
+        project_trust::trust(&env.home.join(".koto"), &env.work);
         env.cloud = true;
         env
     }

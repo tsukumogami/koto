@@ -409,11 +409,14 @@ fn neither_the_age_bound_nor_source_retired_decides_a_present_target() {
         ),
     )
     .unwrap();
+    // Trusted, so it is the key that's ignored, not the whole file.
+    migration_carrier::project_trust::trust(&h.b.home.join(".koto"), &h.b.ws);
     let out = h.prune_ok(&[]);
     assert_eq!(out["marker_retain_days"], 30);
     assert_eq!(ignored(&out), None);
     assert!(names(&out["remove"]).is_empty());
     std::fs::write(&project, &text).unwrap();
+    migration_carrier::project_trust::trust(&h.b.home.join(".koto"), &h.b.ws);
 
     // Set for the user, even at 0 days, it decides nothing: it is reported
     // ignored, and the relation still keeps both.
@@ -665,6 +668,7 @@ fn arguments_and_the_local_backend_are_checked_before_anything_runs() {
         "[session]\nbackend = \"local\"\n",
     )
     .unwrap();
+    migration_carrier::project_trust::trust(&h.b.home.join(".koto"), &h.b.ws);
     let run = h.prune(&[]);
     refused(&run, "invalid_arguments", 2);
     let run = h.prune(&["--apply", "--source-retired"]);

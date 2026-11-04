@@ -550,6 +550,12 @@ pub enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Trust this directory's project config (.koto/config.toml) as it is
+    /// now: print what it applies, then apply it from now on. Any later
+    /// change to the file needs a new trust.
+    Trust,
+    /// Stop applying this directory's project config
+    Untrust,
 }
 
 #[derive(Subcommand)]
@@ -1552,6 +1558,7 @@ fn session_dir_report(
     if let Some(ignored) = &config.session_env.backend_ignored {
         out["backend_ignored"] = serde_json::json!(ignored);
     }
+    out["project_config"] = config.project_config.to_json();
     out
 }
 
@@ -3001,13 +3008,13 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
-                config::validate::validate_project_key(&key)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let path = config::resolve::project_config_path();
-                let mut doc = config::resolve::load_toml_value(&path)?;
-                config::set_value_in_toml(&mut doc, &key, &value)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                // The project file: created and trusted, or edited when it
+                // is trusted as it stands, and the bytes written trusted.
+                config::trust::set_project_key(
+                    config::resolve::user_config_path().as_deref(),
+                    &key,
+                    &value,
+                )?;
             }
             Ok(())
         }
@@ -3023,11 +3030,23 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 if key == "machine.name" {
                     anyhow::bail!("key 'machine.name' can only be set in user config (--user)");
                 }
-                let path = config::resolve::project_config_path();
-                let mut doc = config::resolve::load_toml_value(&path)?;
-                config::unset_value_in_toml(&mut doc, &key)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                config::trust::unset_project_key(
+                    config::resolve::user_config_path().as_deref(),
+                    &key,
+                )?;
+            }
+            Ok(())
+        }
+        ConfigCommand::Trust => {
+            let report = config::trust::trust_here(config::resolve::user_config_path().as_deref())?;
+            print!("{}", config::trust::render_trust_report(&report));
+            Ok(())
+        }
+        ConfigCommand::Untrust => {
+            if config::trust::untrust_here()? {
+                println!("This directory's project config is no longer trusted.");
+            } else {
+                eprintln!("note: this directory's project config wasn't trusted");
             }
             Ok(())
         }
@@ -3049,12 +3068,17 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                         config::retention::origins_json(&resolved.retention, o);
                     }
                     map.insert("origins".to_string(), origins);
+                    map.insert(
+                        "project_config".to_string(),
+                        resolved.project_config.to_json(),
+                    );
                 }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("{}", toml::to_string_pretty(&redacted)?);
                 print!("{}", config::session_env::origins_toml(&resolved));
                 print!("{}", config::retention::origins_toml(&resolved.retention));
+                print!("{}", resolved.project_config.to_toml_comments());
             }
             Ok(())
         }

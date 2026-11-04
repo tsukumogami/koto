@@ -19,6 +19,8 @@ mod fake_s3;
 mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -390,6 +392,7 @@ fn a_migrated_session_answers_status_and_refuses_a_write_with_the_exact_error_ob
     let koto_dir = tmp.path().join("ws/.koto");
     std::fs::create_dir_all(&koto_dir).unwrap();
     std::fs::write(koto_dir.join("config.toml"), config).unwrap();
+    project_trust::trust(&tmp.path().join(".koto"), &tmp.path().join("ws"));
 
     let ws = tmp.path().join("ws");
     let src = ws.join("t.md");

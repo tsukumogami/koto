@@ -6,6 +6,8 @@
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -658,13 +660,14 @@ fn a_project_config_cannot_turn_rotation_on() {
     // `koto config set` without --user refuses the key...
     let out = env.run(&["config", "set", "run_journal.rotate_bytes", "100"]);
     assert!(!out.status.success());
-    // ...and a hand-written project file is ignored for it.
+    // ...and a hand-written project file is ignored for it, even trusted.
     std::fs::create_dir_all(env.work.join(".koto")).unwrap();
     std::fs::write(
         env.work.join(".koto/config.toml"),
         "[run_journal]\nrotate_bytes = 100\n",
     )
     .unwrap();
+    project_trust::trust(&env.home.join(".koto"), &env.work);
     assert_eq!(
         env.ok(&["config", "get", "run_journal.rotate_bytes"])
             .trim(),

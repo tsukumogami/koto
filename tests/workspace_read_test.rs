@@ -289,6 +289,9 @@ fn a_same_host_read_leaves_the_shared_store_alone() {
     let f = fixture();
     let mut c = Host::new(f._root.path(), "c", &cloud(&f.s3));
     c.home = f.a.home.clone();
+    // Its workspace config was trusted under its own home; trust it in the
+    // home it now shares.
+    migration_carrier::project_trust::trust(&c.home.join(".koto"), &c.ws);
     c.cache = f.a.cache.clone();
     let a_local = tree(&f.a.session_dir(NAME));
     let before = objects(&f.s3);

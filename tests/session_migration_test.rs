@@ -1482,6 +1482,7 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
         text.replace("backend = \"cloud\"", "backend = \"local\""),
     )
     .unwrap();
+    migration_carrier::project_trust::trust(&local.home.join(".koto"), &local.ws);
     s3.clear_requests();
     start_session(&local, "plain");
     for args in [

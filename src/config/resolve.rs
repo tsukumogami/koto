@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use super::session_env::{self, Origin};
+use super::trust;
 use super::validate::{check_decider_endpoint, DECIDER_TIMEOUT_DEFAULT_MS, DECIDER_TIMEOUT_MAX_MS};
 use super::{DeciderConfig, KotoConfig, RequestStoreConfig};
 use crate::decider::{ApiKey, GlobalMode, SettingOrigin};
@@ -38,15 +39,21 @@ pub struct RequestStoreOverrides {
 /// [`merge_decider`] and [`apply_decider_env`]): project config can only
 /// contribute a mode, and its key, endpoint, and timeout are dropped here.
 /// Problems in `[decider]` never fail the load; they're collected as
-/// warnings that [`resolve_decider`] returns. This function prints
-/// nothing.
+/// warnings that [`resolve_decider`] returns.
+///
+/// The project file applies only when the user has trusted it as it stands
+/// ([`trust::check_project`]); otherwise it isn't parsed. A trusted file
+/// contributes only the keys in `validate::PROJECT_ALLOWLIST`. The one
+/// thing this function prints is [`trust::note_once`]'s stderr lines: a
+/// note when a project file was ignored, and a warning per key a trusted
+/// one may not set, once per process.
 ///
 /// Precedence (highest to lowest):
 /// 1. Environment variables (`KOTO_SESSION_*` for the session backend,
 ///    location and credentials, `AWS_ACCESS_KEY_ID` and
 ///    `AWS_SECRET_ACCESS_KEY` when the koto credential pair is unset,
 ///    `KOTO_REQUEST_STORE_*` for request-store dimensions)
-/// 2. Project config (.koto/config.toml in current directory)
+/// 2. Project config (.koto/config.toml in current directory), when trusted
 /// 3. User config (~/.koto/config.toml)
 /// 4. Built-in defaults
 ///
@@ -90,22 +97,25 @@ pub fn load_config() -> Result<KotoConfig> {
     let root_selects_cloud = config.session.backend == "cloud"
         && config.session_env.origin("session.backend") == Origin::User;
 
-    // Layer 2: project config
-    let project_path = project_config_path();
-    if project_path.exists() {
-        let project_config = load_config_file(&project_path, "project config")?;
-        record_file_secrets(&mut config.secret_sources, &project_config.config);
-        merge_config(&mut config, &project_config);
-        mark_file_origins(&mut config, &project_config, Origin::Project, false);
-        config
-            .retention
-            .merge_file(&project_config.config.retention, Origin::Project);
-        merge_decider(
-            &mut config.decider,
-            &project_config.config.decider,
-            ConfigLayer::Project,
-        );
-    }
+    // Layer 2: project config, only when the user has trusted the file as
+    // it stands (see `trust`). A file that isn't trusted is never parsed and
+    // contributes nothing; a trusted one contributes only the keys project
+    // config may set.
+    let check = trust::check_project(user_config_path().as_deref());
+    config.project_config = match check {
+        trust::ProjectCheck::Trusted { bytes } => {
+            let project = load_project_bytes(&bytes)?;
+            record_file_secrets(&mut config.secret_sources, &project.secrets);
+            merge_config(&mut config, &project.loaded);
+            mark_file_origins(&mut config, &project.loaded, Origin::Project, false);
+            config
+                .retention
+                .merge_file(&project.loaded.config.retention, Origin::Project);
+            merge_decider(&mut config.decider, &project.decider, ConfigLayer::Project);
+            trust::ProjectConfigState::trusted(&project.layer)
+        }
+        other => trust::ProjectConfigState::ignored(&other),
+    };
 
     // Layer 3: the KOTO_SESSION_* location variables, then the
     // credentials: the koto pair as a whole, else the AWS pair as before.
@@ -130,6 +140,7 @@ pub fn load_config() -> Result<KotoConfig> {
         root_selects_cloud,
     );
 
+    trust::note_once(&config.project_config);
     Ok(config)
 }
 
@@ -492,6 +503,63 @@ fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
         .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Syntax))?;
     let config: KotoConfig = toml::from_str(&content)
         .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Shape))?;
+    Ok(loaded_config(&raw, config))
+}
+
+/// A trusted project file, loaded from the bytes its grant verified.
+struct ProjectFile {
+    /// The file reduced to the keys project config may set.
+    loaded: LoadedConfig,
+    /// What the reduction kept and dropped.
+    layer: super::validate::ProjectLayer,
+    /// The file's `[decider]` table as written, for [`merge_decider`],
+    /// which takes only the mode from project config and warns about the
+    /// rest.
+    decider: DeciderConfig,
+    /// The secret values the file set, dropped or not, for redaction.
+    secrets: KotoConfig,
+}
+
+/// Load a trusted project file from `bytes`: parse it, reduce it to the
+/// keys project config may set, and read the reduced table as a config.
+fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
+    let path = trust::project_config_path();
+    let label = "project config";
+    let raw = trust::parse_raw(bytes)?;
+    let layer = super::validate::filter_project_layer(&raw);
+    // `parse_raw` checked the bytes are UTF-8.
+    let content = std::str::from_utf8(bytes).unwrap_or_default();
+    let config: KotoConfig = layer
+        .kept
+        .clone()
+        .try_into()
+        .map_err(|e| ConfigParseError::new(label, &path, content, &e, ParseProblem::Shape))?;
+    let decider = raw
+        .get("decider")
+        .cloned()
+        .and_then(|v| v.try_into::<DeciderConfig>().ok())
+        .unwrap_or_default();
+    let mut secrets = KotoConfig::default();
+    let text = |table: &str, sub: Option<&str>, key: &str| {
+        let mut at = raw.get(table)?;
+        if let Some(sub) = sub {
+            at = at.get(sub)?;
+        }
+        at.get(key)?.as_str().map(str::to_string)
+    };
+    secrets.session.cloud.access_key = text("session", Some("cloud"), "access_key");
+    secrets.session.cloud.secret_key = text("session", Some("cloud"), "secret_key");
+    secrets.decider.api_key = text("decider", None, "api_key");
+    Ok(ProjectFile {
+        loaded: loaded_config(&layer.kept, config),
+        layer,
+        decider,
+        secrets,
+    })
+}
+
+/// A parsed config file's typed config plus which keys its raw table names.
+fn loaded_config(raw: &toml::Value, config: KotoConfig) -> LoadedConfig {
     let request_store_keys = raw
         .as_table()
         .and_then(|t| t.get("request_store"))
@@ -521,15 +589,15 @@ fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
         .and_then(|v| v.as_table())
         .map(|t| t.contains_key("native"))
         .unwrap_or(false);
-    let session_keys = session_keys_named(&raw);
-    Ok(LoadedConfig {
+    let session_keys = session_keys_named(raw);
+    LoadedConfig {
         config,
         request_store_keys,
         request_store_has_recursion,
         run_journal_keys,
         workflows_native_present,
         session_keys,
-    })
+    }
 }
 
 /// The session settings a file's raw TOML names, as dotted names. Both TOML
@@ -1178,11 +1246,6 @@ pub fn user_config_path() -> Option<PathBuf> {
     crate::koto_home::koto_home().map(|root| root.join("config.toml"))
 }
 
-/// Path to the project config file: .koto/config.toml (relative to cwd)
-pub fn project_config_path() -> PathBuf {
-    PathBuf::from(".koto").join("config.toml")
-}
-
 /// Ensure the koto root (~/.koto/ unless `KOTO_HOME` moves it) exists with
 /// 0700 permissions when this call creates it.
 pub fn ensure_koto_dir() -> Result<PathBuf> {
@@ -1322,6 +1385,7 @@ mod tests {
                 decider: Default::default(),
                 secret_sources: Default::default(),
                 session_env: Default::default(),
+                project_config: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
@@ -1526,27 +1590,155 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_overrides_user() {
+    fn test_project_config_overrides_user_once_trusted() {
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
         let _session_env = NoSessionEnv::new();
+        let _no_root = UnsetEnv::new("KOTO_HOME");
+        let project = tmp.path().join("project");
+        let user_home = tmp.path().join("user-home");
+        fs::create_dir_all(project.join(".koto")).unwrap();
+        fs::create_dir_all(user_home.join(".koto")).unwrap();
+        let _guard = SetCwd::new(&project);
+        let _home_guard = SetEnv::new("HOME", user_home.to_str().unwrap());
+        env::remove_var("AWS_ACCESS_KEY_ID");
+        env::remove_var("AWS_SECRET_ACCESS_KEY");
+        fs::write(
+            user_home.join(".koto").join("config.toml"),
+            "[session.cloud]\nbucket = \"user-bucket\"\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".koto").join("config.toml"),
+            "[session]\nbackend = \"cloud\"\n\n[session.cloud]\nbucket = \"proj-bucket\"\n",
+        )
+        .unwrap();
+
+        // Not trusted yet: the project file contributes nothing.
+        let config = load_config().unwrap();
+        assert_eq!(config.session.cloud.bucket.as_deref(), Some("user-bucket"));
+        assert_eq!(config.session.backend, "local");
+        assert_eq!(
+            config.project_config.status,
+            trust::ProjectStatus::Untrusted
+        );
+
+        trust::trust_here(user_config_path().as_deref()).unwrap();
+        let config = load_config().unwrap();
+        assert_eq!(config.session.backend, "cloud");
+        assert_eq!(config.session.cloud.bucket.as_deref(), Some("proj-bucket"));
+        assert_eq!(config.project_config.status, trust::ProjectStatus::Trusted);
+
+        // Any change to the file lapses the grant.
+        fs::write(
+            project.join(".koto").join("config.toml"),
+            "[session]\nbackend = \"cloud\"\n\n[session.cloud]\nbucket = \"other\"\n",
+        )
+        .unwrap();
+        let config = load_config().unwrap();
+        assert_eq!(config.session.cloud.bucket.as_deref(), Some("user-bucket"));
+        assert_eq!(config.project_config.status, trust::ProjectStatus::Changed);
+    }
+
+    #[test]
+    fn a_project_file_that_is_the_user_file_is_read_once() {
+        let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
+        let _no_root = UnsetEnv::new("KOTO_HOME");
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
         env::remove_var("AWS_ACCESS_KEY_ID");
         env::remove_var("AWS_SECRET_ACCESS_KEY");
-
-        // Write a project config.
-        let project_dir = tmp.path().join(".koto");
-        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(tmp.path().join(".koto")).unwrap();
         fs::write(
-            project_dir.join("config.toml"),
-            "[session]\nbackend = \"cloud\"\n\n[session.cloud]\nbucket = \"proj-bucket\"\n",
+            tmp.path().join(".koto").join("config.toml"),
+            "[session]\nbackend = \"cloud\"\n\n[session.cloud]\nbucket = \"home-bucket\"\n",
         )
         .unwrap();
 
         let config = load_config().unwrap();
         assert_eq!(config.session.backend, "cloud");
-        assert_eq!(config.session.cloud.bucket, Some("proj-bucket".to_string()));
+        assert_eq!(config.session.cloud.bucket.as_deref(), Some("home-bucket"));
+        assert_eq!(config.project_config.status, trust::ProjectStatus::Absent);
+        assert_eq!(
+            config.session_env.origin("session.cloud.bucket"),
+            Origin::User
+        );
+    }
+
+    #[test]
+    fn an_untrusted_project_file_is_never_parsed() {
+        let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
+        let _no_root = UnsetEnv::new("KOTO_HOME");
+        let project = tmp.path().join("project");
+        let user_home = tmp.path().join("user-home");
+        fs::create_dir_all(project.join(".koto")).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let _guard = SetCwd::new(&project);
+        let _home_guard = SetEnv::new("HOME", user_home.to_str().unwrap());
+        fs::write(
+            project.join(".koto").join("config.toml"),
+            "this is = = not toml [",
+        )
+        .unwrap();
+
+        let config = load_config().unwrap();
+        assert_eq!(
+            config.project_config.status,
+            trust::ProjectStatus::Untrusted
+        );
+        assert!(trust::trust_here(user_config_path().as_deref()).is_err());
+    }
+
+    #[test]
+    fn a_trusted_project_file_sets_only_allowed_keys() {
+        let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
+        let _no_root = UnsetEnv::new("KOTO_HOME");
+        let project = tmp.path().join("project");
+        let user_home = tmp.path().join("user-home");
+        fs::create_dir_all(project.join(".koto")).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let _guard = SetCwd::new(&project);
+        let _home_guard = SetEnv::new("HOME", user_home.to_str().unwrap());
+        env::remove_var("AWS_ACCESS_KEY_ID");
+        env::remove_var("AWS_SECRET_ACCESS_KEY");
+        fs::write(
+            project.join(".koto").join("config.toml"),
+            "[session.cloud]\nbucket = \"proj-bucket\"\nendpoint = \"https://u:p@store.example\"\n\
+             access_key = \"project-access\"\nsecret_key = \"project-secret\"\n\n\
+             [request_store]\nredelegation_cap = 9\n\n[workflows]\nnative = false\n",
+        )
+        .unwrap();
+        trust::trust_here(user_config_path().as_deref()).unwrap();
+
+        let config = load_config().unwrap();
+        assert_eq!(config.session.cloud.bucket.as_deref(), Some("proj-bucket"));
+        assert!(config.session.cloud.endpoint.is_none());
+        assert!(config.session.cloud.access_key.is_none());
+        assert!(config.session.cloud.secret_key.is_none());
+        assert_eq!(config.request_store.redelegation_cap, 3);
+        assert!(config.workflows.native);
+        for key in [
+            "session.cloud.endpoint",
+            "session.cloud.access_key",
+            "session.cloud.secret_key",
+            "request_store.redelegation_cap",
+            "workflows.native",
+        ] {
+            assert!(
+                config.project_config.dropped.iter().any(|k| k == key),
+                "{key} not reported dropped"
+            );
+        }
+        // Dropped secrets are still searched for in output.
+        let keys = crate::config::redaction_keys(&config);
+        assert!(keys.iter().any(|(_, v)| v == "project-access"));
+        assert!(keys.iter().any(|(_, v)| v == "project-secret"));
     }
 
     #[test]
@@ -1554,7 +1746,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
         let _session_env = NoSessionEnv::new();
-        let _guard = SetCwd::new(tmp.path());
+        let _no_root = UnsetEnv::new("KOTO_HOME");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let _guard = SetCwd::new(&project);
         // The user layer gets its own HOME, apart from the project directory.
         let user_home = tmp.path().join("user-home");
         fs::create_dir_all(user_home.join(".koto")).unwrap();
@@ -1563,9 +1758,10 @@ mod tests {
         env::remove_var("AWS_SECRET_ACCESS_KEY");
         env::remove_var(ENV_DECIDER_API_KEY);
 
-        // The user file's cloud key is replaced by the project file's, and
-        // the project file's decider key is ignored by the merge.
-        let koto_dir = tmp.path().join(".koto");
+        // Neither the project file's cloud key nor its decider key applies,
+        // trusted or not: a project file never supplies a credential. Both
+        // values are still searched for in output.
+        let koto_dir = project.join(".koto");
         fs::create_dir_all(&koto_dir).unwrap();
         fs::write(
             user_home.join(".koto").join("config.toml"),
@@ -1580,10 +1776,12 @@ mod tests {
         )
         .unwrap();
 
+        trust::trust_here(user_config_path().as_deref()).unwrap();
         let config = load_config().unwrap();
+        // A project file never supplies a credential, trusted or not.
         assert_eq!(
             config.session.cloud.access_key.as_deref(),
-            Some("project-file-access-key")
+            Some("user-file-access-key")
         );
         assert!(config.decider.api_key.is_none());
         let keys = crate::config::redaction_keys(&config);
@@ -2265,6 +2463,31 @@ mod tests {
             match &self.prev {
                 Some(val) => env::set_var(&self.key, val),
                 None => env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// RAII guard that removes an env var and restores it on drop.
+    struct UnsetEnv {
+        key: String,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl UnsetEnv {
+        fn new(key: &str) -> Self {
+            let prev = env::var_os(key);
+            env::remove_var(key);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for UnsetEnv {
+        fn drop(&mut self) {
+            if let Some(val) = &self.prev {
+                env::set_var(&self.key, val);
             }
         }
     }

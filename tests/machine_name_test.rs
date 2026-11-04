@@ -14,6 +14,8 @@
 mod fake_s3;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use fake_s3::FakeS3;
 use serde_json::Value;
@@ -569,7 +571,16 @@ fn the_project_config_never_supplies_the_machine_name() {
         "[machine]\nname = \"proj-name\"\n",
     )
     .unwrap();
-    m.init("wf");
+    // Trusted, so the key is refused for what it is rather than for an
+    // untrusted file: a trusted project file still can't name the machine.
+    project_trust::trust(&m.koto_home(), &m.ws);
+    let out = m.init("wf");
+    assert_eq!(
+        out.stderr_lines_naming("machine.name"),
+        1,
+        "{}",
+        out.describe()
+    );
     assert_eq!(m.recorded("wf"), Some(host_machine_name()));
     assert_ne!(m.koto(&["config", "get", "machine.name"]).code, Some(0));
 }

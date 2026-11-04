@@ -210,6 +210,9 @@ impl World {
                 "[session]\nbackend = \"cloud\"\n",
             )
             .unwrap();
+            // The workspace config is trusted in the root the host's
+            // commands run with (a2 shares a's).
+            migration_carrier::project_trust::trust(&koto_home(host), &host.ws);
             assert_scratch(&root, host, &s3);
         }
         World {

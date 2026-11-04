@@ -2,6 +2,8 @@
 mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/project_trust.rs"]
+mod project_trust;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -6180,11 +6182,13 @@ fn koto_backend_cmd(dir: &Path, home: &Path) -> Command {
     cmd
 }
 
-/// Write a project-level .koto/config.toml with the given TOML content.
-fn write_project_config(dir: &Path, content: &str) {
+/// Write a project-level .koto/config.toml with the given TOML content,
+/// trusted in the koto root under `home`.
+fn write_project_config(dir: &Path, home: &Path, content: &str) {
     let config_dir = dir.join(".koto");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("config.toml"), content).unwrap();
+    project_trust::trust(&home.join(".koto"), dir);
 }
 
 #[test]
@@ -6208,7 +6212,7 @@ fn backend_local_explicit_config_works() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    write_project_config(tmp.path(), "[session]\nbackend = \"local\"\n");
+    write_project_config(tmp.path(), &home, "[session]\nbackend = \"local\"\n");
 
     let src = write_template_source(tmp.path());
 
@@ -6224,7 +6228,7 @@ fn backend_unknown_value_fails() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    write_project_config(tmp.path(), "[session]\nbackend = \"s3-custom\"\n");
+    write_project_config(tmp.path(), &home, "[session]\nbackend = \"s3-custom\"\n");
 
     let src = write_template_source(tmp.path());
 

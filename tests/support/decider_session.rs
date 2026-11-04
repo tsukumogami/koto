@@ -22,6 +22,9 @@
 
 #![allow(dead_code)]
 
+#[path = "project_trust.rs"]
+mod project_trust;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -213,11 +216,13 @@ impl Harness {
         std::fs::write(d.join("config.toml"), body).unwrap();
     }
 
-    /// Write `.koto/config.toml` in the working directory.
+    /// Write `.koto/config.toml` in the working directory, trusted as its
+    /// owner would trust it.
     pub fn project_config(&self, body: &str) {
         let d = self.dir.join(".koto");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.toml"), body).unwrap();
+        project_trust::trust(&self.home().join(".koto"), &self.dir);
     }
 
     /// A `koto` command with no decider env set at all.

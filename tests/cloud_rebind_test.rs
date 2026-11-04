@@ -104,6 +104,7 @@ fn a_cloud_rebind_reaches_the_remote_and_next_runs_from_the_new_directory() {
     )
     .unwrap();
     let moved = std::fs::canonicalize(&moved).unwrap();
+    migration_carrier::project_trust::trust(&host.home.join(".koto"), &moved);
     let template = root.path().join("marker.md");
     std::fs::write(&template, MARKER_TEMPLATE).unwrap();
 
@@ -239,6 +240,7 @@ fn host_and_sibling(s3: &FakeS3, root: &Path) -> (Host, std::path::PathBuf) {
     )
     .unwrap();
     let sibling = std::fs::canonicalize(&sibling).unwrap();
+    migration_carrier::project_trust::trust(&host.home.join(".koto"), &sibling);
     (host, sibling)
 }
 
