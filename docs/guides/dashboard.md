@@ -5,6 +5,15 @@ pane lists sessions, ordered so the ones that need you come first. The right
 pane shows the focused session in four tabs: Summary, History, Remaining and
 Session. It needs a terminal at least 80 columns wide to show both panes.
 
+The dashboard gathers every workspace's sessions on one screen: those of every
+workspace on this machine, and under the cloud backend those other machines
+pushed to the bucket too, each marked `@<machine>`. Each row shows the
+session's intent and current state, and an intent is whatever was written
+about the work. That matters on a shared screen, a screen share or a
+recording, where a launch shows all of it at once. See
+[What the dashboard reads](cloud-sync-setup.md#what-the-dashboard-reads) for
+the remote rows.
+
 ## Keys
 
 | Key | Action |
