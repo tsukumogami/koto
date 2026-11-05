@@ -26,6 +26,7 @@ use crate::cli::dashboard_data::{row_name, CachedSession, DetailData, Liveness, 
 use crate::cli::dashboard_state::{
     DashboardAppState, DashboardTab, Membership, SessionTabState, TaskCounts,
 };
+use crate::session::remote_feed::TRUNCATED_NOTE;
 use crate::session_view::{
     format_size, KeyPreview, Locality, MigratedTo, Sanitized, SessionFacts, SessionViewSnapshot,
     CUT_MARKER,
@@ -305,8 +306,12 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     // Trailing collapsed summary for the receded set (hidden by default).
     let receded = state.receded_summary();
     if receded.total() > 0 && !state.show_receded {
+        let sources = match receded.sources {
+            0 => String::new(),
+            n => format!(" \u{00b7} {n} superseded"),
+        };
         let summary = format!(
-            "\u{2713} {} done \u{00b7} {} abandoned \u{2014} press a / --all",
+            "\u{2713} {} done \u{00b7} {} abandoned{sources} \u{2014} press a / --all",
             receded.done, receded.abandoned
         );
         rows.push(
@@ -320,15 +325,23 @@ fn render_list(f: &mut Frame<'_>, state: &DashboardAppState, area: ratatui::layo
     // silently dropped) and of hidden migrated sources, then one status line
     // while the last feed snapshot couldn't read some or all of the bucket
     // (the rows it couldn't read stay as they were), naming the failure's
-    // class and the endpoint's host, both sanitized. The status line wraps
-    // inside the list's width rather than losing the host off its end.
+    // class and the endpoint's host, both sanitized, or saying it reached a
+    // listing ceiling (`listing truncated`), or both on the one line. The
+    // status line wraps inside the list's width rather than losing the host
+    // off its end.
     let mut notes: Vec<Line<'_>> = Vec::new();
     if let Some(note) = tally_line(&state.tree) {
         notes.push(Line::styled(note, Style::default().fg(Color::Red)));
     }
-    if let Some(failure) = &state.tree.remote_failure {
+    let bucket_note = match (&state.tree.remote_failure, state.tree.remote_truncated) {
+        (Some(failure), true) => Some(format!("{} \u{00b7} {TRUNCATED_NOTE}", failure.line())),
+        (Some(failure), false) => Some(failure.line()),
+        (None, true) => Some(TRUNCATED_NOTE.to_string()),
+        (None, false) => None,
+    };
+    if let Some(note) = bucket_note {
         let width = area.width.saturating_sub(2) as usize;
-        for row in wrap_fact("\u{26a0} bucket", &failure.line(), width) {
+        for row in wrap_fact("\u{26a0} bucket", &note, width) {
             notes.push(Line::styled(row, Style::default().fg(Color::Yellow)));
         }
     }
@@ -3108,5 +3121,81 @@ mod tests {
         state.tree.remote_failure = None;
         let lines = frame_lines(&state, 78);
         assert!(!lines.iter().any(|l| l.contains("bucket:")), "{lines:#?}");
+    }
+
+    /// The status text: every row from the one holding `bucket:` down to
+    /// the list's bottom border, inner text trimmed and joined.
+    fn bucket_status(lines: &[String]) -> String {
+        let Some(start) = lines.iter().position(|l| l.contains("bucket:")) else {
+            return String::new();
+        };
+        lines[start..]
+            .iter()
+            .take_while(|l| !l.starts_with('\u{2514}'))
+            .filter_map(|l| l.split('\u{2502}').nth(1))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn a_listing_ceiling_shows_on_the_status_line_until_a_snapshot_reaches_none() {
+        let mut state = tree_state(vec![("mine".to_string(), local_row("mine", Some("mine")))]);
+        state.tree.remote_truncated = true;
+        let lines = frame_lines(&state, 78);
+        let status: Vec<_> = lines.iter().filter(|l| l.contains("bucket:")).collect();
+        assert_eq!(status.len(), 1, "{lines:#?}");
+        assert!(
+            bucket_status(&lines).contains("listing truncated"),
+            "{lines:#?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("mine")), "{lines:#?}");
+
+        // With a failure as well, both on the one status line.
+        state.tree.remote_failure = Some(crate::session::remote_feed::ReadFailure {
+            class: crate::session::remote_feed::FailureClass::Timeout,
+            host: "host".to_string(),
+            top_level: false,
+            workspaces: vec!["0123456789abcdef".to_string()],
+        });
+        let lines = frame_lines(&state, 78);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("bucket:")).count(),
+            1,
+            "{lines:#?}"
+        );
+        let text = bucket_status(&lines);
+        assert!(
+            text.contains("timeout at host") && text.contains("listing truncated"),
+            "{text}"
+        );
+
+        state.tree.remote_failure = None;
+        state.tree.remote_truncated = false;
+        let lines = frame_lines(&state, 78);
+        assert!(!lines.iter().any(|l| l.contains("bucket:")), "{lines:#?}");
+        assert!(!lines.join("").contains("truncated"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_row_receded_as_a_named_source_is_not_counted_abandoned() {
+        let (key, mut named) = remote_row("named", Some("machine-a"), None, false);
+        named.receded_by_source = true;
+        let mut state = tree_state(vec![(key, named)]);
+        let summary = state.receded_summary();
+        assert_eq!(
+            (summary.done, summary.abandoned, summary.sources),
+            (0, 0, 1)
+        );
+        let lines = frame_lines(&state, 78);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("0 abandoned \u{00b7} 1 superseded")),
+            "{lines:#?}"
+        );
+        state.show_receded = true;
+        let lines = frame_lines(&state, 78);
+        assert!(!lines.join("").contains("superseded"), "{lines:#?}");
     }
 }

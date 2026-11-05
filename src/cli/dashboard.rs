@@ -109,8 +109,10 @@ fn format_elapsed(secs: u64) -> String {
 /// dropped when the pass listed that session, so it shows once, from the
 /// pass. A failed pass leaves the local rows standing and says on one
 /// stderr line which class of failure it met at which host (and, when only
-/// some workspaces failed, how many); rows listed as unknown and hidden
-/// sources are counted in the tree for the stderr notes.
+/// some workspaces failed, how many); a pass that reached a listing
+/// ceiling says so on one stderr line holding `listing truncated`; rows
+/// listed as unknown and hidden sources are counted in the tree for the
+/// stderr notes.
 ///
 /// [`RemoteReader::scan`]: crate::session::remote_feed::RemoteReader::scan
 fn once_remote_rows(
@@ -154,6 +156,9 @@ fn once_remote_rows(
             if failure.top_level { "" } else { "all " },
             failure.line()
         );
+    }
+    if snapshot.truncated {
+        eprintln!("note: {}", crate::session::remote_feed::TRUNCATED_NOTE);
     }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;

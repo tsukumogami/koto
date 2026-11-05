@@ -2992,3 +2992,529 @@ fn a_path_in_a_marker_or_parent_reads_and_writes_nothing_else() {
     assert_eq!(paths_under(&b.sessions()), store, "nothing in B's store");
     no_x(&after);
 }
+
+// --- Plan step 7: times another machine wrote, and the listing ceilings ---
+
+use std::time::SystemTime;
+
+/// The seconds a `format_duration` token (`45s`, `2m5s`, `1h1m`) reads;
+/// `None` for any other token.
+fn duration_token(token: &str) -> Option<u64> {
+    let (mut total, mut digits, mut any) = (0u64, String::new(), false);
+    for c in token.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let n: u64 = digits.parse().ok()?;
+        digits.clear();
+        total += n * match c {
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        any = true;
+    }
+    (any && digits.is_empty()).then_some(total)
+}
+
+/// The idle, in seconds, the TUI's list row labelled `name` and marked
+/// with a machine shows; `None` when no such row is drawn.
+fn tui_idle(lines: &[String], name: &str) -> Option<u64> {
+    let marker = format!("{name} @");
+    let line = lines.iter().find(|l| l.contains(&marker))?;
+    line.split(|c: char| c.is_whitespace() || c == '\u{2502}')
+        .rev()
+        .find_map(duration_token)
+}
+
+/// How many top-level listings the request log holds: one a scan, while
+/// the top level fits one page.
+fn top_level_listings(s3: &FakeS3) -> usize {
+    s3.requests()
+        .iter()
+        .filter(|r| r.list_prefix.as_deref() == Some(""))
+        .count()
+}
+
+/// The stderr lines of `out` that hold `listing truncated`.
+fn truncation_notes(out: &Out) -> Vec<&str> {
+    out.stderr
+        .lines()
+        .filter(|l| l.contains("listing truncated"))
+        .collect()
+}
+
+/// Plan step 7, criterion 14: a `last_event_at` an hour ahead prints idle
+/// `0s` in `--once`, and in the TUI, across scans that find the summary's
+/// ETag unchanged, reads at least 2 s on a frame 2 s after the first; one
+/// 4 minutes ahead isn't clamped and reads `0s` on both frames. An unknown
+/// row whose state file is listed an hour ahead ages the same way. A
+/// `created_at` an hour ahead prints elapsed `0s`, and the Session tab
+/// shows no time later than B's clock.
+#[test]
+fn a_far_future_time_is_clamped_to_the_reader_clock_and_the_row_still_ages() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let now = SystemTime::now();
+    let hour = Duration::from_secs(3600);
+    // Each labelled by its name: the list shows a row's intent.
+    plant(&s3, PLANTED, "ahead", |s| {
+        s["intent"] = "ahead".into();
+        s["last_event_at"] = fake_s3::rfc3339_millis(now + hour).into();
+    });
+    plant(&s3, PLANTED, "near", |s| {
+        s["intent"] = "near".into();
+        s["last_event_at"] = fake_s3::rfc3339_millis(now + Duration::from_secs(240)).into();
+    });
+    plant(&s3, PLANTED, "born", |s| {
+        s["created_at"] = fake_s3::rfc3339_millis(now + hour).into();
+    });
+    plant_state(&s3, PLANTED, "bare");
+    s3.set_last_modified(&state_key(PLANTED, "bare"), now + hour);
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let row = |name: &str| row_of(&rows, name, PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    for name in ["ahead", "near", "bare"] {
+        assert_eq!(row(name)[6], "0s", "{name}'s idle: {:?}", row(name));
+    }
+    assert_eq!(row("bare")[3], "unknown", "{:?}", row("bare"));
+    assert_eq!(row("born")[2], "0s", "born's elapsed: {:?}", row("born"));
+
+    // The TUI: a first frame with the rows, then one 2 s later with a scan
+    // between them, which GETs no summary again.
+    let summary_gets = |s3: &FakeS3| {
+        object_gets(s3)
+            .into_iter()
+            .filter(|k| k.ends_with("/summary.json"))
+            .count()
+    };
+    s3.clear_requests();
+    let mut first: Option<(Instant, usize, usize)> = None;
+    let mut seen = (None, None, None);
+    drive_tui(&s3, &b, &mut |lines, _| {
+        let idle = (
+            tui_idle(lines, "ahead"),
+            tui_idle(lines, "near"),
+            tui_idle(lines, "bare"),
+        );
+        let (Some(_), Some(near), Some(_)) = idle else {
+            return false;
+        };
+        match first {
+            None => {
+                assert_eq!(near, 0, "4 minutes ahead reads 0s: {lines:#?}");
+                first = Some((Instant::now(), top_level_listings(&s3), summary_gets(&s3)));
+                false
+            }
+            Some((at, scans, _)) => {
+                seen = idle;
+                at.elapsed() >= Duration::from_secs(2) && top_level_listings(&s3) > scans
+            }
+        }
+    });
+    let (_, _, gets) = first.unwrap();
+    let (ahead, near, bare) = seen;
+    assert!(ahead.unwrap() >= 2, "ahead's idle grew: {ahead:?}");
+    assert!(bare.unwrap() >= 2, "bare's idle grew: {bare:?}");
+    assert_eq!(near, Some(0), "4 minutes ahead still reads 0s");
+    assert_eq!(
+        summary_gets(&s3),
+        gets,
+        "the later scans found every summary's ETag unchanged"
+    );
+
+    let mut tui = TuiView::scan(&s3, &b);
+    let key = tui.key("born", PLANTED);
+    let tab = tui.draw(Some(&key), 160, 40);
+    let created = tab
+        .iter()
+        .find_map(|l| l.split("Created: ").nth(1))
+        .map(|v| v.trim_end_matches([' ', '\u{2502}']).to_string())
+        .unwrap_or_else(|| panic!("{tab:#?}"));
+    let clock = fake_s3::rfc3339_millis(SystemTime::now());
+    assert!(
+        created.as_str() <= clock.as_str(),
+        "{created} after {clock}"
+    );
+}
+
+/// B's TUI, the receded set shown (a row with no readable last event reads
+/// as long idle): wait until the frame shows a row labelled with each of
+/// `names`, then `j`, the frame after it, three Tabs, the frame after them,
+/// and `q`. Each frame, with how long after its key press it was drawn.
+fn press_once_rows_show(
+    s3: &FakeS3,
+    b: &Machine,
+    names: &[String],
+) -> Vec<(Duration, Vec<String>)> {
+    let (store, tree) = local_rows(b);
+    let feed = RemoteFeed::spawn(
+        &bucket_at(&s3.endpoint()),
+        dashboard_data::local_view(&tree),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let mut state = DashboardAppState::new(500);
+    state.tree = tree;
+    state.show_receded = true;
+    let mut sources = LoopSources {
+        refresh_local: Box::new(move |tree| dashboard_data::refresh(tree, &store)),
+        feed: Some(feed),
+        sessions: None,
+    };
+    let probe = Arc::new(Mutex::new(Probe::default()));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let mut script = Script {
+        probe: Arc::clone(&probe),
+        dialled: Arc::clone(&ready),
+        started: Instant::now(),
+    };
+    let shutdown = AtomicBool::new(false);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    let recorder = Arc::clone(&probe);
+    run_loop(
+        &mut terminal,
+        &mut state,
+        &mut sources,
+        &mut script,
+        &SystemClock,
+        &shutdown,
+        &mut |at, buffer, _| {
+            let lines = buffer_lines(buffer);
+            let mut probe = recorder.lock().unwrap();
+            if probe.step == 0
+                && names
+                    .iter()
+                    .all(|n| lines.iter().any(|l| l.contains(&format!("{n} @"))))
+            {
+                ready.store(1, Ordering::SeqCst);
+            }
+            if probe.step == 1 || probe.step == 5 {
+                probe.frames.push((at, lines));
+                probe.step += 1;
+            }
+        },
+    )
+    .unwrap();
+    let probe = probe.lock().unwrap();
+    let pressed = |step| probe.pressed.iter().find(|(s, _)| *s == step).unwrap().1;
+    probe
+        .frames
+        .iter()
+        .zip([1, 5])
+        .map(|((at, lines), step)| (at.duration_since(pressed(step)), lines.clone()))
+        .collect()
+}
+
+/// Plan step 7, criterion 15: a `last_event_at` or `created_at` holding a
+/// year or an hour of `u64::MAX`, a fraction of two-byte characters or a
+/// word prints on ten fields in `--once --all`, which exits 0 within 30 s
+/// with no panic, and the TUI draws its frame after a key press within
+/// 200 ms with those rows present.
+#[test]
+fn a_timestamp_that_cannot_be_read_neither_hangs_nor_panics_the_reader() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let bad = [
+        "18446744073709551615-01-01T00:00:00Z",
+        "2026-01-01T18446744073709551615:00:00Z",
+        "2026-01-01T00:00:00.\u{e9}\u{e9}Z",
+        "yesterday",
+    ];
+    let mut names = Vec::new();
+    for (i, value) in bad.iter().enumerate() {
+        for field in ["last_event_at", "created_at"] {
+            let name = format!("{}{i}", &field[..2]);
+            plant(&s3, PLANTED, &name, |s| {
+                s[field] = (*value).into();
+                s["intent"] = name.clone().into();
+            });
+            names.push(name);
+        }
+    }
+
+    let started = Instant::now();
+    let out = b.koto(&["dashboard", "--once", "--all"]);
+    let took = started.elapsed();
+    println!("--once with unreadable timestamps took {took:?}");
+    assert_eq!(out.code, Some(0), "{}", out.describe());
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(!out.stderr.contains("panicked"), "{}", out.describe());
+    let rows = out.rows();
+    for name in &names {
+        let row = row_of(&rows, name, PLANTED).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(row.len(), 10, "{row:?}");
+        assert_eq!(row[1], "check", "{row:?}");
+    }
+
+    let frames = press_once_rows_show(&s3, &b, &names);
+    assert_eq!(frames.len(), 2, "a frame after j and after the tabs");
+    for (waited, lines) in &frames {
+        assert!(*waited < Duration::from_millis(200), "{waited:?}");
+        let text = lines.join("\n");
+        assert!(!text.contains("panicked"), "{text}");
+    }
+    let list = frames[0].1.join("\n");
+    for name in &names {
+        assert!(
+            list.contains(&format!("{name} @machine-a")),
+            "{name}: {list}"
+        );
+    }
+}
+
+/// Plan step 7, criteria 16 and 19: with 5,001 workspace prefixes beside
+/// B's, `--once` lists 5,000, not the last in key order, writes one stderr
+/// line holding `listing truncated` and prints B's local row and a remote
+/// one; the TUI shows the notice on its status line beside its local row.
+/// Once two prefixes go, the next snapshot has no notice, and the TUI's
+/// clears.
+#[test]
+fn a_bucket_past_5000_prefixes_lists_5000_with_one_notice() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    for i in 0..5001 {
+        s3.put(&format!("{}/pad", prefix_n(i)), b"x");
+    }
+    plant(&s3, &prefix_n(0), "far", |_| {});
+    let mut every: Vec<String> = (0..5001).map(prefix_n).collect();
+    every.push(b.workspace());
+    every.sort();
+
+    let started = Instant::now();
+    let out = once_on(&s3, &b, &[]);
+    println!("--once over 5,002 prefixes took {:?}", started.elapsed());
+    let listed: std::collections::HashSet<String> = listed_prefixes(&s3).into_iter().collect();
+    assert_eq!(listed.len(), 5000, "5,000 prefixes listed");
+    assert!(
+        !listed.contains(every.last().unwrap()),
+        "the last one isn't"
+    );
+    assert!(top_level_listings(&s3) <= 100);
+    assert_eq!(truncation_notes(&out).len(), 1, "{}", out.describe());
+    assert_eq!(out.stderr.lines().count(), 1, "{}", out.describe());
+    let rows = out.rows();
+    assert!(row_of(&rows, "mine", &b.workspace()).is_some(), "{rows:?}");
+    assert!(row_of(&rows, "far", &prefix_n(0)).is_some(), "{rows:?}");
+
+    assert_tui_status(&s3.endpoint(), &b, "listing truncated");
+
+    // Down to 5,000 prefixes: the next snapshot, and the TUI, say nothing.
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+    assert!(cached_scan(&s3, &reader, &mut cache).truncated);
+    s3.remove(&format!("{}/pad", prefix_n(5000)));
+    s3.remove(&format!("{}/pad", prefix_n(4999)));
+    assert!(!cached_scan(&s3, &reader, &mut cache).truncated);
+    drive_tui(&s3, &b, &mut |lines, state| {
+        assert!(
+            !status_text(lines).contains("listing truncated"),
+            "{lines:#?}"
+        );
+        !state.tree.sessions.values().all(|s| !s.remote) && shows_local_row(lines)
+    });
+}
+
+/// Plan step 7, criteria 17 and 19: a prefix holding more than 100 pages is
+/// listed 100 times, the rows from those pages and from another prefix
+/// print beside B's own with the notice, and the session after the
+/// hundredth page doesn't. Once the prefix fits 100 pages again, the next
+/// snapshot has no notice.
+#[test]
+fn a_prefix_past_100_pages_lists_100_with_the_notice() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    plant(&s3, PLANTED, "a-first", |_| {});
+    for i in 0..100_500 {
+        s3.put(&key_of(PLANTED, "m-pad", &format!("p{i:06}")), b"");
+    }
+    plant(&s3, PLANTED, "z-last", |_| {});
+    plant(&s3, NAMED, "other", |_| {});
+
+    let started = Instant::now();
+    let out = once_on(&s3, &b, &["--all"]);
+    println!("--once over a 100-page prefix took {:?}", started.elapsed());
+    let pages = listed_prefixes(&s3)
+        .into_iter()
+        .filter(|p| p == PLANTED)
+        .count();
+    assert_eq!(pages, 100, "100 listing requests for the padded prefix");
+    let rows = out.rows();
+    let state = |name: &str, ws: &str| row_of(&rows, name, ws).map(|r| r[1].clone());
+    assert_eq!(
+        state("a-first", PLANTED).as_deref(),
+        Some("check"),
+        "{rows:?}"
+    );
+    assert_eq!(state("other", NAMED).as_deref(), Some("check"), "{rows:?}");
+    assert!(state("mine", &b.workspace()).is_some(), "{rows:?}");
+    assert_eq!(
+        state("z-last", PLANTED),
+        None,
+        "past the 100th page: {rows:?}"
+    );
+    assert_eq!(truncation_notes(&out).len(), 1, "{}", out.describe());
+    assert_eq!(out.stderr.lines().count(), 1, "{}", out.describe());
+
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+    let over = cached_scan(&s3, &reader, &mut cache);
+    assert!(over.truncated);
+    assert!(over.rows.iter().all(|r| r.name != "z-last"));
+    for i in 0..600 {
+        s3.remove(&key_of(PLANTED, "m-pad", &format!("p{i:06}")));
+    }
+    let under = cached_scan(&s3, &reader, &mut cache);
+    assert!(!under.truncated, "the notice clears on the next snapshot");
+    assert!(under.rows.iter().any(|r| r.name == "z-last"));
+}
+
+/// A workspace prefix that sorts after every one a machine derives.
+const NEWEST: &str = "ffffffffffffffff";
+
+/// Plan step 7, criterion 18: with 20,500 sessions, the 500 changed most
+/// recently in the prefix last in key order, `--once --all` prints exactly
+/// 20,000 remote rows, those 500 among them, the oldest prefix's 500 oldest
+/// left out, plus B's local row, writes the notice, and GETs no summary of
+/// a session it left out.
+#[test]
+fn the_session_ceiling_keeps_the_20000_most_recent_and_every_local_row() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let base = SystemTime::now() - Duration::from_secs(10 * 86400);
+    for p in 0..20u64 {
+        let ws = prefix_n(p as usize);
+        for n in 0..1000u64 {
+            let key = state_key(&ws, &format!("s{n:03}"));
+            s3.put(&key, b"{}\n");
+            s3.set_last_modified(
+                &key,
+                base + Duration::from_secs(p * 3600) - Duration::from_secs(n),
+            );
+        }
+    }
+    // Summaries no read should reach: the oldest prefix's oldest sessions.
+    let oldest = prefix_n(0);
+    for n in 990..1000 {
+        put_summary(&s3, &oldest, &format!("s{n:03}"), b"{}");
+    }
+    for n in 0..500 {
+        plant(&s3, NEWEST, &format!("n{n:03}"), |_| {});
+    }
+
+    let started = Instant::now();
+    let out = once_on(&s3, &b, &["--all"]);
+    println!("--once over 20,501 sessions took {:?}", started.elapsed());
+    let rows = out.rows();
+    let own = b.workspace();
+    let remote: Vec<&Vec<String>> = rows.iter().filter(|r| r[9] != own).collect();
+    assert_eq!(remote.len(), 20_000, "{}", out.stderr);
+    let newest: Vec<_> = remote.iter().filter(|r| r[9] == NEWEST).collect();
+    assert_eq!(newest.len(), 500);
+    assert!(newest.iter().all(|r| r[1] == "check"), "{newest:?}");
+    let mut kept: Vec<&str> = remote
+        .iter()
+        .filter(|r| r[9] == oldest)
+        .map(|r| r[0].as_str())
+        .collect();
+    kept.sort();
+    let expected: Vec<String> = (0..500).map(|n| format!("s{n:03}")).collect();
+    assert_eq!(kept, expected, "the oldest prefix keeps its 500 newest");
+    for p in 1..20 {
+        let ws = prefix_n(p);
+        assert_eq!(remote.iter().filter(|r| r[9] == ws).count(), 1000, "{ws}");
+    }
+    assert!(row_of(&rows, "mine", &own).is_some(), "B's local row");
+    assert_eq!(truncation_notes(&out).len(), 1, "{}", out.stderr);
+    let gets: Vec<String> = object_gets(&s3)
+        .into_iter()
+        .filter(|k| k.ends_with("/summary.json"))
+        .collect();
+    assert!(gets.len() <= 20_000, "{}", gets.len());
+    assert!(
+        gets.iter()
+            .all(|k| !k.starts_with(&format!("{oldest}/s99"))),
+        "no summary of a session left out is read"
+    );
+}
+
+/// Plan step 7, criterion 18 in the TUI: 250 prefixes of 81 sessions each,
+/// more than the 200-prefix budget lists in one scan, over enough scans to
+/// list every prefix, never put more than 20,000 remote rows in B's tree,
+/// which comes to hold exactly 20,000 with the notice on the status line
+/// and B's local row.
+#[test]
+fn the_tui_never_holds_more_than_20000_remote_rows_across_a_rotation() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let idle = SystemTime::now() - Duration::from_secs(2 * 3600);
+    let all: Vec<String> = (0..250).map(prefix_n).collect();
+    for (p, ws) in all.iter().enumerate() {
+        for n in 0..81u64 {
+            let key = state_key(ws, &format!("s{n:02}"));
+            s3.put(&key, b"{}\n");
+            s3.set_last_modified(&key, idle - Duration::from_secs(p as u64 * 100 + n));
+        }
+    }
+    s3.clear_requests();
+    let mut most = 0usize;
+    let started = Instant::now();
+    drive_tui(&s3, &b, &mut |lines, state| {
+        let remote = state.tree.sessions.values().filter(|s| s.remote).count();
+        assert!(remote <= 20_000, "{remote} remote rows");
+        most = most.max(remote);
+        top_level_listings(&s3) >= 3
+            && remote == 20_000
+            && status_text(lines).contains("listing truncated")
+            && shows_local_row(lines)
+    });
+    println!(
+        "the TUI rotated through 250 prefixes and 20,250 sessions in {:?}",
+        started.elapsed()
+    );
+    let listed: std::collections::HashSet<String> = listed_prefixes(&s3).into_iter().collect();
+    assert!(
+        all.iter().all(|ws| listed.contains(ws)),
+        "every prefix listed"
+    );
+    assert_eq!(most, 20_000);
+}
+
+/// Plan step 7, criterion 19: a bucket below every ceiling, here 250
+/// prefixes, which only passes the TUI's 200-prefix budget, shows no
+/// notice in `--once`, in any cached snapshot or on any frame of the TUI.
+#[test]
+fn a_bucket_below_every_ceiling_shows_no_truncation_notice() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let idle = SystemTime::now() - Duration::from_secs(2 * 3600);
+    for i in 0..250 {
+        let key = state_key(&prefix_n(i), "s");
+        s3.put(&key, b"{}\n");
+        s3.set_last_modified(&key, idle);
+    }
+    let out = once_on(&s3, &b, &["--all"]);
+    assert!(truncation_notes(&out).is_empty(), "{}", out.describe());
+    assert_eq!(out.rows().len(), 251, "{}", out.describe());
+
+    let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+    let mut cache = FeedCache::new();
+    for _ in 0..3 {
+        assert!(!cached_scan(&s3, &reader, &mut cache).truncated);
+    }
+    s3.clear_requests();
+    drive_tui(&s3, &b, &mut |lines, state| {
+        assert!(!lines.join("").contains("listing truncated"), "{lines:#?}");
+        top_level_listings(&s3) >= 3
+            && state.tree.sessions.values().filter(|s| s.remote).count() == 250
+            && shows_local_row(lines)
+    });
+}

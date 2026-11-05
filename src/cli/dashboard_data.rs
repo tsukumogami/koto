@@ -275,6 +275,9 @@ pub struct SessionTree {
     /// Why the last feed snapshot couldn't read some or all of the bucket;
     /// `None` once a snapshot reads it without failure.
     pub remote_failure: Option<ReadFailure>,
+    /// The last feed snapshot reached a listing ceiling, so some of the
+    /// bucket isn't shown; `false` once a snapshot reaches none.
+    pub remote_truncated: bool,
 }
 
 impl SessionTree {
@@ -288,6 +291,7 @@ impl SessionTree {
             remote_unreadable: 0,
             remote_hidden: 0,
             remote_failure: None,
+            remote_truncated: false,
         }
     }
 
@@ -824,8 +828,9 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 /// keyed by [`remote_key`], except that the rows of a workspace whose
 /// listing failed (every workspace, when the top-level listing failed) stay
 /// as they were, since a failed listing says nothing about removal. A
-/// session this machine holds a copy of stays its local row. The tallies
-/// and the failure come from the snapshot.
+/// session this machine holds a copy of stays its local row. The tallies,
+/// the failure and whether a listing ceiling was reached come from the
+/// snapshot.
 pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.sessions
         .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
@@ -839,6 +844,7 @@ pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
     tree.remote_failure = snapshot.failure.clone();
+    tree.remote_truncated = snapshot.truncated;
     drop_shadowed_remote(tree);
     tree.rebuild_roots();
 }
@@ -1189,9 +1195,18 @@ fn build_gate_condition(
     None
 }
 
+/// The latest year [`parse_timestamp_to_systemtime`] reads; a later one, as
+/// a timestamp another machine wrote may hold, reads as no time at all.
+const MAX_YEAR: u64 = 9999;
+
 /// Parse an RFC 3339 / ISO 8601 UTC timestamp string into a `SystemTime`.
 ///
-/// Format: `YYYY-MM-DDTHH:MM:SS[.mmm]Z`. Returns `None` on any parse error.
+/// Format: `YYYY-MM-DDTHH:MM:SS[.fff]Z`. Returns `None` on any parse error,
+/// and for any field out of its range: a year before 1970 or after
+/// [`MAX_YEAR`], a month, day, hour, minute or second the calendar doesn't
+/// have, or a fraction that isn't all ASCII digits. A remote row's times
+/// come from another machine's summary, so no input can make this loop
+/// without end, overflow or slice inside a character.
 pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<SystemTime> {
     let t = timestamp.trim_end_matches('Z');
     let (date_part, time_part) = t.split_once('T')?;
@@ -1205,16 +1220,20 @@ pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<SystemTim
     } else {
         (time_part, "0")
     };
+    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
 
     let mut hms_parts = hms.split(':');
     let hour: u64 = hms_parts.next()?.parse().ok()?;
     let minute: u64 = hms_parts.next()?.parse().ok()?;
     let second: u64 = hms_parts.next()?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
 
-    let millis: u64 = {
-        let frac_str = format!("{:0<3}", &frac[..frac.len().min(3)]);
-        frac_str.parse().ok()?
-    };
+    // ASCII digits only, so the first three bytes are three characters.
+    let millis: u64 = format!("{:0<3}", &frac[..frac.len().min(3)]).parse().ok()?;
 
     let days = days_since_epoch(year, month, day)?;
     let secs = days * 86400 + hour * 3600 + minute * 60 + second;
@@ -1230,22 +1249,27 @@ pub(crate) fn compute_elapsed_since(timestamp: &str) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-/// Compute days since Unix epoch for a given year/month/day (Gregorian).
+/// Compute days since Unix epoch for a given year/month/day (Gregorian);
+/// `None` for a year outside 1970 to [`MAX_YEAR`] or a month or day the
+/// calendar doesn't have.
 fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
-    if !(1..=12).contains(&month) || day < 1 {
+    if !(1970..=MAX_YEAR).contains(&year) || !(1..=12).contains(&month) {
         return None;
-    }
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
     }
     let month_days: &[u64] = if is_leap(year) {
         &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
         &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
+    if day < 1 || day > month_days[(month - 1) as usize] {
+        return None;
+    }
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
     for m in 1..month {
-        days += month_days.get((m - 1) as usize)?;
+        days += month_days[(m - 1) as usize];
     }
     days += day - 1;
     Some(days)
@@ -2693,5 +2717,52 @@ mod tests {
             liveness::Liveness::NeedsYouBlocked
         );
         assert!(is_session_receded(&named, now));
+    }
+
+    /// Each out-of-range input another machine could write reads as no time,
+    /// at once: a year of `u64::MAX` (once a loop of that many years), an
+    /// hour of `u64::MAX` (once an overflow), a fraction of two-byte
+    /// characters (once a slice inside one) and a word.
+    #[test]
+    fn dashboard_data_timestamp_parser_reads_each_out_of_range_input_as_none() {
+        for input in [
+            "18446744073709551615-01-01T00:00:00Z",
+            "2026-01-01T18446744073709551615:00:00Z",
+            "2026-01-01T00:18446744073709551615:00Z",
+            "2026-01-01T00:00:18446744073709551615Z",
+            "2026-01-01T00:00:00.\u{e9}\u{e9}Z",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00.1x2Z",
+            "yesterday",
+            "",
+            "10000-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-13-01T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:61Z",
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(parse_timestamp_to_systemtime(input), None, "{input:?}");
+            assert_eq!(compute_elapsed_since(input), Duration::ZERO, "{input:?}");
+            assert!(started.elapsed() < Duration::from_secs(1), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn dashboard_data_timestamp_parser_reads_the_calendar_edges() {
+        let at = |s| {
+            parse_timestamp_to_systemtime(s)
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+        };
+        assert_eq!(at("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(at("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
+        assert_eq!(at("2026-01-01T00:00:00.5Z"), Some(1_767_225_600_500));
+        assert_eq!(at("2026-01-01T00:00:00.123456Z"), Some(1_767_225_600_123));
+        assert_eq!(at("2024-02-29T23:59:60Z"), Some(1_709_251_200_000));
+        assert!(at("9999-12-31T23:59:59.999Z").is_some());
     }
 }

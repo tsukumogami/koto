@@ -18,7 +18,11 @@
 //! `url` encoding so a key reaches the reader as stored; a summary or marker
 //! GET asks for its first 64 KiB and one byte and reads no further; a
 //! summary with a field over its cap is unreadable; and every string bound
-//! for a remote row passes through [`sanitize_bucket_text`] first.
+//! for a remote row passes through [`sanitize_bucket_text`] first. A time
+//! more than [`FUTURE_SKEW`] past the reader's clock is clamped to it when
+//! first read, and each pass stops at [`MAX_PREFIXES`] workspace prefixes,
+//! [`MAX_PAGES`] pages a listing and [`MAX_SESSIONS`] sessions, saying so
+//! in [`RemoteSnapshot::truncated`].
 //!
 //! The interactive dashboard reads through a [`RemoteFeed`]: one background
 //! thread that owns its own reader, scans on a fixed interval, and hands each
@@ -31,8 +35,8 @@
 //! Every request the reader makes fails after [`REQUEST_TIMEOUT`], and every
 //! failure falls in one [`FailureClass`] ([`failure_class_after`]). A failed
 //! top-level listing ends the pass with no further request. The reader asks
-//! a listing again only after a throttle, never after a timeout, but rust-s3
-//! asks every failed request again on its own, a second later, unless the
+//! a listing page again only after a throttle, never after a timeout, but
+//! rust-s3 asks every failed request again on its own, a second later, unless the
 //! process has called `s3::set_retries(0)`. That setting is process-wide,
 //! with no per-bucket form, and the reader can't set it: `koto dashboard`
 //! does, in its `run` in `src/cli/dashboard.rs`. Only with it does a bucket that
@@ -49,9 +53,9 @@ use s3::error::S3Error;
 use s3::serde_types::ListBucketResult;
 use s3::Bucket;
 
-use crate::session::cloud::{
-    is_workspace_prefix, list_retrying_when, marker_target_str, MIGRATED_MARKER,
-};
+use crate::cli::dashboard_data::parse_timestamp_to_systemtime;
+use crate::engine::types::iso8601_at;
+use crate::session::cloud::{is_workspace_prefix, marker_target_str, MIGRATED_MARKER};
 use crate::session::state_file_name;
 use crate::session::summary::{is_internal_name, SessionSummary, MAX_SUMMARY_BYTES, SUMMARY_FILE};
 use crate::session::sync_stamp::normalize_etag;
@@ -162,6 +166,203 @@ fn decode_listing(pages: &mut [ListBucketResult]) {
             });
         }
     }
+}
+
+/// The most workspace prefixes one scan lists: the first ones the top-level
+/// listing returns, in its order. A top-level listing says nothing of when
+/// a prefix last changed, so it can't choose by recency.
+pub const MAX_PREFIXES: usize = 5_000;
+
+/// The most pages one scan asks of one listing, the top-level one included.
+pub const MAX_PAGES: usize = 100;
+
+/// The most remote sessions one scan keeps, chosen by recency
+/// ([`keep_most_recent`]). This machine's own sessions, which show as their
+/// local rows, are never among those it drops.
+pub const MAX_SESSIONS: usize = 20_000;
+
+/// What a scan that reached [`MAX_PREFIXES`], [`MAX_PAGES`] or
+/// [`MAX_SESSIONS`] says, on `--once`'s stderr and the TUI's status line.
+pub const TRUNCATED_NOTE: &str =
+    "listing truncated: a listing ceiling was reached, so some of other machines' sessions \
+     aren't shown";
+
+/// How many times one listing page is asked, the first included, while
+/// the bucket throttles it. The same as the sync path's listing.
+const PAGE_ATTEMPTS: u32 = 3;
+
+/// The wait before a page's second ask, doubled before each ask after that.
+const PAGE_BACKOFF: Duration = Duration::from_millis(250);
+
+/// A listing of `prefix`, split at `delimiter` when there is one, read one
+/// page at a time and no further than `max_pages` pages: the pages read,
+/// and whether the listing went on past them. Each page is asked up to
+/// [`PAGE_ATTEMPTS`] times while `retry` accepts its failure, waiting
+/// [`PAGE_BACKOFF`], doubled each time, between asks; a failure carries how
+/// long its last ask took. Only the dashboard's reader lists this way; the
+/// sync path follows every page.
+fn list_pages(
+    bucket: &Bucket,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_pages: usize,
+    retry: impl Fn(&S3Error) -> bool,
+) -> Result<(Vec<ListBucketResult>, bool), (S3Error, Duration)> {
+    let delimiter = delimiter.map(str::to_string);
+    let mut pages: Vec<ListBucketResult> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let ask = || {
+            let started = Instant::now();
+            bucket
+                .list_page(
+                    prefix.to_string(),
+                    delimiter.clone(),
+                    token.clone(),
+                    None,
+                    None,
+                )
+                .map(|(page, _)| page)
+                .map_err(|e| (e, started.elapsed()))
+        };
+        let mut wait = PAGE_BACKOFF;
+        let mut attempt = 1;
+        let page = loop {
+            match ask() {
+                Err((e, _)) if attempt < PAGE_ATTEMPTS && retry(&e) => {
+                    std::thread::sleep(wait);
+                    wait *= 2;
+                    attempt += 1;
+                }
+                result => break result?,
+            }
+        };
+        token = page
+            .next_continuation_token
+            .clone()
+            .filter(|t| !t.is_empty());
+        pages.push(page);
+        match token {
+            None => return Ok((pages, false)),
+            Some(_) if pages.len() >= max_pages => return Ok((pages, true)),
+            Some(_) => {}
+        }
+    }
+}
+
+/// How far past the reader's clock a time another machine wrote may lie
+/// and still be read as written: ordinary clock skew between two machines.
+/// A later one is clamped to the reader's clock.
+pub const FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+
+/// Whether `t` lies more than [`FUTURE_SKEW`] past `now`.
+fn is_far_future(t: SystemTime, now: SystemTime) -> bool {
+    now.checked_add(FUTURE_SKEW).is_some_and(|edge| t > edge)
+}
+
+/// Clamp a summary's `created_at` and `last_event_at` to `now`, the
+/// reader's clock when it read the summary, when either lies more than
+/// [`FUTURE_SKEW`] past it, so a forged future time can't hold a row's idle
+/// at zero. A time is read as the dashboard reads it, after the bucket-text
+/// sanitizer; one that doesn't parse is left as it is.
+///
+/// The clamp is applied once, when the summary is read: a cached scan
+/// reuses the clamped summary while its ETag is unchanged, so the row's
+/// idle grows from the first read, as it would from a real time.
+fn clamp_summary_times(summary: &mut SessionSummary, now: SystemTime) {
+    let ahead = |text: &str| {
+        parse_timestamp_to_systemtime(&sanitize_bucket_text(text))
+            .is_some_and(|t| is_far_future(t, now))
+    };
+    if ahead(&summary.created_at) {
+        summary.created_at = iso8601_at(now);
+    }
+    if summary.last_event_at.as_deref().is_some_and(ahead) {
+        summary.last_event_at = Some(iso8601_at(now));
+    }
+}
+
+/// Clamp each listed LastModified of `listing` that lies more than
+/// [`FUTURE_SKEW`] past `now` to `now`, or, when `before` (the session as
+/// the cache last listed it) lists the same file with the same non-empty
+/// ETag, to the time it was given then, so an unchanged object keeps the
+/// time it was first clamped to and its row ages from there.
+fn clamp_listing(listing: &mut SessionListing, before: Option<&SessionListing>, now: SystemTime) {
+    for (file, object) in listing.objects.iter_mut() {
+        if !object.last_modified.is_some_and(|t| is_far_future(t, now)) {
+            continue;
+        }
+        let earlier = before
+            .and_then(|b| b.objects.get(file))
+            .filter(|was| !object.etag.is_empty() && was.etag == object.etag)
+            .and_then(|was| was.last_modified)
+            .filter(|t| !is_far_future(*t, now));
+        object.last_modified = Some(earlier.unwrap_or(now));
+    }
+}
+
+/// A session a scan may keep or drop at [`MAX_SESSIONS`]: its workspace
+/// prefix, its name and its state file's listed LastModified.
+pub type SessionCandidate<'a> = (&'a str, &'a str, Option<SystemTime>);
+
+/// The sessions a scan keeps out of `candidates` when there are more than
+/// `limit`: prefixes in order of their most recent state change (the
+/// newest LastModified among their sessions, newest first, a prefix with no
+/// time last, then by prefix), and within a prefix its sessions newest
+/// first, then by name, until `limit` are taken. `None` when there are no
+/// more than `limit`, and every candidate is kept.
+pub fn keep_most_recent(
+    candidates: &[SessionCandidate<'_>],
+    limit: usize,
+) -> Option<HashSet<(String, String)>> {
+    if candidates.len() <= limit {
+        return None;
+    }
+    let mut newest: HashMap<&str, Option<SystemTime>> = HashMap::new();
+    for &(workspace, _, modified) in candidates {
+        let at = newest.entry(workspace).or_insert(None);
+        *at = (*at).max(modified);
+    }
+    let mut order: Vec<&SessionCandidate<'_>> = candidates.iter().collect();
+    order.sort_by(|a, b| {
+        newest[b.0]
+            .cmp(&newest[a.0])
+            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.1.cmp(b.1))
+    });
+    Some(
+        order
+            .into_iter()
+            .take(limit)
+            .map(|&(workspace, name, _)| (workspace.to_string(), name.to_string()))
+            .collect(),
+    )
+}
+
+/// Run `f` on every item, [`FANOUT`] at a time, and give the results in the
+/// items' order.
+fn fan_out<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, R)>> = Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..items.len().min(FANOUT) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else {
+                    return;
+                };
+                let result = f(item);
+                results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((i, result));
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    results.sort_by_key(|(i, _)| *i);
+    results.into_iter().map(|(_, r)| r).collect()
 }
 
 /// What a bounded GET gave.
@@ -535,8 +736,9 @@ fn is_stale(summary: &SessionSummary, state: &ListedObject, now: SystemTime) -> 
     }
 }
 
-/// One workspace's scan: the session directories it holds.
-type WorkspaceScan = Result<Vec<ScannedSession>, ListFailure>;
+/// One workspace's listing: its session directories by name, and whether
+/// it stopped at [`MAX_PAGES`].
+type Listed = (BTreeMap<String, SessionListing>, bool);
 
 /// How a bucket request the reader made failed. Every failure is one of
 /// these four; [`failure_class_after`] decides which.
@@ -733,6 +935,11 @@ pub struct RemoteSnapshot {
     pub unreadable: usize,
     /// Migrated sources left out in favour of their copy.
     pub hidden_sources: usize,
+    /// The pass reached a ceiling ([`MAX_PREFIXES`], [`MAX_PAGES`] or
+    /// [`MAX_SESSIONS`]), so some of the bucket isn't in `rows`. A cached
+    /// pass also counts a prefix whose last answered listing reached
+    /// [`MAX_PAGES`], until a listing of it doesn't.
+    pub truncated: bool,
 }
 
 impl RemoteSnapshot {
@@ -774,6 +981,8 @@ struct CachedWorkspace {
     listed_at: u64,
     /// The newest LastModified the last answered listing showed.
     newest: Option<SystemTime>,
+    /// The last answered listing stopped at [`MAX_PAGES`].
+    truncated: bool,
     /// The sessions the last answered listing found, by name.
     sessions: BTreeMap<String, ScannedSession>,
 }
@@ -869,21 +1078,23 @@ impl RemoteReader {
         }
     }
 
-    /// A listing of `prefix`, asked again only while the bucket throttles
-    /// it (koto's usual retries), never after a timeout or a refusal. It is
-    /// asked in [`LIST_ENCODING`] and its keys decoded, so a listed key is
-    /// the key as stored, whatever characters it holds.
+    /// A listing of `prefix`, at most [`MAX_PAGES`] pages ([`list_pages`]),
+    /// and whether it went on past them. Each page is asked again only
+    /// while the bucket throttles it (koto's usual retries), never after a
+    /// timeout or a refusal. It is asked in [`LIST_ENCODING`] and its keys
+    /// decoded, so a listed key is the key as stored, whatever characters
+    /// it holds.
     fn list(
         &self,
-        prefix: String,
+        prefix: &str,
         delimiter: Option<&str>,
-    ) -> Result<Vec<ListBucketResult>, ListFailure> {
-        let mut pages = list_retrying_when(&self.lister, prefix, delimiter, |e| {
+    ) -> Result<(Vec<ListBucketResult>, bool), ListFailure> {
+        let (mut pages, truncated) = list_pages(&self.lister, prefix, delimiter, MAX_PAGES, |e| {
             failure_class(e) == FailureClass::Throttled
         })
         .map_err(|(error, took)| ListFailure { error, took })?;
         decode_listing(&mut pages);
-        Ok(pages)
+        Ok((pages, truncated))
     }
 
     /// A failure of this reader's bucket.
@@ -896,27 +1107,40 @@ impl RemoteReader {
         }
     }
 
-    /// The bucket's workspace prefixes, from one top-level listing.
-    fn workspaces(&self) -> Result<Vec<String>, ListFailure> {
-        let pages = self.list(String::new(), Some("/"))?;
-        Ok(pages
+    /// The bucket's workspace prefixes, from one top-level listing, at
+    /// most the first [`MAX_PREFIXES`] in the listing's order, and whether
+    /// any were left out or the listing stopped at [`MAX_PAGES`].
+    fn workspaces(&self) -> Result<(Vec<String>, bool), ListFailure> {
+        let (pages, mut truncated) = self.list("", Some("/"))?;
+        let mut all: Vec<String> = pages
             .iter()
             .filter_map(|page| page.common_prefixes.as_ref())
             .flatten()
             .filter_map(|cp| cp.prefix.strip_suffix('/'))
             .filter(|p| is_workspace_prefix(p))
             .map(str::to_string)
-            .collect())
+            .collect();
+        if all.len() > MAX_PREFIXES {
+            all.truncate(MAX_PREFIXES);
+            truncated = true;
+        }
+        Ok((all, truncated))
     }
 
     /// The session directories under `workspace`, from its
-    /// `/ctx/`-delimited listing, every page followed.
+    /// `/ctx/`-delimited listing, its first [`MAX_PAGES`] pages followed.
     pub fn list_workspace(
         &self,
         workspace: &str,
     ) -> Result<BTreeMap<String, SessionListing>, ListFailure> {
-        let pages = self.list(format!("{workspace}/"), Some(CTX_DELIMITER))?;
-        Ok(group_sessions(
+        self.list_sessions(workspace).map(|(sessions, _)| sessions)
+    }
+
+    /// [`RemoteReader::list_workspace`], and whether the listing stopped at
+    /// [`MAX_PAGES`].
+    fn list_sessions(&self, workspace: &str) -> Result<Listed, ListFailure> {
+        let (pages, truncated) = self.list(&format!("{workspace}/"), Some(CTX_DELIMITER))?;
+        let sessions = group_sessions(
             workspace,
             pages
                 .iter()
@@ -933,7 +1157,8 @@ impl RemoteReader {
                         },
                     )
                 }),
-        ))
+        );
+        Ok((sessions, truncated))
     }
 
     /// GET `<workspace>/<name>/<file>`, reading no more than `cap` bytes
@@ -961,13 +1186,17 @@ impl RemoteReader {
         }
     }
 
-    /// Read one session's summary.
-    fn read_summary(&self, workspace: &str, name: &str) -> SummaryRead {
+    /// Read one session's summary, its far-future times clamped to `now`
+    /// ([`clamp_summary_times`]).
+    fn read_summary(&self, workspace: &str, name: &str, now: SystemTime) -> SummaryRead {
         match self.get(workspace, name, SUMMARY_FILE, MAX_SUMMARY_BYTES) {
             Fetched::Failed => SummaryRead::Unreadable("unfetched"),
             Fetched::Oversized => SummaryRead::Unreadable("oversized"),
             Fetched::Body(bytes) => match SessionSummary::parse(&bytes, workspace, name) {
-                Ok(summary) => SummaryRead::Read(Box::new(summary)),
+                Ok(mut summary) => {
+                    clamp_summary_times(&mut summary, now);
+                    SummaryRead::Read(Box::new(summary))
+                }
                 Err(reason) => SummaryRead::Unreadable(reason),
             },
         }
@@ -987,68 +1216,67 @@ impl RemoteReader {
         })
     }
 
-    /// The session directories of one workspace, with the summary and
-    /// marker of each one that has a state object and isn't internal. A
-    /// summary over [`MAX_SUMMARY_BYTES`] by its listed size isn't fetched.
+    /// The summary and marker of one listed session, when it has a state
+    /// object and isn't internal. A summary over [`MAX_SUMMARY_BYTES`] by
+    /// its listed size isn't fetched.
     ///
-    /// `previous` is what the last answered listing of this workspace found,
-    /// when the caller keeps a [`FeedCache`]: a summary that was read and
-    /// parsed, or a marker that named a copy, is reused without a GET while
-    /// its object's listed ETag is the one it was read under.
-    fn scan_workspace(
+    /// `before` is the session as the last answered listing of its
+    /// workspace found it, when the caller keeps a [`FeedCache`]: a summary
+    /// that was read and parsed, or a marker that named a copy, is reused
+    /// without a GET while its object's listed ETag is the one it was read
+    /// under.
+    fn read_session(
         &self,
-        workspace: &str,
-        previous: Option<&BTreeMap<String, ScannedSession>>,
-    ) -> WorkspaceScan {
-        let mut sessions = Vec::new();
-        for (name, listing) in self.list_workspace(workspace)? {
-            let wanted = listing.state(&name).is_some() && !is_internal_name(&name);
-            let before = previous.and_then(|p| p.get(&name));
-            let unchanged = |file: &str| match (
-                before.and_then(|b| b.listing.objects.get(file)),
-                listing.objects.get(file),
-            ) {
-                (Some(was), Some(now)) => !now.etag.is_empty() && was.etag == now.etag,
-                _ => false,
-            };
-            let summary = match listing.objects.get(SUMMARY_FILE) {
-                Some(_) if !wanted => SummaryRead::Absent,
-                Some(obj) if obj.size > MAX_SUMMARY_BYTES as u64 => {
-                    SummaryRead::Unreadable("oversized")
+        session: &ScannedSession,
+        before: Option<&ScannedSession>,
+        now: SystemTime,
+    ) -> (SummaryRead, Option<MigratedTo>) {
+        let (workspace, name, listing) = (&session.workspace, &session.name, &session.listing);
+        let wanted = listing.state(name).is_some() && !is_internal_name(name);
+        let unchanged = |file: &str| match (
+            before.and_then(|b| b.listing.objects.get(file)),
+            listing.objects.get(file),
+        ) {
+            (Some(was), Some(now)) => !now.etag.is_empty() && was.etag == now.etag,
+            _ => false,
+        };
+        let summary = match listing.objects.get(SUMMARY_FILE) {
+            Some(_) if !wanted => SummaryRead::Absent,
+            Some(obj) if obj.size > MAX_SUMMARY_BYTES as u64 => {
+                SummaryRead::Unreadable("oversized")
+            }
+            Some(_) => match before.map(|b| &b.summary) {
+                Some(read @ SummaryRead::Read(_)) if unchanged(SUMMARY_FILE) => read.clone(),
+                _ => self.read_summary(workspace, name, now),
+            },
+            None => SummaryRead::Absent,
+        };
+        let marker = match listing.objects.get(MIGRATED_MARKER) {
+            Some(obj) if wanted && obj.size <= MAX_MARKER_BYTES as u64 => {
+                match before.and_then(|b| b.marker.as_ref()) {
+                    Some(m) if unchanged(MIGRATED_MARKER) => Some(m.clone()),
+                    _ => self.read_marker(workspace, name),
                 }
-                Some(_) => match before.map(|b| &b.summary) {
-                    Some(read @ SummaryRead::Read(_)) if unchanged(SUMMARY_FILE) => read.clone(),
-                    _ => self.read_summary(workspace, &name),
-                },
-                None => SummaryRead::Absent,
-            };
-            let marker = match listing.objects.get(MIGRATED_MARKER) {
-                Some(obj) if wanted && obj.size <= MAX_MARKER_BYTES as u64 => {
-                    match before.and_then(|b| b.marker.as_ref()) {
-                        Some(m) if unchanged(MIGRATED_MARKER) => Some(m.clone()),
-                        _ => self.read_marker(workspace, &name),
-                    }
-                }
-                _ => None,
-            };
-            sessions.push(ScannedSession {
-                workspace: workspace.to_string(),
-                name,
-                listing,
-                summary,
-                marker,
-            });
-        }
-        Ok(sessions)
+            }
+            _ => None,
+        };
+        (summary, marker)
     }
 
-    /// One pass over the bucket: every workspace prefix, each listed with
-    /// the `/ctx/` delimiter, [`FANOUT`] at a time, then [`classify`]d as a
-    /// whole against `local`. A failed top-level listing ends the pass with
-    /// no further request. A failed workspace leaves the others' rows
-    /// standing and is named in `failure`, which carries the class of the
-    /// first one in workspace order. Nothing is kept: every summary listed
-    /// is fetched, as `koto dashboard --once` needs.
+    /// One pass over the bucket: the first [`MAX_PREFIXES`] workspace
+    /// prefixes, each listed with the `/ctx/` delimiter, [`FANOUT`] at a
+    /// time and no further than [`MAX_PAGES`] pages, then, of the sessions
+    /// listed, at most [`MAX_SESSIONS`] kept by recency
+    /// ([`keep_most_recent`]) and only those read, then [`classify`]d as a
+    /// whole against `local`. A session `local` holds by its home prefix
+    /// and name is never among those dropped. A pass that reached any of
+    /// the ceilings says so in `truncated`. A failed top-level listing ends
+    /// the pass with no further request. A failed workspace leaves the
+    /// others' rows standing and is named in `failure`, which carries the
+    /// class of the first one in workspace order. Nothing is kept: every
+    /// summary of a kept session is fetched, as `koto dashboard --once`
+    /// needs. A summary's or state file's time more than [`FUTURE_SKEW`]
+    /// past the reader's clock is clamped to it.
     pub fn scan(&self, local: &LocalView) -> RemoteSnapshot {
         self.scan_with(local, None)
     }
@@ -1056,18 +1284,21 @@ impl RemoteReader {
     /// [`RemoteReader::scan`] through `cache`, as the feed thread runs it.
     /// At most [`PREFIX_BUDGET`] prefixes are listed ([`choose_prefixes`]);
     /// a prefix left out this pass keeps what the cache holds, and its
-    /// cached sessions are classified with the rest so its rows stand. A
+    /// cached sessions are classified with the rest so its rows stand. The
+    /// session ceiling chooses among the listed sessions and the cached ones
+    /// together, and the cache keeps only the sessions it chose. A
     /// workspace whose listing failed keeps its cache entry and is left to
     /// the holder's kept rows, as without a cache. A summary or marker whose
-    /// listed ETag is unchanged is reused, not fetched. A session gone from
-    /// an answered listing, and a prefix gone from the top level, leave the
-    /// cache.
+    /// listed ETag is unchanged is reused, not fetched, and so is the time a
+    /// far-future summary time or LastModified was clamped to, so the row
+    /// ages from its first read. A session gone from an answered listing,
+    /// and a prefix gone from the top level, leave the cache.
     pub fn scan_cached(&self, local: &LocalView, cache: &mut FeedCache) -> RemoteSnapshot {
         self.scan_with(local, Some(cache))
     }
 
     fn scan_with(&self, local: &LocalView, cache: Option<&mut FeedCache>) -> RemoteSnapshot {
-        let all = match self.workspaces() {
+        let (all, mut truncated) = match self.workspaces() {
             Ok(w) => w,
             Err(e) => {
                 return RemoteSnapshot {
@@ -1081,58 +1312,143 @@ impl RemoteReader {
             Some(cache) => choose_prefixes(&all, cache, now, PREFIX_BUDGET),
             None => all.clone(),
         };
-        let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<(String, WorkspaceScan)>> = Mutex::new(Vec::new());
+        let listed = fan_out(&workspaces, |ws| self.list_sessions(ws));
+
+        // The listed sessions, their far-future times clamped, each held
+        // against what the cache last had for it.
         let previous = cache.as_deref();
-        std::thread::scope(|scope| {
-            for _ in 0..workspaces.len().min(FANOUT) {
-                scope.spawn(|| {
-                    while let Some(ws) = workspaces.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let result = self.scan_workspace(ws, previous.and_then(|c| c.sessions(ws)));
-                        results
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((ws.clone(), result));
+        let mut failed: Vec<(String, FailureClass)> = Vec::new();
+        let mut fresh: Vec<FreshWorkspace> = Vec::new();
+        for (ws, result) in workspaces.iter().zip(listed) {
+            let (listings, cut) = match result {
+                Ok(listed) => listed,
+                Err(e) => {
+                    failed.push((ws.clone(), e.class()));
+                    continue;
+                }
+            };
+            truncated |= cut;
+            let before = previous.and_then(|c| c.sessions(ws));
+            let sessions: Vec<ScannedSession> = listings
+                .into_iter()
+                .map(|(name, mut listing)| {
+                    let was = before.and_then(|b| b.get(&name)).map(|s| &s.listing);
+                    clamp_listing(&mut listing, was, now);
+                    ScannedSession {
+                        workspace: ws.clone(),
+                        name,
+                        listing,
+                        summary: SummaryRead::Absent,
+                        marker: None,
                     }
-                });
-            }
+                })
+                .collect();
+            let newest = sessions
+                .iter()
+                .flat_map(|s| s.listing.objects.values())
+                .filter_map(|o| o.last_modified)
+                .max();
+            fresh.push(FreshWorkspace {
+                workspace: ws.clone(),
+                newest,
+                truncated: cut,
+                sessions,
+            });
+        }
+
+        // The session ceiling, over the listed sessions and, through a
+        // cache, the cached ones of every prefix not listed this pass.
+        let counted = |s: &ScannedSession| {
+            s.listing.state(&s.name).is_some()
+                && !is_internal_name(&s.name)
+                && !local.homes.contains(&(s.workspace.clone(), s.name.clone()))
+        };
+        let listed_now: HashSet<&str> = workspaces.iter().map(String::as_str).collect();
+        let cached_elsewhere = previous.into_iter().flat_map(|c| {
+            c.workspaces
+                .iter()
+                .filter(|(ws, _)| !listed_now.contains(ws.as_str()))
+                .flat_map(|(_, w)| w.sessions.values())
         });
+        let candidates: Vec<SessionCandidate<'_>> = fresh
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .chain(cached_elsewhere)
+            .filter(|s| counted(s))
+            .map(|s| {
+                let modified = s.listing.state(&s.name).and_then(|o| o.last_modified);
+                (s.workspace.as_str(), s.name.as_str(), modified)
+            })
+            .collect();
+        let keep = keep_most_recent(&candidates, MAX_SESSIONS);
+        truncated |= keep.is_some();
+        let kept = |s: &ScannedSession| {
+            !counted(s)
+                || keep
+                    .as_ref()
+                    .is_none_or(|k| k.contains(&(s.workspace.clone(), s.name.clone())))
+        };
+
+        // Read what the kept listed sessions need, a workspace per thread.
+        let reads = fan_out(&fresh, |w| {
+            let before = previous.and_then(|c| c.sessions(&w.workspace));
+            w.sessions
+                .iter()
+                .map(|s| {
+                    kept(s).then(|| self.read_session(s, before.and_then(|b| b.get(&s.name)), now))
+                })
+                .collect::<Vec<_>>()
+        });
+        for (w, reads) in fresh.iter_mut().zip(reads) {
+            let sessions = std::mem::take(&mut w.sessions);
+            w.sessions = sessions
+                .into_iter()
+                .zip(reads)
+                .filter_map(|(mut s, read)| {
+                    (s.summary, s.marker) = read?;
+                    Some(s)
+                })
+                .collect();
+        }
+
         let mut snapshot = RemoteSnapshot::default();
         let mut scanned = Vec::new();
-        let mut failed: Vec<(String, FailureClass)> = Vec::new();
-        let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
         match cache {
             None => {
-                for (ws, result) in results {
-                    match result {
-                        Ok(sessions) => scanned.extend(sessions),
-                        Err(e) => failed.push((ws, e.class())),
-                    }
+                for w in fresh {
+                    scanned.extend(w.sessions);
                 }
             }
             Some(cache) => {
                 cache.scans += 1;
                 let scan = cache.scans;
-                cache.workspaces.retain(|ws, _| all.contains(ws));
-                for (ws, result) in results {
-                    let entry = cache.workspaces.entry(ws.clone()).or_default();
+                let present: HashSet<&str> = all.iter().map(String::as_str).collect();
+                cache
+                    .workspaces
+                    .retain(|ws, _| present.contains(ws.as_str()));
+                for (ws, _) in &failed {
+                    cache.workspaces.entry(ws.clone()).or_default().listed_at = scan;
+                }
+                for w in fresh {
+                    let entry = cache.workspaces.entry(w.workspace).or_default();
                     entry.listed_at = scan;
-                    match result {
-                        Ok(sessions) => {
-                            entry.newest = sessions
-                                .iter()
-                                .flat_map(|s| s.listing.objects.values())
-                                .filter_map(|o| o.last_modified)
-                                .max();
-                            entry.sessions =
-                                sessions.into_iter().map(|s| (s.name.clone(), s)).collect();
-                        }
-                        Err(e) => failed.push((ws, e.class())),
+                    entry.newest = w.newest;
+                    entry.truncated = w.truncated;
+                    entry.sessions = w
+                        .sessions
+                        .into_iter()
+                        .map(|s| (s.name.clone(), s))
+                        .collect();
+                }
+                for (ws, entry) in cache.workspaces.iter_mut() {
+                    if !listed_now.contains(ws.as_str()) {
+                        entry.sessions.retain(|_, s| kept(s));
                     }
                 }
                 let failed_now: HashSet<&str> = failed.iter().map(|(ws, _)| ws.as_str()).collect();
                 for (ws, entry) in &cache.workspaces {
                     if !failed_now.contains(ws.as_str()) {
+                        truncated |= entry.truncated;
                         scanned.extend(entry.sessions.values().cloned());
                     }
                 }
@@ -1148,8 +1464,18 @@ impl RemoteReader {
         snapshot.rows = classified.rows;
         snapshot.unreadable = classified.unreadable;
         snapshot.hidden_sources = classified.hidden_sources;
+        snapshot.truncated = truncated;
         snapshot
     }
+}
+
+/// One workspace a pass listed: its sessions, the newest LastModified the
+/// listing showed and whether it stopped at [`MAX_PAGES`].
+struct FreshWorkspace {
+    workspace: String,
+    newest: Option<SystemTime>,
+    truncated: bool,
+    sessions: Vec<ScannedSession>,
 }
 
 /// How long the feed thread waits between the end of one scan and the
@@ -1930,6 +2256,7 @@ mod tests {
                 CachedWorkspace {
                     listed_at,
                     newest: Some(now() - Duration::from_secs(age)),
+                    truncated: false,
                     sessions: BTreeMap::new(),
                 },
             );
@@ -2128,5 +2455,182 @@ mod tests {
         };
         assert!(std::io::copy(&mut &b"abcd"[..], &mut exact).is_ok());
         assert_eq!(exact.bytes, b"abcd");
+    }
+
+    // --- the clamp of far-future times ---
+
+    fn at(offset: Duration, ahead: bool) -> SystemTime {
+        if ahead {
+            now() + offset
+        } else {
+            now() - offset
+        }
+    }
+
+    fn clamped(created: SystemTime, last: SystemTime) -> SessionSummary {
+        let mut s = summary(WS, "s", "id", "e");
+        s.created_at = iso8601_at(created);
+        s.last_event_at = Some(iso8601_at(last));
+        clamp_summary_times(&mut s, now());
+        s
+    }
+
+    #[test]
+    fn remote_feed_clamp_keeps_a_time_up_to_five_minutes_ahead() {
+        for offset in [Duration::ZERO, Duration::from_secs(240), FUTURE_SKEW] {
+            let t = at(offset, true);
+            let s = clamped(t, t);
+            assert_eq!(s.created_at, iso8601_at(t), "{offset:?}");
+            assert_eq!(s.last_event_at, Some(iso8601_at(t)), "{offset:?}");
+        }
+        let past = at(Duration::from_secs(3600), false);
+        assert_eq!(clamped(past, past).created_at, iso8601_at(past));
+    }
+
+    #[test]
+    fn remote_feed_clamp_brings_a_time_past_five_minutes_to_the_reader_clock() {
+        for offset in [
+            FUTURE_SKEW + Duration::from_millis(1),
+            Duration::from_secs(3600),
+            Duration::from_secs(400 * 365 * 86400),
+        ] {
+            let t = at(offset, true);
+            let s = clamped(t, t);
+            assert_eq!(s.created_at, iso8601_at(now()), "{offset:?}");
+            assert_eq!(s.last_event_at, Some(iso8601_at(now())), "{offset:?}");
+        }
+        // Each field on its own.
+        let (ahead, past) = (
+            at(Duration::from_secs(3600), true),
+            at(Duration::ZERO, false),
+        );
+        let s = clamped(past, ahead);
+        assert_eq!(s.created_at, iso8601_at(past));
+        assert_eq!(s.last_event_at, Some(iso8601_at(now())));
+    }
+
+    #[test]
+    fn remote_feed_clamp_leaves_an_unparsed_or_absent_time_alone() {
+        let mut s = summary(WS, "s", "id", "e");
+        s.created_at = "18446744073709551615-01-01T00:00:00Z".to_string();
+        s.last_event_at = Some("yesterday".to_string());
+        clamp_summary_times(&mut s, now());
+        assert_eq!(s.created_at, "18446744073709551615-01-01T00:00:00Z");
+        assert_eq!(s.last_event_at.as_deref(), Some("yesterday"));
+        s.last_event_at = None;
+        clamp_summary_times(&mut s, now());
+        assert_eq!(s.last_event_at, None);
+    }
+
+    fn listing_at(etag: &str, modified: SystemTime) -> SessionListing {
+        let mut listing = SessionListing::default();
+        listing.objects.insert(
+            state_file_name("s"),
+            ListedObject {
+                size: 10,
+                etag: etag.to_string(),
+                last_modified: Some(modified),
+            },
+        );
+        listing
+    }
+
+    fn state_time(listing: &SessionListing) -> Option<SystemTime> {
+        listing.state("s").and_then(|o| o.last_modified)
+    }
+
+    #[test]
+    fn remote_feed_clamp_of_a_listed_time_holds_while_its_etag_is_unchanged() {
+        let ahead = now() + Duration::from_secs(3600);
+        let edge = now() + FUTURE_SKEW;
+        let mut near = listing_at("s", edge);
+        clamp_listing(&mut near, None, now());
+        assert_eq!(state_time(&near), Some(edge), "five minutes ahead stands");
+
+        let mut first = listing_at("s", ahead);
+        clamp_listing(&mut first, None, now());
+        assert_eq!(
+            state_time(&first),
+            Some(now()),
+            "clamped to the reader's clock"
+        );
+
+        // A later scan lists the same object, as far ahead: it keeps the
+        // time it was first clamped to, so its idle grows.
+        let later = now() + Duration::from_secs(120);
+        let mut again = listing_at("s", ahead);
+        clamp_listing(&mut again, Some(&first), later);
+        assert_eq!(state_time(&again), Some(now()));
+
+        // A new object (another ETag) is clamped afresh.
+        let mut changed = listing_at("t", ahead);
+        clamp_listing(&mut changed, Some(&first), later);
+        assert_eq!(state_time(&changed), Some(later));
+    }
+
+    // --- the session ceiling's choice ---
+
+    fn candidates(spec: &[(&'static str, &'static str, u64)]) -> Vec<SessionCandidate<'static>> {
+        spec.iter()
+            .map(|&(ws, name, age)| (ws, name, Some(now() - Duration::from_secs(age))))
+            .collect()
+    }
+
+    fn kept_names(keep: &HashSet<(String, String)>) -> Vec<(String, String)> {
+        let mut names: Vec<_> = keep.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn remote_feed_ceiling_keeps_every_session_at_or_under_it() {
+        let all = candidates(&[(WS, "a", 5), (OTHER, "b", 1)]);
+        assert_eq!(keep_most_recent(&all, 2), None);
+        assert_eq!(keep_most_recent(&[], 0), None);
+    }
+
+    #[test]
+    fn remote_feed_ceiling_takes_prefixes_by_their_newest_state_then_sessions_by_recency() {
+        // OTHER holds the newest state file though it sorts last by key;
+        // WS's newest session is older, so it is cut first.
+        let all = candidates(&[
+            (WS, "a", 100),
+            (WS, "b", 50),
+            (WS, "c", 300),
+            (OTHER, "x", 10),
+            (OTHER, "y", 900),
+        ]);
+        let keep = keep_most_recent(&all, 3).unwrap();
+        let pair = |ws: &str, n: &str| (ws.to_string(), n.to_string());
+        assert_eq!(
+            kept_names(&keep),
+            vec![pair(WS, "b"), pair(OTHER, "x"), pair(OTHER, "y")]
+        );
+        let keep = keep_most_recent(&all, 4).unwrap();
+        assert!(keep.contains(&pair(WS, "a")) && !keep.contains(&pair(WS, "c")));
+    }
+
+    #[test]
+    fn remote_feed_ceiling_puts_a_session_with_no_time_last_and_breaks_ties_by_name() {
+        let mut all = candidates(&[(WS, "b", 10), (WS, "a", 10)]);
+        all.push((OTHER, "z", None));
+        let keep = keep_most_recent(&all, 1).unwrap();
+        assert_eq!(kept_names(&keep), vec![(WS.to_string(), "a".to_string())]);
+        let keep = keep_most_recent(&all, 2).unwrap();
+        assert!(!keep.contains(&(OTHER.to_string(), "z".to_string())));
+    }
+
+    #[test]
+    fn remote_feed_ceiling_keeps_exactly_its_limit_of_20000() {
+        let names: Vec<String> = (0..MAX_SESSIONS + 50).map(|i| format!("s{i:05}")).collect();
+        let all: Vec<SessionCandidate<'_>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (WS, n.as_str(), Some(now() - Duration::from_secs(i as u64))))
+            .collect();
+        let keep = keep_most_recent(&all, MAX_SESSIONS).unwrap();
+        assert_eq!(keep.len(), MAX_SESSIONS);
+        assert!(keep.contains(&(WS.to_string(), names[0].clone())));
+        assert!(!keep.contains(&(WS.to_string(), names[MAX_SESSIONS].clone())));
     }
 }

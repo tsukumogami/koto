@@ -647,24 +647,32 @@ impl DashboardAppState {
         rows
     }
 
-    /// Count the receded sessions (done + abandoned idle + stale pending) so the
-    /// render layer can show a collapsed summary. Counts every session in the
-    /// tree, regardless of `show_receded`.
+    /// Count the receded sessions (done, abandoned idle + stale pending, and
+    /// remote rows, not done, that another remote summary names as a
+    /// source) so the render layer can show a collapsed summary. Counts
+    /// every session in the tree, regardless of `show_receded`.
     pub fn receded_summary(&self) -> RecededSummary {
         let now = SystemTime::now();
         let mut done = 0usize;
         let mut abandoned = 0usize;
+        let mut sources = 0usize;
         for s in self.tree.sessions.values() {
             if !is_session_receded(s, now) {
                 continue;
             }
             if classify_liveness(s, now) == Liveness::Done {
                 done += 1;
+            } else if s.receded_by_source {
+                sources += 1;
             } else {
                 abandoned += 1;
             }
         }
-        RecededSummary { done, abandoned }
+        RecededSummary {
+            done,
+            abandoned,
+            sources,
+        }
     }
 
     /// Count the sessions in each non-receded liveness band, for the all-clear
@@ -809,12 +817,15 @@ pub struct RecededSummary {
     pub done: usize,
     /// Abandoned idle + stale pending sessions.
     pub abandoned: usize,
+    /// Remote rows, not done, that another remote row's summary names among
+    /// its `sources`: receded as superseded, not abandoned.
+    pub sources: usize,
 }
 
 impl RecededSummary {
     /// Total receded sessions.
     pub fn total(&self) -> usize {
-        self.done + self.abandoned
+        self.done + self.abandoned + self.sources
     }
 }
 
