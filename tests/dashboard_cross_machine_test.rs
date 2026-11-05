@@ -1924,15 +1924,29 @@ impl TuiView {
         TuiView { state }
     }
 
-    /// The row key of the remote row named `name` (as shown) under `ws`.
+    /// The row key of the one remote row named `name` (as shown) under `ws`.
+    /// A remote row is keyed by its name as listed, so the key is found by
+    /// the name [`dashboard_data::row_name`] shows.
     fn key(&self, name: &str, ws: &str) -> String {
-        let key = dashboard_data::remote_key(name, ws);
-        assert!(
-            self.state.tree.sessions.contains_key(&key),
-            "{key:?} among {:?}",
+        let found: Vec<&String> = self
+            .state
+            .tree
+            .sessions
+            .iter()
+            .filter(|(key, s)| {
+                s.remote
+                    && s.workspace.as_deref() == Some(ws)
+                    && dashboard_data::row_name(key, s) == name
+            })
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{name:?}@{ws} among {:?}",
             self.state.tree.sessions.keys().collect::<Vec<_>>()
         );
-        key
+        found[0].clone()
     }
 
     /// The frame's lines: the list, and with `focus` that row's Session tab.

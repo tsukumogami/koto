@@ -407,7 +407,12 @@ fn render_detail(
             Some(marker) => format!(" {} {marker} ", row_name(key, s)),
             None => format!(" {key} "),
         },
-        (Some(key), None) => format!(" {key} "),
+        // A focused row that has since gone; its key may be a remote one,
+        // which holds the name as the bucket listed it.
+        (Some(key), None) => format!(
+            " {} ",
+            crate::session::remote_feed::sanitize_bucket_text(key)
+        ),
         (None, _) => " session ".to_string(),
     };
 

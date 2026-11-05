@@ -250,7 +250,8 @@ pub struct CachedSession {
 /// Hierarchical view of all sessions visible to the dashboard.
 pub struct SessionTree {
     /// All sessions indexed by row key: the session name for a local row,
-    /// `name@workspace` for a remote one ([`remote_key`]).
+    /// `name@workspace` for a remote one ([`remote_key`]), its name as the
+    /// bucket listed it. A remote key is never shown; [`row_name`] is.
     pub sessions: HashMap<String, CachedSession>,
     /// Names of root sessions: those with no parent, whose parent is absent,
     /// or whose parent chain loops back to them ([`SessionTree::detached`]).
@@ -632,9 +633,10 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// Every string the row carries from the bucket, its name included, is
 /// passed through [`sanitize_bucket_text`] here, so `--once` and the
 /// interactive dashboard show the same text and neither meets a control
-/// character another machine wrote. The row's name is
-/// `header.workflow`; key the row by it ([`remote_key`]). The summary's
-/// name was compared with its key before this.
+/// character another machine wrote. The row's displayed name is
+/// `header.workflow`; key the row by the name as listed, `row.name`
+/// ([`remote_key`]), since two listed names can sanitize to the same text.
+/// The summary's name was compared with its key before this.
 pub fn remote_session(row: &RemoteRow) -> CachedSession {
     let text = |s: &str| sanitize_bucket_text(s);
     let opt = |s: &Option<String>| s.as_deref().map(sanitize_bucket_text);
@@ -734,17 +736,21 @@ fn make_empty_header() -> StateFileHeader {
     }
 }
 
-/// The row key of a remote row: `name@workspace`. Session names allow only
+/// The row key of a remote row: `name@workspace`, with `name` as the
+/// bucket listed it, unique within its workspace. Session names allow only
 /// `[a-zA-Z0-9._-]` and `~`, so the key can't collide with a local row's,
-/// which is the bare name.
+/// which is the bare name. The key may hold raw bucket text, so it is
+/// never shown: [`row_name`] is.
 pub fn remote_key(name: &str, workspace: &str) -> String {
     format!("{name}@{workspace}")
 }
 
-/// The session name behind row key `key`.
-pub fn row_name<'a>(key: &'a str, session: &CachedSession) -> &'a str {
+/// The session name to show for the row at key `key`: the key itself for a
+/// local row, and the sanitized `header.workflow` for a remote one, never
+/// its key.
+pub fn row_name<'a>(key: &'a str, session: &'a CachedSession) -> &'a str {
     if session.remote {
-        key.split_once('@').map_or(key, |(name, _)| name)
+        &session.header.workflow
     } else {
         key
     }
@@ -753,7 +759,9 @@ pub fn row_name<'a>(key: &'a str, session: &CachedSession) -> &'a str {
 /// The row key of the parent `session` nests under, in the same location:
 /// a remote row's parent is the remote row of that name in its own
 /// workspace, never a same-named local one. `None` when it records no
-/// parent.
+/// parent. The parent's name is the sanitized one the row carries, so for
+/// an ordinary name it is that row's key; a parent whose listed name holds
+/// a character the sanitizer replaced isn't found, and the row is a root.
 pub fn parent_key(session: &CachedSession) -> Option<String> {
     let parent = session.header.parent_workflow.as_deref()?;
     Some(if session.remote {
@@ -825,7 +833,8 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 }
 
 /// Take a complete feed snapshot: its rows replace the tree's remote rows,
-/// keyed by [`remote_key`], except that the rows of a workspace whose
+/// keyed by [`remote_key`] of the name as listed, so two rows whose names
+/// sanitize to the same text both stay, except that the rows of a workspace whose
 /// listing failed (every workspace, when the top-level listing failed) stay
 /// as they were, since a failed listing says nothing about removal. A
 /// session this machine holds a copy of stays its local row. The tallies,
@@ -836,10 +845,8 @@ pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
         .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
     for row in &snapshot.rows {
         let session = remote_session(row);
-        tree.sessions.insert(
-            remote_key(&session.header.workflow, &row.workspace),
-            session,
-        );
+        tree.sessions
+            .insert(remote_key(&row.name, &row.workspace), session);
     }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
@@ -2540,9 +2547,36 @@ mod tests {
         );
         assert_eq!(
             keys(&tree),
-            vec![remote_key(&clean("n"), WS_A), remote_key(&clean("u"), WS_A)],
-            "rows are keyed by their sanitized names"
+            vec![
+                remote_key(&hostile("n"), WS_A),
+                remote_key(&hostile("u"), WS_A)
+            ],
+            "rows are keyed by their names as listed"
         );
+        let shown: Vec<String> = keys(&tree)
+            .iter()
+            .map(|k| row_name(k, &tree.sessions[k]).to_string())
+            .collect();
+        assert_eq!(shown, vec![clean("n"), clean("u")], "and shown sanitized");
+    }
+
+    #[test]
+    fn remote_rows_whose_names_sanitize_alike_both_stay() {
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows: vec![unknown_row(WS_A, "a\tb"), unknown_row(WS_A, "a\u{200B}b")],
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(tree.sessions.len(), 2, "neither row replaces the other");
+        assert_eq!(tree.roots.len(), 2);
+        for key in keys(&tree) {
+            let shown = row_name(&key, &tree.sessions[&key]);
+            assert_eq!(shown, "a b");
+            assert!(!shown.contains(['\t', '\u{200B}']), "{shown:?}");
+        }
     }
 
     #[test]
