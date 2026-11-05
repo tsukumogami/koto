@@ -12,7 +12,9 @@ session's intent and current state, and an intent is whatever was written
 about the work. That matters on a shared screen, a screen share or a
 recording, where a launch shows all of it at once. See
 [What the dashboard reads](cloud-sync-setup.md#what-the-dashboard-reads) for
-the remote rows.
+the remote rows. When a listing reaches one of the ceilings that section names,
+`koto dashboard --once` still exits 0, and only its `listing truncated` notice
+on stderr shows that remote rows were left out.
 
 ## Keys
 
