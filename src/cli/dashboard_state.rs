@@ -12,10 +12,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::session_view::{KeyPreview, Sanitized, SessionViewSnapshot, SnapshotError};
 
-use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+use crate::cli::dashboard_data::liveness::{idle_for, is_session_receded, session_attention};
 use crate::cli::dashboard_data::{
-    classify_liveness, derive_label, parent_key, row_name, CachedSession, DetailData, Liveness,
-    SessionTree,
+    classify_liveness, derive_label, row_name, CachedSession, DetailData, Liveness, SessionTree,
 };
 
 /// Which tab is active in the detail pane.
@@ -564,13 +563,14 @@ impl DashboardAppState {
     }
 
     /// Check whether a row (by key) has any children in the tree. A child
-    /// names its parent by row key ([`parent_key`]), so a remote child
-    /// counts only under its own machine's parent.
+    /// names its parent by row key ([`SessionTree::parent_of`]), so a remote
+    /// child counts only under its own machine's parent, and a row whose
+    /// parent chain loops back to it is no one's child.
     fn session_has_children(&self, session_id: &str) -> bool {
         self.tree
             .sessions
-            .values()
-            .any(|s| parent_key(s).as_deref() == Some(session_id))
+            .iter()
+            .any(|(key, s)| self.tree.parent_of(key, s).as_deref() == Some(session_id))
     }
 
     /// Compute aggregate `TaskCounts` for a root session based on its children.
@@ -581,8 +581,8 @@ impl DashboardAppState {
         let mut failed = 0;
         let mut blocked = 0;
 
-        for s in self.tree.sessions.values() {
-            if parent_key(s).as_deref() == Some(root_id) {
+        for (key, s) in &self.tree.sessions {
+            if self.tree.parent_of(key, s).as_deref() == Some(root_id) {
                 total += 1;
                 if s.is_terminal {
                     if is_failed_state(s.current_state.as_deref()) {
@@ -636,9 +636,7 @@ impl DashboardAppState {
             // user has revealed them.
             if !self.show_receded {
                 if let Some(s) = self.tree.sessions.get(root_id.as_str()) {
-                    let liveness = classify_liveness(s, now);
-                    let idle = idle_for(s, now);
-                    if is_receded(liveness, idle) {
+                    if is_session_receded(s, now) {
                         continue;
                     }
                 }
@@ -649,26 +647,32 @@ impl DashboardAppState {
         rows
     }
 
-    /// Count the receded sessions (done + abandoned idle + stale pending) so the
-    /// render layer can show a collapsed summary. Counts every session in the
-    /// tree, regardless of `show_receded`.
+    /// Count the receded sessions (done, abandoned idle + stale pending, and
+    /// remote rows, not done, that another remote summary names as a
+    /// source) so the render layer can show a collapsed summary. Counts
+    /// every session in the tree, regardless of `show_receded`.
     pub fn receded_summary(&self) -> RecededSummary {
         let now = SystemTime::now();
         let mut done = 0usize;
         let mut abandoned = 0usize;
+        let mut sources = 0usize;
         for s in self.tree.sessions.values() {
-            let liveness = classify_liveness(s, now);
-            let idle = idle_for(s, now);
-            if !is_receded(liveness, idle) {
+            if !is_session_receded(s, now) {
                 continue;
             }
-            if liveness == Liveness::Done {
+            if classify_liveness(s, now) == Liveness::Done {
                 done += 1;
+            } else if s.receded_by_source {
+                sources += 1;
             } else {
                 abandoned += 1;
             }
         }
-        RecededSummary { done, abandoned }
+        RecededSummary {
+            done,
+            abandoned,
+            sources,
+        }
     }
 
     /// Count the sessions in each non-receded liveness band, for the all-clear
@@ -679,9 +683,7 @@ impl DashboardAppState {
         let mut active = 0usize;
         let mut idle = 0usize;
         for s in self.tree.sessions.values() {
-            let liveness = classify_liveness(s, now);
-            let idle_dur = idle_for(s, now);
-            match attention_key(liveness, idle_dur).0 {
+            match session_attention(s, now).0 {
                 0 => needs_you += 1,
                 1 => active += 1,
                 2 => idle += 1,
@@ -780,7 +782,7 @@ impl DashboardAppState {
                 .tree
                 .sessions
                 .iter()
-                .filter(|(_, s)| parent_key(s).as_deref() == Some(session_id))
+                .filter(|(key, s)| self.tree.parent_of(key, s).as_deref() == Some(session_id))
                 .map(|(name, _)| name)
                 .collect();
             children.sort_by_key(|id| {
@@ -815,12 +817,15 @@ pub struct RecededSummary {
     pub done: usize,
     /// Abandoned idle + stale pending sessions.
     pub abandoned: usize,
+    /// Remote rows, not done, that another remote row's summary names among
+    /// its `sources`: receded as superseded, not abandoned.
+    pub sources: usize,
 }
 
 impl RecededSummary {
     /// Total receded sessions.
     pub fn total(&self) -> usize {
-        self.done + self.abandoned
+        self.done + self.abandoned + self.sources
     }
 }
 
@@ -844,9 +849,7 @@ pub(crate) fn session_sort_key(
     session: &CachedSession,
     now: SystemTime,
 ) -> (u8, std::cmp::Reverse<Duration>) {
-    let liveness = classify_liveness(session, now);
-    let idle = idle_for(session, now);
-    attention_key(liveness, idle)
+    session_attention(session, now)
 }
 
 /// Fallback sort key for a session id missing from the tree: receded band,
@@ -932,6 +935,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 

@@ -173,9 +173,12 @@ the hostname of whichever machine last wrote the session.
 **R6. The dashboard lists sessions from every prefix in the bucket.** When
 the cloud backend is the selected backend, `koto dashboard` and
 `koto dashboard --once` list the sessions under every workspace prefix in
-the configured bucket, following every page of a listing. Sessions koto owns
-internally (execution anchors, batch internals, and ids containing `~`) stay
-filtered out exactly as they are for local rows.
+the configured bucket, following a listing's pages, up to the per-run
+ceilings the design sets: 5,000 workspace prefixes, 100 listing pages per
+prefix and 20,000 sessions. A run that reaches one lists no further, shows
+a `listing truncated` notice and still shows every local row. Sessions koto
+owns internally (execution anchors, batch internals, and ids containing `~`)
+stay filtered out exactly as they are for local rows.
 
 **R7. A remote row shows its current state.** A remote row carries the
 same facts a local row does: current state, whether it's blocked, failed or
@@ -234,9 +237,11 @@ remote rows as to local ones; a session-name argument prints every row with
 that name, local and remote.
 
 **R15. Text from the bucket is sanitized.** Every field that came from the
-bucket (machine name, session id, state, intent, template name) has each
-control character (U+0000 to U+001F, U+007F, U+0080 to U+009F, U+2028 and
-U+2029) replaced by a single space, in `--once` and in the TUI.
+bucket (session id, state, intent, template name) has each control character
+(U+0000 to U+001F, U+007F, U+0080 to U+009F, U+2028 and U+2029) replaced by
+a single space, in `--once` and in the TUI. The machine name is validated
+instead: one that fails the machine name rules, as one holding a control
+character does, reads as no recorded machine (`unknown`).
 
 **R16. `--detail` reports the machine.** `koto dashboard --detail <name>`
 includes a `machine` field holding the recorded name, or `null` when none is
@@ -375,11 +380,13 @@ records every request.
 - [ ] With the local backend, every line of `koto dashboard --once` over the
   existing `--once` test fixtures equals the line those tests expect today
   followed by two empty tab-separated fields. (R14, R20)
-- [ ] A remote session whose machine name, id, state, intent and template
-  name each contain a tab, a newline, an ESC, a U+0085 and a U+2028 prints in
-  `--once` with each of those replaced by a space and exactly ten fields per
-  line, and the TUI's rendered buffer for its row contains none of those
-  characters. (R15)
+- [ ] A remote session whose id, state, intent and template name each
+  contain a tab, a newline, an ESC, a U+0085 and a U+2028 prints in `--once`
+  with each of those replaced by a space and exactly ten fields per line,
+  and the TUI's rendered buffer for its row contains none of those
+  characters. A remote session whose machine name holds a tab or an ESC
+  reads as no recorded machine: an empty `machine` field in `--once` and
+  `@unknown` on its TUI row. (R15)
 - [ ] `--detail` for a session with a recorded machine prints its name in
   `machine`, and the bucket's request log shows no write during the run.
   (R16, R18)
@@ -448,8 +455,9 @@ records every request.
   for up to 200 workspace prefixes. A bucket that a great many directories
   have used costs more listings per refresh.
 - The machine name is whatever the producing machine recorded. A
-  developer with write access to the bucket can write any name; the
-  dashboard sanitizes it for display but doesn't verify it.
+  developer with write access to the bucket can write any name that passes
+  the machine name rules; the dashboard shows a name that fails them as
+  `unknown`, but doesn't verify one that passes.
 - Freshness is bounded by how often the producing machine pushes: a session
   that hasn't ticked since its last push shows its last pushed state.
 

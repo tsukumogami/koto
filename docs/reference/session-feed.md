@@ -3061,9 +3061,17 @@ with earlier koto releases; columns 7 and 8, then 9 and 10, were appended additi
 | 9 | `machine` | **(appended)** The machine that produced the session: the `machine_name` of its latest `session_imported` event when it was imported, else the `machine` on its `workflow_initialized` event (`KOTO_MACHINE_NAME`, else the user-level `machine.name`, else the short hostname). Empty when no machine is recorded, as for a session from before the machine stamp, or when the recorded name breaks the machine name rule. |
 | 10 | `workspace` | **(appended)** The 16-hex workspace prefix the session's copy lives under in the bucket. Empty on the local backend. |
 
-Appended fields are sanitized of tab, carriage-return, and newline characters so the
-tab-separated contract holds. Rows are emitted in attention order (needs-you band
-first, then active, then idle/fresh-pending), longest-idle first within a band.
+Every string a remote row takes from the bucket passes one sanitizer, in `--once` and
+in the TUI. It replaces each C0 and C1 control character, DEL, U+2028, U+2029, the
+bidirectional override and isolate characters (U+202A to U+202E, U+2066 to U+2069,
+U+061C), the zero-width and directional marks (U+200B to U+200F, U+FEFF) and the tag
+characters (U+E0000 to U+E007F) with a single space. That removes tab and newline, so
+the tab-separated contract holds, and ESC, so no terminal escape reaches the screen;
+other text, such as `café`, is unchanged. The `machine` value isn't sanitized but
+checked: a name that breaks the machine name rule, one holding a control character
+included, reads as no recorded machine. A local row's fields are cleared of tab,
+carriage return and newline, as before. Rows are emitted in attention order (needs-you
+band first, then active, then idle/fresh-pending), longest-idle first within a band.
 
 A consumer reading only the first six fields is unaffected. A consumer that asserts a
 strict column count must expect ten.
@@ -3092,9 +3100,10 @@ The dashboard decides each session directory it lists in the bucket in this orde
    listed`. A marker whose copy isn't in the bucket hides nothing.
 5. A session whose state file has no `summary.json` beside it (as a release before the
    summary pushes it), whose summary couldn't be fetched (its GET failed or didn't
-   answer 200), is over 64 KiB, doesn't parse, carries another
-   schema or names another session, or whose summary's `state_etag` isn't the listed
-   state file's ETag once that file is more than 60 seconds old, prints with `status`
+   answer 200), is over 64 KiB, doesn't parse, carries another schema, names another
+   session, has a field over its cap or more than 16 `sources` entries, or whose
+   summary's `state_etag` isn't the listed state file's ETag once that file is more
+   than 60 seconds old, prints with `status`
    `unknown`: `current_state`, `intent`, `template` and `machine` are empty, `workspace`
    holds its prefix, and `idle` is measured from the state file's last-modified time in
    the bucket. Inside those 60 seconds a differing `state_etag` is the ordinary gap
@@ -3104,6 +3113,20 @@ The dashboard decides each session directory it lists in the bucket in this orde
    where `N` also counts this machine's unreadable sessions. With no such remote row
    the note keeps its older form, `note: N unreadable session(s) skipped`.
 6. Every other session prints from its summary.
+
+A summary is fetched only when the listing gives its size as at most 64 KiB, and the
+read stops at 64 KiB plus one byte, so an object replaced between the listing and the
+read is bounded too. The reader checks each field's cap, as the writer does: `name`,
+`template_name`, `current_state` and `salient_var` 256 bytes each, `intent` 1 KiB.
+A summary with any of them over its cap, or with more than 16 `sources` entries, is
+unreadable as in item 5. A `machine` over 64 characters fails the machine name rule
+and reads as no recorded machine, with the row's other facts shown.
+
+Each run stops at 5,000 workspace prefixes, 100 listing pages per prefix and 20,000
+sessions. A run that reaches any of them shows a notice containing `listing
+truncated`: one stderr line in `--once`, the status line in the TUI. This machine's
+own rows are never dropped by a ceiling. A bucket below every ceiling shows no notice,
+and the TUI's notice is gone after the first read that reaches none.
 
 The dashboard reads only listings, `summary.json` and `migrated.json` objects from the
 bucket: never a state file, nothing under a session's `ctx/`, and it writes nothing.

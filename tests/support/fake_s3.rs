@@ -29,6 +29,11 @@
 //! A PUT honours `If-Match` and `If-None-Match: *` as S3 does: when the
 //! stored object's ETag isn't the one named, or an object is there for
 //! `If-None-Match: *`, it answers 412 PreconditionFailed and stores nothing.
+//! A GET with `Range: bytes=<first>-<last>` is answered 206 with only those
+//! bytes (416 when the range starts past the end), and a listing asked with
+//! `encoding-type=url` is answered with its keys URL-encoded, as S3 does.
+//! Each request's record carries its `Range` header and how many body bytes
+//! its reply put on the connection, so a test can see how far a read went.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
@@ -62,8 +67,18 @@ pub struct Request {
     /// `Credential=` part of its `Authorization` header; `None` when the
     /// request carried no signature.
     pub access_key: Option<String>,
+    /// The `Range` header, when the request carried one.
+    pub range: Option<String>,
+    /// For a listing, whether it asked for `encoding-type=url`.
+    pub url_encoded: bool,
+    /// How many body bytes the reply put on the connection before it
+    /// closed: the whole body, or fewer when the client hung up first.
+    /// Zero until the reply has been written.
+    pub body_sent: usize,
     /// When the request had been read in full.
     pub at: Instant,
+    /// Which request this is, counted from the endpoint's start.
+    seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +137,8 @@ struct State {
     /// LastModified.
     modified: BTreeMap<String, SystemTime>,
     requests: Vec<Request>,
+    /// How many requests have been received, recorded or since cleared.
+    received: u64,
     faults: Vec<Fault>,
     triggers: Vec<Trigger>,
     holds: Vec<Hold>,
@@ -316,6 +333,9 @@ impl FakeS3 {
 
     /// Once, when the next `method` request for exactly `key` has been
     /// handled and before it is answered, store `bytes` under `put_key`.
+    /// `method` `LIST` with a prefix as `key` fires after a listing of
+    /// exactly that prefix, so an object can change between the listing
+    /// that shows it and the GET that reads it.
     pub fn put_after(&self, method: &str, key: &str, put_key: &str, bytes: &[u8]) {
         lock(&self.state).triggers.push(Trigger {
             method: method.to_string(),
@@ -367,6 +387,8 @@ struct Incoming {
     if_match: Option<String>,
     /// The `If-None-Match` header, when the request carried one.
     if_none_match: Option<String>,
+    /// The `Range` header, when the request carried one.
+    range: Option<String>,
 }
 
 fn read_request(stream: &TcpStream) -> Option<Incoming> {
@@ -381,6 +403,7 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
     let mut access_key = None;
     let mut if_match = None;
     let mut if_none_match = None;
+    let mut range = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -407,6 +430,9 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
             if name.trim().eq_ignore_ascii_case("if-none-match") {
                 if_none_match = Some(value.trim().to_string());
             }
+            if name.trim().eq_ignore_ascii_case("range") {
+                range = Some(value.trim().to_string());
+            }
         }
     }
     let mut body = vec![0u8; content_length];
@@ -427,7 +453,37 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
         access_key,
         if_match,
         if_none_match,
+        range,
     })
+}
+
+/// The inclusive byte range a `Range: bytes=<first>-[<last>]` header asks
+/// of an object `len` bytes long: `Some(Ok(..))` for a range that starts
+/// inside the object (its end cut to the object's), `Some(Err(()))` for one
+/// that doesn't (S3 answers 416), `None` for a header that isn't one such
+/// range, which S3 ignores.
+fn byte_range(header: &str, len: usize) -> Option<Result<(usize, usize), ()>> {
+    let spec = header.strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+    let first: usize = first.trim().parse().ok()?;
+    let last: Option<usize> = match last.trim() {
+        "" => None,
+        l => Some(l.parse().ok()?),
+    };
+    if last.is_some_and(|l| l < first) {
+        return None;
+    }
+    if first >= len {
+        return Some(Err(()));
+    }
+    Some(Ok((first, last.unwrap_or(len - 1).min(len - 1))))
+}
+
+/// `s` in the `url` encoding S3 answers an `encoding-type=url` listing in:
+/// form encoding, a space as `+` and every other byte outside
+/// `[A-Za-z0-9*._-]` as `%XX`.
+fn url_encode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -486,7 +542,7 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     let Some(req) = read_request(&stream) else {
         return;
     };
-    let reply = answer(&req, bucket, state);
+    let (reply, seq) = answer(&req, bucket, state);
     // Before the reply goes out, so the client's next request already
     // sees what the trigger stored.
     fire_triggers(&req, bucket, state);
@@ -497,7 +553,11 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     if !latency.is_zero() {
         thread::sleep(latency);
     }
-    write_reply(stream, &req.method, &reply);
+    let sent = write_reply(stream, &req.method, &reply);
+    let mut st = lock(state);
+    if let Some(r) = st.requests.iter_mut().find(|r| r.seq == seq) {
+        r.body_sent = sent;
+    }
 }
 
 /// Forget, and return, the first hold `req` matches.
@@ -515,17 +575,29 @@ fn take_hold(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Durat
     Some(st.holds.remove(at).duration)
 }
 
-/// Run, and forget, the triggers `req` matches.
+/// Run, and forget, the triggers `req` matches. A listing matches as
+/// method `LIST` with its prefix as the key.
 fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
     let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
     let key = match rest.split_once('/') {
         Some((b, k)) if b == bucket => k,
         _ => return,
     };
+    let param = |name: &str| {
+        req.query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let (method, key) = if req.method == "GET" && param("list-type") == Some("2") {
+        ("LIST", param("prefix").unwrap_or_default())
+    } else {
+        (req.method.as_str(), key)
+    };
     let mut st = lock(state);
     let (fired, kept): (Vec<Trigger>, Vec<Trigger>) = std::mem::take(&mut st.triggers)
         .into_iter()
-        .partition(|t| t.method == req.method && t.key == key);
+        .partition(|t| t.method == method && t.key == key);
     st.triggers = kept;
     for t in fired {
         st.modified.insert(t.put_key.clone(), SystemTime::now());
@@ -533,7 +605,17 @@ fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
     }
 }
 
-fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
+/// Record `req` and answer it; the number is the one its record carries.
+fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> (Reply, u64) {
+    let seq = {
+        let mut st = lock(state);
+        st.received += 1;
+        st.received
+    };
+    (answer_as(req, bucket, state, seq), seq)
+}
+
+fn answer_as(req: &Incoming, bucket: &str, state: &Mutex<State>, seq: u64) -> Reply {
     let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
     let (named_bucket, key) = match rest.split_once('/') {
         Some((b, k)) => (b, k.to_string()),
@@ -558,7 +640,11 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         },
         delimiter: param("delimiter").filter(|d| is_list && !d.is_empty()),
         access_key: req.access_key.clone(),
+        range: req.range.clone(),
+        url_encoded: is_list && param("encoding-type").as_deref() == Some("url"),
+        body_sent: 0,
         at: Instant::now(),
+        seq,
     });
 
     if named_bucket != bucket {
@@ -596,6 +682,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         let prefix = param("prefix").unwrap_or_default();
         let delimiter = param("delimiter").filter(|d| !d.is_empty());
         let after = param("continuation-token").filter(|t| !t.is_empty());
+        let encoded = param("encoding-type").as_deref() == Some("url");
         return Reply::ok(list_xml(
             bucket,
             &st.objects,
@@ -603,15 +690,38 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
             &prefix,
             delimiter.as_deref(),
             after.as_deref(),
+            encoded,
         ));
     }
 
     match req.method.as_str() {
         "GET" => match st.objects.get(&key) {
-            Some(bytes) => Reply {
-                status: 200,
-                headers: vec![("ETag", etag(bytes))],
-                body: bytes.clone(),
+            Some(bytes) => match req
+                .range
+                .as_deref()
+                .and_then(|r| byte_range(r, bytes.len()))
+            {
+                Some(Ok((first, last))) => Reply {
+                    status: 206,
+                    headers: vec![
+                        ("ETag", etag(bytes)),
+                        (
+                            "Content-Range",
+                            format!("bytes {first}-{last}/{}", bytes.len()),
+                        ),
+                    ],
+                    body: bytes[first..=last].to_vec(),
+                },
+                Some(Err(())) => Reply::error(
+                    416,
+                    "InvalidRange",
+                    "The requested range is not satisfiable",
+                ),
+                None => Reply {
+                    status: 200,
+                    headers: vec![("ETag", etag(bytes))],
+                    body: bytes.clone(),
+                },
             },
             None => Reply::error(404, "NoSuchKey", "The specified key does not exist."),
         },
@@ -671,6 +781,12 @@ const PAGE_KEYS: usize = 1000;
 /// `delimiter` past the prefix rolled up into common prefixes, at most
 /// [`PAGE_KEYS`] entries a page. A page that stops short says so and names
 /// its last entry as the token the next page starts after.
+///
+/// `encoded` answers an `encoding-type=url` listing as S3 does: the page
+/// says `<EncodingType>url</EncodingType>` and every key, prefix and
+/// delimiter in it is URL-encoded. Otherwise they are sent as stored,
+/// XML-escaped only, so a control character in a key reaches the client
+/// raw.
 fn list_xml(
     bucket: &str,
     objects: &BTreeMap<String, Vec<u8>>,
@@ -678,7 +794,15 @@ fn list_xml(
     prefix: &str,
     delimiter: Option<&str>,
     after_token: Option<&str>,
+    encoded: bool,
 ) -> Vec<u8> {
+    let field = |s: &str| {
+        if encoded {
+            url_encode(s)
+        } else {
+            xml_escape(s)
+        }
+    };
     let mut contents = Vec::new();
     let mut common: Vec<String> = Vec::new();
     let mut entries = 0usize;
@@ -732,9 +856,12 @@ fn list_xml(
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", field(prefix)));
     if let Some(d) = delimiter {
-        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", field(d)));
+    }
+    if encoded {
+        xml.push_str("<EncodingType>url</EncodingType>");
     }
     xml.push_str(&format!(
         "<KeyCount>{}</KeyCount><MaxKeys>{PAGE_KEYS}</MaxKeys><IsTruncated>{}</IsTruncated>",
@@ -752,7 +879,7 @@ fn list_xml(
             "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
              <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>\
              </Contents>",
-            xml_escape(key),
+            field(key),
             modified,
             xml_escape(tag),
             size
@@ -761,7 +888,7 @@ fn list_xml(
     for p in &common {
         xml.push_str(&format!(
             "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-            xml_escape(p)
+            field(p)
         ));
     }
     xml.push_str("</ListBucketResult>");
@@ -769,7 +896,7 @@ fn list_xml(
 }
 
 /// `at` as S3 lists a LastModified: `YYYY-MM-DDTHH:MM:SS.sssZ`, UTC.
-fn rfc3339_millis(at: SystemTime) -> String {
+pub fn rfc3339_millis(at: SystemTime) -> String {
     let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = since.as_secs();
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
@@ -800,11 +927,15 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn write_reply(mut stream: TcpStream, method: &str, reply: &Reply) {
+/// Write `reply` and close the connection. Returns how many body bytes went
+/// out before the body ended or the client hung up.
+fn write_reply(mut stream: TcpStream, method: &str, reply: &Reply) -> usize {
     let reason = match reply.status {
         200 => "OK",
         204 => "No Content",
+        206 => "Partial Content",
         404 => "Not Found",
+        416 => "Range Not Satisfiable",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -823,7 +954,16 @@ fn write_reply(mut stream: TcpStream, method: &str, reply: &Reply) {
         head.push_str(&format!("{}: {}\r\n", name, value));
     }
     head.push_str("\r\n");
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+    if stream.write_all(head.as_bytes()).is_err() {
+        return 0;
+    }
+    let mut sent = 0;
+    for chunk in body.chunks(64 * 1024) {
+        if stream.write_all(chunk).is_err() {
+            break;
+        }
+        sent += chunk.len();
+    }
     let _ = stream.flush();
+    sent
 }

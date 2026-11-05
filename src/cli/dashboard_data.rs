@@ -3,7 +3,7 @@
 //! Responsible for reading session state from disk and maintaining an
 //! up-to-date `SessionTree` via mtime-based incremental diffing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -13,10 +13,11 @@ use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
     read_header,
 };
-use crate::engine::types::is_leap;
+use crate::engine::types::parse_timestamp_to_systemtime;
 use crate::engine::types::StateFileHeader;
 use crate::session::remote_feed::{
-    ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot, RowStatus,
+    sanitize_bucket_text, ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot,
+    RowStatus,
 };
 use crate::session::row::{derive_row, latest_import};
 use crate::session::{state_file_name, SessionBackend};
@@ -147,6 +148,25 @@ pub mod liveness {
         attention_key(liveness, idle).0 == 3
     }
 
+    /// A session's attention key by `now`: [`attention_key`] of its liveness
+    /// and idle time, except that a remote row another remote summary names
+    /// as a source ([`CachedSession::receded_by_source`]) sits in the
+    /// receded band whatever its liveness, so it leaves the default view
+    /// and the needs-you band and shows with `--all` and the `a` key.
+    pub fn session_attention(session: &CachedSession, now: SystemTime) -> (u8, Reverse<Duration>) {
+        let idle = idle_for(session, now);
+        if session.receded_by_source {
+            return (3, Reverse(idle));
+        }
+        attention_key(classify_liveness(session, now), idle)
+    }
+
+    /// True when `session` is in the receded band by
+    /// [`session_attention`].
+    pub fn is_session_receded(session: &CachedSession, now: SystemTime) -> bool {
+        session_attention(session, now).0 == 3
+    }
+
     // `is_failed_state` now lives in `crate::engine::persistence` as the single
     // shared implementation (imported above); the `/workflows` projection
     // writer reuses the same function.
@@ -221,15 +241,27 @@ pub struct CachedSession {
     /// names, which a remote scan hides; `None` for a session never
     /// imported and for a remote row.
     pub imported_from: Option<ImportedSource>,
+    /// A remote row another remote row's summary names among its `sources`
+    /// ([`RemoteRow::receded_by_source`]): it recedes whatever its liveness
+    /// ([`liveness::session_attention`]). Always `false` for a local row.
+    pub receded_by_source: bool,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
 pub struct SessionTree {
     /// All sessions indexed by row key: the session name for a local row,
-    /// `name@workspace` for a remote one ([`remote_key`]).
+    /// `name@workspace` for a remote one ([`remote_key`]), its name as the
+    /// bucket listed it. A remote key is never shown; [`row_name`] is.
     pub sessions: HashMap<String, CachedSession>,
-    /// Names of root sessions (those with no parent, or whose parent is absent).
+    /// Names of root sessions: those with no parent, whose parent is absent,
+    /// or whose parent chain loops back to them ([`SessionTree::detached`]).
     pub roots: Vec<String>,
+    /// Row keys whose parent link is ignored because following it loops
+    /// back to the row: a session naming itself as its parent, or each of a
+    /// set of sessions naming each other. Each one is a root, and none is
+    /// another's child, so a forged parent can't make a row vanish or nest
+    /// without end.
+    pub detached: HashSet<String>,
     /// Count of session dirs whose header failed to parse on the last refresh.
     /// Surfaced as a trailing note (TUI) / count (`--once`) instead of dropping
     /// the sessions silently.
@@ -244,6 +276,9 @@ pub struct SessionTree {
     /// Why the last feed snapshot couldn't read some or all of the bucket;
     /// `None` once a snapshot reads it without failure.
     pub remote_failure: Option<ReadFailure>,
+    /// The last feed snapshot reached a listing ceiling, so some of the
+    /// bucket isn't shown; `false` once a snapshot reaches none.
+    pub remote_truncated: bool,
 }
 
 impl SessionTree {
@@ -252,11 +287,29 @@ impl SessionTree {
         Self {
             sessions: HashMap::new(),
             roots: Vec::new(),
+            detached: HashSet::new(),
             unreadable: 0,
             remote_unreadable: 0,
             remote_hidden: 0,
             remote_failure: None,
+            remote_truncated: false,
         }
+    }
+
+    /// The row key the row `key` nests under: its [`parent_key`], unless
+    /// its parent chain loops back to it ([`SessionTree::detached`]).
+    pub fn parent_of(&self, key: &str, session: &CachedSession) -> Option<String> {
+        if self.detached.contains(key) {
+            return None;
+        }
+        parent_key(session)
+    }
+
+    /// Rebuild [`SessionTree::roots`] and [`SessionTree::detached`] from
+    /// the session map.
+    pub fn rebuild_roots(&mut self) {
+        self.detached = cyclic_keys(&self.sessions);
+        self.roots = rebuild_roots(&self.sessions, &self.detached);
     }
 }
 
@@ -435,6 +488,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             };
         }
     };
@@ -461,6 +515,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             };
         }
     };
@@ -501,6 +556,7 @@ pub fn read_session(path: &Path) -> CachedSession {
         workspace: None,
         remote: false,
         imported_from,
+        receded_by_source: false,
     }
 }
 
@@ -573,7 +629,17 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// workspace and, as `mtime`, the state file's LastModified, which its idle
 /// time is measured from. No state, intent, template or machine, so its
 /// status reads `unknown` and it is never shown with a state it may not have.
+///
+/// Every string the row carries from the bucket, its name included, is
+/// passed through [`sanitize_bucket_text`] here, so `--once` and the
+/// interactive dashboard show the same text and neither meets a control
+/// character another machine wrote. The row's displayed name is
+/// `header.workflow`; key the row by the name as listed, `row.name`
+/// ([`remote_key`]), since two listed names can sanitize to the same text.
+/// The summary's name was compared with its key before this.
 pub fn remote_session(row: &RemoteRow) -> CachedSession {
+    let text = |s: &str| sanitize_bucket_text(s);
+    let opt = |s: &Option<String>| s.as_deref().map(sanitize_bucket_text);
     let s = match &row.status {
         RowStatus::Shown(summary) => summary.as_ref(),
         RowStatus::Unknown {
@@ -582,8 +648,8 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
             ..
         } => {
             let mut header = make_empty_header();
-            header.workflow = row.name.clone();
-            header.session_id = session_id.clone().unwrap_or_default();
+            header.workflow = text(&row.name);
+            header.session_id = opt(session_id).unwrap_or_default();
             return CachedSession {
                 header,
                 current_state: None,
@@ -601,30 +667,30 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
                 workspace: Some(row.workspace.clone()),
                 remote: true,
                 imported_from: None,
+                receded_by_source: row.receded_by_source,
             };
         }
     };
     let mut header = make_empty_header();
-    header.workflow = s.name.clone();
-    header.session_id = s.session_id.clone();
-    header.created_at = s.created_at.clone();
-    header.template_name = s.template_name.clone();
-    header.parent_workflow = s.parent.clone();
-    header.kind = s.kind.clone();
-    let last_event_at = s
-        .last_event_at
+    header.workflow = text(&row.name);
+    header.session_id = text(&s.session_id);
+    header.created_at = text(&s.created_at);
+    header.template_name = opt(&s.template_name);
+    header.parent_workflow = opt(&s.parent);
+    header.kind = opt(&s.kind);
+    let last_event_at = opt(&s.last_event_at)
         .as_deref()
         .and_then(parse_timestamp_to_systemtime);
     CachedSession {
         header,
-        current_state: s.current_state.clone(),
+        current_state: opt(&s.current_state),
         is_terminal: s.is_terminal,
         is_blocked: s.is_blocked,
-        intent: s.intent.clone(),
+        intent: opt(&s.intent),
         mtime: last_event_at.unwrap_or(SystemTime::UNIX_EPOCH),
         state_path: PathBuf::new(),
         last_event_at,
-        salient_var: s.salient_var.clone(),
+        salient_var: opt(&s.salient_var),
         is_unreadable: false,
         is_batch_task: s.is_batch_task,
         is_request_leg: s.is_request_leg,
@@ -632,6 +698,7 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
         workspace: Some(row.workspace.clone()),
         remote: true,
         imported_from: None,
+        receded_by_source: row.receded_by_source,
     }
 }
 
@@ -669,17 +736,21 @@ fn make_empty_header() -> StateFileHeader {
     }
 }
 
-/// The row key of a remote row: `name@workspace`. Session names allow only
+/// The row key of a remote row: `name@workspace`, with `name` as the
+/// bucket listed it, unique within its workspace. Session names allow only
 /// `[a-zA-Z0-9._-]` and `~`, so the key can't collide with a local row's,
-/// which is the bare name.
+/// which is the bare name. The key may hold raw bucket text, so it is
+/// never shown: [`row_name`] is.
 pub fn remote_key(name: &str, workspace: &str) -> String {
     format!("{name}@{workspace}")
 }
 
-/// The session name behind row key `key`.
-pub fn row_name<'a>(key: &'a str, session: &CachedSession) -> &'a str {
+/// The session name to show for the row at key `key`: the key itself for a
+/// local row, and the sanitized `header.workflow` for a remote one, never
+/// its key.
+pub fn row_name<'a>(key: &'a str, session: &'a CachedSession) -> &'a str {
     if session.remote {
-        key.split_once('@').map_or(key, |(name, _)| name)
+        &session.header.workflow
     } else {
         key
     }
@@ -688,7 +759,9 @@ pub fn row_name<'a>(key: &'a str, session: &CachedSession) -> &'a str {
 /// The row key of the parent `session` nests under, in the same location:
 /// a remote row's parent is the remote row of that name in its own
 /// workspace, never a same-named local one. `None` when it records no
-/// parent.
+/// parent. The parent's name is the sanitized one the row carries, so for
+/// an ordinary name it is that row's key; a parent whose listed name holds
+/// a character the sanitizer replaced isn't found, and the row is a root.
 pub fn parent_key(session: &CachedSession) -> Option<String> {
     let parent = session.header.parent_workflow.as_deref()?;
     Some(if session.remote {
@@ -760,40 +833,84 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 }
 
 /// Take a complete feed snapshot: its rows replace the tree's remote rows,
-/// keyed by [`remote_key`], except that the rows of a workspace whose
+/// keyed by [`remote_key`] of the name as listed, so two rows whose names
+/// sanitize to the same text both stay, except that the rows of a workspace whose
 /// listing failed (every workspace, when the top-level listing failed) stay
 /// as they were, since a failed listing says nothing about removal. A
-/// session this machine holds a copy of stays its local row. The tallies
-/// and the failure come from the snapshot.
+/// session this machine holds a copy of stays its local row. The tallies,
+/// the failure and whether a listing ceiling was reached come from the
+/// snapshot.
 pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.sessions
         .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
     for row in &snapshot.rows {
+        let session = remote_session(row);
         tree.sessions
-            .insert(remote_key(&row.name, &row.workspace), remote_session(row));
+            .insert(remote_key(&row.name, &row.workspace), session);
     }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
     tree.remote_failure = snapshot.failure.clone();
+    tree.remote_truncated = snapshot.truncated;
     drop_shadowed_remote(tree);
-    tree.roots = rebuild_roots(&tree.sessions);
+    tree.rebuild_roots();
 }
 
 /// Rebuild the `roots` Vec from the current session map.
 ///
-/// A session is a root if it has no parent, or if its parent's row key
-/// ([`parent_key`]) is not present in the current session map.
-fn rebuild_roots(sessions: &HashMap<String, CachedSession>) -> Vec<String> {
+/// A session is a root if it has no parent, if its parent's row key
+/// ([`parent_key`]) is not present in the current session map, or if it is
+/// in `detached` ([`cyclic_keys`]), its parent chain looping back to it.
+fn rebuild_roots(
+    sessions: &HashMap<String, CachedSession>,
+    detached: &HashSet<String>,
+) -> Vec<String> {
     let mut roots: Vec<String> = sessions
         .iter()
-        .filter(|(_, cached)| match parent_key(cached) {
-            None => true,
-            Some(parent) => !sessions.contains_key(&parent),
+        .filter(|(key, cached)| {
+            detached.contains(key.as_str())
+                || match parent_key(cached) {
+                    None => true,
+                    Some(parent) => !sessions.contains_key(&parent),
+                }
         })
         .map(|(name, _)| name.clone())
         .collect();
     roots.sort();
     roots
+}
+
+/// The row keys whose parent chain loops back to themselves: a session
+/// whose parent is itself, and every member of a ring of sessions naming
+/// each other. A session merely nested under such a ring isn't one of them.
+///
+/// Every row names at most one parent, so walking each chain once, and
+/// stopping at a row an earlier walk already settled, finds every ring in
+/// time linear in the number of rows.
+fn cyclic_keys(sessions: &HashMap<String, CachedSession>) -> HashSet<String> {
+    let parent =
+        |key: &str| parent_key(sessions.get(key)?).filter(|parent| sessions.contains_key(parent));
+    let mut settled: HashSet<String> = HashSet::new();
+    let mut cyclic = HashSet::new();
+    for start in sessions.keys() {
+        let mut path: Vec<String> = Vec::new();
+        let mut on_path: HashMap<String, usize> = HashMap::new();
+        let mut at = Some(start.clone());
+        while let Some(key) = at {
+            if settled.contains(&key) {
+                break;
+            }
+            if let Some(&from) = on_path.get(&key) {
+                cyclic.extend(path[from..].iter().cloned());
+                break;
+            }
+            on_path.insert(key.clone(), path.len());
+            at = parent(&key);
+            path.push(key);
+        }
+        settled.extend(path);
+    }
+    cyclic
 }
 
 /// Refresh the session tree by scanning the backend and re-reading changed sessions.
@@ -829,7 +946,7 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
     // Rebuild roots whenever the session set changed (adds or removes).
     // Also rebuild if any mtime-changed session could have had its parent change.
     if session_set_changed || shadowed || !diff.changed.is_empty() {
-        tree.roots = rebuild_roots(&tree.sessions);
+        tree.rebuild_roots();
     }
 
     // Recompute the unreadable tally directly from the backend: sessions whose
@@ -1085,38 +1202,6 @@ fn build_gate_condition(
     None
 }
 
-/// Parse an RFC 3339 / ISO 8601 UTC timestamp string into a `SystemTime`.
-///
-/// Format: `YYYY-MM-DDTHH:MM:SS[.mmm]Z`. Returns `None` on any parse error.
-pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<SystemTime> {
-    let t = timestamp.trim_end_matches('Z');
-    let (date_part, time_part) = t.split_once('T')?;
-    let mut date_parts = date_part.split('-');
-    let year: u64 = date_parts.next()?.parse().ok()?;
-    let month: u64 = date_parts.next()?.parse().ok()?;
-    let day: u64 = date_parts.next()?.parse().ok()?;
-
-    let (hms, frac) = if let Some((hms, frac)) = time_part.split_once('.') {
-        (hms, frac)
-    } else {
-        (time_part, "0")
-    };
-
-    let mut hms_parts = hms.split(':');
-    let hour: u64 = hms_parts.next()?.parse().ok()?;
-    let minute: u64 = hms_parts.next()?.parse().ok()?;
-    let second: u64 = hms_parts.next()?.parse().ok()?;
-
-    let millis: u64 = {
-        let frac_str = format!("{:0<3}", &frac[..frac.len().min(3)]);
-        frac_str.parse().ok()?
-    };
-
-    let days = days_since_epoch(year, month, day)?;
-    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
-    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(secs * 1000 + millis))
-}
-
 /// Compute the elapsed time since an ISO 8601 UTC timestamp string.
 ///
 /// Falls back to `Duration::ZERO` on any parse error or future timestamp.
@@ -1124,27 +1209,6 @@ pub(crate) fn compute_elapsed_since(timestamp: &str) -> Duration {
     parse_timestamp_to_systemtime(timestamp)
         .and_then(|event_time| SystemTime::now().duration_since(event_time).ok())
         .unwrap_or(Duration::ZERO)
-}
-
-/// Compute days since Unix epoch for a given year/month/day (Gregorian).
-fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
-    if !(1..=12).contains(&month) || day < 1 {
-        return None;
-    }
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    let month_days: &[u64] = if is_leap(year) {
-        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    for m in 1..month {
-        days += month_days.get((m - 1) as usize)?;
-    }
-    days += day - 1;
-    Some(days)
 }
 
 #[cfg(test)]
@@ -1356,6 +1420,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1396,6 +1461,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1436,6 +1502,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1747,6 +1814,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1843,6 +1911,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
         sessions.insert(
@@ -1864,10 +1933,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 2);
         assert!(roots.contains(&"root-a".to_string()));
         assert!(roots.contains(&"root-b".to_string()));
@@ -1895,6 +1965,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
         sessions.insert(
@@ -1916,10 +1987,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 1);
         assert!(roots.contains(&"parent".to_string()));
         assert!(!roots.contains(&"child".to_string()));
@@ -1948,10 +2020,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 1);
         assert!(roots.contains(&"orphan".to_string()));
     }
@@ -2057,6 +2130,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 
@@ -2248,6 +2322,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 
@@ -2318,6 +2393,7 @@ mod tests {
                 state_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
                 session_id: None,
             },
+            receded_by_source: false,
         }
     }
 
@@ -2343,6 +2419,93 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
             "idle is measured from the state file's LastModified"
         );
+    }
+
+    #[test]
+    fn a_remote_row_carries_every_bucket_string_sanitized() {
+        let hostile = |head: &str| format!("{head}\t\n\u{1B}[2J\u{85}\u{2028}\u{202E}z");
+        let clean = |head: &str| format!("{head}   [2J   z");
+        let summary = crate::session::summary::SessionSummary {
+            schema: 1,
+            session_id: hostile("id"),
+            name: hostile("n"),
+            home: WS_A.to_string(),
+            kind: Some(hostile("k")),
+            parent: Some(hostile("p")),
+            created_at: hostile("c"),
+            template_name: Some(hostile("t")),
+            current_state: Some(hostile("s")),
+            is_terminal: false,
+            is_blocked: true,
+            failed: false,
+            intent: Some(hostile("i")),
+            salient_var: Some(hostile("v")),
+            is_batch_task: false,
+            is_request_leg: false,
+            last_event_at: None,
+            last_seq: 1,
+            state_etag: "e".to_string(),
+            machine: Some("bad\u{1B}machine".to_string()),
+            sources: Vec::new(),
+        };
+        let row = RemoteRow {
+            workspace: WS_A.to_string(),
+            name: hostile("n"),
+            status: RowStatus::Shown(Box::new(summary)),
+            receded_by_source: false,
+        };
+        let s = remote_session(&row);
+        assert_eq!(s.header.workflow, clean("n"));
+        assert_eq!(s.header.session_id, clean("id"));
+        assert_eq!(s.header.created_at, clean("c"));
+        assert_eq!(s.header.kind, Some(clean("k")));
+        assert_eq!(s.header.parent_workflow, Some(clean("p")));
+        assert_eq!(s.header.template_name, Some(clean("t")));
+        assert_eq!(s.current_state, Some(clean("s")));
+        assert_eq!(s.intent, Some(clean("i")));
+        assert_eq!(s.salient_var, Some(clean("v")));
+        assert_eq!(s.machine, None, "a machine name that breaks the rules");
+
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows: vec![row, unknown_row(WS_A, &hostile("u"))],
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(
+            keys(&tree),
+            vec![
+                remote_key(&hostile("n"), WS_A),
+                remote_key(&hostile("u"), WS_A)
+            ],
+            "rows are keyed by their names as listed"
+        );
+        let shown: Vec<String> = keys(&tree)
+            .iter()
+            .map(|k| row_name(k, &tree.sessions[k]).to_string())
+            .collect();
+        assert_eq!(shown, vec![clean("n"), clean("u")], "and shown sanitized");
+    }
+
+    #[test]
+    fn remote_rows_whose_names_sanitize_alike_both_stay() {
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows: vec![unknown_row(WS_A, "a\tb"), unknown_row(WS_A, "a\u{200B}b")],
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(tree.sessions.len(), 2, "neither row replaces the other");
+        assert_eq!(tree.roots.len(), 2);
+        for key in keys(&tree) {
+            let shown = row_name(&key, &tree.sessions[&key]);
+            assert_eq!(shown, "a b");
+            assert!(!shown.contains(['\t', '\u{200B}']), "{shown:?}");
+        }
     }
 
     #[test]
@@ -2395,5 +2558,174 @@ mod tests {
         apply_snapshot(&mut tree, &RemoteSnapshot::default());
         assert!(tree.sessions.is_empty());
         assert_eq!(tree.remote_failure, None);
+    }
+
+    // -- forged parents and sources -------------------------------------------
+
+    /// A blocked remote row `name` under [`WS_A`] whose summary names
+    /// `parent`, shown from that summary.
+    fn shown_row(name: &str, parent: Option<&str>) -> RemoteRow {
+        RemoteRow {
+            workspace: WS_A.to_string(),
+            name: name.to_string(),
+            status: RowStatus::Shown(Box::new(crate::session::summary::SessionSummary {
+                schema: 1,
+                session_id: format!("sid-{name}"),
+                name: name.to_string(),
+                home: WS_A.to_string(),
+                kind: None,
+                parent: parent.map(str::to_string),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                template_name: Some("gated".to_string()),
+                current_state: Some("check".to_string()),
+                is_terminal: false,
+                is_blocked: true,
+                failed: false,
+                intent: None,
+                salient_var: None,
+                is_batch_task: false,
+                is_request_leg: false,
+                // Recent, so the blocked row sits in the needs-you band.
+                last_event_at: Some(crate::engine::types::now_iso8601()),
+                last_seq: 1,
+                state_etag: "e".to_string(),
+                machine: Some("machine-a".to_string()),
+                sources: Vec::new(),
+            })),
+            receded_by_source: false,
+        }
+    }
+
+    fn tree_of(rows: Vec<RemoteRow>) -> SessionTree {
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows,
+                ..RemoteSnapshot::default()
+            },
+        );
+        tree
+    }
+
+    #[test]
+    fn dashboard_data_a_parent_naming_itself_leaves_the_row_a_root() {
+        let tree = tree_of(vec![shown_row("loop", Some("loop"))]);
+        let key = remote_key("loop", WS_A);
+        assert_eq!(tree.roots, vec![key.clone()]);
+        assert!(tree.detached.contains(&key));
+        let s = &tree.sessions[&key];
+        assert_eq!(tree.parent_of(&key, s), None, "no one's child");
+        assert_eq!(s.header.parent_workflow.as_deref(), Some("loop"));
+    }
+
+    #[test]
+    fn dashboard_data_two_parents_naming_each_other_leave_both_roots() {
+        let tree = tree_of(vec![
+            shown_row("ping", Some("pong")),
+            shown_row("pong", Some("ping")),
+            // Nested under one of the ring: a child, not a ring member.
+            shown_row("leaf", Some("ping")),
+            // A longer ring of three.
+            shown_row("r1", Some("r2")),
+            shown_row("r2", Some("r3")),
+            shown_row("r3", Some("r1")),
+        ]);
+        let k = |name: &str| remote_key(name, WS_A);
+        let mut roots = vec![k("ping"), k("pong"), k("r1"), k("r2"), k("r3")];
+        roots.sort();
+        assert_eq!(tree.roots, roots);
+        let leaf = &tree.sessions[&k("leaf")];
+        assert_eq!(tree.parent_of(&k("leaf"), leaf), Some(k("ping")));
+        assert!(!tree.detached.contains(&k("leaf")));
+    }
+
+    #[test]
+    fn dashboard_data_a_parent_cycle_shows_every_row_and_expands_without_end() {
+        use crate::cli::dashboard_state::DashboardAppState;
+        let mut state = DashboardAppState::new(500);
+        state.tree = tree_of(vec![
+            shown_row("loop", Some("loop")),
+            shown_row("ping", Some("pong")),
+            shown_row("pong", Some("ping")),
+            shown_row("leaf", Some("ping")),
+        ]);
+        let k = |name: &str| remote_key(name, WS_A);
+        for key in state.tree.sessions.keys() {
+            state.expanded.insert(key.clone());
+        }
+        let mut shown: Vec<String> = state
+            .visible_rows()
+            .into_iter()
+            .map(|r| r.session_id)
+            .collect();
+        shown.sort();
+        let mut want = vec![k("leaf"), k("loop"), k("ping"), k("pong")];
+        want.sort();
+        assert_eq!(shown, want, "each row once, the leaf under its parent");
+    }
+
+    #[test]
+    fn dashboard_data_a_row_named_as_a_source_recedes_whatever_its_liveness() {
+        use super::liveness::{is_session_receded, session_attention};
+        let now = SystemTime::now();
+        let mut row = shown_row("y", None);
+        let blocked = remote_session(&row);
+        assert_eq!(session_attention(&blocked, now).0, 0, "needs-you");
+        row.receded_by_source = true;
+        let named = remote_session(&row);
+        assert!(named.receded_by_source);
+        assert_eq!(
+            classify_liveness(&named, now),
+            liveness::Liveness::NeedsYouBlocked
+        );
+        assert!(is_session_receded(&named, now));
+    }
+
+    /// Each out-of-range input another machine could write reads as no time,
+    /// at once: a year of `u64::MAX` (once a loop of that many years), an
+    /// hour of `u64::MAX` (once an overflow), a fraction of two-byte
+    /// characters (once a slice inside one) and a word.
+    #[test]
+    fn dashboard_data_timestamp_parser_reads_each_out_of_range_input_as_none() {
+        for input in [
+            "18446744073709551615-01-01T00:00:00Z",
+            "2026-01-01T18446744073709551615:00:00Z",
+            "2026-01-01T00:18446744073709551615:00Z",
+            "2026-01-01T00:00:18446744073709551615Z",
+            "2026-01-01T00:00:00.\u{e9}\u{e9}Z",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00.1x2Z",
+            "yesterday",
+            "",
+            "10000-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-13-01T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:61Z",
+        ] {
+            let started = std::time::Instant::now();
+            assert_eq!(parse_timestamp_to_systemtime(input), None, "{input:?}");
+            assert_eq!(compute_elapsed_since(input), Duration::ZERO, "{input:?}");
+            assert!(started.elapsed() < Duration::from_secs(1), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn dashboard_data_timestamp_parser_reads_the_calendar_edges() {
+        let at = |s| {
+            parse_timestamp_to_systemtime(s)
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+        };
+        assert_eq!(at("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(at("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
+        assert_eq!(at("2026-01-01T00:00:00.5Z"), Some(1_767_225_600_500));
+        assert_eq!(at("2026-01-01T00:00:00.123456Z"), Some(1_767_225_600_123));
+        assert_eq!(at("2024-02-29T23:59:60Z"), Some(1_709_251_200_000));
+        assert!(at("9999-12-31T23:59:59.999Z").is_some());
     }
 }

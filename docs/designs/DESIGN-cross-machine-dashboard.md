@@ -559,7 +559,7 @@ first that matches decides:
 | 3 | `session_id` or (home, name) of a local session | dropped (shown as local) |
 | 4 | `migrated.json` naming a copy present in this scan, or named by a local import or supersede record | hidden, counted |
 | 5 | state object, no summary | `unknown`, counted unreadable |
-| 6 | summary over 64 KiB, unparseable, wrong schema, key mismatch, or `sources` over 16 | `unknown`, counted unreadable |
+| 6 | summary over 64 KiB, a field over its cap, unparseable, wrong schema, key mismatch, or `sources` over 16 | `unknown`, counted unreadable |
 | 7 | summary whose `state_etag` differs and state older than 60 s | `unknown`, counted unreadable |
 | 8 | named in another remote summary's `sources` | receded |
 | 9 | otherwise | shown from the summary |
@@ -698,9 +698,10 @@ a body that reaches the limit is unreadable. Each field has its own cap
 (name, template name, state and salient variable 256 bytes each, intent
 1 KiB, machine 64), checked by the writer and again by the reader. The body
 is parsed into a closed schema:
-an unknown `schema` value, a missing required field, or a `session_id`,
-`name` or `home` that disagrees with the object's key makes the row
-unreadable rather than partly trusted. The `machine` value is re-validated
+an unknown `schema` value, a missing required field, a field over its cap,
+or a `session_id`, `name` or `home` that disagrees with the object's key
+makes the row unreadable rather than partly trusted. A bad `machine` is
+the exception and leaves the row readable: the value is re-validated
 against the same 1-to-64-character `[A-Za-z0-9._-]` rule the writer uses,
 with `unknown` reserved; a value that fails is shown as `unknown`, so a
 missing record and a malformed one look the same and neither can pose as a
@@ -725,15 +726,18 @@ the reader. Every request times out after 10 seconds, the TUI's scan has
 its per-refresh budget, and each run stops at 5,000 workspace prefixes, 100
 listing pages per prefix and 20,000 sessions, showing a "listing
 truncated" notice on the status line (and stderr for `--once`) when a
-ceiling is reached. Local rows are never dropped by a ceiling; prefixes are
-taken in order of their most recent state change as the listings report it,
-so the sessions most likely to need the developer survive truncation. A
-writer can still pad the bucket to push real sessions past a ceiling, or
-forge blocked rows to crowd the needs-you band; both are visible (the
-truncation notice, the machine marker on every forged row) and part of the
-accepted risk. Request cost is bounded per run and, in the TUI, per
-refresh; a long-running TUI's total cost is documented rather than
-capped.
+ceiling is reached. Local rows are never dropped by a ceiling. At the
+session ceiling, prefixes are taken in order of their most recent state
+change as their listings report it, so the sessions most likely to need the
+developer survive that cut. The prefix ceiling can't choose that way: a
+top-level listing reports no time, so a run keeps the first 5,000 prefixes
+in the order the listing returns them. On `--once` the same prefixes drop
+on every run, and only the notice shows it. A writer can still pad the
+bucket to push real sessions past a ceiling, or forge blocked rows to
+crowd the needs-you band; both are visible (the truncation notice, the
+machine marker on every forged row) and part of the accepted risk.
+Request cost is bounded per run and, in the TUI, per refresh; a
+long-running TUI's total cost is documented rather than capped.
 
 **Concurrent writers.** Two machines can push the same session when their
 checkouts share a path (and so a prefix). The summary is last-writer-wins

@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, buffer::Buffer, Terminal};
 
-use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+use crate::cli::dashboard_data::liveness::{idle_for, session_attention};
 use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
@@ -109,8 +109,10 @@ fn format_elapsed(secs: u64) -> String {
 /// dropped when the pass listed that session, so it shows once, from the
 /// pass. A failed pass leaves the local rows standing and says on one
 /// stderr line which class of failure it met at which host (and, when only
-/// some workspaces failed, how many); rows listed as unknown and hidden
-/// sources are counted in the tree for the stderr notes.
+/// some workspaces failed, how many); a pass that reached a listing
+/// ceiling says so on one stderr line holding `listing truncated`; rows
+/// listed as unknown and hidden sources are counted in the tree for the
+/// stderr notes.
 ///
 /// [`RemoteReader::scan`]: crate::session::remote_feed::RemoteReader::scan
 fn once_remote_rows(
@@ -155,6 +157,9 @@ fn once_remote_rows(
             failure.line()
         );
     }
+    if snapshot.truncated {
+        eprintln!("note: {}", crate::session::remote_feed::TRUNCATED_NOTE);
+    }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
 
@@ -163,10 +168,14 @@ fn once_remote_rows(
             tree.sessions.remove(&row.name);
         }
     }
+    // Each row's name is its sanitized one, as every other fact it carries.
     snapshot
         .rows
         .iter()
-        .map(|row| (row.name.clone(), dashboard_data::remote_session(row)))
+        .map(|row| {
+            let session = dashboard_data::remote_session(row);
+            (session.header.workflow.clone(), session)
+        })
         .collect()
 }
 
@@ -207,14 +216,17 @@ fn run_once(
 
         let liveness = classify_liveness(session, now);
         let idle = idle_for(session, now);
+        // A remote row another remote summary names as a source sits in
+        // the receded band whatever its liveness.
+        let band = session_attention(session, now).0;
 
         // Default excludes the receded set unless --all.
-        if !args.all && is_receded(liveness, idle) {
+        if !args.all && band == 3 {
             continue;
         }
 
         // --needs-you: only the needs-you band.
-        if args.needs_you && attention_key(liveness, idle).0 != 0 {
+        if args.needs_you && band != 0 {
             continue;
         }
 
@@ -231,8 +243,8 @@ fn run_once(
     // Attention order; tie-break on session id, then workspace, for
     // determinism.
     rows.sort_by(|a, b| {
-        attention_key(a.2, a.3)
-            .cmp(&attention_key(b.2, b.3))
+        session_attention(a.1, now)
+            .cmp(&session_attention(b.1, now))
             .then_with(|| a.0.cmp(b.0))
             .then_with(|| a.1.workspace.cmp(&b.1.workspace))
     });
@@ -269,7 +281,10 @@ fn run_once(
 /// legacy positional contract; columns 7-8 are the appended `idle` and
 /// `liveness`, and 9-10 the `machine` that produced the session and the
 /// `workspace` id of its copy, both empty unless `cloud` (PRD R20).
-/// Appended/interpolated fields are sanitized of tabs/newlines.
+/// Appended/interpolated fields are sanitized of tabs/newlines. A remote
+/// row's text arrives already through the bucket-text sanitizer
+/// ([`dashboard_data::remote_session`]), which leaves no control character
+/// at all.
 fn format_once_line(
     session_id: &str,
     session: &CachedSession,
@@ -986,6 +1001,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 

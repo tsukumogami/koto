@@ -1214,8 +1214,12 @@ built from the small `summary.json` each push publishes beside the state
 file, never from the session's history or context. A session whose summary
 can't be read or no longer matches its state prints with status `unknown`.
 A session this machine holds a copy of prints once, as its own row. Every
-run reads the bucket's current state: it lists every workspace prefix and
-reads every summary, and keeps nothing between runs. On the local backend
+run reads the bucket's current state and keeps nothing between runs. Each
+run reads at most 5,000 workspace prefixes, 100 listing pages per prefix
+and 20,000 remote sessions; past any of these it still prints what it
+read, local rows included, and adds one `listing truncated` line on stderr.
+A run past the prefix ceiling drops the same prefixes every time, so that
+line is the only sign of them. On the local backend
 `machine` and `workspace` are empty and no network request is made.
 
 When the bucket can't be read, the local lines still print, one line on
