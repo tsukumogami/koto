@@ -3436,6 +3436,80 @@ pub(crate) fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
+/// The latest year [`parse_timestamp_to_systemtime`] reads; a later one, as
+/// a timestamp another machine wrote may hold, reads as no time at all.
+const MAX_YEAR: u64 = 9999;
+
+/// Parse an RFC 3339 / ISO 8601 UTC timestamp string into a `SystemTime`.
+///
+/// Format: `YYYY-MM-DDTHH:MM:SS[.fff]Z`. Returns `None` on any parse error,
+/// and for any field out of its range: a year before 1970 or after
+/// [`MAX_YEAR`], a month, day, hour, minute or second the calendar doesn't
+/// have, or a fraction that isn't all ASCII digits. A remote row's times
+/// come from another machine's summary, so no input can make this loop
+/// without end, overflow or slice inside a character. The dashboard's rows
+/// and the remote feed's reader both read times through it.
+pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<std::time::SystemTime> {
+    use std::time::{Duration, SystemTime};
+
+    let t = timestamp.trim_end_matches('Z');
+    let (date_part, time_part) = t.split_once('T')?;
+    let mut date_parts = date_part.split('-');
+    let year: u64 = date_parts.next()?.parse().ok()?;
+    let month: u64 = date_parts.next()?.parse().ok()?;
+    let day: u64 = date_parts.next()?.parse().ok()?;
+
+    let (hms, frac) = if let Some((hms, frac)) = time_part.split_once('.') {
+        (hms, frac)
+    } else {
+        (time_part, "0")
+    };
+    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut hms_parts = hms.split(':');
+    let hour: u64 = hms_parts.next()?.parse().ok()?;
+    let minute: u64 = hms_parts.next()?.parse().ok()?;
+    let second: u64 = hms_parts.next()?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    // ASCII digits only, so the first three bytes are three characters.
+    let millis: u64 = format!("{:0<3}", &frac[..frac.len().min(3)]).parse().ok()?;
+
+    let days = days_since_epoch(year, month, day)?;
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(secs * 1000 + millis))
+}
+
+/// Compute days since Unix epoch for a given year/month/day (Gregorian);
+/// `None` for a year outside 1970 to [`MAX_YEAR`] or a month or day the
+/// calendar doesn't have.
+fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
+    if !(1970..=MAX_YEAR).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let month_days: &[u64] = if is_leap(year) {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    if day < 1 || day > month_days[(month - 1) as usize] {
+        return None;
+    }
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        days += month_days[(m - 1) as usize];
+    }
+    days += day - 1;
+    Some(days)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
