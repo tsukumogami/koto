@@ -16,7 +16,8 @@ use crate::engine::persistence::{
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::remote_feed::{
-    ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot, RowStatus,
+    sanitize_bucket_text, ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot,
+    RowStatus,
 };
 use crate::session::row::{derive_row, latest_import};
 use crate::session::{state_file_name, SessionBackend};
@@ -573,7 +574,16 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// workspace and, as `mtime`, the state file's LastModified, which its idle
 /// time is measured from. No state, intent, template or machine, so its
 /// status reads `unknown` and it is never shown with a state it may not have.
+///
+/// Every string the row carries from the bucket, its name included, is
+/// passed through [`sanitize_bucket_text`] here, so `--once` and the
+/// interactive dashboard show the same text and neither meets a control
+/// character another machine wrote. The row's name is
+/// `header.workflow`; key the row by it ([`remote_key`]). The summary's
+/// name was compared with its key before this.
 pub fn remote_session(row: &RemoteRow) -> CachedSession {
+    let text = |s: &str| sanitize_bucket_text(s);
+    let opt = |s: &Option<String>| s.as_deref().map(sanitize_bucket_text);
     let s = match &row.status {
         RowStatus::Shown(summary) => summary.as_ref(),
         RowStatus::Unknown {
@@ -582,8 +592,8 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
             ..
         } => {
             let mut header = make_empty_header();
-            header.workflow = row.name.clone();
-            header.session_id = session_id.clone().unwrap_or_default();
+            header.workflow = text(&row.name);
+            header.session_id = opt(session_id).unwrap_or_default();
             return CachedSession {
                 header,
                 current_state: None,
@@ -605,26 +615,25 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
         }
     };
     let mut header = make_empty_header();
-    header.workflow = s.name.clone();
-    header.session_id = s.session_id.clone();
-    header.created_at = s.created_at.clone();
-    header.template_name = s.template_name.clone();
-    header.parent_workflow = s.parent.clone();
-    header.kind = s.kind.clone();
-    let last_event_at = s
-        .last_event_at
+    header.workflow = text(&row.name);
+    header.session_id = text(&s.session_id);
+    header.created_at = text(&s.created_at);
+    header.template_name = opt(&s.template_name);
+    header.parent_workflow = opt(&s.parent);
+    header.kind = opt(&s.kind);
+    let last_event_at = opt(&s.last_event_at)
         .as_deref()
         .and_then(parse_timestamp_to_systemtime);
     CachedSession {
         header,
-        current_state: s.current_state.clone(),
+        current_state: opt(&s.current_state),
         is_terminal: s.is_terminal,
         is_blocked: s.is_blocked,
-        intent: s.intent.clone(),
+        intent: opt(&s.intent),
         mtime: last_event_at.unwrap_or(SystemTime::UNIX_EPOCH),
         state_path: PathBuf::new(),
         last_event_at,
-        salient_var: s.salient_var.clone(),
+        salient_var: opt(&s.salient_var),
         is_unreadable: false,
         is_batch_task: s.is_batch_task,
         is_request_leg: s.is_request_leg,
@@ -769,8 +778,11 @@ pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.sessions
         .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
     for row in &snapshot.rows {
-        tree.sessions
-            .insert(remote_key(&row.name, &row.workspace), remote_session(row));
+        let session = remote_session(row);
+        tree.sessions.insert(
+            remote_key(&session.header.workflow, &row.workspace),
+            session,
+        );
     }
     tree.remote_unreadable = snapshot.unreadable;
     tree.remote_hidden = snapshot.hidden_sources;
@@ -2342,6 +2354,65 @@ mod tests {
             s.mtime,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
             "idle is measured from the state file's LastModified"
+        );
+    }
+
+    #[test]
+    fn a_remote_row_carries_every_bucket_string_sanitized() {
+        let hostile = |head: &str| format!("{head}\t\n\u{1B}[2J\u{85}\u{2028}\u{202E}z");
+        let clean = |head: &str| format!("{head}   [2J   z");
+        let summary = crate::session::summary::SessionSummary {
+            schema: 1,
+            session_id: hostile("id"),
+            name: hostile("n"),
+            home: WS_A.to_string(),
+            kind: Some(hostile("k")),
+            parent: Some(hostile("p")),
+            created_at: hostile("c"),
+            template_name: Some(hostile("t")),
+            current_state: Some(hostile("s")),
+            is_terminal: false,
+            is_blocked: true,
+            failed: false,
+            intent: Some(hostile("i")),
+            salient_var: Some(hostile("v")),
+            is_batch_task: false,
+            is_request_leg: false,
+            last_event_at: None,
+            last_seq: 1,
+            state_etag: "e".to_string(),
+            machine: Some("bad\u{1B}machine".to_string()),
+            sources: Vec::new(),
+        };
+        let row = RemoteRow {
+            workspace: WS_A.to_string(),
+            name: hostile("n"),
+            status: RowStatus::Shown(Box::new(summary)),
+        };
+        let s = remote_session(&row);
+        assert_eq!(s.header.workflow, clean("n"));
+        assert_eq!(s.header.session_id, clean("id"));
+        assert_eq!(s.header.created_at, clean("c"));
+        assert_eq!(s.header.kind, Some(clean("k")));
+        assert_eq!(s.header.parent_workflow, Some(clean("p")));
+        assert_eq!(s.header.template_name, Some(clean("t")));
+        assert_eq!(s.current_state, Some(clean("s")));
+        assert_eq!(s.intent, Some(clean("i")));
+        assert_eq!(s.salient_var, Some(clean("v")));
+        assert_eq!(s.machine, None, "a machine name that breaks the rules");
+
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows: vec![row, unknown_row(WS_A, &hostile("u"))],
+                ..RemoteSnapshot::default()
+            },
+        );
+        assert_eq!(
+            keys(&tree),
+            vec![remote_key(&clean("n"), WS_A), remote_key(&clean("u"), WS_A)],
+            "rows are keyed by their sanitized names"
         );
     }
 

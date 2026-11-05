@@ -467,11 +467,23 @@ fn render_remote_session_tab(
     session: &CachedSession,
     area: ratatui::layout::Rect,
 ) {
-    use crate::session_view::sanitize_capped;
+    use crate::session::remote_feed::sanitize_bucket_text;
+    use crate::session_view::CUT_MARKER;
     let width = area.width as usize;
+    // Bucket text, through the one sanitizer every remote row's text takes:
+    // each control or invisible-formatting character is a space, never an
+    // escape. The row's facts are sanitized already; this keeps the tab
+    // safe on its own.
     let fact = |v: Option<&str>| {
         v.filter(|v| !v.is_empty())
-            .map(|v| sanitize_capped(v, REMOTE_FACT_CAP).to_string())
+            .map(|v| {
+                let clean = sanitize_bucket_text(v);
+                if clean.chars().count() <= REMOTE_FACT_CAP {
+                    return clean;
+                }
+                let cut: String = clean.chars().take(REMOTE_FACT_CAP).collect();
+                format!("{cut}{CUT_MARKER}")
+            })
             .unwrap_or_else(|| ABSENT.to_string())
     };
     let facts = [

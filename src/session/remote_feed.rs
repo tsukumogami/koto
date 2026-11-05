@@ -14,6 +14,12 @@
 //! which drops removed, internal and locally held sessions, hides migrated
 //! sources, and lists a session it can't trust a summary for as `unknown`.
 //!
+//! Everything read from the bucket is untrusted. Listings are asked in the
+//! `url` encoding so a key reaches the reader as stored; a summary or marker
+//! GET asks for its first 64 KiB and one byte and reads no further; a
+//! summary with a field over its cap is unreadable; and every string bound
+//! for a remote row passes through [`sanitize_bucket_text`] first.
+//!
 //! The interactive dashboard reads through a [`RemoteFeed`]: one background
 //! thread that owns its own reader, scans on a fixed interval, and hands each
 //! complete [`RemoteSnapshot`] to the UI thread over a channel, so no key
@@ -68,6 +74,129 @@ pub const MAX_MARKER_BYTES: usize = 64 * 1024;
 
 /// How many workspace listings are in flight at once.
 const FANOUT: usize = 64;
+
+/// Whether `c` is a character the bucket-text sanitizer replaces: every C0
+/// and C1 control, DEL, the line and paragraph separators, the
+/// bidirectional embeddings, overrides and isolates, the zero-width and
+/// directional marks, the Arabic letter mark, the byte-order mark and the
+/// tag characters.
+fn is_display_hazard(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1F}'
+            | '\u{7F}'..='\u{9F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Text read from the bucket, made safe to show: each character
+/// [`is_display_hazard`] names becomes exactly one space, and every other
+/// character is kept as it is. Every string another machine wrote passes
+/// through this before it reaches a remote row, in `koto dashboard --once`
+/// and in the interactive dashboard alike, so no such text can move the
+/// cursor, retitle the terminal, break a tab-separated line or reorder what
+/// is drawn around it.
+pub fn sanitize_bucket_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_display_hazard(c) { ' ' } else { c })
+        .collect()
+}
+
+/// The `encoding-type` the reader asks its listings in. Without it a key's
+/// carriage return, U+0085 or U+2028 reaches the client raw inside the
+/// listing's XML, and rust-s3's parser turns each into a newline, so the
+/// listed name is no longer the stored key and the session can't be read.
+const LIST_ENCODING: &str = "url";
+
+/// A listed key or prefix in the `url` encoding S3 answers an
+/// `encoding-type=url` listing with: `+` is a space and `%XX` a byte.
+/// `None` when it isn't well formed or doesn't decode to UTF-8.
+fn url_decode(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hex = encoded.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Decode, in place, the keys and prefixes of each page that says it was
+/// answered in [`LIST_ENCODING`]. A key that doesn't decode is dropped from
+/// its page; a page in no encoding is left as it came.
+fn decode_listing(pages: &mut [ListBucketResult]) {
+    for page in pages {
+        if page.encoding_type.as_deref() != Some(LIST_ENCODING) {
+            continue;
+        }
+        page.contents.retain_mut(|obj| match url_decode(&obj.key) {
+            Some(key) => {
+                obj.key = key;
+                true
+            }
+            None => false,
+        });
+        if let Some(prefixes) = page.common_prefixes.as_mut() {
+            prefixes.retain_mut(|cp| match url_decode(&cp.prefix) {
+                Some(prefix) => {
+                    cp.prefix = prefix;
+                    true
+                }
+                None => false,
+            });
+        }
+    }
+}
+
+/// What a bounded GET gave.
+#[derive(Debug, PartialEq, Eq)]
+enum Fetched {
+    /// The whole body, no longer than the cap.
+    Body(Vec<u8>),
+    /// The body ran past the cap and was read no further.
+    Oversized,
+    /// The GET failed, or answered neither 200 nor 206.
+    Failed,
+}
+
+/// A writer that keeps at most `limit` bytes and refuses any past them, so
+/// a body streamed into it is read no further than that.
+struct BoundedSink {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = self.limit - self.bytes.len();
+        if room == 0 && !buf.is_empty() {
+            return Err(std::io::Error::other("body past the read bound"));
+        }
+        let n = buf.len().min(room);
+        self.bytes.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// One top-level object of a session directory, as the listing reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +261,7 @@ pub enum SummaryRead {
     /// The listing shows no summary (or none was asked for).
     Absent,
     /// Listed but not usable; the reason (`oversized`, `unfetched`,
-    /// `malformed`, `schema`, `key-mismatch`).
+    /// `malformed`, `schema`, `field-cap`, `key-mismatch`).
     Unreadable(&'static str),
     /// Read and checked against its key.
     Read(Box<SessionSummary>),
@@ -643,6 +772,8 @@ pub fn choose_prefixes(
 /// listings and GETs.
 pub struct RemoteReader {
     bucket: Box<Bucket>,
+    /// The same client, asking its listings in [`LIST_ENCODING`].
+    lister: Box<Bucket>,
     host: String,
 }
 
@@ -658,8 +789,20 @@ impl RemoteReader {
     /// own (see the module documentation).
     pub fn new(bucket: &Bucket) -> Result<Self, ReadFailure> {
         let host = host_of(&bucket.region().host());
-        match bucket.with_request_timeout(REQUEST_TIMEOUT) {
-            Ok(bucket) => Ok(Self { bucket, host }),
+        let mut query = bucket.extra_query.clone();
+        query.insert("encoding-type".to_string(), LIST_ENCODING.to_string());
+        let built = bucket
+            .with_request_timeout(REQUEST_TIMEOUT)
+            .and_then(|plain| {
+                let lister = plain.with_extra_query(query)?;
+                Ok((plain, Box::new(lister)))
+            });
+        match built {
+            Ok((bucket, lister)) => Ok(Self {
+                bucket,
+                lister,
+                host,
+            }),
             Err(_) => Err(ReadFailure {
                 class: FailureClass::Unreachable,
                 host,
@@ -670,16 +813,20 @@ impl RemoteReader {
     }
 
     /// A listing of `prefix`, asked again only while the bucket throttles
-    /// it (koto's usual retries), never after a timeout or a refusal.
+    /// it (koto's usual retries), never after a timeout or a refusal. It is
+    /// asked in [`LIST_ENCODING`] and its keys decoded, so a listed key is
+    /// the key as stored, whatever characters it holds.
     fn list(
         &self,
         prefix: String,
         delimiter: Option<&str>,
     ) -> Result<Vec<ListBucketResult>, ListFailure> {
-        list_retrying_when(&self.bucket, prefix, delimiter, |e| {
+        let mut pages = list_retrying_when(&self.lister, prefix, delimiter, |e| {
             failure_class(e) == FailureClass::Throttled
         })
-        .map_err(|(error, took)| ListFailure { error, took })
+        .map_err(|(error, took)| ListFailure { error, took })?;
+        decode_listing(&mut pages);
+        Ok(pages)
     }
 
     /// A failure of this reader's bucket.
@@ -732,34 +879,50 @@ impl RemoteReader {
         ))
     }
 
-    /// GET `<workspace>/<name>/<file>`; `None` when it fails or doesn't
-    /// answer 200.
-    fn get(&self, workspace: &str, name: &str, file: &str) -> Option<Vec<u8>> {
-        let response = self
-            .bucket
-            .get_object(format!("{workspace}/{name}/{file}"))
-            .ok()?;
-        (response.status_code() == 200).then(|| response.bytes().to_vec())
+    /// GET `<workspace>/<name>/<file>`, reading no more than `cap` bytes
+    /// and one past them. The request asks for that range
+    /// (`bytes=0-<cap>`), and a body that runs past `cap` anyway (the
+    /// endpoint ignored the range) stops being read there, so an object
+    /// replaced by a huge one after it was listed costs no more than that.
+    fn get(&self, workspace: &str, name: &str, file: &str, cap: usize) -> Fetched {
+        let mut sink = BoundedSink {
+            bytes: Vec::new(),
+            limit: cap + 1,
+        };
+        let answered = self.bucket.get_object_range_to_writer(
+            format!("{workspace}/{name}/{file}"),
+            0,
+            Some(cap as u64),
+            &mut sink,
+        );
+        if sink.bytes.len() > cap {
+            return Fetched::Oversized;
+        }
+        match answered {
+            Ok(200 | 206) => Fetched::Body(sink.bytes),
+            _ => Fetched::Failed,
+        }
     }
 
     /// Read one session's summary.
     fn read_summary(&self, workspace: &str, name: &str) -> SummaryRead {
-        match self.get(workspace, name, SUMMARY_FILE) {
-            None => SummaryRead::Unreadable("unfetched"),
-            Some(bytes) => match SessionSummary::parse(&bytes, workspace, name) {
+        match self.get(workspace, name, SUMMARY_FILE, MAX_SUMMARY_BYTES) {
+            Fetched::Failed => SummaryRead::Unreadable("unfetched"),
+            Fetched::Oversized => SummaryRead::Unreadable("oversized"),
+            Fetched::Body(bytes) => match SessionSummary::parse(&bytes, workspace, name) {
                 Ok(summary) => SummaryRead::Read(Box::new(summary)),
                 Err(reason) => SummaryRead::Unreadable(reason),
             },
         }
     }
 
-    /// Read one session's `migrated.json`; `None` when it can't be read or
-    /// doesn't name a copy.
+    /// Read one session's `migrated.json`; `None` when it can't be read,
+    /// runs past [`MAX_MARKER_BYTES`] or doesn't name a copy.
     fn read_marker(&self, workspace: &str, name: &str) -> Option<MigratedTo> {
-        let bytes = self.get(workspace, name, MIGRATED_MARKER)?;
-        if bytes.len() > MAX_MARKER_BYTES {
+        let Fetched::Body(bytes) = self.get(workspace, name, MIGRATED_MARKER, MAX_MARKER_BYTES)
+        else {
             return None;
-        }
+        };
         Some(MigratedTo {
             prefix: marker_target_str(&bytes, "prefix")?,
             session: marker_target_str(&bytes, "session")?,
@@ -1673,5 +1836,120 @@ mod tests {
         assert!(choose_prefixes(&all, &cache, now(), 200).contains(&all[200]));
         all.push("ffffffffffffffff".to_string());
         assert!(choose_prefixes(&all, &cache, now(), 200).contains(&all[201]));
+    }
+
+    /// Each character of `range`, between two letters, comes out of the
+    /// sanitizer as those letters with one space between them.
+    fn assert_spaced(range: impl IntoIterator<Item = char>) {
+        let mut seen = 0;
+        for c in range {
+            assert_eq!(
+                sanitize_bucket_text(&format!("a{c}b")),
+                "a b",
+                "U+{:04X}",
+                c as u32
+            );
+            seen += 1;
+        }
+        assert!(seen > 0);
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_c0_control() {
+        assert_spaced('\u{0}'..='\u{1F}');
+        assert_eq!(sanitize_bucket_text("a\u{1B}b"), "a b");
+        assert_eq!(sanitize_bucket_text("a\t\n\rb"), "a   b");
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_del() {
+        assert_spaced(['\u{7F}']);
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_c1_control() {
+        assert_spaced('\u{80}'..='\u{9F}');
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_the_line_and_paragraph_separators() {
+        assert_spaced(['\u{2028}', '\u{2029}']);
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_bidi_embedding_and_override() {
+        assert_spaced('\u{202A}'..='\u{202E}');
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_bidi_isolate() {
+        assert_spaced('\u{2066}'..='\u{2069}');
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_zero_width_and_directional_mark() {
+        assert_spaced('\u{200B}'..='\u{200F}');
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_the_arabic_letter_mark() {
+        assert_spaced(['\u{061C}']);
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_the_byte_order_mark() {
+        assert_spaced(['\u{FEFF}']);
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_spaces_each_tag_character() {
+        assert_spaced('\u{E0000}'..='\u{E007F}');
+    }
+
+    #[test]
+    fn remote_feed_sanitizer_keeps_other_text_as_it_is() {
+        let kept = "caf\u{e9} \u{65e5}\u{672c} \\u{1B} a-b_c.d ~ @ \u{2030} \u{2070} \u{E0080}";
+        assert_eq!(sanitize_bucket_text(kept), kept);
+        // Each hazard is one space, never an escape, and the text around
+        // it is untouched.
+        assert_eq!(
+            sanitize_bucket_text("caf\u{e9}\u{1B}[2J\u{1B}]0;owned\u{7}"),
+            "caf\u{e9} [2J ]0;owned "
+        );
+    }
+
+    #[test]
+    fn remote_feed_url_decode_reads_the_listing_encoding() {
+        assert_eq!(url_decode("a+b%09c%1Bd").as_deref(), Some("a b\tc\u{1B}d"));
+        assert_eq!(
+            url_decode("x%C2%85y%E2%80%A8z").as_deref(),
+            Some("x\u{85}y\u{2028}z")
+        );
+        assert_eq!(url_decode("ws%2Fname%2B").as_deref(), Some("ws/name+"));
+        assert_eq!(
+            url_decode("plain-name_1.2~3").as_deref(),
+            Some("plain-name_1.2~3")
+        );
+        assert_eq!(url_decode("bad%G1"), None);
+        assert_eq!(url_decode("cut%4"), None);
+        assert_eq!(url_decode("%FF"), None, "not UTF-8");
+    }
+
+    #[test]
+    fn remote_feed_bounded_sink_refuses_bytes_past_its_limit() {
+        use std::io::Write;
+        let mut sink = BoundedSink {
+            bytes: Vec::new(),
+            limit: 4,
+        };
+        assert!(sink.write_all(b"abc").is_ok());
+        assert!(sink.write_all(b"defg").is_err());
+        assert_eq!(sink.bytes, b"abcd");
+        let mut exact = BoundedSink {
+            bytes: Vec::new(),
+            limit: 4,
+        };
+        assert!(std::io::copy(&mut &b"abcd"[..], &mut exact).is_ok());
+        assert_eq!(exact.bytes, b"abcd");
     }
 }

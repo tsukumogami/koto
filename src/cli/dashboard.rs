@@ -163,10 +163,14 @@ fn once_remote_rows(
             tree.sessions.remove(&row.name);
         }
     }
+    // Each row's name is its sanitized one, as every other fact it carries.
     snapshot
         .rows
         .iter()
-        .map(|row| (row.name.clone(), dashboard_data::remote_session(row)))
+        .map(|row| {
+            let session = dashboard_data::remote_session(row);
+            (session.header.workflow.clone(), session)
+        })
         .collect()
 }
 
@@ -269,7 +273,10 @@ fn run_once(
 /// legacy positional contract; columns 7-8 are the appended `idle` and
 /// `liveness`, and 9-10 the `machine` that produced the session and the
 /// `workspace` id of its copy, both empty unless `cloud` (PRD R20).
-/// Appended/interpolated fields are sanitized of tabs/newlines.
+/// Appended/interpolated fields are sanitized of tabs/newlines. A remote
+/// row's text arrives already through the bucket-text sanitizer
+/// ([`dashboard_data::remote_session`]), which leaves no control character
+/// at all.
 fn format_once_line(
     session_id: &str,
     session: &CachedSession,

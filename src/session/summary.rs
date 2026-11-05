@@ -159,8 +159,10 @@ impl SessionSummary {
     ///
     /// Refused (`Err` with the reason) when the body is over
     /// [`MAX_SUMMARY_BYTES`], doesn't parse into the closed schema, carries
-    /// another schema version, or names a session or workspace other than
-    /// the key it was read from.
+    /// another schema version, holds a field over its cap
+    /// ([`SessionSummary::over_cap`]), or names a session or workspace other
+    /// than the key it was read from. `name` is the key's session name as
+    /// listed, compared before anything sanitizes either.
     pub fn parse(bytes: &[u8], home: &str, name: &str) -> Result<Self, &'static str> {
         if bytes.len() > MAX_SUMMARY_BYTES {
             return Err("oversized");
@@ -169,10 +171,28 @@ impl SessionSummary {
         if summary.schema != SUMMARY_SCHEMA {
             return Err("schema");
         }
+        if summary.over_cap() {
+            return Err("field-cap");
+        }
         if summary.name != name || summary.home != home || summary.session_id.is_empty() {
             return Err("key-mismatch");
         }
         Ok(summary)
+    }
+
+    /// Whether a field the writer caps is longer, in bytes, than its cap:
+    /// the name, template name, current state or salient variable over
+    /// [`TEXT_FIELD_CAP`], or the intent over [`INTENT_CAP`]. A reader
+    /// trusts no part of such a summary. The machine isn't counted here: a
+    /// machine name over [`MACHINE_CAP`] breaks the machine-name rules and
+    /// reads as no recorded machine, with the summary's other facts shown.
+    pub fn over_cap(&self) -> bool {
+        let over = |field: Option<&String>, cap: usize| field.is_some_and(|v| v.len() > cap);
+        self.name.len() > TEXT_FIELD_CAP
+            || over(self.template_name.as_ref(), TEXT_FIELD_CAP)
+            || over(self.current_state.as_ref(), TEXT_FIELD_CAP)
+            || over(self.salient_var.as_ref(), TEXT_FIELD_CAP)
+            || over(self.intent.as_ref(), INTENT_CAP)
     }
 }
 
@@ -260,5 +280,82 @@ mod tests {
             SessionSummary::parse(&big, "0123456789abcdef", "review"),
             Err("oversized")
         );
+    }
+
+    /// Parse `summary` back from its bytes, under its own key.
+    fn reparse(summary: &SessionSummary) -> Result<SessionSummary, &'static str> {
+        SessionSummary::parse(&summary.to_bytes(), &summary.home, &summary.name)
+    }
+
+    #[test]
+    fn summary_text_fields_show_at_256_bytes_and_are_refused_at_257() {
+        type Field = fn(&mut SessionSummary, String);
+        let fields: [(&str, Field); 4] = [
+            ("name", |s, v| s.name = v),
+            ("template_name", |s, v| s.template_name = Some(v)),
+            ("current_state", |s, v| s.current_state = Some(v)),
+            ("salient_var", |s, v| s.salient_var = Some(v)),
+        ];
+        for (field, set) in fields {
+            let mut at = sample();
+            set(&mut at, "x".repeat(TEXT_FIELD_CAP));
+            assert_eq!(reparse(&at), Ok(at.clone()), "{field} at 256 bytes");
+            let mut over = sample();
+            set(&mut over, "x".repeat(TEXT_FIELD_CAP + 1));
+            assert_eq!(reparse(&over), Err("field-cap"), "{field} at 257 bytes");
+        }
+    }
+
+    #[test]
+    fn summary_intent_shows_at_1024_bytes_and_is_refused_at_1025() {
+        let mut at = sample();
+        at.intent = Some("i".repeat(INTENT_CAP));
+        assert_eq!(reparse(&at), Ok(at.clone()));
+        let mut over = sample();
+        over.intent = Some("i".repeat(INTENT_CAP + 1));
+        assert_eq!(reparse(&over), Err("field-cap"));
+    }
+
+    #[test]
+    fn summary_caps_count_bytes_not_characters() {
+        // 200 two-byte characters: 200 characters, 400 bytes.
+        let mut wide = sample();
+        wide.current_state = Some("\u{e9}".repeat(200));
+        assert_eq!(reparse(&wide), Err("field-cap"));
+        // 128 two-byte characters are exactly the 256-byte cap.
+        let mut at = sample();
+        at.current_state = Some("\u{e9}".repeat(128));
+        assert_eq!(reparse(&at), Ok(at.clone()));
+        // 342 three-byte characters, 1,026 bytes, are over the intent's cap.
+        let mut intent = sample();
+        intent.intent = Some("\u{20ac}".repeat(342));
+        assert_eq!(reparse(&intent), Err("field-cap"));
+    }
+
+    #[test]
+    fn summary_machine_over_its_cap_leaves_the_summary_readable() {
+        let mut long = sample();
+        long.machine = Some("m".repeat(MACHINE_CAP + 1));
+        assert_eq!(reparse(&long), Ok(long.clone()));
+    }
+
+    #[test]
+    fn summary_malformed_bodies_are_refused() {
+        let key = |bytes: &[u8]| SessionSummary::parse(bytes, "0123456789abcdef", "review");
+        assert_eq!(key(b"not json"), Err("malformed"));
+        let mut bytes = sample().to_bytes();
+        let at = bytes.windows(4).position(|w| w == b"wait").unwrap();
+        bytes[at] = 0xff;
+        assert_eq!(key(&bytes), Err("malformed"), "a body that isn't UTF-8");
+        let mut value: serde_json::Value = serde_json::from_slice(&sample().to_bytes()).unwrap();
+        value.as_object_mut().unwrap().remove("is_blocked");
+        assert_eq!(
+            key(&serde_json::to_vec(&value).unwrap()),
+            Err("malformed"),
+            "missing is_blocked"
+        );
+        let mut empty_id = sample();
+        empty_id.session_id = String::new();
+        assert_eq!(key(&empty_id.to_bytes()), Err("key-mismatch"));
     }
 }

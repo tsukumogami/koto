@@ -1799,3 +1799,648 @@ fn remote_feed_once_at_200_prefixes_and_2000_sessions() {
     assert_eq!(shown, 2000, "{}", out.describe());
     assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
 }
+
+// --- PLAN step 7: text and objects another machine wrote ---------------
+
+use koto::cli::dashboard_render::render_frame;
+use koto::cli::dashboard_state::DashboardTab;
+
+/// A workspace prefix no machine here derives, for planted sessions.
+const PLANTED: &str = "00000000000000aa";
+
+/// The characters the bucket-text rule replaces, written out again here so
+/// the tests don't take the rule from the code under test.
+fn is_hazard(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1F}'
+            | '\u{7F}'..='\u{9F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Every hazard in `text`, as `U+XXXX`.
+fn hazards(text: &str) -> Vec<String> {
+    text.chars()
+        .filter(|c| is_hazard(*c))
+        .map(|c| format!("U+{:04X}", c as u32))
+        .collect()
+}
+
+/// Every character of every range the rule names.
+fn every_hazard() -> Vec<char> {
+    let ranges: [(u32, u32); 10] = [
+        (0x0, 0x1F),
+        (0x7F, 0x7F),
+        (0x80, 0x9F),
+        (0x2028, 0x2029),
+        (0x202A, 0x202E),
+        (0x2066, 0x2069),
+        (0x200B, 0x200F),
+        (0x061C, 0x061C),
+        (0xFEFF, 0xFEFF),
+        (0xE0000, 0xE007F),
+    ];
+    ranges
+        .iter()
+        .flat_map(|&(lo, hi)| (lo..=hi).filter_map(char::from_u32))
+        .collect()
+}
+
+/// Put a state file for `name` under `ws`, as another machine's push
+/// would; returns its ETag.
+fn plant_state(s3: &FakeS3, ws: &str, name: &str) -> String {
+    let key = state_key(ws, name);
+    s3.put(&key, b"{\"planted\":true}\n");
+    s3.etag_of(&key).unwrap()
+}
+
+/// A schema-1 summary of a blocked session `name` under `ws` in state
+/// `check`, naming the state file [`plant_state`] put there.
+fn summary_of(s3: &FakeS3, ws: &str, name: &str) -> serde_json::Value {
+    let etag = plant_state(s3, ws, name);
+    serde_json::json!({
+        "schema": 1,
+        "session_id": format!("sid-{name}"),
+        "name": name,
+        "home": ws,
+        "kind": null,
+        "parent": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "template_name": "gated",
+        "current_state": "check",
+        "is_terminal": false,
+        "is_blocked": true,
+        "failed": false,
+        "intent": null,
+        "salient_var": null,
+        "is_batch_task": false,
+        "is_request_leg": false,
+        // Recent, so the blocked row sits in the needs-you band.
+        "last_event_at": fake_s3::rfc3339_millis(std::time::SystemTime::now()),
+        "last_seq": 1,
+        "state_etag": etag,
+        "machine": "machine-a",
+        "sources": [],
+    })
+}
+
+/// Put `body` as the summary of `name` under `ws`.
+fn put_summary(s3: &FakeS3, ws: &str, name: &str, body: &[u8]) {
+    s3.put(&key_of(ws, name, "summary.json"), body);
+}
+
+/// Plant session `name` under `ws`: its state file and a summary with
+/// `edit` applied.
+fn plant(s3: &FakeS3, ws: &str, name: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut summary = summary_of(s3, ws, name);
+    edit(&mut summary);
+    put_summary(s3, ws, name, summary.to_string().as_bytes());
+}
+
+/// B's interactive dashboard over one feed scan of the bucket, as the feed
+/// thread runs it, drawn on a [`TestBackend`] with the receded set shown.
+struct TuiView {
+    state: DashboardAppState,
+}
+
+impl TuiView {
+    fn scan(s3: &FakeS3, b: &Machine) -> Self {
+        let (_store, mut tree) = local_rows(b);
+        let reader = RemoteReader::new(&bucket_at(&s3.endpoint())).unwrap();
+        let snapshot =
+            reader.scan_cached(&dashboard_data::local_view(&tree), &mut FeedCache::new());
+        dashboard_data::apply_snapshot(&mut tree, &snapshot);
+        let mut state = DashboardAppState::new(500);
+        state.tree = tree;
+        state.show_receded = true;
+        TuiView { state }
+    }
+
+    /// The row key of the remote row named `name` (as shown) under `ws`.
+    fn key(&self, name: &str, ws: &str) -> String {
+        let key = dashboard_data::remote_key(name, ws);
+        assert!(
+            self.state.tree.sessions.contains_key(&key),
+            "{key:?} among {:?}",
+            self.state.tree.sessions.keys().collect::<Vec<_>>()
+        );
+        key
+    }
+
+    /// The frame's lines: the list, and with `focus` that row's Session tab.
+    fn draw(&mut self, focus: Option<&str>, width: u16, height: u16) -> Vec<String> {
+        match focus {
+            Some(key) => {
+                self.state.focused_id = Some(key.to_string());
+                self.state.active_tab = DashboardTab::Session;
+            }
+            None => self.state.focused_id = None,
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render_frame(f, &self.state)).unwrap();
+        buffer_lines(terminal.backend().buffer())
+    }
+}
+
+/// Assert no hazard is anywhere in `lines`.
+fn assert_no_hazard(lines: &[String], what: &str) {
+    let text = lines.join("\n");
+    let found = hazards(&text.replace('\n', ""));
+    assert!(found.is_empty(), "{what}: {found:?} in {text}");
+}
+
+/// The tally line for `n` remote rows listed as unknown and no local one.
+fn unknown_tally(n: usize) -> String {
+    format!("note: {n} unreadable session(s), {n} listed as unknown")
+}
+
+/// Plan step 7, criterion 1: a name, state, intent and template holding a
+/// tab, a newline, an ESC, a U+0085 and a U+2028 print on one ten-field
+/// line with each replaced by one space, and still show the state; the TUI
+/// list row and Session tab carry none of them; a no-summary session with
+/// such a name prints the same way as `unknown`.
+#[test]
+fn bucket_text_with_controls_prints_on_one_line_with_each_spaced() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let mixed = |head: &str| format!("{head}\ta\nb\u{1B}c\u{85}d\u{2028}e");
+    let spaced = |head: &str| format!("{head} a b c d e");
+    let (shown, bare) = (mixed("n"), mixed("u"));
+    plant(&s3, PLANTED, &shown, |s| {
+        s["current_state"] = mixed("s").into();
+        s["intent"] = mixed("i").into();
+        s["template_name"] = mixed("t").into();
+        s["session_id"] = mixed("id").into();
+    });
+    plant_state(&s3, PLANTED, &bare);
+
+    let out = once_on(&s3, &b, &["--all"]);
+    assert_eq!(out.stdout.lines().count(), 2, "{}", out.describe());
+    let rows = out.rows();
+    for row in &rows {
+        assert_eq!(row.len(), 10, "ten fields: {row:?}");
+        assert!(hazards(&row.join("")).is_empty(), "{row:?}");
+    }
+    let row = row_of(&rows, &spaced("n"), PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(row[1], spaced("s"), "{row:?}");
+    assert_eq!(row[3], "blocked", "the state still shows: {row:?}");
+    assert_eq!(row[4], spaced("i"), "{row:?}");
+    assert_eq!(row[5], spaced("t"), "{row:?}");
+    assert_eq!(row[8], "machine-a", "{row:?}");
+    assert!(
+        !out.stdout.contains("\\u{"),
+        "no visible escape: {}",
+        out.stdout
+    );
+    let unknown = row_of(&rows, &spaced("u"), PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(unknown[3], "unknown", "{unknown:?}");
+    assert!(out.stderr.contains(&unknown_tally(1)), "{}", out.stderr);
+
+    // The interactive dashboard, its feed on a short interval.
+    drive_tui(&s3, &b, &mut |lines, state| {
+        assert_no_hazard(lines, "the TUI's list");
+        state.tree.remote_unreadable == 1
+            && lines
+                .iter()
+                .any(|l| l.contains("i a b c") && l.contains(&spaced("s")))
+            && lines.iter().any(|l| l.contains("u a b c"))
+    });
+    let mut tui = TuiView::scan(&s3, &b);
+    let key = tui.key(&spaced("n"), PLANTED);
+    let tab = tui.draw(Some(&key), 160, 40);
+    assert_no_hazard(&tab, "the Session tab");
+    let text = tab.join("\n");
+    for fact in [
+        format!("Session: {}", spaced("n")),
+        format!("State: {}", spaced("s")),
+        format!("Session id: {}", spaced("id")),
+    ] {
+        assert!(text.contains(&fact), "{fact:?} in {text}");
+    }
+    assert!(!text.contains("\\u{"), "no visible escape: {text}");
+    let key = tui.key(&spaced("u"), PLANTED);
+    assert_no_hazard(&tui.draw(Some(&key), 160, 40), "the unknown row's tab");
+}
+
+/// Plan step 7, criterion 2: each character of every range the rule names,
+/// between two letters of an intent and a state, prints as those letters
+/// with one space between them, and reaches no cell of the TUI; `café`
+/// beside it is unchanged.
+#[test]
+fn every_hazard_character_prints_as_one_space_and_reaches_no_cell() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let all = every_hazard();
+    assert_eq!(all.len(), 32 + 1 + 32 + 2 + 5 + 4 + 5 + 1 + 1 + 128);
+    let name = |c: char| format!("c{:05x}", c as u32);
+    for &c in &all {
+        plant(&s3, PLANTED, &name(c), |s| {
+            s["intent"] = format!("caf\u{e9} a{c}b").into();
+            s["current_state"] = format!("s{c}t").into();
+        });
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_eq!(rows.len(), all.len(), "{}", out.describe());
+    for &c in &all {
+        let row = row_of(&rows, &name(c), PLANTED)
+            .unwrap_or_else(|| panic!("U+{:04X}: {rows:?}", c as u32));
+        assert_eq!(row.len(), 10, "U+{:04X}: {row:?}", c as u32);
+        assert_eq!(row[1], "s t", "U+{:04X}: {row:?}", c as u32);
+        assert_eq!(row[4], "caf\u{e9} a b", "U+{:04X}: {row:?}", c as u32);
+    }
+    assert!(hazards(&out.stdout.replace(['\t', '\n'], "")).is_empty());
+
+    let mut tui = TuiView::scan(&s3, &b);
+    let list = tui.draw(None, 79, all.len() as u16 + 10);
+    assert_no_hazard(&list, "the TUI's list");
+    assert_eq!(
+        list.iter()
+            .filter(|l| l.contains("caf\u{e9} a b @machine-a"))
+            .count(),
+        all.len(),
+        "{list:#?}"
+    );
+    for &c in &all {
+        let key = tui.key(&name(c), PLANTED);
+        let tab = tui.draw(Some(&key), 160, 30);
+        assert_no_hazard(&tab, &format!("U+{:04X}'s Session tab", c as u32));
+        let text = tab.join("\n");
+        assert!(text.contains("Intent: caf\u{e9} a b"), "{text}");
+        assert!(text.contains("State: s t"), "{text}");
+    }
+}
+
+/// Plan step 7, criterion 3: CSI and OSC sequences in an intent leave no
+/// ESC or BEL in `--once` or the TUI; in `created_at`, `kind`, `parent` and
+/// `salient_var` they reach no row, and the Session tab shows `created_at`
+/// with each one a space.
+#[test]
+fn terminal_sequences_in_bucket_text_reach_no_row() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let csi = "\u{1B}[2J";
+    let osc = "\u{1B}]0;owned\u{7}";
+    let hostile = format!("x{csi}y{osc}z");
+    let created = format!("2026-01-01T00:00:00Z{csi}{osc}");
+    for (name, intent) in [("loud", Some(hostile.clone())), ("quiet", None)] {
+        plant(&s3, PLANTED, name, |s| {
+            s["intent"] = intent.into();
+            s["created_at"] = created.clone().into();
+            s["kind"] = hostile.clone().into();
+            s["parent"] = hostile.clone().into();
+            s["salient_var"] = hostile.clone().into();
+        });
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    assert!(
+        !out.stdout.contains('\u{1B}') && !out.stdout.contains('\u{7}'),
+        "{:?}",
+        out.stdout
+    );
+    let rows = out.rows();
+    let loud = row_of(&rows, "loud", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(loud[4], "x [2Jy ]0;owned z", "{loud:?}");
+    assert_eq!(loud[3], "blocked", "{loud:?}");
+    assert!(row_of(&rows, "quiet", PLANTED).is_some(), "{rows:?}");
+
+    drive_tui(&s3, &b, &mut |lines, _| {
+        assert_no_hazard(lines, "the TUI's list");
+        lines.iter().any(|l| l.contains("x [2Jy"))
+    });
+    let mut tui = TuiView::scan(&s3, &b);
+    // The intent-less row's label folds in its salient variable.
+    let list = tui.draw(None, 79, 20);
+    assert_no_hazard(&list, "the TUI's list");
+    assert!(
+        list.iter().any(|l| l.contains("gated \u{b7} x [2Jy")),
+        "{list:#?}"
+    );
+    for name in ["loud", "quiet"] {
+        let key = tui.key(name, PLANTED);
+        let tab = tui.draw(Some(&key), 160, 40);
+        assert_no_hazard(&tab, name);
+        let text = tab.join("\n");
+        assert!(
+            text.contains("Created: 2026-01-01T00:00:00Z [2J ]0;owned"),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// Plan step 7, criterion 4: a machine that breaks the machine-name rules
+/// reads as no recorded machine, with the row's other facts from its
+/// summary.
+#[test]
+fn a_machine_name_that_breaks_the_rules_reads_as_none_recorded() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let machines = [
+        ("spaced", "bad name!".to_string()),
+        ("literal", "unknown".to_string()),
+        ("long", "m".repeat(65)),
+        ("tabbed", "tab\there".to_string()),
+        ("escaped", "esc\u{1B}here".to_string()),
+    ];
+    for (name, machine) in &machines {
+        plant(&s3, PLANTED, name, |s| {
+            s["machine"] = machine.clone().into();
+            s["intent"] = format!("about {name}").into();
+        });
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    for (name, _) in &machines {
+        let row = row_of(&rows, name, PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(row.len(), 10, "{row:?}");
+        assert_eq!(row[8], "", "{name}: no recorded machine: {row:?}");
+        assert_eq!(row[1], "check", "{name}: {row:?}");
+        assert_eq!(row[3], "blocked", "{name}: {row:?}");
+        assert_eq!(row[4], format!("about {name}"), "{name}: {row:?}");
+    }
+    assert!(!out.stderr.contains("unreadable"), "{}", out.stderr);
+
+    let mut tui = TuiView::scan(&s3, &b);
+    let list = tui.draw(None, 79, 20);
+    for (name, _) in &machines {
+        let line = list
+            .iter()
+            .find(|l| l.contains(&format!("about {name}")))
+            .unwrap_or_else(|| panic!("{name}: {list:#?}"));
+        assert!(line.contains("@unknown"), "{name}: {line:?}");
+        assert!(line.contains("check"), "{name}: {line:?}");
+        let key = tui.key(name, PLANTED);
+        let text = tui.draw(Some(&key), 160, 30).join("\n");
+        assert!(text.contains("Machine: unknown"), "{name}: {text}");
+        assert!(text.contains("State: check"), "{name}: {text}");
+    }
+}
+
+/// `body` padded with trailing spaces, which JSON allows, to `len` bytes.
+fn padded(body: &serde_json::Value, len: usize) -> Vec<u8> {
+    let mut bytes = body.to_string().into_bytes();
+    assert!(bytes.len() <= len);
+    bytes.resize(len, b' ');
+    bytes
+}
+
+/// Every GET of `key` in the request log.
+fn gets_of(s3: &FakeS3, key: &str) -> Vec<fake_s3::Request> {
+    s3.requests()
+        .into_iter()
+        .filter(|r| r.method == "GET" && r.list_prefix.is_none() && r.key == key)
+        .collect()
+}
+
+/// Assert row `name` under [`PLANTED`] prints `unknown` with nothing from a
+/// summary: no state, intent, template or machine.
+fn assert_unknown_row(rows: &[Vec<String>], name: &str) {
+    let row = row_of(rows, name, PLANTED).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+    assert_eq!(row.len(), 10, "{row:?}");
+    assert_eq!(row[3], "unknown", "{name}: {row:?}");
+    for (i, column) in [
+        (1, "current_state"),
+        (4, "intent"),
+        (5, "template"),
+        (8, "machine"),
+    ] {
+        assert_eq!(row[i], "", "{name}'s {column} is empty: {row:?}");
+    }
+}
+
+/// Plan step 7, criterion 5: a summary listed at 64 KiB and one byte is
+/// never fetched and lists as `unknown`, counted; one padded to exactly
+/// 64 KiB shows from its fields.
+#[test]
+fn a_summary_listed_over_64_kib_is_never_fetched() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let mut over = summary_of(&s3, PLANTED, "over");
+    over["intent"] = "too big".into();
+    put_summary(&s3, PLANTED, "over", &padded(&over, 64 * 1024 + 1));
+    let mut at = summary_of(&s3, PLANTED, "at");
+    at["intent"] = "just fits".into();
+    put_summary(&s3, PLANTED, "at", &padded(&at, 64 * 1024));
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_unknown_row(&rows, "over");
+    let fits = row_of(&rows, "at", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(
+        (fits[1].as_str(), fits[3].as_str(), fits[4].as_str()),
+        ("check", "blocked", "just fits"),
+        "{fits:?}"
+    );
+    assert!(out.stderr.contains(&unknown_tally(1)), "{}", out.stderr);
+    assert!(
+        gets_of(&s3, &key_of(PLANTED, "over", "summary.json")).is_empty(),
+        "no GET of the oversized summary"
+    );
+    let read = gets_of(&s3, &key_of(PLANTED, "at", "summary.json"));
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0].range.as_deref(), Some("bytes=0-65536"), "{read:?}");
+    assert_eq!(read[0].body_sent, 64 * 1024, "{read:?}");
+}
+
+/// Plan step 7, criterion 6: a summary and a `migrated.json` replaced by
+/// 64 MiB bodies between the listing and the GET are read no further than
+/// 64 KiB and one byte; the summary lists as `unknown`, counted, and the
+/// marker hides nothing.
+#[test]
+fn a_body_swapped_after_the_listing_is_read_no_further_than_the_bound() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    plant(&s3, PLANTED, "swapped", |s| {
+        s["intent"] = "first body".into()
+    });
+    plant(&s3, PLANTED, "source", |s| {
+        s["intent"] = "the source".into()
+    });
+    plant(&s3, PLANTED, "copy", |s| s["intent"] = "the copy".into());
+    let marker = serde_json::json!({
+        "prefix": PLANTED,
+        "session": "copy",
+        "session_id": "sid-copy",
+    });
+    let marker_key = key_of(PLANTED, "source", "migrated.json");
+    s3.put(&marker_key, marker.to_string().as_bytes());
+    // Both swapped once the workspace's listing has been answered: a valid
+    // body followed by 64 MiB of padding, which a full read would accept.
+    let huge = |body: &serde_json::Value| padded(body, 64 * 1024 * 1024);
+    let summary_key = key_of(PLANTED, "swapped", "summary.json");
+    let mut second = summary_of(&s3, PLANTED, "swapped");
+    second["intent"] = "second body".into();
+    let listing = format!("{PLANTED}/");
+    s3.put_after("LIST", &listing, &summary_key, &huge(&second));
+    s3.put_after("LIST", &listing, &marker_key, &huge(&marker));
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_unknown_row(&rows, "swapped");
+    assert!(!out.stdout.contains("body"), "{}", out.stdout);
+    let source = row_of(&rows, "source", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(
+        source[4], "the source",
+        "the marker hid nothing: {source:?}"
+    );
+    assert!(row_of(&rows, "copy", PLANTED).is_some(), "{rows:?}");
+    assert!(out.stderr.contains(&unknown_tally(1)), "{}", out.stderr);
+    assert!(!out.stderr.contains("hidden"), "{}", out.stderr);
+    for key in [&summary_key, &marker_key] {
+        let read = gets_of(&s3, key);
+        assert_eq!(read.len(), 1, "{key}: {read:?}");
+        assert_eq!(read[0].range.as_deref(), Some("bytes=0-65536"), "{read:?}");
+        assert!(
+            read[0].body_sent <= 64 * 1024 + 1,
+            "{key}: {} body bytes sent",
+            read[0].body_sent
+        );
+    }
+}
+
+/// Plan step 7, criterion 7: a field over its byte cap makes the summary
+/// unreadable, with none of its text in the row; at the cap it shows; and
+/// the caps count bytes.
+#[test]
+fn a_summary_field_over_its_byte_cap_reads_unknown() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let over_name = "n".repeat(257);
+    let at_name = "a".repeat(256);
+    let leak = |s: &mut serde_json::Value| {
+        s["intent"] = "leaked intent".into();
+        s["template_name"] = "leaked-template".into();
+    };
+    plant(&s3, PLANTED, "state-257", |s| {
+        leak(s);
+        s["current_state"] = "s".repeat(257).into();
+    });
+    plant(&s3, PLANTED, "template-257", |s| {
+        s["intent"] = "leaked intent".into();
+        s["template_name"] = "t".repeat(257).into();
+    });
+    plant(&s3, PLANTED, "salient-257", |s| {
+        leak(s);
+        s["salient_var"] = "v".repeat(257).into();
+    });
+    plant(&s3, PLANTED, &over_name, leak);
+    plant(&s3, PLANTED, "intent-1025", |s| {
+        s["template_name"] = "leaked-template".into();
+        s["intent"] = "i".repeat(1025).into();
+    });
+    plant(&s3, PLANTED, "wide-state", |s| {
+        leak(s);
+        s["current_state"] = "\u{e9}".repeat(200).into();
+    });
+    plant(&s3, PLANTED, "state-256", |s| {
+        s["current_state"] = "s".repeat(256).into();
+        s["template_name"] = "t".repeat(256).into();
+        s["salient_var"] = "v".repeat(256).into();
+    });
+    plant(&s3, PLANTED, &at_name, |s| {
+        s["intent"] = "i".repeat(1024).into();
+    });
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    for name in [
+        "state-257",
+        "template-257",
+        "salient-257",
+        over_name.as_str(),
+        "intent-1025",
+        "wide-state",
+    ] {
+        assert_unknown_row(&rows, name);
+    }
+    assert!(!out.stdout.contains("leaked"), "{}", out.stdout);
+    assert!(!out.stdout.contains(&"s".repeat(257)), "no over-cap state");
+    assert!(
+        !out.stdout.contains(&"i".repeat(1025)),
+        "no over-cap intent"
+    );
+    assert!(
+        !out.stdout.contains(&"v".repeat(257)),
+        "no over-cap variable"
+    );
+    assert!(out.stderr.contains(&unknown_tally(6)), "{}", out.stderr);
+
+    let at = row_of(&rows, "state-256", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(at[1], "s".repeat(256), "{at:?}");
+    assert_eq!(at[5], "t".repeat(256), "{at:?}");
+    assert_eq!(at[3], "blocked", "{at:?}");
+    let named = row_of(&rows, &at_name, PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(named[4], "i".repeat(1024), "{named:?}");
+    assert_eq!(named[1], "check", "{named:?}");
+}
+
+/// Plan step 7, criterion 8: a summary that isn't JSON, isn't UTF-8, lacks
+/// `is_blocked`, has an unknown field, carries schema 2, names another
+/// session or workspace, or has an empty `session_id` lists as `unknown`,
+/// counted, with none of its text in the row.
+#[test]
+fn a_malformed_summary_reads_unknown_with_none_of_its_text() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let leaky = |name: &str| {
+        let mut s = summary_of(&s3, PLANTED, name);
+        s["intent"] = format!("leaked from {name}").into();
+        s["current_state"] = "leaked-state".into();
+        s
+    };
+    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+    let text = leaky("not-json").to_string();
+    cases.push((
+        "not-json",
+        format!("{} trailing", text.trim_end_matches('}')).into_bytes(),
+    ));
+    let mut bytes = leaky("not-utf8").to_string().into_bytes();
+    let at = bytes.windows(6).position(|w| w == b"leaked").unwrap();
+    bytes[at] = 0xff;
+    cases.push(("not-utf8", bytes));
+    let mut s = leaky("no-blocked");
+    s.as_object_mut().unwrap().remove("is_blocked");
+    cases.push(("no-blocked", s.to_string().into_bytes()));
+    let mut s = leaky("extra-field");
+    s["owner"] = "someone".into();
+    cases.push(("extra-field", s.to_string().into_bytes()));
+    let mut s = leaky("schema-2");
+    s["schema"] = 2.into();
+    cases.push(("schema-2", s.to_string().into_bytes()));
+    let mut s = leaky("other-name");
+    s["name"] = "someone-else".into();
+    cases.push(("other-name", s.to_string().into_bytes()));
+    let mut s = leaky("other-home");
+    s["home"] = "00000000000000bb".into();
+    cases.push(("other-home", s.to_string().into_bytes()));
+    let mut s = leaky("empty-id");
+    s["session_id"] = "".into();
+    cases.push(("empty-id", s.to_string().into_bytes()));
+    for (name, body) in &cases {
+        put_summary(&s3, PLANTED, name, body);
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_eq!(rows.len(), cases.len(), "{}", out.describe());
+    for (name, _) in &cases {
+        assert_unknown_row(&rows, name);
+    }
+    assert!(!out.stdout.contains("leaked"), "{}", out.stdout);
+    assert!(
+        out.stderr.contains(&unknown_tally(cases.len())),
+        "{}",
+        out.stderr
+    );
+}
