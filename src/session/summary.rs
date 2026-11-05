@@ -35,6 +35,8 @@ pub const TEXT_FIELD_CAP: usize = 256;
 pub const INTENT_CAP: usize = 1024;
 /// The machine name's cap, in bytes.
 pub const MACHINE_CAP: usize = crate::session::version::MACHINE_NAME_MAX;
+/// The most `sources` entries a readable summary carries.
+pub const MAX_SOURCES: usize = 16;
 
 /// A session koto keeps for its own bookkeeping, by name: an epoch branch
 /// (`~`), an execution anchor (`anchor-` prefix) or an anchor's close
@@ -160,8 +162,9 @@ impl SessionSummary {
     /// Refused (`Err` with the reason) when the body is over
     /// [`MAX_SUMMARY_BYTES`], doesn't parse into the closed schema, carries
     /// another schema version, holds a field over its cap
-    /// ([`SessionSummary::over_cap`]), or names a session or workspace other
-    /// than the key it was read from. `name` is the key's session name as
+    /// ([`SessionSummary::over_cap`]), carries more than [`MAX_SOURCES`]
+    /// `sources` entries, or names a session or workspace other than the
+    /// key it was read from. `name` is the key's session name as
     /// listed, compared before anything sanitizes either.
     pub fn parse(bytes: &[u8], home: &str, name: &str) -> Result<Self, &'static str> {
         if bytes.len() > MAX_SUMMARY_BYTES {
@@ -173,6 +176,9 @@ impl SessionSummary {
         }
         if summary.over_cap() {
             return Err("field-cap");
+        }
+        if summary.sources.len() > MAX_SOURCES {
+            return Err("sources-cap");
         }
         if summary.name != name || summary.home != home || summary.session_id.is_empty() {
             return Err("key-mismatch");
@@ -337,6 +343,22 @@ mod tests {
         let mut long = sample();
         long.machine = Some("m".repeat(MACHINE_CAP + 1));
         assert_eq!(reparse(&long), Ok(long.clone()));
+    }
+
+    #[test]
+    fn summary_sources_show_at_16_entries_and_are_refused_at_17() {
+        let entry = |i: usize| SummarySource {
+            relation: "imported".into(),
+            prefix: "0123456789abcdef".into(),
+            name: format!("source-{i}"),
+            session_id: format!("sid-{i}"),
+        };
+        let mut at = sample();
+        at.sources = (0..MAX_SOURCES).map(entry).collect();
+        assert_eq!(reparse(&at), Ok(at.clone()), "16 entries");
+        let mut over = sample();
+        over.sources = (0..=MAX_SOURCES).map(entry).collect();
+        assert_eq!(reparse(&over), Err("sources-cap"), "17 entries");
     }
 
     #[test]

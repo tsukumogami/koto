@@ -261,7 +261,7 @@ pub enum SummaryRead {
     /// The listing shows no summary (or none was asked for).
     Absent,
     /// Listed but not usable; the reason (`oversized`, `unfetched`,
-    /// `malformed`, `schema`, `field-cap`, `key-mismatch`).
+    /// `malformed`, `schema`, `field-cap`, `sources-cap`, `key-mismatch`).
     Unreadable(&'static str),
     /// Read and checked against its key.
     Read(Box<SessionSummary>),
@@ -346,6 +346,11 @@ pub struct RemoteRow {
     pub name: String,
     /// What the row shows.
     pub status: RowStatus,
+    /// Another remote row's summary names this session among its `sources`
+    /// (by workspace prefix, name and `session_id`), so the row recedes: it
+    /// leaves the default view and the needs-you band, and shows with
+    /// `--all` and the `a` key. A `sources` entry never hides a row.
+    pub receded_by_source: bool,
 }
 
 /// What [`classify`] decided for a scan.
@@ -378,6 +383,13 @@ pub struct Classified {
 ///    that file is more than [`STALE_SUMMARY_WINDOW`] old by `now` (or its
 ///    LastModified didn't parse): `unknown`, counted;
 /// 8. otherwise shown from its summary.
+///
+/// Then each row a `sources` entry of another shown row's summary names
+/// recedes ([`RemoteRow::receded_by_source`]): only that row, matched by
+/// workspace prefix, name and the `session_id` its summary records. An entry
+/// naming its own summary's session, a local session (never a remote row
+/// here) or a session by prefix and name with another `session_id` recedes
+/// nothing. `sources` never hides or counts a row: hiding takes rule 4.
 pub fn classify(scan: &[ScannedSession], local: &LocalView, now: SystemTime) -> Classified {
     let present: HashMap<(&str, &str), &ScannedSession> = scan
         .iter()
@@ -428,12 +440,57 @@ pub fn classify(scan: &[ScannedSession], local: &LocalView, now: SystemTime) -> 
             workspace: session.workspace.clone(),
             name: session.name.clone(),
             status,
+            receded_by_source: false,
         });
     }
+    recede_named_sources(&mut out.rows);
     out.rows.sort_by(|a, b| {
         (a.workspace.as_str(), a.name.as_str()).cmp(&(b.workspace.as_str(), b.name.as_str()))
     });
     out
+}
+
+/// The `sources` rule of [`classify`]: mark each row another shown row's
+/// summary names as a source, by workspace prefix, name and `session_id`.
+fn recede_named_sources(rows: &mut [RemoteRow]) {
+    let named: HashSet<(&str, &str, &str)> = rows
+        .iter()
+        .filter_map(|row| match &row.status {
+            RowStatus::Shown(summary) => Some((row, summary)),
+            RowStatus::Unknown { .. } => None,
+        })
+        .flat_map(|(row, summary)| {
+            summary.sources.iter().filter(move |source| {
+                let is_self = (source.prefix == row.workspace && source.name == row.name)
+                    || source.session_id == summary.session_id;
+                !is_self
+            })
+        })
+        .map(|source| {
+            (
+                source.prefix.as_str(),
+                source.name.as_str(),
+                source.session_id.as_str(),
+            )
+        })
+        .collect();
+    if named.is_empty() {
+        return;
+    }
+    let receded: Vec<bool> = rows
+        .iter()
+        .map(|row| {
+            let session_id = match &row.status {
+                RowStatus::Shown(summary) => Some(summary.session_id.as_str()),
+                RowStatus::Unknown { session_id, .. } => session_id.as_deref(),
+            };
+            session_id
+                .is_some_and(|id| named.contains(&(row.workspace.as_str(), row.name.as_str(), id)))
+        })
+        .collect();
+    for (row, receded) in rows.iter_mut().zip(receded) {
+        row.receded_by_source = receded;
+    }
 }
 
 /// Rule 4 of [`classify`]: whether `session` is a source whose copy this
@@ -1510,6 +1567,126 @@ mod tests {
             vec![(WS, "a", true), (WS, "z", true), (OTHER, "b", true)]
         );
         assert_eq!((c.unreadable, c.hidden_sources), (0, 0));
+    }
+
+    // -- sources ------------------------------------------------------------
+
+    /// A shown session `name` whose summary names each of `sources`
+    /// (`prefix`, `name`, `session_id`).
+    fn naming(ws: &str, name: &str, id: &str, sources: &[(&str, &str, &str)]) -> ScannedSession {
+        let mut s = summary(ws, name, id, "s");
+        s.sources = sources
+            .iter()
+            .map(
+                |&(prefix, name, session_id)| crate::session::summary::SummarySource {
+                    relation: "imported".to_string(),
+                    prefix: prefix.to_string(),
+                    name: name.to_string(),
+                    session_id: session_id.to_string(),
+                },
+            )
+            .collect();
+        session(ws, name, SummaryRead::Read(Box::new(s)))
+    }
+
+    /// `(workspace, name, receded_by_source)` of each row.
+    fn receded(c: &Classified) -> Vec<(&str, &str, bool)> {
+        c.rows
+            .iter()
+            .map(|r| (r.workspace.as_str(), r.name.as_str(), r.receded_by_source))
+            .collect()
+    }
+
+    #[test]
+    fn sources_an_entry_recedes_only_the_row_it_names() {
+        let scan = [
+            naming(WS, "x", "x-id", &[(OTHER, "y", "y-id")]),
+            shown(OTHER, "y", "y-id"),
+            shown(OTHER, "z", "z-id"),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(
+            receded(&c),
+            vec![(WS, "x", false), (OTHER, "y", true), (OTHER, "z", false)]
+        );
+        // Receded, not hidden: Y is listed from its summary and not counted.
+        assert_eq!(names(&c)[1], (OTHER, "y", true));
+        assert_eq!((c.unreadable, c.hidden_sources), (0, 0));
+    }
+
+    #[test]
+    fn sources_an_entry_naming_itself_or_another_session_id_recedes_nothing() {
+        let scan = [
+            naming(WS, "x", "x-id", &[(WS, "x", "x-id"), (OTHER, "y", "not-y")]),
+            naming(WS, "w", "w-id", &[(WS, "w", "w-other-id")]),
+            shown(OTHER, "y", "y-id"),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert!(c.rows.iter().all(|r| !r.receded_by_source), "{c:?}");
+        assert_eq!((c.unreadable, c.hidden_sources), (0, 0));
+    }
+
+    #[test]
+    fn sources_an_entry_naming_a_local_session_leaves_it_to_its_local_row() {
+        let local = LocalView {
+            session_ids: ["mine-id".to_string()].into_iter().collect(),
+            ..LocalView::default()
+        };
+        let scan = [
+            naming(WS, "x", "x-id", &[(OTHER, "mine", "mine-id")]),
+            shown(OTHER, "mine", "mine-id"),
+        ];
+        let c = classify(&scan, &local, now());
+        assert_eq!(receded(&c), vec![(WS, "x", false)]);
+        assert_eq!(c.hidden_sources, 0);
+    }
+
+    #[test]
+    fn sources_never_hide_a_session_without_its_own_marker() {
+        let mut scan: Vec<ScannedSession> = (0..16)
+            .map(|i| {
+                naming(
+                    WS,
+                    &format!("x{i:02}"),
+                    &format!("x{i}-id"),
+                    &[(OTHER, "y", "y-id")],
+                )
+            })
+            .collect();
+        scan.push(shown(OTHER, "y", "y-id"));
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c.rows.len(), 17);
+        assert_eq!(c.hidden_sources, 0);
+        assert!(receded(&c).contains(&(OTHER, "y", true)));
+
+        // Only a marker in Y's own directory, naming a copy in the scan,
+        // hides it, and it is counted.
+        let mut y = shown(OTHER, "y", "y-id");
+        y.marker = Some(MigratedTo {
+            prefix: WS.to_string(),
+            session: "x00".to_string(),
+            session_id: Some("x0-id".to_string()),
+        });
+        *scan.last_mut().unwrap() = y;
+        let c = classify(&scan, &LocalView::default(), now());
+        assert_eq!(c.rows.len(), 16);
+        assert_eq!(c.hidden_sources, 1);
+    }
+
+    #[test]
+    fn sources_of_an_unreadable_or_stale_summary_recede_nothing() {
+        let mut stale = naming(WS, "x", "x-id", &[(OTHER, "y", "y-id")]);
+        if let SummaryRead::Read(s) = &mut stale.summary {
+            s.state_etag = "older".to_string();
+        }
+        let scan = [
+            stale,
+            session(WS, "u", SummaryRead::Unreadable("sources-cap")),
+            shown(OTHER, "y", "y-id"),
+        ];
+        let c = classify(&scan, &LocalView::default(), now());
+        assert!(c.rows.iter().all(|r| !r.receded_by_source), "{c:?}");
+        assert_eq!(c.unreadable, 2);
     }
 
     // -- failure classes ----------------------------------------------------

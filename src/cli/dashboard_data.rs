@@ -3,7 +3,7 @@
 //! Responsible for reading session state from disk and maintaining an
 //! up-to-date `SessionTree` via mtime-based incremental diffing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -148,6 +148,25 @@ pub mod liveness {
         attention_key(liveness, idle).0 == 3
     }
 
+    /// A session's attention key by `now`: [`attention_key`] of its liveness
+    /// and idle time, except that a remote row another remote summary names
+    /// as a source ([`CachedSession::receded_by_source`]) sits in the
+    /// receded band whatever its liveness, so it leaves the default view
+    /// and the needs-you band and shows with `--all` and the `a` key.
+    pub fn session_attention(session: &CachedSession, now: SystemTime) -> (u8, Reverse<Duration>) {
+        let idle = idle_for(session, now);
+        if session.receded_by_source {
+            return (3, Reverse(idle));
+        }
+        attention_key(classify_liveness(session, now), idle)
+    }
+
+    /// True when `session` is in the receded band by
+    /// [`session_attention`].
+    pub fn is_session_receded(session: &CachedSession, now: SystemTime) -> bool {
+        session_attention(session, now).0 == 3
+    }
+
     // `is_failed_state` now lives in `crate::engine::persistence` as the single
     // shared implementation (imported above); the `/workflows` projection
     // writer reuses the same function.
@@ -222,6 +241,10 @@ pub struct CachedSession {
     /// names, which a remote scan hides; `None` for a session never
     /// imported and for a remote row.
     pub imported_from: Option<ImportedSource>,
+    /// A remote row another remote row's summary names among its `sources`
+    /// ([`RemoteRow::receded_by_source`]): it recedes whatever its liveness
+    /// ([`liveness::session_attention`]). Always `false` for a local row.
+    pub receded_by_source: bool,
 }
 
 /// Hierarchical view of all sessions visible to the dashboard.
@@ -229,8 +252,15 @@ pub struct SessionTree {
     /// All sessions indexed by row key: the session name for a local row,
     /// `name@workspace` for a remote one ([`remote_key`]).
     pub sessions: HashMap<String, CachedSession>,
-    /// Names of root sessions (those with no parent, or whose parent is absent).
+    /// Names of root sessions: those with no parent, whose parent is absent,
+    /// or whose parent chain loops back to them ([`SessionTree::detached`]).
     pub roots: Vec<String>,
+    /// Row keys whose parent link is ignored because following it loops
+    /// back to the row: a session naming itself as its parent, or each of a
+    /// set of sessions naming each other. Each one is a root, and none is
+    /// another's child, so a forged parent can't make a row vanish or nest
+    /// without end.
+    pub detached: HashSet<String>,
     /// Count of session dirs whose header failed to parse on the last refresh.
     /// Surfaced as a trailing note (TUI) / count (`--once`) instead of dropping
     /// the sessions silently.
@@ -253,11 +283,28 @@ impl SessionTree {
         Self {
             sessions: HashMap::new(),
             roots: Vec::new(),
+            detached: HashSet::new(),
             unreadable: 0,
             remote_unreadable: 0,
             remote_hidden: 0,
             remote_failure: None,
         }
+    }
+
+    /// The row key the row `key` nests under: its [`parent_key`], unless
+    /// its parent chain loops back to it ([`SessionTree::detached`]).
+    pub fn parent_of(&self, key: &str, session: &CachedSession) -> Option<String> {
+        if self.detached.contains(key) {
+            return None;
+        }
+        parent_key(session)
+    }
+
+    /// Rebuild [`SessionTree::roots`] and [`SessionTree::detached`] from
+    /// the session map.
+    pub fn rebuild_roots(&mut self) {
+        self.detached = cyclic_keys(&self.sessions);
+        self.roots = rebuild_roots(&self.sessions, &self.detached);
     }
 }
 
@@ -436,6 +483,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             };
         }
     };
@@ -462,6 +510,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             };
         }
     };
@@ -502,6 +551,7 @@ pub fn read_session(path: &Path) -> CachedSession {
         workspace: None,
         remote: false,
         imported_from,
+        receded_by_source: false,
     }
 }
 
@@ -611,6 +661,7 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
                 workspace: Some(row.workspace.clone()),
                 remote: true,
                 imported_from: None,
+                receded_by_source: row.receded_by_source,
             };
         }
     };
@@ -641,6 +692,7 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
         workspace: Some(row.workspace.clone()),
         remote: true,
         imported_from: None,
+        receded_by_source: row.receded_by_source,
     }
 }
 
@@ -788,24 +840,64 @@ pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.remote_hidden = snapshot.hidden_sources;
     tree.remote_failure = snapshot.failure.clone();
     drop_shadowed_remote(tree);
-    tree.roots = rebuild_roots(&tree.sessions);
+    tree.rebuild_roots();
 }
 
 /// Rebuild the `roots` Vec from the current session map.
 ///
-/// A session is a root if it has no parent, or if its parent's row key
-/// ([`parent_key`]) is not present in the current session map.
-fn rebuild_roots(sessions: &HashMap<String, CachedSession>) -> Vec<String> {
+/// A session is a root if it has no parent, if its parent's row key
+/// ([`parent_key`]) is not present in the current session map, or if it is
+/// in `detached` ([`cyclic_keys`]), its parent chain looping back to it.
+fn rebuild_roots(
+    sessions: &HashMap<String, CachedSession>,
+    detached: &HashSet<String>,
+) -> Vec<String> {
     let mut roots: Vec<String> = sessions
         .iter()
-        .filter(|(_, cached)| match parent_key(cached) {
-            None => true,
-            Some(parent) => !sessions.contains_key(&parent),
+        .filter(|(key, cached)| {
+            detached.contains(key.as_str())
+                || match parent_key(cached) {
+                    None => true,
+                    Some(parent) => !sessions.contains_key(&parent),
+                }
         })
         .map(|(name, _)| name.clone())
         .collect();
     roots.sort();
     roots
+}
+
+/// The row keys whose parent chain loops back to themselves: a session
+/// whose parent is itself, and every member of a ring of sessions naming
+/// each other. A session merely nested under such a ring isn't one of them.
+///
+/// Every row names at most one parent, so walking each chain once, and
+/// stopping at a row an earlier walk already settled, finds every ring in
+/// time linear in the number of rows.
+fn cyclic_keys(sessions: &HashMap<String, CachedSession>) -> HashSet<String> {
+    let parent =
+        |key: &str| parent_key(sessions.get(key)?).filter(|parent| sessions.contains_key(parent));
+    let mut settled: HashSet<String> = HashSet::new();
+    let mut cyclic = HashSet::new();
+    for start in sessions.keys() {
+        let mut path: Vec<String> = Vec::new();
+        let mut on_path: HashMap<String, usize> = HashMap::new();
+        let mut at = Some(start.clone());
+        while let Some(key) = at {
+            if settled.contains(&key) {
+                break;
+            }
+            if let Some(&from) = on_path.get(&key) {
+                cyclic.extend(path[from..].iter().cloned());
+                break;
+            }
+            on_path.insert(key.clone(), path.len());
+            at = parent(&key);
+            path.push(key);
+        }
+        settled.extend(path);
+    }
+    cyclic
 }
 
 /// Refresh the session tree by scanning the backend and re-reading changed sessions.
@@ -841,7 +933,7 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
     // Rebuild roots whenever the session set changed (adds or removes).
     // Also rebuild if any mtime-changed session could have had its parent change.
     if session_set_changed || shadowed || !diff.changed.is_empty() {
-        tree.roots = rebuild_roots(&tree.sessions);
+        tree.rebuild_roots();
     }
 
     // Recompute the unreadable tally directly from the backend: sessions whose
@@ -1368,6 +1460,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1408,6 +1501,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1448,6 +1542,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1759,6 +1854,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1855,6 +1951,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
         sessions.insert(
@@ -1876,10 +1973,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 2);
         assert!(roots.contains(&"root-a".to_string()));
         assert!(roots.contains(&"root-b".to_string()));
@@ -1907,6 +2005,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
         sessions.insert(
@@ -1928,10 +2027,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 1);
         assert!(roots.contains(&"parent".to_string()));
         assert!(!roots.contains(&"child".to_string()));
@@ -1960,10 +2060,11 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
-        let roots = rebuild_roots(&sessions);
+        let roots = rebuild_roots(&sessions, &cyclic_keys(&sessions));
         assert_eq!(roots.len(), 1);
         assert!(roots.contains(&"orphan".to_string()));
     }
@@ -2069,6 +2170,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 
@@ -2260,6 +2362,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 
@@ -2330,6 +2433,7 @@ mod tests {
                 state_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
                 session_id: None,
             },
+            receded_by_source: false,
         }
     }
 
@@ -2388,6 +2492,7 @@ mod tests {
             workspace: WS_A.to_string(),
             name: hostile("n"),
             status: RowStatus::Shown(Box::new(summary)),
+            receded_by_source: false,
         };
         let s = remote_session(&row);
         assert_eq!(s.header.workflow, clean("n"));
@@ -2466,5 +2571,127 @@ mod tests {
         apply_snapshot(&mut tree, &RemoteSnapshot::default());
         assert!(tree.sessions.is_empty());
         assert_eq!(tree.remote_failure, None);
+    }
+
+    // -- forged parents and sources -------------------------------------------
+
+    /// A blocked remote row `name` under [`WS_A`] whose summary names
+    /// `parent`, shown from that summary.
+    fn shown_row(name: &str, parent: Option<&str>) -> RemoteRow {
+        RemoteRow {
+            workspace: WS_A.to_string(),
+            name: name.to_string(),
+            status: RowStatus::Shown(Box::new(crate::session::summary::SessionSummary {
+                schema: 1,
+                session_id: format!("sid-{name}"),
+                name: name.to_string(),
+                home: WS_A.to_string(),
+                kind: None,
+                parent: parent.map(str::to_string),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                template_name: Some("gated".to_string()),
+                current_state: Some("check".to_string()),
+                is_terminal: false,
+                is_blocked: true,
+                failed: false,
+                intent: None,
+                salient_var: None,
+                is_batch_task: false,
+                is_request_leg: false,
+                // Recent, so the blocked row sits in the needs-you band.
+                last_event_at: Some(crate::engine::types::now_iso8601()),
+                last_seq: 1,
+                state_etag: "e".to_string(),
+                machine: Some("machine-a".to_string()),
+                sources: Vec::new(),
+            })),
+            receded_by_source: false,
+        }
+    }
+
+    fn tree_of(rows: Vec<RemoteRow>) -> SessionTree {
+        let mut tree = SessionTree::new();
+        apply_snapshot(
+            &mut tree,
+            &RemoteSnapshot {
+                rows,
+                ..RemoteSnapshot::default()
+            },
+        );
+        tree
+    }
+
+    #[test]
+    fn dashboard_data_a_parent_naming_itself_leaves_the_row_a_root() {
+        let tree = tree_of(vec![shown_row("loop", Some("loop"))]);
+        let key = remote_key("loop", WS_A);
+        assert_eq!(tree.roots, vec![key.clone()]);
+        assert!(tree.detached.contains(&key));
+        let s = &tree.sessions[&key];
+        assert_eq!(tree.parent_of(&key, s), None, "no one's child");
+        assert_eq!(s.header.parent_workflow.as_deref(), Some("loop"));
+    }
+
+    #[test]
+    fn dashboard_data_two_parents_naming_each_other_leave_both_roots() {
+        let tree = tree_of(vec![
+            shown_row("ping", Some("pong")),
+            shown_row("pong", Some("ping")),
+            // Nested under one of the ring: a child, not a ring member.
+            shown_row("leaf", Some("ping")),
+            // A longer ring of three.
+            shown_row("r1", Some("r2")),
+            shown_row("r2", Some("r3")),
+            shown_row("r3", Some("r1")),
+        ]);
+        let k = |name: &str| remote_key(name, WS_A);
+        let mut roots = vec![k("ping"), k("pong"), k("r1"), k("r2"), k("r3")];
+        roots.sort();
+        assert_eq!(tree.roots, roots);
+        let leaf = &tree.sessions[&k("leaf")];
+        assert_eq!(tree.parent_of(&k("leaf"), leaf), Some(k("ping")));
+        assert!(!tree.detached.contains(&k("leaf")));
+    }
+
+    #[test]
+    fn dashboard_data_a_parent_cycle_shows_every_row_and_expands_without_end() {
+        use crate::cli::dashboard_state::DashboardAppState;
+        let mut state = DashboardAppState::new(500);
+        state.tree = tree_of(vec![
+            shown_row("loop", Some("loop")),
+            shown_row("ping", Some("pong")),
+            shown_row("pong", Some("ping")),
+            shown_row("leaf", Some("ping")),
+        ]);
+        let k = |name: &str| remote_key(name, WS_A);
+        for key in state.tree.sessions.keys() {
+            state.expanded.insert(key.clone());
+        }
+        let mut shown: Vec<String> = state
+            .visible_rows()
+            .into_iter()
+            .map(|r| r.session_id)
+            .collect();
+        shown.sort();
+        let mut want = vec![k("leaf"), k("loop"), k("ping"), k("pong")];
+        want.sort();
+        assert_eq!(shown, want, "each row once, the leaf under its parent");
+    }
+
+    #[test]
+    fn dashboard_data_a_row_named_as_a_source_recedes_whatever_its_liveness() {
+        use super::liveness::{is_session_receded, session_attention};
+        let now = SystemTime::now();
+        let mut row = shown_row("y", None);
+        let blocked = remote_session(&row);
+        assert_eq!(session_attention(&blocked, now).0, 0, "needs-you");
+        row.receded_by_source = true;
+        let named = remote_session(&row);
+        assert!(named.receded_by_source);
+        assert_eq!(
+            classify_liveness(&named, now),
+            liveness::Liveness::NeedsYouBlocked
+        );
+        assert!(is_session_receded(&named, now));
     }
 }

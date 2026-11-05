@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, buffer::Buffer, Terminal};
 
-use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
+use crate::cli::dashboard_data::liveness::{idle_for, session_attention};
 use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
@@ -211,14 +211,17 @@ fn run_once(
 
         let liveness = classify_liveness(session, now);
         let idle = idle_for(session, now);
+        // A remote row another remote summary names as a source sits in
+        // the receded band whatever its liveness.
+        let band = session_attention(session, now).0;
 
         // Default excludes the receded set unless --all.
-        if !args.all && is_receded(liveness, idle) {
+        if !args.all && band == 3 {
             continue;
         }
 
         // --needs-you: only the needs-you band.
-        if args.needs_you && attention_key(liveness, idle).0 != 0 {
+        if args.needs_you && band != 0 {
             continue;
         }
 
@@ -235,8 +238,8 @@ fn run_once(
     // Attention order; tie-break on session id, then workspace, for
     // determinism.
     rows.sort_by(|a, b| {
-        attention_key(a.2, a.3)
-            .cmp(&attention_key(b.2, b.3))
+        session_attention(a.1, now)
+            .cmp(&session_attention(b.1, now))
             .then_with(|| a.0.cmp(b.0))
             .then_with(|| a.1.workspace.cmp(&b.1.workspace))
     });
@@ -993,6 +996,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 

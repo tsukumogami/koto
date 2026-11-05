@@ -2444,3 +2444,551 @@ fn a_malformed_summary_reads_unknown_with_none_of_its_text() {
         out.stderr
     );
 }
+
+/// A second planted workspace prefix.
+const NAMED: &str = "00000000000000bb";
+
+/// A summary's `sources` entry naming `name` under `prefix` by `session_id`.
+fn source_entry(prefix: &str, name: &str, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "relation": "imported",
+        "prefix": prefix,
+        "name": name,
+        "session_id": session_id,
+    })
+}
+
+/// The stderr lines counting hidden sources.
+fn hidden_notes(out: &Out) -> Vec<&str> {
+    out.stderr
+        .lines()
+        .filter(|l| l.contains("hidden source(s)"))
+        .collect()
+}
+
+/// Press `code` on `state`, as the loop hands it a key.
+fn press(state: &mut DashboardAppState, code: KeyCode) {
+    state.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+/// The index of the first of `lines` holding `needle`.
+fn line_at(lines: &[String], needle: &str) -> Option<usize> {
+    lines.iter().position(|l| l.contains(needle))
+}
+
+/// Plan step 7, criterion 9: a `sources` entry in X's summary naming Y by
+/// `session_id` takes Y out of the default `--once`, `--needs-you` and the
+/// TUI's needs-you band; Y still prints with its own state under `--all`
+/// and shows after the `a` key, X is listed as before, and nothing is
+/// counted hidden or unknown.
+#[test]
+fn a_sources_entry_only_recedes_the_row_it_names() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    plant(&s3, PLANTED, "x", |s| {
+        s["intent"] = "intent-x".into();
+        s["sources"] = serde_json::json!([source_entry(NAMED, "y", "sid-y")]);
+    });
+    plant(&s3, NAMED, "y", |s| s["intent"] = "intent-y".into());
+
+    for args in [&[][..], &["--needs-you"][..]] {
+        let out = once_on(&s3, &b, args);
+        let rows = out.rows();
+        let x = row_of(&rows, "x", PLANTED).unwrap_or_else(|| panic!("{args:?}: {rows:?}"));
+        assert_eq!(
+            (x[1].as_str(), x[3].as_str(), x[4].as_str(), x[8].as_str()),
+            ("check", "blocked", "intent-x", "machine-a"),
+            "{args:?}: {x:?}"
+        );
+        assert!(row_of(&rows, "y", NAMED).is_none(), "{args:?}: {rows:?}");
+        assert_eq!(rows.len(), 1, "{args:?}: {rows:?}");
+        assert!(hidden_notes(&out).is_empty(), "{args:?}: {}", out.stderr);
+        assert!(!out.stderr.contains("unknown"), "{args:?}: {}", out.stderr);
+    }
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let y = row_of(&rows, "y", NAMED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(y.len(), 10, "{y:?}");
+    assert_eq!(
+        (y[1].as_str(), y[3].as_str(), y[4].as_str(), y[8].as_str()),
+        ("check", "blocked", "intent-y", "machine-a"),
+        "Y with its own state, not unknown: {y:?}"
+    );
+    let x = row_of(&rows, "x", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!((x[3].as_str(), x[4].as_str()), ("blocked", "intent-x"));
+    assert!(hidden_notes(&out).is_empty(), "{}", out.stderr);
+    assert!(!out.stderr.contains("unknown"), "{}", out.stderr);
+
+    // The interactive dashboard, its feed on a short interval: Y's row is
+    // held but not drawn, and nothing is counted.
+    let y_key = dashboard_data::remote_key("y", NAMED);
+    drive_tui(&s3, &b, &mut |lines, state| {
+        if !(state.tree.sessions.contains_key(&y_key) && line_at(lines, "intent-x").is_some()) {
+            return false;
+        }
+        assert!(line_at(lines, "intent-y").is_none(), "{lines:#?}");
+        assert_eq!(
+            (state.tree.remote_hidden, state.tree.remote_unreadable),
+            (0, 0)
+        );
+        assert!(!lines.iter().any(|l| l.contains("hidden source")));
+        true
+    });
+
+    // The needs-you band holds X only; the `a` key brings Y back, in the
+    // receded band after it.
+    let mut tui = TuiView::scan(&s3, &b);
+    tui.state.show_receded = false;
+    let rows: Vec<String> = tui
+        .state
+        .visible_rows()
+        .into_iter()
+        .map(|r| r.session_id)
+        .collect();
+    assert_eq!(rows, vec![dashboard_data::remote_key("x", PLANTED)]);
+    let lines = tui.draw(None, 110, 20);
+    assert!(line_at(&lines, "intent-x").is_some(), "{lines:#?}");
+    assert!(line_at(&lines, "intent-y").is_none(), "{lines:#?}");
+    press(&mut tui.state, KeyCode::Char('a'));
+    let lines = tui.draw(None, 110, 20);
+    let (x_at, y_at) = (line_at(&lines, "intent-x"), line_at(&lines, "intent-y"));
+    assert!(x_at.is_some() && y_at > x_at, "{lines:#?}");
+    let y_line = &lines[y_at.unwrap()];
+    assert!(
+        y_line.contains("@machine-a") && y_line.contains("check"),
+        "{y_line:?}"
+    );
+}
+
+/// Plan step 7, criterion 10: an entry naming a session B holds locally,
+/// one naming its own summary's session and one with Y's prefix and name
+/// but another `session_id` recede nothing; a session many summaries name
+/// stays listed with no marker of its own; a forged marker in a session's
+/// own directory, naming a copy in the same scan, hides it, counted on the
+/// tally line and in the stderr note.
+#[test]
+fn a_sources_entry_recedes_no_local_self_or_other_id_row_and_only_a_marker_hides() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    b.start_blocked("mine");
+    let wb = b.workspace();
+    let pushed = s3.object(&key_of(&wb, "mine", "summary.json")).unwrap();
+    let pushed: serde_json::Value = serde_json::from_slice(&pushed).unwrap();
+    let mine_id = pushed["session_id"].as_str().unwrap().to_string();
+    let sources = |entries: Vec<serde_json::Value>| serde_json::Value::Array(entries);
+    plant(&s3, PLANTED, "x-local", |s| {
+        s["sources"] = sources(vec![source_entry(&wb, "mine", &mine_id)]);
+    });
+    plant(&s3, PLANTED, "x-self", |s| {
+        s["sources"] = sources(vec![source_entry(PLANTED, "x-self", "sid-x-self")]);
+    });
+    plant(&s3, PLANTED, "x-other-id", |s| {
+        s["sources"] = sources(vec![source_entry(NAMED, "y", "not-sid-y")]);
+    });
+    plant(&s3, NAMED, "y", |_| {});
+    // Named by five summaries, with no marker of its own.
+    for i in 0..5 {
+        plant(&s3, PLANTED, &format!("n{i}"), |s| {
+            s["sources"] = sources(vec![source_entry(NAMED, "w", "sid-w")]);
+        });
+    }
+    plant(&s3, NAMED, "w", |_| {});
+    // A forged marker in h's own directory, naming a copy in the scan.
+    plant(&s3, NAMED, "h", |_| {});
+    plant(&s3, PLANTED, "h-copy", |_| {});
+    let marker = serde_json::json!({
+        "schema": 1,
+        "target": {
+            "session": "h-copy",
+            "session_id": "sid-h-copy",
+            "workspace": "/elsewhere",
+            "prefix": PLANTED,
+        },
+        "machine_id": "m",
+        "migrated_at": "2026-10-31T00:00:00Z",
+    });
+    s3.put(
+        &key_of(NAMED, "h", "migrated.json"),
+        marker.to_string().as_bytes(),
+    );
+
+    let out = once_on(&s3, &b, &[]);
+    let rows = out.rows();
+    let mine = rows_named(&rows, "mine");
+    assert_eq!(mine.len(), 1, "B's local row once: {rows:?}");
+    assert_eq!(
+        (mine[0][1].as_str(), mine[0][8].as_str()),
+        ("check", "machine-b")
+    );
+    assert_eq!(mine[0][9], wb, "{rows:?}");
+    for (name, ws) in [
+        ("x-local", PLANTED),
+        ("x-self", PLANTED),
+        ("x-other-id", PLANTED),
+        ("y", NAMED),
+        ("h-copy", PLANTED),
+    ] {
+        let row = row_of(&rows, name, ws).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(row[3], "blocked", "{name}: {row:?}");
+    }
+    assert!(row_of(&rows, "w", NAMED).is_none(), "w recedes: {rows:?}");
+    assert!(row_of(&rows, "h", NAMED).is_none(), "h is hidden: {rows:?}");
+    assert_eq!(
+        hidden_notes(&out),
+        vec!["note: 1 hidden source(s): imported into a copy that is listed"],
+        "{}",
+        out.stderr
+    );
+
+    let out = once_on(&s3, &b, &["--all"]);
+    let rows = out.rows();
+    let w = row_of(&rows, "w", NAMED).unwrap_or_else(|| panic!("w stays listed: {rows:?}"));
+    assert_eq!((w[1].as_str(), w[3].as_str()), ("check", "blocked"));
+    assert!(row_of(&rows, "h", NAMED).is_none(), "{rows:?}");
+    assert_eq!(rows_named(&rows, "mine").len(), 1, "{rows:?}");
+    assert_eq!(hidden_notes(&out).len(), 1, "{}", out.stderr);
+
+    let (h_key, w_key) = (
+        dashboard_data::remote_key("h", NAMED),
+        dashboard_data::remote_key("w", NAMED),
+    );
+    drive_tui(&s3, &b, &mut |lines, state| {
+        state.tree.remote_hidden == 1
+            && lines.iter().any(|l| l.contains("1 hidden source(s)"))
+            && state.tree.sessions.contains_key(&w_key)
+            && !state.tree.sessions.contains_key(&h_key)
+            && state.tree.sessions.contains_key("mine")
+    });
+}
+
+/// Plan step 7, criterion 11: a summary with 17 `sources` entries prints as
+/// `unknown`, counted, and recedes nothing; one with 16 shows from its
+/// summary.
+#[test]
+fn a_summary_with_17_sources_reads_unknown_and_recedes_nothing() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let entries = |target: &str, n: usize| {
+        let mut all = vec![source_entry(NAMED, target, &format!("sid-{target}"))];
+        all.extend(
+            (1..n).map(|i| source_entry(PLANTED, &format!("gone{i}"), &format!("sid-gone{i}"))),
+        );
+        serde_json::Value::Array(all)
+    };
+    plant(&s3, PLANTED, "seventeen", |s| {
+        s["intent"] = "leaked from seventeen".into();
+        s["sources"] = entries("t17", 17);
+    });
+    plant(&s3, PLANTED, "sixteen", |s| {
+        s["intent"] = "intent-16".into();
+        s["sources"] = entries("t16", 16);
+    });
+    plant(&s3, NAMED, "t17", |_| {});
+    plant(&s3, NAMED, "t16", |_| {});
+
+    let out = once_on(&s3, &b, &[]);
+    let rows = out.rows();
+    assert_unknown_row(&rows, "seventeen");
+    assert!(!out.stdout.contains("leaked"), "{}", out.stdout);
+    assert!(out.stderr.contains(&unknown_tally(1)), "{}", out.stderr);
+    let sixteen = row_of(&rows, "sixteen", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(
+        (
+            sixteen[1].as_str(),
+            sixteen[3].as_str(),
+            sixteen[4].as_str()
+        ),
+        ("check", "blocked", "intent-16"),
+        "{sixteen:?}"
+    );
+    let t17 = row_of(&rows, "t17", NAMED).unwrap_or_else(|| panic!("nothing receded: {rows:?}"));
+    assert_eq!(t17[3], "blocked", "{t17:?}");
+    assert!(row_of(&rows, "t16", NAMED).is_none(), "{rows:?}");
+
+    let rows = once_on(&s3, &b, &["--all"]).rows();
+    assert!(row_of(&rows, "t16", NAMED).is_some(), "{rows:?}");
+}
+
+/// Plan step 7, criterion 12: a summary whose `parent` names itself, and
+/// two whose parents name each other, show each row in B's TUI, as they do
+/// in `--once`.
+#[test]
+fn a_parent_cycle_still_shows_each_row_in_the_tui_as_in_once() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    for (name, parent) in [("loop", "loop"), ("ping", "pong"), ("pong", "ping")] {
+        plant(&s3, PLANTED, name, |s| {
+            s["parent"] = parent.into();
+            s["intent"] = format!("i-{name}").into();
+        });
+    }
+    let intents = ["i-loop", "i-ping", "i-pong"];
+
+    let out = once_on(&s3, &b, &[]);
+    let rows = out.rows();
+    assert_eq!(rows.len(), 3, "{}", out.describe());
+    for name in ["loop", "ping", "pong"] {
+        let row = row_of(&rows, name, PLANTED).unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(
+            (row[1].as_str(), row[3].as_str()),
+            ("check", "blocked"),
+            "{row:?}"
+        );
+        assert_eq!(row[4], format!("i-{name}"));
+    }
+
+    drive_tui(&s3, &b, &mut |lines, state| {
+        state.tree.sessions.len() == 3
+            && intents.iter().all(|i| line_at(lines, i).is_some())
+            && (state.tree.remote_hidden, state.tree.remote_unreadable) == (0, 0)
+    });
+
+    // Each row once, expanded or not.
+    let mut tui = TuiView::scan(&s3, &b);
+    tui.state.show_receded = false;
+    for expand in [false, true] {
+        if expand {
+            let keys: Vec<String> = tui.state.tree.sessions.keys().cloned().collect();
+            tui.state.expanded.extend(keys);
+        }
+        let lines = tui.draw(None, 110, 20);
+        for intent in intents {
+            assert_eq!(
+                lines.iter().filter(|l| l.contains(intent)).count(),
+                1,
+                "{intent}, expanded {expand}: {lines:#?}"
+            );
+        }
+    }
+}
+
+/// Every path under `dir`, depth first; empty when it doesn't exist.
+fn paths_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        out.push(path.clone());
+        if path.is_dir() {
+            out.extend(paths_under(&path));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The log read nothing but listings of the top level and of `ws`, and
+/// GETs of `name`'s own `summary.json` and `migrated.json`; no write.
+fn assert_reads_only_its_own(s3: &FakeS3, ws: &str, name: &str) {
+    assert_read_only(s3);
+    let own = [
+        key_of(ws, name, "summary.json"),
+        key_of(ws, name, "migrated.json"),
+    ];
+    for r in s3.requests() {
+        match &r.list_prefix {
+            Some(prefix) => assert!(
+                prefix.is_empty() || *prefix == format!("{ws}/"),
+                "only the top level and {ws}/ are listed: {r:?}"
+            ),
+            None => assert!(own.contains(&r.key), "only its own objects: {r:?}"),
+        }
+    }
+}
+
+/// Input that presses `keys` one at a time once the log is `ready`, each
+/// after the frame drawn for the one before it.
+struct Presses {
+    keys: Vec<KeyCode>,
+    log: Arc<Mutex<PressLog>>,
+}
+
+#[derive(Default)]
+struct PressLog {
+    ready: bool,
+    pressed: usize,
+    awaiting: bool,
+    /// The frame drawn after each press.
+    frames: Vec<Vec<String>>,
+}
+
+impl EventSource for Presses {
+    fn next_event(&mut self, timeout: Duration) -> std::io::Result<Option<Event>> {
+        let mut log = self.log.lock().unwrap();
+        if log.ready && !log.awaiting && log.pressed < self.keys.len() {
+            let code = self.keys[log.pressed];
+            log.pressed += 1;
+            log.awaiting = true;
+            return Ok(Some(key(code)));
+        }
+        drop(log);
+        std::thread::sleep(timeout);
+        Ok(None)
+    }
+}
+
+/// Plan step 7, criterion 13: a `migrated.json` and a `parent` holding a
+/// parent-directory path cause no GET outside the session's own summary
+/// and marker, no file or directory in B's session store and no write;
+/// Enter, Tab, `r`, `a`, `j` and `k` on the remote row add no write and
+/// nothing to the store, and show only the Session tab's facts and the
+/// other tabs' one line.
+#[test]
+fn a_path_in_a_marker_or_parent_reads_and_writes_nothing_else() {
+    let s3 = FakeS3::start(BUCKET);
+    let b = Machine::new(&s3, "machine-b");
+    let up = ["..", "..", "x"].join("/");
+    plant(&s3, PLANTED, "esc", |s| {
+        s["parent"] = up.clone().into();
+        s["intent"] = "i-esc".into();
+    });
+    let marker = serde_json::json!({
+        "schema": 1,
+        "target": {"session": up, "session_id": up, "workspace": up, "prefix": up},
+        "machine_id": up,
+        "migrated_at": "2026-10-31T00:00:00Z",
+    });
+    s3.put(
+        &key_of(PLANTED, "esc", "migrated.json"),
+        marker.to_string().as_bytes(),
+    );
+    let root = b.home.parent().unwrap().to_path_buf();
+    let store = paths_under(&b.sessions());
+    let no_x = |paths: &[PathBuf]| {
+        let found: Vec<_> = paths
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "x"))
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+    };
+
+    let out = once_on(&s3, &b, &["--all"]);
+    assert_reads_only_its_own(&s3, PLANTED, "esc");
+    assert_eq!(
+        gets_of(&s3, &key_of(PLANTED, "esc", "migrated.json")).len(),
+        1,
+        "the marker was read"
+    );
+    let rows = out.rows();
+    assert_eq!(rows.len(), 1, "{}", out.describe());
+    let esc = row_of(&rows, "esc", PLANTED).unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!((esc[3].as_str(), esc[4].as_str()), ("blocked", "i-esc"));
+    assert!(hidden_notes(&out).is_empty(), "{}", out.stderr);
+    assert_eq!(paths_under(&b.sessions()), store, "nothing in B's store");
+    no_x(&paths_under(&root));
+
+    // The interactive dashboard, with the Session tab's loader on the
+    // bucket as `koto dashboard` builds it.
+    s3.clear_requests();
+    let before = paths_under(&root);
+    let (local, tree) = local_rows(&b);
+    let bucket = bucket_at(&s3.endpoint());
+    let feed = RemoteFeed::spawn(
+        &bucket,
+        dashboard_data::local_view(&tree),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let cloud = koto::session::cloud::CloudBackend::with_parts(
+        LocalBackend::with_base_dir(b.sessions()),
+        bucket,
+        b.workspace(),
+    );
+    let loader = SessionLoader::spawn(Arc::new(koto::session::Backend::Cloud(cloud))).unwrap();
+    let mut state = DashboardAppState::new(500);
+    state.tree = tree;
+    let mut sources = LoopSources {
+        refresh_local: Box::new(move |tree| dashboard_data::refresh(tree, &local)),
+        feed: Some(feed),
+        sessions: Some(loader),
+    };
+    use KeyCode::{Char, Enter, Tab};
+    let keys = vec![
+        Char('j'),
+        Enter,
+        Tab,
+        Tab,
+        Tab,
+        Char('r'),
+        Char('a'),
+        Char('j'),
+        Char('k'),
+        Enter,
+    ];
+    let count = keys.len();
+    let log = Arc::new(Mutex::new(PressLog::default()));
+    let mut input = Presses {
+        keys,
+        log: Arc::clone(&log),
+    };
+    let remote = dashboard_data::remote_key("esc", PLANTED);
+    let shutdown = AtomicBool::new(false);
+    let started = Instant::now();
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    run_loop(
+        &mut terminal,
+        &mut state,
+        &mut sources,
+        &mut input,
+        &SystemClock,
+        &shutdown,
+        &mut |_, buffer, state| {
+            let mut log = log.lock().unwrap();
+            let lines = buffer_lines(buffer);
+            if log.awaiting {
+                log.frames.push(lines);
+                log.awaiting = false;
+                if log.frames.len() == count {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
+            } else if !log.ready
+                && state.tree.sessions.contains_key(&remote)
+                && line_at(&lines, "i-esc").is_some()
+            {
+                log.ready = true;
+            }
+            if started.elapsed() > Duration::from_secs(60) {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+        },
+    )
+    .unwrap();
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.frames.len(), count, "every key drew a frame");
+    let one_line = "This session's detail lives on its own machine, machine-a.";
+    let workspace = format!("Workspace: {PLANTED}");
+    let session_facts = [
+        "Machine: machine-a",
+        workspace.as_str(),
+        "Session: esc",
+        "State: check",
+        "Intent: i-esc",
+        "Session id: sid-esc",
+        "Context keys and history live on that machine.",
+    ];
+    // After Enter (Summary), then History and Remaining: the one line.
+    for (i, tab) in [(1, "Summary"), (2, "History"), (3, "Remaining")] {
+        let text = log.frames[i].join("\n");
+        assert!(text.contains(one_line), "{tab}: {text}");
+        assert!(!text.contains("Session id:"), "{tab}: {text}");
+    }
+    // The Session tab, then r, a, j, k and Enter on it: its facts only.
+    for (i, frame) in log.frames.iter().enumerate().skip(4) {
+        let text = frame.join("\n");
+        for fact in session_facts {
+            assert!(text.contains(fact), "frame {i}: {fact:?} in {text}");
+        }
+        assert!(!text.contains(one_line), "frame {i}: {text}");
+        assert!(!text.contains("Loading session"), "frame {i}: {text}");
+    }
+    assert_reads_only_its_own(&s3, PLANTED, "esc");
+    let after = paths_under(&root);
+    assert_eq!(after, before, "nothing written under B's root");
+    assert_eq!(paths_under(&b.sessions()), store, "nothing in B's store");
+    no_x(&after);
+}

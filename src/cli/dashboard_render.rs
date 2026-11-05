@@ -1257,6 +1257,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
 
@@ -1550,6 +1551,7 @@ mod tests {
                 workspace: None,
                 remote: false,
                 imported_from: None,
+                receded_by_source: false,
             },
         );
         state.tree.roots = vec!["my-workflow".to_string()];
@@ -1839,6 +1841,7 @@ mod tests {
             workspace: None,
             remote: false,
             imported_from: None,
+            receded_by_source: false,
         }
     }
 
@@ -2957,6 +2960,7 @@ mod tests {
                 machine: Some("machine-b".to_string()),
                 sources: Vec::new(),
             })),
+            receded_by_source: false,
         };
         crate::cli::dashboard_data::apply_snapshot(
             &mut state.tree,
