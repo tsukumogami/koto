@@ -7,10 +7,10 @@ problem: |
   wait grows with every workspace that ever pushed to the bucket, so a caller
   that checks a few names under a short timeout never gets an answer.
 outcome: |
-  Someone asking koto about a name no session has gets the not-found answer in
-  about the time a read of an existing session takes, however many workspaces
-  share the bucket, and every other answer koto gives for a name with no local
-  copy, the `session_unlocated` refusal included, stays exactly as it is.
+  By default nothing a caller sees changes. A bucket's owner can choose to trust
+  a fast answer, and there a name no session has reads not-found in about the
+  time an existing session takes, however many workspaces share the bucket, at
+  the accepted cost that a session only an older release made may read absent.
 ---
 
 # BRIEF: Cloud missing-session lookup
@@ -40,7 +40,7 @@ with no copy on this host and no state under this directory's prefix, koto
 asks whether any other directory's prefix in the bucket holds it
 (`CloudBackend::check_located` and `held_elsewhere` in
 `src/session/cloud.rs`). That question costs a listing per workspace prefix
-the bucket has ever had, and every clone, instance and worktree that pushed a
+the bucket has ever had, and every clone or worktree directory that pushed a
 session adds a prefix. On a healthy bucket the not-found answer gets slower as
 the bucket ages; on a degraded one, as koto#597's was, every one of those
 listings can also wait out retries.
@@ -57,55 +57,66 @@ whatever answers the question faster has to stay right while they do.
 
 ## User Outcome
 
-A person or script working against a shared cloud bucket asks koto about a
-name, and when no session has that name, hears so in roughly the time an
-existing session takes to read. That holds on a bucket many workspaces have
-used for months, not only on a fresh one. A caller that probes several names
-under a short timeout finishes.
+The fast answer and the unchanged replies pull against each other. While
+older koto releases may still create sessions in a bucket, a fast "no one
+holds this name" can't always be told apart from a session one of them made,
+so the outcome has two halves, and the choice between them belongs to the
+person who owns the bucket.
 
-Nothing else they rely on moves. A session another directory holds still
-refuses with `session_unlocated` and `no_local_copy`; a bucket that answers
-but can't be read in full still gets "koto can't tell" rather than a guess; a
-host that can't reach the bucket still reads a fresh name as absent. A bucket
-shared with older koto releases keeps working for both.
+By default, nothing a caller sees changes, the time a not-found takes
+included. A session another directory holds still refuses with
+`session_unlocated` and `no_local_copy`; a bucket that answers but can't be
+read in full still gets "koto can't tell" rather than a guess; a host that
+can't reach the bucket still reads a fresh name as absent. A bucket shared
+with older releases keeps working for both.
 
-Where the fast answer and the unchanged replies pull against each other, the
-replies win. While older releases may still create sessions in a bucket, a
-fast not-found can't always be told apart from a session one of them made, and
-the brief doesn't ask the design to guess; how the design settles that, and
-who decides when a bucket can trust the fast answer, is the design's call.
+On a bucket whose owner has chosen to trust the fast answer, a person or
+script asking koto about a name no session has hears so in roughly the time an
+existing session takes to read, and that holds on a bucket many workspaces
+have used for months, not only on a fresh one. A caller that probes several
+names under a short timeout finishes. The cost the owner accepts with that
+choice is narrow and visible: a session that only an older release has
+touched may read as absent from other directories for a while, until the
+bucket is checked again, and the owner can go back to the default at any
+time.
 
 ## User Journeys
 
 ### Probe several names under a timeout
 
 A script that coordinates koto sessions checks whether each of four names
-exists before deciding which to create, with a 30-second limit on the whole
-check. Trigger: some of the names have no session yet. Outcome shape: each
-missing name answers not-found in about the time an existing one takes, and
-the script finishes inside its limit.
+exists, one after another, behind a 30-second timeout, against a bucket whose
+owner has chosen to trust the fast answer.
+Trigger: some of the names have no session yet. Outcome shape: each missing
+name answers not-found in about the time an existing one takes, and the
+script finishes inside its limit. On a bucket left at the default, the script
+sees today's timings.
 
 ### Name a session from the wrong directory
 
 A developer runs `koto status` on a session from a directory other than the
 one it was created in, on a host that has no copy of it. Trigger: the command
 reaches the bucket and finds no state under this directory's prefix. Outcome
-shape: koto still refuses with `session_unlocated`, reason `no_local_copy`,
-naming the prefix, exactly as before; the faster not-found path never answers
-this case as absent.
+shape: koto refuses with `session_unlocated`, reason `no_local_copy`, naming
+this directory's prefix, exactly as before, on a bucket at the default and on
+one that trusts the fast answer alike, for any session a current release has
+created or written.
 
 ### Share a bucket with an older koto
 
 A team runs a mix of koto releases against one bucket while hosts upgrade at
 their own pace. Trigger: a host on an older release creates a session that a
-newer host then looks up by name. Outcome shape: the newer host still finds
-that the session is held elsewhere and refuses as before, and the older host
-sees nothing new that it misreads.
+newer host then looks up by name. Outcome shape: on a bucket at the default,
+the newer host still finds that the session is held elsewhere and refuses as
+before. On a bucket whose owner chose the fast answer, that session may read
+as absent from other directories until the bucket is checked again, which is
+the cost the owner accepted. Either way the older host sees nothing new that
+it misreads.
 
 ### Look up a name on a degraded bucket
 
-An operator's bucket is throttling and resetting connections, as koto#597's
-was. Trigger: a command names a session no one has, on a bucket where the fast
+An operator's bucket is timing out listings and resetting connections, as
+koto#597's was. Trigger: a command names a session no one has, on a bucket where the fast
 answer can be trusted. Outcome shape: the answer is still slower than on a
 healthy bucket, but the wait no longer multiplies by the number of workspace
 prefixes the bucket holds.
@@ -118,10 +129,11 @@ prefixes the bucket holds.
   host and no state under this directory's prefix, whether another prefix
   holds it, and what that costs in requests as the bucket gains prefixes.
 - Keeping every reply that case can get today, `session_unlocated` /
-  `no_local_copy`, "can't tell" and absent-when-unreachable included.
+  `no_local_copy`, "can't tell" and absent-when-unreachable included, on
+  every bucket at the default.
+- The bucket owner's choice to trust the fast answer, and the one reply
+  change that choice accepts for sessions only an older release has touched.
 - Buckets written by a mix of koto releases.
-- Anything koto has to write when a session copy is created so that the
-  lookup can be cheap later.
 
 **Out:**
 
@@ -129,10 +141,9 @@ prefixes the bucket holds.
   lookup.
 - The sweeps that follow continues links and back-references between
   sessions; they have their own issues.
-- Changing any reply, or the `session_unlocated` body callers parse, to make
-  the answer faster.
-- How long koto waits on a single request, and how often it retries one: the
-  lookup asks fewer requests, it doesn't change the retry policy.
+- Changing any reply on a bucket at the default, or the `session_unlocated`
+  body callers parse, to make the answer faster.
+- How long koto waits on a single request, and how often it retries one.
 - Making a degraded bucket itself faster.
 
 ## References
