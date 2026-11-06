@@ -238,7 +238,8 @@ Request counts for a not-found on a name with no local copy:
 | Hit through the index, either mode | 4, plus the top-level listing on an undeclared bucket | 3 | 4 or 5 |
 
 A name with `K` leftover entries adds `K` confirming listings on a declared
-bucket, in `ceil(K / 64)` round trips. The unreachable-bucket case is
+bucket, in `ceil(K / 64)` round trips, up to a cap past which the lookup
+runs the exact sweep instead. The unreachable-bucket case is
 unchanged: the own-prefix probe fails without an answer and nothing else is
 asked.
 
@@ -533,7 +534,10 @@ bucket, the last declaration answer and when it was read. "Declared" at any
 age means the lookup skips the top-level listing; "declared" younger than
 `check_window_secs` (default 5) also skips the GET. A GET that fails without
 an answer keeps the last value for the lookup, so a degraded declared bucket
-stays on the bounded path. A 404 or an invalid body clears it at once, and a
+stays on the bounded path, but only for 10 minutes after the last read that
+did answer; past that, lookups fall back to the exact sweep until a read
+answers again, so a host that can't read the declaration can't keep acting
+on it long after a revoke. A 404 or an invalid body clears it at once, and a
 lookup that finds the declaration gone starts the top-level listing then, at
 one round trip more. Write paths never act on a carried value. The window
 reuses the setting the guide already documents for sharing checks between
@@ -640,11 +644,21 @@ index, and the declaration type:
   each listed key, keeps only results that pass `is_workspace_prefix` with
   nothing after them, drops `own`, and de-duplicates. Anything else in the
   listing is ignored.
-- `Declaration`, read with a 4 KiB cap and parsed strictly: a body that is
-  larger, isn't JSON, or lacks a required field reads as undeclared. Fields:
-  `version` (1), `declared_at`, `machine`, `first_release` (informational),
-  and `audit` (`started_at`, `finished_at`, `prefixes`, `sessions`,
-  `entries_written`, `entries_pruned`).
+- `Declaration`, read with a 4 KiB cap on the bytes read (a `Content-Length`
+  over the cap, or a body that runs past it, stops the read) and parsed
+  strictly: a body that is larger, isn't JSON, or lacks a required field
+  reads as undeclared, and `version` is parsed as an integer and the
+  timestamps as timestamps rather than kept as text. Fields: `version` (1),
+  `declared_at`, `machine` (the machine name koto already records on
+  session events), `first_release` (informational), and `audit`
+  (`started_at`, `finished_at`, `prefixes`, `sessions`, `entries_written`,
+  `entries_pruned`).
+- `MAX_ENTRIES_PER_LOOKUP` (256). A lookup stops reading the index listing
+  at that many entries for one name, before any confirmation starts, and
+  treats the name as polluted: on a declared bucket it runs the exact sweep
+  instead of confirming entries one by one. One writer creating many entries
+  for a name can then make that name's lookups no slower than today's, and
+  can't make them slower still.
 
 **The write path in `src/session/cloud.rs`.** A helper,
 `ensure_indexed(id) -> anyhow::Result<()>`, PUTs `entry_key(id, home)` when
@@ -687,10 +701,12 @@ its signature (`anyhow::Result<bool>`) and its callers:
 atomic replace the stamps use. It records the last declaration answer and
 when it was read. A 404 or an invalid body clears "declared" at once. A read
 that fails without an answer keeps the last value for lookups, so a degraded
-bucket doesn't throw a declared host back onto the sweep; write paths never
-act on that carried value. "Not declared" can be remembered freely, since it
-only leads to the exact fallback. A memo file that can't be parsed is
-ignored.
+bucket doesn't throw a declared host back onto the sweep, for at most 10
+minutes after the last answered read (Decision 5); write paths never act on
+that carried value. "Not declared" can be remembered freely, since it only
+leads to the exact fallback. A memo file that can't be parsed, or whose key
+doesn't match this endpoint and bucket, is ignored. The file holds no
+secrets and gets the same user-only mode as the stamps.
 
 **The operator command: `koto session index`.** Subcommands:
 
@@ -704,15 +720,24 @@ ignored.
   object newer than the declaration's audit start revokes the declaration
   and is named in the output. Prints the counts, and records them in a
   local audit file for `declare` to read.
-- `declare [--no-probation]`: re-lists the prefixes whose listing changed
-  since the audit, refuses unless the audit finished at least the probation
-  window ago (7 days), answered every listing, and no entry-less state
-  object is newer than its start, and then PUTs the declaration.
+- `declare [--no-probation]`: walks the bucket again as the audit does, so
+  the local audit file is a record of when the audit ran and never the proof
+  that the bucket is covered. Refuses unless the audit finished at least the
+  probation window ago (7 days), answered every listing, and no entry-less
+  state object is newer than its start, and then PUTs the declaration.
 - `revoke`: deletes the declaration.
 
-The command runs only against the configured bucket with the user's own
-credentials, prints what it will write, and needs `--yes` to write without a
-prompt, like `koto workspace prune`.
+Every session name and prefix the audit and declare walks find in the bucket
+passes `validate_session_id` and `is_workspace_prefix` before a key is built
+from it, the `ctx` case included; anything that fails is skipped and counted
+as skipped, never written, pruned or used to abort the run. Bucket text the
+commands print (a skipped key, a declaration field) is escaped and cut to a
+fixed length, so a key holding control characters can't rewrite what the
+operator sees before confirming. The commands run only against the
+configured bucket with the user's own credentials, print what they will
+write, and need `--yes` to write without a prompt, like `koto workspace
+prune`; the prompts for `--no-probation` and `--prune --revoke` say in one
+line what they give up.
 
 ### Key interfaces
 
@@ -822,7 +847,11 @@ Deliverables:
   `an_oversized_or_malformed_declaration_reads_as_undeclared`,
   `a_prune_racing_a_create_ends_in_a_refused_declaration`
   (using the fake's `put_after` to land the create inside the prune),
-  `a_refused_entry_put_blocks_the_push_only_on_a_declared_bucket`.
+  `a_refused_entry_put_blocks_the_push_only_on_a_declared_bucket`,
+  `a_name_with_more_entries_than_the_cap_falls_back_to_the_sweep`,
+  `a_carried_declaration_expires_while_reads_keep_failing`,
+  `audit_skips_and_reports_keys_that_fail_validation`,
+  `audit_output_escapes_control_characters_in_bucket_keys`.
 - `docs/guides/cloud-sync-setup.md` and
   `plugins/koto-skills/skills/koto-user/references/error-handling.md`.
 
@@ -842,7 +871,87 @@ undeclared bucket, so they exercise the fallback exactly as written.
 
 ## Security Considerations
 
-To be completed by the security review.
+**Trust model.** The cloud backend already assumes that everyone who can
+write to the bucket belongs to one owner or team and isn't hostile, though
+their tools may be old, misconfigured or compromised. This design keeps that
+model. It adds no dependency, no endpoint and no credential type: the new
+code uses the existing S3 client and `serde_json`, and fetches nothing it
+would execute. The only new local state is two small files beside the local
+session store, the declaration memo and the last audit's counts. They hold
+no secrets and are written with the same atomic replace and user-only mode
+as the sync stamps.
+
+**Input from the bucket.** Everything the new code reads from the bucket is
+untrusted. A lookup takes the part of each index key after
+`koto-names/<name>/` and accepts it only if it's exactly 16 lowercase hex
+digits, and only then builds another key from it. The name comes from the
+command line and has already passed session-name validation, which requires
+a leading letter and allows no `/`, so index keys can't reach outside their
+own prefix or collide with the declaration. The audit and declare commands
+apply the same two checks to every name and prefix they find while walking
+the bucket, and skip and report anything that fails rather than build a key
+from it. The declaration is read with a 4 KiB limit on the bytes read,
+parsed strictly, and treated as absent if anything is wrong with it, which
+sends lookups back to the exact sweep. Bucket text the operator commands
+print is escaped and truncated, so a hostile key or declaration field can't
+send control sequences to the terminal of someone about to confirm a write.
+A memo file that can't be parsed is ignored.
+
+**What a forged entry can do.** An index entry is a hint, not an answer.
+Every hit is confirmed by listing the named prefix and looking for the
+session's state object, so a forged or stale entry costs one listing and
+can't make a command say a session lives where it doesn't. A writer can
+create many entries for one name to slow that name's lookups; past 256
+entries the lookup stops confirming them and runs the exact sweep, so the
+worst it can do is today's cost for that one name.
+
+**What the declaration can do.** The declaration is the one object that
+changes replies: on a bucket that carries it, a name with no index entry
+reads as not-found. The bucket can't tell the operator from any other
+writer, so anyone who can write under `koto-names/` can create or delete the
+declaration, and anyone who can delete an entry can make that one name read
+as not-found from other directories. In both cases a command may report no
+such session where it would otherwise refuse with `session_unlocated`, and a
+caller could then create a second session of the same name, the hazard
+koto#518 closed. Nothing is read from or written into another workspace's
+session, a writer with that access could already delete or overwrite the
+state objects themselves, and the effect ends when the declaration is
+deleted or the next audit revokes it. Deleting the declaration is always
+safe. A forged declaration also turns a refused entry write from a warning
+into a failed push, so it can stop hosts with prefix-scoped credentials from
+creating session copies until it's removed. The guide will tell owners who
+want more than the convention to restrict writes of `koto-names/_complete`
+to the operator's credentials with a bucket policy, to turn on object
+versioning so an overwrite can be inspected and reverted, and to keep
+`koto-names/` out of lifecycle rules that expire old objects, since entries
+are written once and never refreshed.
+
+**Credentials.** Hosts need PUT and LIST under `koto-names/` and GET of
+`koto-names/_complete`, on top of what they use today; the guide lists the
+exact permissions. Credentials limited to one workspace prefix warn on an
+undeclared bucket and can't create session copies on a declared one, and
+`declare` refuses while it can see the entry-less copies they leave. Read
+access gains nothing from the index: confirming an entry still needs list
+access to the prefix it names.
+
+**What the new keys reveal.** Index keys expose every session name, and the
+workspace prefix holding it, to anyone who can list `koto-names/`. Anyone
+who can list the whole bucket could already collect the same facts by
+walking every prefix, but a policy granting list access on `koto-names/`
+alone now exposes all names, so session names should be treated as readable
+by everyone with access to the bucket. Session commands never remove an
+entry, so deleting a session leaves its name in the bucket until an operator
+prunes the index; the guide and the delete documentation will say so for
+people who delete sessions for privacy reasons. The declaration records the
+machine name of the host that wrote it and the audit's counts. Entries have
+empty bodies, and no session content, path or credential goes into the new
+keys.
+
+**Stale local answers.** A host trusts a remembered "declared" answer for
+the check window, and keeps using it while later reads fail without a reply,
+but for no more than 10 minutes after its last answered read. A revoke
+reaches a host on its next answered read, and a host whose declaration
+reads keep failing falls back to the exact sweep once that limit passes.
 
 ## Consequences
 
@@ -869,7 +978,12 @@ To be completed by the security review.
 - A new key family and an operator command to build, document and test;
   tests that count every PUT of a push gain one key.
 - The index only grows between audits, and a name reused under many
-  prefixes pays one confirming listing per leftover entry.
+  prefixes pays one confirming listing per leftover entry. A deleted
+  session's name stays readable under `koto-names/` until an operator
+  prunes.
+- Any bucket writer can create or delete the declaration, so on a declared
+  bucket the reply guarantee rests on the owner's bucket policy as well as
+  on koto.
 - Hosts whose credentials only allow `<prefix>/*` warn on undeclared
   buckets and can't push new copies on declared ones.
 - On a bucket whose single requests hang, one listing can still wait
@@ -885,7 +999,11 @@ To be completed by the security review.
   `revoke` is one delete.
 - `declare` refuses while it can see entry-less state objects, including
   those that prefix-scoped credentials leave behind, and names them.
-- `--prune` is available whenever the owner wants to shrink the index.
+- `--prune` is available whenever the owner wants to shrink the index or
+  clear deleted sessions' names.
+- The guide gives owners the bucket policy, versioning and lifecycle
+  settings that keep the declaration and the entries in the operator's
+  hands (see Security Considerations).
 - An explicit request timeout on the probe path is a separate lever, left
   to its own issue, and setting rust-s3's 60-second timeout explicitly in
   `create_bucket` keeps a crate upgrade from moving the retry line.
