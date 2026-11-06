@@ -225,7 +225,8 @@ entry-less state object newer than the declaration, it deletes the
 declaration, which sends every newer host back to the exact sweep. A revoke
 command does the same by hand.
 
-Request counts for a not-found on a name with no local copy:
+Request counts for a not-found on a name with no local copy, counting the
+own-prefix probe that `located_probe` makes before `held_elsewhere` runs:
 
 | Case | Requests | Round trips | At N = 300 |
 |---|---|---|---|
@@ -639,7 +640,8 @@ index, and the declaration type:
 - `entry_key(name, prefix)`, which takes a name that already passed
   `validate_session_id` and a prefix that passed `is_workspace_prefix`, and
   refuses anything else.
-- `listing_prefix(name)` for `koto-names/<name>/`.
+- `listing_prefix(name)` for `koto-names/<name>/`, always with the trailing
+  `/`, so a listing for `foo` never returns entries for `foobar`.
 - `prefixes_from(pages, name, own)`, which strips `koto-names/<name>/` from
   each listed key, keeps only results that pass `is_workspace_prefix` with
   nothing after them, drops `own`, and de-duplicates. Anything else in the
@@ -654,20 +656,25 @@ index, and the declaration type:
   (`started_at`, `finished_at`, `prefixes`, `sessions`, `entries_written`,
   `entries_pruned`).
 - `MAX_ENTRIES_PER_LOOKUP` (256). A lookup stops reading the index listing
-  at that many entries for one name, before any confirmation starts, and
+  at that many entries for one name (it stops paginating there, before any
+  confirmation starts), and
   treats the name as polluted: on a declared bucket it runs the exact sweep
   instead of confirming entries one by one. One writer creating many entries
   for a name can then make that name's lookups no slower than today's, and
   can't make them slower still.
 
 **The write path in `src/session/cloud.rs`.** A helper,
-`ensure_indexed(id) -> anyhow::Result<()>`, PUTs `entry_key(id, home)` when
-`self.stamp(id)` doesn't say `indexed`, and is called at the top of
-`put_state` and `put_state_over` before the state PUT. `push_staged` writes
+`ensure_indexed(id) -> anyhow::Result<bool>`, PUTs `entry_key(id, home)`
+when `self.stamp(id)` doesn't say `indexed`, and is called at the top of
+`put_state` and `put_state_over` before the state PUT. It returns whether
+the entry is now known to be in the bucket (written now, or already marked),
+and the caller passes that to `record_synced`. `push_staged` writes
 the entry for its target as its first upload, before the state object, and
 leaves it in place if it rolls back with `take_back`. A transient failure is
 returned like a failed state PUT, so `sync_push_state` leaves the push owed
-and `strict_push_state` fails. A 403 reads the declaration once: absent, the
+and `strict_push_state` fails. A refusal is recognized the way the 501
+fallback is, as `S3Error::HttpFailWithBody(403, _)`, and reads the
+declaration once: absent, the
 host warns that it can't write the index and goes on with the push, leaving
 the entry owed; present or unreadable, the push fails with an error that
 names the missing permission, because a declared bucket would otherwise miss
@@ -675,8 +682,10 @@ this session.
 
 **`src/session/sync_stamp.rs`.** `Stamp` gains `indexed: bool` with
 `#[serde(default)]`. `Stamp::for_bytes` carries it from a previous stamp
-with the same `state_key`, and `record_synced` sets it after a push that
-followed a successful `ensure_indexed`.
+with the same `state_key`, and `record_synced` takes the `bool` that
+`ensure_indexed` returned and sets `indexed` from it. A push that went on
+after a refused entry write (an undeclared bucket) stamps `indexed: false`,
+so the next push tries again.
 
 **The read path: `held_elsewhere`.** Rewritten around three steps, keeping
 its signature (`anyhow::Result<bool>`) and its callers:
@@ -692,9 +701,12 @@ its signature (`anyhow::Result<bool>`) and its callers:
    declaration that couldn't be read with no memo to fall back on: a failed
    top-level listing is `Err`; otherwise a confirmed hit is `Ok(true)`, and
    a miss runs today's sweep over the top-level listing's prefixes minus
-   those already confirmed absent. When the memo said "declared" but the
-   GET now reads absent, the top-level listing starts at that point, at the
-   cost of one more round trip on that one lookup.
+   those already confirmed absent. Whenever the lookup ends up needing the
+   top-level listing it didn't start in step 1 (the memo said "declared" but
+   the GET now reads absent, a carried "declared" has passed its 10-minute
+   limit while the GET keeps failing, or the name hit
+   `MAX_ENTRIES_PER_LOOKUP`), it starts it then, at one more round trip on
+   that one lookup.
 
 **The declaration memo.** A host-wide file beside the local session store,
 `cloud-index.json`, keyed by endpoint and bucket, written with the same
@@ -718,13 +730,18 @@ secrets and gets the same user-only mode as the stamps.
   no state object for that name; on a declared bucket `--prune` refuses
   unless `--revoke` is also given. On a declared bucket, an entry-less state
   object newer than the declaration's audit start revokes the declaration
-  and is named in the output. Prints the counts, and records them in a
-  local audit file for `declare` to read.
+  and is named in the output. Prints the counts and writes them to
+  `koto-names/_audit` (JSON, same 4 KiB cap and strict parse as the
+  declaration), so `declare` can run on any machine. Every run replaces that
+  record, so re-running the audit restarts the probation clock.
 - `declare [--no-probation]`: walks the bucket again as the audit does, so
-  the local audit file is a record of when the audit ran and never the proof
-  that the bucket is covered. Refuses unless the audit finished at least the
+  the audit record says when the audit ran and is never the proof that the
+  bucket is covered. Refuses unless the audit finished at least the
   probation window ago (7 days), answered every listing, and no entry-less
-  state object is newer than its start, and then PUTs the declaration.
+  state object is newer than its start, and then PUTs the declaration. Both
+  times are the bucket's: the probation is measured from the
+  `LastModified` of `koto-names/_audit` and compared with the state objects'
+  `LastModified`, so a skewed local clock can't shorten it.
 - `revoke`: deletes the declaration.
 
 Every session name and prefix the audit and declare walks find in the bucket
@@ -760,6 +777,7 @@ Bucket layout added beside the workspace prefixes:
 ```
 koto-names/
   _complete                       declaration (JSON, written only by `declare`)
+  _audit                          last audit's record (JSON, written only by `audit`)
   <name>/
     <16-hex prefix>               empty; one per prefix that held <name>
 ```
@@ -786,15 +804,20 @@ the sweep runs over every other prefix as today.
 ### Phase 1: Index keys and the write path
 
 Add `name_index.rs`, `Stamp::indexed`, and `ensure_indexed` in `put_state`,
-`put_state_over` and `push_staged`. Nothing reads the index yet, so every
-lookup is unchanged; this phase can ship alone and starts populating
-buckets as hosts upgrade.
+`put_state_over` and `push_staged`, with the full 403 handling (read the
+declaration once; absent, warn and push with the entry owed; present or
+unreadable, fail the push). No command writes a declaration yet, so a host
+whose credentials can't write under `koto-names/` only warns. Nothing reads
+the index yet, so every lookup is unchanged; this phase can ship alone and
+starts populating buckets as hosts upgrade.
 
 Deliverables:
 - `src/session/name_index.rs` and its unit tests (key building refuses
   invalid names and prefixes; `prefixes_from` drops malformed, foreign and
   own entries).
 - Changes to `src/session/cloud.rs` and `src/session/sync_stamp.rs`.
+- The permissions hosts now need under `koto-names/`, in
+  `docs/guides/cloud-sync-setup.md`.
 - Tests in `tests/cloud_bound_dir_test.rs` or a new
   `tests/cloud_name_index_test.rs`:
   `a_create_writes_the_name_entry_before_the_state_object`,
@@ -803,6 +826,7 @@ Deliverables:
   `an_import_writes_the_target_s_entry_first`,
   `a_first_push_of_an_older_copy_writes_its_entry`,
   `a_failed_entry_put_leaves_the_push_owed`,
+  `a_refused_entry_put_warns_and_pushes_on_an_undeclared_bucket`,
   `a_delete_leaves_the_name_entry`.
 - Existing tests that list every PUT of a push or an import (for example in
   `tests/cloud_summary_retry_test.rs` and `tests/import_keeps_source_test.rs`)
@@ -816,18 +840,22 @@ treating every bucket as undeclared (the declaration read is wired but no
 command writes one yet). Hits get faster; misses are today's sweep.
 
 Deliverables:
-- `held_elsewhere`, the memo file, and their tests:
+- `held_elsewhere`, the memo file, the stderr hint after a slow undeclared
+  sweep, and an explicit 60-second request timeout in `create_bucket` (the
+  value rust-s3 uses today, so nothing changes), with their tests:
   `an_indexed_session_refuses_from_another_prefix_without_a_sweep`,
   `an_older_writer_s_session_is_found_by_the_sweep_on_an_undeclared_bucket`,
   `a_stale_entry_is_confirmed_and_read_as_absent`,
   `a_forged_entry_never_builds_a_key`,
   `a_failed_index_listing_changes_nothing_on_an_undeclared_bucket`,
-  `a_failed_top_level_listing_is_cant_tell_even_with_an_index_hit`.
+  `a_failed_top_level_listing_is_cant_tell_even_with_an_index_hit`,
+  `an_index_listing_for_a_name_never_returns_a_longer_name_s_entries`.
 
 ### Phase 3: The declaration and the operator command
 
-Add `koto session index audit|declare|revoke`, the declared branch of
-`held_elsewhere`, and the 403 handling on the write path. Document the
+Add `koto session index audit|declare|revoke` and the declared branch of
+`held_elsewhere`; the write path's 403 handling, in place since Phase 1,
+starts failing pushes once a declaration exists. Document the
 command and the declared bucket's trade in `docs/guides/cloud-sync-setup.md`
 and the error-handling reference.
 
@@ -847,7 +875,8 @@ Deliverables:
   `an_oversized_or_malformed_declaration_reads_as_undeclared`,
   `a_prune_racing_a_create_ends_in_a_refused_declaration`
   (using the fake's `put_after` to land the create inside the prune),
-  `a_refused_entry_put_blocks_the_push_only_on_a_declared_bucket`,
+  `a_refused_entry_put_blocks_the_push_on_a_declared_bucket`,
+  `rerunning_the_audit_restarts_the_probation`,
   `a_name_with_more_entries_than_the_cap_falls_back_to_the_sweep`,
   `a_carried_declaration_expires_while_reads_keep_failing`,
   `audit_skips_and_reports_keys_that_fail_validation`,
@@ -876,10 +905,9 @@ write to the bucket belongs to one owner or team and isn't hostile, though
 their tools may be old, misconfigured or compromised. This design keeps that
 model. It adds no dependency, no endpoint and no credential type: the new
 code uses the existing S3 client and `serde_json`, and fetches nothing it
-would execute. The only new local state is two small files beside the local
-session store, the declaration memo and the last audit's counts. They hold
-no secrets and are written with the same atomic replace and user-only mode
-as the sync stamps.
+would execute. The only new local state is one small file beside the local
+session store, the declaration memo. It holds no secrets and is written with
+the same atomic replace and user-only mode as the sync stamps.
 
 **Input from the bucket.** Everything the new code reads from the bucket is
 untrusted. A lookup takes the part of each index key after
@@ -890,7 +918,8 @@ a leading letter and allows no `/`, so index keys can't reach outside their
 own prefix or collide with the declaration. The audit and declare commands
 apply the same two checks to every name and prefix they find while walking
 the bucket, and skip and report anything that fails rather than build a key
-from it. The declaration is read with a 4 KiB limit on the bytes read,
+from it. The declaration and the audit record are each read with a 4 KiB
+limit on the bytes read,
 parsed strictly, and treated as absent if anything is wrong with it, which
 sends lookups back to the exact sweep. Bucket text the operator commands
 print is escaped and truncated, so a hostile key or declaration field can't
@@ -917,7 +946,9 @@ koto#518 closed. Nothing is read from or written into another workspace's
 session, a writer with that access could already delete or overwrite the
 state objects themselves, and the effect ends when the declaration is
 deleted or the next audit revokes it. Deleting the declaration is always
-safe. A forged declaration also turns a refused entry write from a warning
+safe. A forged `koto-names/_audit` can at most let `declare` run before the
+probation has really passed, which gives its writer nothing a forged
+declaration wouldn't. A forged declaration also turns a refused entry write from a warning
 into a failed push, so it can stop hosts with prefix-scoped credentials from
 creating session copies until it's removed. The guide will tell owners who
 want more than the convention to restrict writes of `koto-names/_complete`
