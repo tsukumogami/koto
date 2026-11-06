@@ -35,6 +35,7 @@ rationale: |
   either changes a reply or still grows with the prefix count; trusting the
   index after a one-time backfill was rejected because it silently turns
   no_local_copy into not-found for sessions older releases create later.
+upstream: docs/briefs/BRIEF-cloud-missing-session-lookup.md
 decision_provenance: inline-resolved
 ---
 
