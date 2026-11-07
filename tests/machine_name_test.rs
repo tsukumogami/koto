@@ -339,9 +339,12 @@ impl Machine {
             .unwrap_or_else(|e| panic!("--detail {name} is not JSON ({e}): {}", out.describe()))
     }
 
-    /// The `--once` rows, each split into its tab-separated fields.
-    fn once_rows(&self) -> Vec<Vec<String>> {
-        self.ok(&["dashboard", "--once"])
+    /// The `--once` rows, each split into its tab-separated fields. `flags`
+    /// are added after `--once`.
+    fn once_rows(&self, flags: &[&str]) -> Vec<Vec<String>> {
+        let mut args = vec!["dashboard", "--once"];
+        args.extend_from_slice(flags);
+        self.ok(&args)
             .stdout
             .lines()
             .map(|l| l.split('\t').map(str::to_string).collect())
@@ -662,7 +665,7 @@ fn an_import_records_the_importing_machine() {
     // Back to `work`, so the copy runs and `--once` lists it.
     b.ok(&["rewind", "wf"]);
     assert_eq!(b.detail("wf")["machine"], "machine-b");
-    let rows = b.once_rows();
+    let rows = b.once_rows(&[]);
     let copy = rows
         .iter()
         .find(|r| r[0] == "wf" && r.get(9).map(String::as_str) == Some(b.workspace().as_str()))
@@ -751,7 +754,10 @@ fn detail_reports_null_for_a_v0_33_store_and_changes_nothing_else() {
         ..local
     };
     cloud.write_user_config("");
-    let rows = cloud.once_rows();
+    // `--all`: the store's events are fixed in the past, so the session is
+    // older than the dashboard's abandoned cutoff and recedes from the default
+    // view at some date after the fixture was written.
+    let rows = cloud.once_rows(&["--all"]);
     let row = rows
         .iter()
         .find(|r| r[0] == "v033")
