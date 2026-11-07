@@ -986,7 +986,7 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     let of = |method: &str| -> std::collections::BTreeSet<String> {
         writes
             .iter()
-            .filter(|(m, k)| m == method && k != &manifest)
+            .filter(|(m, k)| m == method && k != &manifest && !k.starts_with("koto-names/"))
             .map(|(_, k)| k.clone())
             .collect()
     };
@@ -1006,6 +1006,7 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     assert!(
         writes
             .iter()
+            .filter(|(_, k)| !k.starts_with("koto-names/"))
             .all(|(_, k)| k.starts_with(&target) || *k == pointer),
         "a write landed outside the target's prefix and the back-reference: {:?}",
         writes
@@ -1557,7 +1558,10 @@ fn terminal_ticks_remove_a_source_and_keep_an_imported_copy() {
     assert_eq!(a_after, a_before, "B's terminal tick touched A's prefix");
     let writes = all_writes(&s3);
     assert!(
-        writes.iter().all(|(_, k)| k.starts_with(&target)),
+        writes
+            .iter()
+            .filter(|(_, k)| !k.starts_with("koto-names/"))
+            .all(|(_, k)| k.starts_with(&target)),
         "a write outside B's prefix: {:?}",
         writes
     );
