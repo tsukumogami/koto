@@ -16,8 +16,9 @@ to `0.9.x`).
   session copy's first state object goes up, koto now writes an empty index
   object `koto-names/<name>/<prefix>`, once per copy and host; deleting a
   session leaves it. Keys that can't PUT it warn and push anyway, unless
-  `koto-names/_complete` can't be read either, or holds a valid
-  declaration: then the push fails as a failed state upload does. Nothing
+  koto can't list `koto-names/_complete`, or finds it listed and can't
+  read it, or finds a valid declaration in it: then the push fails as a
+  failed state upload does. Nothing
   reads the index yet, so no command's reply changes.
 
 - **The first release after v0.24.0 is the
