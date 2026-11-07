@@ -242,7 +242,7 @@ impl CloudBackend {
         match state_log::compare(&local, &pulled.bytes) {
             LogOrder::Same | LogOrder::RemoteExtends | LogOrder::HeaderOnly => {
                 if self.write_local_state_bytes(pred, fenced).is_ok() {
-                    self.record_synced(pred, etag.as_deref(), fenced);
+                    self.record_synced(pred, etag.as_deref(), fenced, false);
                 }
             }
             LogOrder::LocalExtends | LogOrder::Diverged => {

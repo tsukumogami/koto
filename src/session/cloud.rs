@@ -377,6 +377,12 @@ struct Probes {
     /// one push ([`CloudBackend::defer_writes_to`]). Kept here, in the box,
     /// for the same reason.
     deferred_to: Mutex<Option<String>>,
+    /// The name-index entries the bucket refused this process on a bucket
+    /// that reads undeclared ([`CloudBackend::write_entry`]): a later push
+    /// of the same copy in this process goes on without asking again, so
+    /// the declaration is read once and the refusal's retry sleep is paid
+    /// once. Kept here, in the box, for the same reason.
+    entries_refused: Mutex<HashSet<String>>,
 }
 
 impl CloudBackend {
@@ -434,6 +440,7 @@ impl CloudBackend {
                 homes: Mutex::default(),
                 located: Mutex::default(),
                 deferred_to: Mutex::default(),
+                entries_refused: Mutex::default(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -1423,10 +1430,16 @@ impl CloudBackend {
 
     /// Stamp `id` as holding `bytes`, which the bucket holds under `etag`:
     /// after a pull or a push of its state file.
-    fn record_synced(&self, id: &str, etag: Option<&str>, bytes: &[u8]) {
+    ///
+    /// `indexed` is what [`CloudBackend::ensure_indexed`] returned for a
+    /// push; a pull passes `false`, so it keeps what the previous stamp for
+    /// the key said and never marks a copy indexed that this host hasn't
+    /// written the entry for.
+    fn record_synced(&self, id: &str, etag: Option<&str>, bytes: &[u8], indexed: bool) {
         let dir = self.local.session_dir(id);
         let previous = self.stamp(id);
-        let stamp = match etag.filter(|e| !e.is_empty()) {
+        let carried = previous.as_ref().is_some_and(|p| p.indexed);
+        let mut stamp = match etag.filter(|e| !e.is_empty()) {
             Some(etag) => {
                 let mut stamp =
                     Stamp::for_bytes(previous.as_ref(), &self.state_key(id), etag, bytes);
@@ -1441,7 +1454,83 @@ impl CloudBackend {
                 ..Stamp::default()
             },
         };
+        stamp.indexed = indexed || carried;
         stamp.save(&dir);
+    }
+
+    /// Make sure the name-index entry of `id`'s copy is in the bucket
+    /// before its state object goes up ([`crate::session::name_index`]): PUT
+    /// it unless the stamp says it is there, or the bucket already refused
+    /// it in this process. Returns whether the entry is now known to be
+    /// there, for [`CloudBackend::record_synced`].
+    fn ensure_indexed(&self, id: &str) -> anyhow::Result<bool> {
+        if self.stamp(id).is_some_and(|s| s.indexed) {
+            return Ok(true);
+        }
+        self.write_entry(id, &self.home(id))
+    }
+
+    /// PUT the empty entry `koto-names/<name>/<prefix>`. `Ok(true)` when it
+    /// went up; `Ok(false)` when the push may go on without it.
+    ///
+    /// A transient failure is returned as a failed state PUT would be, so
+    /// the push is owed. A refusal (403) reads the declaration once: on a
+    /// bucket that reads undeclared, nothing yet trusts the index, so the
+    /// push warns and goes on with the entry owed; on a declared bucket, or
+    /// one whose declaration can't be read, the push fails, since a
+    /// declared bucket would otherwise read this copy as missing.
+    fn write_entry(&self, name: &str, prefix: &str) -> anyhow::Result<bool> {
+        use crate::session::name_index::{self, DeclarationRead};
+
+        // Only a made-up prefix, never one koto derives or records, fails
+        // here; such a copy can't be indexed and is pushed as before.
+        let Ok(key) = name_index::entry_key(name, prefix) else {
+            return Ok(false);
+        };
+        let refused = || {
+            self.probes
+                .entries_refused
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
+        if refused().contains(&key) {
+            return Ok(false);
+        }
+        match self.bucket.put_object(&key, b"") {
+            Ok(_) => Ok(true),
+            Err(S3Error::HttpFailWithBody(403, _)) => {
+                let found = match name_index::read_declaration(&self.bucket) {
+                    DeclarationRead::Absent => {
+                        eprintln!(
+                            "warning: cloud sync: the bucket refused the name-index entry {} \
+                             for session '{}', so the push goes on and the entry is owed to a \
+                             later push",
+                            key, name
+                        );
+                        refused().insert(key);
+                        return Ok(false);
+                    }
+                    DeclarationRead::Present => format!(
+                        "the bucket declares its name index complete ({})",
+                        name_index::DECLARATION_KEY
+                    ),
+                    DeclarationRead::Unreadable(why) => format!(
+                        "whether the bucket declares its name index complete couldn't be read \
+                         ({})",
+                        why
+                    ),
+                };
+                anyhow::bail!(
+                    "cloud sync: the bucket refused the name-index entry {} for session '{}', \
+                     and {}: these credentials need PUT permission under {} to push",
+                    key,
+                    name,
+                    found,
+                    name_index::ENTRY_ROOT
+                )
+            }
+            Err(e) => Err(e).with_context(|| format!("S3 PUT failed for key: {}", key)),
+        }
     }
 
     /// PUT `id`'s state file and stamp what went up, only over the copy
@@ -1457,6 +1546,7 @@ impl CloudBackend {
     fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
         self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
+        let indexed = self.ensure_indexed(id)?;
         // A copy the session's successor fenced refuses the push as
         // `session_superseded`, not as a conflict to resolve.
         let refused = |remote: &[u8]| {
@@ -1513,7 +1603,7 @@ impl CloudBackend {
         let response = sent.with_context(|| format!("S3 PUT failed for key: {}", key))?;
         self.forget_probe(id);
         let etag = response_etag(&response);
-        self.record_synced(id, etag.as_deref(), data);
+        self.record_synced(id, etag.as_deref(), data, indexed);
         self.put_summary(id, data, etag.as_deref());
         Ok(())
     }
@@ -1623,13 +1713,14 @@ impl CloudBackend {
     fn put_state_over(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
         self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
+        let indexed = self.ensure_indexed(id)?;
         let response = self
             .bucket
             .put_object(&key, data)
             .with_context(|| format!("S3 PUT failed for key: {}", key))?;
         self.forget_probe(id);
         let etag = response_etag(&response);
-        self.record_synced(id, etag.as_deref(), data);
+        self.record_synced(id, etag.as_deref(), data, indexed);
         self.put_summary(id, data, etag.as_deref());
         Ok(())
     }
@@ -2106,7 +2197,7 @@ impl CloudBackend {
                 }
             };
             if keep_local {
-                self.record_synced(id, Some(&remote_etag), response.bytes());
+                self.record_synced(id, Some(&remote_etag), response.bytes(), false);
                 return Ok(());
             }
         }
@@ -2117,7 +2208,7 @@ impl CloudBackend {
                 state_path.display()
             )
         })?;
-        self.record_synced(id, Some(&remote_etag), response.bytes());
+        self.record_synced(id, Some(&remote_etag), response.bytes(), false);
         Ok(())
     }
 
@@ -6265,9 +6356,10 @@ impl CloudBackend {
     }
 
     /// Push the staged target under this workspace's prefix with the strict
-    /// push: state file, template, each key, manifest, version record. On a
-    /// failure, delete exactly what this run pushed and refuse
-    /// `import_push_failed`. Returns the keys pushed.
+    /// push: its name-index entry, then state file, template, each key,
+    /// manifest, version record. On a failure, delete exactly what this run
+    /// pushed, the entry aside, and refuse `import_push_failed`. Returns the
+    /// keys pushed, which never include the entry.
     fn push_staged(
         &self,
         target: &str,
@@ -6308,6 +6400,19 @@ impl CloudBackend {
             staged.join("version.json"),
         ));
 
+        let failed = |e: anyhow::Error| {
+            ImportError::new(
+                ImportErrorCode::PushFailed,
+                format!("could not push the imported session: {:#}", e),
+            )
+        };
+        // The target's name-index entry goes up first, so no copy is in the
+        // bucket without it. It is never taken back: an entry left by a
+        // failed import costs a later lookup one listing, never a reply.
+        self.refuse_if_read_only(&format!("S3 PUT of {}", self.own_state_key(target)))
+            .and_then(|()| self.write_entry(target, &self.prefix))
+            .map_err(failed)?;
+
         let mut pushed = Vec::new();
         for (key, path) in uploads {
             let result = std::fs::read(&path)
@@ -6315,10 +6420,7 @@ impl CloudBackend {
                 .and_then(|data| self.put_object(&key, &data));
             if let Err(e) = result {
                 self.take_back(&pushed);
-                return Err(ImportError::new(
-                    ImportErrorCode::PushFailed,
-                    format!("could not push the imported session: {:#}", e),
-                ));
+                return Err(failed(e));
             }
             pushed.push(key);
         }
@@ -8845,6 +8947,7 @@ mod tests {
             .requests()
             .into_iter()
             .filter(|r| r.method == "PUT" || r.method == "DELETE")
+            .filter(|r| !r.path.contains("/koto-names/"))
             .map(|r| {
                 let rest = r.path.rsplit_once("/wf/").map(|(_, rest)| rest);
                 format!("{} {}", r.method, rest.unwrap_or(&r.path))

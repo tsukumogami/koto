@@ -377,9 +377,9 @@ enum Fetched {
 
 /// A writer that keeps at most `limit` bytes and refuses any past them, so
 /// a body streamed into it is read no further than that.
-struct BoundedSink {
-    bytes: Vec<u8>,
-    limit: usize,
+pub(crate) struct BoundedSink {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) limit: usize,
 }
 
 impl std::io::Write for BoundedSink {

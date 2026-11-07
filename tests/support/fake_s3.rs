@@ -32,7 +32,8 @@
 //! A GET with `Range: bytes=<first>-<last>` is answered 206 with only those
 //! bytes (416 when the range starts past the end), and a listing asked with
 //! `encoding-type=url` is answered with its keys URL-encoded, as S3 does.
-//! Each request's record carries its `Range` header and how many body bytes
+//! Each request's record carries its `Range`, `If-Match` and
+//! `If-None-Match` headers and how many body bytes
 //! its reply put on the connection, so a test can see how far a read went.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
@@ -69,6 +70,10 @@ pub struct Request {
     pub access_key: Option<String>,
     /// The `Range` header, when the request carried one.
     pub range: Option<String>,
+    /// The `If-Match` header, when the request carried one.
+    pub if_match: Option<String>,
+    /// The `If-None-Match` header, when the request carried one.
+    pub if_none_match: Option<String>,
     /// For a listing, whether it asked for `encoding-type=url`.
     pub url_encoded: bool,
     /// How many body bytes the reply put on the connection before it
@@ -641,6 +646,8 @@ fn answer_as(req: &Incoming, bucket: &str, state: &Mutex<State>, seq: u64) -> Re
         delimiter: param("delimiter").filter(|d| is_list && !d.is_empty()),
         access_key: req.access_key.clone(),
         range: req.range.clone(),
+        if_match: req.if_match.clone(),
+        if_none_match: req.if_none_match.clone(),
         url_encoded: is_list && param("encoding-type").as_deref() == Some("url"),
         body_sent: 0,
         at: Instant::now(),
