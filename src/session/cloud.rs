@@ -31,6 +31,7 @@ use crate::engine::reentrancy;
 use crate::session::batch::{self, BatchLock, Journal, Pending};
 use crate::session::context::{is_host_local_key, is_pin_record_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
+use crate::session::name_index;
 use crate::session::state_log;
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{
@@ -220,6 +221,25 @@ const LIST_ATTEMPTS: u32 = 3;
 /// [`list_retrying`]'s wait before its second ask, doubled before each ask
 /// after that.
 const LIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a lookup's sweep of the other workspace prefixes
+/// ([`CloudBackend::sweep`]) may take before koto prints
+/// [`SLOW_SWEEP_HINT`] on stderr. A sweep costs about one round trip per
+/// [`HELD_ELSEWHERE_FANOUT`] prefixes, so a few seconds means a bucket of
+/// many hundreds of prefixes or a slow network, where indexing the
+/// bucket's older sessions would let lookups skip it (koto#597).
+const SLOW_SWEEP_HINT_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The hint a slow sweep prints. Fixed text: it names no session, prefix
+/// or anything else read from the bucket.
+const SLOW_SWEEP_HINT: &str = "hint: cloud sync: looking this session up listed every \
+     workspace prefix in the bucket; `koto session index audit` indexes the bucket's older \
+     sessions so lookups can be answered from the name index instead";
+
+/// The request timeout of every request koto makes to the bucket. It is
+/// rust-s3's own default, set here so a crate upgrade can't move it under
+/// [`list_retrying`]'s retry policy.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
@@ -855,92 +875,132 @@ impl CloudBackend {
     }
 
     /// Whether a workspace prefix other than this directory's holds `id`'s
-    /// state object: one listing of the bucket's top level, which names the
-    /// workspace prefixes, then one of each other prefix's `<prefix>/<id>/`.
-    /// Asked only for a session with no local copy and no state under this
-    /// directory's prefix.
+    /// state object. Asked only for a session with no local copy and no
+    /// state under this directory's prefix.
+    ///
+    /// The lookup reads the bucket's name index first
+    /// ([`crate::session::name_index`]), in three steps:
+    ///
+    /// 1. Three requests go out together ([`CloudBackend::start_lookup`]):
+    ///    the index listing of `koto-names/<id>/`, the read of the
+    ///    declaration, and the listing of the bucket's top level, which
+    ///    names the workspace prefixes.
+    /// 2. Each prefix the index names is confirmed by listing its
+    ///    `<prefix>/<id>/` and looking for the state object, as the sweep
+    ///    does, so a stale or forged entry costs one listing and never
+    ///    answers on its own.
+    /// 3. The answer. Every bucket reads undeclared in this release: a
+    ///    confirmed hit is `Ok(true)`, and a miss sweeps every other prefix
+    ///    the top-level listing names, less those step 2 already found
+    ///    without the session ([`CloudBackend::sweep`]), so a session only
+    ///    an older release wrote, with no entry, is still found.
     ///
     /// `Ok(false)` only when every other prefix was asked and answered that
-    /// it holds no state for `id`. A listing the bucket throttled is asked
-    /// again ([`list_retrying`]); one that still fails is `Err`, since koto
-    /// can't tell what that prefix holds, and the caller reports it rather
-    /// than read the session as absent (koto#528).
-    ///
-    /// The per-prefix listings run [`HELD_ELSEWHERE_FANOUT`] at a time: asked
-    /// in turn, a bucket with hundreds of prefixes kept a probe of a name
-    /// that exists nowhere waiting minutes (koto#526). Once a prefix is found
-    /// holding the session, or a listing fails for good, no further listing
-    /// starts, though those already in flight finish.
-    ///
-    /// `Relaxed` ordering is enough for both atomics. The index needs only
-    /// atomicity: `fetch_add` is a read-modify-write, so each prefix is
-    /// handed to exactly one worker whatever the ordering. `stop` is only an
-    /// early stop: a worker that reads it late makes one listing more, and
-    /// never changes the answer, which is read after the scope has joined
-    /// every worker, and the join makes all their writes visible. The answer
-    /// stays exact: `found` is set only by a listing that showed the state
-    /// object, and `Ok(false)` needs no stop at all, so every worker ran
-    /// until the index passed the last prefix, each one asked and answered.
+    /// it holds no state for `id`. A failed top-level listing is `Err`
+    /// whatever the index found, since an undeclared bucket can't be read
+    /// without it, and so is a confirming or sweeping listing that still
+    /// fails once asked again ([`list_retrying`]): koto can't tell what that
+    /// prefix holds, and the caller reports it rather than read the session
+    /// as absent (koto#528). A failed index listing or declaration read
+    /// changes nothing: the sweep covers every prefix the index would have
+    /// spared it.
     fn held_elsewhere(&self, id: &str) -> anyhow::Result<bool> {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let pages = list_retrying(&self.bucket, String::new(), Some("/"))
-            .map_err(|e| anyhow::anyhow!("listing the bucket's workspace prefixes failed: {e}"))?;
-        let prefixes: Vec<String> = pages
-            .iter()
-            .filter_map(|page| page.common_prefixes.as_ref())
-            .flatten()
-            .filter_map(|cp| cp.prefix.strip_suffix('/'))
-            .filter(|p| is_workspace_prefix(p) && *p != self.prefix)
-            .map(str::to_string)
-            .collect();
-        let bucket = &self.bucket;
-        let holds = |prefix: &str| -> anyhow::Result<bool> {
-            let session = format!("{prefix}/{id}/");
-            let state = format!("{session}{}", state_file_name(id));
-            let pages = list_retrying(bucket, session.clone(), Some("/"))
-                .map_err(|e| anyhow::anyhow!("listing {session} failed: {e}"))?;
-            Ok(pages
-                .iter()
-                .flat_map(|page| page.contents.iter())
-                .any(|obj| obj.key == state))
+        use crate::session::name_index::Memo;
+
+        let endpoint = self.bucket.region().endpoint();
+        let bucket_name = self.bucket.name();
+        let memo_dir = self.local.journal_root();
+        let carried = memo_dir.and_then(|dir| Memo::load(dir, &endpoint, &bucket_name));
+
+        // Step 1. Nothing trusts a declaration yet, so the declaration is
+        // read and the top-level listing started whatever `carried` says.
+        let LookupStart {
+            index,
+            declaration,
+            top_level,
+        } = self.start_lookup(id, true, true);
+        let memo = match (memo_dir, &declaration) {
+            (Some(dir), Some(read)) => Memo::record(
+                dir,
+                &endpoint,
+                &bucket_name,
+                read,
+                std::time::SystemTime::now(),
+            ),
+            _ => carried,
         };
-        let next = AtomicUsize::new(0);
-        let stop = AtomicBool::new(false);
-        let found = AtomicBool::new(false);
-        let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..prefixes.len().min(HELD_ELSEWHERE_FANOUT) {
-                scope.spawn(|| {
-                    while !stop.load(Ordering::Relaxed) {
-                        let Some(prefix) = prefixes.get(next.fetch_add(1, Ordering::Relaxed))
-                        else {
-                            break;
-                        };
-                        match holds(prefix) {
-                            Ok(false) => {}
-                            Ok(true) => {
-                                found.store(true, Ordering::Relaxed);
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                failed
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get_or_insert(e);
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                });
+
+        // The one place a declared bucket would be told apart from an
+        // undeclared one (koto#609): `declaration`, this lookup's read, and
+        // `memo`, the answer in effect after it, are both in hand here. No
+        // command writes a declaration yet, so this release ignores both
+        // and reads every bucket as undeclared.
+        let _undeclared = (declaration, memo);
+
+        let top_level = match top_level {
+            Some(listed) => listed,
+            None => top_level_prefixes(&self.bucket, &self.prefix),
+        }?;
+
+        // Step 2. A failed index listing, and one cut off at
+        // `MAX_ENTRIES_PER_LOOKUP`, confirm nothing and spare the sweep
+        // nothing.
+        let confirmed_absent = match index {
+            Ok(read) if !read.capped => {
+                if any_holds(&self.bucket, id, &read.prefixes)? {
+                    return Ok(true);
+                }
+                read.prefixes
             }
-        });
-        if found.into_inner() {
-            return Ok(true);
+            _ => Vec::new(),
+        };
+
+        // Step 3, on an undeclared bucket.
+        self.sweep(id, &top_level, &confirmed_absent)
+    }
+
+    /// [`CloudBackend::held_elsewhere`]'s first step: the index listing of
+    /// `koto-names/<id>/`, and with it, each when asked for, the
+    /// declaration read and the top-level listing, every one on its own
+    /// thread so the three cost one round trip.
+    fn start_lookup(&self, id: &str, declaration: bool, top_level: bool) -> LookupStart {
+        let bucket = &self.bucket;
+        let own = self.prefix.as_str();
+        std::thread::scope(|scope| {
+            let index = scope.spawn(|| read_index(bucket, id, own));
+            let declaration =
+                declaration.then(|| scope.spawn(|| name_index::read_declaration(bucket)));
+            let top_level = top_level.then(|| scope.spawn(|| top_level_prefixes(bucket, own)));
+            LookupStart {
+                index: joined(index),
+                declaration: declaration.map(joined),
+                top_level: top_level.map(joined),
+            }
+        })
+    }
+
+    /// The exact fallback: ask every prefix in `top_level` but those in
+    /// `confirmed_absent` whether it holds `id`, as every lookup did before
+    /// the name index. A sweep that takes longer than
+    /// [`SLOW_SWEEP_HINT_AFTER`] prints a hint on stderr naming the command
+    /// that lets lookups skip it.
+    fn sweep(
+        &self,
+        id: &str,
+        top_level: &[String],
+        confirmed_absent: &[String],
+    ) -> anyhow::Result<bool> {
+        let rest: Vec<String> = top_level
+            .iter()
+            .filter(|p| !confirmed_absent.contains(p))
+            .cloned()
+            .collect();
+        let started = std::time::Instant::now();
+        let held = any_holds(&self.bucket, id, &rest);
+        if started.elapsed() > SLOW_SWEEP_HINT_AFTER {
+            eprintln!("{SLOW_SWEEP_HINT}");
         }
-        match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            Some(e) => Err(e),
-            None => Ok(false),
-        }
+        held
     }
 
     /// Where `id`'s own copy lives in the bucket, asked of its local header
@@ -1480,7 +1540,7 @@ impl CloudBackend {
     /// one whose declaration can't be read, the push fails, since a
     /// declared bucket would otherwise read this copy as missing.
     fn write_entry(&self, name: &str, prefix: &str) -> anyhow::Result<bool> {
-        use crate::session::name_index::{self, DeclarationRead};
+        use crate::session::name_index::DeclarationRead;
 
         // Only a made-up prefix, never one koto derives or records, fails
         // here; such a copy can't be indexed and is pushed as before.
@@ -6671,7 +6731,8 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
         config.bucket.as_deref().unwrap_or("koto-sessions"),
         region,
         credentials,
-    )?;
+    )?
+    .with_request_timeout(REQUEST_TIMEOUT)?;
     if config.path_style == Some(true) {
         return Ok(bucket.with_path_style());
     }
@@ -6752,12 +6813,24 @@ pub(crate) fn list_retrying_when(
     retry: impl Fn(&S3Error) -> bool,
 ) -> Result<Vec<s3::serde_types::ListBucketResult>, (S3Error, std::time::Duration)> {
     let delimiter = delimiter.map(str::to_string);
-    let ask = || {
-        let started = std::time::Instant::now();
-        bucket
-            .list(prefix.clone(), delimiter.clone())
-            .map_err(|e| (e, started.elapsed()))
-    };
+    asked_retrying(
+        || {
+            let started = std::time::Instant::now();
+            bucket
+                .list(prefix.clone(), delimiter.clone())
+                .map_err(|e| (e, started.elapsed()))
+        },
+        retry,
+    )
+}
+
+/// `ask`, made up to [`LIST_ATTEMPTS`] times while it fails with an error
+/// `retry` accepts, waiting [`LIST_BACKOFF`], doubled each time, between
+/// asks: [`list_retrying_when`]'s policy for any one request.
+fn asked_retrying<T>(
+    ask: impl Fn() -> Result<T, (S3Error, std::time::Duration)>,
+    retry: impl Fn(&S3Error) -> bool,
+) -> Result<T, (S3Error, std::time::Duration)> {
     let mut wait = LIST_BACKOFF;
     for _ in 1..LIST_ATTEMPTS {
         match ask() {
@@ -6769,6 +6842,172 @@ pub(crate) fn list_retrying_when(
         }
     }
     ask()
+}
+
+/// A listing of `prefix` with no delimiter, page by page, that stops
+/// asking for pages once it holds `cap` keys or more. Each page is asked
+/// as [`list_retrying`] asks a listing. The flag says whether it stopped
+/// at the cap.
+fn list_capped(
+    bucket: &Bucket,
+    prefix: &str,
+    cap: usize,
+) -> Result<(Vec<s3::serde_types::ListBucketResult>, bool), S3Error> {
+    let mut pages = Vec::new();
+    let mut keys = 0;
+    let mut token: Option<String> = None;
+    loop {
+        let page = asked_retrying(
+            || {
+                bucket
+                    .list_page(prefix.to_string(), None, token.clone(), None, None)
+                    .map(|(page, _)| page)
+                    .map_err(|e| (e, std::time::Duration::ZERO))
+            },
+            is_transient,
+        )
+        .map_err(|(e, _)| e)?;
+        keys += page.contents.len();
+        token = page.next_continuation_token.clone();
+        pages.push(page);
+        if keys >= cap {
+            return Ok((pages, true));
+        }
+        if token.is_none() {
+            return Ok((pages, false));
+        }
+    }
+}
+
+/// What [`CloudBackend::start_lookup`] got back: the index read, and the
+/// declaration read and the top-level listing when it was asked for them.
+struct LookupStart {
+    index: anyhow::Result<IndexRead>,
+    declaration: Option<name_index::DeclarationRead>,
+    top_level: Option<anyhow::Result<Vec<String>>>,
+}
+
+/// One lookup's read of the name index for a name.
+struct IndexRead {
+    /// The other workspace prefixes the index names as having held the
+    /// name, through [`name_index::prefixes_from`].
+    prefixes: Vec<String>,
+    /// Whether the listing stopped at
+    /// [`name_index::MAX_ENTRIES_PER_LOOKUP`] entries: the name is treated
+    /// as polluted and no entry of it is confirmed.
+    capped: bool,
+}
+
+/// Read `koto-names/<id>/`, at most up to the page that reaches
+/// [`name_index::MAX_ENTRIES_PER_LOOKUP`] entries, and keep the prefixes
+/// other than `own` it validly names.
+fn read_index(bucket: &Bucket, id: &str, own: &str) -> anyhow::Result<IndexRead> {
+    let listing = name_index::listing_prefix(id)?;
+    let (pages, capped) = list_capped(bucket, &listing, name_index::MAX_ENTRIES_PER_LOOKUP)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "listing {listing} failed: {}",
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+    Ok(IndexRead {
+        prefixes: name_index::prefixes_from(&pages, id, own),
+        capped,
+    })
+}
+
+/// The workspace prefixes the bucket's top-level listing names, other than
+/// `own`.
+fn top_level_prefixes(bucket: &Bucket, own: &str) -> anyhow::Result<Vec<String>> {
+    let pages = list_retrying(bucket, String::new(), Some("/"))
+        .map_err(|e| anyhow::anyhow!("listing the bucket's workspace prefixes failed: {e}"))?;
+    Ok(pages
+        .iter()
+        .filter_map(|page| page.common_prefixes.as_ref())
+        .flatten()
+        .filter_map(|cp| cp.prefix.strip_suffix('/'))
+        .filter(|p| is_workspace_prefix(p) && *p != own)
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether any of `prefixes` holds `id`'s state object: one listing of
+/// each `<prefix>/<id>/`, [`HELD_ELSEWHERE_FANOUT`] at a time.
+///
+/// `Ok(false)` only when every prefix was asked and answered that it holds
+/// no state for `id`. A listing the bucket throttled is asked again
+/// ([`list_retrying`]); one that still fails is `Err`, since koto can't
+/// tell what that prefix holds.
+///
+/// Asked in turn, a bucket with hundreds of prefixes kept a probe of a
+/// name that exists nowhere waiting minutes (koto#526). Once a prefix is
+/// found holding the session, or a listing fails for good, no further
+/// listing starts, though those already in flight finish.
+///
+/// `Relaxed` ordering is enough for both atomics. The index needs only
+/// atomicity: `fetch_add` is a read-modify-write, so each prefix is handed
+/// to exactly one worker whatever the ordering. `stop` is only an early
+/// stop: a worker that reads it late makes one listing more, and never
+/// changes the answer, which is read after the scope has joined every
+/// worker, and the join makes all their writes visible. The answer stays
+/// exact: `found` is set only by a listing that showed the state object,
+/// and `Ok(false)` needs no stop at all, so every worker ran until the
+/// index passed the last prefix, each one asked and answered.
+fn any_holds(bucket: &Bucket, id: &str, prefixes: &[String]) -> anyhow::Result<bool> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let holds = |prefix: &str| -> anyhow::Result<bool> {
+        let session = format!("{prefix}/{id}/");
+        let state = format!("{session}{}", state_file_name(id));
+        let pages = list_retrying(bucket, session.clone(), Some("/"))
+            .map_err(|e| anyhow::anyhow!("listing {session} failed: {e}"))?;
+        Ok(pages
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .any(|obj| obj.key == state))
+    };
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let found = AtomicBool::new(false);
+    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..prefixes.len().min(HELD_ELSEWHERE_FANOUT) {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(prefix) = prefixes.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    match holds(prefix) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            found.store(true, Ordering::Relaxed);
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            failed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(e);
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if found.into_inner() {
+        return Ok(true);
+    }
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
+}
+
+/// The value of a scoped thread, or its panic carried on.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// A response's `ETag` header, without its quotes; `None` when it has none.

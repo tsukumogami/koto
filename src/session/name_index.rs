@@ -18,11 +18,12 @@
 //! and a listing's keys are kept only when they parse back the same way, so
 //! nothing a bucket lists can steer a lookup outside the workspace prefixes.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use s3::serde_types::ListBucketResult;
 use s3::Bucket;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::session::continues_bucket::is_workspace_prefix;
 use crate::session::validate::validate_session_id;
@@ -207,6 +208,154 @@ pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
             without_url_userinfo(&e.to_string())
         )),
     }
+}
+
+/// The host-wide memo of the declaration, a file of this name beside the
+/// local session store: the last answer a lookup's read of
+/// [`DECLARATION_KEY`] got from one endpoint and bucket, and when.
+///
+/// A lookup records every answered read here. A read that got no answer
+/// leaves the memo as it was, so a later lookup can still see the last
+/// answer and how old it is. Nothing reads it to decide anything yet.
+pub const MEMO_FILE: &str = "cloud-index.json";
+
+/// The most bytes of [`MEMO_FILE`] a host reads; a larger file is ignored.
+const MAX_MEMO_BYTES: u64 = 4096;
+
+/// The last declaration answer [`MEMO_FILE`] records for one endpoint and
+/// bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Memo {
+    /// The endpoint the answer came from, without URL userinfo.
+    pub endpoint: String,
+    /// The bucket the answer came from.
+    pub bucket: String,
+    /// Whether the read found a declaration [`parse_declaration`] accepts.
+    pub declared: bool,
+    /// When the last read that got an answer was made.
+    pub read_at: SystemTime,
+}
+
+/// [`Memo`] as the file holds it. The format is versioned so a later
+/// release can change it; a file of another version is ignored.
+#[derive(Debug, Serialize, Deserialize)]
+struct MemoFile {
+    version: u64,
+    endpoint: String,
+    bucket: String,
+    declared: bool,
+    read_at: String,
+}
+
+const MEMO_VERSION: u64 = 1;
+
+impl Memo {
+    /// The memo in `dir` for `endpoint` and `bucket`. `None` when there is
+    /// no file, it can't be read or parsed, or it records another endpoint
+    /// or bucket: each reads as no memo.
+    pub fn load(dir: &Path, endpoint: &str, bucket: &str) -> Option<Memo> {
+        use std::io::Read;
+        let file = std::fs::File::open(dir.join(MEMO_FILE)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_MEMO_BYTES + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > MAX_MEMO_BYTES {
+            return None;
+        }
+        let file: MemoFile = serde_json::from_slice(&bytes).ok()?;
+        let endpoint = memo_endpoint(endpoint);
+        if file.version != MEMO_VERSION || file.endpoint != endpoint || file.bucket != bucket {
+            return None;
+        }
+        Some(Memo {
+            endpoint,
+            bucket: file.bucket,
+            declared: file.declared,
+            read_at: crate::engine::types::parse_timestamp_to_systemtime(&file.read_at)?,
+        })
+    }
+
+    /// Write this memo to `dir` through a temporary file renamed into
+    /// place, user-only on Unix. Failures are ignored: the memo is only
+    /// ever a hint.
+    pub fn save(&self, dir: &Path) {
+        let file = MemoFile {
+            version: MEMO_VERSION,
+            endpoint: memo_endpoint(&self.endpoint),
+            bucket: self.bucket.clone(),
+            declared: self.declared,
+            read_at: crate::engine::types::iso8601_at(self.read_at),
+        };
+        let Ok(bytes) = serde_json::to_vec(&file) else {
+            return;
+        };
+        if !dir.is_dir() {
+            return;
+        }
+        let tmp = dir.join(format!(".{}.{}.tmp", MEMO_FILE, std::process::id()));
+        if write_private(&tmp, &bytes).is_err()
+            || std::fs::rename(&tmp, dir.join(MEMO_FILE)).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Record in `dir` what one read of the declaration from `endpoint`
+    /// and `bucket` found at `now`, and return the memo that is in effect
+    /// afterwards. A present declaration records "declared"; an absent or
+    /// invalid one records "not declared", replacing an earlier "declared"
+    /// at once; a read that got no answer changes nothing and returns the
+    /// memo as it was.
+    pub(crate) fn record(
+        dir: &Path,
+        endpoint: &str,
+        bucket: &str,
+        read: &DeclarationRead,
+        now: SystemTime,
+    ) -> Option<Memo> {
+        let declared = match read {
+            DeclarationRead::Present => true,
+            DeclarationRead::Absent => false,
+            DeclarationRead::Unreadable(_) => return Memo::load(dir, endpoint, bucket),
+        };
+        let memo = Memo {
+            endpoint: memo_endpoint(endpoint),
+            bucket: bucket.to_string(),
+            declared,
+            read_at: now,
+        };
+        memo.save(dir);
+        Some(memo)
+    }
+}
+
+/// `endpoint` without any URL userinfo, with or without a scheme, so the
+/// memo never keeps credentials written into the endpoint.
+fn memo_endpoint(endpoint: &str) -> String {
+    let stripped = crate::session::cloud::without_url_userinfo(endpoint);
+    if stripped.contains("://") {
+        return stripped;
+    }
+    let authority_end = stripped.find('/').unwrap_or(stripped.len());
+    match stripped[..authority_end].rfind('@') {
+        Some(at) => stripped[at + 1..].to_string(),
+        None => stripped,
+    }
+}
+
+/// Create `path` with `bytes`, readable and writable by its owner only on
+/// Unix.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
