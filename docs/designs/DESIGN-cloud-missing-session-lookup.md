@@ -179,8 +179,12 @@ Key assumptions:
   follow the first backfill at once and the probation adds nothing.
 - Every S3-compatible endpoint koto supports accepts a PUT under a second
   top-level key family with the credentials it already uses. If not, hosts
-  whose credentials only allow `<prefix>/*` warn on undeclared buckets and
-  can't create sessions on declared ones.
+  that can read `koto-names/_complete` but can't write entries warn on
+  undeclared buckets and can't push an unindexed copy (a new one, or one
+  from before the upgrade) on declared ones. Hosts whose credentials only
+  allow `<prefix>/*` can neither write entries nor read the declaration, so
+  their pushes fail on every bucket until they're granted the `koto-names/`
+  permissions.
 - `LastModified` on a state object is reliable enough for the audit to tell
   "created after the audit started" from "created before".
 - rust-s3's default single retry and 60-second request timeout stay as they
@@ -351,7 +355,8 @@ exists and so always writes the entry. `Stamp` is already filtered on
 `state_key`, which embeds the home prefix and the name, so a renamed or
 re-homed copy starts unmarked and writes its new entry. A failed entry PUT
 stops the state PUT and leaves the push owed, as a failed state PUT does
-today. The body is empty, so the PUT is idempotent and needs no
+today. A refused one (403) reads the declaration first, by the rule in
+Solution Architecture's write path. The body is empty, so the PUT is idempotent and needs no
 precondition.
 
 `Stamp` gains `indexed: bool` (serde default `false`), carried from a
@@ -675,11 +680,18 @@ leaves it in place if it rolls back with `take_back`. A transient failure is
 returned like a failed state PUT, so `sync_push_state` leaves the push owed
 and `strict_push_state` fails. A refusal is recognized the way the 501
 fallback is, as `S3Error::HttpFailWithBody(403, _)`, and reads the
-declaration once: absent, the
-host warns that it can't write the index and goes on with the push, leaving
-the entry owed; present or unreadable, the push fails with an error that
-names the missing permission, because a declared bucket would otherwise miss
-this session.
+declaration once, listing its key and then reading the object. Absent (the
+listing answers without the key, or the read answers 404 or an invalid
+body), the host warns that it can't write the index and goes on with the
+push, leaving the entry owed. Present, or unreadable (any other outcome:
+the listing or the read refused, answered with another error, or
+unanswered), the push fails with an error that names the entry, the PUT
+permission it needs under `koto-names/` and, when the declaration couldn't
+be read, why, because a declared bucket would otherwise miss this session. A
+host that can't read the declaration can't tell an undeclared bucket from a
+declared one, so its push fails on both. The failure is returned the same
+way as a transient one. This paragraph is the rule for a refused entry
+write; Decision 2, Phase 1 and Security Considerations follow it.
 
 **`src/session/sync_stamp.rs`.** `Stamp` gains `indexed: bool` with
 `#[serde(default)]`. `Stamp::for_bytes` carries it from a previous stamp
@@ -807,8 +819,12 @@ the sweep runs over every other prefix as today.
 Add `name_index.rs`, `Stamp::indexed`, and `ensure_indexed` in `put_state`,
 `put_state_over` and `push_staged`, with the full 403 handling (read the
 declaration once; absent, warn and push with the entry owed; present or
-unreadable, fail the push). No command writes a declaration yet, so a host
-whose credentials can't write under `koto-names/` only warns. Nothing reads
+unreadable, meaning refused, erroring or unanswered, fail the push; an
+invalid body reads as absent). No command writes a declaration yet, so a host
+whose credentials can read `koto-names/_complete` but can't write under
+`koto-names/` only warns. A host whose credentials can't read the
+declaration either has its pushes fail on every bucket, as the write path
+says, until it's granted the permissions the guide lists. Nothing reads
 the index yet, so every lookup is unchanged; this phase can ship alone and
 starts populating buckets as hosts upgrade.
 
@@ -856,7 +872,8 @@ Deliverables:
 
 Add `koto session index audit|declare|revoke` and the declared branch of
 `held_elsewhere`; the write path's 403 handling, in place since Phase 1,
-starts failing pushes once a declaration exists. Document the
+starts failing the pushes of hosts that can read the declaration but not
+write entries once a declaration exists. Document the
 command and the declared bucket's trade in `docs/guides/cloud-sync-setup.md`
 and the error-handling reference.
 
@@ -949,9 +966,10 @@ state objects themselves, and the effect ends when the declaration is
 deleted or the next audit revokes it. Deleting the declaration is always
 safe. A forged `koto-names/_audit` can at most let `declare` run before the
 probation has really passed, which gives its writer nothing a forged
-declaration wouldn't. A forged declaration also turns a refused entry write from a warning
-into a failed push, so it can stop hosts with prefix-scoped credentials from
-creating session copies until it's removed. The guide will tell owners who
+declaration wouldn't. A forged declaration also turns a refused entry
+write from a warning into a failed push, so it can stop hosts whose
+credentials can read the declaration but not write entries from pushing
+unindexed copies until it's removed. The guide will tell owners who
 want more than the convention to restrict writes of `koto-names/_complete`
 to the operator's credentials with a bucket policy, to turn on object
 versioning so an overwrite can be inspected and reverted, and to keep
@@ -960,9 +978,14 @@ are written once and never refreshed.
 
 **Credentials.** Hosts need PUT and LIST under `koto-names/` and GET of
 `koto-names/_complete`, on top of what they use today; the guide lists the
-exact permissions. Credentials limited to one workspace prefix warn on an
-undeclared bucket and can't create session copies on a declared one, and
-`declare` refuses while it can see the entry-less copies they leave. Read
+exact permissions. Credentials that can read the declaration but can't
+write under `koto-names/` warn on an undeclared bucket and can't push an
+unindexed copy (a new one, or one from before the upgrade) on a declared
+one, and `declare` refuses while it can see the entry-less copies they
+leave. Credentials limited to one workspace prefix can neither write
+entries nor read the declaration, so they can't tell an undeclared bucket
+from a declared one, and their pushes fail on both with an error that
+names the PUT permission they lack (the write path above). Read
 access gains nothing from the index: confirming an entry still needs list
 access to the prefix it names.
 
@@ -1016,8 +1039,12 @@ reads keep failing falls back to the exact sweep once that limit passes.
 - Any bucket writer can create or delete the declaration, so on a declared
   bucket the reply guarantee rests on the owner's bucket policy as well as
   on koto.
-- Hosts whose credentials only allow `<prefix>/*` warn on undeclared
-  buckets and can't push new copies on declared ones.
+- Hosts that can read the declaration but can't write entries warn on
+  undeclared buckets and can't push unindexed copies, new or from before
+  the upgrade, on declared ones. Hosts whose credentials only allow
+  `<prefix>/*` can't read the declaration, so their pushes fail on every
+  bucket until they're granted the `koto-names/` permissions (see
+  Credentials in Security Considerations).
 - On a bucket whose single requests hang, one listing can still wait
   rust-s3's 60-second timeout, so even a declared bucket can't promise an
   answer inside 30 seconds.
@@ -1030,7 +1057,7 @@ reads keep failing falls back to the exact sweep once that limit passes.
   that for any declared bucket that older releases might still reach;
   `revoke` is one delete.
 - `declare` refuses while it can see entry-less state objects, including
-  those that prefix-scoped credentials leave behind, and names them.
+  those that hosts unable to write entries leave behind, and names them.
 - `--prune` is available whenever the owner wants to shrink the index or
   clear deleted sessions' names.
 - The guide gives owners the bucket policy, versioning and lifecycle
