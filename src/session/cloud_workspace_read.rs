@@ -305,7 +305,7 @@ impl WorkspaceReader {
             .map_err(|e| self.unreadable(&format!("session '{}'", name), e))?;
         std::fs::write(dir.join(state_file_name(name)), &bytes)
             .map_err(|e| self.unreadable(&format!("the state file of '{}'", name), e))?;
-        self.backend.record_synced(name, Some(&etag), &bytes);
+        self.backend.record_synced(name, Some(&etag), &bytes, false);
         Ok(())
     }
 

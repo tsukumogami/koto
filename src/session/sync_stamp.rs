@@ -6,8 +6,9 @@
 //!
 //! - `cloud-sync.json` ([`Stamp`]): the bucket's ETag for the state file and
 //!   the length and SHA-256 of the bytes this host last pulled or pushed
-//!   under it, the ETag of the remote manifest cached beside it, and the
-//!   tick that last checked the session.
+//!   under it, the ETag of the remote manifest cached beside it, the tick
+//!   that last checked the session, and whether this host knows the copy's
+//!   name-index entry to be in the bucket (koto#607).
 //! - `cloud-manifest.json`: the remote manifest as the bucket last served
 //!   it, valid while the bucket's manifest ETag equals the stamped one.
 //! - `cloud-tick.id`: in a session's own directory, the id of the tick now
@@ -155,6 +156,12 @@ pub struct Stamp {
     /// a pull fetched them, or this host's own push sent them.
     #[serde(default)]
     pub verified_tick: Option<String>,
+    /// Whether this host knows the name-index entry for `state_key`'s name
+    /// and prefix to be in the bucket ([`crate::session::name_index`]).
+    /// Absent from an older release's stamp, which then costs one
+    /// idempotent entry PUT on the next push.
+    #[serde(default)]
+    pub indexed: bool,
 }
 
 impl Stamp {
@@ -186,17 +193,18 @@ impl Stamp {
     }
 
     /// A stamp for `bytes`, stored under `state_key` with `etag`, keeping the
-    /// cached manifest's ETag when the key is the same.
+    /// cached manifest's ETag and whether the copy is indexed when the key
+    /// is the same.
     pub fn for_bytes(previous: Option<&Stamp>, state_key: &str, etag: &str, bytes: &[u8]) -> Self {
+        let same = previous.filter(|p| p.state_key == state_key);
         Stamp {
             state_key: state_key.to_string(),
             state_etag: Some(etag.to_string()),
             state_len: bytes.len() as u64,
             state_sha256: sha256_hex(bytes),
-            manifest_etag: previous
-                .filter(|p| p.state_key == state_key)
-                .and_then(|p| p.manifest_etag.clone()),
+            manifest_etag: same.and_then(|p| p.manifest_etag.clone()),
             verified_tick: None,
+            indexed: same.is_some_and(|p| p.indexed),
         }
     }
 }
@@ -405,6 +413,29 @@ mod tests {
             Stamp::for_bytes(Some(&old), "other", "e2", b"b").manifest_etag,
             None
         );
+    }
+
+    #[test]
+    fn an_older_stamp_without_the_index_flag_loads_unindexed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(STAMP_FILE),
+            br#"{"state_key":"p/wf/koto-wf.state.jsonl","state_etag":"e1","state_len":5,"state_sha256":"x","manifest_etag":null,"verified_tick":null}"#,
+        )
+        .unwrap();
+        let loaded = Stamp::load(dir.path()).expect("an older stamp still loads");
+        assert_eq!(loaded.state_etag.as_deref(), Some("e1"));
+        assert!(!loaded.indexed);
+    }
+
+    #[test]
+    fn a_new_stamp_keeps_the_index_flag_only_for_the_same_key() {
+        let mut old = Stamp::for_bytes(None, "k", "e1", b"a");
+        assert!(!old.indexed, "no previous stamp");
+        old.indexed = true;
+        assert!(Stamp::for_bytes(Some(&old), "k", "e2", b"b").indexed);
+        assert!(!Stamp::for_bytes(Some(&old), "other", "e2", b"b").indexed);
+        assert!(!Stamp::for_bytes(None, "k", "e2", b"b").indexed);
     }
 
     #[test]

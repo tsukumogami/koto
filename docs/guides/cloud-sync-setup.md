@@ -100,6 +100,17 @@ koto config set --user session.cloud.secret_key <your-secret-key>
 
 The `--user` flag is required for credentials. They're blocked from project config to prevent accidental commits to git. Env vars take precedence over user config. `koto config list` redacts credential values in output, and koto replaces any credential it knows of with `[REDACTED:<source>]` in the output of the commands a session runs.
 
+### What the keys must be allowed to do
+
+Each host needs to list, read, write and delete objects under the workspace prefixes it uses (see [Where a session lives in the bucket](#where-a-session-lives-in-the-bucket)). Beyond those, it needs:
+
+- PUT and LIST under `koto-names/`
+- GET of `koto-names/_complete`
+
+`koto-names/` is the bucket's index of session names. Before a session copy's first state object goes up, koto writes an empty object `koto-names/<name>/<prefix>`. The object has no body: its key alone records the session's name and the prefix of the workspace that holds it. It's written once per copy and per host: after a create, an import, a rename, or the first push of a copy an older koto created. Deleting a session (`koto session cleanup`, `koto session prune`) leaves that object in the bucket, so nothing needs DELETE under `koto-names/`.
+
+A host whose keys can't PUT the index object warns on stderr and pushes anyway, leaving the object for a later push to write. To tell whether it may skip the object, it checks for `koto-names/_complete` once: it lists that key, and reads the object only when the listing shows it. When the listing doesn't show it, the push warns and goes on. The push fails instead when the listing fails (keys without LIST under `koto-names/`, or a bucket that fails the request), when the object is listed but can't be read (keys without GET on it), or when it holds a valid declaration, the way a failed state upload does, with an error that names the index object and the missing PUT permission. So grant all three permissions together. No koto command writes `koto-names/_complete` in this release.
+
 ## 4. Use koto normally
 
 There are no sync commands. These commands read or write the session's copy in the bucket as part of their normal work:

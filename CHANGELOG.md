@@ -10,6 +10,17 @@ to `0.9.x`).
 
 ### Compatibility
 
+- **Cloud keys need PUT and LIST under `koto-names/` and GET of
+  `koto-names/_complete`
+  ([koto#607](https://github.com/tsukumogami/koto/issues/607)).** Before a
+  session copy's first state object goes up, koto now writes an empty index
+  object `koto-names/<name>/<prefix>`, once per copy and host; deleting a
+  session leaves it. Keys that can't PUT it warn and push anyway, unless
+  koto can't list `koto-names/_complete`, or finds it listed and can't
+  read it, or finds a valid declaration in it: then the push fails as a
+  failed state upload does. Nothing
+  reads the index yet, so no command's reply changes.
+
 - **The first release after v0.24.0 is the
   first release that honours pins in full.** Every host that shares a bucket
   needs it. koto v0.24.0 has pins
