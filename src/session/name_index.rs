@@ -466,6 +466,13 @@ mod tests {
     }
 
     #[test]
+    fn prefixes_from_a_name_never_keeps_a_longer_name_s_entries() {
+        let keys = vec![format!("koto-names/foobar/{P}")];
+        assert!(prefixes_from(&[page(&keys)], "foo", "").is_empty());
+        assert_eq!(prefixes_from(&[page(&keys)], "foobar", ""), vec![P]);
+    }
+
+    #[test]
     fn prefixes_from_an_invalid_name_is_empty() {
         let keys = vec![format!("koto-names/a/b/{P}")];
         assert!(prefixes_from(&[page(&keys)], "a/b", "").is_empty());
@@ -589,5 +596,212 @@ mod tests {
         let mut body = valid();
         body["declared_at"] = 1_700_000_000.into();
         assert_eq!(parse_declaration(&bytes(&body)), None, "a number");
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    const ENDPOINT: &str = "http://127.0.0.1:9000";
+    const BUCKET: &str = "sessions";
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn memo(declared: bool, read_at: SystemTime) -> Memo {
+        Memo {
+            endpoint: ENDPOINT.to_string(),
+            bucket: BUCKET.to_string(),
+            declared,
+            read_at,
+        }
+    }
+
+    #[test]
+    fn a_saved_memo_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Memo::load(dir.path(), ENDPOINT, BUCKET), None, "no file");
+        for declared in [true, false] {
+            let saved = memo(declared, at(1_800_000_000) + Duration::from_millis(250));
+            saved.save(dir.path());
+            assert_eq!(Memo::load(dir.path(), ENDPOINT, BUCKET), Some(saved));
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![MEMO_FILE.to_string()], "no temporary file left");
+    }
+
+    #[test]
+    fn a_memo_that_does_not_parse_is_no_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MEMO_FILE);
+        let good = serde_json::json!({
+            "version": MEMO_VERSION,
+            "endpoint": ENDPOINT,
+            "bucket": BUCKET,
+            "declared": true,
+            "read_at": "2026-11-01T10:00:00Z",
+        });
+        std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+        assert!(
+            Memo::load(dir.path(), ENDPOINT, BUCKET).is_some(),
+            "control"
+        );
+
+        let mut other_version = good.clone();
+        other_version["version"] = (MEMO_VERSION + 1).into();
+        let mut bad_time = good.clone();
+        bad_time["read_at"] = "yesterday".into();
+        let mut oversized = good.clone();
+        oversized["padding"] = "x".repeat(MAX_MEMO_BYTES as usize).into();
+        for body in [
+            b"not json".to_vec(),
+            Vec::new(),
+            b"{\"declared\": true}".to_vec(),
+            serde_json::to_vec(&other_version).unwrap(),
+            serde_json::to_vec(&bad_time).unwrap(),
+            serde_json::to_vec(&oversized).unwrap(),
+        ] {
+            std::fs::write(&path, &body).unwrap();
+            assert_eq!(
+                Memo::load(dir.path(), ENDPOINT, BUCKET),
+                None,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // The next answered read replaces it.
+        std::fs::write(&path, b"garbage").unwrap();
+        let now = at(1_800_000_000);
+        let after = Memo::record(dir.path(), ENDPOINT, BUCKET, &DeclarationRead::Absent, now);
+        assert_eq!(after, Some(memo(false, now)));
+        assert_eq!(Memo::load(dir.path(), ENDPOINT, BUCKET), after);
+    }
+
+    #[test]
+    fn a_memo_of_another_bucket_or_endpoint_is_no_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        memo(true, at(1_800_000_000)).save(dir.path());
+        assert_eq!(Memo::load(dir.path(), ENDPOINT, "other"), None);
+        assert_eq!(
+            Memo::load(dir.path(), "http://127.0.0.1:9001", BUCKET),
+            None
+        );
+        assert!(Memo::load(dir.path(), ENDPOINT, BUCKET).is_some());
+    }
+
+    #[test]
+    fn a_memo_keeps_no_endpoint_userinfo() {
+        for (endpoint, kept) in [
+            (
+                "https://AKIAKEY:s3cr3t@s3.example.com:9000/base",
+                "https://s3.example.com:9000/base",
+            ),
+            (
+                "AKIAKEY:s3cr3t@s3.example.com:9000/base",
+                "s3.example.com:9000/base",
+            ),
+            ("AKIAKEY:s3cr3t@s3.example.com", "s3.example.com"),
+            ("s3.example.com/a@b", "s3.example.com/a@b"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let now = at(1_800_000_000);
+            let after =
+                Memo::record(dir.path(), endpoint, BUCKET, &DeclarationRead::Present, now).unwrap();
+            assert_eq!(after.endpoint, kept, "{endpoint}");
+            let text = std::fs::read_to_string(dir.path().join(MEMO_FILE)).unwrap();
+            assert!(!text.contains("AKIAKEY"), "{text}");
+            assert!(!text.contains("s3cr3t"), "{text}");
+            assert_eq!(
+                Memo::load(dir.path(), endpoint, BUCKET),
+                Some(after.clone()),
+                "{endpoint}"
+            );
+            assert_eq!(Memo::load(dir.path(), kept, BUCKET), Some(after));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_memo_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MEMO_FILE);
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        memo(true, at(1_800_000_000)).save(dir.path());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(Memo::load(dir.path(), ENDPOINT, BUCKET).is_some());
+    }
+
+    #[test]
+    fn a_read_without_an_answer_keeps_the_memo_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = at(1_800_000_000);
+        Memo::record(
+            dir.path(),
+            ENDPOINT,
+            BUCKET,
+            &DeclarationRead::Present,
+            first,
+        );
+        let unreadable = DeclarationRead::Unreadable("listing failed: 503".to_string());
+        let after = Memo::record(dir.path(), ENDPOINT, BUCKET, &unreadable, at(1_800_000_600));
+        assert_eq!(after, Some(memo(true, first)));
+        assert_eq!(
+            Memo::load(dir.path(), ENDPOINT, BUCKET),
+            Some(memo(true, first))
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Memo::record(empty.path(), ENDPOINT, BUCKET, &unreadable, first),
+            None
+        );
+        assert!(!empty.path().join(MEMO_FILE).exists());
+    }
+
+    #[test]
+    fn an_absent_declaration_clears_declared_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        Memo::record(
+            dir.path(),
+            ENDPOINT,
+            BUCKET,
+            &DeclarationRead::Present,
+            at(1_800_000_000),
+        );
+        let later = at(1_800_000_001);
+        let after = Memo::record(
+            dir.path(),
+            ENDPOINT,
+            BUCKET,
+            &DeclarationRead::Absent,
+            later,
+        );
+        assert_eq!(after, Some(memo(false, later)));
+        assert_eq!(
+            Memo::load(dir.path(), ENDPOINT, BUCKET),
+            Some(memo(false, later))
+        );
+    }
+
+    #[test]
+    fn a_memo_that_can_not_be_written_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let now = at(1_800_000_000);
+        assert_eq!(
+            Memo::record(&missing, ENDPOINT, BUCKET, &DeclarationRead::Present, now),
+            Some(memo(true, now))
+        );
+        assert!(!missing.exists());
     }
 }

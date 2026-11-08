@@ -540,6 +540,22 @@ to `0.9.x`).
 
 ### Changed
 
+- **A cloud lookup of a name with no local copy reads the name index first
+  ([koto#608](https://github.com/tsukumogami/koto/issues/608)).** Beside
+  the bucket's top-level listing, koto now lists `koto-names/<name>/` and
+  reads `koto-names/_complete` in the same round trip, and confirms each
+  prefix the index names by listing it. A confirmed hit answers without
+  listing every other workspace prefix; a miss still lists every prefix the
+  index didn't already rule out, so a session only an older release wrote is
+  still found and no reply changes. A not-found costs two more requests than
+  before, in the same round trip. A failed index listing or declaration read
+  changes nothing, and a hand-planted `koto-names/_complete` is read but not
+  acted on yet. The answer is kept in `cloud-index.json` beside the local
+  session store, with no credentials in it. When that sweep of every prefix
+  takes longer than two seconds, koto prints a one-line hint on stderr
+  naming `koto session index audit`, which arrives in a later release;
+  stdout and the exit code are unchanged. Every request to the bucket now
+  sets rust-s3's 60-second request timeout explicitly.
 - **A cloud `koto next` pushes its session once, before it returns.** The
   tick's own event appends, header rewrites and the evidence it copies into
   context now wait in the session's batch with its commands' writes, and the

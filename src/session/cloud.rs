@@ -8458,6 +8458,31 @@ mod tests {
         assert!(!create_bucket(&config).unwrap().is_path_style());
     }
 
+    #[test]
+    fn create_bucket_sets_the_request_timeout_explicitly() {
+        let mut config = CloudConfig {
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            bucket: Some("sessions".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key: Some("k".to_string()),
+            secret_key: Some("s".to_string()),
+            path_style: Some(true),
+            marker_retain_days: None,
+            check_window_secs: None,
+        };
+        let sixty = Some(std::time::Duration::from_secs(60));
+        let bucket = create_bucket(&config).unwrap();
+        assert!(bucket.is_path_style());
+        assert_eq!(bucket.request_timeout(), sixty, "path-style");
+
+        for path_style in [None, Some(false)] {
+            config.path_style = path_style;
+            let bucket = create_bucket(&config).unwrap();
+            assert!(!bucket.is_path_style());
+            assert_eq!(bucket.request_timeout(), sixty, "{path_style:?}");
+        }
+    }
+
     // -- the migration marker on state reads --
 
     fn marker_bytes(target: &str, workspace: &str) -> Vec<u8> {

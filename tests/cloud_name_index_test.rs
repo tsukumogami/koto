@@ -843,7 +843,9 @@ fn a_delete_leaves_the_name_entry() {
 /// The two top-level listings drop `koto-names/` as they drop every common
 /// prefix that isn't a workspace's: a lookup of a missing name from another
 /// directory makes as many requests, with the same reply, as on the same
-/// bucket without the index, and asks no `koto-names/` listing; the
+/// bucket without the index, and its only `koto-names/` listings are the
+/// lookup's own reads of the name's entries and of the declaration
+/// (koto#608), never one built from the top-level listing; the
 /// dashboard's remote scan shows the same rows and lists nothing under
 /// `koto-names/`.
 #[test]
@@ -909,7 +911,17 @@ fn top_level_listings_ignore_the_name_index_prefix() {
         bare_requests.len(),
         "{indexed_requests:#?} against {bare_requests:#?}"
     );
-    assert!(index_listings(&indexed_requests).is_empty());
+    let lookup_reads = |requests: &[fake_s3::Request]| -> Vec<String> {
+        let mut prefixes: Vec<String> = index_listings(requests)
+            .into_iter()
+            .filter_map(|r| r.list_prefix)
+            .collect();
+        prefixes.sort();
+        prefixes
+    };
+    let expected = vec![DECLARATION.to_string(), "koto-names/missing/".to_string()];
+    assert_eq!(lookup_reads(&indexed_requests), expected);
+    assert_eq!(lookup_reads(&bare_requests), expected);
     assert_eq!(indexed_rows, bare_rows);
     assert!(indexed_rows.iter().any(|r| r[0] == WF), "{indexed_rows:?}");
     assert!(
