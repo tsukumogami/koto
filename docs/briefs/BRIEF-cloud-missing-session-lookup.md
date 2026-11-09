@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Accepted
+status: Done
 problem: |
   On the cloud backend, koto takes far longer to say a session doesn't exist
   than to read one that does: koto#597 saw about 2m16s against about 4s. The
@@ -17,10 +17,10 @@ outcome: |
 
 ## Status
 
-Accepted
+Done
 
 This brief frames the problem behind koto#597 for the design that answers it,
-`docs/designs/DESIGN-cloud-missing-session-lookup.md`. No PRD sits between
+`docs/designs/current/DESIGN-cloud-missing-session-lookup.md`. No PRD sits between
 them: the requirement is the issue's own expectation, read alongside the
 replies koto already promises, and the open questions are all about how to
 meet it.
@@ -149,7 +149,7 @@ prefixes the bucket holds.
 ## References
 
 - koto#597 -- the report this brief frames.
-- `docs/designs/DESIGN-cloud-missing-session-lookup.md` -- the design that
+- `docs/designs/current/DESIGN-cloud-missing-session-lookup.md` -- the design that
   answers it.
 - `src/session/cloud.rs` -- `CloudBackend::check_located` and
   `held_elsewhere`, the lookup as it stands.

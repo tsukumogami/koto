@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   On the cloud backend, a command naming a session with no copy on this host
   and no state under this directory's prefix asks every other workspace
@@ -43,7 +43,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
