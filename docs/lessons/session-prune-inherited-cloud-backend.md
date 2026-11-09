@@ -16,21 +16,24 @@ the removal couldn't be undone from koto.
 
 ## The mechanism
 
-Three things lined up, and in koto before 0.25.0 none of them could be changed
-by the usual test isolation:
+Three things lined up. The first is how koto worked before 0.25.0. The other
+two still hold today, outside a `KOTO_HOME` root:
 
-- **The store followed `HOME`.** koto built `~/.koto` from the home directory in
-  several places and didn't read `KOTO_HOME` at all. Overriding `HOME` was the
-  only way to move the store, and `KOTO_SESSIONS_BASE` moved only the local
-  backend's session directory.
-- **The backend came from the environment.** `KOTO_SESSION_BACKEND=cloud` and the
-  `KOTO_SESSION_CLOUD_*` variables select the cloud backend and its bucket on
-  their own, with no config file. A test process inherits them from the shell
-  that started it, so a scratch `HOME` still talked to the real bucket.
-- **An apply removes remote copies.** On the cloud backend, `--apply` deletes each
-  removed session's objects in the bucket as well as the local copy. The direct
-  `--apply --all` form had no preview step, unlike the preview-then-plan path
-  (`koto session prune` without `--apply`, then `--apply --plan <token>`).
+- **The store followed `HOME` (before 0.25.0).** koto built `~/.koto` from the
+  home directory in several places and didn't read `KOTO_HOME` at all.
+  Overriding `HOME` was the only way to move the store, and `KOTO_SESSIONS_BASE`
+  moved only the local backend's session directory.
+- **The backend comes from the environment (still true).** `KOTO_SESSION_BACKEND=cloud`
+  and the `KOTO_SESSION_CLOUD_*` variables select the cloud backend and its
+  bucket on their own, with no config file. A test process inherits them from
+  the shell that started it, so a scratch `HOME` still talks to the real bucket.
+  Since 0.26.0, a `KOTO_HOME` root ignores an inherited cloud backend.
+- **An apply removes remote copies (still true).** On the cloud backend,
+  `--apply` deletes each removed session's objects in the bucket as well as the
+  local copy. The direct `--apply --all` form has no preview step, unlike the
+  preview-then-plan path (`koto session prune` without `--apply`, then
+  `--apply --plan <token>`). Since 0.25.0 it refuses a short retention on the
+  cloud backend unless confirmed.
 
 So a scratch `HOME` gave a false sense of isolation. The store path might have
 moved, but the backend, and with it the bucket the deletes went to, didn't.
@@ -60,12 +63,15 @@ Before any prune, cleanup, import or delete in a test or a trial:
 - On koto 0.25.x, `KOTO_HOME` moves the root but an inherited cloud backend still
   applies, and on anything older `KOTO_HOME` does nothing. There, unset
   `KOTO_SESSION_BACKEND` and every `KOTO_SESSION_CLOUD_*` variable in the test's
-  environment, and give it a scratch `HOME`, before running anything that removes.
+  environment, run it from a directory with no project config that selects the
+  cloud backend, and give it a scratch `HOME`, before running anything that
+  removes.
 - Unset `KOTO_SESSIONS_BASE`, or check that it also points under the scratch
   directory. The reported root doesn't cover it, and it wins over the root for
   the local backend's session directory.
-- Don't rely on a scratch `HOME`. It moves none of the backend selection.
-- Prefer the preview-then-plan path for any removal a person cares about.
+- A scratch `HOME` alone isn't isolation. It moves none of the backend selection.
+- The preview-then-plan path lists the set before anything is removed, so
+  whoever reads it can see which sessions would go before they do.
 
 The [CLI usage guide](../guides/cli-usage.md) documents `KOTO_HOME`, the
 `koto session dir --json` fields and the prune refusals as they stand today.
