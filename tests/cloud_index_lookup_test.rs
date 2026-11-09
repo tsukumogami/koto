@@ -1481,3 +1481,164 @@ fn a_carried_declaration_expires_while_reads_keep_failing() {
     assert_absent(&exists_windowed(&h, &dir, OLD));
     assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
 }
+
+/// `HELD_ELSEWHERE_FANOUT` in `src/session/cloud.rs`: how many confirming
+/// listings a lookup keeps in flight at once.
+const FANOUT: usize = 64;
+
+/// K leftover entries for a name (prefixes the index names that hold no
+/// state for it) cost exactly K confirming listings on a declared bucket,
+/// at most `FANOUT` in flight at once. With K = 100 against a slow bucket
+/// they arrive in two waves: a worker sends its next listing only once its
+/// last one has answered, so nothing reaches the bucket within one latency
+/// of the first confirming listing but the first wave. The lookup answers
+/// not-found and makes no top-level listing.
+#[test]
+fn k_leftover_entries_on_a_declared_bucket_cost_k_confirming_listings_in_two_waves() {
+    const K: u32 = 100;
+    let latency = Duration::from_millis(400);
+    let s3 = FakeS3::start(BUCKET);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+    let own = prefix_of(&dir);
+    let leftovers = plant_prefixes(&s3, K);
+    for p in &leftovers {
+        plant_entry(&s3, GHOST, p);
+    }
+
+    s3.set_latency(latency);
+    s3.clear_requests();
+    let out = h.exists(&dir, GHOST);
+    s3.set_latency(Duration::ZERO);
+    assert_absent(&out);
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+    assert_eq!(
+        other_prefix_listings(&s3, &own, GHOST).len(),
+        K as usize,
+        "{:?}",
+        listings(&s3)
+    );
+    assert_swept(&s3, &leftovers, GHOST);
+
+    let confirming: Vec<String> = leftovers.iter().map(|p| format!("{p}/{GHOST}/")).collect();
+    let mut at: Vec<_> = s3
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.list_prefix
+                .as_deref()
+                .is_some_and(|l| confirming.iter().any(|c| c == l))
+        })
+        .map(|r| r.at)
+        .collect();
+    at.sort();
+    let first = at[0];
+    let first_wave = at.iter().filter(|t| **t - first < latency).count();
+    assert_eq!(
+        first_wave, FANOUT,
+        "confirming listings within {latency:?} of the first"
+    );
+    assert!(
+        at[FANOUT] - first >= latency,
+        "the second wave started {:?} after the first",
+        at[FANOUT] - first
+    );
+}
+
+/// With no memo (`cloud-index.json` absent), a lookup on a declared bucket
+/// starts the index listing, the declaration read and the top-level
+/// listing in one round trip, and answers from the declared branch: an
+/// entry-less session under another prefix reads not-found, and nothing
+/// sweeps. The declaration read opens with a listing of its key
+/// (`name_index::read_declaration`, which spares an absent declaration
+/// rust-s3's retried 404 GET), so that listing is what joins the round
+/// trip, and the GET follows it. A failed top-level listing changes no
+/// answer.
+#[test]
+fn a_declared_bucket_with_no_memo_reads_in_one_round_trip_whatever_the_top_level_listing_does() {
+    let latency = Duration::from_millis(300);
+    let s3 = FakeS3::start(BUCKET);
+    s3.put(declaration::KEY, &declaration::valid());
+    let first = Host::new(&s3);
+    let a = first.dir("a");
+    first.init(&a);
+    let planted = plant_prefixes(&s3, 10);
+    plant_state(&s3, &planted[0], OLD);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+    let own = prefix_of(&dir);
+
+    assert!(!h.memo_path().exists(), "a memo before the first lookup");
+    s3.set_latency(latency);
+    s3.clear_requests();
+    let out = h.exists(&dir, GHOST);
+    s3.set_latency(Duration::ZERO);
+    assert_absent(&out);
+
+    let requests = lookup_requests(&s3, &own, GHOST);
+    let at = |pred: &dyn Fn(&fake_s3::Request) -> bool, what: &str| {
+        let found: Vec<_> = requests.iter().filter(|r| pred(r)).map(|r| r.at).collect();
+        assert_eq!(found.len(), 1, "one {what}: {requests:?}");
+        found[0]
+    };
+    let index_listing = format!("koto-names/{GHOST}/");
+    let index = at(
+        &|r| r.list_prefix.as_deref() == Some(index_listing.as_str()),
+        "index listing",
+    );
+    let declaration_listing = at(
+        &|r| r.list_prefix.as_deref() == Some(DECLARATION),
+        "declaration listing",
+    );
+    let top_level = at(
+        &|r| r.list_prefix.as_deref() == Some("") && r.delimiter.as_deref() == Some("/"),
+        "top-level listing",
+    );
+    let get = at(
+        &|r| r.method == "GET" && r.key == declaration::KEY,
+        "declaration GET",
+    );
+    let step_one = [index, declaration_listing, top_level];
+    let earliest = *step_one.iter().min().unwrap();
+    let latest = *step_one.iter().max().unwrap();
+    assert!(
+        latest - earliest < latency,
+        "the first step's requests went out over {:?}",
+        latest - earliest
+    );
+    assert!(
+        declaration_listing < get,
+        "the GET went out before the listing"
+    );
+    assert!(
+        other_prefix_listings(&s3, &own, GHOST).is_empty(),
+        "{:?}",
+        listings(&s3)
+    );
+
+    // A failed top-level listing is asked again (`list_retrying`), so it
+    // is asked at least once rather than exactly once.
+    let check = |what: &str, failed: bool| {
+        assert!(!h.memo_path().exists(), "{what}: a memo was written");
+        s3.clear_requests();
+        assert_absent(&h.exists(&dir, OLD));
+        let asked = top_level_listings(&s3);
+        assert!(
+            if failed { asked >= 1 } else { asked == 1 },
+            "{what}: {:?}",
+            listings(&s3)
+        );
+        assert!(
+            other_prefix_listings(&s3, &own, OLD).is_empty(),
+            "{what}: {:?}",
+            listings(&s3)
+        );
+        assert_absent(&h.exists(&dir, GHOST));
+        let out = h.exists(&dir, WF);
+        assert_unlocated(&out, "context exists", WF, "no_local_copy");
+    };
+    check("top-level listing answered", false);
+
+    s3.fail("LIST", "", 503);
+    check("top-level listing failed", true);
+    s3.clear_faults();
+}
