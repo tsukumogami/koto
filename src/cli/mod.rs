@@ -23,6 +23,7 @@ pub mod retry;
 pub mod review;
 pub mod session;
 pub mod session_anchor;
+pub mod session_index;
 pub(crate) mod session_inventory;
 #[cfg(unix)]
 pub(crate) mod session_prune;
@@ -951,6 +952,21 @@ pub enum SessionCommand {
     Needed {
         /// The directory to judge
         path: String,
+    },
+
+    /// Audit, declare or revoke the cloud bucket's name index.
+    ///
+    /// The bucket keeps one empty entry per session name and workspace
+    /// prefix under `koto-names/`. `audit` backfills the entries older
+    /// sessions lack and records the audit; `declare` then marks the index
+    /// complete, so a lookup reads a name missing from it as absent instead
+    /// of listing every prefix; `revoke` takes that back. Operator commands,
+    /// cloud backend only: under the local backend each refuses, exit 2,
+    /// with no request. Each prints what it will write or delete and asks
+    /// `[y/N]` unless given `--yes`.
+    Index {
+        #[command(subcommand)]
+        action: session_index::IndexCommand,
     },
 
     /// Move a session's execution anchor to another directory.
@@ -2382,6 +2398,9 @@ pub fn run(app: App) -> Result<()> {
         Command::Session {
             subcommand: SessionCommand::Needed { path },
         } => session::handle_needed(&path),
+        Command::Session {
+            subcommand: SessionCommand::Index { action },
+        } => session_index::handle(action),
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -2410,6 +2429,7 @@ pub fn run(app: App) -> Result<()> {
                     unreachable!("handled before the backend")
                 }
                 SessionCommand::Needed { .. } => unreachable!("handled before the backend"),
+                SessionCommand::Index { .. } => unreachable!("handled before the backend"),
                 SessionCommand::List {
                     pinned: true, json, ..
                 } => session::handle_list_pinned(&backend, json),

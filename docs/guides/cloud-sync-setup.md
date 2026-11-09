@@ -109,7 +109,7 @@ Each host needs to list, read, write and delete objects under the workspace pref
 
 `koto-names/` is the bucket's index of session names. Before a session copy's first state object goes up, koto writes an empty object `koto-names/<name>/<prefix>`. The object has no body: its key alone records the session's name and the prefix of the workspace that holds it. It's written once per copy and per host: after a create, an import, a rename, or the first push of a copy an older koto created. Deleting a session (`koto session cleanup`, `koto session prune`) leaves that object in the bucket, so nothing needs DELETE under `koto-names/`.
 
-A host whose keys can't PUT the index object warns on stderr and pushes anyway, leaving the object for a later push to write. To tell whether it may skip the object, it checks for `koto-names/_complete` once: it lists that key, and reads the object only when the listing shows it. When the listing doesn't show it, the push warns and goes on. The push fails instead when the listing fails (keys without LIST under `koto-names/`, or a bucket that fails the request), when the object is listed but can't be read (keys without GET on it), or when it holds a valid declaration, the way a failed state upload does, with an error that names the index object and the missing PUT permission. So grant all three permissions together. No koto command writes `koto-names/_complete` in this release.
+A host whose keys can't PUT the index object warns on stderr and pushes anyway, leaving the object for a later push to write. To tell whether it may skip the object, it checks for `koto-names/_complete` once: it lists that key, and reads the object only when the listing shows it. When the listing doesn't show it, the push warns and goes on. The push fails instead when the listing fails (keys without LIST under `koto-names/`, or a bucket that fails the request), when the object is listed but can't be read (keys without GET on it), or when it holds a valid declaration, the way a failed state upload does, with an error that names the index object and the missing PUT permission. So grant all three permissions together. Only the operator commands in [Indexing the bucket's older sessions](#indexing-the-buckets-older-sessions) write `koto-names/_complete` and `koto-names/_audit` or delete anything under `koto-names/`; the keys that run them also need DELETE under `koto-names/` and GET of `koto-names/_audit`.
 
 ## 4. Use koto normally
 
@@ -180,7 +180,7 @@ When koto can't tell which copy is the session's own, the commands that name it 
 
 The reasons are:
 
-- `no_local_copy`: this host holds no copy of the session and the bucket holds none under the current directory's prefix, but another directory's prefix holds one. A session the bucket holds under no prefix was never used, and reads as absent. Run the command from the directory the session was started in, or read it with `--workspace` (below).
+- `no_local_copy`: this host holds no copy of the session and the bucket holds none under the current directory's prefix, but another directory's prefix holds one. A session the bucket holds under no prefix was never used, and reads as absent. Run the command from the directory the session was started in, or read it with `--workspace` (below). The one exception is a declared bucket, one carrying a valid `koto-names/_complete`: there a session that only older koto releases have touched has no entry in the name index, so from other directories it reads as absent instead of refusing with `no_local_copy`, until the next `koto session index audit` revokes the declaration (see [Indexing the bucket's older sessions](#indexing-the-buckets-older-sessions)).
 - `recorded_copy_mismatch`: the bucket holds no copy at the recorded prefix, or the copy there carries another `session_id`, so it is another session of the same name.
 The other four concern a session that records no prefix, named from outside its execution anchor. Each message names the anchor, where the session still reads and writes as before:
 
@@ -194,6 +194,33 @@ Telling a never-used name from one held under another directory's prefix costs l
 A listing the bucket throttles or fails to answer during that scan is asked up to three times. If one still fails, koto can't tell whether another prefix holds the session, so the command exits 2 with an error naming the listing and what the bucket answered, rather than reading the session as absent. Run it again once the bucket answers. The first listing, of `<session>/` under the current directory's prefix, gets the same handling when the bucket answers it with a throttle or a server error (429, 500, 502, 503 or 504). A host that can't reach the bucket at all fails that listing without an answer, and still reads a never-used name as absent.
 
 The local backend answers a name the same from every directory and never refuses.
+
+### Indexing the bucket's older sessions
+
+The sweep above is what a lookup falls back on because the name index can't be trusted to be complete: sessions an older koto created have no entry under `koto-names/`. Three operator commands change that. Each works only under the cloud backend (under the local backend it refuses with exit 2 and makes no request), prints every key it will write or delete before it writes, and asks `[y/N]`; anything but `y` or `yes`, end of input included, exits 2 with nothing written. `--yes` skips the question, for a scheduled run.
+
+```bash
+koto session index audit [--prune [--revoke]] [--yes]
+koto session index declare [--no-probation] [--yes]
+koto session index revoke [--yes]
+```
+
+`koto session index audit` lists the bucket's top level, each workspace prefix, each session under it and every entry under `koto-names/`, then PUTs the empty entry `koto-names/<name>/<prefix>` for each state object that has none. It ends by writing the audit record `koto-names/_audit`, a small JSON object with the audit's start and finish times and its counts, and prints the counts: prefixes, sessions, entries written, entries pruned, stale entries and keys skipped. A listing that still fails after its retries doesn't stop the walk, but the run then writes no audit record and exits 3. A name or prefix that isn't one koto would write (a key under a workspace prefix whose session part fails the session-name rule, an entry whose prefix isn't 16 lowercase hex digits) is skipped, counted and printed escaped, and never written or deleted.
+
+An entry whose prefix holds no state for its name is stale: the session was deleted or moved. The audit counts stale entries and keeps them. `--prune` deletes them. On a declared bucket, pruning would remove entries lookups trust, so `--prune` alone refuses there with exit 2, and `--prune --revoke` deletes `koto-names/_complete` first, before any entry, giving up the declaration until someone declares again.
+
+`koto session index declare` walks the bucket again and PUTs the declaration, `koto-names/_complete`, only when every listing answered, a valid audit record exists, no state object lacks its entry (it names any that does), and the probation has passed: the newest state object in the bucket must be at least 7 days younger than the audit record. Both times are the `LastModified` the bucket gave the objects, never the host's clock, so a host whose clock is wrong can't shorten the wait. The 7 days are there to catch an older koto still writing to the bucket: its new sessions arrive with no entry, and both the next audit and `declare` see them. On a quiet bucket, where no state object is written in the 7 days after the audit, the probation can't pass on its own; `declare --no-probation` declares without it, and every other check still holds. Running the audit again restarts the probation.
+
+`koto session index revoke` deletes `koto-names/_complete` and nothing else.
+
+A declared bucket trades one case for speed. A lookup of a name the bucket doesn't hold costs 3 requests whatever the number of prefixes, instead of one listing per prefix. But a session that only older releases have touched has no entry, so from other directories it reads as not found rather than refusing with `no_local_copy`, until the next audit finds it. When an audit on a declared bucket finds a state object with no entry that is newer than the declaration's audit, it deletes `koto-names/_complete` before anything else, prints that object's key, and backfills its entry. So for any declared bucket that older releases might still reach, run `koto session index audit --yes` on a schedule.
+
+Securing the index:
+
+- Restrict writes of `koto-names/_complete` to the operator's credentials with a bucket policy. A host that can write it can make lookups trust an incomplete index.
+- Turn on object versioning, so an overwritten declaration or audit record can be inspected and reverted.
+- Keep `koto-names/` out of lifecycle rules that expire objects. An expired entry makes its session read as absent on a declared bucket.
+- Session names, and the prefix that holds each, are readable by anyone who can list `koto-names/`. Deleting a session leaves its name there until an audit with `--prune`.
 
 koto's own reads of other sessions, such as an agent session's anchor or another member of a hierarchy, use the same copy, and a session koto can't locate is read as this host holds it. `koto next` keeps its own check: it refuses a directory outside the session's execution anchor with `execution_anchor_mismatch`.
 

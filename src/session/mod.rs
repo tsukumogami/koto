@@ -8,6 +8,7 @@ pub mod duration;
 pub mod finished;
 pub mod hierarchy;
 pub mod import_links;
+pub mod index_audit;
 pub mod inventory;
 pub mod links;
 pub mod local;
