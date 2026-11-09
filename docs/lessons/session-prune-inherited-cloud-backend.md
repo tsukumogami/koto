@@ -7,8 +7,8 @@ Area: session removal, storage backends and test isolation.
 A test script meant to run against a scratch store ran
 `koto session prune --apply --all` with a one-second retention
 (`KOTO_RETENTION_KEEP=1s KOTO_RETENTION_IDLE_PERIOD=1s`). Its scratch setup
-was missing, so the command ran against the real store on the machine, which
-used the cloud backend. A retention that short releases almost every finished
+didn't take effect, so the command ran against a real store that used the
+cloud backend. A retention that short releases almost every finished
 session. The prune removed them locally, and under the cloud backend each
 removal also deleted the session's copy in the bucket. Running sessions and
 the sessions the retention rule still kept survived. Nothing asked first, and
@@ -57,6 +57,10 @@ Before any prune, cleanup, import or delete in a test or a trial:
   and refuse to go on unless `backend` is `local` and `root` sits under the
   scratch directory. `backend_ignored`, when present, names a cloud setting that
   `KOTO_HOME` set aside, which is the run being protected rather than a problem.
+- On koto 0.25.x, `KOTO_HOME` moves the root but an inherited cloud backend still
+  applies, and on anything older `KOTO_HOME` does nothing. There, unset
+  `KOTO_SESSION_BACKEND` and every `KOTO_SESSION_CLOUD_*` variable in the test's
+  environment, and give it a scratch `HOME`, before running anything that removes.
 - Unset `KOTO_SESSIONS_BASE`, or check that it also points under the scratch
   directory. The reported root doesn't cover it, and it wins over the root for
   the local backend's session directory.

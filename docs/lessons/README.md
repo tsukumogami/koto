@@ -22,7 +22,8 @@ search for.
 
 ## Writing a lesson
 
-Name the file for the mechanism, in kebab-case, and give it these sections:
+Name the file for the mechanism, in kebab-case. Under the title, put an
+`Area:` line naming the failure area as the index does, then these sections:
 
 - **What failed**: what someone saw, in terms of koto's own behaviour.
 - **The mechanism**: why it happened, with the koto version it applies to when
