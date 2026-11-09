@@ -1,0 +1,9 @@
+# OpenTelemetry telemetry-schema file for koto's workflow signal contract.
+# Draft: contract version 0.1.0. The contract text is
+# docs/reference/signal-contract.md in this repository.
+# Each later version adds an entry under `versions`, with the
+# rename_attributes changes that version makes.
+file_format: 1.1.0
+schema_url: https://raw.githubusercontent.com/tsukumogami/koto/main/schemas/signals/0.1.0
+versions:
+  0.1.0:
