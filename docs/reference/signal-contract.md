@@ -1,9 +1,8 @@
 # Workflow Signal Contract Reference
 
-**Status: draft, contract version 0.1.0.** Names and record kinds may still
-change before 1.0.0. The draft becomes 1.0.0, with its schema file, once the
-records have been checked live on two backends; emitters built before then
-state `0.1.0`.
+**Status: draft, contract version 0.1.0.** The draft becomes 1.0.0, with
+its schema file, once the records have been checked live on two backends;
+emitters built before then state `0.1.0`.
 
 This contract says what koto tells OpenTelemetry about a workflow run, and
 what niwa adds to the agent runtime's own records when it launches a session.
@@ -22,7 +21,7 @@ runtime session (Claude Code)                    team's receiver
         │                                                   │
         │ CLAUDE_CODE_SESSION_ID, TRACEPARENT (headless)    │
         ▼                                                   │
-koto process (one per command)                              │
+each koto command (its own process)                         │
   scope "koto", schema_url = koto schema file               │
   resource: service.name=koto, service.version,             │
             koto.contract.version                           │
@@ -32,7 +31,12 @@ koto process (one per command)                              │
 
 The local [run journal](run-journal.md) is a separate record and doesn't
 change for this contract. Where a journal field name differs from the
-contract's, the name table below says so.
+contract's, the name table below says so. Gates, default actions, the
+decider and request legs are koto's own terms; the
+[CLI usage guide](../guides/cli-usage.md),
+[decider authoring guide](../guides/decider-authoring.md) and
+[default action authoring guide](../guides/default-action-authoring.md)
+describe them.
 
 ## Nothing is sent by default
 
@@ -134,7 +138,7 @@ key, which the contract carries but doesn't own or set.
 
 | Name | Owner | Type | Requiredness | Stability | Class | Record kinds | Meaning |
 |---|---|---|---|---|---|---|---|
-| `session.id` | runtime-key | string | conditional | development | identifier | all (when a runtime session exists) | The driving runtime session's id, as the runtime reports it (join key; the run journal calls it koto.driver.session.id) |
+| `session.id` | runtime-key | string | conditional | development | identifier | all (when a runtime session exists) | The driving runtime session's id, as the runtime reports it (join key; the run journal calls it `koto.driver.session.id`) |
 | `service.name` | koto | string | required | stable | dimension | resource | `koto`: the emitting tool |
 | `service.version` | koto | string | required | stable | dimension | resource | koto's release version (the engine version) |
 | `koto.contract.version` | koto | string | required | stable | dimension | resource | Contract version the record was emitted under |
@@ -157,7 +161,7 @@ key, which the contract carries but doesn't own or set.
 | `koto.visit.exit` | koto | string | required | development | dimension | state_exited | How the visit ended: transition, rewind or cancel |
 | `koto.terminal` | koto | string | required | stable | dimension | terminal | Terminal state name |
 | `koto.run.result` | koto | string | required | development | dimension | terminal,cancelled | success, blocked, refused, error, unclassified, cancelled |
-| `koto.check.name` | koto | string | required | stable | dimension | check kinds, decider_checked, decider_fallback, decision_recorded | Gate name, or `__action__` (the run journal calls it koto.check) |
+| `koto.check.name` | koto | string | required | stable | dimension | check kinds, decider_checked, decider_fallback, decision_recorded | Gate name, or `__action__` (most run journal records call it `koto.check`) |
 | `koto.check.outcome` | koto | string | required | stable | dimension | check_evaluated | passed, failed, timed_out, error |
 | `koto.attempt` | koto | int | required | stable | identifier | check_evaluated, check_rule, check_finding, check_disputed | Attempt number of a state's checks, counted over every visit to that state in the session |
 | `koto.visit_attempt` | koto | int | required | stable | identifier | check_evaluated, check_rule, check_finding, check_disputed | Attempt number within the current visit; back to 1 when a new visit starts |
@@ -167,7 +171,7 @@ key, which the contract carries but doesn't own or set.
 | `koto.check.findings_truncated` | koto | boolean | optional | stable | identifier | check_evaluated | True when more than 50 findings |
 | `koto.check.duration_ms` | koto | int | conditional | stable | identifier | check_evaluated | Wall-clock ms of the check's command |
 | `koto.check.unanswered_count` | koto | int | conditional | stable | identifier | check_evaluated | Decider-check veto criteria with no verdict |
-| `error.type` | koto | string | conditional | stable | dimension | check_evaluated | Error code of a decider check's output.error (the run journal calls it koto.check.error) |
+| `error.type` | koto | string | conditional | stable | dimension | check_evaluated | Error code of a decider check's output.error (the run journal calls it `koto.check.error`) |
 | `koto.rule.id` | koto | string | conditional | stable | dimension | check_rule, check_finding, check_disputed, decider_checked, decider_fallback, decision_recorded | Rule id or its digest; required on every kind it appears on except decision_recorded, where only a check_answer carries it |
 | `koto.rule.visit_count` | koto | int | required | stable | identifier | check_rule | Times the rule failed in this visit |
 | `koto.rule.session_count` | koto | int | required | stable | identifier | check_rule | Times the rule failed in the session |
@@ -179,10 +183,10 @@ key, which the contract carries but doesn't own or set.
 | `koto.poll.elapsed_secs` | koto | int | required | stable | identifier | check_pending | Seconds since the poll window opened |
 | `koto.decider.awaiting_count` | koto | int | conditional | stable | identifier | check_evaluated, check_pending | Criteria waiting on the agent's answer |
 | `koto.decider.agent_answered_count` | koto | int | conditional | stable | identifier | check_evaluated, check_pending | Criteria decided from an agent answer |
-| `gen_ai.provider.name` | koto | string | required | development | dimension | decider_consulted, decider_checked | Decider provider (the run journal calls it koto.decider.provider) |
-| `gen_ai.response.model` | koto | string | required | development | dimension | decider_consulted, decider_checked | Model build the provider reported (the run journal calls it koto.decider.model) |
-| `gen_ai.usage.input_tokens` | koto | int | conditional | development | identifier | decider_consulted, decider_checked | Decider input tokens (the run journal calls it koto.decider.input_tokens) |
-| `gen_ai.usage.output_tokens` | koto | int | conditional | development | identifier | decider_consulted, decider_checked | Decider output tokens (the run journal calls it koto.decider.output_tokens) |
+| `gen_ai.provider.name` | koto | string | required | development | dimension | decider_consulted, decider_checked | Decider provider (the run journal calls it `koto.decider.provider`) |
+| `gen_ai.response.model` | koto | string | required | development | dimension | decider_consulted, decider_checked | Model build the provider reported (the run journal calls it `koto.decider.model`) |
+| `gen_ai.usage.input_tokens` | koto | int | conditional | development | identifier | decider_consulted, decider_checked | Decider input tokens (the run journal calls it `koto.decider.input_tokens`) |
+| `gen_ai.usage.output_tokens` | koto | int | conditional | development | identifier | decider_consulted, decider_checked | Decider output tokens (the run journal calls it `koto.decider.output_tokens`) |
 | `koto.decider.outcome` | koto | string | required | stable | dimension | decider_consulted, decider_checked | Outcome of a consultation or criterion |
 | `koto.decider.mode` | koto | string | conditional | stable | dimension | decider_consulted, decider_field, decider_checked, decider_fallback | veto, shadow |
 | `koto.decider.reason` | koto | string | conditional | stable | dimension | decider_consulted, decider_checked, decider_fallback, decision_recorded | Why a criterion went unanswered |
@@ -451,8 +455,8 @@ would otherwise let a slug or workspace name inject `service.name` or
 `user.*`.
 
 **Forged records.** Any process running as the user can emit records that
-look like koto's. Records are measurement, not evidence: nothing in koto or
-niwa reads them back to decide anything.
+look like koto's. Records are measurement, not evidence: nothing in koto,
+niwa or shirabe reads them back to decide anything.
 
 **Schema URL.** A collector that applies the schema file fetches the
 `schema_url` a record names. A team should allow only koto's published
