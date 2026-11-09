@@ -881,29 +881,43 @@ impl CloudBackend {
     /// The lookup reads the bucket's name index first
     /// ([`crate::session::name_index`]), in three steps:
     ///
-    /// 1. Three requests go out together ([`CloudBackend::start_lookup`]):
-    ///    the index listing of `koto-names/<id>/`, the read of the
-    ///    declaration, and the listing of the bucket's top level, which
-    ///    names the workspace prefixes.
+    /// 1. Up to three requests go out together
+    ///    ([`CloudBackend::start_lookup`]): the index listing of
+    ///    `koto-names/<id>/`, the read of the declaration, and the listing
+    ///    of the bucket's top level, which names the workspace prefixes.
+    ///    The host's memo ([`name_index::Memo`]) chooses which: a
+    ///    remembered "declared" skips the top-level listing and reads the
+    ///    declaration with a GET alone, and one younger than the check
+    ///    window skips the read too. With no memo, or one that says "not
+    ///    declared", all three go out, the declaration listed first.
     /// 2. Each prefix the index names is confirmed by listing its
     ///    `<prefix>/<id>/` and looking for the state object, as the sweep
     ///    does, so a stale or forged entry costs one listing and never
     ///    answers on its own.
-    /// 3. The answer. Every bucket reads undeclared in this release: a
-    ///    confirmed hit is `Ok(true)`, and a miss sweeps every other prefix
-    ///    the top-level listing names, less those step 2 already found
-    ///    without the session ([`CloudBackend::sweep`]), so a session only
-    ///    an older release wrote, with no entry, is still found.
+    /// 3. The answer, which depends on whether the bucket reads declared
+    ///    ([`CloudBackend::reads_declared`]).
     ///
-    /// `Ok(false)` only when every other prefix was asked and answered that
-    /// it holds no state for `id`. A failed top-level listing is `Err`
-    /// whatever the index found, since an undeclared bucket can't be read
-    /// without it, and so is a confirming or sweeping listing that still
-    /// fails once asked again ([`list_retrying`]): koto can't tell what that
-    /// prefix holds, and the caller reports it rather than read the session
-    /// as absent (koto#528). A failed index listing or declaration read
-    /// changes nothing: the sweep covers every prefix the index would have
-    /// spared it.
+    /// On a declared bucket the index is trusted: a confirmed hit is
+    /// `Ok(true)` and no hit is `Ok(false)`, with no sweep and whatever the
+    /// top-level listing found. A failed index listing, or a confirming
+    /// listing that still fails once asked again ([`list_retrying`]), is
+    /// `Err`. A name whose listing stopped at
+    /// [`name_index::MAX_ENTRIES_PER_LOOKUP`] confirms nothing and sweeps
+    /// every other prefix instead, so a flooded name costs what it did
+    /// before the index.
+    ///
+    /// On an undeclared bucket a confirmed hit is `Ok(true)`, and a miss
+    /// sweeps every other prefix the top-level listing names, less those
+    /// step 2 already found without the session ([`CloudBackend::sweep`]),
+    /// so a session only an older release wrote, with no entry, is still
+    /// found. `Ok(false)` only when every other prefix was asked and
+    /// answered that it holds no state for `id`. A failed top-level listing
+    /// is `Err` whatever the index found, since an undeclared bucket can't
+    /// be read without it, and so is a confirming or sweeping listing that
+    /// still fails once asked again: koto can't tell what that prefix
+    /// holds, and the caller reports it rather than read the session as
+    /// absent (koto#528). A failed index listing changes nothing: the
+    /// sweep covers every prefix the index would have spared it.
     fn held_elsewhere(&self, id: &str) -> anyhow::Result<bool> {
         use crate::session::name_index::Memo;
 
@@ -911,36 +925,60 @@ impl CloudBackend {
         let bucket_name = self.bucket.name();
         let memo_dir = self.local.journal_root();
         let carried = memo_dir.and_then(|dir| Memo::load(dir, &endpoint, &bucket_name));
+        let started = std::time::SystemTime::now();
+        let remembered = carried.filter(|memo| memo.declared);
+        let remembered_within = |limit: std::time::Duration| {
+            remembered.as_ref().is_some_and(|memo| {
+                !self.probes.window.is_zero()
+                    && started
+                        .duration_since(memo.read_at)
+                        .is_ok_and(|age| age < limit)
+            })
+        };
 
-        // Step 1. Nothing trusts a declaration yet, so the declaration is
-        // read and the top-level listing started whatever `carried` says.
+        // Step 1. A remembered "declared" at any age only decides which
+        // requests go out first: the top-level listing waits until the
+        // declaration has been read again and found missing.
+        let ask = if remembered_within(self.probes.window) {
+            DeclarationAsk::Skip
+        } else if remembered.is_some() {
+            DeclarationAsk::Get
+        } else {
+            DeclarationAsk::ListFirst
+        };
         let LookupStart {
             index,
             declaration,
             top_level,
-        } = self.start_lookup(id, true, true);
-        let memo = match (memo_dir, &declaration) {
-            (Some(dir), Some(read)) => Memo::record(
+        } = self.start_lookup(id, ask, remembered.is_none());
+        if let (Some(dir), Some(read)) = (memo_dir, &declaration) {
+            Memo::record(
                 dir,
                 &endpoint,
                 &bucket_name,
                 read,
                 std::time::SystemTime::now(),
-            ),
-            _ => carried,
-        };
-
-        // The one place a declared bucket would be told apart from an
-        // undeclared one (koto#609): `declaration`, this lookup's read, and
-        // `memo`, the answer in effect after it, are both in hand here. No
-        // command writes a declaration yet, so this release ignores both
-        // and reads every bucket as undeclared.
-        let _undeclared = (declaration, memo);
-
-        let top_level = match top_level {
+            );
+        }
+        let declared = Self::reads_declared(
+            declaration.as_ref(),
+            remembered_within(name_index::MAX_DECLARATION_CARRY),
+        );
+        let top_level = || match top_level {
             Some(listed) => listed,
             None => top_level_prefixes(&self.bucket, &self.prefix),
-        }?;
+        };
+
+        if declared {
+            // Step 2 and 3, on a declared bucket. A failed top-level
+            // listing changes nothing unless the sweep needs it.
+            let read = index?;
+            if !read.capped {
+                return any_holds(&self.bucket, id, &read.prefixes);
+            }
+            return self.sweep(id, &top_level()?, &[]);
+        }
+        let top_level = top_level()?;
 
         // Step 2. A failed index listing, and one cut off at
         // `MAX_ENTRIES_PER_LOOKUP`, confirm nothing and spare the sweep
@@ -959,17 +997,42 @@ impl CloudBackend {
         self.sweep(id, &top_level, &confirmed_absent)
     }
 
+    /// Whether [`CloudBackend::held_elsewhere`] reads the bucket as
+    /// declared, from this lookup's read of the declaration (`None` when
+    /// the memo was fresh enough that none was made) and whether the
+    /// memo's "declared" is still within [`name_index::MAX_DECLARATION_CARRY`]
+    /// of its last answered read.
+    ///
+    /// A declaration that parses reads declared, and one that is missing,
+    /// too large or doesn't parse reads undeclared, whatever the memo says.
+    /// A read that got no answer reads declared only while the carry
+    /// holds: with a check window of 0 nothing is carried, and the lookup
+    /// takes the exact sweep.
+    fn reads_declared(read: Option<&name_index::DeclarationRead>, carry_holds: bool) -> bool {
+        use crate::session::name_index::DeclarationRead;
+        match read {
+            None | Some(DeclarationRead::Present) => true,
+            Some(DeclarationRead::Absent) => false,
+            Some(DeclarationRead::Unreadable(_)) => carry_holds,
+        }
+    }
+
     /// [`CloudBackend::held_elsewhere`]'s first step: the index listing of
-    /// `koto-names/<id>/`, and with it, each when asked for, the
-    /// declaration read and the top-level listing, every one on its own
-    /// thread so the three cost one round trip.
-    fn start_lookup(&self, id: &str, declaration: bool, top_level: bool) -> LookupStart {
+    /// `koto-names/<id>/`, and with it, as asked for, the declaration read
+    /// and the top-level listing, every one on its own thread so they cost
+    /// one round trip.
+    fn start_lookup(&self, id: &str, declaration: DeclarationAsk, top_level: bool) -> LookupStart {
         let bucket = &self.bucket;
         let own = self.prefix.as_str();
         std::thread::scope(|scope| {
             let index = scope.spawn(|| read_index(bucket, id, own));
-            let declaration =
-                declaration.then(|| scope.spawn(|| name_index::read_declaration(bucket)));
+            let declaration = match declaration {
+                DeclarationAsk::Skip => None,
+                DeclarationAsk::ListFirst => {
+                    Some(scope.spawn(|| name_index::read_declaration(bucket)))
+                }
+                DeclarationAsk::Get => Some(scope.spawn(|| get_declaration_retrying(bucket))),
+            };
             let top_level = top_level.then(|| scope.spawn(|| top_level_prefixes(bucket, own)));
             LookupStart {
                 index: joined(index),
@@ -6885,6 +6948,30 @@ struct LookupStart {
     index: anyhow::Result<IndexRead>,
     declaration: Option<name_index::DeclarationRead>,
     top_level: Option<anyhow::Result<Vec<String>>>,
+}
+
+/// How [`CloudBackend::start_lookup`] reads the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclarationAsk {
+    /// Not at all: the memo's "declared" is younger than the check window.
+    Skip,
+    /// Listed first, then fetched if listed
+    /// ([`name_index::read_declaration`]): the usual undeclared bucket
+    /// costs one listing and no 404 GET.
+    ListFirst,
+    /// Fetched alone ([`get_declaration_retrying`]): the memo says the
+    /// object is there.
+    Get,
+}
+
+/// [`name_index::get_declaration`], asked again as [`list_retrying`] asks
+/// a listing while it fails with a [transient](is_transient) error.
+fn get_declaration_retrying(bucket: &Bucket) -> name_index::DeclarationRead {
+    asked_retrying(
+        || name_index::get_declaration(bucket).map_err(|e| (e, std::time::Duration::ZERO)),
+        is_transient,
+    )
+    .unwrap_or_else(|(e, _)| name_index::unanswered_get(&e))
 }
 
 /// One lookup's read of the name index for a name.
