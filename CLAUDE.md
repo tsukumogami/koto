@@ -45,6 +45,7 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 - State files are written atomically to prevent corruption
 - `wip/` must be empty before merging to main (CI enforces this)
 - Never add AI attribution or co-author lines to commits or PRs
+- Lessons from past failures cover session removal, storage backends and test isolation; read `docs/lessons/README.md` when an investigation reaches one of those areas
 
 ## Names must resolve
 
