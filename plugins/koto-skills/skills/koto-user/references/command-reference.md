@@ -32,6 +32,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session pin/unpin` | Runner and operator — keeping a finished session's record past every removal, and releasing it |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
+| `koto session index audit/declare/revoke` | Operator — cloud backend only, backfilling and declaring the bucket's name index; not part of a workflow run |
 | `--workspace <id>` before `status` or `context get/exists/list` | Reader — cloud backend only, a session in another workspace, read in place |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |

@@ -94,14 +94,19 @@ pub fn prefixes_from(pages: &[ListBucketResult], name: &str, own: &str) -> Vec<S
     prefixes
 }
 
+/// The audit record's key, written by `koto session index audit` at the end
+/// of each run and read by `koto session index declare`. Like the
+/// declaration it starts with `_`, so no entry listing ever includes it.
+pub const AUDIT_KEY: &str = "koto-names/_audit";
+
 /// The declaration at [`DECLARATION_KEY`]. Every field is required, and
 /// fields it doesn't know are ignored, so a newer writer can add some.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declaration {
     /// The declaration format, as an integer.
     pub version: u64,
     /// When the bucket was declared.
-    #[serde(deserialize_with = "timestamp")]
+    #[serde(deserialize_with = "timestamp", serialize_with = "write_timestamp")]
     pub declared_at: SystemTime,
     /// The machine name of the host that declared it.
     pub machine: String,
@@ -111,12 +116,12 @@ pub struct Declaration {
     pub audit: Audit,
 }
 
-/// The audit a [`Declaration`] records.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The audit a [`Declaration`] records, and the record at [`AUDIT_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Audit {
-    #[serde(deserialize_with = "timestamp")]
+    #[serde(deserialize_with = "timestamp", serialize_with = "write_timestamp")]
     pub started_at: SystemTime,
-    #[serde(deserialize_with = "timestamp")]
+    #[serde(deserialize_with = "timestamp", serialize_with = "write_timestamp")]
     pub finished_at: SystemTime,
     /// How many workspace prefixes it walked.
     pub prefixes: u64,
@@ -134,6 +139,11 @@ fn timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SystemTime, D
         .ok_or_else(|| serde::de::Error::custom(format!("not a timestamp: {:?}", text)))
 }
 
+/// A timestamp field written in the form [`timestamp`] reads back.
+fn write_timestamp<S: serde::Serializer>(t: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::engine::types::iso8601_at(*t))
+}
+
 /// The declaration in `bytes`; `None`, undeclared, for a body over
 /// [`MAX_DECLARATION_BYTES`] or one that doesn't parse strictly.
 pub fn parse_declaration(bytes: &[u8]) -> Option<Declaration> {
@@ -141,6 +151,27 @@ pub fn parse_declaration(bytes: &[u8]) -> Option<Declaration> {
         return None;
     }
     serde_json::from_slice(bytes).ok()
+}
+
+/// The audit record in `bytes`, read as [`parse_declaration`] reads a
+/// declaration: `None`, no audit, for a body over [`MAX_DECLARATION_BYTES`]
+/// or one that doesn't parse strictly.
+pub fn parse_audit(bytes: &[u8]) -> Option<Audit> {
+    if bytes.len() > MAX_DECLARATION_BYTES {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
+
+/// What one capped read of a small record ([`get_capped`]) found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CappedRead {
+    /// No object (404), or a body that ran past [`MAX_DECLARATION_BYTES`].
+    Absent,
+    /// The body, at most [`MAX_DECLARATION_BYTES`] bytes.
+    Body(Vec<u8>),
+    /// The bucket answered with a status that says nothing of the object.
+    Status(u16),
 }
 
 /// What one read of [`DECLARATION_KEY`] found.
@@ -194,31 +225,40 @@ pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
 /// as absent, as does a 404. A request that failed is `Err`, so the
 /// caller can ask again; [`unanswered_get`] words it.
 pub(crate) fn get_declaration(bucket: &Bucket) -> Result<DeclarationRead, s3::error::S3Error> {
+    Ok(match get_capped(bucket, DECLARATION_KEY)? {
+        CappedRead::Body(bytes) => match parse_declaration(&bytes) {
+            Some(_) => DeclarationRead::Present,
+            None => DeclarationRead::Absent,
+        },
+        CappedRead::Absent => DeclarationRead::Absent,
+        CappedRead::Status(status) => DeclarationRead::Unreadable(format!(
+            "reading {} answered status {}",
+            DECLARATION_KEY, status
+        )),
+    })
+}
+
+/// One GET of `key` for the range of its first [`MAX_DECLARATION_BYTES`]
+/// bytes, never keeping more than that and one byte: the read of
+/// [`DECLARATION_KEY`] and of [`AUDIT_KEY`]. A body that runs past the cap
+/// (an endpoint ignoring the range) stops being read there and reads as
+/// absent, as does a 404. A request that failed is `Err`.
+pub(crate) fn get_capped(bucket: &Bucket, key: &str) -> Result<CappedRead, s3::error::S3Error> {
     use crate::session::remote_feed::BoundedSink;
 
     let mut sink = BoundedSink {
         bytes: Vec::new(),
         limit: MAX_DECLARATION_BYTES + 1,
     };
-    let answered = bucket.get_object_range_to_writer(
-        DECLARATION_KEY,
-        0,
-        Some(MAX_DECLARATION_BYTES as u64),
-        &mut sink,
-    );
+    let answered =
+        bucket.get_object_range_to_writer(key, 0, Some(MAX_DECLARATION_BYTES as u64), &mut sink);
     if sink.bytes.len() > MAX_DECLARATION_BYTES {
-        return Ok(DeclarationRead::Absent);
+        return Ok(CappedRead::Absent);
     }
     match answered {
-        Ok(200 | 206) => Ok(match parse_declaration(&sink.bytes) {
-            Some(_) => DeclarationRead::Present,
-            None => DeclarationRead::Absent,
-        }),
-        Ok(404) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(DeclarationRead::Absent),
-        Ok(status) => Ok(DeclarationRead::Unreadable(format!(
-            "reading {} answered status {}",
-            DECLARATION_KEY, status
-        ))),
+        Ok(200 | 206) => Ok(CappedRead::Body(sink.bytes)),
+        Ok(404) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(CappedRead::Absent),
+        Ok(status) => Ok(CappedRead::Status(status)),
         Err(e) => Err(e),
     }
 }

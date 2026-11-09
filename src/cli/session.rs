@@ -982,7 +982,7 @@ pub fn handle_needed(path: &str) -> Result<()> {
 /// The sessions directory `koto session needed` reads, resolved the way
 /// `build_backend` resolves it, without building the backend, and the
 /// cloud configuration when the backend is the cloud one.
-fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
+pub(super) fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
     let config = crate::config::resolve::load_config()?;
     crate::config::session_env::check(&config)?;
     let koto_sessions = || -> Result<std::path::PathBuf> {

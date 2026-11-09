@@ -708,6 +708,24 @@ The verb reads this host's sessions directory: the local store, or under the clo
 
 The verb builds no backend, since constructing one can migrate an old store layout. Under the cloud backend it opens a read-only reader of the configured bucket instead, which only lists and reads: it never pulls, spools or restores a session, writes nothing, here or in the bucket, and logs no context read. Each running session under the path that nothing on this host releases costs at least one listing; a path holding no such session costs no request at all.
 
+#### session index
+
+Operator commands for the cloud bucket's name index, `koto-names/`: the empty entry `koto-names/<name>/<prefix>` koto keeps for each session copy, which lets a lookup find a name with one listing instead of one per workspace prefix.
+
+```bash
+koto session index audit [--prune [--revoke]] [--yes]
+koto session index declare [--no-probation] [--yes]
+koto session index revoke [--yes]
+```
+
+- `audit` walks every workspace prefix and session in the bucket, PUTs the entry each state object lacks, and writes the audit record `koto-names/_audit`. Entries whose prefix no longer holds their session are counted as stale; `--prune` deletes them. On a declared bucket `--prune` needs `--revoke`, which deletes the declaration first. An audit that finds, on a declared bucket, a state object with no entry newer than the declaration's audit deletes the declaration and names the object.
+- `declare` walks the bucket again and writes the declaration, `koto-names/_complete`, after which a lookup reads a name missing from the index as absent. It refuses unless every listing answered, an audit record exists, no state object lacks its entry, and the newest state object is at least 7 days younger than the audit record, as the bucket timestamps them. `--no-probation` lifts only that 7-day wait.
+- `revoke` deletes `koto-names/_complete` and nothing else.
+
+Each prints the keys it will write or delete, then asks `[y/N]` unless given `--yes`; any answer but `y` or `yes`, end of input included, exits 2 and writes nothing. Under the local backend each refuses with exit 2 and makes no request. A refusal exits 2; a listing that still fails after its retries, or a failed write, exits 3. Keys read from the bucket are printed escaped and cut to a fixed length.
+
+See [Indexing the bucket's older sessions](cloud-sync-setup.md#indexing-the-buckets-older-sessions) for what a declared bucket trades, when to run the audit, and how to secure `koto-names/`.
+
 #### session recover
 
 Lists, and optionally restores, the sessions the old-layout migration moved aside because their name was already taken. See [Session storage](#session-storage) for how they get there.
@@ -915,7 +933,9 @@ Removes a session directory and all its contents. Idempotent -- succeeds even if
 koto session cleanup <name>
 ```
 
-When it removes a session, it also deletes a finished record a crash left under the name; on a name koto already removed itself it removes nothing, and the record stays the `koto status` answer. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
+When it removes a session, it also deletes a finished record a crash left under the name; on a name koto already removed itself it removes nothing, and the record stays the `koto status` answer.
+
+Under the cloud backend, removing a session leaves its name in the bucket's name index: the entry `koto-names/<name>/<prefix>` stays, readable by anyone who can list `koto-names/`, until an operator runs `koto session index audit --prune` (see [session index](#session-index)). Keep that in mind when you remove a session because its name shouldn't be seen. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
 
 An explicit removal still removes when the retention rule would keep the session, and says what it broke. Just before removing, it judges the session's hierarchy (see [session hierarchy](#session-hierarchy)) and lists every other live member under `live_members`, each with its `kind` (`koto_session` or `anchor`) and, for an anchor, whether it is `observed`. The removed session itself is never named, and a session nothing alive keeps gets an empty list, including one kept only because its retention hasn't passed. A non-empty list also prints a warning on stderr. When the sessions directory can't be read, the session is still removed, the list is empty, and `live_members_error` says why. A malformed retention setting falls back to the defaults here, with a warning, so it never blocks a removal.
 

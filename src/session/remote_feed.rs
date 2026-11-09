@@ -116,7 +116,7 @@ pub fn sanitize_bucket_text(text: &str) -> String {
 /// carriage return, U+0085 or U+2028 reaches the client raw inside the
 /// listing's XML, and rust-s3's parser turns each into a newline, so the
 /// listed name is no longer the stored key and the session can't be read.
-const LIST_ENCODING: &str = "url";
+pub(crate) const LIST_ENCODING: &str = "url";
 
 /// A listed key or prefix in the `url` encoding S3 answers an
 /// `encoding-type=url` listing with: `+` is a space and `%XX` a byte.
@@ -143,7 +143,7 @@ fn url_decode(encoded: &str) -> Option<String> {
 /// Decode, in place, the keys and prefixes of each page that says it was
 /// answered in [`LIST_ENCODING`]. A key that doesn't decode is dropped from
 /// its page; a page in no encoding is left as it came.
-fn decode_listing(pages: &mut [ListBucketResult]) {
+pub(crate) fn decode_listing(pages: &mut [ListBucketResult]) {
     for page in pages {
         if page.encoding_type.as_deref() != Some(LIST_ENCODING) {
             continue;
