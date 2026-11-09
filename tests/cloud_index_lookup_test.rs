@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/declaration.rs"]
+mod declaration;
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
 #[path = "support/koto_command.rs"]
@@ -700,13 +702,17 @@ fn an_index_past_the_cap_reads_one_page_and_sweeps() {
 
 // -- the declaration and its memo --
 
-/// A valid declaration planted by hand changes no reply: `status` and
-/// `context exists` of a missing name, an older writer's name and an
-/// indexed name answer as they did without it. The memo records it as
-/// declared, and a second lookup still reads the declaration, lists the
-/// top level and sweeps on a miss.
+/// A valid declaration planted by hand turns the declared branch on and
+/// changes one reply only. `status` and `context exists` of a missing name
+/// and of an indexed name answer as they did without it, while an older
+/// writer's session, held under another prefix with no entry, now answers
+/// as a missing name does: the reply change the design accepts on a
+/// declared bucket. The memo records the bucket as declared, and the next
+/// lookup of the missing name trusts it: no top-level listing, no sweep
+/// and no listing of the declaration, only one GET of it (the window is
+/// 0).
 #[test]
-fn a_planted_declaration_changes_no_reply_and_skips_no_request() {
+fn a_planted_declaration_changes_only_an_unindexed_session_s_reply() {
     let s3 = FakeS3::start(BUCKET);
     let first = Host::new(&s3);
     let second = Host::new(&s3);
@@ -735,10 +741,29 @@ fn a_planted_declaration_changes_no_reply_and_skips_no_request() {
         serde_json::from_slice(&std::fs::read(second.memo_path()).unwrap()).unwrap();
     assert_eq!(memo["declared"], false, "{memo}");
 
+    // What the missing name answered to `args`, asked of `name` instead.
+    let as_missing = |args: &[&str], name: &str| {
+        let ghost: Vec<&str> = args
+            .iter()
+            .map(|a| if *a == name { GHOST } else { *a })
+            .collect();
+        let at = commands.iter().position(|c| *c == ghost).unwrap();
+        let (code, stdout, field_code, reason) = undeclared[at].clone();
+        let stdout = stdout.replace(&format!("'{GHOST}'"), &format!("'{name}'"));
+        (code, stdout, field_code, reason)
+    };
+
     s3.put(DECLARATION, &declaration());
     for (args, before) in commands.iter().zip(&undeclared) {
-        assert_eq!(&second.koto(&b, args).reply(), before, "koto {args:?}");
+        let after = second.koto(&b, args).reply();
+        if args.contains(&OLD) {
+            assert_ne!(&after, before, "koto {args:?} kept its undeclared reply");
+            assert_eq!(after, as_missing(args, OLD), "koto {args:?}");
+        } else {
+            assert_eq!(&after, before, "koto {args:?}");
+        }
     }
+    assert_absent(&second.exists(&b, OLD));
     let memo: serde_json::Value =
         serde_json::from_slice(&std::fs::read(second.memo_path()).unwrap()).unwrap();
     assert_eq!(memo["declared"], true, "{memo}");
@@ -746,11 +771,14 @@ fn a_planted_declaration_changes_no_reply_and_skips_no_request() {
 
     s3.clear_requests();
     assert_absent(&second.exists(&b, GHOST));
-    assert_eq!(listed(&s3, DECLARATION), 1);
-    assert_eq!(declaration_gets(&s3), 1);
-    assert_eq!(top_level_listings(&s3), 1);
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", shapes(&s3));
+    assert_eq!(listed(&s3, DECLARATION), 0, "{:?}", shapes(&s3));
+    assert_eq!(declaration_gets(&s3), 1, "{:?}", shapes(&s3));
     assert_eq!(listed(&s3, &format!("koto-names/{GHOST}/")), 1);
-    assert_swept(&s3, &others, GHOST);
+    for p in &others {
+        let sweep = format!("{p}/{GHOST}/");
+        assert_eq!(listed(&s3, &sweep), 0, "{sweep}: {:?}", listings(&s3));
+    }
 }
 
 /// A memo that doesn't parse, and one recorded for another bucket, are
@@ -1001,4 +1029,455 @@ fn an_index_hit_prints_no_hint_however_slow() {
     s3.set_latency(Duration::ZERO);
     assert_unlocated(&out, "context exists", WF, "no_local_copy");
     assert!(!out.stderr.contains(HINT), "{}", out.describe());
+}
+
+// -- the declared branch (koto#609) --
+
+/// The check window the declared tests set when they need one above 0.
+const WINDOW_SECS: &str = "1";
+
+/// Run `cmd` and capture what it printed.
+fn run(mut cmd: Command) -> Out {
+    let o = cmd.output().unwrap();
+    Out {
+        code: o.status.code(),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+/// `context exists <name> k.md` from `dir` with the check window above 0.
+fn exists_windowed(h: &Host, dir: &Path, name: &str) -> Out {
+    let mut cmd = h.cmd(dir, &["context", "exists", name, "k.md"]);
+    cmd.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", WINDOW_SECS);
+    run(cmd)
+}
+
+/// The host's memo, parsed.
+fn memo(h: &Host) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(h.memo_path()).unwrap()).unwrap()
+}
+
+/// Write the memo for `endpoint` and this bucket by hand: `declared`, its
+/// last answered read `age` ago.
+fn write_memo(h: &Host, endpoint: &str, declared: bool, age: Duration) {
+    let read_at = fake_s3::rfc3339_millis(std::time::SystemTime::now() - age);
+    let body = serde_json::json!({
+        "version": 1,
+        "endpoint": endpoint,
+        "bucket": BUCKET,
+        "declared": declared,
+        "read_at": read_at,
+    });
+    std::fs::write(h.memo_path(), serde_json::to_vec(&body).unwrap()).unwrap();
+}
+
+/// Move the memo's last answered read to `age` ago, keeping the rest.
+fn age_memo(h: &Host, age: Duration) {
+    let mut body = memo(h);
+    body["read_at"] = fake_s3::rfc3339_millis(std::time::SystemTime::now() - age).into();
+    std::fs::write(h.memo_path(), serde_json::to_vec(&body).unwrap()).unwrap();
+}
+
+/// A bucket carrying a valid declaration, and a host whose memo says
+/// "declared" from an earlier lookup of a missing name from `dir_name`.
+fn declared_host(s3: &FakeS3, dir_name: &str) -> (Host, PathBuf) {
+    s3.put(declaration::KEY, &declaration::valid());
+    let h = Host::new(s3);
+    h.make_root();
+    let dir = h.dir(dir_name);
+    assert_absent(&h.exists(&dir, "earlier"));
+    assert_eq!(memo(&h)["declared"], true, "{}", memo(&h));
+    (h, dir)
+}
+
+/// Every request but the HEADs of `name`'s state key under `own`, which
+/// `context exists` makes after the lookup for a name it reads as absent.
+fn lookup_requests(s3: &FakeS3, own: &str, name: &str) -> Vec<fake_s3::Request> {
+    let own_state = format!("{own}/{name}/koto-{name}.state.jsonl");
+    s3.requests()
+        .into_iter()
+        .filter(|r| !(r.method == "HEAD" && r.key == own_state))
+        .collect()
+}
+
+/// [`shapes`] of [`lookup_requests`].
+fn lookup_shapes(s3: &FakeS3, own: &str, name: &str) -> Vec<String> {
+    let mut shapes: Vec<String> = lookup_requests(s3, own, name)
+        .iter()
+        .map(|r| match &r.list_prefix {
+            Some(prefix) => format!("LIST {prefix:?} {:?}", r.delimiter),
+            None => format!("{} {}", r.method, r.key),
+        })
+        .collect();
+    shapes.sort();
+    shapes
+}
+
+/// The listings of `<p>/<name>/` made for a `p` other than `own`.
+fn other_prefix_listings(s3: &FakeS3, own: &str, name: &str) -> Vec<String> {
+    let suffix = format!("/{name}/");
+    let own_listing = format!("{own}{suffix}");
+    listings(s3)
+        .into_iter()
+        .filter(|l| l.ends_with(&suffix) && !l.starts_with("koto-names/") && *l != own_listing)
+        .collect()
+}
+
+/// A missing name on a declared bucket costs the own-prefix probe, the
+/// index listing and the declaration GET, whatever the prefix count, and
+/// the last two share one round trip after the first.
+#[test]
+fn a_missing_name_on_a_declared_bucket_costs_three_requests_at_any_prefix_count() {
+    let s3 = FakeS3::start(BUCKET);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+    let own = prefix_of(&dir);
+    let mut expected = vec![
+        list_shape(&format!("{own}/{GHOST}/"), None),
+        list_shape(&format!("koto-names/{GHOST}/"), None),
+        format!("GET {}", declaration::KEY),
+    ];
+    expected.sort();
+
+    for count in [1, 64, 300, 2_000] {
+        plant_prefixes(&s3, count);
+        s3.clear_requests();
+        assert_absent(&h.exists(&dir, GHOST));
+        assert_eq!(
+            lookup_shapes(&s3, &own, GHOST),
+            expected,
+            "{count} prefixes"
+        );
+    }
+
+    let latency = Duration::from_millis(300);
+    s3.set_latency(latency);
+    s3.clear_requests();
+    let out = h.exists(&dir, GHOST);
+    s3.set_latency(Duration::ZERO);
+    assert_absent(&out);
+    let requests = lookup_requests(&s3, &own, GHOST);
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let at = |pred: &dyn Fn(&fake_s3::Request) -> bool| {
+        requests.iter().find(|r| pred(r)).map(|r| r.at).unwrap()
+    };
+    let probe_listing = format!("{own}/{GHOST}/");
+    let index_listing = format!("koto-names/{GHOST}/");
+    let probe = at(&|r| r.list_prefix.as_deref() == Some(probe_listing.as_str()));
+    let index = at(&|r| r.list_prefix.as_deref() == Some(index_listing.as_str()));
+    let get = at(&|r| r.method == "GET" && r.key == declaration::KEY);
+    let (early, late) = if index < get {
+        (index, get)
+    } else {
+        (get, index)
+    };
+    assert!(
+        late - early < latency / 2,
+        "index and GET {:?} apart",
+        late - early
+    );
+    assert!(probe < early, "the index or GET went out before the probe");
+    assert!(
+        late - probe < latency * 2,
+        "the lookup took {:?}",
+        late - probe
+    );
+
+    // A "declared" younger than the window skips the GET as well.
+    write_memo(&h, &s3.endpoint(), true, Duration::ZERO);
+    s3.clear_requests();
+    let mut cmd = h.cmd(&dir, &["context", "exists", GHOST, "k.md"]);
+    cmd.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "60");
+    assert_absent(&run(cmd));
+    let listings_only: Vec<String> = expected
+        .iter()
+        .filter(|s| s.starts_with("LIST"))
+        .cloned()
+        .collect();
+    assert_eq!(lookup_shapes(&s3, &own, GHOST), listings_only, "fresh memo");
+}
+
+/// Throttles that clear within the retries cost the same at 64 and 300
+/// prefixes, ask each key a bounded number of times, and never sweep. A
+/// declaration GET that keeps failing, with the memo's last answered read
+/// under 10 minutes old and the window above 0, stays bounded too.
+#[test]
+fn a_missing_name_on_a_degraded_declared_bucket_asks_a_bounded_number_of_listings() {
+    let mut totals = Vec::new();
+    for count in [64, 300] {
+        let s3 = FakeS3::start(BUCKET);
+        let (h, dir) = declared_host(&s3, "elsewhere");
+        let own = prefix_of(&dir);
+        plant_prefixes(&s3, count);
+        let probe = format!("{own}/{GHOST}/");
+        let index = format!("koto-names/{GHOST}/");
+        s3.fail_times("LIST", &probe, 503, 2);
+        s3.fail_times("LIST", &index, 503, 2);
+        s3.fail_times("GET", declaration::KEY, 503, 2);
+        s3.clear_requests();
+        assert_absent(&h.exists(&dir, GHOST));
+        let requests = lookup_requests(&s3, &own, GHOST);
+        totals.push(requests.len());
+        // Each of LIST_ATTEMPTS asks is at most rust-s3's request and its
+        // one retry.
+        let max = 3 * 2;
+        assert!(listed(&s3, &probe) <= max, "{:?}", listings(&s3));
+        assert!(listed(&s3, &index) <= max, "{:?}", listings(&s3));
+        assert!(declaration_gets(&s3) <= max, "{requests:?}");
+        assert_eq!(top_level_listings(&s3), 0, "{count}: {:?}", listings(&s3));
+        assert!(other_prefix_listings(&s3, &own, GHOST).is_empty());
+
+        // The GET fails on every ask; the carried "declared" still holds.
+        s3.clear_faults();
+        s3.fail("GET", declaration::KEY, 503);
+        age_memo(&h, Duration::from_secs(120));
+        s3.clear_requests();
+        assert_absent(&exists_windowed(&h, &dir, GHOST));
+        assert!(declaration_gets(&s3) > 0, "the GET was skipped");
+        assert_eq!(top_level_listings(&s3), 0, "{count}: {:?}", listings(&s3));
+        assert!(other_prefix_listings(&s3, &own, GHOST).is_empty());
+
+        // With the window at 0 nothing is carried: the same failing GET
+        // reads undeclared and the lookup sweeps every other prefix.
+        s3.clear_requests();
+        assert_absent(&h.exists(&dir, GHOST));
+        assert_eq!(top_level_listings(&s3), 1, "{count}: {:?}", listings(&s3));
+        assert_eq!(
+            other_prefix_listings(&s3, &own, GHOST).len(),
+            count as usize
+        );
+    }
+    assert_eq!(totals[0], totals[1], "requests at 64 and 300 prefixes");
+}
+
+/// An indexed session under one prefix still refuses from another on a
+/// declared bucket, listing only its holder besides the own prefix, with
+/// no top-level listing once the memo says "declared".
+#[test]
+fn a_declared_bucket_still_refuses_an_indexed_session_from_another_prefix() {
+    let s3 = FakeS3::start(BUCKET);
+    let first = Host::new(&s3);
+    let a = first.dir("a");
+    first.init(&a);
+    plant_prefixes(&s3, 300);
+    let (second, b) = declared_host(&s3, "elsewhere");
+    let own = prefix_of(&b);
+
+    s3.clear_requests();
+    let out = second.exists(&b, WF);
+    assert_unlocated(&out, "context exists", WF, "no_local_copy");
+    assert_eq!(out.json()["locations"][0], own, "{}", out.describe());
+    assert!(!out.stdout.contains("value"), "{}", out.describe());
+    assert_eq!(
+        other_prefix_listings(&s3, &own, WF),
+        vec![format!("{}/{WF}/", prefix_of(&a))]
+    );
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+}
+
+/// On a declared bucket a failed index listing, or a failed confirming
+/// listing, is "can't tell" (exit 2), never not-found.
+#[test]
+fn a_failed_index_listing_on_a_declared_bucket_is_cant_tell() {
+    let s3 = FakeS3::start(BUCKET);
+    let first = Host::new(&s3);
+    let a = first.dir("a");
+    first.init(&a);
+    plant_prefixes(&s3, 10);
+    let (second, b) = declared_host(&s3, "elsewhere");
+    let holder = format!("{}/{WF}/", prefix_of(&a));
+
+    let assert_cant_tell = |name: &str, listing: &str| {
+        let out = second.exists(&b, name);
+        assert_eq!(out.code, Some(2), "{name}: {}", out.describe());
+        assert_eq!(
+            out.json()["command"],
+            "context exists",
+            "{}",
+            out.describe()
+        );
+        let text = format!("{}{}", out.stdout, out.stderr);
+        let needles = [
+            format!("'{name}'"),
+            "can't tell".into(),
+            "503".into(),
+            listing.into(),
+        ];
+        for needle in needles {
+            assert!(
+                text.contains(&needle),
+                "{name}: no {needle:?}: {}",
+                out.describe()
+            );
+        }
+    };
+
+    for name in [GHOST, WF] {
+        s3.fail("LIST", &format!("koto-names/{name}/"), 503);
+    }
+    for name in [GHOST, WF] {
+        assert_cant_tell(name, &format!("koto-names/{name}/"));
+    }
+    s3.clear_faults();
+    s3.fail("LIST", &holder, 503);
+    assert_cant_tell(WF, &holder);
+
+    s3.clear_faults();
+    assert_absent(&second.exists(&b, GHOST));
+    assert_unlocated(
+        &second.exists(&b, WF),
+        "context exists",
+        WF,
+        "no_local_copy",
+    );
+}
+
+/// A host whose memo says "declared", pointed at a closed port, reads a
+/// never-used name as absent after the own-prefix probe alone.
+#[test]
+fn an_unreachable_declared_bucket_still_reads_a_never_used_name_as_absent() {
+    let s3 = FakeS3::start(BUCKET);
+    let (mut h, dir) = declared_host(&s3, "offline");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    h.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let endpoint = h.endpoint.clone();
+    write_memo(&h, &endpoint, true, Duration::from_secs(120));
+
+    s3.clear_requests();
+    assert_absent(&h.exists(&dir, "never_used"));
+    assert!(s3.requests().is_empty(), "{:?}", s3.requests());
+}
+
+/// Every rejected declaration body reads as undeclared: an entry-less
+/// session under another prefix refuses with `no_local_copy`, and a
+/// missing name sweeps every other prefix. With a memo that said
+/// "declared", the same body, or no object at all, clears it in that
+/// lookup, which then lists the top level and sweeps.
+#[test]
+fn an_oversized_or_malformed_declaration_reads_as_undeclared() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.make_root();
+    let others = plant_prefixes(&s3, 6);
+    plant_state(&s3, &others[3], OLD);
+    let dir = h.dir("elsewhere");
+    let endpoint = s3.endpoint();
+
+    let mut bodies: Vec<(&str, Option<Vec<u8>>)> = declaration::rejected()
+        .into_iter()
+        .map(|(label, body)| (label, Some(body)))
+        .collect();
+    bodies.push(("removed", None));
+    for (label, body) in &bodies {
+        match body {
+            Some(body) => s3.put(declaration::KEY, body),
+            None => s3.remove(declaration::KEY),
+        }
+        for remembered in [false, true] {
+            if remembered {
+                write_memo(&h, &endpoint, true, Duration::from_secs(1));
+            }
+            s3.clear_requests();
+            let out = h.exists(&dir, OLD);
+            assert_unlocated(&out, "context exists", OLD, "no_local_copy");
+            assert_eq!(memo(&h)["declared"], false, "{label}, memo {remembered}");
+            if remembered {
+                assert_eq!(top_level_listings(&s3), 1, "{label}: {:?}", listings(&s3));
+                write_memo(&h, &endpoint, true, Duration::from_secs(1));
+            }
+            s3.clear_requests();
+            assert_absent(&h.exists(&dir, GHOST));
+            assert_swept(&s3, &others, GHOST);
+        }
+    }
+}
+
+/// A name the index lists more entries for than the cap confirms none of
+/// them on a declared bucket and sweeps instead, so the sweep finds an
+/// entry-less session; the index listing stops at the first page. Under
+/// the cap, the same bucket reads that session as not-found, with no
+/// top-level listing.
+#[test]
+fn a_name_with_more_entries_than_the_cap_falls_back_to_the_sweep() {
+    let s3 = FakeS3::start(BUCKET);
+    let mut others = plant_prefixes(&s3, 300);
+    let holder = "f".repeat(16);
+    plant_state(&s3, &holder, OLD);
+    others.push(holder);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+    let own = prefix_of(&dir);
+    let index = format!("koto-names/{OLD}/");
+
+    for p in others.iter().take(200) {
+        plant_entry(&s3, OLD, p);
+    }
+    s3.clear_requests();
+    assert_absent(&h.exists(&dir, OLD));
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+    assert_eq!(other_prefix_listings(&s3, &own, OLD).len(), 200);
+
+    for p in others.iter().take(300) {
+        plant_entry(&s3, OLD, p);
+    }
+    s3.clear_requests();
+    let out = h.exists(&dir, OLD);
+    assert_unlocated(&out, "context exists", OLD, "no_local_copy");
+    assert_eq!(top_level_listings(&s3), 1, "{:?}", listings(&s3));
+    assert_swept(&s3, &others, OLD);
+
+    for i in 0..1_500u32 {
+        plant_entry(&s3, OLD, &format!("{:016x}", 0x1000_0000 + i));
+    }
+    s3.clear_requests();
+    let out = h.exists(&dir, OLD);
+    assert_unlocated(&out, "context exists", OLD, "no_local_copy");
+    assert_eq!(listed(&s3, &index), 1, "{:?}", listings(&s3));
+    assert_swept(&s3, &others, OLD);
+}
+
+/// A remembered "declared" carries a lookup through declaration reads that
+/// keep failing only for 10 minutes after the last answered read, and the
+/// failed reads don't move that limit. Past it, lookups sweep; an answered
+/// read restores the bounded path.
+#[test]
+fn a_carried_declaration_expires_while_reads_keep_failing() {
+    let s3 = FakeS3::start(BUCKET);
+    let others = plant_prefixes(&s3, 8);
+    plant_state(&s3, &others[5], OLD);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+
+    s3.fail("GET", declaration::KEY, 503);
+    age_memo(&h, Duration::from_secs(5 * 60));
+    let read_at = memo(&h)["read_at"].clone();
+    for _ in 0..2 {
+        s3.clear_requests();
+        assert_absent(&exists_windowed(&h, &dir, GHOST));
+        assert!(declaration_gets(&s3) > 0, "the GET was skipped");
+        assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+        assert_absent(&exists_windowed(&h, &dir, OLD));
+        assert_eq!(memo(&h)["read_at"], read_at, "a failed read moved the memo");
+    }
+
+    age_memo(&h, Duration::from_secs(11 * 60));
+    s3.clear_requests();
+    assert_absent(&exists_windowed(&h, &dir, GHOST));
+    assert_eq!(top_level_listings(&s3), 1, "{:?}", listings(&s3));
+    assert_swept(&s3, &others, GHOST);
+    let out = exists_windowed(&h, &dir, OLD);
+    assert_unlocated(&out, "context exists", OLD, "no_local_copy");
+
+    s3.clear_faults();
+    s3.clear_requests();
+    let expired_at = memo(&h)["read_at"].clone();
+    assert_absent(&exists_windowed(&h, &dir, GHOST));
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+    assert_ne!(
+        memo(&h)["read_at"],
+        expired_at,
+        "the answered read wasn't recorded"
+    );
+    s3.clear_requests();
+    assert_absent(&exists_windowed(&h, &dir, OLD));
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
 }

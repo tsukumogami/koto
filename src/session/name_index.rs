@@ -10,7 +10,8 @@
 //!
 //! `koto-names/_complete`, the declaration, says an audit found every older
 //! copy indexed too, so a miss in the index can be trusted. Nothing here
-//! writes it; the write path only reads it, to decide whether a refused
+//! writes it. A lookup reads it to decide whether a miss in the index is
+//! an answer, and the write path reads it to decide whether a refused
 //! entry PUT may be skipped.
 //!
 //! The index's keys are built only from a name that passed
@@ -42,6 +43,12 @@ pub const MAX_ENTRIES_PER_LOOKUP: usize = 256;
 /// The most bytes of the declaration a host reads; a larger body reads as
 /// undeclared.
 pub const MAX_DECLARATION_BYTES: usize = 4096;
+
+/// How long after its last answered read a remembered "declared" still
+/// stands for a lookup whose own read of the declaration got no answer.
+/// Past it, the lookup reads the bucket as undeclared until a read answers
+/// again, and a read that fails never moves the limit.
+pub const MAX_DECLARATION_CARRY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// `koto-names/<name>/<prefix>`, the entry that says `prefix` held `name`.
 /// Refuses a name [`validate_session_id`] rejects and a prefix that isn't
@@ -157,7 +164,6 @@ pub(crate) enum DeclarationRead {
 /// replaced after the listing) stops being read at the cap.
 pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
     use crate::session::cloud::without_url_userinfo;
-    use crate::session::remote_feed::BoundedSink;
 
     let pages = match bucket.list(DECLARATION_KEY.to_string(), None) {
         Ok(pages) => pages,
@@ -179,6 +185,17 @@ pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
     if listed.size > MAX_DECLARATION_BYTES as u64 {
         return DeclarationRead::Absent;
     }
+    get_declaration(bucket).unwrap_or_else(|e| unanswered_get(&e))
+}
+
+/// One capped GET of [`DECLARATION_KEY`], with no listing first: the read
+/// a host makes when it expects the object to be there. A body that runs
+/// past [`MAX_DECLARATION_BYTES`] stops being read at the cap and reads
+/// as absent, as does a 404. A request that failed is `Err`, so the
+/// caller can ask again; [`unanswered_get`] words it.
+pub(crate) fn get_declaration(bucket: &Bucket) -> Result<DeclarationRead, s3::error::S3Error> {
+    use crate::session::remote_feed::BoundedSink;
+
     let mut sink = BoundedSink {
         bytes: Vec::new(),
         limit: MAX_DECLARATION_BYTES + 1,
@@ -190,24 +207,30 @@ pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
         &mut sink,
     );
     if sink.bytes.len() > MAX_DECLARATION_BYTES {
-        return DeclarationRead::Absent;
+        return Ok(DeclarationRead::Absent);
     }
     match answered {
-        Ok(200 | 206) => match parse_declaration(&sink.bytes) {
+        Ok(200 | 206) => Ok(match parse_declaration(&sink.bytes) {
             Some(_) => DeclarationRead::Present,
             None => DeclarationRead::Absent,
-        },
-        Ok(404) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => DeclarationRead::Absent,
-        Ok(status) => DeclarationRead::Unreadable(format!(
+        }),
+        Ok(404) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(DeclarationRead::Absent),
+        Ok(status) => Ok(DeclarationRead::Unreadable(format!(
             "reading {} answered status {}",
             DECLARATION_KEY, status
-        )),
-        Err(e) => DeclarationRead::Unreadable(format!(
-            "reading {} failed: {}",
-            DECLARATION_KEY,
-            without_url_userinfo(&e.to_string())
-        )),
+        ))),
+        Err(e) => Err(e),
     }
+}
+
+/// The [`DeclarationRead::Unreadable`] of a [`get_declaration`] whose
+/// request failed with `e`.
+pub(crate) fn unanswered_get(e: &s3::error::S3Error) -> DeclarationRead {
+    DeclarationRead::Unreadable(format!(
+        "reading {} failed: {}",
+        DECLARATION_KEY,
+        crate::session::cloud::without_url_userinfo(&e.to_string())
+    ))
 }
 
 /// The host-wide memo of the declaration, a file of this name beside the
@@ -216,7 +239,9 @@ pub(crate) fn read_declaration(bucket: &Bucket) -> DeclarationRead {
 ///
 /// A lookup records every answered read here. A read that got no answer
 /// leaves the memo as it was, so a later lookup can still see the last
-/// answer and how old it is. Nothing reads it to decide anything yet.
+/// answer and how old it is. A lookup reads it to choose which requests it
+/// starts, and to stand in for a read that gets no answer; a write path
+/// never reads it.
 pub const MEMO_FILE: &str = "cloud-index.json";
 
 /// The most bytes of [`MEMO_FILE`] a host reads; a larger file is ignored.

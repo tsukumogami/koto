@@ -540,6 +540,25 @@ to `0.9.x`).
 
 ### Changed
 
+- **On a bucket that carries a valid `koto-names/_complete`, a cloud lookup
+  trusts the name index
+  ([koto#609](https://github.com/tsukumogami/koto/issues/609)).** A name
+  with no local copy reads as not-found after the own-prefix listing, the
+  index listing and a GET of the declaration, three requests in two round
+  trips however many workspace prefixes the bucket has; a session the
+  index names is still confirmed by listing its prefix. A failed index or
+  confirming listing is "can't tell" rather than not-found. This is the
+  one reply that changes, and only on a declared bucket: a session only an
+  older release wrote, with no index entry, reads as not-found from other
+  prefixes. A missing, oversized or malformed declaration reads as
+  undeclared and every reply stays as before. `cloud-index.json` now
+  decides which requests a lookup starts: a remembered declaration skips
+  the top-level listing, and one younger than
+  `session.cloud.check_window_secs` skips the declaration read too. When
+  that read gets no answer, the remembered declaration stands for up to 10
+  minutes after the last read that did, and never with a check window of
+  0. A name with more than 256 index entries is swept as before. The write
+  path reads the bucket, never the memo.
 - **A cloud lookup of a name with no local copy reads the name index first
   ([koto#608](https://github.com/tsukumogami/koto/issues/608)).** Beside
   the bucket's top-level listing, koto now lists `koto-names/<name>/` and

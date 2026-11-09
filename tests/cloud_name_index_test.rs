@@ -14,6 +14,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/declaration.rs"]
+mod declaration;
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
 #[path = "support/koto_command.rs"]
@@ -787,6 +789,152 @@ fn a_refused_entry_put_pushes_on_when_the_planted_declaration_is_rejected() {
             }
         }
     }
+}
+
+/// On a bucket carrying a valid declaration, a refused entry PUT blocks
+/// the push. Creating the session sends no state PUT and leaves no state
+/// object (init's best-effort upload of the compiled template still goes
+/// up): `koto init`'s push only reports it on stderr and leaves the push
+/// owed, and `koto session flush`, the strict push of the batch a
+/// tick left owed, fails naming `koto-names/` and the missing PUT
+/// permission. A declaration read that gets no answer fails the push too.
+/// Once the bucket stops refusing, the next push writes the entry and then
+/// the state. A memo that still says "declared" after the declaration was
+/// removed changes nothing: the write path reads the bucket itself after
+/// the refusal, finds no declaration, warns and pushes.
+#[test]
+fn a_refused_entry_put_blocks_the_push_on_a_declared_bucket() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let a = h.dir("a");
+    let key = entry(WF, &a);
+    let session = format!("{}/{WF}/", prefix_of(&a));
+    s3.put(declaration::KEY, &declaration::valid());
+    s3.fail("PUT", &key, 403);
+    let blocked = |what: &str, out: &Out| {
+        assert_eq!(puts_of(&s3, &state_key(&a)), 0, "{what}: {:#?}", puts(&s3));
+        assert!(s3.object(&state_key(&a)).is_none(), "{what}");
+        let text = format!("{}{}", out.stdout, out.stderr);
+        assert!(
+            text.contains("koto-names/") && text.contains(&key),
+            "{what}: {}",
+            out.describe()
+        );
+        assert!(
+            text.contains("PUT permission"),
+            "{what}: {}",
+            out.describe()
+        );
+    };
+
+    // The create's push, which only reports a failure.
+    let out = h.init_with(&a, TICK_TEMPLATE);
+    blocked("init", &out);
+    assert!(out.stderr.contains("PUT permission"), "{}", out.describe());
+    let unpushed = |what: &str| {
+        let stamp = h.session_dir(WF).join("cloud-sync.json");
+        if stamp.exists() {
+            assert_ne!(
+                h.stamp(WF)["state_sha256"].as_str(),
+                Some(sha256_hex(&h.local_state(WF)).as_str()),
+                "{what}: the stamp names the unpushed bytes"
+            );
+            assert_ne!(h.stamp(WF)["indexed"], true, "{what}");
+        }
+    };
+    unpushed("init");
+    assert_eq!(
+        s3.keys_under(&session)
+            .into_iter()
+            .filter(|k| !k.ends_with("/template.json"))
+            .collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "only the compiled template may be under {session}"
+    );
+
+    // A tick leaves its batch owed, and the strict push of it fails.
+    let tick = h.koto(&a, &["next", WF]);
+    blocked("tick", &tick);
+    s3.clear_requests();
+    let out = h.koto(&a, &["session", "flush", WF]);
+    assert_ne!(out.code, Some(0), "flush: {}", out.describe());
+    blocked("flush", &out);
+    unpushed("flush");
+
+    // A declaration read that gets no answer fails it as well.
+    s3.fail("LIST", declaration::KEY, 503);
+    s3.fail("GET", declaration::KEY, 503);
+    s3.clear_requests();
+    let out = h.koto(&a, &["session", "flush", WF]);
+    assert_ne!(out.code, Some(0), "unanswered: {}", out.describe());
+    blocked("unanswered", &out);
+    assert!(
+        s3.requests()
+            .iter()
+            .any(|r| r.list_prefix.as_deref() == Some(declaration::KEY)),
+        "the declaration was never asked: {:#?}",
+        s3.requests()
+    );
+    unpushed("unanswered");
+
+    s3.clear_faults();
+    s3.clear_requests();
+    h.ok(&a, &["session", "flush", WF]);
+    let puts = puts(&s3);
+    let at_entry = puts
+        .iter()
+        .position(|k| *k == key)
+        .unwrap_or_else(|| panic!("no entry: {puts:#?}"));
+    let at_state = puts
+        .iter()
+        .position(|k| *k == state_key(&a))
+        .unwrap_or_else(|| panic!("no state: {puts:#?}"));
+    assert!(at_entry < at_state, "{puts:#?}");
+    assert_eq!(h.stamp(WF)["indexed"], true);
+
+    // A memo that still says "declared", fresh enough that a lookup
+    // wouldn't read the bucket, over a bucket whose declaration is gone.
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let a = h.dir("a");
+    let key = entry(WF, &a);
+    std::fs::create_dir_all(h.home.join(".koto")).unwrap();
+    let memo = h.home.join(".koto/cloud-index.json");
+    let body = serde_json::json!({
+        "version": 1,
+        "endpoint": s3.endpoint(),
+        "bucket": BUCKET,
+        "declared": true,
+        "read_at": fake_s3::rfc3339_millis(std::time::SystemTime::now()),
+    });
+    std::fs::write(&memo, serde_json::to_vec(&body).unwrap()).unwrap();
+    s3.put(declaration::KEY, &declaration::valid());
+    s3.remove(declaration::KEY);
+    s3.fail("PUT", &key, 403);
+    std::fs::write(a.join("flow.md"), TEMPLATE).unwrap();
+    let mut cmd = h.cmd(&a, &["init", WF, "--template", "flow.md"]);
+    cmd.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "600");
+    let out = h.run(cmd);
+    assert_eq!(out.code, Some(0), "{}", out.describe());
+    assert!(
+        out.stderr.contains("warning:") && out.stderr.contains(&key),
+        "{}",
+        out.describe()
+    );
+    assert!(s3.object(&state_key(&a)).is_some(), "the state went up");
+    let requests = s3.requests();
+    let refused = requests
+        .iter()
+        .position(|r| r.method == "PUT" && r.key == key)
+        .unwrap_or_else(|| panic!("no entry PUT: {requests:#?}"));
+    // read_declaration lists the key before it fetches it.
+    assert!(
+        requests[refused..]
+            .iter()
+            .any(|r| r.list_prefix.as_deref() == Some(declaration::KEY)),
+        "no read of {} after the refused PUT: {requests:#?}",
+        declaration::KEY
+    );
 }
 
 /// Deleting a session, by `session cleanup` or by `session prune`, removes
