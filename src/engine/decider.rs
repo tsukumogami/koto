@@ -782,6 +782,7 @@ mod tests {
                             from: "gather".to_string(),
                             to: "review".to_string(),
                             rationale: None,
+                            decision: None,
                         },
                     ),
                     ev(4, evidence("review")),

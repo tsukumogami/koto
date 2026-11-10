@@ -338,6 +338,7 @@ pub fn handle_overrides_record(
         override_applied: override_applied.clone(),
         actual_output: actual_output.clone(),
         timestamp: ts.clone(),
+        decision: None,
     };
     if let Err(e) = backend.append_event(&name, &payload, &ts) {
         exit_with_error_code(
@@ -432,6 +433,7 @@ pub fn handle_overrides_list(backend: &crate::session::Backend, name: String) ->
                 override_applied,
                 actual_output,
                 timestamp,
+                ..
             } = &e.payload
             {
                 Some(serde_json::json!({

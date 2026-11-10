@@ -6150,6 +6150,7 @@ mod tests {
                     override_applied,
                     actual_output: serde_json::json!({"exit_code": 1, "error": ""}),
                     timestamp: "2026-04-01T00:00:00Z".to_string(),
+                    decision: None,
                 },
             ),
         ]

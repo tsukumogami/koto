@@ -6546,6 +6546,7 @@ fn handle_next(
             from: current_state.clone(),
             to: target.clone(),
             rationale: rationale.clone(),
+            decision: None,
         };
         // Captured so the in-memory event built below (for the delivery
         // predicate) carries the same timestamp actually persisted,
