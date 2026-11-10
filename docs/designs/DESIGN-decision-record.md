@@ -18,7 +18,9 @@ decision: |
   from koto's own variables (a new koto-skills hook supplies the acting agent), authority from the
   anchor, the chain from koto's dispatched-by links. Gate-passing commands write their event and
   their decision in one critical section, the decider ledger is retired, and everything is
-  reached through an extended `koto decisions` command.
+  reached through an extended `koto decisions` command. A successor that took over through the
+  supersede fence stands where its predecessor stood: the fence writes a write-once marker beside
+  the predecessor, and the chain walk follows it forward with the session id checked.
 rationale: |
   A per-target directory is the only layout whose per-tick cost doesn't grow with how many
   decisions the sessions above hold or how large their logs are, and every primitive it needs
@@ -220,7 +222,11 @@ mirror, spool, manifest or bucket:
    chain `incomplete`; any other failure blocks naming that session. The walk stops at 64 sessions
    and blocks as unreadable beyond that, so a hostile link chain can't run a tick past its time
    limit.
-4. **List `koto/aimed/<aim-id>/`** in each chain session and read only what is found.
+4. **List `koto/aimed/<aim-id>/`** in each chain session and read only what is found. Because the
+   walk starts at the session itself, this includes the session's own aimed area: that listing is
+   the own-session read R22 adds for a person's replacement, and it costs nothing beyond the walk.
+   It fails closed like the others. From it koto counts a replacement only when a person decider
+   entered it.
 5. **Decide** with R17's standing, R19's race, R18 and R22's clearing rules; a decision that reads
    `reversed` and isn't cleared becomes a reserved synthetic blocking condition on the
    `__action__` precedent, its name refused at template compile time.
@@ -242,8 +248,8 @@ reverser's session; with none of these, `reverse` fails with `reversal_refused` 
 Locally that is about 20 `read_dir` calls on near-empty or missing directories at depth five, well
 under a millisecond, and it doesn't grow with how many decisions any chain session holds. Under the
 cloud backend there are no requests when the skip applies; otherwise the walk is seeded from the
-chain snapshot in the session's newest decision, every chain session's link and aimed listings go
-out in parallel, fresh (never from the five-second listing cache, since a reversal added within it
+chain snapshot in the session's newest decision, every chain session's link and aimed listings,
+the session's own aimed listing among them, go out in parallel, fresh (never from the five-second listing cache, since a reversal added within it
 must not be missed), and a changed link is followed sequentially. That is about two round trips in
 the common case and depth plus one in the worst, around a second at depth five.
 
@@ -399,15 +405,21 @@ output when given none of the new flags. New forms:
 |---|---|
 | `koto decisions record <session> --kind <k> --outcome <o> <subject flags> [decider flags]` | record any kind (R1 to R3) |
 | `koto decisions list <session> [--received] [--below] [filters] --format v1` | list with status (R14, R15) |
-| `koto decisions show <session> <id>` | one decision, its winning reversal and its affected dependents (R21) |
-| `koto decisions reverse <session> <id> [--in <session>] [--compensating <url>] [--replacement <outcome>] [decider flags]` | reverse under R17 to R19 |
+| `koto decisions show <session> <id>` | one decision with every recorded field and its status, its winning reversal with standing and path, and its affected dependents, read from any session on the host (R21, R44) |
+| `koto decisions chain <session>` | the session's chain as koto walks it now, with link kinds, supersede hops and their confirmation, and the session's own supersede marker (R45) |
+| `koto decisions reverse <session> <id> [--in <session>] [--compensating <url>] [--replacement <outcome>] [decider flags]` | reverse under R17 to R19 and R39 to R43 |
 | `koto decisions report --since <t> --until <t> [--below <session>]` | R29's tables |
 | `koto decisions import <session> <file>` | R28's idempotent import |
 
 Shared decider flags: `--by session|person:<handle>|check:<name>`, `--surface`, `--link`,
 `--agent`, `--run-mode`, `--basis` (repeatable), `--evidence` (repeatable), `--reason`. Output is
 JSON carrying `"v": 1`. New typed errors: `decider_missing`, `decision_exists`, `reversal_refused`,
-`invalid_decision`.
+`invalid_decision`. `reversal_refused` gains the reason `supersede_unconfirmed` (R40), and every
+command refuses a fenced session with the existing `session_superseded` (R37). `list` gains a
+`--fenced <session>` filter for reversals whose standing path names a hop from that session (R41).
+Every subcommand that acts on a session (`record`, `list`, `show`, `reverse`, `chain` and
+`import`) takes it as a positional argument and never reads it from the environment (R46);
+`report` spans sessions and narrows them only with `--below`.
 
 #### Alternatives Considered
 
@@ -455,9 +467,94 @@ All of these are shirabe work items. None lands in niwa. shirabe may require kot
   the coordinator's state scripts, which the state-unification work just moved, for no reader-visible
   gain.
 
+### Decision 6: How a successor gets its predecessor's standing
+
+Resolved inline. Added with the PRD's R37 to R48, and answers open question 3.
+
+A coordinator replaced through `koto init <successor> --continues <predecessor> --supersede` must
+stand where its predecessor stood and no higher (R39), read from the fence and never from the
+`continues` link, which the successor writes itself. The tick's reversal read has to find a
+reversal recorded in a successor (R39), the fenced session must record nothing (R37), and the walk
+has to stay inside R36's budget (R48).
+
+Key assumptions:
+- Whoever can fence a session can already cancel or change it, locally or through the bucket
+  credential, so reading standing from the fence grants nothing they lacked. If koto ever grants
+  bucket writes per prefix, this needs revisiting.
+- The fence keeps its one-winner rule: of two successors, the first append wins.
+
+#### Chosen: A write-once supersede marker beside the fenced session, followed forward in the chain walk
+
+- **The marker.** `koto init --supersede` writes `koto/superseded-by` in the predecessor beside the
+  fence, create-only by the decision writer's primitive (local create-rename, `If-None-Match: *`
+  in the bucket), holding the successor's name and session id, the fence's actor and time, and
+  `decisions_through`, the highest decision id the fence saw in the predecessor. It sits
+  outside the manifest like the pin and the migration marker, so one `stat` or one GET reads it.
+  It's written after the fence and before the successor is created. A re-run of the command, which
+  the fence already makes idempotent, writes a missing marker. `check_writer_key` refuses every
+  other writer and every remove of it.
+- **The fenced session records nothing.** Locally, the decision writer reads the fence under the
+  `ctx/manifest.lock` it allocates under. Today `append_supersede_fence` takes only the log's
+  append lock, and no command holds the manifest lock and the append lock together, so the order
+  below is set by this design for the two new holders rather than copied from current code: the
+  fencing command takes the manifest lock first and the append lock inside it, holding both
+  through the append, and a gate-passing decision write that appends to the log takes them in the
+  same order. Neither takes the other's locks in reverse, so the two can't deadlock, and a
+  decision and a fence can't interleave. The state-file lock `koto next` takes for a whole tick on
+  a batching state sits outside both and isn't part of this order: neither the fence nor the
+  decision writer takes it, so a decision written during a tick that holds it waits only on the
+  two locks above, and the fence never waits on a tick. The fence reads `decisions_through` under the manifest lock. Its wait on
+  that lock is bounded by `FENCE_LOCK_WAIT` like its wait on the append lock, which needs a
+  bounded acquire: `LocalBackend::acquire_flock` blocks without limit, so the fence takes the
+  manifest lock through a timed acquire like `AppendLock::acquire_within`. A lock still held when
+  the wait ends exits 3 `fence_unavailable` with nothing written. Under the cloud backend no lock spans the
+  fencing host and the predecessor's host, and a plain `record` pushes no event whose conditional
+  push the fence would make fail. So the fence lists the predecessor's decision prefix in the bucket
+  before its conditional push and takes `decisions_through` from that listing, and every reader
+  treats a decision in a fenced session with a higher id as written after the fence: status
+  `refused`, no standing, no block (R37). A decision created between the listing and the push
+  reads `refused` too, which errs toward the fence.
+- **The walk.** `src/decisions/chain.rs` gains a forward step. At each chain session it reads the
+  marker; if one is there, it reads the successor's header and confirms the session id, then takes
+  the successor's position as the fenced session's and keeps going forward, up to
+  `MAX_SUPERSEDE_HOPS` (64), the constant `src/session/links.rs` already defines. It doesn't reuse
+  `newest_member`: that walk reads each fence from the local log and ends at the last member it
+  reaches without saying whether a hop held, while this step reads the marker in one read under
+  either backend and has to report each hop as confirmed or not. It applies the same name check
+  and cycle guard. Upward it continues from the fenced session's frozen links, never the
+  successor's. A missing marker ends the forward step there; a malformed one makes the session
+  unreadable (R23); a mismatched id marks the hop unconfirmed.
+- **Standing.** `src/decisions/standing.rs` treats each confirmed later member as the fenced
+  session: above what it was above, the same decider for R17's first rule, and an entering session
+  for a person exactly as the fenced session was. The rule that only a person reverses a person is
+  unchanged (R43). A reversal that needs an unconfirmed hop is refused with `supersede_unconfirmed`
+  and never asserted (R40). The reversal's `path` records each hop: fenced session, successor,
+  actor, time (R41).
+- **The tick.** For each chain session, the tick also lists `koto/aimed/<aim-id>/` in that
+  session's confirmed later members, so a successor's reversal blocks the worker below (R39). A
+  reversal of a fenced session's decision blocks no member of its run, since the fenced session
+  has no live workflow left to stop (R42).
+- **The chain read.** `koto decisions chain <session>` prints this walk without recording
+  anything (R45). It's the same code path standing uses, so a consumer reads where a session
+  stands instead of keeping its own walk.
+
+#### Alternatives Considered
+
+- **No standing for a successor; the person above reverses.** Rejected: after a coordinator and the
+  one above it are both replaced, only the person at the top can overrule a long-lived worker, the
+  run's routine reversals of its own earlier calls are refused, and a ruling recorded at the root
+  can never be reversed after the first handover.
+- **Re-link live workers to the successor at takeover.** Rejected: the worker re-links only after
+  reading the fence, so the fence still grants the standing; a stopped worker never re-links;
+  earlier decisions keep their old snapshot; and the predecessor's own decisions aren't covered.
+- **Read the fence from the predecessor's log.** Rejected: a log scan per chain session on every
+  tick breaks R36's budget and R38's one-read rule.
+- **Standing `asserted` through a hop.** Rejected: an asserted reversal never stops a live worker or
+  clears a verified one, so after a replacement only the person at the top could stop a worker.
+
 ## Decision Outcome
 
-The five choices form one path. A decision starts at a recording command: a `koto decisions`
+The six choices form one path. A decision starts at a recording command: a `koto decisions`
 subcommand, one of the three gate-passing commands, or a shirabe step calling one of them. koto
 resolves the decider from `--by`, or from the harness session and anchor it observes, with the agent
 and run mode from the koto-skills hook or from flags, and refuses when nothing establishes one. It
@@ -475,6 +572,11 @@ id, after checking standing against the original's chain snapshot; if a competin
 reach won R19's race, it records its own refusal and exits non-zero. A live decider's `koto next`
 lists `koto/aimed/<its-id>/` in each chain session, blocks on a reversed decision, and clears when it
 rewinds or a replacement from someone with standing arrives in the same listing.
+
+When a coordinator is replaced, the fence leaves a marker beside the predecessor. Every walk
+(standing, the tick, listings below, `show` and `chain`) follows it forward to the successor with
+the session id checked, so the successor reverses with the predecessor's standing and a reversal
+it records reaches the worker below.
 
 The decider ledger stops being written and its report reads sessions. The run journal and the event
 sink are untouched, so telemetry receives what it receives today, and the host-file requirement is
@@ -548,7 +650,12 @@ sessions. The koto-skills plugin gains one hook. shirabe calls the commands at i
 - **`src/decisions/store.rs`** (new): the allocator and create-only writer over both backends;
   integrity checks for readers (R23); listing of a session's two areas.
 - **`src/decisions/chain.rs`** (new): the chain walk over `koto/links/dispatched-by/` and
-  `koto/links/held-by/`, in R12's order, labelling each hop, marking `incomplete`, cycle-guarded.
+  `koto/links/held-by/`, in R12's order, labelling each hop, marking `incomplete`, cycle-guarded,
+  and following each chain session forward through its supersede marker with the session id
+  checked (Decision 6). It backs `koto decisions chain`.
+- **`src/cli/init_supersede.rs`, `src/session/links.rs`**: the fencing command writes the
+  create-only `koto/superseded-by` marker and takes the manifest lock around its fence append;
+  `check_writer_key` refuses every other writer and remove of the marker (R37, R38).
 - **`src/decisions/standing.rs`** (new): R17's standing over a chain snapshot, R18's refusals, R19's
   race, R22's clearing rules, and each decision's status.
 - **`src/decisions/decider.rs`** (new): resolves the decider, agent, run mode and authority (Decision
@@ -611,7 +718,20 @@ A decision body (field names indicative):
 ```
 
 A `reverse` adds `target` (`{name, id, decision}`), `standing` (`verified` or `asserted`), the
-`path` that gave it standing, and optional `compensating` and `replacement`. A `person` decider
+`path` that gave it standing, and optional `compensating` and `replacement`. A path step reached
+through a supersede hop records the fenced session, its successor, and the fence's actor and time:
+
+```json
+"path": [{"session": "work-on-123", "via": "leg", "to": "coord-a"},
+         {"hop": {"fenced": "coord-a", "successor": {"name": "coord-b", "id": "a41f..."},
+                  "actor": {"...": "as the fence records it"}, "time": "2026-11-20T12:00:03.114Z"}}]
+```
+
+The supersede marker, `koto/superseded-by` in the fenced session, holds
+`{"v": 1, "successor": {"name", "id"}, "actor", "time", "decisions_through"}`, the last the
+12-digit id or `null` when the session held none. `koto decisions chain <session>` prints
+`{"v": 1, "session", "marker", "links": [{"session", "via", "hops": [{"successor", "confirmed",
+"actor", "time"}]}], "incomplete"}`. A `person` decider
 carries `handle` (`handed`), `surface`, an optional `link` and the entering session. A `check` decider
 carries `name` and the session that ran it. An imported decision carries `source`, `source_id` and
 `imported_at`.
@@ -635,9 +755,14 @@ winner), plus the existing `session_migrated`.
    reversal in the reverser's session if it is on the chain and otherwise in `KOTO_ANCHOR`'s anchor,
    then lists competing reversals on the original's chain; if one wins, it records `refused` in its
    own session and exits non-zero.
-4. **Tick.** A live session holding decisions lists `koto/aimed/<aim-id>/` in each chain session
-   before gate evaluation and blocks or proceeds; its workflow state is untouched by a block.
-5. **Report.** `report` and `decider report` scan the store, or the hierarchy below a session, read
+4. **Tick.** A live session holding decisions lists `koto/aimed/<aim-id>/` in each chain session,
+   in each confirmed later member of a chain session's run, and, once one of its decisions reads
+   reversed, in its own session for a person's replacement (R22), before gate evaluation, and
+   blocks or proceeds; its workflow state is untouched by a block.
+5. **Show and chain.** `show` reads one decision from any session on the host, computes its status
+   from the reversals on its chain and the chain's runs, and writes nothing; `chain` prints the
+   walk itself.
+6. **Report.** `report` and `decider report` scan the store, or the hierarchy below a session, read
    decision keys and session events, and print.
 
 ## Implementation Approach
@@ -656,9 +781,11 @@ Deliverables: `src/decisions/store.rs`, changes to `local.rs`, `cloud.rs`, `sync
 ### Phase 2: Recording and listing
 
 The body, decider resolution, chain snapshot, `koto decisions record`, `list`, `show`, with filters
-and `--received`.
+and `--received`. `show` reads from any session on the host and returns every recorded field (R44);
+the harness identifier follows the run journal's id-shape rule for a driver (R47).
 
-Deliverables: `body.rs`, `decider.rs`, `chain.rs`, `read.rs`, the CLI; tests for R1 to R3, R7 to R16.
+Deliverables: `body.rs`, `decider.rs`, `chain.rs`, `read.rs`, the CLI; tests for R1 to R3, R7 to R16,
+R44, R46 and R47.
 
 ### Phase 3: The agent hook
 
@@ -680,6 +807,16 @@ fail-closed reads, and the cloud listing path.
 
 Deliverables: `handle_next` and `advance.rs` changes, `template/types.rs`; tests for R22 and R23, and
 R36's tick benchmark.
+
+### Phase 5a: Succession
+
+The supersede marker and the fenced session's refusal, the forward step in the chain walk, standing
+through confirmed hops, the hop in the standing path, the tick's read of later members, and
+`koto decisions chain` (Decision 6). It needs Phases 4 and 5 for standing and the tick read, and
+Phases 6 and 7, since the fenced session's refusal covers the gate-passing commands and `import`.
+
+Deliverables: changes to `init_supersede.rs`, `links.rs`, `chain.rs`, `standing.rs`, the tick read
+and the CLI; tests for R37 to R43, R45 and R48.
 
 ### Phase 6: Existing records and the ledger
 
@@ -751,6 +888,18 @@ which reversals a session treats as aimed at itself.
 
 **No self-clearing.** A blocked worker can't clear its own block: a replacement clears only when its
 decider has standing over the reverser, and naming the reversal in `basis` isn't enough on its own.
+The one exception is a person who reversed their own decision through the deciding session: a
+person entering through that session may record the replacement (R22), and the session alone still
+can't. The tick finds that replacement in the session's own aimed area and counts it only when its
+decider is a person.
+
+**Standing through a fence.** Whoever fences a session takes its `verified` standing over everything
+below it, a live worker's pauses included. That's no wider than what the fence already gives them,
+since they can cancel the fenced session itself, and the standing path names the fence's actor and
+time so a reader can list every reversal one fence enabled (R41). The marker is create-only and
+guarded like a decision key; the walk checks the successor's own session id against it, so a
+renamed or planted successor confirms nothing. A hostile marker can only make its session
+unreadable, which blocks rather than grants.
 Reversing a person's decision takes a person decider; because a handle is unauthenticated, the record
 keeps the entering session and the observed harness id, so a reader sees which agent session claimed
 to be a person.
@@ -809,6 +958,8 @@ widen who may reverse.
 - The host-file requirement can't be verified on a host until the run journal is removed.
 - An `asserted` reversal, recorded beyond a broken chain, shows in listings but doesn't stop a live
   worker.
+- A fence written by a koto release older than the marker confers no standing, so reversals below
+  it still go to the session or person above.
 - Accepted limits, each with the trigger for revisiting it: one writable chain session can block a
   worker that can't clear the block itself (revisit if sessions are ever shared across users through
   a bucket); a `--by person:<handle>` claim is unauthenticated, so an agent can claim to be a person
@@ -834,9 +985,9 @@ between hosts):
   delimiter touch the cloud tick that work just made faster (koto#549). The reversal read costs
   nothing for a session with no decisions and about two round trips otherwise.
 - *Successor coordinators.* A coordinator's successor continues its run through a `continues` link
-  that, by that work's rule, grants no authority. This design gives a successor no standing over
-  what its predecessor dispatched; whether it should have any is open question 3, and nothing here
-  assumes an answer.
+  that, by that work's rule, grants no authority. The successor's standing comes from the
+  supersede fence instead (Decision 6), which answers open question 3: a successor stands where its
+  predecessor stood, read from a marker the fence writes, and never from the link.
 - *The coordinator's record.* Its `record/decisions` and `record/reversals` keys stay; each row gains a
   decision citation (Decision 5).
 - *Import.* Accumulating source ids in `koto/imported-from` changes a key the import code writes.
@@ -874,7 +1025,7 @@ report.
 
 Recorded for the state-unification lane, which was paused when this design was written. Questions
 1, 2, 4, 5 and 6 carry the answer this design assumes, each pending that lane's confirmation.
-Question 3 is open: the design assumes no answer to it.
+Question 3 has since been answered by the PRD's R37 to R43 and Decision 6.
 
 1. **Reserved areas outside the manifest.** Do `koto/decisions/`, `koto/aimed/` and `koto/packs/`, held
    as create-only bucket objects outside the pushed manifest the way the pin is, collide with anything
@@ -884,11 +1035,13 @@ Question 3 is open: the design assumes no answer to it.
    *Assumed, pending state-unification confirmation:* stay and cite now; a rendering is later work.
 3. **Successor standing.** Should a session that continues another, through a `continues` link, stand
    above what its predecessor dispatched when reversing a decision? That lane's rule says the link
-   grants no authority. *Open.* How authority and decisions carry from a coordinator to its
-   successor is being worked out separately. Until it is settled, a successor has no standing over
-   its predecessor's dispatches, and the person above reverses instead. *Recommendation for that
-   work:* let a successor reverse below its predecessor, because it continues the same run. *Answer:*
-   pending.
+   grants no authority. *Answer:* yes, read from the supersede fence rather than the link, with six
+   conditions: a fenced session records nothing (R37); the fence is readable at listing cost
+   through a write-once marker (R38); the walk follows the marker forward with the session id
+   checked, every member standing in the fenced session's position and upward reads continuing from
+   its frozen links (R39); a hop koto can't confirm refuses the reversal (R40); the hop is recorded
+   in the reversal's standing path and a confirmed one gives `verified` (R41); and only a person
+   reverses a person, unchanged (R43). Decision 6 has the mechanism.
 4. **Tick budget.** Is about two parallel listing round trips per tick, only for a live session that
    holds decisions, acceptable within the cloud action limit? *Assumed, pending state-unification confirmation:* yes.
 5. **Import history.** May import accumulate every earlier source session id in
