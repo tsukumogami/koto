@@ -11,7 +11,7 @@ split_rationale: |
 tracking_level: none
 upstream: docs/designs/DESIGN-decision-record.md
 milestone: "The decision record"
-issue_count: 13
+issue_count: 14
 ---
 
 # PLAN: The decision record
@@ -25,7 +25,9 @@ Active
 Every delegated decision kept as write-once keys in the session that made it, read and
 reversed from above through session retention, with a live decider stopped by a reversal, the
 decider ledger retired, telemetry left exactly as it is, and shirabe's decision points recording
-through the same commands. Eleven issues land in koto and two in shirabe.
+through the same commands. A coordinator's successor reverses with its predecessor's standing,
+read from the supersede fence, and any session reads one decision or a chain as koto walks it.
+Twelve issues land in koto and two in shirabe.
 
 ## Decomposition Strategy
 
@@ -57,6 +59,12 @@ escalation and judgment (Issues 1, 3, 11), gate passes (Issue 5), three levels w
 middle (Issue 4), racing reversals (Issue 3), and import of the session above (Issue 7). Issue 13
 walks all of them.
 
+Issue 14 was added with the PRD's R37 to R48, for a second consumer: shirabe's coordinator, whose
+standing rules cite the decisions they came from. It carries the supersede hop (Decision 6) and the
+chain read. The single-decision read, the session-addressed commands and the harness id's shape
+(R44, R46, R47) land in Issue 1, and a person lifting a block they caused (R22's added clause)
+lands in Issue 4. shirabe's citation work needs a koto release carrying Issues 1, 3, 4 and 14.
+
 ## Issue Outlines
 
 ### Issue 1: feat(decisions): record decisions as write-once keys and read them from above
@@ -78,6 +86,9 @@ walks all of them.
 - [ ] With network access blocked and the local backend, record, list and show succeed (R35).
 - [ ] A decision recorded with a harness tool-call identifier lists it, and the stored body holds no harness field beyond R30's three pointers; a `verdict` recorded with decider kind `check` naming the grader and a pointer to its session event lists that decider, the session that ran it and the pointer (R30).
 - [ ] Under the cloud backend, a pull of the session onto a host with no local copy, and a `--workspace` read, both list the session's decisions, though decision files sit outside the manifest.
+- [ ] From a session the director dispatched, and from an unrelated session on the same host, `koto decisions show <director> <id>` of a person `judgment` returns the decider's handle, surface and entering session, the chain snapshot with each link's kind, the time, subject and reason, and the status; a decision in a session koto can't read shows `unreadable`; neither session's keys or log change (R44, R16).
+- [ ] `record`, `list` and `show` act on the session named in their arguments; run with `KOTO_ANCHOR` and `KOTO_SESSION_*` naming another session, `record` writes only into the named one (R46).
+- [ ] With `CLAUDE_CODE_SESSION_ID` set to a value that isn't id-shaped by the run journal's driver rule, a decision records an empty harness identifier and, with `KOTO_ANCHOR` unset and no `--by`, establishes no decider; with an id-shaped value it records that value `observed`, equal to the driver id the rule derives for the process (R47).
 
 **Dependencies**: None
 
@@ -136,6 +147,7 @@ walks all of them.
 - [ ] A session not on C's chain made unreadable doesn't block C; a session holding no decisions makes no chain reads (verified by a read counter in tests).
 - [ ] Under the cloud backend, a chain session whose listing fails with a permission error blocks C naming it, and a chain session migrated by import is read at the session it moved to (R23).
 - [ ] The reserved condition names are refused when a template declares them.
+- [ ] A person enters a `judgment` through C and then reverses it through C; C blocks. A new `judgment` naming the reversal, entered by a person through C, clears the block; the same replacement recorded by C with no person decider leaves C blocked (R22).
 - [ ] The aim ids include the session's own id and the id in `koto/imported-from` in today's single-source form, so a session imported before Issue 7 lands is blocked by a reversal aimed at its earlier id.
 - [ ] A benchmark on the CI runner, median of five warm runs, measures the tick's added cost at chain depth five with 1,000 decisions per chain session and fails above 50 ms (R36).
 
@@ -231,14 +243,15 @@ walks all of them.
 **Goal**: A koto user can record, list, reverse, report and import decisions from the docs alone, knows the trust model, and no longer finds the decider ledger described as current; this carries the design's user-visible surface (R31).
 
 **Acceptance Criteria**:
-- [ ] `docs/guides/cli-usage.md` documents every `koto decisions` subcommand and flag in the design's command table, with one worked example each.
+- [ ] `docs/guides/cli-usage.md` documents every `koto decisions` subcommand and flag in the design's command table, `chain` and `--fenced` included, with one worked example each.
+- [ ] The docs say how a successor coordinator gets its predecessor's standing from the supersede fence, what an unconfirmed hop does, and that reading a decision needs no standing.
 - [ ] A reference page documents the decision body fields, the three reserved areas, the statuses, the standing labels, and the error codes `decider_missing`, `decision_exists`, `invalid_decision` and `reversal_refused`.
 - [ ] The docs state that decider identities are attribution, not authentication, what `observed`, `handed`, `verified` and `asserted` mean, that decision bodies travel with the session unscrubbed, and that `koto context list` doesn't show decision keys.
 - [ ] `docs/workspace-layout.md`, `docs/guides/decider-authoring.md` and the koto-skills references describe `koto decider report` reading sessions and the ledger file as no longer used.
 - [ ] The koto-skills `koto-user` references document the agent hook, the reversal block condition and how to clear it.
 - [ ] Every command shown in the docs runs as written against a scratch session.
 
-**Dependencies**: Blocked by <<ISSUE:1>>, <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:5>>, <<ISSUE:6>>, <<ISSUE:8>>
+**Dependencies**: Blocked by <<ISSUE:1>>, <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:5>>, <<ISSUE:6>>, <<ISSUE:8>>, <<ISSUE:14>>
 
 **Type**: docs
 **Files**: `docs/guides/cli-usage.md`, `docs/reference/`, `docs/workspace-layout.md`, `docs/guides/decider-authoring.md`, `plugins/koto-skills/skills/koto-user/references/`
@@ -278,20 +291,42 @@ walks all of them.
 
 ### Issue 13: test(decisions): walk the decision record's evidence end to end
 
-**Goal**: Every acceptance criterion in `docs/prds/PRD-decision-record.md` runs as a functional scenario against the first koto release carrying Issues 1 to 9 and the first shirabe release carrying Issues 11 and 12, once session retention reads Done; the result is the milestone's verdict.
+**Goal**: Every acceptance criterion in `docs/prds/PRD-decision-record.md` runs as a functional scenario against the first koto release carrying Issues 1 to 9 and 14 and the first shirabe release carrying Issues 11 and 12, once session retention reads Done; the result is the milestone's verdict.
 
 **Acceptance Criteria**:
-- [ ] A functional suite runs one scenario per PRD acceptance-criteria group ("Reading an unattended unit after it finished", "A person deciding", "Reversing from above", "Escalation and judgment", "Gate passes", "Three levels, a finished middle, a live grandchild", "Racing reversals", "Standing", "Write-once and concurrency", "Cloud and import", "Listing", "Existing records and shirabe", "Reporting", "Field-level checks", "Independence and the rest"), each carrying every assertion its PRD group states, and each passing; the agent scenarios include a decision recorded through the koto-skills hook listing agent `sub-1` labelled `observed`.
+- [ ] A functional suite runs one scenario per PRD acceptance-criteria group ("Reading an unattended unit after it finished", "A person deciding", "Reversing from above", "Escalation and judgment", "Gate passes", "Three levels, a finished middle, a live grandchild", "Racing reversals", "Standing", "Write-once and concurrency", "Cloud and import", "Listing", "Existing records and shirabe", "Reporting", "Field-level checks", "Succession", "Reading one decision and the chain", "Standing rulings and a person's own block", "The harness id and the tick's driver", "Independence and the rest"), each carrying every assertion its PRD group states, and each passing; the agent scenarios include a decision recorded through the koto-skills hook listing agent `sub-1` labelled `observed`.
 - [ ] Issue 9's event-sink parity test ran rather than skipped, against a koto whose emit path exists.
 - [ ] The cloud and import scenario runs with the owner's per-command cloud configuration from the environment only; every other scenario runs with none.
 - [ ] Every scenario runs with no workspace manager installed, and a session dispatched by one with koto absent from its path dispatches normally.
 - [ ] The host-file check of the first criterion runs in an isolated koto home with `run_journal.enabled = false` and is reported as interim; its final verdict is recorded only on a koto release without the run journal (koto#545), and no host is told to switch its journal off.
 - [ ] The run reports which criteria passed, which are interim, and which wait on an external release.
 
-**Dependencies**: Blocked by <<ISSUE:1>>, <<ISSUE:2>>, <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:5>>, <<ISSUE:6>>, <<ISSUE:7>>, <<ISSUE:8>>, <<ISSUE:9>>, <<ISSUE:11>>, <<ISSUE:12>>
+**Dependencies**: Blocked by <<ISSUE:1>>, <<ISSUE:2>>, <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:5>>, <<ISSUE:6>>, <<ISSUE:7>>, <<ISSUE:8>>, <<ISSUE:9>>, <<ISSUE:11>>, <<ISSUE:12>>, <<ISSUE:14>>
 
 **Type**: task
 **Files**: `tests/`
+
+### Issue 14: feat(decisions): give a successor its predecessor's standing through the supersede fence
+
+**Goal**: A coordinator that took over a run through `koto init --continues --supersede` reverses with exactly the standing its predecessor had, read from a write-once marker the fence leaves, its reversals reach the workers below, and `koto decisions chain` prints the walk; this serves the PRD's "Succession" criteria and the chain-read half of "Reading one decision and the chain" (R37 to R43, R45, R48).
+
+**Acceptance Criteria**:
+- [ ] After `koto init S --continues P --supersede`, `koto decisions record`, `reverse` and `import` addressed to P exit non-zero with `session_superseded` naming S and P gains no key; listing P still returns its decisions; a fence and a `record` started from a shared barrier in 20 trials never leave a decision written after the fence (R37).
+- [ ] P holds `koto/superseded-by` naming S's name and id, the fence's actor and time; reading it costs one read and no log read (read counter); `koto context add` and `remove` on it are refused naming it; under the cloud backend it is its own object under P's prefix; a fencing command stopped between the fence and the marker by a fault point writes the marker when re-run (R38).
+- [ ] With P dispatching W through a leg and W's `judgment` live, S's reversal of it is accepted with standing `verified`, recorded in S, its path naming the P-to-S hop with actor and time; W's next `koto next` blocks naming it; W's, P's and the session above P's keys and logs are byte-identical to before (R39, R41).
+- [ ] S reverses P's own session `judgment`; S alone reversing a person's `judgment` entered through P is refused, and with `--by person:<handle>` through S it is accepted `verified` with the hop in its path (R39, R43).
+- [ ] With S fenced in turn by S2, S2's reversal of W's judgment is accepted and its path names both hops in order; `list --below S2` returns W's decisions (R39, R41).
+- [ ] S's reversal of a decision by the session above P, or by a sibling of P, is refused and recorded; with S linked under X by `koto session link`, W's chain read lists no X and X's reversal of W's judgment is refused (R39).
+- [ ] With P's marker removed by a fixture (fence event kept), and with a marker naming the wrong session id, S's reversal exits with `reversal_refused` reason `supersede_unconfirmed`, records `refused` in S, and never records `asserted`; a malformed marker makes W's `koto next` block naming P unreadable (R40).
+- [ ] A person's reversal of their own ruling through S doesn't block S's `koto next`; `show` of the ruling from S reads `reversed` with the hop in the winning reversal's path (R42).
+- [ ] `list --fenced P` returns exactly the reversals whose path names the P-to-S hop (R41).
+- [ ] `koto decisions chain W` lists P labelled `leg`, W's anchor `held-by`, and P's hop to S with confirmation, successor, actor and time; `chain P` reports P's own marker; a mismatched id lists the hop unconfirmed; no session gains a key or event (R45).
+- [ ] The tick benchmark at chain depth five, with two chain sessions each fenced twice, measures under 50 ms as a median of five warm runs on the CI runner (R48).
+
+**Dependencies**: Blocked by <<ISSUE:3>>, <<ISSUE:4>>
+
+**Type**: code
+**Files**: `src/cli/init_supersede.rs`, `src/session/links.rs`, `src/decisions/chain.rs`, `src/decisions/standing.rs`, `src/decisions/read.rs`, `src/cli/mod.rs`
 
 
 ## Dependency Graph
@@ -311,6 +346,7 @@ graph TD
     I11["11: shirabe records decisions"]
     I12["12: shirabe interim import"]
     I13["13: evidence walk"]
+    I14["14: successor standing"]
 
     I1 --> I3
     I1 --> I5
@@ -342,13 +378,17 @@ graph TD
     I9 --> I13
     I11 --> I13
     I12 --> I13
+    I3 --> I14
+    I4 --> I14
+    I14 --> I10
+    I14 --> I13
 
     classDef done fill:#c8e6c9
     classDef ready fill:#bbdefb
     classDef blocked fill:#fff9c4
 
     class I1,I2 ready
-    class I3,I4,I5,I6,I7,I8,I9,I10,I11,I12,I13 blocked
+    class I3,I4,I5,I6,I7,I8,I9,I10,I11,I12,I13,I14 blocked
 ```
 
 **Legend**: Green = done, Blue = ready, Yellow = blocked
@@ -362,13 +402,16 @@ then Issue 13. Issues 3 and 8 feed Issue 12 through the release.
 
 **After Issue 1:** Issues 3 and 5 in parallel.
 
-**After Issue 3:** Issues 4 and 8 in parallel; after Issue 4, Issue 7, once session retention reads Done.
+**After Issue 3:** Issues 4 and 8 in parallel; after Issue 4, Issue 14, and Issue 7 once session retention reads Done.
 
 **After Issue 5:** Issues 6 and 9 in parallel.
 
 **After a koto release carrying Issues 1, 3 and 5:** Issue 11 in shirabe; then Issue 12, once a release also carries Issue 8.
 
-**Docs:** Issue 10 once Issues 1, 3, 4, 5, 6 and 8 have landed.
+**Docs:** Issue 10 once Issues 1, 3, 4, 5, 6, 8 and 14 have landed.
+
+**For shirabe's standing-rule citations:** a koto release carrying Issues 1, 3, 4 and 14. The
+driver id its tick gates compare against comes from #600, separate from this plan.
 
 **Last:** Issue 13, once session retention reads Done. Its host-file check is interim until a koto
 release without the run journal (koto#545, not before 2026-11-16); every other criterion it walks

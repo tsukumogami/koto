@@ -95,6 +95,17 @@ dispatch hierarchy is alive, writes koto-owned dispatch links in each dispatched
 leaves a read session untouched when another session reads it. The record can now be built on
 that footing.
 
+A second consumer depends on the record too. A coordinator is replaced every few hours through
+`koto init <successor> --continues <predecessor> --supersede`, and the workers it dispatched outlive
+it. shirabe's coordinator makes every standing rule it follows cite the decision it came from, so a
+reader can tell a person's ruling from a coordinator's own prose, and so the person can reverse the
+ruling later. That needs three things the first draft of this record left open. A successor has to
+stand where its predecessor stood. Otherwise a ruling recorded at the root of a run can't be
+reversed by anyone once the run's first coordinator is replaced: the fenced session refuses writes,
+and the successor isn't on the ruling's chain. A session has to read one decision held in another
+session, including one above it, with every field the consumer computes from. And the harness id a
+decision records has to match the driver id koto hands a gate, so a gate can check who is ticking.
+
 ## Goals
 
 - The session or person above a delegated session reads every decision it made or received, from
@@ -108,6 +119,10 @@ that footing.
 - koto's existing partial records write to this one vocabulary, and the decider ledger stops being
   a host file.
 - The record works with koto alone; niwa may set it up and is never required.
+- A session that takes over another through koto's supersede fence reverses with exactly the
+  standing its predecessor had, read from the fence and never from the successor's own links.
+- Any session on the host reads one decision by session and identifier, with every recorded field,
+  its status and the reversal that won, and reads a session's chain as koto walks it.
 
 ## User Stories
 
@@ -140,6 +155,17 @@ that footing.
 11. As the maintainer of shirabe's coordinator and review panel, I want their decisions written to
     the shared record while `record/decisions`, `record/reversals` and the panel's verdict ledger
     keep returning what their readers get today.
+12. As a coordinator that took over a predecessor's run through koto's supersede fence, I want to
+    reverse a decision made below my predecessor, or by it, with the standing it had and no more,
+    so the workers it dispatched still answer to the run after the handover.
+13. As the person at the root of a run whose coordinator has been replaced, I want to reverse,
+    through the run's newest member, a ruling I gave an earlier member, so a standing rule never
+    becomes irreversible at the first handover.
+14. As a manager citing a ruling its director recorded, I want to read that decision by session
+    and identifier from my own session, with its decider, its entering session, its chain, its
+    status and the reversal that won, though the director is above me.
+15. As the maintainer of a coordinator's provenance reader, I want koto to give me a session's chain
+    as it walks it, supersede hops included, so my reader keeps no chain walk of its own.
 
 ## Requirements
 
@@ -150,8 +176,11 @@ that footing.
 | deciding session | the koto session a decision's keys live in |
 | agent session | one harness conversation; koto knows it by its anchor session, named in `KOTO_ANCHOR` |
 | chain | the ordered sessions above a deciding session: first those reached by following koto-owned dispatched-by links upward from the deciding session, then its anchor (reached by its held-by link) and those reached upward from the anchor, skipping any session already listed |
-| above | a session is above a decision when it, or its anchor, is on the decision's chain |
-| established decider | a decider named with `--by`, or, with none named, a harness session identifier in `CLAUDE_CODE_SESSION_ID` or a readable anchor named in `KOTO_ANCHOR`; the koto session name alone never establishes one |
+| above | a session is above a decision when it, or its anchor, is on the decision's chain, or when it is a later member of the run of a session on that chain, reached through supersede markers koto confirms (R39) |
+| established decider | a decider named with `--by`, or, with none named, an id-shaped harness session identifier in `CLAUDE_CODE_SESSION_ID` (R47) or a readable anchor named in `KOTO_ANCHOR`; the koto session name alone never establishes one |
+| run | a session and the successors that `koto init <successor> --continues <session> --supersede` fenced it for, one after another; each is a member of the run |
+| supersede marker | the write-once marker koto writes beside a fenced session, naming its successor's session name and id, the fence's actor and the fence's time (R38) |
+| hop | one step of a walk from a fenced session to its successor through the supersede marker; a hop is confirmed when the successor's own session id equals the one the marker names |
 | status | each decision reads as exactly one of `in-effect`, `reversed`, `refused` or `unreadable`. A `reverse` reads `in-effect` when it wins R19's rule and `refused` when it loses; a `refused` decision always reads `refused`; any other decision reads `reversed` when a winning reversal names it, otherwise `in-effect` |
 | decision keys | the keys holding decisions, under one koto-reserved key prefix the design names |
 
@@ -169,7 +198,7 @@ that footing.
   | `gate-pass` | letting a workflow past a gate it had not passed on its own: by override, by a directed transition past an unmet gate, or by an agent's `koto decider answer` of `pass` | `passed` |
   | `escalate` | taking a question to someone above | `escalated` |
   | `decline-escalation` | deciding a question won't be taken above | `kept` |
-  | `judgment` | settling a judgment call, including disputing or dismissing a finding | `settled` |
+  | `judgment` | settling a judgment call, including disputing or dismissing a finding, and a ruling that binds a session until it is reversed | `settled` |
   | `verdict` | judging evidence, such as a review verdict or a production verdict | `pass`, `fail`, `inconclusive` |
   | `reverse` | overruling an earlier decision | `reversed` |
   | `refused` | a decision attempt koto refused | `refused` |
@@ -221,7 +250,7 @@ that footing.
 
 - **R7.** Every decision names a decider of exactly one kind:
   - `session`: the koto session name; the harness session identifier when `CLAUDE_CODE_SESSION_ID`
-    is set, else empty; the anchor session when `KOTO_ANCHOR` names a readable one, else empty;
+    is set and id-shaped (R47), else empty; the anchor session when `KOTO_ANCHOR` names a readable one, else empty;
     and the agent within it that decided, one of `main`, the identifier of an agent the main agent
     started, or `unknown`. koto takes the agent from `KOTO_AGENT_ID` (`observed`, set by koto's own
     harness hook from what the harness reports) or from `--agent` (`handed`), records `unknown`
@@ -335,9 +364,16 @@ that footing.
     the deciding session's chain by a decider with standing over the reversal by R17's rules (the
     reverser, or a session or person above the reverser). For a `gate-pass` it must be for the same
     workflow, state and gate, and a pass whose standing is `asserted` doesn't clear a `verified`
-    reversal. The deciding session can't clear its own block this way; its route is the rewind.
+    reversal. The deciding session can't clear its own block this way; its route is the rewind;
+    or
+  - the reversal was entered by a person through the deciding session itself (R17's same-decider
+    rule for a person), and a person entering through the deciding session records a new decision
+    of the same kind naming the reversal in its `basis`. A person changing their mind through a
+    session overrules no session above it, so the block clears. The deciding session alone still
+    can't clear it.
 
-  A reversal that lost R19's race blocks nothing.
+  A reversal that lost R19's race blocks nothing. A reversal of a fenced session's decision blocks
+  no member of its run (R42).
 - **R23.** Reading reversals at `koto next` writes nothing in any session on the chain. Reads fail
   closed. A chain session is unreadable when its directory exists but a decision or reversal key in
   it fails to parse, its keys can't be read for a reason other than absence, or, under the cloud
@@ -422,6 +458,97 @@ that footing.
   its configuration; nothing here makes it run koto, read or write workflow state, or fail without
   koto.
 
+The requirements from R37 on were added for the second consumer. They're numbered after the
+non-functional ones so every earlier number keeps its meaning.
+
+**Succession through the supersede fence**
+
+- **R37.** A fenced session records no decision. Every decision command addressed to a session
+  whose log holds a `session_superseded` fence (recording, reversing, importing, and the
+  gate-passing commands of R24) refuses with `session_superseded`, naming the successor, and
+  writes nothing. A fence and a decision racing on one session never land in the wrong order:
+  either the decision is written before the fence, or the command refuses. The fenced session
+  keeps serving its decisions to readers, as a migrated session does (R6).
+- **R38.** When koto fences a session, it writes a supersede marker beside it, the way it marks a
+  migrated session. The marker is write-once. It names the successor's session name and id, the
+  fence's actor and the fence's time, and a reader gets it in one read with no log scan, under
+  both backends. Only the fencing command writes it, and koto refuses every other write and every
+  removal of it, as R5 does for decision keys. A fencing command that stops between the fence and
+  the marker writes the missing marker when it's run again; until the marker exists, the fence
+  confirms no hop (R40).
+- **R39.** Standing and reads follow a run forward. When koto judges standing (R17), picks where a
+  reversal is recorded (R4), reads reversals at `koto next` (R22), or lists below a session (R15),
+  it follows each session on a chain forward through its supersede marker to the run's later
+  members, the way it follows a migration marker, and confirms each hop. A later member reached
+  through confirmed hops stands in the fenced session's position:
+  - it is above whatever the fenced session was above;
+  - it counts as the fenced session for R17's same-decider rule, so it may reverse the fenced
+    session's own session decisions;
+  - a person entering through it counts as entering through the fenced session;
+  - a reversal recorded in it counts as recorded in a session on the original's chain, so a live
+    decider below the fenced session finds it at `koto next`.
+
+  The position is the fenced session's and no more. koto continues upward from the fenced
+  session's links as each decision's chain froze them, never from the successor's own links, so a
+  successor gains no standing above or beside that position. A decision's chain snapshot (R12) is
+  never rewritten; hops are applied when it is read. A walk follows at most 64 hops through one
+  run, and treats the next one as unconfirmed.
+- **R40.** A hop koto can't confirm gives no standing. When a reversal would have standing only
+  through such a hop (a fenced session with no marker, a marker naming a session id other than the
+  successor's own, or a marker that can't be read), koto refuses it with `reversal_refused` reason
+  `supersede_unconfirmed` and records a `refused` decision in the would-be reverser's session. An
+  unconfirmed hop never yields `asserted` standing, even where R17 would otherwise assert. For
+  `koto next` and listings, a marker that exists but fails to parse makes its session unreadable
+  (R23); a fenced session with no marker just ends the forward walk there.
+- **R41.** A reversal that got its standing through one or more hops records each hop in its
+  standing path: the fenced session, its successor, the fence's actor and the fence's time. A path
+  whose hops koto confirmed and whose links are complete gives standing `verified`, so the
+  reversal blocks and clears like any other verified one (R22). A listing filters reversals by a
+  fenced session their path names, so a reader can list every reversal one fence enabled.
+- **R42.** A reversal of a fenced session's decision blocks no member of its run. R22's block is
+  on the deciding session's own workflow, and a fenced session has none left to advance. A later
+  member reads the decision's status instead (R44).
+- **R43.** Succession doesn't change who may reverse a person's decision. A later member, as a
+  session, can't reverse a person's decision entered through any member of its run. A person
+  entering through the later member can, and the reversal records the hop (R41).
+
+**Reading one decision and the chain**
+
+- **R44.** koto shows one decision, addressed by session name and identifier, to any session on the
+  host, whether or not the reader is above it. Reading needs no standing; standing governs
+  reversing only. The answer carries:
+  - every field the decision recorded: kind, outcome, subject, time, state, the decider with each
+    of R7's fields and its source labels (a person decider's entering session included), the
+    authority, the chain snapshot with each link's kind and its `incomplete` mark, basis, evidence
+    and reason;
+  - its status (Terms);
+  - when it reads `reversed`, the winning reversal's session, identifier, time, decider, reason,
+    standing and standing path, hops included;
+  - the dependents R21 computes.
+
+  R16 holds for it: the read changes nothing in any session. A decision held in a session koto
+  can't read shows as `unreadable`, never `in-effect`.
+- **R45.** koto reads a session's chain as it would walk it now, without recording anything: each
+  session in R12's order with the link kind that reached it, each supersede hop followed forward
+  from a session on it with whether koto confirmed it and the marker's successor, actor and time,
+  and the `incomplete` mark. The same read reports the session's own supersede marker when it has
+  one. It writes nothing, fails closed as R23 does, and uses the same walk standing uses, so a
+  consumer computing where a session stands needs no walk of its own.
+- **R46.** Every decision command names the session it acts on as an argument: recording, listing,
+  showing and reversing. A decision is recorded in the named session, which is its deciding
+  session (R4), and a session decider names that session (R7). koto never takes the session to
+  record in from the environment.
+
+**The harness id and the tick's driver**
+
+- **R47.** koto records a session decider's harness identifier as `observed` only when
+  `CLAUDE_CODE_SESSION_ID` is id-shaped by the rule koto's run journal applies to a tick's driver,
+  and records it empty otherwise; only an id-shaped value establishes a decider (Terms). When
+  koto hands its gates the tick's driver id (#600), that value and the harness identifier a
+  decision records in the same process are the same string, so a gate comparing a tick's driver
+  with a decision's decider compares like with like. The record builds no driver variable and
+  reads none.
+
 ### Non-functional
 
 - **R32.** Decisions are immutable once written. Two sessions each recording 100 decisions at once
@@ -441,6 +568,10 @@ that footing.
   session's own chain; over a store of 1,000 sessions in one hierarchy four levels deep, holding
   100 decisions each (100,000 in all), a listing below the root and the R29 report each finish in
   under five seconds.
+- **R48.** Following a run forward (R39) reads one supersede marker for each chain session that has
+  one, and the reversals in each later member it reaches; it touches no session off the chain and
+  its runs. R36's 50 ms limit still holds at a chain depth of five when two of the five chain
+  sessions have each been fenced twice.
 
 ## Acceptance Criteria
 
@@ -637,6 +768,85 @@ that footing.
   reversals from the session it moved to.
 - [ ] With a session that is not on C's chain made unreadable, C's `koto next` still advances.
 
+**Succession**
+
+The fixture for this group: P is a coordinator dispatched by D through a request leg. P dispatches
+W through a request leg, and W records a `judgment` and keeps running. P records a `judgment` of
+its own, and a person enters a `judgment` through P with `--by person:<handle> --surface
+terminal`. Then `koto init S --continues P --supersede` fences P.
+
+- [ ] After the fence, `koto decisions record`, `koto decisions reverse` and `koto decisions import`
+  addressed to P each exit non-zero with `session_superseded` naming S, and P gains no key;
+  listing P still returns its three earlier decisions. A fence and a `record` on one session,
+  started from a shared barrier in 20 trials, each end with either the decision written before the
+  fence or the record refused, never a decision after the fence.
+- [ ] P holds a supersede marker naming S's session name and id, the fence's actor and its time.
+  Reading it takes one read and no read of P's log (checked by a read counter in tests).
+  `koto context add` and `koto context remove` on it are refused naming it. Under the cloud
+  backend it appears under P's bucket prefix.
+- [ ] From S, reversing W's judgment is accepted with standing `verified` and recorded in S. Its
+  standing path names the hop from P to S with the fence's actor and time. W's next `koto next`
+  blocks naming S's reversal, and W's, P's and D's keys and logs are byte-identical to before.
+- [ ] From S, reversing P's own session `judgment` is accepted. From S alone, reversing the person's
+  `judgment` entered through P is refused and recorded `refused` in S. With `--by
+  person:<handle>` through S it's accepted with standing `verified` and the hop in its path.
+- [ ] With S itself fenced by S2, reversing W's judgment from S2 is accepted, and the standing path
+  names both hops in order. Listing below S2 returns W's decisions.
+- [ ] From S, reversing a decision D made, and one made by W2 (a session D dispatched beside P), are
+  each refused and recorded `refused` in S. With S also linked under another session X by `koto
+  session link`, W's chain read lists no X, and X's attempt to reverse W's judgment is refused
+  and recorded `refused` in X: the walk continues upward from P's frozen links, never S's own.
+- [ ] With P's marker removed by a test fixture (the fence event left in P's log), and in a second
+  run with the marker naming a session id other than S's, S's reversal of W's judgment exits
+  non-zero with `reversal_refused` reason `supersede_unconfirmed`, and a `refused` decision is
+  recorded in S. Neither run records standing `asserted`.
+- [ ] With P's marker holding malformed JSON, W's `koto next` blocks naming P as unreadable, and a
+  listing of W's decisions shows the judgment `unreadable`.
+- [ ] After the person reverses their own ruling through S, S's `koto next` isn't blocked by it, and
+  showing the ruling from S reads `reversed` with the winning reversal's hop.
+- [ ] A listing of reversals filtered on fenced session P returns exactly the reversals whose path
+  names the P-to-S hop.
+- [ ] R48's tick benchmark, at chain depth five with two chain sessions each fenced twice, measures
+  under 50 ms.
+
+**Reading one decision and the chain**
+
+- [ ] M is dispatched by D through a request leg, and D records a person `judgment` through D. From
+  M, `koto decisions show D <id>` returns the decider kind `person` with its handle, surface and
+  entering session D; the chain snapshot with each link's kind; the time, subject and reason; and
+  status `in-effect`. An unrelated session on the same host gets the same answer. M's and D's keys
+  and logs are byte-identical before and after.
+- [ ] After a person reverses that judgment through D, `show` from M returns status `reversed` with
+  the winning reversal's session, identifier, time, decider, reason, standing and standing path. A
+  `show` of a decision in a session koto can't read returns `unreadable`.
+- [ ] Reading W's chain from the succession fixture lists P labelled `leg`, W's anchor labelled
+  `held-by`, and P's hop to S with its confirmation, successor, actor and time. Reading P's chain
+  reports P's own marker. With the marker naming the wrong session id, the hop is listed
+  unconfirmed. No session gains a key or event from the read.
+- [ ] `koto decisions record`, `list`, `show` and `reverse` each act on the session named in their
+  arguments. Run from a process whose `KOTO_ANCHOR` and `KOTO_SESSION_*` variables name another
+  session, `record` still writes into the named session only.
+
+**Standing rulings and a person's own block**
+
+- [ ] A person records a ruling through a coordinator session as a `judgment` with outcome
+  `settled`, and it lists with kind `judgment`; recording a ruling needs no other kind.
+- [ ] C is live, and a person enters a `judgment` through C, then reverses it through C. C's next
+  `koto next` blocks. A new `judgment` naming the reversal, entered by a person through C, clears
+  the block. In a second run, the same replacement recorded by C with no person decider leaves C
+  blocked.
+
+**The harness id and the tick's driver**
+
+- [ ] With `CLAUDE_CODE_SESSION_ID` set to a value that isn't id-shaped and `KOTO_ANCHOR` unset, a
+  gate pass with no `--by` is refused with `decider_missing`, and a decision recorded with `--by
+  person:<handle>` records an empty harness identifier. With an id-shaped value, the decision's
+  harness identifier is the value, labelled `observed`.
+- [ ] For one process ticking a session past a gate with `koto next --to`, the harness identifier
+  its `gate-pass` decision records equals, byte for byte, the driver id koto's driver rule derives
+  for that process, the value #600 hands the tick's gates. While the run journal exists, it also
+  equals the driver the journal records for that tick.
+
 **Independence and the rest**
 
 - [ ] Every scenario above runs with no workspace manager installed. With a workspace-manager
@@ -661,7 +871,22 @@ that footing.
   documents when a decision is reversed.
 - **Session retention, dispatch links and anchors.** They already shipped; this feature reads them
   and changes none of their rules. A person's explicit `koto session cleanup` still removes a
-  session and its decisions.
+  session and its decisions. The one change to succession is R38's marker, which the fencing
+  command writes beside the fence it already appends.
+- **Who may fence a session.** Anyone who can fence a session can already cancel or change it,
+  locally or through the bucket credential. A rule limiting who may fence belongs to succession,
+  not to this record; until one exists, whoever fences a session takes its standing (Known
+  Limitations).
+- **A carry that rides the fence.** `koto init --continues` without `--supersede` fences nothing,
+  and copying keys from a predecessor confers no standing. Making a carry ride the fence would be a
+  change to succession; this record only reads the fence.
+- **Dispatch links and requesters koto observes itself.** `init` and `link` links are written by a
+  session's own opener and stay as they are. A consumer that trusts only koto-written links reads
+  the `leg` kind each chain link already carries (R12).
+- **A verified identity for a person decider.** A handle stays `handed` text. Verifying it needs an
+  identity koto doesn't hold, which R8 rules out.
+- **The tick's driver variable.** Handing gates the tick's driver id is #600's to build. This
+  record says only what it expects of that value (R47).
 - **Reading another host's sessions without an import.** Cross-host reads wait on the owner's
   instruction.
 - **Workspace-manager changes.** The dispatch tree the workspace manager records stays its own; koto
@@ -691,6 +916,11 @@ that footing.
   can't be judged from this host and records as `asserted`.
 - R19 orders reversals by their recorded times; on one host the clock is shared, and across hosts a
   skewed clock can change which reversal wins, the same for every reader.
+- A fence written by a koto release older than R38 has no marker, so it confirms no hop, and a
+  successor of that fenced session gets no standing from it. Reversals below such a fence go to
+  the session or person above, as before this record.
+- Whoever fences a session takes its `verified` standing over everything below it, including the
+  power to stop a live worker. The fence already lets them stop the session itself.
 
 ## Decisions and Trade-offs
 
@@ -733,3 +963,27 @@ that footing.
   that wants a longer memory keeps its own reading.
 - **Reversal is final.** Reversing a reversal would make "in effect" depend on the parity of a chain;
   a new decision restores.
+- **A successor stands where its predecessor stood, read from the fence.** A `continues` link is
+  written by the successor itself and grants no authority, so standing can't come from it. The
+  supersede fence is the one record tying predecessor to successor that the successor doesn't just
+  assert: koto appends it to the predecessor's own log, under the predecessor's own lock, with one
+  winner. Without it, once a coordinator is replaced, only the person at the top could overrule a
+  long-lived worker, the run's routine reversals of its own earlier calls would be refused, and a
+  ruling recorded at the root could never be reversed. Re-linking live workers to the successor
+  was rejected: a stopped worker never re-links, decisions recorded before the re-link keep their
+  old snapshot, and the predecessor's own decisions aren't covered.
+- **An unconfirmed hop refuses rather than asserting.** An `asserted` reversal never stops a live
+  worker or clears a `verified` one, so a hop that could only assert would leave the run unable to
+  stop its own workers. Refusing makes the coordinator escalate, which it already does.
+- **Reading needs no standing.** Who decided what is attribution, and every reader should be able
+  to check it, including a manager citing its director. Standing governs reversing only.
+- **A standing ruling is a person's `judgment`.** A ruling that binds a session until it's reversed
+  is a judgment call a person settled. A separate kind would add nothing a reader can't already
+  read from the decider and the subject.
+- **A person can lift a block they caused through the same session.** R22 keeps a reversed session
+  from clearing its own block because doing so would overrule the session above it. When a person
+  reversed their own decision through that session, nobody above is overruled, so a person's
+  replacement through it clears the block. The session alone still can't.
+- **The record expects the driver id and doesn't build it.** A gate that checks who is ticking
+  compares a tick's driver with a decision's decider. The record's part is making the values the
+  same string; #600 hands the value to gates.
