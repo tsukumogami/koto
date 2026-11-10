@@ -17,6 +17,9 @@
 //! The reason goes through koto's known-credential redaction, the same pass
 //! captured output and findings get, before it is stored.
 //!
+//! After the event, the dispute is also recorded as a `judgment` in the
+//! decision record, with no change to the command's output.
+//!
 //! Errors print a JSON body on stdout: exit 1 for a missing session or an
 //! append that fails, nothing appended; exit 2 with a typed `code` for a
 //! caller problem (a gate not evaluated in the state, a rule id or reason
@@ -184,7 +187,7 @@ fn redactor_for(
     })
 }
 
-pub fn handle(backend: &dyn SessionBackend, subcommand: DisputesSubcommand) -> Result<()> {
+pub fn handle(backend: &crate::session::Backend, subcommand: DisputesSubcommand) -> Result<()> {
     match subcommand {
         DisputesSubcommand::Record {
             name,
@@ -198,7 +201,7 @@ pub fn handle(backend: &dyn SessionBackend, subcommand: DisputesSubcommand) -> R
 }
 
 fn handle_record(
-    backend: &dyn SessionBackend,
+    backend: &crate::session::Backend,
     name: String,
     gate: String,
     rule: String,
@@ -266,11 +269,12 @@ fn handle_record(
     let redactor = redactor_for(backend, &name, &header, &events);
     let (reason, _) = crate::redact::redact_str(&reason, &redactor).cut_bytes(REASON_MAX_BYTES);
 
+    let reason = reason.into_string();
     let payload = EventPayload::FindingDisputed(FindingDispute {
-        state,
-        gate,
-        rule_id: rule,
-        reason: reason.into_string(),
+        state: state.clone(),
+        gate: gate.clone(),
+        rule_id: rule.clone(),
+        reason: reason.clone(),
         source: by.as_str().to_string(),
         attempt,
         visit_attempt,
@@ -278,12 +282,81 @@ fn handle_record(
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());
     }
+    record_judgment(backend, &name, &header, &state, &gate, &rule, reason, by);
 
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({"status": "recorded"}))?
     );
     Ok(())
+}
+
+/// Record the dispute as a `judgment` (decision record, R25): the rule's
+/// finding is wrong, the redacted reason as its reason and the
+/// `finding_disputed` event as its evidence. `--by agent` is the session's
+/// judgment; `--by person` is a person's whose handle the command doesn't
+/// carry, recorded as `unknown` at the terminal. The command's output is
+/// unchanged: a decision that can't be written is one warning.
+#[allow(clippy::too_many_arguments)]
+fn record_judgment(
+    backend: &crate::session::Backend,
+    name: &str,
+    header: &StateFileHeader,
+    state: &str,
+    gate: &str,
+    rule: &str,
+    reason: String,
+    by: DisputeSource,
+) {
+    use crate::decisions::decider::{Flags, Observed};
+    use crate::decisions::gate_pass;
+    let written = (|| {
+        let events = backend
+            .read_events(name)
+            .map(|(_, events)| events)
+            .map_err(|e| {
+                crate::decisions::DecisionError::new("decision_write_failed", e.to_string())
+            })?;
+        let disputed = events
+            .iter()
+            .rev()
+            .find(|e| matches!(&e.payload, EventPayload::FindingDisputed(d) if d.gate == gate && d.rule_id == rule))
+            .map(|e| e.seq)
+            .unwrap_or_default();
+        let flags = match by {
+            DisputeSource::Agent => Flags {
+                by: Some("session".to_string()),
+                ..Flags::default()
+            },
+            DisputeSource::Person => Flags {
+                by: Some("person:unknown".to_string()),
+                surface: Some("terminal".to_string()),
+                ..Flags::default()
+            },
+        };
+        let observed = Observed::from_env(backend);
+        let decider = gate_pass::judgment_decider(name, &flags, &observed)?;
+        let current = derive_state_from_log(&events).unwrap_or_default();
+        let at = gate_pass::At {
+            session: name,
+            session_id: &header.session_id,
+            state: &current,
+            log_seq: events.last().map(|e| e.seq).unwrap_or(0),
+        };
+        let req = gate_pass::judgment(
+            format!("rule {rule} at gate {gate} in state {state} is wrong"),
+            Some(reason),
+            vec![format!("event:{name}:{disputed}")],
+        );
+        let prepared = gate_pass::Prepared::new(backend, at, req, decider, &flags, &observed)?;
+        gate_pass::record(backend, &prepared)
+    })();
+    if let Err(e) = written {
+        eprintln!(
+            "warning: the dispute in '{name}' wasn't recorded as a decision: {}",
+            e.message
+        );
+    }
 }
 
 #[cfg(test)]

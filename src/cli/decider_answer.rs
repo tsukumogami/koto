@@ -16,6 +16,13 @@
 //! one before it. The units that evaluation printed are its output's
 //! `units`.
 //!
+//! The answer is also a decision in the decision record, written with the
+//! event in one critical section and embedded in it: a `pass` is a
+//! `gate-pass` whose decider is `--by`'s, else the agent session's marked
+//! `defaulted`, and which is refused with `decider_missing` (exit 2,
+//! nothing appended) when no agent session is established; a `fail` or
+//! `unclear` is a `judgment`.
+//!
 //! Errors print a JSON body on stdout and exit 2 for a caller problem (an
 //! answer outside the three words, a check or criterion the current state
 //! doesn't declare, no fallback to answer, a unit missing, unexpected or not
@@ -28,6 +35,8 @@ use clap::Args;
 
 use crate::cache::sha256_hex;
 use crate::decider::check::{AgentAnswer, DeciderCheckAnswered, DeciderFallback};
+use crate::decisions::decider::Observed;
+use crate::decisions::{gate_pass, DecisionError};
 use crate::engine::persistence::{arrival_index, derive_machine_state};
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::session::SessionBackend;
@@ -79,6 +88,12 @@ pub struct AnswerArgs {
     /// for a check that grades units, refused for one that doesn't
     #[arg(long)]
     pub unit: Option<String>,
+
+    /// Who answered (the decision record's decider flags). A `pass` is a
+    /// gate pass: with no `--by` it is the agent session's, marked
+    /// defaulted, and refused when no agent session is established
+    #[command(flatten)]
+    pub decider: crate::cli::decisions::DeciderArgs,
 }
 
 /// A typed refusal: exit 2, nothing appended.
@@ -174,13 +189,14 @@ fn latest_evaluation<'e>(
     (pending, printed)
 }
 
-pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<()> {
+pub fn handle_answer(backend: &crate::session::Backend, args: AnswerArgs) -> Result<()> {
     let AnswerArgs {
         name,
         gate,
         criterion,
         answer,
         unit,
+        decider: decider_args,
     } = args;
 
     // The answer is checked first: it needs nothing loaded.
@@ -316,24 +332,63 @@ pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<(
         }
     };
 
-    let payload = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
-        state: state.clone(),
-        visit_seq: fallback.visit_seq,
-        gate: gate.clone(),
-        rule_id: criterion.clone(),
-        declaration_hash: fallback.declaration_hash.clone(),
-        input_sha256: fallback.input_sha256.clone(),
-        answer,
-        fallback_seq,
-        // An answer binds to the fallback it answers, its unit included.
-        unit: fallback.unit.clone(),
-        // Copied so the run journal reads the check's declared labels from
-        // this event, as it does from the fallback's.
-        unit_labels: fallback.unit_labels.clone(),
-        decision: None,
+    // The answer is a decision, written with its event in one critical
+    // section: a `pass` is a gate pass (R24), refused with nothing appended
+    // when no decider is established; a `fail` or `unclear` is a judgment
+    // (R25), the session's unless `--by` names another decider.
+    let flags = decider_args.flags();
+    let observed = Observed::from_env(backend);
+    let at = gate_pass::At {
+        session: &name,
+        session_id: &header.session_id,
+        state: &state,
+        log_seq: events.last().map(|e| e.seq).unwrap_or(0),
+    };
+    let decision_refused = |e: DecisionError| -> ! {
+        if e.code == "decision_write_failed" {
+            fail(EXIT_INFRASTRUCTURE, e.message);
+        }
+        refuse(e.code, e.message, &gate, &criterion, Some(&state))
+    };
+    let (decider, req) = if answer == AgentAnswer::Pass {
+        let decider = gate_pass::resolve_or_refuse(backend, at, &gate, &flags, &observed)
+            .unwrap_or_else(|e| decision_refused(e));
+        (decider, gate_pass::gate_pass(at, &gate, None))
+    } else {
+        let decider = gate_pass::judgment_decider(&name, &flags, &observed)
+            .unwrap_or_else(|e| decision_refused(e));
+        let what = format!(
+            "criterion {} of {} answered {}",
+            criterion,
+            gate,
+            answer.as_str()
+        );
+        (decider, gate_pass::judgment(what, None, vec![]))
+    };
+    let prepared = gate_pass::Prepared::new(backend, at, req, decider, &flags, &observed)
+        .unwrap_or_else(|e| decision_refused(e));
+    let recorded = gate_pass::record_with_event(backend, &prepared, &now_iso8601(), |decision| {
+        EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
+            state: state.clone(),
+            visit_seq: fallback.visit_seq,
+            gate: gate.clone(),
+            rule_id: criterion.clone(),
+            declaration_hash: fallback.declaration_hash.clone(),
+            input_sha256: fallback.input_sha256.clone(),
+            answer,
+            fallback_seq,
+            // An answer binds to the fallback it answers, its unit included.
+            unit: fallback.unit.clone(),
+            // Copied so the run journal reads the check's declared labels
+            // from this event, as it does from the fallback's.
+            unit_labels: fallback.unit_labels.clone(),
+            decision: Some(decision),
+        })
     });
-    if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-        fail(1, e.to_string());
+    match recorded {
+        Ok(_) => {}
+        Err(e) if e.code == gate_pass::EVENT_APPEND_FAILED => fail(1, e.message),
+        Err(e) => decision_refused(e),
     }
 
     let mut body = serde_json::json!({
