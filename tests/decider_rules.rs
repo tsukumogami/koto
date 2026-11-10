@@ -154,6 +154,13 @@ fn harness(tpl: &str, units: &str) -> Harness {
 
 fn next(h: &Harness, extra: &[&str]) -> Value {
     let mut cmd = h.koto_mode("auto");
+    // A fixed harness session, so a `--to` past an unmet gate (a gate pass)
+    // has an established decider.
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
+    cmd.env_remove("KOTO_ANCHOR");
     cmd.args(["next", WF, "--no-cleanup"]);
     cmd.args(extra);
     let out = cmd.output().unwrap();

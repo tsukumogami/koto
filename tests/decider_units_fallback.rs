@@ -227,6 +227,13 @@ fn command_of(finding: &Value, answer: &str) -> Vec<String> {
 
 fn answer_cmd(h: &Harness, args: &[&str]) -> std::process::Output {
     let mut cmd = h.koto();
+    // A fixed harness session, so an answer of pass (a gate pass) has an
+    // established decider.
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
+    cmd.env_remove("KOTO_ANCHOR");
     cmd.args(["decider", "answer"]).args(args);
     cmd.output().unwrap()
 }

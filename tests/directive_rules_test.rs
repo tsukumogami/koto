@@ -9,8 +9,8 @@
 //! nothing in another. Both are telemetry: the response is unchanged.
 //!
 //! Every test runs koto with `HOME` and `KOTO_SESSIONS_BASE` in its own
-//! temporary directory and `CLAUDE_CODE_SESSION_ID` cleared, so the store and
-//! the journal are the test's own.
+//! temporary directory and one fixed `CLAUDE_CODE_SESSION_ID`, so the store and
+//! the journal are the test's own and a gate pass has a decider.
 
 #![cfg(unix)]
 
@@ -128,7 +128,14 @@ impl Env {
     }
 
     fn scope(&self, cmd: &mut std::process::Command) {
-        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+        // A fixed harness session, so a gate pass (an override, a `--to`
+        // past an overridable gate, or an answer of pass) has an established
+        // decider.
+        cmd.env(
+            "CLAUDE_CODE_SESSION_ID",
+            "0f0e0d0c-1111-4222-8333-444455556666",
+        );
+        cmd.env_remove("KOTO_ANCHOR");
         cmd.env_remove("KOTO_HOME");
         cmd.current_dir(&self.dir);
         cmd.env("KOTO_SESSIONS_BASE", self.dir.join("sessions"));
