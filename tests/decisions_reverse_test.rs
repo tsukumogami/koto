@@ -309,6 +309,12 @@ fn a_coordinator_reverses_a_finished_workers_decisions() {
         &by_session,
     );
     let before = env.snapshot("w");
+    // The snapshot holds the worker's log and each of its decision keys.
+    assert!(before.contains_key(Path::new("koto-w.state.jsonl")));
+    for original in [&accept, &gate, &merge] {
+        let key = Path::new("ctx/koto/decisions").join(&original.id);
+        assert!(before.contains_key(&key), "{key:?} isn't in the snapshot");
+    }
 
     let mut reversals = Vec::new();
     for original in [&accept, &gate, &merge] {
@@ -330,15 +336,24 @@ fn a_coordinator_reverses_a_finished_workers_decisions() {
                 .is_file(),
             "no key under coord's koto/aimed/<worker-id>/"
         );
-        reversals.push(rid);
+        reversals.push(d);
     }
 
     let listing = env.list("w", &[]);
-    for (original, rid) in [&accept, &gate, &merge].iter().zip(&reversals) {
+    for (original, d) in [&accept, &gate, &merge].iter().zip(&reversals) {
         let e = entry(&listing, "w", &original.id);
         assert_eq!(e["status"], "reversed", "{e}");
-        assert_eq!(e["reversed_by"]["session"], "coord");
-        assert_eq!(e["reversed_by"]["id"], rid.as_str());
+        let by = &e["reversed_by"];
+        assert_eq!(by["session"], "coord");
+        assert_eq!(by["id"], d["id"]);
+        assert_eq!(by["time"], d["time"]);
+        assert!(by["time"].as_str().is_some_and(|t| t.len() == 24));
+        assert_eq!(by["decider"], d["decider"]);
+        assert_eq!(by["decider"]["kind"], "session");
+        assert_eq!(by["decider"]["session"]["value"], "coord");
+        assert_eq!(by["standing"], "verified");
+        assert_eq!(by["reason"], "wrong call");
+        assert_eq!(by["path"], d["path"]);
     }
     assert!(
         listing["decisions"]
@@ -349,8 +364,11 @@ fn a_coordinator_reverses_a_finished_workers_decisions() {
         "{listing}"
     );
     let coord = env.list("coord", &[]);
-    for rid in &reversals {
-        assert_eq!(entry(&coord, "coord", rid)["status"], "in-effect");
+    for d in &reversals {
+        assert_eq!(
+            entry(&coord, "coord", d["id"].as_str().unwrap())["status"],
+            "in-effect"
+        );
     }
     assert_eq!(
         env.snapshot("w"),
@@ -359,10 +377,8 @@ fn a_coordinator_reverses_a_finished_workers_decisions() {
     );
 }
 
-#[test]
-fn a_reverser_off_the_chain_records_in_its_anchor_when_that_is_on_it() {
-    let env = Env::new();
-    let harness = "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60731";
+/// Open an anchor for `harness` and return its name.
+fn open_anchor(env: &Env, harness: &str) -> String {
     let opened = env.run_env(
         &[],
         &[
@@ -376,19 +392,29 @@ fn a_reverser_off_the_chain_records_in_its_anchor_when_that_is_on_it() {
         ],
     );
     assert_eq!(opened.code, 0, "{}", opened.stderr);
-    let anchor = opened
+    opened
         .stdout
         .lines()
         .find_map(|l| l.strip_prefix("anchor="))
         .unwrap()
-        .to_string();
+        .to_string()
+}
+
+/// `koto init` with `envs` set, so a `KOTO_ANCHOR` there holds the session.
+fn init_with(env: &Env, envs: &[(&str, &str)], name: &str, extra: &[&str]) {
     let template = env.root.join("work.md");
-    let held = [("KOTO_ANCHOR", anchor.as_str())];
-    let out = env.run_env(
-        &held,
-        &["init", "w", "--template", template.to_str().unwrap()],
-    );
+    let mut args = vec!["init", name, "--template", template.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let out = env.run_env(envs, &args);
     assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
+fn a_reverser_off_the_chain_records_in_its_anchor_when_that_is_on_it() {
+    let env = Env::new();
+    let anchor = open_anchor(&env, "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60731");
+    let held = [("KOTO_ANCHOR", anchor.as_str())];
+    init_with(&env, &held, "w", &[]);
     env.init("outsider", &[]);
     let call = env.judgment("w", "use postgres");
 
@@ -406,6 +432,74 @@ fn a_reverser_off_the_chain_records_in_its_anchor_when_that_is_on_it() {
         .join(d["id"].as_str().unwrap())
         .is_file());
     assert!(!env.sessions().join("outsider/ctx/koto/aimed").exists());
+}
+
+#[test]
+fn a_reversal_through_an_anchor_that_loses_is_refused_in_the_reversers_session() {
+    // The competitor is there when the reversal is written.
+    let env = Env::new();
+    let anchor = open_anchor(&env, "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60732");
+    let held = [("KOTO_ANCHOR", anchor.as_str())];
+    env.init("coord", &[]);
+    init_with(&env, &held, "w", &["--dispatched-by", "coord"]);
+    env.init("outsider", &[]);
+    let call = env.judgment("w", "use postgres");
+    let c_rid = env.reversed(&call, "coord", &[])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = env.reverse_env(&[held[0], HIDE_BEFORE], &call, "outsider", &[]);
+    assert_ne!(out.code, 0, "{}", out.stdout);
+    let err = out.json();
+    assert_eq!(err["reason"], "lost_race");
+    assert_eq!(err["refused"]["session"], "outsider");
+    let refused = refusals(&env.list("outsider", &[]));
+    assert_eq!(refused.len(), 1);
+    let refusal = &refused[0]["decision"]["refusal"];
+    assert_eq!(refusal["winner"], json!({"session": "coord", "id": c_rid}));
+    assert_eq!(refusal["reversal"]["session"], anchor.as_str());
+    assert!(refusals(&env.list(&anchor, &[])).is_empty());
+
+    // The competitor is hidden until after the command returns: the
+    // reverser's next decision command records the refusal in its own
+    // session, once.
+    let env = Env::new();
+    let anchor = open_anchor(&env, "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60733");
+    let held = [("KOTO_ANCHOR", anchor.as_str())];
+    env.init("coord", &[]);
+    init_with(&env, &held, "w", &["--dispatched-by", "coord"]);
+    env.init("outsider", &[]);
+    let call = env.judgment("w", "use postgres");
+    env.reversed(&call, "coord", &[]);
+    let out = env.reverse_env(&[held[0], HIDE_ALL], &call, "outsider", &[]);
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    let a_rid = out.json()["id"].as_str().unwrap().to_string();
+    assert!(refusals(&env.list("outsider", &[])).is_empty());
+
+    let next = [
+        "decisions",
+        "record",
+        "outsider",
+        "--kind",
+        "judgment",
+        "--outcome",
+        "settled",
+        "--subject",
+        "what=next call",
+        "--by",
+        "session",
+    ];
+    for _ in 0..2 {
+        let out = env.run_env(&held, &next);
+        assert_eq!(out.code, 0, "{}", out.stdout);
+    }
+    let refused = refusals(&env.list("outsider", &[]));
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0]["decision"]["refusal"]["reversal"],
+        json!({"session": anchor, "id": a_rid})
+    );
+    assert!(refusals(&env.list(&anchor, &[])).is_empty());
 }
 
 // ===== R21: what reversing each kind means =====
@@ -874,7 +968,15 @@ fn a_decider_reverses_its_own_decision() {
 fn show_returns_the_winning_reversal() {
     let env = Env::new();
     env.init("director", &[]);
-    env.init("kid", &["--dispatched-by", "director"]);
+    // The kid runs in its own agent session: a harness session id and the
+    // anchor that holds it.
+    let harness = "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60741";
+    let anchor = open_anchor(&env, harness);
+    let as_kid = [
+        ("KOTO_ANCHOR", anchor.as_str()),
+        ("CLAUDE_CODE_SESSION_ID", harness),
+    ];
+    init_with(&env, &as_kid, "kid", &["--dispatched-by", "director"]);
     let call = env.record(
         "director",
         "judgment",
@@ -896,23 +998,39 @@ fn show_returns_the_winning_reversal() {
     );
 
     let before = env.snapshot("director");
-    // Read as the dispatched session would; show takes no reader.
-    let out = env.ok(&["decisions", "show", "director", &call.id]).json();
+    let kid_before = env.snapshot("kid");
+    let show = |id: &str| {
+        let out = env.run_env(&as_kid, &["decisions", "show", "director", id]);
+        assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+        out.json()
+    };
+    let out = show(&call.id);
     assert_eq!(out["status"], "reversed");
+    assert_eq!(out["decision"]["decider"]["handle"]["value"], "ana");
     let by = &out["reversed_by"];
+    // The winning reversal's session, identifier, time, decider, reason,
+    // standing and standing path, each as the reversal recorded it.
     assert_eq!(by["session"], "director");
     assert_eq!(by["id"], d["id"]);
+    assert!(by["id"].as_str().is_some_and(|i| i.len() == 12));
     assert_eq!(by["time"], d["time"]);
+    assert!(by["time"].as_str().is_some_and(|t| t.len() == 24));
     assert_eq!(by["decider"], d["decider"]);
+    assert_eq!(by["decider"]["kind"], "person");
     assert_eq!(by["decider"]["handle"]["value"], "bea");
+    assert_eq!(by["decider"]["entering"]["session"]["value"], "director");
     assert_eq!(by["reason"], "the freeze blocks the fix");
     assert_eq!(by["standing"], "verified");
-    assert_eq!(by["path"], json!([]));
-    assert_eq!(out["decision"]["decider"]["handle"]["value"], "ana");
+    assert_eq!(by["path"], d["path"]);
+    assert_eq!(
+        by["path"],
+        json!([]),
+        "a person through the deciding session needs no hop"
+    );
 
     // The reversal itself shows in effect.
     let rid = d["id"].as_str().unwrap();
-    let shown = env.ok(&["decisions", "show", "director", rid]).json();
+    let shown = show(rid);
     assert_eq!(shown["status"], "in-effect");
     assert_eq!(shown["decision"]["kind"], "reverse");
     assert_eq!(
@@ -920,8 +1038,5 @@ fn show_returns_the_winning_reversal() {
         before,
         "show wrote to the session"
     );
-    assert!(env
-        .snapshot("kid")
-        .keys()
-        .all(|k| !k.starts_with("ctx/koto/aimed")));
+    assert_eq!(env.snapshot("kid"), kid_before, "show wrote to the reader");
 }
