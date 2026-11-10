@@ -179,7 +179,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
 | above | a session is above a decision when it, or its anchor, is on the decision's chain, or when it is a later member of the run of a session on that chain, reached through supersede markers koto confirms (R39) |
 | established decider | a decider named with `--by`, or, with none named, an id-shaped harness session identifier in `CLAUDE_CODE_SESSION_ID` (R47) or a readable anchor named in `KOTO_ANCHOR`; the koto session name alone never establishes one |
 | run | a session and the successors that `koto init <successor> --continues <session> --supersede` fenced it for, one after another; each is a member of the run |
-| supersede marker | the write-once marker koto writes beside a fenced session, naming its successor's session name and id, the fence's actor and the fence's time (R38) |
+| supersede marker | the write-once marker koto writes beside a fenced session, naming its successor's session name and id, the fence's actor, the fence's time and the highest decision identifier the fence saw (R38) |
 | hop | one step of a walk from a fenced session to its successor through the supersede marker; a hop is confirmed when the successor's own session id equals the one the marker names |
 | status | each decision reads as exactly one of `in-effect`, `reversed`, `refused` or `unreadable`. A `reverse` reads `in-effect` when it wins R19's rule and `refused` when it loses; a `refused` decision always reads `refused`; any other decision reads `reversed` when a winning reversal names it, otherwise `in-effect` |
 | decision keys | the keys holding decisions, under one koto-reserved key prefix the design names |
@@ -370,7 +370,10 @@ decision records has to match the driver id koto hands a gate, so a gate can che
     rule for a person), and a person entering through the deciding session records a new decision
     of the same kind naming the reversal in its `basis`. A person changing their mind through a
     session overrules no session above it, so the block clears. The deciding session alone still
-    can't clear it.
+    can't clear it. The replacement is recorded in the deciding session (R4), which isn't on its
+    own chain, so for this case `koto next` also lists the aimed area of the deciding session
+    itself, one more listing in a session it already reads, and counts a replacement there only
+    when a person decider entered it.
 
   A reversal that lost R19's race blocks nothing. A reversal of a fenced session's decision blocks
   no member of its run (R42).
@@ -466,12 +469,17 @@ non-functional ones so every earlier number keeps its meaning.
 - **R37.** A fenced session records no decision. Every decision command addressed to a session
   whose log holds a `session_superseded` fence (recording, reversing, importing, and the
   gate-passing commands of R24) refuses with `session_superseded`, naming the successor, and
-  writes nothing. A fence and a decision racing on one session never land in the wrong order:
-  either the decision is written before the fence, or the command refuses. The fenced session
-  keeps serving its decisions to readers, as a migrated session does (R6).
+  writes nothing. On one host, a fence and a decision racing on one session never land in the
+  wrong order: either the decision is written before the fence, or the command refuses. Under the
+  cloud backend the fence can be pushed from another host, and a decision can be written by a
+  process that hasn't seen it yet, so the marker records the highest decision identifier the fence
+  saw (R38). Every reader treats a decision in a fenced session with a higher identifier as
+  written after the fence: it reads `refused`, gives no standing and blocks nothing. The fenced
+  session keeps serving its decisions to readers, as a migrated session does (R6).
 - **R38.** When koto fences a session, it writes a supersede marker beside it, the way it marks a
   migrated session. The marker is write-once. It names the successor's session name and id, the
-  fence's actor and the fence's time, and a reader gets it in one read with no log scan, under
+  fence's actor, the fence's time and the highest decision identifier the session held when the
+  fence was written (R37), and a reader gets it in one read with no log scan, under
   both backends. Only the fencing command writes it, and koto refuses every other write and every
   removal of it, as R5 does for decision keys. A fencing command that stops between the fence and
   the marker writes the missing marker when it's run again; until the marker exists, the fence
@@ -780,10 +788,14 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   listing P still returns its three earlier decisions. A fence and a `record` on one session,
   started from a shared barrier in 20 trials, each end with either the decision written before the
   fence or the record refused, never a decision after the fence.
-- [ ] P holds a supersede marker naming S's session name and id, the fence's actor and its time.
-  Reading it takes one read and no read of P's log (checked by a read counter in tests).
-  `koto context add` and `koto context remove` on it are refused naming it. Under the cloud
-  backend it appears under P's bucket prefix.
+- [ ] Under the cloud backend, with S's fence pushed from a second host while P's own host records
+  a `judgment` it hasn't seen the fence for, the judgment's identifier is above the marker's
+  highest identifier, and a listing of P and `show` of the judgment both read it `refused`; a
+  reversal written in P the same way blocks nothing below P.
+- [ ] P holds a supersede marker naming S's session name and id, the fence's actor, its time and
+  the highest decision identifier P held. Reading it takes one read and no read of P's log
+  (checked by a read counter in tests). `koto context add` and `koto context remove` on it are
+  refused naming it. Under the cloud backend it appears under P's bucket prefix.
 - [ ] From S, reversing W's judgment is accepted with standing `verified` and recorded in S. Its
   standing path names the hop from P to S with the fence's actor and time. W's next `koto next`
   blocks naming S's reversal, and W's, P's and D's keys and logs are byte-identical to before.
@@ -833,8 +845,8 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   `settled`, and it lists with kind `judgment`; recording a ruling needs no other kind.
 - [ ] C is live, and a person enters a `judgment` through C, then reverses it through C. C's next
   `koto next` blocks. A new `judgment` naming the reversal, entered by a person through C, clears
-  the block. In a second run, the same replacement recorded by C with no person decider leaves C
-  blocked.
+  the block, found in C's own aimed area. In a second run, the same replacement recorded by C with
+  no person decider leaves C blocked. Both runs pass under the cloud backend too.
 
 **The harness id and the tick's driver**
 
@@ -976,7 +988,10 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   worker or clears a `verified` one, so a hop that could only assert would leave the run unable to
   stop its own workers. Refusing makes the coordinator escalate, which it already does.
 - **Reading needs no standing.** Who decided what is attribution, and every reader should be able
-  to check it, including a manager citing its director. Standing governs reversing only.
+  to check it, including a manager citing its director. Standing governs reversing only. Limiting
+  the read to sessions above would protect nothing: any process on the host can already read a
+  session's files, and a decision body travels with its session wherever the session goes. A
+  body that has to be kept from other sessions doesn't belong in a decision.
 - **A standing ruling is a person's `judgment`.** A ruling that binds a session until it's reversed
   is a judgment call a person settled. A separate kind would add nothing a reader can't already
   read from the decider and the subject.

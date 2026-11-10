@@ -482,14 +482,25 @@ Key assumptions:
 
 - **The marker.** `koto init --supersede` writes `koto/superseded-by` in the predecessor beside the
   fence, create-only by the decision writer's primitive (local create-rename, `If-None-Match: *`
-  in the bucket), holding the successor's name and session id, the fence's actor and time. It sits
+  in the bucket), holding the successor's name and session id, the fence's actor and time, and
+  `decisions_through`, the highest decision id the fence saw in the predecessor. It sits
   outside the manifest like the pin and the migration marker, so one `stat` or one GET reads it.
   It's written after the fence and before the successor is created. A re-run of the command, which
   the fence already makes idempotent, writes a missing marker. `check_writer_key` refuses every
   other writer and every remove of it.
-- **The fenced session records nothing.** The decision writer reads the fence under the manifest
-  lock it allocates under, and the fencing command takes that lock around its append, so a
-  decision and a fence can't interleave (R37).
+- **The fenced session records nothing.** Locally, the decision writer reads the fence under the
+  `ctx/manifest.lock` it allocates under, and the fencing command takes that lock before the log's
+  append lock and holds it through the append, the same order a gate-passing command takes them in
+  (manifest lock, then the append inside it), so the two can't deadlock and a decision and a fence
+  can't interleave. The fence reads `decisions_through` under the same lock. Its wait on the
+  manifest lock is bounded by `FENCE_LOCK_WAIT` like its wait on the append lock, and a lock still
+  held exits 3 `fence_unavailable` with nothing written. Under the cloud backend no lock spans the
+  fencing host and the predecessor's host, and a plain `record` pushes no event whose conditional
+  push the fence would make fail. So the fence lists the predecessor's decision prefix in the bucket
+  before its conditional push and takes `decisions_through` from that listing, and every reader
+  treats a decision in a fenced session with a higher id as written after the fence: status
+  `refused`, no standing, no block (R37). A decision created between the listing and the push
+  reads `refused` too, which errs toward the fence.
 - **The walk.** `src/decisions/chain.rs` gains a forward step. At each chain session it reads the
   marker; if one is there, it reads the successor's header and confirms the session id, then takes
   the successor's position as the fenced session's and keeps going forward, up to
@@ -504,7 +515,8 @@ Key assumptions:
   actor, time (R41).
 - **The tick.** For each chain session, the tick also lists `koto/aimed/<aim-id>/` in that
   session's confirmed later members, so a successor's reversal blocks the worker below (R39). A
-  fenced session's own decisions block nothing, since it has no live workflow (R42).
+  reversal of a fenced session's decision blocks no member of its run, since the fenced session
+  has no live workflow left to stop (R42).
 - **The chain read.** `koto decisions chain <session>` prints this walk without recording
   anything (R45). It's the same code path standing uses, so a consumer reads where a session
   stands instead of keeping its own walk.
@@ -699,7 +711,8 @@ through a supersede hop records the fenced session, its successor, and the fence
 ```
 
 The supersede marker, `koto/superseded-by` in the fenced session, holds
-`{"v": 1, "successor": {"name", "id"}, "actor", "time"}`. `koto decisions chain <session>` prints
+`{"v": 1, "successor": {"name", "id"}, "actor", "time", "decisions_through"}`, the last the
+12-digit id or `null` when the session held none. `koto decisions chain <session>` prints
 `{"v": 1, "session", "marker", "links": [{"session", "via", "hops": [{"successor", "confirmed",
 "actor", "time"}]}], "incomplete"}`. A `person` decider
 carries `handle` (`handed`), `surface`, an optional `link` and the entering session. A `check` decider
@@ -726,8 +739,9 @@ winner), plus the existing `session_migrated`.
    then lists competing reversals on the original's chain; if one wins, it records `refused` in its
    own session and exits non-zero.
 4. **Tick.** A live session holding decisions lists `koto/aimed/<aim-id>/` in each chain session,
-   and in each confirmed later member of a chain session's run, before gate evaluation and blocks
-   or proceeds; its workflow state is untouched by a block.
+   in each confirmed later member of a chain session's run, and, once one of its decisions reads
+   reversed, in its own session for a person's replacement (R22), before gate evaluation, and
+   blocks or proceeds; its workflow state is untouched by a block.
 5. **Show and chain.** `show` reads one decision from any session on the host, computes its status
    from the reversals on its chain and the chain's runs, and writes nothing; `chain` prints the
    walk itself.
@@ -858,7 +872,8 @@ which reversals a session treats as aimed at itself.
 decider has standing over the reverser, and naming the reversal in `basis` isn't enough on its own.
 The one exception is a person who reversed their own decision through the deciding session: a
 person entering through that session may record the replacement (R22), and the session alone still
-can't.
+can't. The tick finds that replacement in the session's own aimed area and counts it only when its
+decider is a person.
 
 **Standing through a fence.** Whoever fences a session takes its `verified` standing over everything
 below it, a live worker's pauses included. That's no wider than what the fence already gives them,
