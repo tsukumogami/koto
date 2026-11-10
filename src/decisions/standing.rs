@@ -53,21 +53,33 @@ pub mod reasons {
     pub const LOST_RACE: &str = "lost_race";
 }
 
-/// R19's order: time, then reverser session name, then id. Times compare
-/// as strings, which orders them correctly only because every writer
-/// stamps fixed-width RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
-fn race_key(b: &DecisionBody) -> (&str, &str, &str) {
-    (&b.time, &b.session.name, &b.id)
+/// R19's order: time, then the reverser's session name, then id, then the
+/// holding session so the order is total. The reverser is the session the
+/// decider entered through, which differs from the holder when the
+/// reversal sits in the reverser's anchor (R4). Times compare as strings,
+/// which orders them correctly only because every writer stamps
+/// fixed-width RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+fn race_key(b: &DecisionBody) -> (&str, &str, &str, &str) {
+    (&b.time, reverser_of(b), &b.id, &b.session.name)
+}
+
+/// The reverser's session: the one the decider entered through, or the
+/// holding session when the body names none.
+fn reverser_of(b: &DecisionBody) -> &str {
+    match entered_through(&b.decider) {
+        "" => &b.session.name,
+        entered => entered,
+    }
 }
 
 /// Why `lost` lost to `winner`, for the refusal's message.
 pub fn lost_message(lost: &DecisionBody, winner: &DecisionBody) -> String {
     let why = if winner.time != lost.time {
         "was recorded earlier"
-    } else if winner.session.name != lost.session.name {
-        "has the same time and a session name that sorts first"
+    } else if reverser_of(winner) != reverser_of(lost) {
+        "has the same time and a reverser session name that sorts first"
     } else {
-        "has the same time and session and an id that sorts first"
+        "has the same time and reverser and an id that sorts first"
     };
     format!(
         "reversal {}:{} lost to {}:{}, which {why}",
@@ -970,5 +982,39 @@ mod tests {
         assert_eq!(index.status(&o), "reversed");
         assert_eq!(index.status(&b), "in-effect");
         assert_eq!(index.status(&a), "refused");
+    }
+
+    #[test]
+    fn equal_times_go_to_the_reverser_name_not_the_holder() {
+        let o = body(
+            "c",
+            "000000000001",
+            "judgment",
+            session_decider("c"),
+            &["anchor-a", "anchor-b"],
+        );
+        let time = "2026-11-10T00:00:01.000Z";
+        // Held in anchors whose names sort the other way round from the
+        // sessions that entered the reversals through them.
+        let mut by_zed = reversal("anchor-a", "000000000001", time, &o);
+        by_zed.decider = session_decider("zed");
+        let mut by_amy = reversal("anchor-b", "000000000001", time, &o);
+        by_amy.decider = person("dana", "amy");
+        for order in [[&by_zed, &by_amy], [&by_amy, &by_zed]] {
+            assert!(same(winner(order).unwrap(), &by_amy));
+        }
+        let sessions = [("anchor-a", &by_zed), ("anchor-b", &by_amy), ("c", &o)]
+            .into_iter()
+            .map(|(s, b)| (s.to_string(), vec![Entry::Decision(Box::new(b.clone()))]))
+            .collect();
+        let index = Index::from_sessions(sessions);
+        assert!(same(
+            index.winner_of("c-id", "000000000001").unwrap(),
+            &by_amy
+        ));
+        assert_eq!(index.status(&o), "reversed");
+        assert_eq!(index.status(&by_amy), "in-effect");
+        assert_eq!(index.status(&by_zed), "refused");
+        assert!(lost_message(&by_zed, &by_amy).contains("reverser session name"));
     }
 }
