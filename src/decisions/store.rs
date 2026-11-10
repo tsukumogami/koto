@@ -314,23 +314,19 @@ pub fn list_with(backend: &Backend, session: &str, remote: bool) -> Listing {
     listing
 }
 
-/// Record a decision in `session`'s `koto/decisions/` area: allocate the
-/// next id under the session's manifest lock, build the body for it with
-/// `build`, and publish it create-only. Returns the body as stored.
-///
-/// It first repeats the check for reversals `session` recorded that lost
-/// their race (R19), so every decision command in a session that lost one
-/// records its refusal; see [`super::standing::settle`].
+/// Record a decision in `session`: allocate the next id under the
+/// session's manifest lock, build the body for it with `build`, and publish
+/// it create-only. Returns the body as stored.
 pub fn write(
     backend: &Backend,
     session: &str,
     build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
 ) -> Result<DecisionBody, DecisionError> {
-    super::standing::settle(backend, session);
     write_in(backend, session, &Area::Decisions, build)
 }
 
-/// [`write`] into `area`, without the repeat check.
+/// [`write`] into `area`: `koto/decisions/`, or a reversal's
+/// `koto/aimed/<target>/`.
 pub fn write_in(
     backend: &Backend,
     session: &str,

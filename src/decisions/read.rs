@@ -1,5 +1,6 @@
-//! The pure read path behind `koto decisions list` and `show` (PRD R14 to
-//! R16, R44).
+//! The pure read path under `koto decisions list` and `show` (PRD R14 to
+//! R16, R44): one session's decisions with their integrity checks.
+//! The standing module, above this one, adds the statuses reversals give.
 //!
 //! It reads decision files and state-file headers straight from disk (and,
 //! under the cloud backend, the bucket's decision objects), and never takes
@@ -11,15 +12,13 @@ use serde_json::{json, Value};
 
 use super::body::DecisionBody;
 use super::chain;
-use super::standing::{Index, Scope};
+use super::is_decision_id;
 use super::store::{self, Area};
-use super::{is_decision_id, FORMAT_VERSION};
 use crate::session::{Backend, SessionBackend};
 
-/// A decision's status as its body alone shows it: `refused` for a
-/// `refused`, else `in-effect`. Readers that can see reversals use
-/// [`Index::status`] instead (R19, R20).
-pub fn status_of(body: &DecisionBody) -> &'static str {
+/// A decision's status as its body alone shows it, before any reversal
+/// is applied.
+fn status_of(body: &DecisionBody) -> &'static str {
     if body.kind == "refused" {
         "refused"
     } else {
@@ -222,7 +221,7 @@ impl Filters {
 
 /// Sort entries by time, then session, then id; unreadable entries,
 /// which have no time, go last in session and id order.
-fn sort(entries: &mut [Entry]) {
+pub fn sort(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         let key = |e: &Entry| match e {
             Entry::Decision(body) => (
@@ -274,61 +273,6 @@ pub fn local_sessions(backend: &Backend) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// `koto decisions list <session> --format v1`, or with `below` the
-/// decisions of every session below `session`. Each status comes from the
-/// reversals found anywhere in the local store (R19, R20).
-pub fn list(backend: &Backend, session: &str, below: bool, filters: &Filters) -> Value {
-    let index = Index::scan(backend, true);
-    let sessions = if below {
-        sessions_below(backend, session)
-    } else {
-        vec![session.to_string()]
-    };
-    let mut entries: Vec<Entry> = sessions
-        .iter()
-        .flat_map(|s| index.entries(backend, s))
-        .filter(|e| match e {
-            Entry::Decision(body) => filters.matches(body),
-            Entry::Unreadable { .. } => true,
-        })
-        .collect();
-    sort(&mut entries);
-    let scope = Scope::new(backend, session);
-    let mut out = json!({
-        "v": FORMAT_VERSION,
-        "session": session,
-        "decisions": entries
-            .iter()
-            .map(|e| index.entry_json(e, &scope))
-            .collect::<Vec<_>>(),
-    });
-    if below {
-        out["below"] = json!(true);
-        out["sessions"] = json!(sessions);
-    }
-    out
-}
-
-/// `koto decisions show <session> <id>`: the entry for `id`, or `None`
-/// when the session holds no file of that name in either area.
-pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
-    let index = Index::scan(backend, true);
-    let entries = index.entries(backend, session);
-    let found = entries.iter().find(|e| match e {
-        Entry::Decision(body) => body.id == id,
-        Entry::Unreadable { id: Some(i), .. } => i == id,
-        Entry::Unreadable { id: None, .. } => false,
-    });
-    let whole_session_unreadable = entries
-        .iter()
-        .find(|e| matches!(e, Entry::Unreadable { id: None, .. }));
-    let entry = found.or(whole_session_unreadable)?;
-    let mut out = index.entry_json(entry, &Scope::new(backend, session));
-    out["v"] = json!(FORMAT_VERSION);
-    out["id"] = json!(id);
-    Some(out)
 }
 
 /// Strip control and terminal escape characters from text read from a

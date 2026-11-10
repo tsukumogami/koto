@@ -13,7 +13,7 @@ use crate::decisions::body::{
     self, BasisRef, Compensating, DecisionBody, Refusal, Request, SessionRef, Target,
 };
 use crate::decisions::decider::{self, Flags, Observed};
-use crate::decisions::read::{self, Entry, Filters};
+use crate::decisions::read::{Entry, Filters};
 use crate::decisions::standing::{self, reasons, Index};
 use crate::decisions::store::Area;
 use crate::decisions::{chain, codes, store, DecisionError, FORMAT_VERSION};
@@ -243,6 +243,8 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
     let state = crate::engine::persistence::derive_state_from_log(&events).unwrap_or_default();
     let log_seq = events.last().map(|e| e.seq).unwrap_or(0);
 
+    // A reversal entered through this session may have lost since (R19).
+    standing::settle(backend, name);
     let written = store::write(backend, name, |id| {
         Ok(DecisionBody {
             v: FORMAT_VERSION,
@@ -280,7 +282,7 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             "v": FORMAT_VERSION,
             "session": name,
             "id": written.id,
-            "status": read::status_of(&written),
+            "status": if written.kind == "refused" { "refused" } else { "in-effect" },
             "decision": written,
         }))?
     );
@@ -335,7 +337,7 @@ pub fn handle_list(backend: &Backend, name: &str, args: &ListArgs) -> Result<()>
     };
     println!(
         "{}",
-        serde_json::to_string(&read::list(backend, name, args.below, &filters))?
+        serde_json::to_string(&standing::list(backend, name, args.below, &filters))?
     );
     Ok(())
 }
@@ -364,7 +366,7 @@ pub fn handle_show(backend: &Backend, name: &str, id: &str) -> Result<()> {
             EXIT_CALLER_ERROR,
         );
     }
-    match read::show(backend, name, id) {
+    match standing::show(backend, name, id) {
         Some(out) => println!("{}", serde_json::to_string(&out)?),
         None => refuse(
             COMMAND,
@@ -752,10 +754,7 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
         // reversal sits in its anchor (R19).
         let recorded = standing::record_lost(backend, &reverser, &written, w)
             .unwrap_or_else(|e| refuse(COMMAND, &e));
-        let message = format!(
-            "reversal {}:{} lost to {}:{}, recorded earlier",
-            written.session.name, written.id, winner.session, winner.id
-        );
+        let message = standing::lost_message(&written, w);
         refuse_reversal(
             reasons::LOST_RACE,
             &message,

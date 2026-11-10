@@ -7,10 +7,13 @@
 //!   the decision it is aimed at, and computes each decision's status with
 //!   R19's race: the earliest time wins, then the reverser session whose
 //!   name sorts first by bytes, then the id that sorts first. Every reader
-//!   builds one and applies the same rule, so they agree.
-//! - [`settle`] is R19's repeat check: a session that recorded a reversal
-//!   that has since lost records a `refused` naming the winner.
+//!   builds one and applies the same rule, so they agree. [`list`] and
+//!   [`show`] print decisions with the statuses it gives them.
+//! - [`settle`] is R19's repeat check: every decision command that writes
+//!   calls it for its session first, so a reversal entered through that
+//!   session that has since lost gets a `refused` naming the winner there.
 //!
+//! This module sits above [`store`] and [`read`]; neither calls into it.
 //! Supersede hops (R39 to R43) aren't followed here.
 
 use std::cell::OnceCell;
@@ -50,9 +53,26 @@ pub mod reasons {
     pub const LOST_RACE: &str = "lost_race";
 }
 
-/// R19's order: time, then reverser session name, then id.
+/// R19's order: time, then reverser session name, then id. Times compare
+/// as strings, which orders them correctly only because every writer
+/// stamps fixed-width RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
 fn race_key(b: &DecisionBody) -> (&str, &str, &str) {
     (&b.time, &b.session.name, &b.id)
+}
+
+/// Why `lost` lost to `winner`, for the refusal's message.
+pub fn lost_message(lost: &DecisionBody, winner: &DecisionBody) -> String {
+    let why = if winner.time != lost.time {
+        "was recorded earlier"
+    } else if winner.session.name != lost.session.name {
+        "has the same time and a session name that sorts first"
+    } else {
+        "has the same time and session and an id that sorts first"
+    };
+    format!(
+        "reversal {}:{} lost to {}:{}, which {why}",
+        lost.session.name, lost.id, winner.session.name, winner.id
+    )
 }
 
 /// The reversal that wins R19's race among `reversals`.
@@ -298,6 +318,61 @@ impl<'a> Scope<'a> {
         }
         out
     }
+}
+
+/// `koto decisions list <session> --format v1`, or with `below` the
+/// decisions of every session below `session`. Each status comes from the
+/// reversals found anywhere in the local store (R19, R20).
+pub fn list(backend: &Backend, session: &str, below: bool, filters: &read::Filters) -> Value {
+    let index = Index::scan(backend, true);
+    let sessions = if below {
+        read::sessions_below(backend, session)
+    } else {
+        vec![session.to_string()]
+    };
+    let mut entries: Vec<Entry> = sessions
+        .iter()
+        .flat_map(|s| index.entries(backend, s))
+        .filter(|e| match e {
+            Entry::Decision(body) => filters.matches(body),
+            Entry::Unreadable { .. } => true,
+        })
+        .collect();
+    read::sort(&mut entries);
+    let scope = Scope::new(backend, session);
+    let mut out = json!({
+        "v": FORMAT_VERSION,
+        "session": session,
+        "decisions": entries
+            .iter()
+            .map(|e| index.entry_json(e, &scope))
+            .collect::<Vec<_>>(),
+    });
+    if below {
+        out["below"] = json!(true);
+        out["sessions"] = json!(sessions);
+    }
+    out
+}
+
+/// `koto decisions show <session> <id>`: the entry for `id`, or `None`
+/// when the session holds no file of that name in either area.
+pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
+    let index = Index::scan(backend, true);
+    let entries = index.entries(backend, session);
+    let found = entries.iter().find(|e| match e {
+        Entry::Decision(body) => body.id == id,
+        Entry::Unreadable { id: Some(i), .. } => i == id,
+        Entry::Unreadable { id: None, .. } => false,
+    });
+    let whole_session_unreadable = entries
+        .iter()
+        .find(|e| matches!(e, Entry::Unreadable { id: None, .. }));
+    let entry = found.or(whole_session_unreadable)?;
+    let mut out = index.entry_json(entry, &Scope::new(backend, session));
+    out["v"] = json!(FORMAT_VERSION);
+    out["id"] = json!(id);
+    Some(out)
 }
 
 /// Where a reversal is recorded and the standing it carries.
@@ -557,10 +632,7 @@ pub fn record_lost(
             RefusedReversal {
                 aimed_at: aimed_at.clone(),
                 target: target.clone(),
-                reason: format!(
-                    "reversal {}:{} of {aimed_at} lost to {}:{}, recorded earlier",
-                    lost.session.name, lost.id, winner.session.name, winner.id
-                ),
+                reason: format!("{} (aimed at {aimed_at})", lost_message(lost, winner)),
                 refusal: Refusal {
                     reason: reasons::LOST_RACE.to_string(),
                     winner: Some(reference(winner)),
@@ -597,8 +669,10 @@ fn entered_through(decider: &Decider) -> &str {
 /// The refusal always goes in `session`: R19 puts it in the losing
 /// reverser's own session, where its next decision command finds it.
 ///
-/// It reads local copies only. Failures are dropped: the check runs
-/// before an unrelated decision and must not block it.
+/// Every command that writes a decision calls it for its session before
+/// writing. It reads local copies only. A failure is reported on stderr
+/// and otherwise dropped: the check runs before an unrelated decision and
+/// must not block it.
 pub fn settle(backend: &Backend, session: &str) {
     let own = read::read_session_with(backend, session, false);
     let mut holders: Vec<String> = chain::snapshot(backend, session)
@@ -636,7 +710,12 @@ pub fn settle(backend: &Backend, session: &str) {
         let Some(t) = &lost.target else { continue };
         if let Some(w) = index.winner_of(&t.id, &t.decision) {
             if !same(w, lost) {
-                let _ = record_lost(backend, session, lost, w);
+                if let Err(e) = record_lost(backend, session, lost, w) {
+                    eprintln!(
+                        "koto: couldn't record in '{session}' that reversal {}:{} lost: {e}",
+                        lost.session.name, lost.id
+                    );
+                }
             }
         }
     }
