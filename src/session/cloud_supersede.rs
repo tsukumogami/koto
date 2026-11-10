@@ -17,16 +17,19 @@
 //!
 //! Everything read from the bucket is data. The prefix is checked to be a
 //! workspace prefix and every name is validated before a key is built from
-//! it; the predecessor's log is parsed whole, and a carried key is checked
-//! as `koto context add` checks one.
+//! it; the predecessor's log is parsed whole, a carried key is checked as
+//! `koto context add` checks one, and a carried value is checked against
+//! the hash the predecessor's manifest gives it before it is returned.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use super::{
-    asked_retrying, is_not_found, is_precondition_failed, is_transient, is_workspace_prefix,
-    parse_source_log, response_etag, without_url_userinfo, CloudBackend, S3Error,
+    asked_retrying, each_in_parallel, is_not_found, is_precondition_failed, is_transient,
+    is_workspace_prefix, parse_source_log, response_etag, without_url_userinfo, CloudBackend,
+    S3Error,
 };
+use crate::cache::sha256_hex;
 use crate::engine::persistence::{
     append_supersede_fence, superseded_by, SessionSupersededError, SupersedeFence,
 };
@@ -80,6 +83,86 @@ impl std::fmt::Display for BucketReadFailed {
 }
 
 impl std::error::Error for BucketReadFailed {}
+
+/// Why the predecessor's side of a carry can't be trusted: what the bucket
+/// holds for it is missing or doesn't check out. Each renders as fixed
+/// wording, so no text read from the bucket (a parser's message, a key
+/// name, a hash) reaches the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarrySourceError {
+    /// The predecessor's context manifest isn't one.
+    ManifestUnparsable,
+    /// The bucket holds no context manifest for a predecessor whose log
+    /// records a key the carry would take.
+    ManifestMissing,
+    /// The manifest names a carried key `koto context add` would refuse.
+    BadKey,
+    /// The manifest gives a carried key a hash that isn't 64 lowercase hex
+    /// digits.
+    BadHash,
+    /// The bucket holds no object for a key the manifest names.
+    ObjectMissing,
+    /// A carried value read twice didn't match its manifest hash either
+    /// time.
+    HashMismatch,
+}
+
+impl std::fmt::Display for CarrySourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ManifestUnparsable => {
+                "the predecessor's context manifest in the bucket doesn't parse"
+            }
+            Self::ManifestMissing => {
+                "the bucket holds no context manifest for the predecessor, though its log records \
+                 keys to carry"
+            }
+            Self::BadKey => "the predecessor's context manifest names a key koto refuses",
+            Self::BadHash => "the predecessor's context manifest gives a key a malformed hash",
+            Self::ObjectMissing => {
+                "the bucket holds no object for a key the predecessor's context manifest names"
+            }
+            Self::HashMismatch => {
+                "a carried value in the bucket doesn't match the hash the predecessor's context \
+                 manifest gives it"
+            }
+        })
+    }
+}
+
+impl std::error::Error for CarrySourceError {}
+
+/// One key a carry copies from the predecessor, with the sha256 its manifest
+/// gives the key's value. Only [`CloudBackend::carry_plan`] builds one, after
+/// the key passed [`validate_context_key`] and the hash its shape check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CarryEntry {
+    key: String,
+    hash: String,
+}
+
+impl CarryEntry {
+    /// The key's name, validated.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Whether `hash` is a sha256 in the form the context store writes: 64
+/// lowercase hex digits.
+fn is_sha256_hex(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a workspace prefix or a predecessor id no key may be built from.
+fn check_carry_source(prefix: &str, pred: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_workspace_prefix(prefix),
+        "'{prefix}' isn't a workspace prefix"
+    );
+    validate_session_id(pred)?;
+    Ok(())
+}
 
 /// A predecessor's state file as the bucket holds it, pulled for the fence.
 pub(crate) struct PulledState {
@@ -320,50 +403,112 @@ impl CloudBackend {
         }
     }
 
-    /// Every key under each of `prefixes` in `pred`'s context under
-    /// workspace prefix `prefix`, with its value, read from the bucket: one
-    /// GET of the manifest, then one per key. Reserved keys are left out;
-    /// a key name that `koto context add` would refuse fails the read.
-    pub(crate) fn carry_source(
+    /// The keys a carry copies from `pred` under workspace prefix `prefix`,
+    /// sorted, each with its manifest hash: one GET of `pred`'s context
+    /// manifest, filtered as a sync filters it (host-local keys and pin
+    /// records out), then to the keys under each of `prefixes`, reserved
+    /// keys left out.
+    ///
+    /// A manifest the bucket doesn't hold is an empty plan, unless
+    /// `log_names_carried` says `pred`'s log records a key the carry would
+    /// take; then it is [`CarrySourceError::ManifestMissing`]. A manifest
+    /// that doesn't parse, names a key `koto context add` would refuse, or
+    /// gives a key a malformed hash is a [`CarrySourceError`], and a read
+    /// that fails is the [`BucketReadFailed`] from
+    /// [`CloudBackend::get_with_etag`].
+    pub(crate) fn carry_plan(
         &self,
         prefix: &str,
         pred: &str,
         prefixes: &[String],
-    ) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-        anyhow::ensure!(
-            is_workspace_prefix(prefix),
-            "'{prefix}' isn't a workspace prefix"
-        );
-        validate_session_id(pred)?;
-        let ctx = format!("{prefix}/{pred}/ctx/");
-        let manifest = match self.get_with_etag(&format!("{ctx}manifest.json"))? {
-            Some((bytes, _)) => {
-                let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
-                    anyhow::anyhow!("the bucket's context manifest of '{pred}' doesn't parse: {e}")
-                })?;
-                manifest.drop_host_local();
-                manifest.drop_pin_records();
-                manifest
+        log_names_carried: bool,
+    ) -> anyhow::Result<Vec<CarryEntry>> {
+        check_carry_source(prefix, pred)?;
+        let Some((bytes, _)) = self.get_with_etag(&format!("{prefix}/{pred}/ctx/manifest.json"))?
+        else {
+            if log_names_carried {
+                return Err(CarrySourceError::ManifestMissing.into());
             }
-            None => Manifest::default(),
+            return Ok(Vec::new());
         };
-        let keys: BTreeSet<&String> = manifest
-            .keys
-            .keys()
-            .filter(|k| prefixes.iter().any(|p| k.starts_with(p.as_str())))
-            .filter(|k| !is_reserved_key(k))
-            .collect();
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            validate_context_key(key).map_err(|e| {
-                anyhow::anyhow!("the bucket's context manifest of '{pred}' names a bad key: {e}")
-            })?;
-            let (value, _) = self.get_with_etag(&format!("{ctx}{key}"))?.ok_or_else(|| {
-                anyhow::anyhow!("the bucket holds no object for '{pred}''s key '{key}'")
-            })?;
-            out.push((key.clone(), value));
+        let mut manifest: Manifest =
+            serde_json::from_slice(&bytes).map_err(|_| CarrySourceError::ManifestUnparsable)?;
+        manifest.drop_host_local();
+        manifest.drop_pin_records();
+        let mut plan = Vec::new();
+        // A manifest's keys are a sorted map, so the plan comes out sorted.
+        for (key, meta) in manifest.keys {
+            if !prefixes.iter().any(|p| key.starts_with(p.as_str())) || is_reserved_key(&key) {
+                continue;
+            }
+            validate_context_key(&key).map_err(|_| CarrySourceError::BadKey)?;
+            if !is_sha256_hex(&meta.hash) {
+                return Err(CarrySourceError::BadHash.into());
+            }
+            plan.push(CarryEntry {
+                key,
+                hash: meta.hash,
+            });
         }
-        Ok(out)
+        Ok(plan)
+    }
+
+    /// The keys of `entries` this host's local store holds in `succ` with
+    /// the entry's hash, read from its manifest once. Neither the bucket
+    /// nor `succ`'s manifest there is read: a key counts as held only when
+    /// this host wrote it or already holds it with that hash. A local
+    /// manifest that can't be read holds nothing.
+    pub(crate) fn held_locally<'e>(
+        &self,
+        succ: &str,
+        entries: &'e [CarryEntry],
+    ) -> BTreeSet<&'e str> {
+        let Ok(local) = self.local.read_manifest(succ) else {
+            return BTreeSet::new();
+        };
+        entries
+            .iter()
+            .filter(|e| local.keys.get(&e.key).is_some_and(|m| m.hash == e.hash))
+            .map(|e| e.key.as_str())
+            .collect()
+    }
+
+    /// Read one chunk of plan entries (at most [`super::FLUSH_PARALLELISM`])
+    /// from `pred` under workspace prefix `prefix`, each GET on its own
+    /// scoped thread, and return each entry's value in entry order. The
+    /// threads only read.
+    ///
+    /// Each value is checked against its entry's hash before it is
+    /// returned; one that differs is read once more, in case the first read
+    /// caught the object mid-replace, and then is
+    /// [`CarrySourceError::HashMismatch`]. An object the bucket doesn't hold
+    /// is [`CarrySourceError::ObjectMissing`], read once; a read that fails
+    /// is the [`BucketReadFailed`] from [`CloudBackend::get_with_etag`].
+    pub(crate) fn fetch_carried(
+        &self,
+        prefix: &str,
+        pred: &str,
+        entries: &[CarryEntry],
+    ) -> Vec<anyhow::Result<Vec<u8>>> {
+        if let Err(e) = check_carry_source(prefix, pred) {
+            let reason = format!("{e:#}");
+            return entries
+                .iter()
+                .map(|_| Err(anyhow::anyhow!("{reason}")))
+                .collect();
+        }
+        each_in_parallel(entries, |entry| {
+            let key = format!("{prefix}/{pred}/ctx/{}", entry.key);
+            for _ in 0..2 {
+                let (value, _) = self
+                    .get_with_etag(&key)?
+                    .ok_or(CarrySourceError::ObjectMissing)?;
+                if sha256_hex(&value) == entry.hash {
+                    return Ok(value);
+                }
+            }
+            Err(CarrySourceError::HashMismatch.into())
+        })
     }
 
     /// Hold `session`'s writes in this process for one push, as a write
@@ -577,6 +722,106 @@ mod tests {
             format!("the bucket couldn't be read at {KEY}: status 204")
         );
         assert_eq!(answered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_manifest_hash_is_64_lowercase_hex_digits() {
+        let hash = crate::cache::sha256_hex(b"alpha");
+        assert!(is_sha256_hex(&hash));
+        assert!(!is_sha256_hex(&hash.to_uppercase()));
+        assert!(!is_sha256_hex(&hash[1..]));
+        assert!(!is_sha256_hex(&format!("{hash}0")));
+        assert!(!is_sha256_hex(&format!("{}g", &hash[1..])));
+        assert!(!is_sha256_hex(""));
+    }
+
+    #[test]
+    fn a_plan_is_refused_before_any_key_is_built_from_a_bad_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let prefixes = vec!["record/".to_string()];
+        assert!(backend
+            .carry_plan("../elsewhere", "p", &prefixes, true)
+            .is_err());
+        assert!(backend.carry_plan(PREFIX, "../p", &prefixes, true).is_err());
+        assert_eq!(answered.load(Ordering::SeqCst), 0);
+    }
+
+    /// The [`CarrySourceError`] a carry step returned.
+    fn source_error(e: &anyhow::Error) -> CarrySourceError {
+        *e.downcast_ref::<CarrySourceError>()
+            .unwrap_or_else(|| panic!("not a CarrySourceError: {e:#}"))
+    }
+
+    #[test]
+    fn a_missing_manifest_is_an_empty_plan_unless_the_log_names_a_carried_key() {
+        let prefixes = vec!["record/".to_string()];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, _) = scripted(&["404 Not Found"; 2]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        assert!(backend
+            .carry_plan(PREFIX, "p", &prefixes, false)
+            .unwrap()
+            .is_empty());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, _) = scripted(&["404 Not Found"; 2]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let e = backend
+            .carry_plan(PREFIX, "p", &prefixes, true)
+            .unwrap_err();
+        assert_eq!(source_error(&e), CarrySourceError::ManifestMissing);
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_parse_says_so_without_the_parser_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Every request is answered `alpha`, which isn't a manifest.
+        let (url, _) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let e = backend
+            .carry_plan(PREFIX, "p", &["record/".to_string()], false)
+            .unwrap_err();
+        assert_eq!(source_error(&e), CarrySourceError::ManifestUnparsable);
+        assert_eq!(
+            format!("{e:#}"),
+            CarrySourceError::ManifestUnparsable.to_string()
+        );
+    }
+
+    #[test]
+    fn a_fetched_value_is_returned_only_when_it_matches_its_hash() {
+        let entry = |hash: String| CarryEntry {
+            key: "record/a".to_string(),
+            hash,
+        };
+        // Every request is answered `alpha`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let got = backend.fetch_carried(PREFIX, "p", &[entry(crate::cache::sha256_hex(b"alpha"))]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref().unwrap(), b"alpha");
+        assert_eq!(answered.load(Ordering::SeqCst), 1);
+
+        // A value that differs from its hash on both reads.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let got = backend.fetch_carried(PREFIX, "p", &[entry(crate::cache::sha256_hex(b"beta"))]);
+        let e = got.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(source_error(&e), CarrySourceError::HashMismatch);
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+
+        // An object the bucket doesn't hold is read once.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&["404 Not Found"; 2]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let got = backend.fetch_carried(PREFIX, "p", &[entry(crate::cache::sha256_hex(b"alpha"))]);
+        let e = got.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(source_error(&e), CarrySourceError::ObjectMissing);
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
     }
 
     #[test]

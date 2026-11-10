@@ -5862,7 +5862,7 @@ mod continues;
 
 #[path = "cloud_supersede.rs"]
 mod supersede;
-pub(crate) use supersede::{check_fence_names, CloudFence, PulledState};
+pub(crate) use supersede::{check_fence_names, CarryEntry, CloudFence, PulledState};
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
@@ -7318,7 +7318,7 @@ fn response_etag(response: &s3::request::ResponseData) -> Option<String> {
 /// How many of a flush's independent requests (one per context key) are in
 /// flight at once. Each waits a full round trip, so a batch of many keys
 /// would otherwise cost the flush that many round trips in a row.
-const FLUSH_PARALLELISM: usize = 8;
+pub(crate) const FLUSH_PARALLELISM: usize = 8;
 
 /// Run `f` on every item, [`FLUSH_PARALLELISM`] at a time, and return the
 /// first error once every started call has finished. A chunk that fails

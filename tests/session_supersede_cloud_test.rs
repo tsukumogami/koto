@@ -192,20 +192,65 @@ impl Hosts {
 
     /// Create `p` on host 1 in W1, holding [`PRED_KEYS`].
     fn predecessor(&self) {
+        self.predecessor_with(&PRED_KEYS);
+    }
+
+    /// Create `p` on host 1 in W1, holding `keys`.
+    fn predecessor_with(&self, keys: &[(&str, &str)]) {
         self.ok(
             1,
             &self.w1,
             &["init", "p", "--template", self.template.to_str().unwrap()],
         );
-        for (key, value) in PRED_KEYS {
+        self.add_to_predecessor(keys);
+    }
+
+    /// Write `keys` in `p` on host 1 in W1, each pushed to the bucket.
+    fn add_to_predecessor(&self, keys: &[(&str, &str)]) {
+        for (key, value) in keys {
             let out = self
                 .cmd(1, &self.w1)
                 .args(["context", "add", "p", key])
-                .write_stdin(value)
+                .write_stdin(*value)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "context add {key}: {out:?}");
         }
+    }
+
+    /// The bucket key of `p`'s context key `key`.
+    fn pred_ctx(&self, key: &str) -> String {
+        format!("{}/p/ctx/{key}", prefix_of(&self.w1))
+    }
+
+    /// The bucket key of `s`'s context key `key`.
+    fn succ_ctx(&self, key: &str) -> String {
+        format!("{}/s/ctx/{key}", prefix_of(&self.w2))
+    }
+
+    /// The GETs recorded under `p`'s context, its manifest left out, in
+    /// arrival order.
+    fn carried_gets(&self) -> Vec<fake_s3::Request> {
+        let ctx = self.pred_ctx("");
+        let manifest = self.pred_ctx("manifest.json");
+        self.s3
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "GET" && r.key.starts_with(&ctx) && r.key != manifest)
+            .collect()
+    }
+
+    /// How many GETs of `p`'s context key `key` were recorded.
+    fn gets_of(&self, key: &str) -> usize {
+        let key = self.pred_ctx(key);
+        self.carried_gets().iter().filter(|r| r.key == key).count()
+    }
+
+    /// Whether the bucket holds the carry's completion marker in `s`.
+    fn has_marker(&self) -> bool {
+        self.s3
+            .object(&self.succ_ctx("koto/superseded-carry-complete"))
+            .is_some()
     }
 
     /// `koto init <succ> --continues p --continues-from W1 --supersede`
@@ -450,43 +495,227 @@ fn two_racing_successors_yield_one_fence_and_one_refusal() {
     assert!(h.s3.keys_under(&format!("{w2}/{other}/")).is_empty());
 }
 
-/// A carry that fails after the fence leaves the predecessor fenced; the
-/// same command run again creates nothing new, carries every key once, and
-/// a third run carries nothing.
+/// The carried keys of [`PRED_KEYS`], `coord/x` left out.
+fn carried_pred_keys() -> impl Iterator<Item = (&'static str, &'static str)> {
+    PRED_KEYS.into_iter().filter(|(k, _)| *k != "coord/x")
+}
+
+/// A carry whose read of one key keeps failing after the fence leaves the
+/// predecessor fenced and pushes the keys it did read, without the marker.
+/// The same command run again creates nothing new, reads only the key that
+/// failed (no GET of a key the first run carried), and carries just that
+/// one; a third run carries nothing.
 #[test]
 fn a_re_run_after_the_fence_finishes_the_carry_once() {
     let h = Hosts::new();
     h.predecessor();
-    let w1 = prefix_of(&h.w1);
-    let w2 = prefix_of(&h.w2);
-    h.s3.fail("GET", &format!("{w1}/p/ctx/record/a"), 500);
+    h.s3.fail("GET", &h.pred_ctx("record/a"), 500);
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(3), "{out:?}");
     assert_eq!(h.fences().len(), 1);
-    assert!(h
-        .s3
-        .object(&format!("{w2}/s/ctx/koto/superseded-carry-complete"))
-        .is_none());
+    assert!(!h.has_marker());
+    for (key, value) in carried_pred_keys() {
+        let object = h.s3.object(&h.succ_ctx(key));
+        if key == "record/a" {
+            assert!(object.is_none(), "record/a reached the successor");
+        } else {
+            assert_eq!(object.as_deref(), Some(value.as_bytes()), "{key}");
+        }
+    }
     h.s3.clear_faults();
+    h.s3.clear_requests();
 
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(0), "{out:?}");
     let body = printed_json(&out.stdout);
     assert_eq!(body["outcome"], "unchanged");
-    assert_eq!(body["carried"], 5);
-    assert!(h
-        .s3
-        .object(&format!("{w2}/s/ctx/koto/superseded-carry-complete"))
-        .is_some());
+    assert_eq!(body["carried"], 1);
+    assert!(h.has_marker());
     assert_eq!(
-        h.s3.object(&format!("{w2}/s/ctx/record/a")).as_deref(),
+        h.s3.object(&h.succ_ctx("record/a")).as_deref(),
         Some(&b"alpha"[..])
     );
+    let read: Vec<String> = h.carried_gets().into_iter().map(|r| r.key).collect();
+    assert_eq!(read, vec![h.pred_ctx("record/a")]);
 
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(0), "{out:?}");
     assert_eq!(printed_json(&out.stdout)["carried"], 0);
     assert_eq!(h.fences().len(), 1);
+}
+
+/// A key the successor's bucket manifest lists but this host's local store
+/// doesn't hold is read and written again, not skipped: only the local
+/// store says what is held. A carry that stopped pushed four keys; this
+/// host's local store then loses them, as a host without that copy would
+/// lack them, and the re-run reads all five.
+#[test]
+fn a_key_only_the_successor_s_bucket_manifest_lists_is_fetched() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail("GET", &h.pred_ctx("record/a"), 500);
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    h.s3.clear_faults();
+    let pushed: Value =
+        serde_json::from_slice(&h.s3.object(&h.succ_ctx("manifest.json")).unwrap()).unwrap();
+    let ctx = h.sessions(2).join("s").join("ctx");
+    let local_manifest = ctx.join("manifest.json");
+    let mut local: Value =
+        serde_json::from_slice(&std::fs::read(&local_manifest).unwrap()).unwrap();
+    for (key, _) in carried_pred_keys().filter(|(k, _)| *k != "record/a") {
+        assert!(pushed["keys"][key].is_object(), "{key}: {pushed}");
+        local["keys"].as_object_mut().unwrap().remove(key).unwrap();
+        std::fs::remove_file(ctx.join(key)).unwrap();
+    }
+    std::fs::write(&local_manifest, local.to_string()).unwrap();
+    h.s3.clear_requests();
+
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], 5);
+    for (key, value) in carried_pred_keys() {
+        assert_eq!(h.gets_of(key), 1, "{key}");
+        assert_eq!(
+            h.s3.object(&h.succ_ctx(key)).as_deref(),
+            Some(value.as_bytes())
+        );
+    }
+    assert!(h.has_marker());
+}
+
+/// The carry's GETs run in parallel. Every carried key's GET is held for
+/// `HOLD` before its reply goes out, so a serial carry could send each GET
+/// only after the previous one's reply, at least `HOLD` later. Asserting
+/// that a full chunk of GETs arrived within `HOLD` of the first proves they
+/// were in flight together without timing the whole command, so a slow
+/// machine only makes the margin smaller, never the assertion flaky in the
+/// other direction.
+#[test]
+fn a_carry_reads_its_keys_in_parallel() {
+    const CHUNK: usize = 8;
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(1);
+    let h = Hosts::new();
+    h.predecessor();
+    let extra: Vec<(String, String)> = (0..CHUNK)
+        .map(|i| (format!("record/p/{i}"), format!("value {i}")))
+        .collect();
+    let extra: Vec<(&str, &str)> = extra
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    h.add_to_predecessor(&extra);
+    let carried: Vec<&str> = carried_pred_keys()
+        .map(|(k, _)| k)
+        .chain(extra.iter().map(|(k, _)| *k))
+        .collect();
+    for key in &carried {
+        h.s3.hold("GET", &h.pred_ctx(key), HOLD);
+    }
+    h.s3.clear_requests();
+
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], carried.len());
+    let gets = h.carried_gets();
+    assert_eq!(gets.len(), carried.len(), "{gets:?}");
+    let first = gets[0].at;
+    for get in &gets[..CHUNK] {
+        assert!(
+            get.at.duration_since(first) < HOLD,
+            "{} arrived {:?} after the first GET",
+            get.key,
+            get.at.duration_since(first)
+        );
+    }
+    for (key, value) in &extra {
+        assert_eq!(
+            h.s3.object(&h.succ_ctx(key)).as_deref(),
+            Some(value.as_bytes())
+        );
+    }
+}
+
+/// A key whose GET fails one ask (two requests, given rust-s3's own retry)
+/// is asked again and carried.
+#[test]
+fn a_key_whose_read_fails_once_is_still_carried() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail_times("GET", &h.pred_ctx("record/a"), 503, 2);
+    h.s3.clear_requests();
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], 5);
+    assert_eq!(h.gets_of("record/a"), 3);
+    assert_eq!(
+        h.s3.object(&h.succ_ctx("record/a")).as_deref(),
+        Some(&b"alpha"[..])
+    );
+    assert!(h.has_marker());
+}
+
+/// A value whose bytes differ from the predecessor's manifest hash on both
+/// reads fails the carry and is written nowhere in the successor, neither
+/// in the bucket nor in the local store. One that differs only on the first
+/// read, as an object caught mid-replace would, is read again and carried.
+#[test]
+fn a_value_that_does_not_match_its_manifest_hash_is_never_carried() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.put(&h.pred_ctx("record/a"), b"tampered");
+    h.s3.clear_requests();
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    assert_eq!(h.gets_of("record/a"), 2);
+    assert!(!h.has_marker());
+    assert!(h.s3.object(&h.succ_ctx("record/a")).is_none());
+    let local = h.sessions(2).join("s").join("ctx");
+    assert!(
+        local.join("taken_legs").exists(),
+        "no key reached s locally"
+    );
+    assert!(!local.join("record").join("a").exists());
+
+    let h = Hosts::new();
+    h.predecessor();
+    let key = h.pred_ctx("record/a");
+    h.s3.put(&key, b"tampered");
+    h.s3.put_after("GET", &key, &key, b"alpha");
+    h.s3.clear_requests();
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], 5);
+    assert_eq!(h.gets_of("record/a"), 2);
+    assert_eq!(
+        h.s3.object(&h.succ_ctx("record/a")).as_deref(),
+        Some(&b"alpha"[..])
+    );
+}
+
+/// A predecessor whose bucket holds no context manifest fails the carry
+/// when its log records a key under a `--carry` prefix, since the carry
+/// would otherwise seal a copy of nothing behind the marker; one whose log
+/// records no such key carries nothing and finishes.
+#[test]
+fn a_missing_predecessor_manifest_fails_only_when_its_log_names_a_carried_key() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.remove(&h.pred_ctx("manifest.json"));
+    h.s3.clear_requests();
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    assert_eq!(h.fences().len(), 1);
+    assert!(!h.has_marker());
+    assert!(h.carried_gets().is_empty());
+
+    let h = Hosts::new();
+    h.predecessor_with(&[("coord/x", "coordinator only")]);
+    h.s3.remove(&h.pred_ctx("manifest.json"));
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], 0);
+    assert!(h.has_marker());
 }
 
 /// After the fence every write to the predecessor is refused
