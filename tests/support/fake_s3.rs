@@ -353,7 +353,8 @@ impl FakeS3 {
     /// Once, when the next `method` request for exactly `key` has been
     /// handled (a PUT's object stored), hold its reply for `duration`: the
     /// command that sent it waits there, with the request's effect already
-    /// in the bucket.
+    /// in the bucket. `method` `LIST` with a prefix as `key` holds the next
+    /// listing of exactly that prefix, as a stalled connection would.
     pub fn hold(&self, method: &str, key: &str, duration: Duration) {
         lock(&self.state).holds.push(Hold {
             method: method.to_string(),
@@ -565,28 +566,14 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     }
 }
 
-/// Forget, and return, the first hold `req` matches.
-fn take_hold(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Duration> {
+/// The method and key a hold or a trigger names `req` by: a listing is
+/// method `LIST` with its prefix as the key. `None` for a request outside
+/// the bucket.
+fn target<'a>(req: &'a Incoming, bucket: &str) -> Option<(&'a str, &'a str)> {
     let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
     let key = match rest.split_once('/') {
         Some((b, k)) if b == bucket => k,
         _ => return None,
-    };
-    let mut st = lock(state);
-    let at = st
-        .holds
-        .iter()
-        .position(|h| h.method == req.method && h.key == key)?;
-    Some(st.holds.remove(at).duration)
-}
-
-/// Run, and forget, the triggers `req` matches. A listing matches as
-/// method `LIST` with its prefix as the key.
-fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
-    let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
-    let key = match rest.split_once('/') {
-        Some((b, k)) if b == bucket => k,
-        _ => return,
     };
     let param = |name: &str| {
         req.query
@@ -594,10 +581,28 @@ fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     };
-    let (method, key) = if req.method == "GET" && param("list-type") == Some("2") {
+    Some(if req.method == "GET" && param("list-type") == Some("2") {
         ("LIST", param("prefix").unwrap_or_default())
     } else {
         (req.method.as_str(), key)
+    })
+}
+
+/// Forget, and return, the first hold `req` matches.
+fn take_hold(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Duration> {
+    let (method, key) = target(req, bucket)?;
+    let mut st = lock(state);
+    let at = st
+        .holds
+        .iter()
+        .position(|h| h.method == method && h.key == key)?;
+    Some(st.holds.remove(at).duration)
+}
+
+/// Run, and forget, the triggers `req` matches.
+fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
+    let Some((method, key)) = target(req, bucket) else {
+        return;
     };
     let mut st = lock(state);
     let (fired, kept): (Vec<Trigger>, Vec<Trigger>) = std::mem::take(&mut st.triggers)
