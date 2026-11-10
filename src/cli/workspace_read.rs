@@ -325,12 +325,13 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     /// The verbs `--workspace` reads through. Everything else refuses it.
-    const READ_VERBS: [&str; 6] = [
+    const READ_VERBS: [&str; 7] = [
         "status",
         "context get",
         "context exists",
         "context list",
         "decisions list",
+        "decisions show",
         "overrides list",
     ];
 
