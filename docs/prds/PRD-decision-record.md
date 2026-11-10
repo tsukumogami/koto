@@ -463,8 +463,9 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   its configuration; nothing here makes it run koto, read or write workflow state, or fail without
   koto.
 
-The requirements from R37 on were added for the second consumer. They're numbered after the
-non-functional ones so every earlier number keeps its meaning. One of them changes an earlier
+The requirements from R37 on were added for the second consumer. They come last in each list, R37
+to R47 here and R48 under Non-functional, and their numbers start after R36 so every earlier number
+keeps its meaning. One of them changes an earlier
 requirement on purpose: R47 narrows R7's harness identifier and the established decider in Terms
 to an id-shaped value, and both say so.
 
@@ -560,8 +561,9 @@ to an id-shaped value, and both say so.
 **The harness id and the tick's driver**
 
 - **R47.** koto records a session decider's harness identifier as `observed` only when
-  `CLAUDE_CODE_SESSION_ID` is id-shaped by the rule koto's run journal applies to a tick's driver,
-  and records it empty otherwise; only an id-shaped value establishes a decider (Terms). When
+  `CLAUDE_CODE_SESSION_ID` is id-shaped by the rule koto's run journal applies to a tick's driver
+  (1 to 128 characters, each a letter, a digit, `.`, `_`, `:` or `-`), and records it empty
+  otherwise; only an id-shaped value establishes a decider (Terms). When
   koto hands its gates the tick's driver id (#600), that value and the harness identifier a
   decision records in the same process are the same string, so a gate comparing a tick's driver
   with a decision's decider compares like with like. The record builds no driver variable and

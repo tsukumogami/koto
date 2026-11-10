@@ -417,8 +417,9 @@ JSON carrying `"v": 1`. New typed errors: `decider_missing`, `decision_exists`, 
 `invalid_decision`. `reversal_refused` gains the reason `supersede_unconfirmed` (R40), and every
 command refuses a fenced session with the existing `session_superseded` (R37). `list` gains a
 `--fenced <session>` filter for reversals whose standing path names a hop from that session (R41).
-Every subcommand takes its session as a positional argument and never reads it from the
-environment (R46).
+Every subcommand that acts on a session (`record`, `list`, `show`, `reverse`, `chain` and
+`import`) takes it as a positional argument and never reads it from the environment (R46);
+`report` spans sessions and narrows them only with `--below`.
 
 #### Alternatives Considered
 
@@ -811,7 +812,8 @@ R36's tick benchmark.
 
 The supersede marker and the fenced session's refusal, the forward step in the chain walk, standing
 through confirmed hops, the hop in the standing path, the tick's read of later members, and
-`koto decisions chain` (Decision 6). It needs Phases 4 and 5 for standing and the tick read.
+`koto decisions chain` (Decision 6). It needs Phases 4 and 5 for standing and the tick read, and
+Phases 6 and 7, since the fenced session's refusal covers the gate-passing commands and `import`.
 
 Deliverables: changes to `init_supersede.rs`, `links.rs`, `chain.rs`, `standing.rs`, the tick read
 and the CLI; tests for R37 to R43, R45 and R48.
