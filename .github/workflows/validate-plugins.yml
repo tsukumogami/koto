@@ -123,6 +123,13 @@ jobs:
           # a PATH of symlinks to only the commands the hook needs.
           bash plugins/koto-skills/hooks/test/session-start-workflows.test.sh
 
+      # Copied into .claude/shirabe-extensions/work-on.md (the /work-on verification map), with any deliberate differences noted there; change both together.
+      - name: Test the PreToolUse agent hook
+        run: |
+          # The suite brings its own stub koto and runs the hook under
+          # env -i, so it needs no build and no harness variables.
+          bash plugins/koto-skills/hooks/test/pre-tool-use-agent.test.sh
+
   schema-validation:
     name: Schema Validation
     if: ${{ github.event.pull_request.draft != true }}
