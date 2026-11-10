@@ -7321,25 +7321,41 @@ fn response_etag(response: &s3::request::ResponseData) -> Option<String> {
 const FLUSH_PARALLELISM: usize = 8;
 
 /// Run `f` on every item, [`FLUSH_PARALLELISM`] at a time, and return the
-/// first error once every started call has finished.
+/// first error once every started call has finished. A chunk that fails
+/// stops the run: no later chunk is started.
 fn in_parallel<T: Sync>(
     items: &[T],
     f: impl Fn(&T) -> anyhow::Result<()> + Sync,
 ) -> anyhow::Result<()> {
     for chunk in items.chunks(FLUSH_PARALLELISM) {
-        let results: Vec<anyhow::Result<()>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunk.iter().map(|item| scope.spawn(|| f(item))).collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("a cloud sync request panicked")))
-                })
-                .collect()
-        });
-        results.into_iter().collect::<anyhow::Result<()>>()?;
+        each_in_parallel(chunk, &f)
+            .into_iter()
+            .collect::<anyhow::Result<()>>()?;
     }
     Ok(())
+}
+
+/// Run `f` on every item, [`FLUSH_PARALLELISM`] at a time, and return each
+/// item's result in item order, not the order the calls finished in. Each
+/// chunk's calls all finish before the next chunk starts, and every chunk
+/// runs whatever an earlier one returned; a caller that should stop at a
+/// failure hands it one chunk at a time, as [`in_parallel`] does. A call
+/// that panicked is an error in its item's place.
+fn each_in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> anyhow::Result<R> + Sync,
+) -> Vec<anyhow::Result<R>> {
+    let mut results = Vec::with_capacity(items.len());
+    for chunk in items.chunks(FLUSH_PARALLELISM) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk.iter().map(|item| scope.spawn(|| f(item))).collect();
+            results.extend(handles.into_iter().map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a cloud sync request panicked")))
+            }));
+        });
+    }
+    results
 }
 
 /// Whether a sync failure must stop the command rather than warn: the
@@ -9651,5 +9667,60 @@ mod tests {
             backend.flush_pending("wf").unwrap();
             assert_eq!(endpoint.requests().len(), before);
         }
+    }
+
+    #[test]
+    fn each_in_parallel_returns_results_in_item_order() {
+        // Later items finish first within each chunk, and there are
+        // several chunks.
+        let items: Vec<u64> = (0..20).collect();
+        let results = each_in_parallel(&items, |&i| {
+            std::thread::sleep(std::time::Duration::from_millis(5 * (8 - i % 8)));
+            Ok(i * 10)
+        });
+        let got: Vec<u64> = results.into_iter().map(Result::unwrap).collect();
+        assert_eq!(got, items.iter().map(|i| i * 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn each_in_parallel_runs_every_chunk_and_maps_a_panic_to_an_error() {
+        let items: Vec<u32> = (0..12).collect();
+        let results = each_in_parallel(&items, |&i| match i {
+            2 => panic!("item 2"),
+            3 => anyhow::bail!("item 3"),
+            _ => Ok(i),
+        });
+        assert_eq!(results.len(), items.len());
+        for (i, result) in results.iter().enumerate() {
+            match i {
+                2 => assert_eq!(
+                    result.as_ref().unwrap_err().to_string(),
+                    "a cloud sync request panicked"
+                ),
+                3 => assert_eq!(result.as_ref().unwrap_err().to_string(), "item 3"),
+                _ => assert_eq!(*result.as_ref().unwrap(), i as u32),
+            }
+        }
+    }
+
+    #[test]
+    fn in_parallel_finishes_a_failing_chunk_and_starts_no_later_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..FLUSH_PARALLELISM * 3).collect();
+        let called = AtomicUsize::new(0);
+        let e = in_parallel(&items, |&i| {
+            called.fetch_add(1, Ordering::SeqCst);
+            match i {
+                // Fails in the second chunk, before its slower neighbours.
+                9 => anyhow::bail!("item 9"),
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Ok(())
+                }
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "item 9");
+        assert_eq!(called.load(Ordering::SeqCst), FLUSH_PARALLELISM * 2);
     }
 }

@@ -10,16 +10,22 @@
 //! a failed request) is [`CloudFence::Unavailable`] with nothing written:
 //! there is no unconditional fallback here, unlike an ordinary push.
 //!
+//! Every read here, the pull and each carried key, is one GET asked again
+//! while it fails with a transient error, as a listing is; one that still
+//! fails is a [`BucketReadFailed`] that keeps the bucket's error for the
+//! caller to class.
+//!
 //! Everything read from the bucket is data. The prefix is checked to be a
 //! workspace prefix and every name is validated before a key is built from
 //! it; the predecessor's log is parsed whole, and a carried key is checked
 //! as `koto context add` checks one.
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use super::{
-    is_not_found, is_precondition_failed, is_workspace_prefix, parse_source_log, response_etag,
-    without_url_userinfo, CloudBackend, S3Error,
+    asked_retrying, is_not_found, is_precondition_failed, is_transient, is_workspace_prefix,
+    parse_source_log, response_etag, without_url_userinfo, CloudBackend, S3Error,
 };
 use crate::engine::persistence::{
     append_supersede_fence, superseded_by, SessionSupersededError, SupersedeFence,
@@ -34,7 +40,46 @@ use crate::session::{state_file_name, SessionBackend};
 /// How long the fence waits for a local copy's append lock when it adds the
 /// fence there too. The bucket's fence already holds; this only makes the
 /// local copy refuse at once rather than at its next push.
-const LOCAL_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const LOCAL_FENCE_WAIT: Duration = Duration::from_secs(2);
+
+/// A read of `key` from the bucket that failed for good, after
+/// [`CloudBackend::get_with_etag`]'s retries, with the last ask's error kept
+/// whole so a caller can class it, in the [`super::ListingFailed`] style.
+/// Its message is the one the read always gave.
+#[derive(Debug)]
+pub(crate) struct BucketReadFailed {
+    /// The object's key.
+    pub key: String,
+    /// The last ask's error. A response the bucket answered with a status
+    /// other than 200 and no error is held as
+    /// [`S3Error::HttpFailWithBody`] with that status and its body.
+    pub source: S3Error,
+    /// How long the last ask took, so a transport failure that ran the
+    /// full request timeout can be told from one that failed at once.
+    /// Nothing classes a failed read yet.
+    #[allow(dead_code)]
+    pub took: Duration,
+}
+
+impl std::fmt::Display for BucketReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = &self.key;
+        match &self.source {
+            // rust-s3 fails every status outside 2xx itself, so a 2xx here
+            // is a response that came back without an error but wasn't a 200.
+            S3Error::HttpFailWithBody(status, _) if (200..300).contains(status) => {
+                write!(f, "the bucket couldn't be read at {key}: status {status}")
+            }
+            e => write!(
+                f,
+                "the bucket couldn't be read at {key}: {}",
+                without_url_userinfo(&e.to_string())
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BucketReadFailed {}
 
 /// A predecessor's state file as the bucket holds it, pulled for the fence.
 pub(crate) struct PulledState {
@@ -123,21 +168,44 @@ impl CloudBackend {
     }
 
     /// GET `key` with its ETag; `None` when the object isn't there.
+    ///
+    /// The GET is asked again as a listing is ([`asked_retrying`]) while it
+    /// fails with a [transient](is_transient) error, so a throttle or a
+    /// dropped connection costs a wait rather than the read. A response
+    /// other than a 200 counts as a failure of its status, so a 5xx the
+    /// bucket answered without an error is asked again too. A 404 or a 403
+    /// is asked once. A read that still fails is a [`BucketReadFailed`]
+    /// holding the last ask's error and how long that ask took.
     fn get_with_etag(&self, key: &str) -> anyhow::Result<Option<(Vec<u8>, String)>> {
-        match self.bucket.get_object(key) {
-            Ok(response) if response.status_code() == 200 => Ok(Some((
+        let fetched = asked_retrying(
+            || {
+                let started = Instant::now();
+                match self.bucket.get_object(key) {
+                    Ok(response) if response.status_code() == 200 => Ok(response),
+                    Ok(response) => Err((
+                        S3Error::HttpFailWithBody(
+                            response.status_code(),
+                            String::from_utf8_lossy(response.bytes()).into_owned(),
+                        ),
+                        started.elapsed(),
+                    )),
+                    Err(e) => Err((e, started.elapsed())),
+                }
+            },
+            is_transient,
+        );
+        match fetched {
+            Ok(response) => Ok(Some((
                 response.bytes().to_vec(),
                 response_etag(&response).unwrap_or_default(),
             ))),
-            Ok(response) if response.status_code() == 404 => Ok(None),
-            Err(e) if is_not_found(&e) => Ok(None),
-            failed => anyhow::bail!(
-                "the bucket couldn't be read at {key}: {}",
-                match failed {
-                    Ok(response) => format!("status {}", response.status_code()),
-                    Err(e) => without_url_userinfo(&e.to_string()),
-                }
-            ),
+            Err((e, _)) if is_not_found(&e) => Ok(None),
+            Err((source, took)) => Err(BucketReadFailed {
+                key: key.to_string(),
+                source,
+                took,
+            }
+            .into()),
         }
     }
 
@@ -390,4 +458,140 @@ pub(super) fn superseded_refusal(id: &str, data: &[u8], remote: &[u8]) -> Option
         }
         .into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::super::test_support::{cloud_backend_at, PREFIX};
+    use super::*;
+
+    const KEY: &str = "7e57000000000000/p/ctx/record/a";
+
+    /// An endpoint on a `127.0.0.1` port that answers its `n`th request
+    /// with `statuses[n]` and an empty body, and every request after the
+    /// script with a 200 carrying `b"alpha"` and an ETag. It returns the URL
+    /// and a count of the requests it has answered.
+    ///
+    /// rust-s3 asks a failed request once more on its own, a second later,
+    /// so one ask that fails is two requests here.
+    fn scripted(statuses: &[&'static str]) -> (String, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answered = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&answered);
+        let statuses = statuses.to_vec();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let n = counted.fetch_add(1, Ordering::SeqCst);
+                let (status, extra, body): (&str, &str, &[u8]) = match statuses.get(n) {
+                    Some(status) => (status, "", b""),
+                    None => ("200 OK", "ETag: \"e1\"\r\n", b"alpha"),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        (format!("http://{addr}"), answered)
+    }
+
+    /// The [`BucketReadFailed`] a failed read returned.
+    fn read_failure(e: &anyhow::Error) -> &BucketReadFailed {
+        e.downcast_ref::<BucketReadFailed>()
+            .unwrap_or_else(|| panic!("not a BucketReadFailed: {e:#}"))
+    }
+
+    #[test]
+    fn a_read_that_fails_transiently_is_asked_again_and_returns_the_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // One ask is a request and rust-s3's own retry of it: both fail,
+        // so only koto's second ask can reach the 200.
+        let (url, answered) = scripted(&["503 Slow Down", "503 Slow Down"]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let got = backend.get_with_etag(KEY).unwrap();
+        assert_eq!(got, Some((b"alpha".to_vec(), "e1".to_string())));
+        assert_eq!(answered.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_403_is_asked_once_and_fails_holding_the_403() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&["403 Forbidden"; 6]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let e = backend.get_with_etag(KEY).unwrap_err();
+        let failed = read_failure(&e);
+        assert_eq!(failed.key, KEY);
+        assert!(
+            matches!(failed.source, S3Error::HttpFailWithBody(403, _)),
+            "{:?}",
+            failed.source
+        );
+        assert!(
+            e.to_string()
+                .starts_with(&format!("the bucket couldn't be read at {KEY}: ")),
+            "{e}"
+        );
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_404_is_asked_once_and_reads_as_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&["404 Not Found"; 6]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        assert_eq!(backend.get_with_etag(KEY).unwrap(), None);
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_response_other_than_a_200_fails_with_its_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A 204 is a success to rust-s3, so it comes back without an error
+        // and without rust-s3's retry; it isn't a value, and isn't transient.
+        let (url, answered) = scripted(&["204 No Content"; 6]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let e = backend.get_with_etag(KEY).unwrap_err();
+        assert!(
+            matches!(read_failure(&e).source, S3Error::HttpFailWithBody(204, _)),
+            "{e:#}"
+        );
+        assert_eq!(
+            e.to_string(),
+            format!("the bucket couldn't be read at {KEY}: status 204")
+        );
+        assert_eq!(answered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_read_says_what_the_pull_always_said() {
+        let failed = BucketReadFailed {
+            key: format!("{PREFIX}/p/koto-p.state.jsonl"),
+            source: S3Error::HttpFailWithBody(500, "oops".to_string()),
+            took: Duration::ZERO,
+        };
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "the bucket couldn't be read at {PREFIX}/p/koto-p.state.jsonl: \
+                 Got HTTP 500 with content 'oops'"
+            )
+        );
+    }
 }
