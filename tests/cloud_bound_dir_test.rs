@@ -1526,3 +1526,48 @@ fn an_unreachable_bucket_still_reads_a_never_used_name_as_absent() {
     assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
     assert!(out.stdout.trim().is_empty(), "{}", out.describe());
 }
+
+/// One stalled listing doesn't hold a new name's lookup (koto#634). The
+/// lookup of a name no prefix holds lists every other workspace prefix;
+/// when one of those listings stalls, with no answer and no refusal, koto
+/// gives up on that request within a bound and asks again, so the lookup
+/// still answers absent. Without a bound of its own, a stalled request is
+/// abandoned only at the HTTP client's 30-second read timeout, and each
+/// listing may be asked six times before the lookup fails.
+#[test]
+fn a_stalled_prefix_listing_is_asked_again_within_a_bound() {
+    const NEVER: &str = "never_used";
+    // Longer than the client's read timeout, so the stalled request is
+    // abandoned rather than answered late; the hold covers one request, so
+    // the listing asked again is answered.
+    let stall = std::time::Duration::from_secs(40);
+    let bound = std::time::Duration::from_secs(25);
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{NEVER}/", prefixes[5]);
+
+    s3.hold("LIST", &listing, stall);
+    s3.clear_requests();
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
+    let took = started.elapsed();
+    assert!(
+        took < bound,
+        "the lookup of a new name waited {took:?} on one stalled listing of {listing:?}, \
+         past the {bound:?} bound: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+    assert!(out.stdout.trim().is_empty(), "{}", out.describe());
+    let asked = s3
+        .requests()
+        .iter()
+        .filter(|r| r.list_prefix.as_deref() == Some(listing.as_str()))
+        .count();
+    assert!(
+        asked >= 2,
+        "the stalled listing was asked {asked} time(s), never again"
+    );
+}

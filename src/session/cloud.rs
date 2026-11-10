@@ -236,10 +236,21 @@ const SLOW_SWEEP_HINT: &str = "hint: cloud sync: looking this session up listed 
      workspace prefix in the bucket; `koto session index audit` indexes the bucket's older \
      sessions so lookups can be answered from the name index instead";
 
-/// The request timeout of every request koto makes to the bucket. It is
-/// rust-s3's own default, set here so a crate upgrade can't move it under
+/// The request timeout of every request koto makes to the bucket, except a
+/// lookup's, which uses [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
+/// default, set here so a crate upgrade can't move it under
 /// [`list_retrying`]'s retry policy.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The request timeout of a lookup's requests ([`CloudBackend::held_elsewhere`]):
+/// the index listing, the declaration read, the top-level listing and every
+/// `<prefix>/<id>/` listing. Each is a small read, so one that hasn't
+/// answered in this long has stalled, and failing it here lets
+/// [`list_retrying`] and rust-s3 ask again on a fresh connection. Under
+/// [`REQUEST_TIMEOUT`] the transport's own 30 s read timeout dropped a
+/// stalled reply first, and the six requests a listing can make took about
+/// three minutes before it failed (koto#634); here they take about one.
+const LOOKUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
@@ -918,9 +929,15 @@ impl CloudBackend {
     /// holds, and the caller reports it rather than read the session as
     /// absent (koto#528). A failed index listing changes nothing: the
     /// sweep covers every prefix the index would have spared it.
+    ///
+    /// Every request the lookup makes is bounded by
+    /// [`LOOKUP_REQUEST_TIMEOUT`], so one stalled listing is asked again
+    /// within seconds instead of holding the lookup for minutes.
     fn held_elsewhere(&self, id: &str) -> anyhow::Result<bool> {
         use crate::session::name_index::Memo;
 
+        let bucket = lookup_bucket(&self.bucket)?;
+        let bucket = bucket.as_ref();
         let endpoint = self.bucket.region().endpoint();
         let bucket_name = self.bucket.name();
         let memo_dir = self.local.journal_root();
@@ -950,7 +967,7 @@ impl CloudBackend {
             index,
             declaration,
             top_level,
-        } = self.start_lookup(id, ask, remembered.is_none());
+        } = self.start_lookup(bucket, id, ask, remembered.is_none());
         if let (Some(dir), Some(read)) = (memo_dir, &declaration) {
             Memo::record(
                 dir,
@@ -966,7 +983,7 @@ impl CloudBackend {
         );
         let top_level = || match top_level {
             Some(listed) => listed,
-            None => top_level_prefixes(&self.bucket, &self.prefix),
+            None => top_level_prefixes(bucket, &self.prefix),
         };
 
         if declared {
@@ -974,9 +991,9 @@ impl CloudBackend {
             // listing changes nothing unless the sweep needs it.
             let read = index?;
             if !read.capped {
-                return any_holds(&self.bucket, id, &read.prefixes);
+                return any_holds(bucket, id, &read.prefixes);
             }
-            return self.sweep(id, &top_level()?, &[]);
+            return Self::sweep(bucket, id, &top_level()?, &[]);
         }
         let top_level = top_level()?;
 
@@ -985,7 +1002,7 @@ impl CloudBackend {
         // nothing.
         let confirmed_absent = match index {
             Ok(read) if !read.capped => {
-                if any_holds(&self.bucket, id, &read.prefixes)? {
+                if any_holds(bucket, id, &read.prefixes)? {
                     return Ok(true);
                 }
                 read.prefixes
@@ -994,7 +1011,7 @@ impl CloudBackend {
         };
 
         // Step 3, on an undeclared bucket.
-        self.sweep(id, &top_level, &confirmed_absent)
+        Self::sweep(bucket, id, &top_level, &confirmed_absent)
     }
 
     /// Whether [`CloudBackend::held_elsewhere`] reads the bucket as
@@ -1021,8 +1038,13 @@ impl CloudBackend {
     /// `koto-names/<id>/`, and with it, as asked for, the declaration read
     /// and the top-level listing, every one on its own thread so they cost
     /// one round trip.
-    fn start_lookup(&self, id: &str, declaration: DeclarationAsk, top_level: bool) -> LookupStart {
-        let bucket = &self.bucket;
+    fn start_lookup(
+        &self,
+        bucket: &Bucket,
+        id: &str,
+        declaration: DeclarationAsk,
+        top_level: bool,
+    ) -> LookupStart {
         let own = self.prefix.as_str();
         std::thread::scope(|scope| {
             let index = scope.spawn(|| read_index(bucket, id, own));
@@ -1048,7 +1070,7 @@ impl CloudBackend {
     /// [`SLOW_SWEEP_HINT_AFTER`] prints a hint on stderr naming the command
     /// that lets lookups skip it.
     fn sweep(
-        &self,
+        bucket: &Bucket,
         id: &str,
         top_level: &[String],
         confirmed_absent: &[String],
@@ -1059,7 +1081,7 @@ impl CloudBackend {
             .cloned()
             .collect();
         let started = std::time::Instant::now();
-        let held = any_holds(&self.bucket, id, &rest);
+        let held = any_holds(bucket, id, &rest);
         if started.elapsed() > SLOW_SWEEP_HINT_AFTER {
             eprintln!("{SLOW_SWEEP_HINT}");
         }
@@ -6802,6 +6824,13 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
     Ok(bucket)
 }
 
+/// A copy of `bucket` whose requests time out after
+/// [`LOOKUP_REQUEST_TIMEOUT`], for a lookup's small reads. It keeps the
+/// bucket's name, endpoint, credentials and addressing.
+fn lookup_bucket(bucket: &Bucket) -> anyhow::Result<Box<Bucket>> {
+    Ok(bucket.with_request_timeout(LOOKUP_REQUEST_TIMEOUT)?)
+}
+
 /// Whether an S3 error is a 404: the object (or bucket) isn't there.
 fn is_not_found(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(404, _))
@@ -8567,6 +8596,34 @@ mod tests {
             let bucket = create_bucket(&config).unwrap();
             assert!(!bucket.is_path_style());
             assert_eq!(bucket.request_timeout(), sixty, "{path_style:?}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_bucket_bounds_its_requests_and_keeps_the_addressing() {
+        let mut config = CloudConfig {
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            bucket: Some("sessions".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key: Some("k".to_string()),
+            secret_key: Some("s".to_string()),
+            path_style: Some(true),
+            marker_retain_days: None,
+            check_window_secs: None,
+        };
+        let ten = Some(std::time::Duration::from_secs(10));
+        for path_style in [Some(true), None, Some(false)] {
+            config.path_style = path_style;
+            let bucket = create_bucket(&config).unwrap();
+            let lookup = lookup_bucket(&bucket).unwrap();
+            assert_eq!(lookup.request_timeout(), ten, "{path_style:?}");
+            assert_eq!(lookup.is_path_style(), bucket.is_path_style());
+            assert_eq!(lookup.url(), bucket.url(), "{path_style:?}");
+            assert_eq!(
+                bucket.request_timeout(),
+                Some(std::time::Duration::from_secs(60)),
+                "the backend's own bucket keeps its timeout"
+            );
         }
     }
 

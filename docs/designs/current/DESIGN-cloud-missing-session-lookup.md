@@ -188,7 +188,8 @@ Key assumptions:
 - `LastModified` on a state object is reliable enough for the audit to tell
   "created after the audit started" from "created before".
 - rust-s3's default single retry and 60-second request timeout stay as they
-  are on the sync path.
+  are on the sync path. The lookup's own requests use a 10-second timeout
+  since koto#634.
 
 #### Chosen: A per-name index whose misses are trusted only on a declared bucket
 
@@ -432,11 +433,12 @@ Delegated to /decision.
 Every listing `held_elsewhere` makes goes through `list_retrying`: up to
 `LIST_ATTEMPTS` (3) asks while the failure is transient (429, 500, 502, 503,
 504, or a transport error, which includes a timeout), with 250 ms and then
-500 ms between asks. Under each ask sits rust-s3's default behavior, which
-`create_bucket` doesn't change: a 60-second request timeout and one retry a
-second later. So one listing is up to six requests, about 3.75 seconds on a
-bucket that throttles every time and about six minutes on one that accepts
-connections and never answers. The policy only ever runs against a bucket
+500 ms between asks. Under each ask sits rust-s3's one retry a second later,
+and since koto#634 a 10-second request timeout of the lookup's own
+(`LOOKUP_REQUEST_TIMEOUT`), where the sync path keeps 60 seconds. So one
+listing is up to six requests, about 3.75 seconds on a bucket that throttles
+every time and about a minute on one that accepts connections and never
+answers. The policy only ever runs against a bucket
 that has already answered the own-prefix probe, so its one choice is where
 the line falls between "answered" and "can't tell".
 
