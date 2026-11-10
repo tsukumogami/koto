@@ -8,8 +8,10 @@
 //! which Claude Code never read, so none of its hooks ran.
 //!
 //! The file registers one SessionStart group, which runs
-//! `hooks/session-start.sh` (it opens the agent session's anchor) and nothing
-//! else. The /workflows SessionStart script
+//! `hooks/session-start.sh` (it opens the agent session's anchor), and one
+//! PreToolUse group matching the Bash tool, which runs
+//! `hooks/pre-tool-use-agent.sh` (it tells koto which agent is running it),
+//! and nothing else. The /workflows SessionStart script
 //! (`hooks/session-start-workflows.sh`) and the Stop reminder
 //! (`hooks/stop-workflows.sh`) stay on disk and stay off: registering them
 //! would run a command at every session start and every turn end for every
@@ -108,8 +110,10 @@ fn plugin_hook_file_registers_only_the_anchor_and_agent_hooks() {
     let text = std::fs::read_to_string(root.join(HOOKS_FILE)).unwrap();
     let doc: Value = serde_json::from_str(&text).unwrap();
     let events = doc["hooks"].as_object().unwrap();
-    // serde_json's map iterates its keys sorted. PreToolUse is the agent
-    // hook's event, checked in plugin_hook_file_registers_the_agent_hook.
+    // serde_json's map iterates its keys sorted while the crate is built
+    // without its `preserve_order` feature; with it, the keys come in file
+    // order and this list must follow. PreToolUse is the agent hook's event,
+    // checked in plugin_hook_file_registers_the_agent_hook.
     assert_eq!(
         events.keys().collect::<Vec<_>>(),
         ["PreToolUse", "SessionStart"],

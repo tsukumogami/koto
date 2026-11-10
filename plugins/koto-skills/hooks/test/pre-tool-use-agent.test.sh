@@ -6,8 +6,9 @@
 # Every case runs the hook under `env -i`, so the only environment it sees is
 # the PATH, AI_AGENT and CLAUDE_CODE_SESSION_ATTENDED the case gives it; a
 # copy of the test runner's own harness variables can't leak in. The PATH is
-# a directory of symlinks to bash, cat and jq plus a stub `koto`, or the same
-# without jq, or without koto.
+# a directory of symlinks to bash, cat, jq and env plus a stub `koto`, or
+# the same without jq, or without koto. env is there for the rewritten
+# commands that start with it; the hook itself doesn't use it.
 #
 # A case either expects a rewrite or expects silence. For a rewrite, the hook
 # must exit 0 and print one JSON object whose only key is hookSpecificOutput,

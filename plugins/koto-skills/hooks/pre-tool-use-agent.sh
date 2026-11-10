@@ -9,8 +9,11 @@
 #
 #   KOTO_AGENT_ID=<agent>[ KOTO_RUN_MODE=<mode>] <command, byte for byte>
 #
-# The assignments reach only the first simple command, the koto call, and
-# no later child. The hook:
+# The assignments reach the first simple command, the koto call, and what
+# that call starts, but nothing later in the command line. That is why this
+# is a prefix and not an `export`: an exported value would reach every later
+# command too, including a nested agent session that would then report this
+# agent as its own. The hook:
 #
 #   1. gives up unless jq and koto are both on the PATH, the payload is a
 #      Bash call whose `tool_input.command` is a string, and that command
@@ -24,13 +27,20 @@
 #      Anything else names no agent, and the hook changes nothing;
 #   3. takes the run mode from `CLAUDE_CODE_SESSION_ATTENDED`, which the
 #      harness sets for every hook to 1 or 0, under the same `AI_AGENT`
-#      check: 1 is attended, 0 unattended, anything else no run mode;
+#      check: 1 is attended, 0 unattended, anything else no run mode. The
+#      decision-record design says to set a run mode only once the harness
+#      reports one, and says it doesn't; Claude Code 2.1.322 does, through
+#      this variable, so this is that report and not a guess. Should it go
+#      away, the hook sets no run mode and koto records `unknown`;
 #   4. rewrites the command only when its first simple command runs koto:
 #      optional plain `NAME=value` assignments, an optional bare `env` with
 #      more of them, then `koto`, `"koto"`, `'koto'` or a plain path ending
 #      in `/koto`, then the end of the line, a blank, `;`, `|` or `&`.
 #      Anything it can't classify (a `cd` first, a subshell, a group,
-#      `time`, `sudo`, quoting or expansion in an assignment) is left alone;
+#      `time`, `sudo`, quoting or expansion in an assignment) is left alone,
+#      and only the first koto of `koto a && koto b` gets the prefix: koto
+#      records such calls' agent as `unknown`, which is allowed, where a
+#      wrong guess about a command's shape could change what it runs;
 #   5. prints `updatedInput` with the whole `tool_input`, only `command`
 #      changed, and no permission decision, so the usual permission checks
 #      still run on the rewritten command.
@@ -48,7 +58,12 @@ payload="$(cat)"
 
 # One jq pass returns three lines: whether the call is a candidate, the
 # agent (`absent`, `bad`, or `id:<id>` with the id already pattern-checked)
-# and the command's first line, which is all the matcher reads.
+# and the command's first line, which is all the matcher reads, since every
+# shape it accepts ends within that line. The id is checked here, with
+# \A and \z, because `$( )` below strips trailing newlines and a bash check
+# alone would pass "sub-1\n"; bash checks it again before use all the same.
+# A command holding a NUL byte is refused because bash can't hold one, so
+# the matcher would read a different string from the one that runs.
 fields="$(printf '%s' "$payload" | jq -r '
   def is_id: type == "string" and length <= 255
     and test("\\A[a-zA-Z0-9][a-zA-Z0-9._-]*\\z");
@@ -121,6 +136,9 @@ koto_re="^[ 	]*(${assign})*(env[ 	]+(${assign})*)?${koto_word}([ 	;|&]|\$)"
 
 prefix="KOTO_AGENT_ID=$agent "
 [ -n "$run_mode" ] && prefix+="KOTO_RUN_MODE=$run_mode "
+
+# The new command is built from the payload inside jq, never from a bash
+# copy, so the original survives byte for byte, trailing newlines included.
 
 printf '%s' "$payload" | jq -c --arg p "$prefix" '{
   hookSpecificOutput: {
