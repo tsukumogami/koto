@@ -31,6 +31,7 @@ rationale: |
   code with a class-chosen exit lets a caller that keeps only the exit tell a
   retry-worthy network failure from a lock or bad-data failure, which
   reusing `persistence_error` or exit 3 cannot do.
+upstream: docs/briefs/BRIEF-takeover-carry.md
 ---
 
 # DESIGN: Takeover carry on the cloud backend
