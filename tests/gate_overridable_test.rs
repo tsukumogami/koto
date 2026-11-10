@@ -23,7 +23,10 @@ fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = koto_command::koto();
     // A fixed harness session, so a gate pass (an override, or a `--to`
     // past an overridable gate) has an established decider.
-    cmd.env("CLAUDE_CODE_SESSION_ID", "0f0e0d0c-1111-4222-8333-444455556666");
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
     cmd.env_remove("KOTO_ANCHOR");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
