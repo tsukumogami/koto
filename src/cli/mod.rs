@@ -10,6 +10,7 @@ pub mod dashboard_state;
 pub mod decider;
 pub mod decider_answer;
 pub mod decider_port;
+pub mod decisions;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
@@ -104,8 +105,9 @@ pub struct App {
     /// Read a session in another workspace's part of the cloud bucket, in
     /// place and without importing it. Takes the workspace's id (its 16-hex
     /// prefix in the bucket) or its absolute path, and goes before the
-    /// verb. Only `status`, `context get`, `context exists` and `context
-    /// list` accept it; every other verb refuses it.
+    /// verb. Only `status`, `context get`, `context exists`, `context
+    /// list`, `decisions list`, `decisions show` and `overrides list` accept
+    /// it; every other verb refuses it.
     #[arg(long, value_name = "ID")]
     pub workspace: Option<String>,
 
@@ -1243,18 +1245,32 @@ pub enum TemplateSubcommand {
 
 #[derive(Subcommand)]
 pub enum DecisionsSubcommand {
-    /// Record a structured decision without advancing state
+    /// Record a decision: `--kind` and `--outcome` write a write-once
+    /// decision key; `--with-data` records the current state's choice as
+    /// before
     Record {
-        /// Workflow name
+        /// Session name
         name: String,
         /// Decision data as JSON (must include "choice" and "rationale" fields)
-        #[arg(long = "with-data")]
-        with_data: String,
+        #[arg(long = "with-data", conflicts_with = "kind")]
+        with_data: Option<String>,
+        #[command(flatten)]
+        decision: decisions::RecordArgs,
     },
-    /// List accumulated decisions for the current state
+    /// List decisions: with no flag, the current state's choices as before;
+    /// with `--format v1` or any filter, the session's decision keys
     List {
-        /// Workflow name
+        /// Session name
         name: String,
+        #[command(flatten)]
+        filters: decisions::ListArgs,
+    },
+    /// Show one decision, by session name and id, with its status
+    Show {
+        /// Session name
+        name: String,
+        /// Decision id
+        id: String,
     },
 }
 
@@ -2900,19 +2916,69 @@ pub fn run(app: App) -> Result<()> {
         Command::Decisions { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
-                DecisionsSubcommand::Record { name, with_data } => {
+                DecisionsSubcommand::Record {
+                    name,
+                    with_data,
+                    decision,
+                } => {
                     refuse_if_unlocated(&backend, &name, "decisions record");
                     refuse_if_superseded(&backend, &name, "decisions record");
-                    handle_decisions_record(&backend, name, with_data)
-                }
-                DecisionsSubcommand::List { name } => {
-                    let read = || Command::Decisions {
-                        subcommand: DecisionsSubcommand::List { name: name.clone() },
-                    };
-                    if let Some(served) = locate_or_serve(&backend, &name, "decisions list", read) {
-                        return served;
+                    match with_data {
+                        Some(with_data) if !decision.any() => {
+                            handle_decisions_record(&backend, name, with_data)
+                        }
+                        Some(_) => exit_with_error_code(
+                            serde_json::json!({
+                                "error": "--with-data records a state choice and takes none of \
+                                          the decision flags",
+                                "code": crate::decisions::codes::INVALID_DECISION,
+                                "field": "with_data",
+                                "command": "decisions record"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        ),
+                        None => decisions::handle_record(&backend, &name, decision),
                     }
-                    handle_decisions_list(&backend, name)
+                }
+                DecisionsSubcommand::List { name, filters } => {
+                    // A read of decision keys reads files only; under the
+                    // cloud backend it still goes through the locate check,
+                    // which answers for a session imported elsewhere.
+                    let new_form = filters.any();
+                    if !new_form || matches!(backend, Backend::Cloud(_)) {
+                        let read = || Command::Decisions {
+                            subcommand: DecisionsSubcommand::List {
+                                name: name.clone(),
+                                filters: filters.clone(),
+                            },
+                        };
+                        if let Some(served) =
+                            locate_or_serve(&backend, &name, "decisions list", read)
+                        {
+                            return served;
+                        }
+                    }
+                    if new_form {
+                        decisions::handle_list(&backend, &name, &filters)
+                    } else {
+                        handle_decisions_list(&backend, name)
+                    }
+                }
+                DecisionsSubcommand::Show { name, id } => {
+                    if matches!(backend, Backend::Cloud(_)) {
+                        let read = || Command::Decisions {
+                            subcommand: DecisionsSubcommand::Show {
+                                name: name.clone(),
+                                id: id.clone(),
+                            },
+                        };
+                        if let Some(served) =
+                            locate_or_serve(&backend, &name, "decisions show", read)
+                        {
+                            return served;
+                        }
+                    }
+                    decisions::handle_show(&backend, &name, &id)
                 }
             }
         }
@@ -8847,7 +8913,10 @@ fn handle_decisions_list(backend: &Backend, name: String) -> Result<()> {
         // in the bucket.
         Err(err) if err.is::<crate::session::SessionMigrated>() => {
             let read = Command::Decisions {
-                subcommand: DecisionsSubcommand::List { name },
+                subcommand: DecisionsSubcommand::List {
+                    name,
+                    filters: Default::default(),
+                },
             };
             return workspace_read::serve_migrated_source(backend, read, err);
         }

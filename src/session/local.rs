@@ -642,6 +642,31 @@ impl LocalBackend {
         Ok(())
     }
 
+    /// Run `f` inside `session`'s `ctx/manifest.lock` critical section,
+    /// the lock every context write takes. The decision writer allocates
+    /// and publishes under it, so two writers in one session serialize and
+    /// their ids follow commit order (DESIGN-decision-record.md, Decision 1).
+    pub(crate) fn with_manifest_lock<T>(
+        &self,
+        session: &str,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let ctx_dir = self.ctx_dir(session);
+        fs::create_dir_all(&ctx_dir)
+            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
+        #[cfg(unix)]
+        let manifest_lock = Self::acquire_flock(&self.manifest_lock_path(session))?;
+        let out = f();
+        #[cfg(unix)]
+        Self::release_flock(&manifest_lock);
+        out
+    }
+
+    /// The `ctx/` directory of `session`.
+    pub(crate) fn ctx_path(&self, session: &str) -> PathBuf {
+        self.ctx_dir(session)
+    }
+
     /// Acquire an exclusive advisory flock on the given path (blocking).
     ///
     /// Creates the lock file if it doesn't exist. Returns the open File
@@ -707,6 +732,7 @@ impl LocalBackend {
         if let Some(writer) = writer {
             crate::session::links::check_writer_key(key, writer)?;
         }
+        crate::session::links::check_decision_key(key)?;
         validate_context_key(key)?;
 
         let ctx_dir = self.ctx_dir(session);
@@ -801,6 +827,7 @@ impl ContextStore for LocalBackend {
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        crate::session::links::check_decision_key(key)?;
         validate_context_key(key)?;
 
         let content_path = self.content_path(session, key);

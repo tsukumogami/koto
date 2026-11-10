@@ -116,10 +116,21 @@ pub fn is_reserved_key(key: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservedKeyError {
     pub key: String,
+    /// The key lies in a decision area, which no writer may change or
+    /// remove, koto's own included.
+    pub write_once: bool,
 }
 
 impl std::fmt::Display for ReservedKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.write_once {
+            return write!(
+                f,
+                "context key '{}' is a decision key: decision keys are write-once, so no \
+                 writer may change or remove one, and only koto's decision commands write them",
+                self.key
+            );
+        }
         write!(
             f,
             "context key '{}' is under the reserved prefix '{}': only koto writes keys there, \
@@ -131,16 +142,35 @@ impl std::fmt::Display for ReservedKeyError {
 
 impl std::error::Error for ReservedKeyError {}
 
-/// Refuse a write or removal of a reserved key by the agent writer.
+/// Refuse a write or removal of a reserved key by the agent writer, and of
+/// a key in a decision area by any writer.
 ///
 /// Called from the context store's write path (the local and cloud stores'
 /// writes and [`ContextStore::remove_with_writer`]), so every caller of the
-/// store meets it. Every other writer passes: koto's own, a transition's,
-/// and a cloud pull's.
+/// store meets it. Outside the decision areas every other writer passes:
+/// koto's own, a transition's, and a cloud pull's. Decisions are written
+/// only by [`crate::decisions::store`], which never goes through a context
+/// store.
 pub fn check_writer_key(key: &str, writer: &str) -> Result<(), ReservedKeyError> {
+    check_decision_key(key)?;
     if writer == WRITER_AGENT && is_reserved_key(key) {
         return Err(ReservedKeyError {
             key: key.to_string(),
+            write_once: false,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a context-store write or removal of `key` when it lies in a
+/// decision area ([`crate::decisions::is_decision_area_key`]), whoever the
+/// writer is. The stores call this from their writer-less primitives too,
+/// so nothing that goes through a context store reaches a decision file.
+pub fn check_decision_key(key: &str) -> Result<(), ReservedKeyError> {
+    if crate::decisions::is_decision_area_key(key) {
+        return Err(ReservedKeyError {
+            key: key.to_string(),
+            write_once: true,
         });
     }
     Ok(())
@@ -207,7 +237,7 @@ impl LinkHints {
         Self::from_state_file(&path)
     }
 
-    fn from_state_file(path: &Path) -> Self {
+    pub(crate) fn from_state_file(path: &Path) -> Self {
         let Ok(header) = crate::engine::persistence::read_header(path) else {
             return Self::default();
         };
@@ -248,6 +278,13 @@ pub struct LinkBody {
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was: Option<String>,
+    /// How koto wrote a dispatched-by link: `leg` (a request-leg bind, from
+    /// the requester), `init` (`koto init --dispatched-by`), `link` (`koto
+    /// session link`) or `anchor` (into an anchor as it opened). A decision's
+    /// chain snapshot labels each hop with it (PRD-decision-record.md, R12).
+    /// Absent on links written before koto recorded it, and on other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// A link body's `prefix`: absent from every kind but continues, `null`
@@ -346,6 +383,22 @@ pub fn write_link<S>(
 where
     S: ContextStore + SessionBackend,
 {
+    write_link_via(store, session, kind, peer, hints, None)
+}
+
+/// [`write_link`], recording in the body how koto wrote the link (its
+/// [`LinkBody::via`]).
+pub fn write_link_via<S>(
+    store: &S,
+    session: &str,
+    kind: LinkKind,
+    peer: &str,
+    hints: &LinkHints,
+    via: Option<&str>,
+) -> anyhow::Result<LinkWrite>
+where
+    S: ContextStore + SessionBackend,
+{
     validate_peer(kind, peer)?;
     if peer == session {
         return Err(InvalidPeerError {
@@ -372,6 +425,7 @@ where
         holder_session_id: None,
         at: crate::engine::types::now_iso8601(),
         was: None,
+        via: via.map(str::to_string),
     };
     let content = serde_json::to_vec(&body)?;
     store.add_with_writer(session, &key, &content, WRITER_KOTO)?;
@@ -500,6 +554,7 @@ where
         holder_session_id: hints.holder_session_id.clone(),
         at: crate::engine::types::now_iso8601(),
         was: None,
+        via: None,
     };
     let key = link_key(kind, pred);
     let content = serde_json::to_vec(&body)?;
@@ -1024,6 +1079,7 @@ mod tests {
             holder_session_id: None,
             at: "x".to_string(),
             was: None,
+            via: None,
         })
         .unwrap();
         assert!(plain.get("prefix").is_none() && plain.get("holder_session_id").is_none());

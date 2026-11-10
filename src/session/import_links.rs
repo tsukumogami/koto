@@ -186,6 +186,7 @@ impl ImportRelation<'_> {
             holder_session_id: Some(self.holder_session_id.to_string()).filter(|id| !id.is_empty()),
             at: crate::engine::types::now_iso8601(),
             was: None,
+            via: None,
         };
         serde_json::to_vec(&body).expect("LinkBody serialize is infallible")
     }
@@ -338,6 +339,7 @@ impl Settlement<'_> {
                             holder_session_id: None,
                             at: crate::engine::types::now_iso8601(),
                             was: Some(anchor.clone()),
+                            via: None,
                         };
                         let content =
                             serde_json::to_vec(&body).expect("LinkBody serialize is infallible");
