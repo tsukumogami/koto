@@ -103,15 +103,17 @@ fn plugin_hook_file_is_matcher_group_shaped_and_keeps_old_hooks_off() {
 }
 
 #[test]
-fn plugin_hook_file_registers_only_the_anchor_hook() {
+fn plugin_hook_file_registers_only_the_anchor_and_agent_hooks() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join(HOOKS_FILE)).unwrap();
     let doc: Value = serde_json::from_str(&text).unwrap();
     let events = doc["hooks"].as_object().unwrap();
+    // serde_json's map iterates its keys sorted. PreToolUse is the agent
+    // hook's event, checked in plugin_hook_file_registers_the_agent_hook.
     assert_eq!(
         events.keys().collect::<Vec<_>>(),
-        ["SessionStart"],
-        "{HOOKS_FILE} registers an event other than SessionStart"
+        ["PreToolUse", "SessionStart"],
+        "{HOOKS_FILE} registers an event other than SessionStart and PreToolUse"
     );
     let groups = events["SessionStart"].as_array().unwrap();
     assert_eq!(
@@ -134,6 +136,47 @@ fn plugin_hook_file_registers_only_the_anchor_hook() {
         root.join("plugins/koto-skills/hooks/session-start.sh")
             .is_file(),
         "hooks/session-start.sh is missing"
+    );
+}
+
+#[test]
+fn plugin_hook_file_registers_the_agent_hook() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join(HOOKS_FILE)).unwrap();
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    let groups = doc["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("hooks.json has no PreToolUse groups");
+    assert_eq!(
+        groups.len(),
+        1,
+        "{HOOKS_FILE} has more than one PreToolUse group"
+    );
+    assert_eq!(
+        groups[0]["matcher"].as_str(),
+        Some("Bash"),
+        "the PreToolUse group matches something other than the Bash tool"
+    );
+    let hooks = groups[0]["hooks"].as_array().unwrap();
+    assert_eq!(
+        hooks.len(),
+        1,
+        "the PreToolUse group runs more than one command"
+    );
+    assert_eq!(hooks[0]["type"].as_str(), Some("command"));
+    assert_eq!(
+        hooks[0]["command"].as_str(),
+        Some(r#"bash "${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use-agent.sh""#),
+        "the PreToolUse group runs something other than hooks/pre-tool-use-agent.sh"
+    );
+    assert!(
+        hooks[0]["timeout"].is_u64(),
+        "the PreToolUse hook has no timeout in seconds"
+    );
+    assert!(
+        root.join("plugins/koto-skills/hooks/pre-tool-use-agent.sh")
+            .is_file(),
+        "hooks/pre-tool-use-agent.sh is missing"
     );
 }
 
