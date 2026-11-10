@@ -84,6 +84,18 @@ impl Listing {
     }
 }
 
+/// Whether `id` can name a `koto/aimed/<id>/` directory: a header session
+/// id (a UUID today) is 1 to 128 characters from `A-Z a-z 0-9 . _ ~ -`,
+/// not starting with `.`, so it is one path component that can't climb.
+pub fn is_target_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+}
+
 /// The directory a context key's file sits at in `ctx_dir`.
 fn key_path(ctx_dir: &Path, key: &str) -> PathBuf {
     key.split('/').fold(ctx_dir.to_path_buf(), |p, c| p.join(c))
@@ -205,7 +217,7 @@ pub fn list_local(ctx_dir: &Path) -> Listing {
                         listing.problem = Some(e);
                         return listing;
                     }
-                    if crate::session::validate::validate_session_id(&target).is_err() {
+                    if !is_target_id(&target) {
                         listing.problem =
                             Some(format!("aimed target '{target}' isn't a session id"));
                         return listing;
@@ -276,12 +288,19 @@ pub fn merge_remote(listing: &mut Listing, remote: Vec<RemoteObject>) {
 /// The listing of `session`'s areas: the local copy, and under the cloud
 /// backend the bucket's objects too. Writes nothing anywhere.
 pub fn list(backend: &Backend, session: &str) -> Listing {
+    list_with(backend, session, true)
+}
+
+/// [`list`], reaching the bucket only when `remote` is set. A scan that
+/// reads every session on the host passes `false` for all but one pass, so
+/// a command makes at most one bucket listing per session.
+pub fn list_with(backend: &Backend, session: &str, remote: bool) -> Listing {
     let local_dir = match backend {
         Backend::Local(l) => l.ctx_path(session),
         Backend::Cloud(c) => c.local().ctx_path(session),
     };
     let mut listing = list_local(&local_dir);
-    if let Backend::Cloud(cloud) = backend {
+    if let (true, Backend::Cloud(cloud)) = (remote, backend) {
         match cloud.decision_objects(session) {
             Ok(objects) => merge_remote(&mut listing, objects),
             Err(e) => {
@@ -295,14 +314,37 @@ pub fn list(backend: &Backend, session: &str) -> Listing {
     listing
 }
 
-/// Record a decision in `session`: allocate the next id under the
-/// session's manifest lock, build the body for it with `build`, and publish
-/// it create-only. Returns the body as stored.
+/// Record a decision in `session`'s `koto/decisions/` area: allocate the
+/// next id under the session's manifest lock, build the body for it with
+/// `build`, and publish it create-only. Returns the body as stored.
+///
+/// It first repeats the check for reversals `session` recorded that lost
+/// their race (R19), so every decision command in a session that lost one
+/// records its refusal; see [`super::standing::settle`].
 pub fn write(
     backend: &Backend,
     session: &str,
     build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
 ) -> Result<DecisionBody, DecisionError> {
+    super::standing::settle(backend, session);
+    write_in(backend, session, &Area::Decisions, build)
+}
+
+/// [`write`] into `area`, without the repeat check.
+pub fn write_in(
+    backend: &Backend,
+    session: &str,
+    area: &Area,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+) -> Result<DecisionBody, DecisionError> {
+    if let Area::Aimed(target) = area {
+        if !is_target_id(target) {
+            return Err(DecisionError::invalid(
+                "target",
+                "the target session id can't name an aimed area",
+            ));
+        }
+    }
     let local = match backend {
         Backend::Local(l) => l,
         Backend::Cloud(c) => c.local(),
@@ -342,7 +384,7 @@ pub fn write(
                     format!("the decision body is larger than {MAX_BODY_BYTES} bytes"),
                 )));
             }
-            let key = Area::Decisions.key(&id);
+            let key = area.key(&id);
             if let Backend::Cloud(cloud) = backend {
                 if let Err(e) = cloud.put_decision_object(session, &key, &bytes) {
                     return Ok(Err(e));
@@ -451,6 +493,17 @@ mod tests {
         );
         assert_eq!(Area::of_key("koto/decisions/a/b"), None);
         assert_eq!(Area::of_key("koto/links/x"), None);
+    }
+
+    #[test]
+    fn a_header_session_id_names_an_aimed_area_and_a_climb_does_not() {
+        assert!(is_target_id("1a304ea0-f1ad-4779-acef-105b4dface95"));
+        assert!(is_target_id("target-session"));
+        assert!(!is_target_id(""));
+        assert!(!is_target_id(".."));
+        assert!(!is_target_id("../x"));
+        assert!(!is_target_id("a/b"));
+        assert!(!is_target_id(&"a".repeat(129)));
     }
 
     #[cfg(unix)]

@@ -11,7 +11,7 @@
 //! no lock, no pull and no write, so it changes no session it passes
 //! (R16). It reads no workspace-manager file (R13).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,8 @@ struct Walk<'a> {
     store: &'a dyn SessionBackend,
     seen: BTreeSet<String>,
     snapshot: ChainSnapshot,
+    /// For each listed session, the session whose link reached it.
+    reached_from: BTreeMap<String, String>,
 }
 
 impl Walk<'_> {
@@ -137,7 +139,7 @@ impl Walk<'_> {
 
     /// List `peer`, reached by a link written `via`, unless it is already
     /// listed or missing. Returns whether it was listed.
-    fn visit(&mut self, peer: &str, via: String) -> bool {
+    fn visit(&mut self, from: &str, peer: &str, via: String) -> bool {
         if self.seen.contains(peer) {
             return false;
         }
@@ -150,6 +152,7 @@ impl Walk<'_> {
             return false;
         }
         self.seen.insert(peer.to_string());
+        self.reached_from.insert(peer.to_string(), from.to_string());
         self.snapshot.links.push(ChainLink {
             session: peer.to_string(),
             via,
@@ -167,7 +170,7 @@ impl Walk<'_> {
                 continue;
             };
             for (peer, body) in found {
-                if self.visit(&peer, dispatched_via(body.as_ref())) {
+                if self.visit(&current, &peer, dispatched_via(body.as_ref())) {
                     queue.push_back(peer);
                 }
             }
@@ -177,10 +180,53 @@ impl Walk<'_> {
 
 /// The chain above `session`, as it stands now.
 pub fn snapshot(store: &dyn SessionBackend, session: &str) -> ChainSnapshot {
+    walk(store, session).snapshot
+}
+
+/// One step of the path a reversal's standing came through: `to` is
+/// reached from `session` by a link written `via`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathStep {
+    pub session: String,
+    pub via: String,
+    pub to: String,
+}
+
+/// The steps the chain walk from `from` takes to reach `to`, as the links
+/// stand now, or `None` when the walk doesn't reach it.
+pub fn path(store: &dyn SessionBackend, from: &str, to: &str) -> Option<Vec<PathStep>> {
+    let walk = walk(store, from);
+    let via_of = |s: &str| {
+        walk.snapshot
+            .links
+            .iter()
+            .find(|l| l.session == s)
+            .map(|l| l.via.clone())
+    };
+    let mut steps = Vec::new();
+    let mut current = to.to_string();
+    while current != from {
+        let parent = walk.reached_from.get(&current)?.clone();
+        steps.push(PathStep {
+            session: parent.clone(),
+            via: via_of(&current)?,
+            to: current,
+        });
+        current = parent;
+        if steps.len() > MAX_CHAIN {
+            return None;
+        }
+    }
+    steps.reverse();
+    Some(steps)
+}
+
+fn walk<'a>(store: &'a dyn SessionBackend, session: &str) -> Walk<'a> {
     let mut walk = Walk {
         store,
         seen: BTreeSet::from([session.to_string()]),
         snapshot: ChainSnapshot::default(),
+        reached_from: BTreeMap::new(),
     };
     walk.up(session);
     match peers(store, session, LinkKind::HeldBy) {
@@ -191,12 +237,12 @@ pub fn snapshot(store: &dyn SessionBackend, session: &str) -> ChainSnapshot {
                 } else {
                     VIA_HELD_BY
                 };
-                if walk.visit(&anchor, via.to_string()) {
+                if walk.visit(session, &anchor, via.to_string()) {
                     walk.up(&anchor);
                 }
             }
         }
         Err(()) => walk.snapshot.incomplete = true,
     }
-    walk.snapshot
+    walk
 }
