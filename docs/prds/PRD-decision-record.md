@@ -364,8 +364,9 @@ decision records has to match the driver id koto hands a gate, so a gate can che
     the deciding session's chain by a decider with standing over the reversal by R17's rules (the
     reverser, or a session or person above the reverser). For a `gate-pass` it must be for the same
     workflow, state and gate, and a pass whose standing is `asserted` doesn't clear a `verified`
-    reversal. The deciding session can't clear its own block this way; its route is the rewind;
-    or
+    reversal. The deciding session, deciding as a session, can't clear its own block this way; its
+    route is the rewind. The next case is the one exception, and it turns on who decides, not
+    where; or
   - the reversal was entered by a person through the deciding session itself (R17's same-decider
     rule for a person), and a person entering through the deciding session records a new decision
     of the same kind naming the reversal in its `basis`. A person changing their mind through a
@@ -373,7 +374,8 @@ decision records has to match the driver id koto hands a gate, so a gate can che
     can't clear it. The replacement is recorded in the deciding session (R4), which isn't on its
     own chain, so for this case `koto next` also lists the aimed area of the deciding session
     itself, one more listing in a session it already reads, and counts a replacement there only
-    when a person decider entered it.
+    when a person decider entered it. That listing fails closed as R23 says for chain sessions:
+    when the deciding session's own aimed area can't be read, `koto next` blocks naming it.
 
   A reversal that lost R19's race blocks nothing. A reversal of a fenced session's decision blocks
   no member of its run (R42).
@@ -462,7 +464,9 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   koto.
 
 The requirements from R37 on were added for the second consumer. They're numbered after the
-non-functional ones so every earlier number keeps its meaning.
+non-functional ones so every earlier number keeps its meaning. One of them changes an earlier
+requirement on purpose: R47 narrows R7's harness identifier and the established decider in Terms
+to an id-shaped value, and both say so.
 
 **Succession through the supersede fence**
 
@@ -475,7 +479,10 @@ non-functional ones so every earlier number keeps its meaning.
   process that hasn't seen it yet, so the marker records the highest decision identifier the fence
   saw (R38). Every reader treats a decision in a fenced session with a higher identifier as
   written after the fence: it reads `refused`, gives no standing and blocks nothing. The fenced
-  session keeps serving its decisions to readers, as a migrated session does (R6).
+  session keeps serving its decisions to readers, as a migrated session does (R6). The cutoff
+  assumes a session's decision identifiers only increase, which holds while one host writes the
+  session, since each identifier is the highest the writer holds plus one. Its two limits are in
+  Known Limitations.
 - **R38.** When koto fences a session, it writes a supersede marker beside it, the way it marks a
   migrated session. The marker is write-once. It names the successor's session name and id, the
   fence's actor, the fence's time and the highest decision identifier the session held when the
@@ -535,7 +542,10 @@ non-functional ones so every earlier number keeps its meaning.
   - the dependents R21 computes.
 
   R16 holds for it: the read changes nothing in any session. A decision held in a session koto
-  can't read shows as `unreadable`, never `in-effect`.
+  can't read shows as `unreadable`, never `in-effect`. The basis, evidence and reason text is shown
+  as recorded, so whatever a decider writes there is readable by every session on the host. Under
+  the cloud backend the read reaches only sessions this host holds a copy of, as koto's other
+  reads do; a session left only in the bucket has to be pulled first.
 - **R45.** koto reads a session's chain as it would walk it now, without recording anything: each
   session in R12's order with the link kind that reached it, each supersede hop followed forward
   from a session on it with whether koto confirmed it and the marker's successor, actor and time,
@@ -556,6 +566,10 @@ non-functional ones so every earlier number keeps its meaning.
   decision records in the same process are the same string, so a gate comparing a tick's driver
   with a decision's decider compares like with like. The record builds no driver variable and
   reads none.
+
+  This narrows R7 and the established decider in Terms, which as first written took any value of
+  `CLAUDE_CODE_SESSION_ID`. The narrowing is deliberate: a value that isn't id-shaped can never
+  equal a tick's driver, so a decider established by it couldn't be checked by any gate.
 
 ### Non-functional
 
@@ -933,6 +947,14 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   the session or person above, as before this record.
 - Whoever fences a session takes its `verified` standing over everything below it, including the
   power to stop a live worker. The fence already lets them stop the session itself.
+- Under the cloud backend, a decision recorded on the fenced session's host after the fence listed
+  its decisions but before the fence's push lands is reported written, then reads `refused` (R37).
+  The caller learns of it only from a later read. A fence with no marker records no cutoff, so a
+  decision written there from a host that hasn't seen the fence reads like any other.
+- A person decider is named with `--by`, which koto records and doesn't verify. An agent in the
+  deciding session that names a person can clear a block a person's reversal through that same
+  session caused (R22). The replacement names the decider it claimed, so the claim is visible, as
+  any other forged person decision is.
 
 ## Decisions and Trade-offs
 
@@ -991,7 +1013,9 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   to check it, including a manager citing its director. Standing governs reversing only. Limiting
   the read to sessions above would protect nothing: any process on the host can already read a
   session's files, and a decision body travels with its session wherever the session goes. A
-  body that has to be kept from other sessions doesn't belong in a decision.
+  body that has to be kept from other sessions doesn't belong in a decision. Revisit this if koto
+  gains a per-session read permission, or if a consumer needs a decision's reason or evidence kept
+  inside its hierarchy.
 - **A standing ruling is a person's `judgment`.** A ruling that binds a session until it's reversed
   is a judgment call a person settled. A separate kind would add nothing a reader can't already
   read from the decider and the subject.

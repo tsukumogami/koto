@@ -222,7 +222,11 @@ mirror, spool, manifest or bucket:
    chain `incomplete`; any other failure blocks naming that session. The walk stops at 64 sessions
    and blocks as unreadable beyond that, so a hostile link chain can't run a tick past its time
    limit.
-4. **List `koto/aimed/<aim-id>/`** in each chain session and read only what is found.
+4. **List `koto/aimed/<aim-id>/`** in each chain session and read only what is found. Because the
+   walk starts at the session itself, this includes the session's own aimed area: that listing is
+   the own-session read R22 adds for a person's replacement, and it costs nothing beyond the walk.
+   It fails closed like the others. From it koto counts a replacement only when a person decider
+   entered it.
 5. **Decide** with R17's standing, R19's race, R18 and R22's clearing rules; a decision that reads
    `reversed` and isn't cleared becomes a reserved synthetic blocking condition on the
    `__action__` precedent, its name refused at template compile time.
@@ -244,8 +248,8 @@ reverser's session; with none of these, `reverse` fails with `reversal_refused` 
 Locally that is about 20 `read_dir` calls on near-empty or missing directories at depth five, well
 under a millisecond, and it doesn't grow with how many decisions any chain session holds. Under the
 cloud backend there are no requests when the skip applies; otherwise the walk is seeded from the
-chain snapshot in the session's newest decision, every chain session's link and aimed listings go
-out in parallel, fresh (never from the five-second listing cache, since a reversal added within it
+chain snapshot in the session's newest decision, every chain session's link and aimed listings,
+the session's own aimed listing among them, go out in parallel, fresh (never from the five-second listing cache, since a reversal added within it
 must not be missed), and a changed link is followed sequentially. That is about two round trips in
 the common case and depth plus one in the worst, around a second at depth five.
 
@@ -489,12 +493,20 @@ Key assumptions:
   the fence already makes idempotent, writes a missing marker. `check_writer_key` refuses every
   other writer and every remove of it.
 - **The fenced session records nothing.** Locally, the decision writer reads the fence under the
-  `ctx/manifest.lock` it allocates under, and the fencing command takes that lock before the log's
-  append lock and holds it through the append, the same order a gate-passing command takes them in
-  (manifest lock, then the append inside it), so the two can't deadlock and a decision and a fence
-  can't interleave. The fence reads `decisions_through` under the same lock. Its wait on the
-  manifest lock is bounded by `FENCE_LOCK_WAIT` like its wait on the append lock, and a lock still
-  held exits 3 `fence_unavailable` with nothing written. Under the cloud backend no lock spans the
+  `ctx/manifest.lock` it allocates under. Today `append_supersede_fence` takes only the log's
+  append lock, and no command holds the manifest lock and the append lock together, so the order
+  below is set by this design for the two new holders rather than copied from current code: the
+  fencing command takes the manifest lock first and the append lock inside it, holding both
+  through the append, and a gate-passing decision write that appends to the log takes them in the
+  same order. Neither takes the other's locks in reverse, so the two can't deadlock, and a
+  decision and a fence can't interleave. The state-file lock `koto next` takes for a whole tick on
+  a batching state sits outside both and isn't part of this order: neither the fence nor the
+  decision writer takes it, so a decision written during a tick that holds it waits only on the
+  two locks above, and the fence never waits on a tick. The fence reads `decisions_through` under the manifest lock. Its wait on
+  that lock is bounded by `FENCE_LOCK_WAIT` like its wait on the append lock, which needs a
+  bounded acquire: `LocalBackend::acquire_flock` blocks without limit, so the fence takes the
+  manifest lock through a timed acquire like `AppendLock::acquire_within`. A lock still held when
+  the wait ends exits 3 `fence_unavailable` with nothing written. Under the cloud backend no lock spans the
   fencing host and the predecessor's host, and a plain `record` pushes no event whose conditional
   push the fence would make fail. So the fence lists the predecessor's decision prefix in the bucket
   before its conditional push and takes `decisions_through` from that listing, and every reader
@@ -504,7 +516,11 @@ Key assumptions:
 - **The walk.** `src/decisions/chain.rs` gains a forward step. At each chain session it reads the
   marker; if one is there, it reads the successor's header and confirms the session id, then takes
   the successor's position as the fenced session's and keeps going forward, up to
-  `MAX_SUPERSEDE_HOPS` (64). Upward it continues from the fenced session's frozen links, never the
+  `MAX_SUPERSEDE_HOPS` (64), the constant `src/session/links.rs` already defines. It doesn't reuse
+  `newest_member`: that walk reads each fence from the local log and ends at the last member it
+  reaches without saying whether a hop held, while this step reads the marker in one read under
+  either backend and has to report each hop as confirmed or not. It applies the same name check
+  and cycle guard. Upward it continues from the fenced session's frozen links, never the
   successor's. A missing marker ends the forward step there; a malformed one makes the session
   unreadable (R23); a mismatched id marks the hop unconfirmed.
 - **Standing.** `src/decisions/standing.rs` treats each confirmed later member as the fenced
