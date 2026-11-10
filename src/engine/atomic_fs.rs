@@ -83,6 +83,34 @@ pub fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), AtomicCreateEr
     Err(from_io(std::io::Error::last_os_error()))
 }
 
+/// [`atomic_create_rename`] with no replacing fallback: an error that the
+/// plain form would answer with a check-then-rename (a cross-device link)
+/// is returned as it is. The decision writer publishes through this, since
+/// a write-once key can't accept the plain form's non-atomic window.
+#[cfg(target_os = "linux")]
+pub fn atomic_create_rename_strict(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    atomic_create_rename(src, dst)
+}
+
+/// [`atomic_create_rename`] with no replacing fallback (see the Linux form).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn atomic_create_rename_strict(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => std::fs::remove_file(src).map_err(AtomicCreateError::Io),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(AtomicCreateError::Collision)
+        }
+        Err(e) => Err(AtomicCreateError::Io(e)),
+    }
+}
+
+/// [`atomic_create_rename`] with no replacing fallback (see the Linux form).
+/// Non-Unix builds have only the best-effort form.
+#[cfg(not(unix))]
+pub fn atomic_create_rename_strict(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    atomic_create_rename(src, dst)
+}
+
 /// Non-Linux Unix fallback: POSIX `link()` + `unlink()`.
 ///
 /// `link()` fails with `EEXIST` when the destination already exists,

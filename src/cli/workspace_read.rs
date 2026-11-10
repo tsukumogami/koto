@@ -51,7 +51,8 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
             ContextCommand::Add { .. } | ContextCommand::Remove { .. } => None,
         },
         Command::Decisions { subcommand } => match subcommand {
-            DecisionsSubcommand::List { name } => Some(("decisions list", name)),
+            DecisionsSubcommand::List { name, .. } => Some(("decisions list", name)),
+            DecisionsSubcommand::Show { name, .. } => Some(("decisions show", name)),
             DecisionsSubcommand::Record { .. } => None,
         },
         Command::Overrides { subcommand } => match subcommand {
@@ -247,7 +248,15 @@ fn serve(
 
     match command {
         Command::Status { .. } => handle_status(&backend, name),
-        Command::Decisions { .. } => handle_decisions_list(&backend, name.to_string()),
+        Command::Decisions { subcommand } => match subcommand {
+            DecisionsSubcommand::List { filters, .. } if filters.any() => {
+                super::decisions::handle_list(&backend, name, &filters)
+            }
+            DecisionsSubcommand::Show { id, .. } => {
+                super::decisions::handle_show(&backend, name, &id)
+            }
+            _ => handle_decisions_list(&backend, name.to_string()),
+        },
         Command::Overrides { .. } => overrides::handle_overrides_list(&backend, name.to_string()),
         Command::Context { subcommand } => {
             match subcommand {

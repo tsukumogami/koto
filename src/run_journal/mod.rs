@@ -307,7 +307,7 @@
 //! state log, version, template and context files only.
 
 mod context_reads;
-mod driver;
+pub(crate) mod driver;
 mod fixture;
 mod pairing;
 #[cfg(unix)]

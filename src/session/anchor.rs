@@ -1043,7 +1043,14 @@ fn create_anchor<S: ContextStore + SessionBackend>(
             continue;
         }
         let hints = LinkHints::for_peer(store, peer);
-        links::write_link(store, name, LinkKind::DispatchedBy, peer, &hints)?;
+        links::write_link_via(
+            store,
+            name,
+            LinkKind::DispatchedBy,
+            peer,
+            &hints,
+            Some("anchor"),
+        )?;
     }
     if let Some(key) = req.observed_key.clone().or(inherited) {
         write_marker(store, name, &key)?;

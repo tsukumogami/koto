@@ -2555,6 +2555,147 @@ impl CloudBackend {
         Ok(())
     }
 
+    /// The bucket's decision objects of session `id`: every object under
+    /// `ctx/koto/decisions/`, `ctx/koto/aimed/` and `ctx/koto/packs/`, as
+    /// its context key and its bytes (or why they couldn't be read), from
+    /// fresh listings outside the probe cache. Reads only: nothing is
+    /// written here or on this host (DESIGN-decision-record.md, Decision 1).
+    /// Decision objects sit outside the manifest, so this is how a host
+    /// with no local copy, and a `--workspace` read, find them.
+    pub(crate) fn decision_objects(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Vec<(String, Result<Vec<u8>, String>)>> {
+        use crate::decisions::body::MAX_BODY_BYTES;
+        let ctx = format!("{}ctx/", self.session_prefix(id));
+        let mut out = Vec::new();
+        for area in crate::decisions::AREAS {
+            let pages = self
+                .bucket
+                .list(format!("{ctx}{area}/"), None)
+                .map_err(|e| anyhow::anyhow!("{}", without_url_userinfo(&e.to_string())))?;
+            let mut count = 0usize;
+            for obj in pages.iter().flat_map(|p| p.contents.iter()) {
+                let Some(key) = obj.key.strip_prefix(&ctx) else {
+                    continue;
+                };
+                count += 1;
+                if count > crate::decisions::MAX_AREA_ENTRIES {
+                    anyhow::bail!("the bucket's {area}/ holds too many objects");
+                }
+                let bytes = if obj.size > MAX_BODY_BYTES as u64 {
+                    Err(format!("is larger than {MAX_BODY_BYTES} bytes"))
+                } else {
+                    match self.bucket.get_object(&obj.key) {
+                        Ok(r) if r.status_code() == 200 => Ok(r.bytes().to_vec()),
+                        Ok(r) => Err(format!("the bucket answered {}", r.status_code())),
+                        Err(e) => Err(without_url_userinfo(&e.to_string())),
+                    }
+                };
+                out.push((key.to_string(), bytes));
+            }
+        }
+        Ok(out)
+    }
+
+    /// PUT decision `key` of session `id` as its own object, create-only:
+    /// `If-None-Match: *`, never the unconditional fallback the state
+    /// file's put has. A 412 whose stored bytes equal `bytes` is a replay
+    /// and succeeds; a 412 with other bytes is `decision_exists`; a bucket
+    /// that doesn't honour the condition (a 501, or a failed one-time
+    /// probe) can't hold decisions.
+    pub(crate) fn put_decision_object(
+        &self,
+        id: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), crate::decisions::DecisionError> {
+        use crate::decisions::{codes, DecisionError};
+        let failed = |e: String| DecisionError::new("decision_write_failed", e);
+        self.refuse_if_read_only(&format!("recording a decision in '{id}'"))
+            .map_err(|e| failed(e.to_string()))?;
+        self.probe_conditional_puts()?;
+        let object = format!("{}ctx/{}", self.session_prefix(id), key);
+        match self.put_state_if(&object, bytes, None) {
+            Ok(r) if (200..300).contains(&r.status_code()) => Ok(()),
+            Ok(r) => Err(failed(format!("PUT {object} answered {}", r.status_code()))),
+            Err(e) if is_precondition_failed(&e) => match self.bucket.get_object(&object) {
+                Ok(r) if r.status_code() == 200 && r.bytes() == bytes => Ok(()),
+                _ => Err(DecisionError::new(
+                    codes::DECISION_EXISTS,
+                    format!("decision key '{key}' already exists in the bucket's copy of '{id}'"),
+                )),
+            },
+            Err(S3Error::HttpFailWithBody(501, _)) => Err(DecisionError::new(
+                codes::BUCKET_UNSUPPORTED,
+                "the bucket doesn't support conditional writes, so it can't hold write-once \
+                 decisions",
+            )),
+            Err(e) => Err(failed(format!(
+                "PUT {object} failed: {}",
+                without_url_userinfo(&e.to_string())
+            ))),
+        }
+    }
+
+    /// Check once per bucket and prefix that the bucket refuses a second
+    /// create-only put of one object (Security Considerations): put a probe
+    /// object twice with `If-None-Match: *`, and require the second to fail
+    /// with 412. A passing probe is remembered in a marker file beside this
+    /// host's sessions; a failing one refuses every decision put.
+    fn probe_conditional_puts(&self) -> Result<(), crate::decisions::DecisionError> {
+        use crate::decisions::{codes, DecisionError};
+        let tag =
+            crate::cache::sha256_hex(format!("{}\n{}", self.bucket.name(), self.prefix).as_bytes());
+        let marker = self
+            .local
+            .base_dir()
+            .join(format!(".decision-bucket-probe-{}", &tag[..16]));
+        if marker.is_file() {
+            return Ok(());
+        }
+        let unsupported = || {
+            DecisionError::new(
+                codes::BUCKET_UNSUPPORTED,
+                "the bucket doesn't refuse a second create-only put of one object, so it can't \
+                 hold write-once decisions",
+            )
+        };
+        let nonce = crate::cache::sha256_hex(
+            format!("{}{:?}", std::process::id(), std::time::SystemTime::now()).as_bytes(),
+        );
+        let object = format!("{}/.koto-probe/decisions-{}", self.prefix, &nonce[..16]);
+        let first = self.put_state_if(&object, b"probe", None);
+        if !first
+            .as_ref()
+            .is_ok_and(|r| (200..300).contains(&r.status_code()))
+        {
+            return Err(match first {
+                Err(S3Error::HttpFailWithBody(501, _)) => unsupported(),
+                Err(e) => DecisionError::new(
+                    "decision_write_failed",
+                    format!(
+                        "probing the bucket for create-only puts failed: {}",
+                        without_url_userinfo(&e.to_string())
+                    ),
+                ),
+                Ok(r) => DecisionError::new(
+                    "decision_write_failed",
+                    format!("probing the bucket answered {}", r.status_code()),
+                ),
+            });
+        }
+        let second = self.put_state_if(&object, b"probe", None);
+        let _ = self.bucket.delete_object(&object);
+        match second {
+            Err(e) if is_precondition_failed(&e) => {
+                let _ = std::fs::write(&marker, b"ok\n");
+                Ok(())
+            }
+            _ => Err(unsupported()),
+        }
+    }
+
     /// DELETE exactly one object, the pin or the release record of `id`,
     /// and fail unless the bucket confirms it. A missing object is a
     /// success, as S3 answers it.
@@ -4704,6 +4845,7 @@ impl CloudBackend {
         write: Option<(&[u8], Option<&str>)>,
     ) -> anyhow::Result<KeyPush> {
         self.refuse_if_read_only(&format!("storing '{}' in '{}'", key, session))?;
+        crate::session::links::check_decision_key(key)?;
         if let Some((_, Some(writer))) = write {
             crate::session::links::check_writer_key(key, writer)?;
         }

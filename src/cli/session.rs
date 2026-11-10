@@ -558,16 +558,17 @@ pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Res
     }
 
     let hints = LinkHints::for_peer(backend, dispatched_by);
-    let outcome = match links::write_link(backend, session, kind, dispatched_by, &hints) {
-        Ok(outcome) => outcome,
-        Err(e) => super::exit_with_error_code(
-            serde_json::json!({
-                "error": format!("could not record the link in '{session}': {e}"),
-                "command": "session link"
-            }),
-            super::EXIT_INFRASTRUCTURE,
-        ),
-    };
+    let outcome =
+        match links::write_link_via(backend, session, kind, dispatched_by, &hints, Some("link")) {
+            Ok(outcome) => outcome,
+            Err(e) => super::exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("could not record the link in '{session}': {e}"),
+                    "command": "session link"
+                }),
+                super::EXIT_INFRASTRUCTURE,
+            ),
+        };
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -1352,10 +1353,27 @@ pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
 /// repairs a missing link. `dispatcher` was validated before the session
 /// was opened.
 pub(crate) fn record_dispatched_by(backend: &Backend, session: &str, dispatcher: &str) {
+    record_dispatched_by_via(backend, session, dispatcher, "init");
+}
+
+/// [`record_dispatched_by`], recording `via` as how the link was written
+/// ([`crate::session::links::LinkBody::via`]).
+pub(crate) fn record_dispatched_by_via(
+    backend: &Backend,
+    session: &str,
+    dispatcher: &str,
+    via: &str,
+) {
     use crate::session::links::{self, LinkHints, LinkKind};
     let hints = LinkHints::for_peer(backend, dispatcher);
-    if let Err(e) = links::write_link(backend, session, LinkKind::DispatchedBy, dispatcher, &hints)
-    {
+    if let Err(e) = links::write_link_via(
+        backend,
+        session,
+        LinkKind::DispatchedBy,
+        dispatcher,
+        &hints,
+        Some(via),
+    ) {
         eprintln!(
             "warning: could not record that '{session}' was dispatched by '{dispatcher}': {e}; \
              run `koto session link {session} --dispatched-by {dispatcher}` to record it"
@@ -1372,7 +1390,7 @@ pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_
     if requested_by == session || validate_peer(LinkKind::DispatchedBy, requested_by).is_err() {
         return;
     }
-    record_dispatched_by(backend, session, requested_by);
+    record_dispatched_by_via(backend, session, requested_by, "leg");
 }
 
 /// Refuse `koto session rebind <name>` from a directory that is neither the
