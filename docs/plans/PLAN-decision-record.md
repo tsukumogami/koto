@@ -323,8 +323,9 @@ lands in Issue 4. shirabe's citation work needs a koto release carrying Issues 1
 - [ ] `list --fenced P` returns exactly the reversals whose path names the P-to-S hop (R41).
 - [ ] `koto decisions chain W` lists P labelled `leg`, W's anchor `held-by`, and P's hop to S with confirmation, successor, actor and time; `chain P` reports P's own marker; a mismatched id lists the hop unconfirmed; no session gains a key or event (R45).
 - [ ] The tick benchmark at chain depth five, with two chain sessions each fenced twice, measures under 50 ms as a median of five warm runs on the CI runner (R48).
+- [ ] With P fenced, `koto overrides record` on P, `koto next --to` past one of P's gates that hasn't passed, and `koto decider answer` with `pass` on P each exit non-zero with `session_superseded` naming S, record no `gate-pass` and no `refused` decision in P, and leave P's state, keys and log byte-identical to before (R37, R24).
 
-**Dependencies**: Blocked by <<ISSUE:3>>, <<ISSUE:4>>
+**Dependencies**: Blocked by <<ISSUE:3>>, <<ISSUE:4>>, <<ISSUE:5>>, <<ISSUE:7>>
 
 **Type**: code
 **Files**: `src/cli/init_supersede.rs`, `src/session/links.rs`, `src/decisions/chain.rs`, `src/decisions/standing.rs`, `src/decisions/read.rs`, `src/cli/mod.rs`
@@ -381,6 +382,8 @@ graph TD
     I12 --> I13
     I3 --> I14
     I4 --> I14
+    I5 --> I14
+    I7 --> I14
     I14 --> I10
     I14 --> I13
 
@@ -403,7 +406,7 @@ then Issue 13. Issues 3 and 8 feed Issue 12 through the release.
 
 **After Issue 1:** Issues 3 and 5 in parallel.
 
-**After Issue 3:** Issues 4 and 8 in parallel; after Issue 4, Issue 14, and Issue 7 once session retention reads Done.
+**After Issue 3:** Issues 4 and 8 in parallel; after Issue 4, Issue 7 once session retention reads Done, then Issue 14 once Issues 5 and 7 have landed, since its fence criteria run `import` and the gate-passing commands.
 
 **After Issue 5:** Issues 6 and 9 in parallel.
 
