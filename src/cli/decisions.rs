@@ -748,7 +748,9 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
             session: w.session.name.clone(),
             id: w.id.clone(),
         };
-        let recorded = standing::record_lost(backend, &recorded_in, &written, w)
+        // The refusal goes in the reverser's own session even when the
+        // reversal sits in its anchor (R19).
+        let recorded = standing::record_lost(backend, &reverser, &written, w)
             .unwrap_or_else(|e| refuse(COMMAND, &e));
         let message = format!(
             "reversal {}:{} lost to {}:{}, recorded earlier",

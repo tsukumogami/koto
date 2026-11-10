@@ -353,6 +353,47 @@ pub fn judge(
     decider: &Decider,
     anchor: Option<&str>,
 ) -> Result<Placement, &'static str> {
+    let live = Live {
+        path_to: &|to: &str| chain::path(store, &original.session.name, to),
+        chain_incomplete: &|| chain::snapshot(store, &original.session.name).incomplete,
+        reverser_below: &|| {
+            chain::snapshot(store, reverser)
+                .links
+                .iter()
+                .any(|l| l.session == original.session.name)
+        },
+    };
+    place(original, reverser, decider, anchor, &live)
+}
+
+/// What [`place`] reads from the links as they stand now, each asked only
+/// when needed.
+pub struct Live<'a> {
+    /// The steps the walk from the original's session takes to reach a
+    /// session, or `None` when it doesn't reach it.
+    pub path_to: &'a dyn Fn(&str) -> Option<Vec<PathStep>>,
+    /// Whether the walk from the original's session is incomplete now.
+    pub chain_incomplete: &'a dyn Fn() -> bool,
+    /// Whether the original's deciding session is on the reverser's chain.
+    pub reverser_below: &'a dyn Fn() -> bool,
+}
+
+/// [`judge`] over facts already read.
+///
+/// A reversal is `verified` only when an R17 rule matches and, for a
+/// session above, the live walk from the original reaches the recording
+/// session, so the path it records is one the links hold now. When the
+/// recorded chain lists a session the live walk no longer reaches, no
+/// rule gives standing: the reversal is `asserted` if the chain, recorded
+/// or live, is incomplete and the reverser isn't below the original, and
+/// refused otherwise.
+pub fn place(
+    original: &DecisionBody,
+    reverser: &str,
+    decider: &Decider,
+    anchor: Option<&str>,
+    live: &Live<'_>,
+) -> Result<Placement, &'static str> {
     let recorded_in = if on_chain(original, reverser) {
         Some(reverser)
     } else {
@@ -361,38 +402,25 @@ pub fn judge(
     if let Some(r) = recorded_in {
         if rule_matches(original, r, decider) {
             let path = if r == original.session.name {
-                Vec::new()
+                Some(Vec::new())
             } else {
-                chain::path(store, &original.session.name, r).unwrap_or_else(|| {
-                    let via = original
-                        .chain
-                        .links
-                        .iter()
-                        .find(|l| l.session == r)
-                        .map(|l| l.via.clone())
-                        .unwrap_or_default();
-                    vec![PathStep {
-                        session: original.session.name.clone(),
-                        via,
-                        to: r.to_string(),
-                    }]
-                })
+                (live.path_to)(r)
             };
-            return Ok(Placement {
-                session: r.to_string(),
-                standing: VERIFIED,
-                path,
-            });
+            if let Some(path) = path {
+                return Ok(Placement {
+                    session: r.to_string(),
+                    standing: VERIFIED,
+                    path,
+                });
+            }
         }
     }
-    // No rule matched. Beyond a broken chain the reversal is asserted,
-    // unless the reverser sits below the original's deciding session.
-    if original.chain.incomplete
-        && reverser != original.session.name
-        && !chain::snapshot(store, reverser)
-            .links
-            .iter()
-            .any(|l| l.session == original.session.name)
+    // No rule gave standing. Beyond a broken chain the reversal is
+    // asserted, unless the reverser sits below the original's deciding
+    // session.
+    if reverser != original.session.name
+        && (original.chain.incomplete || (live.chain_incomplete)())
+        && !(live.reverser_below)()
     {
         return Ok(Placement {
             session: reverser.to_string(),
@@ -548,19 +576,56 @@ pub fn record_lost(
     }
 }
 
-/// R19's repeat check: for each reversal `session` recorded that now
-/// loses to another reversal on this host, record the `refused` naming
-/// the winner, once. It reads local copies only and does nothing for a
-/// session holding no reversal of its own. Failures are dropped: the
-/// check runs before an unrelated decision and must not block it.
+/// The session a decider entered through: the deciding session for a
+/// session, the session that ran a check, a person's entering session.
+fn entered_through(decider: &Decider) -> &str {
+    match decider {
+        Decider::Session { session, .. } | Decider::Check { session, .. } => &session.value,
+        Decider::Person { entering, .. } => &entering.session.value,
+    }
+}
+
+/// R19's repeat check: for each reversal entered through `session` that
+/// now loses to another reversal on this host, record in `session` the
+/// `refused` naming the winner, once.
+///
+/// A reversal entered through `session` sits in `session` itself, or in
+/// the anchor it was recorded in when `session` was off the original's
+/// chain (R4). So the check looks in `session`, in the sessions on its
+/// chain (its own anchor among them) and in the anchor `KOTO_ANCHOR`
+/// names, keeping the reversals whose decider entered through `session`.
+/// The refusal always goes in `session`: R19 puts it in the losing
+/// reverser's own session, where its next decision command finds it.
+///
+/// It reads local copies only. Failures are dropped: the check runs
+/// before an unrelated decision and must not block it.
 pub fn settle(backend: &Backend, session: &str) {
     let own = read::read_session_with(backend, session, false);
+    let mut holders: Vec<String> = chain::snapshot(backend, session)
+        .links
+        .into_iter()
+        .map(|l| l.session)
+        .collect();
+    if let Some(anchor) = crate::session::anchor::anchor_from_env()
+        .filter(|a| crate::session::anchor::is_anchor(backend, a))
+    {
+        holders.push(anchor);
+    }
+    holders.sort();
+    holders.dedup();
+    holders.retain(|h| h != session);
+    let held: Vec<Entry> = holders
+        .iter()
+        .flat_map(|h| read::read_session_with(backend, h, false))
+        .collect();
     let pending: Vec<&DecisionBody> = own
         .iter()
+        .chain(held.iter())
         .filter_map(|e| match e {
             Entry::Decision(b) if b.kind == "reverse" => Some(&**b),
             _ => None,
         })
+        .filter(|b| entered_through(&b.decider) == session)
         .filter(|b| !refusal_recorded(&own, &reference(b)))
         .collect();
     if pending.is_empty() {
@@ -706,6 +771,86 @@ mod tests {
         assert!(rule_matches(&d, "top", &person("bea", "top")));
         assert!(rule_matches(&d, "d", &person("bea", "d")));
         assert!(!rule_matches(&d, "d", &session_decider("d")));
+    }
+
+    fn live<'a>(
+        path_to: &'a dyn Fn(&str) -> Option<Vec<PathStep>>,
+        chain_incomplete: &'a dyn Fn() -> bool,
+    ) -> Live<'a> {
+        Live {
+            path_to,
+            chain_incomplete,
+            reverser_below: &|| false,
+        }
+    }
+
+    #[test]
+    fn a_session_above_is_verified_only_when_the_live_walk_reaches_it() {
+        let w = body(
+            "w",
+            "000000000001",
+            "judgment",
+            session_decider("w"),
+            &["c"],
+        );
+        let reached = |to: &str| {
+            Some(vec![PathStep {
+                session: "w".to_string(),
+                via: "init".to_string(),
+                to: to.to_string(),
+            }])
+        };
+        let p = place(
+            &w,
+            "c",
+            &session_decider("c"),
+            None,
+            &live(&reached, &|| false),
+        )
+        .unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert_eq!(p.session, "c");
+        assert_eq!(p.path.len(), 1);
+
+        // The recorded chain lists c, but the links no longer reach it.
+        let unreached = |_: &str| None;
+        assert_eq!(
+            place(
+                &w,
+                "c",
+                &session_decider("c"),
+                None,
+                &live(&unreached, &|| false)
+            ),
+            Err(reasons::NO_STANDING),
+            "a complete chain that no longer reaches the reverser gives no standing"
+        );
+        let p = place(
+            &w,
+            "c",
+            &session_decider("c"),
+            None,
+            &live(&unreached, &|| true),
+        )
+        .unwrap();
+        assert_eq!(
+            p.standing, ASSERTED,
+            "past a broken live chain it is asserted"
+        );
+        assert_eq!(p.session, "c");
+        assert!(p.path.is_empty());
+
+        // The same session needs no walk.
+        let p = place(
+            &w,
+            "w",
+            &session_decider("w"),
+            None,
+            &live(&unreached, &|| false),
+        )
+        .unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert!(p.path.is_empty());
     }
 
     #[test]
