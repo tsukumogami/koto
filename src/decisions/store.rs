@@ -158,11 +158,9 @@ fn entries(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// with no lock and no write.
 pub fn list_local(ctx_dir: &Path) -> Listing {
     let mut listing = Listing::default();
-    for root in ["koto"] {
-        if let Err(e) = real_dir(&ctx_dir.join(root)) {
-            listing.problem = Some(e);
-            return listing;
-        }
+    if let Err(e) = real_dir(&ctx_dir.join("koto")) {
+        listing.problem = Some(e);
+        return listing;
     }
     let read_area = |area: Area, dir: &Path, listing: &mut Listing| -> Result<(), String> {
         for (name, path) in entries(dir)? {
@@ -243,10 +241,14 @@ pub fn list_local(ctx_dir: &Path) -> Listing {
     listing
 }
 
+/// A decision object as the bucket holds it: its context key, and its bytes
+/// or why they couldn't be read.
+pub type RemoteObject = (String, Result<Vec<u8>, String>);
+
 /// Merge the bucket's copy of a session's areas into the local listing:
 /// an object the local copy lacks is added; one whose bytes differ from the
 /// local file marks that entry unreadable.
-pub fn merge_remote(listing: &mut Listing, remote: Vec<(String, Result<Vec<u8>, String>)>) {
+pub fn merge_remote(listing: &mut Listing, remote: Vec<RemoteObject>) {
     let mut index: BTreeMap<(Area, String), usize> = BTreeMap::new();
     for (i, f) in listing.found.iter().enumerate() {
         index.insert((f.area.clone(), f.name.clone()), i);

@@ -2565,7 +2565,7 @@ impl CloudBackend {
     pub(crate) fn decision_objects(
         &self,
         id: &str,
-    ) -> anyhow::Result<Vec<(String, Result<Vec<u8>, String>)>> {
+    ) -> anyhow::Result<Vec<crate::decisions::store::RemoteObject>> {
         use crate::decisions::body::MAX_BODY_BYTES;
         let ctx = format!("{}ctx/", self.session_prefix(id));
         let mut out = Vec::new();
@@ -4230,6 +4230,14 @@ impl CloudBackend {
                                 if let Some(parent) = local_path.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
+                                if crate::decisions::is_decision_area_key(file_name) {
+                                    pull_decision_copy(
+                                        &session_dir,
+                                        &local_path,
+                                        response.bytes(),
+                                    )?;
+                                    continue;
+                                }
                                 let mut data = response.bytes().to_vec();
                                 if file_name == "manifest.json" {
                                     data = with_host_local_keys(data, &kept);
@@ -4243,6 +4251,35 @@ impl CloudBackend {
         }
 
         Ok(())
+    }
+}
+
+/// Bring a decision object down to `local_path` create-only: a file, or
+/// anything else, already at that path is kept as it is, since a pull
+/// never overwrites a decision key (DESIGN-decision-record.md, Decision 1).
+/// The bytes go to a temporary file in `session_dir` first and are
+/// published with a create-only rename, so no reader sees a partial body.
+fn pull_decision_copy(session_dir: &Path, local_path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use crate::engine::atomic_fs::{atomic_create_rename_strict, AtomicCreateError};
+    use std::io::Write;
+    if std::fs::symlink_metadata(local_path).is_ok() {
+        return Ok(());
+    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".koto-decision-pull-")
+        .tempfile_in(session_dir)
+        .with_context(|| format!("failed to stage a decision in {}", session_dir.display()))?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    let (_, staged) = tmp.keep().map_err(|e| e.error)?;
+    let published = atomic_create_rename_strict(&staged, local_path);
+    let _ = std::fs::remove_file(&staged);
+    match published {
+        Ok(()) | Err(AtomicCreateError::Collision) => Ok(()),
+        Err(AtomicCreateError::Io(e)) => Err(anyhow::Error::new(e).context(format!(
+            "failed to write the pulled decision {}",
+            local_path.display()
+        ))),
     }
 }
 

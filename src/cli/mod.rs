@@ -105,8 +105,9 @@ pub struct App {
     /// Read a session in another workspace's part of the cloud bucket, in
     /// place and without importing it. Takes the workspace's id (its 16-hex
     /// prefix in the bucket) or its absolute path, and goes before the
-    /// verb. Only `status`, `context get`, `context exists` and `context
-    /// list` accept it; every other verb refuses it.
+    /// verb. Only `status`, `context get`, `context exists`, `context
+    /// list`, `decisions list`, `decisions show` and `overrides list` accept
+    /// it; every other verb refuses it.
     #[arg(long, value_name = "ID")]
     pub workspace: Option<String>,
 

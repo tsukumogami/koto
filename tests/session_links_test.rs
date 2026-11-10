@@ -287,8 +287,9 @@ fn session_link_records_one_link_and_rerunning_changes_nothing() {
 
     let body = link(dir, "worker", "dispatcher").expect("link written");
     let fields: Vec<&String> = body.as_object().unwrap().keys().collect();
-    assert_eq!(fields.len(), 5, "{body}");
+    assert_eq!(fields.len(), 6, "{body}");
     assert_eq!(body["v"], 1);
+    assert_eq!(body["via"], "link");
     assert_eq!(body["session"], "dispatcher");
     assert_eq!(
         body["session_id"],

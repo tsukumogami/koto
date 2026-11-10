@@ -29,6 +29,8 @@
 //! A PUT honours `If-Match` and `If-None-Match: *` as S3 does: when the
 //! stored object's ETag isn't the one named, or an object is there for
 //! `If-None-Match: *`, it answers 412 PreconditionFailed and stores nothing.
+//! [`FakeS3::ignore_if_none_match`] makes it store such a PUT anyway, as a
+//! bucket that doesn't support conditional writes would.
 //! A GET with `Range: bytes=<first>-<last>` is answered 206 with only those
 //! bytes (416 when the range starts past the end), and a listing asked with
 //! `encoding-type=url` is answered with its keys URL-encoded, as S3 does.
@@ -148,6 +150,8 @@ struct State {
     triggers: Vec<Trigger>,
     holds: Vec<Hold>,
     latency: Duration,
+    /// Store a PUT whatever its `If-None-Match` says.
+    ignore_if_none_match: bool,
     shutdown: bool,
 }
 
@@ -361,6 +365,12 @@ impl FakeS3 {
             key: key.to_string(),
             duration,
         });
+    }
+
+    /// Store every PUT whatever its `If-None-Match` header says, as a bucket
+    /// that ignores conditional writes would.
+    pub fn ignore_if_none_match(&self) {
+        lock(&self.state).ignore_if_none_match = true;
     }
 
     /// Hold every reply for `latency` before sending it, as a bucket across
@@ -754,7 +764,9 @@ fn answer_as(req: &Incoming, bucket: &str, state: &Mutex<State>, seq: u64) -> Re
             let unquote = |t: &str| t.trim().trim_matches('"').to_string();
             let failed = match (&req.if_match, &req.if_none_match) {
                 (Some(want), _) => current.as_deref().map(unquote) != Some(unquote(want)),
-                (None, Some(any)) if any.trim() == "*" => current.is_some(),
+                (None, Some(any)) if any.trim() == "*" => {
+                    current.is_some() && !st.ignore_if_none_match
+                }
                 _ => false,
             };
             if failed {
