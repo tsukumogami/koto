@@ -38,9 +38,10 @@
 #      in `/koto`, then the end of the line, a blank, `;`, `|` or `&`.
 #      Anything it can't classify (a `cd` first, a subshell, a group,
 #      `time`, `sudo`, quoting or expansion in an assignment) is left alone,
-#      and only the first koto of `koto a && koto b` gets the prefix: koto
-#      records such calls' agent as `unknown`, which is allowed, where a
-#      wrong guess about a command's shape could change what it runs;
+#      and only the first koto of `koto next w && koto status w` gets the
+#      prefix: koto records such calls' agent as `unknown`, which is
+#      allowed, where a wrong guess about a command's shape could change
+#      what it runs;
 #   5. prints `updatedInput` with the whole `tool_input`, only `command`
 #      changed, and no permission decision, so the usual permission checks
 #      still run on the rewritten command.
