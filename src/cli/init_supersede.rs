@@ -766,9 +766,10 @@ fn carry(
 /// rest are read [`FLUSH_PARALLELISM`] at a time and written, in key order,
 /// as each chunk lands.
 ///
-/// A read or a write that fails stops the carry after the chunk's other
-/// values are written: the writes so far are pushed once, best-effort,
-/// without the marker, and the error is a [`CarryIncomplete`]. On success
+/// A read that fails stops the carry after the chunk's other values are
+/// written; a write that fails stops it at once. Either way the writes so
+/// far are pushed once, best-effort, without the marker, and the error is a
+/// [`CarryIncomplete`]. On success
 /// the marker is written last and everything goes up in one push; a push
 /// that fails is a [`CarryIncomplete`] too, its cause marked
 /// [`CarryPushFailed`], and a re-run pushes the open batch first.
