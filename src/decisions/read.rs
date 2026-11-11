@@ -1,5 +1,6 @@
-//! The pure read path behind `koto decisions list` and `show` (PRD R14 to
-//! R16, R44).
+//! The pure read path under `koto decisions list` and `show` (PRD R14 to
+//! R16, R44): one session's decisions with their integrity checks.
+//! The standing module, above this one, adds the statuses reversals give.
 //!
 //! It reads decision files and state-file headers straight from disk (and,
 //! under the cloud backend, the bucket's decision objects), and never takes
@@ -11,13 +12,13 @@ use serde_json::{json, Value};
 
 use super::body::DecisionBody;
 use super::chain;
+use super::is_decision_id;
 use super::store::{self, Area};
-use super::{is_decision_id, FORMAT_VERSION};
 use crate::session::{Backend, SessionBackend};
 
-/// A decision's status (PRD Terms). This issue has no reversal yet, so a
-/// readable decision is `in-effect` unless its kind is `refused`.
-pub fn status_of(body: &DecisionBody) -> &'static str {
+/// A decision's status as its body alone shows it, before any reversal
+/// is applied.
+fn status_of(body: &DecisionBody) -> &'static str {
     if body.kind == "refused" {
         "refused"
     } else {
@@ -62,7 +63,7 @@ impl Entry {
 /// The session id the state file of `session` names, read from the file
 /// without a lock or a pull; under the cloud backend with no local copy,
 /// from the bucket's state file.
-fn session_id(backend: &Backend, session: &str) -> Option<String> {
+fn session_id(backend: &Backend, session: &str, remote: bool) -> Option<String> {
     let path = backend
         .session_dir(session)
         .join(crate::session::state_file_name(session));
@@ -70,6 +71,7 @@ fn session_id(backend: &Backend, session: &str) -> Option<String> {
         return Some(id);
     }
     match backend {
+        Backend::Cloud(_) if !remote => None,
         Backend::Cloud(cloud) => cloud
             .remote_header(session)
             .ok()
@@ -80,23 +82,28 @@ fn session_id(backend: &Backend, session: &str) -> Option<String> {
     }
 }
 
-/// Every decision in `session`'s `koto/decisions/` area, readable or not,
-/// after the integrity checks: a file whose name isn't a decision id, an
-/// id in both areas, a body that doesn't parse or whose own id, session
-/// name or session id disagrees with where it was read, each make the
-/// affected entries unreadable. Aimed decisions are checked but not
-/// returned: they belong to the reversal a later command records.
+/// Every decision in `session`'s two areas, readable or not, after the
+/// integrity checks: a file whose name isn't a decision id, an id in both
+/// areas, a body that doesn't parse or whose own id, session name or
+/// session id disagrees with where it was read, and an aimed body that
+/// isn't a reversal or whose target id isn't its `koto/aimed/<t>/`
+/// directory, each make the affected entries unreadable.
 pub fn read_session(backend: &Backend, session: &str) -> Vec<Entry> {
+    read_session_with(backend, session, true)
+}
+
+/// [`read_session`], reaching the bucket only when `remote` is set.
+pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<Entry> {
     let unreadable = |id: Option<String>, reason: String| Entry::Unreadable {
         session: session.to_string(),
         id,
         reason,
     };
-    let listing = store::list(backend, session);
+    let listing = store::list_with(backend, session, remote);
     if let Some(problem) = listing.problem {
         return vec![unreadable(None, problem)];
     }
-    let own_id = session_id(backend, session);
+    let own_id = session_id(backend, session, remote);
 
     let mut seen_in: std::collections::BTreeMap<String, Vec<Area>> = Default::default();
     for f in &listing.found {
@@ -120,7 +127,7 @@ pub fn read_session(backend: &Backend, session: &str) -> Vec<Entry> {
             continue;
         }
         if seen_in.get(&f.name).is_some_and(|areas| areas.len() > 1) {
-            if f.area == Area::Decisions {
+            if seen_in[&f.name].first() == Some(&f.area) {
                 out.push(unreadable(
                     Some(f.name.clone()),
                     "the id appears in more than one area".to_string(),
@@ -141,12 +148,28 @@ pub fn read_session(backend: &Backend, session: &str) -> Vec<Entry> {
                 if own_id.as_deref().is_some_and(|id| id != body.session.id) {
                     return Err("the body's session id isn't the session's".to_string());
                 }
+                match &f.area {
+                    Area::Aimed(target) => {
+                        if body.kind != "reverse" {
+                            return Err("an aimed decision isn't a reversal".to_string());
+                        }
+                        if body.target.as_ref().is_none_or(|t| &t.id != target) {
+                            return Err(
+                                "the reversal's target isn't the session it is filed under"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Area::Decisions if body.kind == "reverse" => {
+                        return Err("a reversal sits outside koto/aimed/".to_string());
+                    }
+                    Area::Decisions => {}
+                }
                 Ok(body)
             });
-        match (checked, &f.area) {
-            (Ok(body), Area::Decisions) => out.push(Entry::Decision(Box::new(body))),
-            (Ok(_), Area::Aimed(_)) => {}
-            (Err(reason), _) => out.push(unreadable(Some(f.name.clone()), reason)),
+        match checked {
+            Ok(body) => out.push(Entry::Decision(Box::new(body))),
+            Err(reason) => out.push(unreadable(Some(f.name.clone()), reason)),
         }
     }
     out
@@ -198,7 +221,7 @@ impl Filters {
 
 /// Sort entries by time, then session, then id; unreadable entries,
 /// which have no time, go last in session and id order.
-fn sort(entries: &mut [Entry]) {
+pub fn sort(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         let key = |e: &Entry| match e {
             Entry::Decision(body) => (
@@ -222,6 +245,20 @@ fn sort(entries: &mut [Entry]) {
 /// `root`: every session below it, through any number of finished
 /// sessions in between. Sorted by name.
 pub fn sessions_below(backend: &Backend, root: &str) -> Vec<String> {
+    local_sessions(backend)
+        .into_iter()
+        .filter(|n| n != root)
+        .filter(|n| {
+            chain::snapshot(backend, n)
+                .links
+                .iter()
+                .any(|l| l.session == root)
+        })
+        .collect()
+}
+
+/// Every session in the local store, sorted by name.
+pub fn local_sessions(backend: &Backend) -> Vec<String> {
     let base = match backend {
         Backend::Local(l) => l.base_dir().to_path_buf(),
         Backend::Cloud(c) => c.local().base_dir().to_path_buf(),
@@ -232,64 +269,10 @@ pub fn sessions_below(backend: &Backend, root: &str) -> Vec<String> {
     let mut names: Vec<String> = dir
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != root && chain::session_present(backend, n))
-        .filter(|n| {
-            chain::snapshot(backend, n)
-                .links
-                .iter()
-                .any(|l| l.session == root)
-        })
+        .filter(|n| chain::session_present(backend, n))
         .collect();
     names.sort();
     names
-}
-
-/// `koto decisions list <session> --format v1`, or with `below` the
-/// decisions of every session below `session`.
-pub fn list(backend: &Backend, session: &str, below: bool, filters: &Filters) -> Value {
-    let sessions = if below {
-        sessions_below(backend, session)
-    } else {
-        vec![session.to_string()]
-    };
-    let mut entries: Vec<Entry> = sessions
-        .iter()
-        .flat_map(|s| read_session(backend, s))
-        .filter(|e| match e {
-            Entry::Decision(body) => filters.matches(body),
-            Entry::Unreadable { .. } => true,
-        })
-        .collect();
-    sort(&mut entries);
-    let mut out = json!({
-        "v": FORMAT_VERSION,
-        "session": session,
-        "decisions": entries.iter().map(Entry::to_json).collect::<Vec<_>>(),
-    });
-    if below {
-        out["below"] = json!(true);
-        out["sessions"] = json!(sessions);
-    }
-    out
-}
-
-/// `koto decisions show <session> <id>`: the entry for `id`, or `None`
-/// when the session holds no file of that name in either area.
-pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
-    let entries = read_session(backend, session);
-    let found = entries.iter().find(|e| match e {
-        Entry::Decision(body) => body.id == id,
-        Entry::Unreadable { id: Some(i), .. } => i == id,
-        Entry::Unreadable { id: None, .. } => false,
-    });
-    let whole_session_unreadable = entries
-        .iter()
-        .find(|e| matches!(e, Entry::Unreadable { id: None, .. }));
-    let entry = found.or(whole_session_unreadable)?;
-    let mut out = entry.to_json();
-    out["v"] = json!(FORMAT_VERSION);
-    out["id"] = json!(id);
-    Some(out)
 }
 
 /// Strip control and terminal escape characters from text read from a

@@ -3,7 +3,7 @@
 //! A decision is one create-only key in the deciding session's own context:
 //! `koto/decisions/<id>` for every decision not aimed at another session's
 //! decision, and `koto/aimed/<target-session-id>/<id>` for one that is (a
-//! reversal; written by a later command). `koto/packs/` is reserved and held
+//! reversal, written by `koto decisions reverse`). `koto/packs/` is reserved and held
 //! empty. The id is a dense, zero-padded [`ID_WIDTH`]-digit sequence, unique
 //! across both areas of one session, so its byte order is the order the
 //! session recorded its decisions in.
@@ -21,11 +21,14 @@
 //! - [`store`]: the allocator, the create-only writer and the listing of a
 //!   session's areas with their integrity checks.
 //! - [`read`]: the pure read path behind `list` and `show`.
+//! - [`standing`]: who may reverse what, where a reversal is recorded,
+//!   racing reversals and each decision's status.
 
 pub mod body;
 pub mod chain;
 pub mod decider;
 pub mod read;
+pub mod standing;
 pub mod store;
 
 /// The area holding every decision not aimed at another session's decision.
@@ -91,6 +94,9 @@ pub mod codes {
     pub const DECISION_NOT_FOUND: &str = "decision_not_found";
     /// The bucket can't hold write-once decisions.
     pub const BUCKET_UNSUPPORTED: &str = "decision_bucket_unsupported";
+    /// A reversal was refused; the output names the reason from
+    /// [`super::standing::reasons`].
+    pub const REVERSAL_REFUSED: &str = "reversal_refused";
 }
 
 /// A decision command's refusal: a code from [`codes`], the field it names
