@@ -82,6 +82,60 @@ pub struct DecisionBody {
     /// is copied or fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<String>,
+    /// The decision a `reverse` overrules, or a refused reversal aimed at,
+    /// when koto found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Target>,
+    /// A `reverse`'s standing: `verified` or `asserted` (R17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing: Option<String>,
+    /// The chain steps from the original's session up to the session the
+    /// `reverse` is recorded in; empty when it is that session (R17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<PathStep>>,
+    /// A reversal's compensating change, or a record that none exists yet
+    /// (R21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensating: Option<Compensating>,
+    /// The outcome replacing a reversed `verdict` or `judgment` (R21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// Why a reversal was refused, and the reversal that won when it lost
+    /// a race (R18, R19).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
+}
+
+/// The decision a reversal is aimed at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// The original deciding session's name.
+    pub name: String,
+    /// Its session id, which names the `koto/aimed/<id>/` directory.
+    pub id: String,
+    /// The original decision's id.
+    pub decision: String,
+}
+
+pub use super::chain::PathStep;
+
+/// A compensating change; `link` is `null` when none exists yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compensating {
+    pub link: Option<String>,
+}
+
+/// Why a reversal was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// One of the reasons in [`super::standing::reasons`].
+    pub reason: String,
+    /// The reversal that won, for `already_reversed` and `lost_race`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<BasisRef>,
+    /// The session's own reversal that lost, for `lost_race`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversal: Option<BasisRef>,
 }
 
 impl DecisionBody {
@@ -108,6 +162,19 @@ impl DecisionBody {
         }
         if outcomes_of(&body.kind).is_none_or(|o| !o.contains(&body.outcome.as_str())) {
             return Err("body's kind or outcome isn't one koto knows".to_string());
+        }
+        if body.kind == "reverse" {
+            let target_ok = body
+                .target
+                .as_ref()
+                .is_some_and(|t| is_decision_id(&t.decision));
+            let standing_ok = body
+                .standing
+                .as_deref()
+                .is_some_and(|s| s == "verified" || s == "asserted");
+            if !target_ok || !standing_ok || body.path.is_none() {
+                return Err("a reversal's body lacks its target, standing or path".to_string());
+            }
         }
         Ok(body)
     }

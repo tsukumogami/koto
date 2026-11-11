@@ -1277,6 +1277,16 @@ pub enum DecisionsSubcommand {
         /// Decision id
         id: String,
     },
+    /// Reverse a decision, by session name and id, recording the reversal
+    /// in the session named by `--in` or its anchor
+    Reverse {
+        /// The original decision's session name
+        name: String,
+        /// The original decision's id
+        id: String,
+        #[command(flatten)]
+        reversal: decisions::ReverseArgs,
+    },
 }
 
 /// Read and validate a compiled template JSON file.
@@ -2986,6 +2996,12 @@ pub fn run(app: App) -> Result<()> {
                         }
                     }
                     decisions::handle_show(&backend, &name, &id)
+                }
+                DecisionsSubcommand::Reverse { name, id, reversal } => {
+                    let reverser = reversal.in_session.clone();
+                    refuse_if_unlocated(&backend, &reverser, "decisions reverse");
+                    refuse_if_superseded(&backend, &reverser, "decisions reverse");
+                    decisions::handle_reverse(&backend, &name, &id, reversal)
                 }
             }
         }

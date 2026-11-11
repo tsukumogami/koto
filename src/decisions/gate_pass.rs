@@ -128,6 +128,12 @@ impl Prepared {
             evidence: self.evidence.clone(),
             reason: self.reason.clone(),
             tool_call: None,
+            target: None,
+            standing: None,
+            path: None,
+            compensating: None,
+            replacement: None,
+            refusal: None,
         }
     }
 }
