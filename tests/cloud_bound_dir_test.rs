@@ -1571,3 +1571,52 @@ fn a_stalled_prefix_listing_is_asked_again_within_a_bound() {
         "the stalled listing was asked {asked} time(s), never again"
     );
 }
+
+/// A listing that never answers fails a new name's lookup within a bound
+/// (koto#645, koto#635). The lookup of a name no prefix holds lists every
+/// other workspace prefix; when one of those listings stalls every time it
+/// is asked, koto can't tell whether that prefix holds the name, so
+/// `koto status` fails, exit 2, naming the listing. It gives up within the
+/// 40-second lookup budget plus one ask, rather than waiting out three asks
+/// and rust-s3's own retry of each.
+#[test]
+fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
+    const NEVER: &str = "never_used";
+    // Far past the budget, so no ask of the listing is ever answered.
+    let stall = std::time::Duration::from_secs(300);
+    // The 40s budget, one 10s ask after it, and slack.
+    let bound = std::time::Duration::from_secs(55);
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{NEVER}/", prefixes[5]);
+
+    s3.stall("LIST", &listing, stall);
+    s3.clear_requests();
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["status", NEVER]);
+    let took = started.elapsed();
+    assert!(
+        took < bound,
+        "the lookup of a new name took {took:?} on one listing of {listing:?} that never \
+         answers, past the 40s lookup budget and the {bound:?} bound: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(2), "koto status: {}", out.describe());
+    let err = out.json();
+    assert_eq!(err["command"], "status", "{}", out.describe());
+    let message = err["error"].as_str().unwrap();
+    assert!(message.contains(&format!("'{NEVER}'")), "{message}");
+    assert!(message.contains("can't tell"), "{message}");
+    assert!(message.contains(&listing), "{message}");
+    let asked = s3
+        .requests()
+        .iter()
+        .filter(|r| r.list_prefix.as_deref() == Some(listing.as_str()))
+        .count();
+    assert!(
+        asked >= 3,
+        "the stalled listing was asked {asked} time(s), not three"
+    );
+}

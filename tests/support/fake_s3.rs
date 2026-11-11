@@ -25,6 +25,8 @@
 //! see what a command's round trips cost against a distant bucket.
 //! [`FakeS3::hold`] holds one request's reply after handling it, so a test
 //! can stop the command waiting on it at that exact point.
+//! [`FakeS3::stall`] holds every matching request's reply, so a request
+//! asked again stalls too.
 //!
 //! A PUT honours `If-Match` and `If-None-Match: *` as S3 does: when the
 //! stored object's ETag isn't the one named, or an object is there for
@@ -149,6 +151,8 @@ struct State {
     faults: Vec<Fault>,
     triggers: Vec<Trigger>,
     holds: Vec<Hold>,
+    /// Holds that are never used up: see [`FakeS3::stall`].
+    stalls: Vec<Hold>,
     latency: Duration,
     /// Store a PUT whatever its `If-None-Match` says.
     ignore_if_none_match: bool,
@@ -367,6 +371,19 @@ impl FakeS3 {
         });
     }
 
+    /// [`FakeS3::hold`] for every `method` request for exactly `key` from
+    /// now on, not only the next one: each request is handled, then its
+    /// reply held for `duration`. `method` `LIST` with a prefix as `key`
+    /// stalls every listing of exactly that prefix, however often it is
+    /// asked again, as a listing that never answers would.
+    pub fn stall(&self, method: &str, key: &str, duration: Duration) {
+        lock(&self.state).stalls.push(Hold {
+            method: method.to_string(),
+            key: key.to_string(),
+            duration,
+        });
+    }
+
     /// Store every PUT whatever its `If-None-Match` header says, as a bucket
     /// that ignores conditional writes would.
     pub fn ignore_if_none_match(&self) {
@@ -565,6 +582,9 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     if let Some(hold) = take_hold(&req, bucket, state) {
         thread::sleep(hold);
     }
+    if let Some(stall) = find_stall(&req, bucket, state) {
+        thread::sleep(stall);
+    }
     let latency = lock(state).latency;
     if !latency.is_zero() {
         thread::sleep(latency);
@@ -607,6 +627,18 @@ fn take_hold(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Durat
         .iter()
         .position(|h| h.method == method && h.key == key)?;
     Some(st.holds.remove(at).duration)
+}
+
+/// How long the first stall `req` matches holds its reply. Unlike a hold,
+/// the stall stays for the requests after it.
+fn find_stall(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Duration> {
+    let (method, key) = target(req, bucket)?;
+    let st = lock(state);
+    let at = st
+        .stalls
+        .iter()
+        .position(|h| h.method == method && h.key == key)?;
+    Some(st.stalls[at].duration)
 }
 
 /// Run, and forget, the triggers `req` matches.
