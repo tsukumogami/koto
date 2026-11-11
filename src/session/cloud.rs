@@ -1046,7 +1046,11 @@ impl CloudBackend {
 
         // Step 2. A failed index listing, and one cut off at
         // `MAX_ENTRIES_PER_LOOKUP`, confirm nothing and spare the sweep
-        // nothing.
+        // nothing. On this undeclared path a failed index's Err is dropped
+        // on purpose: the sweep asks every prefix the index would have named
+        // and fails on its own if one can't be read. Returning that Err, or
+        // counting it against `LOOKUP_BUDGET`, would turn a lookup the sweep
+        // can still answer into "can't tell".
         let confirmed_absent = match index {
             Ok(read) if !read.capped => {
                 if any_holds(run, bucket, id, &read.prefixes)? {

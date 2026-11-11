@@ -458,7 +458,13 @@ A listing whose every ask stalls now fails in about 31 seconds. Inside one
 elsewhere still wins. Once a listing has failed for good, that call starts
 new asks only until 40 seconds after the lookup began, and the error names
 the listings that failed and the prefixes left unasked, at most 10 of them
-with a count for the rest. While every listing answers, no such limit
+with a count for the rest. The index and top-level reads never set the
+budget off: they run before `any_holds`, each with a gate of its own that
+nothing fails, though the 40 seconds still count from the lookup's start.
+Asks under way when a listing first fails keep their full 10 seconds, and
+a listing whose asks all stall takes about 31 seconds to fail, so on an
+undeclared bucket a stalled index listing and then a stalled sweep can take
+a lookup to about a minute. While every listing answers, no such limit
 applies, which is why this doesn't reopen the whole-sweep deadline rejected
 below: a slow bucket that answers every listing gets the same reply as
 before, and the budget only shortens a call whose answer is already "can't
