@@ -36,9 +36,14 @@
 //! conditionally, exits 3 `fence_unavailable` with nothing written; there
 //! is no unconditional fallback. Of two successors the first push wins; the
 //! other's push is refused, it reads the fence, and it refuses as it would
-//! at step 1. Step 4 reads the carried keys from the same prefix (one GET of
-//! the manifest, one per key) and writes them into the successor, under
-//! this directory's prefix, as one push.
+//! at step 1. Step 4 reads the predecessor's manifest from the same prefix,
+//! skips the keys this host's copy of the successor already holds with the
+//! manifest's hash, reads the rest eight at a time, each checked against
+//! that hash, and writes them into the successor, under this directory's
+//! prefix, as one push with the marker last. A carry that stops pushes what
+//! it wrote, without the marker, so a re-run reads only what is left, and
+//! refuses `carry_incomplete` with the failure's class and the counts: exit
+//! 1 when running it again can finish the carry, else 3.
 //!
 //! Names read from a log or the bucket (a fence's successor and session id,
 //! a home prefix, a carried key) are validated before anything is built
@@ -53,16 +58,249 @@ use crate::engine::persistence::{
     append_supersede_fence, derive_state_from_log, superseded_by, FenceOutcome, SupersedeFence,
     FENCE_LOCK_WAIT,
 };
-use crate::engine::types::{generate_session_id, now_iso8601, SupersedeActor};
-use crate::session::cloud::{check_fence_names, CloudBackend, CloudFence, PulledState};
-use crate::session::context::ContextStore;
+use crate::engine::types::{generate_session_id, now_iso8601, Event, EventPayload, SupersedeActor};
+use crate::session::cloud::{
+    check_fence_names, BucketReadFailed, CarryEntry, CarrySourceError, CloudBackend, CloudFence,
+    PulledState, FLUSH_PARALLELISM,
+};
+use crate::session::context::{is_host_local_key, ContextStore};
 use crate::session::context_log::{added_event, WRITER_KOTO};
 use crate::session::links::{self, is_reserved_key, supersede_fence, MAX_SUPERSEDE_HOPS};
+use crate::session::remote_feed::FailureClass;
 use crate::session::{state_file_name, Backend, SessionBackend};
 
 /// The key `koto init --supersede` writes in the successor once the carry
 /// is complete. A re-run that finds it carries nothing.
 pub const CARRY_COMPLETE_KEY: &str = "koto/superseded-carry-complete";
+
+/// A cloud carry that stopped after the fence and the create, before its
+/// marker reached the bucket: how far it got and what stopped it. It renders
+/// as fixed wording and has no [`std::error::Error::source`], so neither
+/// `{e}` nor `{e:#}` prints the cause, which may hold the bucket's own text.
+/// [`run`] refuses it as `carry_incomplete`, classed by [`CarryFailure`].
+#[derive(Debug)]
+pub(crate) struct CarryIncomplete {
+    /// How many keys the predecessor's manifest names for the carry; `None`
+    /// when the manifest itself couldn't be read or trusted.
+    pub keys: Option<usize>,
+    /// How many of those this host's copy of the successor holds with the
+    /// predecessor's value: the ones it already held, plus `carried`.
+    pub held: usize,
+    /// How many this run wrote.
+    pub carried: usize,
+    /// The key whose read or write stopped the carry: a plan entry's key,
+    /// so it has passed `validate_context_key`, or [`CARRY_COMPLETE_KEY`]
+    /// when the marker's write stopped it; `None` when the manifest read or
+    /// the push stopped it. It is the only name from the bucket the refusal
+    /// shows.
+    pub key: Option<String>,
+    /// What stopped it: the cloud backend's `BucketReadFailed` or
+    /// `CarrySourceError`, or an error marked [`CarryWriteFailed`] or
+    /// [`CarryPushFailed`]. It is never rendered.
+    pub cause: anyhow::Error,
+}
+
+/// The `failure` class of a [`CarryIncomplete`], from its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarryFailure {
+    /// A bucket read failed with no usable answer: a refused connection, a
+    /// host that didn't resolve, a 5xx other than 503.
+    Unreachable,
+    /// A bucket read timed out, or ran the full request timeout.
+    Timeout,
+    /// A bucket read was answered 429 or 503 through every retry.
+    Throttled,
+    /// A bucket read was answered 401 or 403.
+    Denied,
+    /// What the bucket holds for the predecessor doesn't check out.
+    InvalidSource,
+    /// A write into the successor's local store failed.
+    WriteFailed,
+    /// Every key and the marker were written, and the push failed.
+    PushFailed,
+}
+
+impl CarryFailure {
+    /// The class of `cause`. The markers [`carry_from_bucket`] attaches are
+    /// looked for first. A cause that is none of the known ones can only be
+    /// the predecessor's prefix or id failing its check before a key is
+    /// built, so it is `invalid_source`, which a retry can't fix.
+    fn of(cause: &anyhow::Error) -> Self {
+        if cause.downcast_ref::<CarryPushFailed>().is_some() {
+            return Self::PushFailed;
+        }
+        if cause.downcast_ref::<CarryWriteFailed>().is_some() {
+            return Self::WriteFailed;
+        }
+        match cause.downcast_ref::<BucketReadFailed>().map(|r| r.class()) {
+            Some(FailureClass::Unreachable) => Self::Unreachable,
+            Some(FailureClass::Timeout) => Self::Timeout,
+            Some(FailureClass::Throttled) => Self::Throttled,
+            Some(FailureClass::Denied) => Self::Denied,
+            None => Self::InvalidSource,
+        }
+    }
+
+    /// The class as the refusal's `failure` names it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Timeout => "timeout",
+            Self::Throttled => "throttled",
+            Self::Denied => "denied",
+            Self::InvalidSource => "invalid_source",
+            Self::WriteFailed => "write_failed",
+            Self::PushFailed => "push_failed",
+        }
+    }
+
+    /// Whether running the command again after a backoff can finish it.
+    fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable | Self::Timeout | Self::Throttled | Self::PushFailed
+        )
+    }
+}
+
+/// The exit of a refusal a retry after a backoff can clear, as koto's exit
+/// classes define it.
+const EXIT_RETRYABLE: i32 = 1;
+
+/// Refuse `incomplete` as `carry_incomplete`, as [`carry_incomplete`]
+/// words it.
+fn refuse_carry_incomplete(pred: &str, name: &str, incomplete: &CarryIncomplete) -> ! {
+    let (message, exit, extra) = carry_incomplete(pred, name, incomplete);
+    refuse("carry_incomplete", message, exit, extra)
+}
+
+/// The `carry_incomplete` refusal of `incomplete`: its `error` text, its
+/// exit (1 when its class is retryable, else 3) and the body's other
+/// fields. The text is fixed wording, the two session names, the counts and
+/// at most the validated key; the cause is used only to pick the class.
+fn carry_incomplete(
+    pred: &str,
+    name: &str,
+    incomplete: &CarryIncomplete,
+) -> (String, i32, serde_json::Value) {
+    let class = CarryFailure::of(&incomplete.cause);
+    let read_of = match &incomplete.key {
+        Some(key) => format!("a bucket read of '{key}'"),
+        None => "the bucket read of the predecessor's context manifest".to_string(),
+    };
+    let what = match class {
+        CarryFailure::Unreachable => format!("{read_of} failed"),
+        CarryFailure::Timeout => format!("{read_of} timed out"),
+        CarryFailure::Throttled => format!("{read_of} was throttled"),
+        CarryFailure::Denied => format!("{read_of} was denied"),
+        CarryFailure::InvalidSource => {
+            let why = match incomplete.cause.downcast_ref::<CarrySourceError>() {
+                Some(e) => e.to_string(),
+                None => {
+                    "the predecessor's workspace prefix or session id can't be trusted".to_string()
+                }
+            };
+            match &incomplete.key {
+                Some(key) => format!("{why}, for key '{key}'"),
+                None => why,
+            }
+        }
+        CarryFailure::WriteFailed => match &incomplete.key {
+            Some(key) => format!("'{key}' couldn't be written into this host's copy of '{name}'"),
+            None => format!("a key couldn't be written into this host's copy of '{name}'"),
+        },
+        CarryFailure::PushFailed => {
+            "every key and the marker are written on this host, but the push to the bucket failed"
+                .to_string()
+        }
+    };
+    let counts = match incomplete.keys {
+        Some(keys) => format!(
+            "{} of {keys} keys carried, {} remain",
+            incomplete.held,
+            keys.saturating_sub(incomplete.held)
+        ),
+        None => "no key was carried".to_string(),
+    };
+    let next = match class {
+        CarryFailure::Denied => format!(
+            "Check that this host's bucket credentials can read '{pred}''s workspace prefix, then \
+             run the same command again"
+        ),
+        CarryFailure::InvalidSource => format!(
+            "Retrying at once reads the same data; run the same command again once nothing else \
+             writes '{pred}'"
+        ),
+        CarryFailure::WriteFailed => {
+            "Run the same command again once this host's koto store can be written".to_string()
+        }
+        _ => "Run the same command again to finish it".to_string(),
+    };
+    let mut extra = serde_json::json!({
+        "superseded": pred,
+        "name": name,
+        "failure": class.name(),
+        "retryable": class.retryable(),
+    });
+    if let (Some(obj), Some(keys)) = (extra.as_object_mut(), incomplete.keys) {
+        obj.insert("keys".into(), keys.into());
+        obj.insert("held".into(), incomplete.held.into());
+        obj.insert(
+            "remaining".into(),
+            keys.saturating_sub(incomplete.held).into(),
+        );
+    }
+    if let Some(obj) = extra.as_object_mut() {
+        obj.insert("carried".into(), incomplete.carried.into());
+    }
+    let exit = if class.retryable() {
+        EXIT_RETRYABLE
+    } else {
+        super::EXIT_INFRASTRUCTURE
+    };
+    (
+        format!(
+            "--supersede: '{pred}' is fenced and '{name}' exists, but the carry stopped: {what}; \
+             {counts}. {next}"
+        ),
+        exit,
+        extra,
+    )
+}
+
+impl std::fmt::Display for CarryIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the carry stopped before it finished")
+    }
+}
+
+impl std::error::Error for CarryIncomplete {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+/// Marks a [`CarryIncomplete`] cause as a write into the successor's local
+/// store that failed.
+#[derive(Debug)]
+pub(crate) struct CarryWriteFailed;
+
+impl std::fmt::Display for CarryWriteFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a carried key couldn't be written into the successor")
+    }
+}
+
+/// Marks a [`CarryIncomplete`] cause as the push that failed after every
+/// key and the marker were written.
+#[derive(Debug)]
+pub(crate) struct CarryPushFailed;
+
+impl std::fmt::Display for CarryPushFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the successor's carried keys couldn't be pushed to the bucket")
+    }
+}
 
 /// The arguments of one `koto init --supersede`.
 pub(crate) struct SupersedeArgs<'a> {
@@ -335,8 +573,14 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     }
 
     // 4. Carry.
-    let pred_prefix = pulled.as_ref().map(|p| p.prefix.as_str());
-    let carried = carry(backend, pred, name, args.carry, pred_prefix).unwrap_or_else(|e| {
+    let from_bucket = pulled.as_ref().map(|p| BucketSource {
+        prefix: &p.prefix,
+        log_names_carried: logs_a_carried_key(&p.events, args.carry),
+    });
+    let carried = carry(backend, pred, name, args.carry, from_bucket).unwrap_or_else(|e| {
+        if let Some(incomplete) = e.downcast_ref::<CarryIncomplete>() {
+            refuse_carry_incomplete(pred, name, incomplete);
+        }
         refuse(
             "persistence_error",
             format!(
@@ -437,6 +681,30 @@ fn fence_in_bucket(
     }
 }
 
+/// Where a cloud carry reads the predecessor.
+#[derive(Clone, Copy)]
+struct BucketSource<'a> {
+    /// The workspace prefix of the predecessor's fenced copy.
+    prefix: &'a str,
+    /// Whether the predecessor's pulled log records a key the carry takes.
+    log_names_carried: bool,
+}
+
+/// Whether `events` record a `context_added` for a key the carry would
+/// take: one under a `--carry` prefix that is neither koto's own nor
+/// host-local. A predecessor whose bucket holds no manifest is refused when
+/// its log records one, since its manifest can't have been empty.
+fn logs_a_carried_key(events: &[Event], prefixes: &[String]) -> bool {
+    events.iter().any(|e| match &e.payload {
+        EventPayload::ContextAdded { key, .. } => {
+            !is_reserved_key(key)
+                && !is_host_local_key(key)
+                && prefixes.iter().any(|p| key.starts_with(p.as_str()))
+        }
+        _ => false,
+    })
+}
+
 /// Copy every key under each of `prefixes` from `pred` into `succ`, then
 /// write [`CARRY_COMPLETE_KEY`] in `succ`. Returns how many keys were
 /// written. Skips everything when the marker is already there, reserved
@@ -444,43 +712,35 @@ fn fence_in_bucket(
 /// `pred` through the store directly, so the carry logs no read in it;
 /// each write in `succ` is logged as a `context_added` by writer `koto`.
 ///
-/// Under the cloud backend `pred` is read from the bucket under
-/// `pred_prefix`, its fenced copy's prefix, and `succ`'s writes are held
-/// and pushed together once the marker is written. A batch an interrupted
-/// carry left open is pushed first, so a re-run sees what it wrote.
+/// Under the cloud backend `pred` is read from the bucket under its fenced
+/// copy's prefix, as [`carry_from_bucket`] describes.
 fn carry(
     backend: &Backend,
     pred: &str,
     succ: &str,
     prefixes: &[String],
-    pred_prefix: Option<&str>,
+    from_bucket: Option<BucketSource<'_>>,
 ) -> Result<usize> {
-    let store: &dyn ContextStore = backend;
-    let cloud = backend.as_cloud();
-    if let Some(cloud) = cloud {
-        cloud.flush_interrupted_batch(succ)?;
+    if let (Some(cloud), Some(source)) = (backend.as_cloud(), from_bucket) {
+        return carry_from_bucket(backend, cloud, pred, succ, prefixes, source);
     }
+    let store: &dyn ContextStore = backend;
     if store.ctx_exists(succ, CARRY_COMPLETE_KEY) {
         return Ok(0);
     }
-    let source = match (cloud, pred_prefix) {
-        (Some(cloud), Some(prefix)) => cloud.carry_source(prefix, pred, prefixes)?,
-        _ => {
-            let mut keys = BTreeSet::new();
-            for prefix in prefixes {
-                keys.extend(
-                    store
-                        .list_keys(pred, Some(prefix))?
-                        .into_iter()
-                        .filter(|k| !is_reserved_key(k)),
-                );
-            }
-            keys.into_iter()
-                .map(|key| store.get(pred, &key).map(|value| (key, value)))
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
-    let held = cloud.map(|cloud| cloud.defer_writes_to(succ));
+    let mut keys = BTreeSet::new();
+    for prefix in prefixes {
+        keys.extend(
+            store
+                .list_keys(pred, Some(prefix))?
+                .into_iter()
+                .filter(|k| !is_reserved_key(k)),
+        );
+    }
+    let source = keys
+        .into_iter()
+        .map(|key| store.get(pred, &key).map(|value| (key, value)))
+        .collect::<Result<Vec<_>>>()?;
     let mut carried = 0;
     for (key, value) in &source {
         if store.ctx_exists(succ, key) && store.get(succ, key).ok().as_ref() == Some(value) {
@@ -489,18 +749,138 @@ fn carry(
         write_koto_key(backend, succ, key, value)?;
         carried += 1;
     }
-    let marker = serde_json::to_vec(&serde_json::json!({
-        "from": pred,
-        "prefixes": prefixes,
-        "keys": source.len(),
-        "at": now_iso8601(),
-    }))?;
-    write_koto_key(backend, succ, CARRY_COMPLETE_KEY, &marker)?;
-    drop(held);
-    if let Some(cloud) = cloud {
-        cloud.flush_window(succ)?;
+    write_koto_key(
+        backend,
+        succ,
+        CARRY_COMPLETE_KEY,
+        &carry_marker(pred, prefixes, source.len())?,
+    )?;
+    Ok(carried)
+}
+
+/// [`carry`] under the cloud backend. A batch an interrupted carry left
+/// open is pushed first, so a re-run starts from what the bucket holds, and
+/// a marker already there carries nothing. Then `succ`'s writes are held
+/// for one push while the predecessor's manifest is read
+/// ([`CloudBackend::carry_plan`]); a key this host's copy of `succ` already
+/// holds with the manifest's hash is counted as held with no GET, and the
+/// rest are read [`FLUSH_PARALLELISM`] at a time and written, in key order,
+/// as each chunk lands.
+///
+/// A read that fails stops the carry after the chunk's other values are
+/// written; a write that fails stops it at once. Either way the writes so
+/// far are pushed once, best-effort, without the marker, and the error is a
+/// [`CarryIncomplete`]. On success
+/// the marker is written last and everything goes up in one push; a push
+/// that fails is a [`CarryIncomplete`] too, its cause marked
+/// [`CarryPushFailed`], and a re-run pushes the open batch first.
+fn carry_from_bucket(
+    backend: &Backend,
+    cloud: &CloudBackend,
+    pred: &str,
+    succ: &str,
+    prefixes: &[String],
+    source: BucketSource<'_>,
+) -> Result<usize> {
+    let store: &dyn ContextStore = backend;
+    cloud.flush_interrupted_batch(succ)?;
+    if store.ctx_exists(succ, CARRY_COMPLETE_KEY) {
+        return Ok(0);
+    }
+    let guard = cloud.defer_writes_to(succ);
+    let plan = match cloud.carry_plan(source.prefix, pred, prefixes, source.log_names_carried) {
+        Ok(plan) => plan,
+        Err(cause) => {
+            drop(guard);
+            return Err(CarryIncomplete {
+                keys: None,
+                held: 0,
+                carried: 0,
+                key: None,
+                cause,
+            }
+            .into());
+        }
+    };
+    let held = cloud.held_locally(succ, &plan);
+    let wanted: Vec<CarryEntry> = plan
+        .iter()
+        .filter(|e| !held.contains(e.key()))
+        .cloned()
+        .collect();
+    let skipped = plan.len() - wanted.len();
+
+    let mut carried = 0;
+    // The key that stopped the carry, when one did, and why.
+    let mut stopped: Option<(Option<String>, anyhow::Error)> = None;
+    'chunks: for chunk in wanted.chunks(FLUSH_PARALLELISM) {
+        let mut failed = None;
+        for (entry, fetched) in chunk
+            .iter()
+            .zip(cloud.fetch_carried(source.prefix, pred, chunk))
+        {
+            match fetched {
+                Ok(value) => {
+                    if let Err(e) = write_koto_key(backend, succ, entry.key(), &value) {
+                        stopped =
+                            Some((Some(entry.key().to_string()), e.context(CarryWriteFailed)));
+                        break 'chunks;
+                    }
+                    carried += 1;
+                }
+                Err(e) => {
+                    failed.get_or_insert((Some(entry.key().to_string()), e));
+                }
+            }
+        }
+        if failed.is_some() {
+            stopped = failed;
+            break;
+        }
+    }
+    if stopped.is_none() {
+        let marker = carry_marker(pred, prefixes, plan.len())?;
+        if let Err(e) = write_koto_key(backend, succ, CARRY_COMPLETE_KEY, &marker) {
+            stopped = Some((
+                Some(CARRY_COMPLETE_KEY.to_string()),
+                e.context(CarryWriteFailed),
+            ));
+        }
+    }
+    // End the deferral here, so the batch `flush_window` pushes holds only
+    // the carry's writes. `flush_window` pushes whether or not the guard is
+    // held; this is the order, not a dependency.
+    drop(guard);
+    let incomplete = |key, cause| CarryIncomplete {
+        keys: Some(plan.len()),
+        held: skipped + carried,
+        carried,
+        key,
+        cause,
+    };
+    if let Some((key, cause)) = stopped {
+        // The same failing network is likely to fail this push too, and a
+        // batch it leaves open goes up with the next command on this host.
+        // Its failure is dropped, so the class stays the one that stopped
+        // the carry.
+        let _ = cloud.flush_window(succ);
+        return Err(incomplete(key, cause).into());
+    }
+    if let Err(e) = cloud.flush_window(succ) {
+        return Err(incomplete(None, e.context(CarryPushFailed)).into());
     }
     Ok(carried)
+}
+
+/// The value of [`CARRY_COMPLETE_KEY`]: where the carry read from, under
+/// which prefixes, and how many keys it covered.
+fn carry_marker(pred: &str, prefixes: &[String], keys: usize) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "from": pred,
+        "prefixes": prefixes,
+        "keys": keys,
+        "at": now_iso8601(),
+    }))?)
 }
 
 /// `fence`, read from `pred`'s log or its bucket copy, once its names check
@@ -571,4 +951,186 @@ fn write_koto_key(backend: &Backend, session: &str, key: &str, value: &[u8]) -> 
         &added_event(key, value, WRITER_KOTO),
         &now_iso8601(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn added(key: &str) -> Event {
+        let payload = added_event(key, b"v", WRITER_KOTO);
+        Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    #[test]
+    fn a_log_names_a_carried_key_only_under_a_carry_prefix_and_outside_koto_s_own() {
+        let prefixes = vec!["record/".to_string(), "koto".to_string()];
+        assert!(logs_a_carried_key(&[added("record/a")], &prefixes));
+        assert!(!logs_a_carried_key(&[added("coord/x")], &prefixes));
+        assert!(!logs_a_carried_key(
+            &[added("koto/superseded-carry-complete")],
+            &prefixes
+        ));
+        assert!(!logs_a_carried_key(&[], &prefixes));
+    }
+
+    #[test]
+    fn an_incomplete_carry_never_renders_its_cause() {
+        let e: anyhow::Error = CarryIncomplete {
+            keys: Some(3),
+            held: 1,
+            carried: 1,
+            key: None,
+            cause: anyhow::anyhow!("endpoint http://secret.example request id 42")
+                .context(CarryPushFailed),
+        }
+        .into();
+        // anyhow's `{:?}` prints the message and the source chain.
+        for shown in [format!("{e}"), format!("{e:#}"), format!("{e:?}")] {
+            assert!(!shown.contains("secret"), "{shown}");
+        }
+        assert_eq!(format!("{e:#}"), "the carry stopped before it finished");
+        let incomplete = e.downcast_ref::<CarryIncomplete>().unwrap();
+        assert!(incomplete.cause.downcast_ref::<CarryPushFailed>().is_some());
+    }
+
+    const SECRET: &str = "endpoint http://secret.example request id 42";
+
+    fn read_failed(status: u16) -> anyhow::Error {
+        BucketReadFailed {
+            key: "7e57000000000000/p/ctx/record/a".to_string(),
+            source: s3::error::S3Error::HttpFailWithBody(status, SECRET.to_string()),
+            took: std::time::Duration::ZERO,
+        }
+        .into()
+    }
+
+    fn stopped(keys: Option<usize>, key: Option<&str>, cause: anyhow::Error) -> CarryIncomplete {
+        CarryIncomplete {
+            keys,
+            held: if keys.is_some() { 4 } else { 0 },
+            carried: if keys.is_some() { 3 } else { 0 },
+            key: key.map(str::to_string),
+            cause,
+        }
+    }
+
+    #[test]
+    fn an_incomplete_carry_is_classed_by_its_cause() {
+        let cases: Vec<(anyhow::Error, CarryFailure)> = vec![
+            (read_failed(500), CarryFailure::Unreachable),
+            (read_failed(503), CarryFailure::Throttled),
+            (read_failed(429), CarryFailure::Throttled),
+            (read_failed(403), CarryFailure::Denied),
+            (read_failed(401), CarryFailure::Denied),
+            (
+                CarrySourceError::HashMismatch.into(),
+                CarryFailure::InvalidSource,
+            ),
+            (
+                anyhow::anyhow!("'x' isn't a workspace prefix"),
+                CarryFailure::InvalidSource,
+            ),
+            (
+                anyhow::anyhow!("disk full").context(CarryWriteFailed),
+                CarryFailure::WriteFailed,
+            ),
+            // A push's cause may hold anything; the marker decides.
+            (
+                read_failed(503).context(CarryPushFailed),
+                CarryFailure::PushFailed,
+            ),
+        ];
+        for (cause, class) in cases {
+            assert_eq!(CarryFailure::of(&cause), class, "{cause:#}");
+        }
+        let retryable: Vec<&str> = [
+            CarryFailure::Unreachable,
+            CarryFailure::Timeout,
+            CarryFailure::Throttled,
+            CarryFailure::Denied,
+            CarryFailure::InvalidSource,
+            CarryFailure::WriteFailed,
+            CarryFailure::PushFailed,
+        ]
+        .into_iter()
+        .filter(|c| c.retryable())
+        .map(CarryFailure::name)
+        .collect();
+        assert_eq!(
+            retryable,
+            ["unreachable", "timeout", "throttled", "push_failed"]
+        );
+    }
+
+    #[test]
+    fn a_retryable_carry_failure_exits_1_with_its_counts() {
+        let (message, exit, body) = carry_incomplete(
+            "p",
+            "s",
+            &stopped(Some(5), Some("record/a"), read_failed(503)),
+        );
+        assert_eq!(exit, 1);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "superseded": "p", "name": "s", "failure": "throttled", "retryable": true,
+                "keys": 5, "held": 4, "remaining": 1, "carried": 3,
+            })
+        );
+        assert_eq!(
+            message,
+            "--supersede: 'p' is fenced and 's' exists, but the carry stopped: a bucket read of \
+             'record/a' was throttled; 4 of 5 keys carried, 1 remain. Run the same command \
+             again to finish it"
+        );
+    }
+
+    #[test]
+    fn a_carry_whose_plan_failed_leaves_its_counts_out_and_exits_3() {
+        let (message, exit, body) = carry_incomplete(
+            "p",
+            "s",
+            &stopped(None, None, CarrySourceError::BadKey.into()),
+        );
+        assert_eq!(exit, 3);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "superseded": "p", "name": "s", "failure": "invalid_source",
+                "retryable": false, "carried": 0,
+            })
+        );
+        assert!(
+            message.contains(&CarrySourceError::BadKey.to_string()),
+            "{message}"
+        );
+        assert!(message.contains("no key was carried"), "{message}");
+    }
+
+    /// Whatever the class, the text holds none of the cause's own text.
+    #[test]
+    fn a_carry_incomplete_refusal_never_shows_its_cause() {
+        for keys in [None, Some(5)] {
+            let causes = [
+                read_failed(500),
+                read_failed(403),
+                anyhow::anyhow!(SECRET),
+                anyhow::anyhow!(SECRET).context(CarryWriteFailed),
+                anyhow::anyhow!(SECRET).context(CarryPushFailed),
+            ];
+            for cause in causes {
+                let key = keys.map(|_| "record/a");
+                let (message, _, body) = carry_incomplete("p", "s", &stopped(keys, key, cause));
+                assert!(!message.contains("secret"), "{message}");
+                assert!(!body.to_string().contains("secret"), "{body}");
+            }
+        }
+    }
 }
