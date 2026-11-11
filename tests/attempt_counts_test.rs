@@ -106,15 +106,25 @@ impl Env {
     }
 
     fn override_gate(&self, gate: &str) {
-        let out = self.run(&[
-            "overrides",
-            "record",
-            "wf",
-            "--gate",
-            gate,
-            "--rationale",
-            "checked by hand",
-        ]);
+        // A fixed harness session, so the override (a gate pass) has an
+        // established decider.
+        let out = self
+            .koto()
+            .env(
+                "CLAUDE_CODE_SESSION_ID",
+                "0f0e0d0c-1111-4222-8333-444455556666",
+            )
+            .args([
+                "overrides",
+                "record",
+                "wf",
+                "--gate",
+                gate,
+                "--rationale",
+                "checked by hand",
+            ])
+            .output()
+            .unwrap();
         assert!(out.status.success(), "override: {}", describe(&out));
     }
 

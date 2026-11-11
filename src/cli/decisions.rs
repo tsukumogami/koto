@@ -82,6 +82,41 @@ impl RecordArgs {
     }
 }
 
+/// The decider flags of a command that records a decision alongside its
+/// own event: `koto overrides record`, `koto next --to` and `koto decider
+/// answer` (PRD R24).
+#[derive(Args, Debug, Clone, Default)]
+pub struct DeciderArgs {
+    /// Who decided: session, person:<handle> or check:<name>. With none,
+    /// a gate pass is the agent session's, marked defaulted
+    #[arg(long)]
+    pub by: Option<String>,
+    /// A person decider's surface: terminal, forge or relay
+    #[arg(long)]
+    pub surface: Option<String>,
+    /// A person decider's link to the original
+    #[arg(long)]
+    pub link: Option<String>,
+    /// The agent within the deciding session that decided
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// The run mode: attended, unattended or unknown
+    #[arg(long = "run-mode")]
+    pub run_mode: Option<String>,
+}
+
+impl DeciderArgs {
+    pub fn flags(&self) -> Flags {
+        Flags {
+            by: self.by.clone(),
+            surface: self.surface.clone(),
+            link: self.link.clone(),
+            agent: self.agent.clone(),
+            run_mode: self.run_mode.clone(),
+        }
+    }
+}
+
 /// The flags `list` takes beyond the session.
 #[derive(Args, Debug, Clone, Default)]
 pub struct ListArgs {
@@ -130,7 +165,9 @@ impl ListArgs {
     }
 }
 
-fn refuse(command: &str, err: &DecisionError) -> ! {
+/// Print a decision refusal for `command` and exit: 3 for a write that
+/// failed, 2 for anything the caller has to change.
+pub(crate) fn refuse(command: &str, err: &DecisionError) -> ! {
     let mut out = serde_json::json!({
         "error": err.message,
         "code": err.code,
@@ -287,6 +324,97 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
         }))?
     );
     Ok(())
+}
+
+/// Record the state choice `koto decisions record <session> --with-data`
+/// just appended as a `judgment` (R25): the choice as what was judged, its
+/// rationale as the reason, and the session as the decider. The command's
+/// output is unchanged: a decision that can't be written is one warning.
+pub fn record_choice_judgment(
+    backend: &Backend,
+    name: &str,
+    session_id: &str,
+    events: &[crate::engine::types::Event],
+    choice: String,
+    rationale: Option<String>,
+) {
+    use crate::decisions::gate_pass;
+    let written = (|| {
+        let flags = Flags::default();
+        let observed = Observed::from_env(backend);
+        let decider = gate_pass::judgment_decider(name, &flags, &observed)?;
+        let state = crate::engine::persistence::derive_state_from_log(events).unwrap_or_default();
+        let at = gate_pass::At {
+            session: name,
+            session_id,
+            state: &state,
+            log_seq: events.last().map(|e| e.seq).unwrap_or(0),
+        };
+        let req = gate_pass::judgment(choice, rationale, vec![]);
+        let prepared = gate_pass::Prepared::new(backend, at, req, decider, &flags, &observed)?;
+        gate_pass::record(backend, &prepared)
+    })();
+    if let Err(e) = written {
+        eprintln!(
+            "warning: the choice recorded in '{name}' wasn't recorded as a decision: {}",
+            e.message
+        );
+    }
+}
+
+/// The `gate-pass` of a `koto next --to` that moves past `gates` (the
+/// overridable gates it skips that haven't passed, joined with `,`), ready
+/// to be written with the `directed_transition` event. Refuses the tick in
+/// `koto next`'s error shape, with nothing appended, when no decider is
+/// established (a `refused` decision is recorded then) or a flag is
+/// malformed.
+#[allow(clippy::too_many_arguments)]
+pub fn directed_gate_pass(
+    backend: &Backend,
+    name: &str,
+    session_id: &str,
+    state: &str,
+    events: &[crate::engine::types::Event],
+    gates: &str,
+    rationale: Option<String>,
+    args: &DeciderArgs,
+) -> crate::decisions::gate_pass::Prepared {
+    use super::next_types::{NextError, NextErrorCode};
+    use crate::decisions::gate_pass;
+    let flags = args.flags();
+    let observed = Observed::from_env(backend);
+    let at = gate_pass::At {
+        session: name,
+        session_id,
+        state,
+        log_seq: events.last().map(|e| e.seq).unwrap_or(0),
+    };
+    let reason = rationale.filter(|r| !r.trim().is_empty());
+    gate_pass::resolve_or_refuse(backend, at, gates, &flags, &observed)
+        .and_then(|decider| {
+            gate_pass::Prepared::new(
+                backend,
+                at,
+                gate_pass::gate_pass(at, gates, reason),
+                decider,
+                &flags,
+                &observed,
+            )
+        })
+        .unwrap_or_else(|e| {
+            let code = if e.code == codes::DECIDER_MISSING {
+                NextErrorCode::DeciderMissing
+            } else {
+                NextErrorCode::InvalidDecision
+            };
+            let err = NextError {
+                code,
+                message: format!("cannot take --to past {gates}: {}", e.message),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code())
+        })
 }
 
 /// `koto decisions list <session> --format v1 [--below] [filters]`.

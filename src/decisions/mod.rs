@@ -20,6 +20,8 @@
 //! - [`chain`]: the chain snapshot over dispatched-by and held-by links.
 //! - [`store`]: the allocator, the create-only writer and the listing of a
 //!   session's areas with their integrity checks.
+//! - [`gate_pass`]: the decisions koto's own commands record with the
+//!   events they append, and the gate-pass decider rules.
 //! - [`read`]: the pure read path behind `list` and `show`.
 //! - [`standing`]: who may reverse what, where a reversal is recorded,
 //!   racing reversals and each decision's status.
@@ -27,6 +29,7 @@
 pub mod body;
 pub mod chain;
 pub mod decider;
+pub mod gate_pass;
 pub mod read;
 pub mod standing;
 pub mod store;

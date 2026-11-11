@@ -92,6 +92,11 @@ pub enum Decider {
         /// Whether koto filled the decider in for a gate pass nobody named
         /// one for (R24). `koto decisions record` never defaults.
         defaulted: bool,
+        /// Whether nothing established a decider: the session decider of a
+        /// `refused` gate pass, with empty harness and anchor and agent
+        /// `unknown` (R24). Absent from the body when false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        unestablished: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<PersonNote>,
     },
@@ -119,6 +124,16 @@ impl Decider {
         }
     }
 
+    pub fn unestablished(&self) -> bool {
+        matches!(
+            self,
+            Decider::Session {
+                unestablished: true,
+                ..
+            }
+        )
+    }
+
     pub fn defaulted(&self) -> bool {
         matches!(
             self,
@@ -127,6 +142,43 @@ impl Decider {
                 ..
             }
         )
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Resolve the decider of a gate pass (R24): a `--by` decider as
+/// [`resolve`] gives it, else the session decider marked `defaulted` when
+/// a harness session identifier or an anchor establishes one, else
+/// `decider_missing`.
+pub fn resolve_gate_pass(
+    session: &str,
+    flags: &Flags,
+    observed: &Observed,
+) -> Result<Decider, DecisionError> {
+    let mut decider = resolve(session, flags, observed)?;
+    if flags.by.is_none() {
+        if let Decider::Session { defaulted, .. } = &mut decider {
+            *defaulted = true;
+        }
+    }
+    Ok(decider)
+}
+
+/// The decider of a gate pass refused for want of one (R24): the koto
+/// session with empty harness and anchor, agent `unknown`, marked
+/// `unestablished`.
+pub fn unestablished(session: &str) -> Decider {
+    Decider::Session {
+        session: Sourced::observed(session),
+        harness: Sourced::observed(""),
+        anchor: Sourced::observed(""),
+        agent: Sourced::observed("unknown"),
+        defaulted: false,
+        unestablished: true,
+        note: None,
     }
 }
 
@@ -225,6 +277,7 @@ pub fn resolve(
         anchor: entering.anchor.clone(),
         agent: agent.clone(),
         defaulted: false,
+        unestablished: false,
         note,
     };
 
@@ -435,6 +488,38 @@ mod tests {
             serde_json::json!({"value": "unknown", "source": "observed"})
         );
         assert_eq!(json["defaulted"], false);
+    }
+
+    #[test]
+    fn a_gate_pass_with_no_by_defaults_to_the_session_and_is_marked() {
+        let d = resolve_gate_pass("w", &Flags::default(), &observed(Some("abc-1"), None)).unwrap();
+        assert!(d.defaulted());
+        let err = resolve_gate_pass("w", &Flags::default(), &observed(None, None)).unwrap_err();
+        assert_eq!(err.code, codes::DECIDER_MISSING);
+        let flags = Flags {
+            by: Some("session".to_string()),
+            ..Flags::default()
+        };
+        assert!(
+            !resolve_gate_pass("w", &flags, &observed(Some("abc-1"), None))
+                .unwrap()
+                .defaulted()
+        );
+    }
+
+    #[test]
+    fn an_unestablished_decider_has_empty_identity_and_an_unknown_agent() {
+        let json = serde_json::to_value(unestablished("w")).unwrap();
+        assert_eq!(json["unestablished"], true);
+        assert_eq!(json["harness"]["value"], "");
+        assert_eq!(json["anchor"]["value"], "");
+        assert_eq!(json["agent"]["value"], "unknown");
+        // A settled decider carries no marker at all.
+        let d = resolve("w", &Flags::default(), &observed(Some("abc-1"), None)).unwrap();
+        assert!(serde_json::to_value(d)
+            .unwrap()
+            .get("unestablished")
+            .is_none());
     }
 
     #[test]

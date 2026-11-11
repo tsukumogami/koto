@@ -2,7 +2,7 @@
 //
 // Implemented for Issue #49.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::action::FailureKind;
@@ -2468,6 +2468,73 @@ pub(crate) fn directed_target_guard_gates(
         }
     }
     guards
+}
+
+/// The overridable gates a directed transition (`koto next --to`) from
+/// `state` to `target` moves past without their having passed: the gates
+/// every edge to `target` depends on (as [`directed_target_guard_gates`]
+/// reads dependence), whose latest `gate_evaluated` in the current visit to
+/// `state` isn't `passed`, or which have none, and which no
+/// `gate_override_recorded` in the visit already let past. Sorted; empty
+/// when an edge to `target` depends on no overridable gate, so a `--to`
+/// that passes no gate records no gate pass (decision record, R24).
+pub(crate) fn directed_target_skipped_gates(
+    template_state: &TemplateState,
+    state: &str,
+    target: &str,
+    events: &[Event],
+) -> Vec<String> {
+    let mut depended = BTreeSet::new();
+    for (index, transition) in template_state.transitions.iter().enumerate() {
+        if transition.target != target {
+            continue;
+        }
+        let edge: Vec<&String> = template_state
+            .gates
+            .iter()
+            .filter(|(name, gate)| {
+                gate.overridable
+                    && !matches!(
+                        edge_gate_dependence(template_state, index, name),
+                        EdgeGateDependence::None
+                    )
+            })
+            .map(|(name, _)| name)
+            .collect();
+        if edge.is_empty() {
+            return Vec::new();
+        }
+        depended.extend(edge.into_iter().cloned());
+    }
+    let visit_start = events
+        .iter()
+        .rposition(|e| match &e.payload {
+            EventPayload::Transitioned { to, .. }
+            | EventPayload::DirectedTransition { to, .. }
+            | EventPayload::Rewound { to, .. } => to == state,
+            _ => false,
+        })
+        .map_or(0, |i| i + 1);
+    let visit = &events[visit_start..];
+    depended
+        .into_iter()
+        .filter(|gate| {
+            let overridden = visit.iter().any(|e| {
+                matches!(&e.payload, EventPayload::GateOverrideRecorded { state: s, gate: g, .. }
+                    if s == state && g == gate)
+            });
+            let passed = visit.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::GateEvaluated {
+                    state: s,
+                    gate: g,
+                    outcome,
+                    ..
+                } if s == state && g == gate => Some(outcome == "passed"),
+                _ => None,
+            });
+            !overridden && passed != Some(true)
+        })
+        .collect()
 }
 
 /// The gates that refuse a directed transition to `target`, given the real
@@ -6150,6 +6217,7 @@ mod tests {
                     override_applied,
                     actual_output: serde_json::json!({"exit_code": 1, "error": ""}),
                     timestamp: "2026-04-01T00:00:00Z".to_string(),
+                    decision: None,
                 },
             ),
         ]

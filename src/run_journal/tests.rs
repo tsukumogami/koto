@@ -191,6 +191,7 @@ fn commits_map_to_records_and_other_payloads_write_nothing() {
             from: "b".into(),
             to: "c".into(),
             rationale: Some("PLANTED-RATIONALE".into()),
+            decision: None,
         },
         &ts,
     )
@@ -2711,6 +2712,7 @@ fn a_unit_mode_check_relays_the_units_digests_and_declared_labels() {
         fallback_seq: 5,
         unit: Some(unit.clone()),
         unit_labels: Some(declared),
+        decision: None,
     };
     commit_as(
         &f,
@@ -2943,6 +2945,7 @@ fn an_override_relays_check_overridden_with_its_state_and_gate_only() {
             override_applied: serde_json::json!({"exit_code": 0, "note": "PLANTED-VALUE"}),
             actual_output: serde_json::json!({"exit_code": 1, "error": "PLANTED-OUTPUT"}),
             timestamp: crate::engine::types::now_iso8601(),
+            decision: None,
         },
     );
     assert_eq!(batches_for_test(), (1, 0));
@@ -3023,6 +3026,7 @@ fn decider_and_override_records_fit_the_line_cap_at_the_longest_names() {
         override_applied: serde_json::json!({"v": "x".repeat(8192)}),
         actual_output: serde_json::json!({"v": "x".repeat(8192)}),
         timestamp: crate::engine::types::now_iso8601(),
+        decision: None,
     };
     let mut records = Vec::new();
     for payload in [
@@ -3652,6 +3656,7 @@ fn check_answered(answer: AgentAnswer, fallback_seq: u64) -> EventPayload {
         fallback_seq,
         unit: None,
         unit_labels: None,
+        decision: None,
     })
 }
 

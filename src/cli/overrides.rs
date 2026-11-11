@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::cache::sha256_hex;
+use crate::decisions::gate_pass;
 use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_overrides_all, derive_state_from_log,
 };
@@ -39,6 +40,10 @@ pub enum OverridesSubcommand {
         /// then built-in default for the gate type)
         #[arg(long = "with-data")]
         with_data: Option<String>,
+
+        /// Who let the gate pass (the decision record's decider flags)
+        #[command(flatten)]
+        decider: crate::cli::decisions::DeciderArgs,
     },
 
     /// List all gate overrides across the full session history
@@ -125,13 +130,17 @@ pub fn override_refusal(
 ///    --with-data (the refusal comes first so no payload error can mask it)
 /// 4. Resolve override_applied: --with-data → gate.override_default → built_in_default
 /// 5. Read actual_output from derive_last_gate_evaluated (null if absent)
-/// 6. Append GateOverrideRecorded event
+/// 6. Resolve the gate pass's decider (refused with `decider_missing` and
+///    nothing appended when none is established), then append the
+///    GateOverrideRecorded event with its `gate-pass` decision embedded, in
+///    the decision store's critical section
 pub fn handle_overrides_record(
-    backend: &dyn SessionBackend,
+    backend: &crate::session::Backend,
     name: String,
     gate: String,
     rationale: String,
     with_data: Option<String>,
+    decider_args: crate::cli::decisions::DeciderArgs,
 ) -> Result<()> {
     // 1. Size-limit check on --rationale. The --with-data checks run after
     //    the gate is found and known to accept overrides (step 3b), so a
@@ -329,24 +338,53 @@ pub fn handle_overrides_record(
     let actual_output: serde_json::Value =
         derive_last_gate_evaluated(&events, &gate).unwrap_or(serde_json::Value::Null);
 
-    // 6. Append GateOverrideRecorded event
-    let ts = now_iso8601();
-    let payload = EventPayload::GateOverrideRecorded {
-        state: current_state.clone(),
-        gate: gate.clone(),
-        rationale: rationale.clone(),
-        override_applied: override_applied.clone(),
-        actual_output: actual_output.clone(),
-        timestamp: ts.clone(),
+    // 6. The override is a gate pass: resolve its decider, refusing with
+    //    nothing appended when none is established, then append the event
+    //    with its decision embedded, in one critical section.
+    let flags = decider_args.flags();
+    let observed = crate::decisions::decider::Observed::from_env(backend);
+    let at = gate_pass::At {
+        session: &name,
+        session_id: &header.session_id,
+        state: &current_state,
+        log_seq: events.last().map(|e| e.seq).unwrap_or(0),
     };
-    if let Err(e) = backend.append_event(&name, &payload, &ts) {
-        exit_with_error_code(
+    let refuse = |e: &crate::decisions::DecisionError| -> ! {
+        crate::cli::decisions::refuse("overrides record", e)
+    };
+    let decider = gate_pass::resolve_or_refuse(backend, at, &gate, &flags, &observed)
+        .unwrap_or_else(|e| refuse(&e));
+    let prepared = gate_pass::Prepared::new(
+        backend,
+        at,
+        gate_pass::gate_pass(at, &gate, Some(rationale.clone())),
+        decider,
+        &flags,
+        &observed,
+    )
+    .unwrap_or_else(|e| refuse(&e));
+    let ts = now_iso8601();
+    let recorded = gate_pass::record_with_event(backend, &prepared, &ts, |decision| {
+        EventPayload::GateOverrideRecorded {
+            state: current_state.clone(),
+            gate: gate.clone(),
+            rationale: rationale.clone(),
+            override_applied: override_applied.clone(),
+            actual_output: actual_output.clone(),
+            timestamp: ts.clone(),
+            decision: Some(decision),
+        }
+    });
+    match recorded {
+        Ok(_) => {}
+        Err(e) if e.code == gate_pass::EVENT_APPEND_FAILED => exit_with_error_code(
             serde_json::json!({
-                "error": e.to_string(),
+                "error": e.message,
                 "command": "overrides record"
             }),
             1,
-        );
+        ),
+        Err(e) => refuse(&e),
     }
 
     // 7. An override of a blocking decider check is recorded in the decider
@@ -432,6 +470,7 @@ pub fn handle_overrides_list(backend: &crate::session::Backend, name: String) ->
                 override_applied,
                 actual_output,
                 timestamp,
+                ..
             } = &e.payload
             {
                 Some(serde_json::json!({

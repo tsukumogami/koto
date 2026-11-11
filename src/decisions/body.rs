@@ -493,6 +493,89 @@ pub fn parse_evidence(entries: &[String]) -> Result<Vec<Value>, DecisionError> {
         .collect()
 }
 
+/// Check a body that reached the store some other way than a fresh record,
+/// such as one repaired from the event it was embedded in, with the checks
+/// a fresh record gets: it parses as a body, it names `session_name` and
+/// `session_id`, it isn't a reversal (those are aimed, never repaired into
+/// `koto/decisions/`), and its kind, outcome, subject, basis, evidence,
+/// reason and tool-call identifier pass [`validate`], [`parse_basis`] and
+/// [`parse_evidence`] and come back as the body holds them.
+pub fn validate_stored(
+    body: &DecisionBody,
+    session_name: &str,
+    session_id: &str,
+) -> Result<(), DecisionError> {
+    let invalid = |m: String| DecisionError::invalid("body", m);
+    let bytes = body
+        .to_bytes()
+        .map_err(|e| invalid(format!("body doesn't serialize: {e}")))?;
+    let parsed = DecisionBody::parse(&bytes).map_err(invalid)?;
+    if parsed.session.name != session_name || parsed.session.id != session_id {
+        return Err(invalid(format!(
+            "body names session '{}' ({}), not '{session_name}' ({session_id})",
+            parsed.session.name, parsed.session.id
+        )));
+    }
+    if parsed.kind == "reverse" {
+        return Err(invalid(
+            "a reversal isn't stored in koto/decisions/".to_string(),
+        ));
+    }
+    let mut subject = Vec::new();
+    for (field, value) in &parsed.subject {
+        match (field.as_str(), value) {
+            ("paths", Value::Array(paths)) => {
+                for p in paths {
+                    let p = p
+                        .as_str()
+                        .ok_or_else(|| invalid("subject.paths holds a non-string".to_string()))?;
+                    subject.push(("path".to_string(), p.to_string()));
+                }
+            }
+            (_, Value::String(v)) => subject.push((field.clone(), v.clone())),
+            _ => return Err(invalid(format!("subject.{field} isn't a string"))),
+        }
+    }
+    let basis: Vec<String> = parsed
+        .basis
+        .iter()
+        .map(|b| format!("{}:{}", b.session, b.id))
+        .collect();
+    let evidence = parsed
+        .evidence
+        .iter()
+        .map(|e| match (e["kind"].as_str(), e["value"].as_str()) {
+            (Some("event"), _) => Ok(format!(
+                "event:{}:{}",
+                e["session"].as_str().unwrap_or_default(),
+                e["seq"].as_u64().unwrap_or_default()
+            )),
+            (Some("pointer"), Some(v)) => Ok(v.to_string()),
+            _ => Err(invalid(
+                "an evidence entry is neither an event nor a pointer".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let req = Request {
+        kind: parsed.kind.clone(),
+        outcome: parsed.outcome.clone(),
+        subject,
+        basis,
+        evidence,
+        reason: parsed.reason.clone(),
+        tool_call: parsed.tool_call.clone(),
+    };
+    if validate(&req)? != parsed.subject
+        || parse_basis(&req.basis)? != parsed.basis
+        || parse_evidence(&req.evidence)? != parsed.evidence
+    {
+        return Err(invalid(
+            "body's subject, basis or evidence isn't as a fresh record stores it".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// A short, printable preview of caller input for an error message.
 fn preview(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(64).collect()

@@ -28,11 +28,17 @@ fn sessions_base(dir: &Path) -> PathBuf {
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = koto_command::koto();
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+    // A fixed harness session, so a gate pass (an override, a `--to`
+    // past an overridable gate, or an answer of pass) has an established
+    // decider.
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
+    cmd.env_remove("KOTO_ANCHOR");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
     // The `default_action` shells out to this build's `koto`.
     let bin = koto_command::koto_bin();

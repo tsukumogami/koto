@@ -796,6 +796,10 @@ fn an_answer_decides_the_gate_by_mode_and_the_latest_one_wins() {
     let out = run(&h, "auto");
     assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
     answer(&h, "r", "fail");
+    // A fail is a judgment, not a gate pass.
+    let answered = h.events_of("decider_check_answered");
+    let d = &answered.last().unwrap()["payload"]["decision"];
+    assert_eq!(d["kind"], "judgment", "{}", d);
     let out = run(&h, "auto");
     assert_eq!(out["action"], "gate_blocked", "{}", out);
     let f = findings(&out);
@@ -865,7 +869,7 @@ fn an_override_default_without_the_new_lists_still_compiles_and_moves_past_a_wai
     h.stub.push(Reply::status(401));
     let out = run(&h, "auto");
     assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
-    let mut cmd = h.koto();
+    let mut cmd = gate_passer(&h);
     cmd.args([
         "overrides",
         "record",
@@ -1267,8 +1271,7 @@ fn an_override_records_only_the_failed_criterion_as_a_candidate() {
     h.stub.push(fail("a"));
     h.stub.push(Reply::status(401));
     run(&h, "auto");
-    let out = h
-        .koto()
+    let out = gate_passer(&h)
         .args([
             "overrides",
             "record",
@@ -1314,8 +1317,7 @@ fn the_report_tallies_each_criterion() {
     h.stub.push(fail("a"));
     h.stub.push(escape("b"));
     run(&h, "auto");
-    let out = h
-        .koto()
+    let out = gate_passer(&h)
         .args([
             "overrides",
             "record",
@@ -1426,8 +1428,7 @@ fn a_ledger_with_an_overridden_unanswered_line_still_reads() {
     let h = harness(&check_template(&criterion("a", "veto")), SLICE);
     h.stub.push(fail("a"));
     run(&h, "auto");
-    let out = h
-        .koto()
+    let out = gate_passer(&h)
         .args([
             "overrides",
             "record",
@@ -1613,8 +1614,7 @@ fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
         run(&h, "auto");
         h.stub.push(reply);
         run_with(&h, "auto", r#"{"go": true}"#);
-        let out = h
-            .koto()
+        let out = gate_passer(&h)
             .args([
                 "overrides",
                 "record",
@@ -1713,9 +1713,21 @@ fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
 // koto decider answer
 // ---------------------------------------------------------------------------
 
+/// A `koto` command run from a fixed harness session, so a gate pass (an
+/// override, or an answer of pass) has an established decider.
+fn gate_passer(h: &Harness) -> std::process::Command {
+    let mut cmd = h.koto();
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
+    cmd.env_remove("KOTO_ANCHOR");
+    cmd
+}
+
 /// `koto decider answer` with these arguments, as the agent runs it.
 fn answer_cmd(h: &Harness, args: &[&str]) -> std::process::Output {
-    let mut cmd = h.koto();
+    let mut cmd = gate_passer(h);
     cmd.args(["decider", "answer"]).args(args);
     cmd.output().unwrap()
 }
@@ -1763,6 +1775,21 @@ fn the_command_the_waiting_finding_prints_records_the_answer() {
     assert_eq!(p["declaration_hash"], fb["payload"]["declaration_hash"]);
     assert_eq!(p["input_sha256"], fb["payload"]["input_sha256"]);
     assert_eq!(p["fallback_seq"], fb["seq"]);
+    // A pass is a gate pass, its decider the agent session by default.
+    let d = &p["decision"];
+    assert_eq!(d["kind"], "gate-pass", "{}", p);
+    assert_eq!(d["outcome"], "passed", "{}", p);
+    assert_eq!(d["subject"]["state"], "review", "{}", p);
+    assert_eq!(d["subject"]["gate"], "comments", "{}", p);
+    assert_eq!(d["decider"]["kind"], "session", "{}", p);
+    let id = d["id"].as_str().unwrap();
+    let mut show = h.koto();
+    show.args(["decisions", "show", WF, id]);
+    let shown = show.output().unwrap();
+    assert!(shown.status.success(), "{}", describe(&shown));
+    let shown = json_out(&shown);
+    assert_eq!(shown["decision"]["id"], d["id"], "{}", shown);
+    assert_eq!(shown["decision"]["kind"], "gate-pass", "{}", shown);
 
     let out = run(&h, "auto");
     assert_eq!(state_of(&out), "done", "{}", out);
@@ -1821,6 +1848,95 @@ fn the_answer_command_refuses_what_it_cannot_record() {
         ],
     );
     assert_refused(&h, before, &out, "no_fallback");
+}
+
+/// The decisions `koto decisions list` returns for the workflow, filtered
+/// by `extra`.
+fn listed(h: &Harness, extra: &[&str]) -> Vec<Value> {
+    let mut cmd = h.koto();
+    cmd.args(["decisions", "list", WF, "--format", "v1"])
+        .args(extra);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    json_out(&out)["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.get("decision").cloned().unwrap_or_else(|| d.clone()))
+        .collect()
+}
+
+#[test]
+fn an_answer_of_pass_with_no_decider_is_refused_and_recorded_as_refused() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let log = h.raw_log();
+    let before = h.events().len();
+    // No harness session, no anchor, no --by.
+    let mut cmd = h.koto();
+    cmd.env_remove("KOTO_ANCHOR");
+    cmd.args([
+        "decider",
+        "answer",
+        WF,
+        "--gate",
+        "comments",
+        "--criterion",
+        "r",
+        "--answer",
+        "pass",
+    ]);
+    let out = cmd.output().unwrap();
+    assert_refused(&h, before, &out, "decider_missing");
+    assert_eq!(h.raw_log(), log);
+    let refused = listed(&h, &["--kind", "refused"]);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["subject"]["kind"], "gate-pass");
+    assert_eq!(refused[0]["decider"]["unestablished"], true);
+    assert_eq!(refused[0]["decider"]["agent"]["value"], "unknown");
+
+    // With a harness session the same answer is a defaulted gate pass.
+    answer(&h, "r", "pass");
+    let defaulted = listed(&h, &["--defaulted", "true"]);
+    assert_eq!(defaulted.len(), 1, "{defaulted:?}");
+    assert_eq!(defaulted[0]["kind"], "gate-pass");
+}
+
+#[test]
+fn an_answer_stopped_after_its_event_is_repaired_by_the_next_tick() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let mut cmd = gate_passer(&h);
+    cmd.env("KOTO_TEST_DECISION_FAULT", "after-event");
+    cmd.args([
+        "decider",
+        "answer",
+        WF,
+        "--gate",
+        "comments",
+        "--criterion",
+        "r",
+        "--answer",
+        "pass",
+    ]);
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(86), "{}", describe(&out));
+    let answered = h.events_of("decider_check_answered");
+    let embedded = answered.last().unwrap()["payload"]["decision"].clone();
+    let id = embedded["id"].as_str().unwrap().to_string();
+    assert!(listed(&h, &[]).is_empty(), "no key before the repair");
+
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    let stored = listed(&h, &[]);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0]["id"], id.as_str());
+    let mut show = h.koto();
+    show.args(["decisions", "show", WF, &id]);
+    let shown = show.output().unwrap();
+    assert!(shown.status.success(), "{}", describe(&shown));
 }
 
 #[cfg(unix)]

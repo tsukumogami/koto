@@ -473,7 +473,13 @@ fn legacy_record_and_list_keep_their_output_without_a_new_flag() {
     let out = env.ok(&["decisions", "list", "w"]).json();
     assert_eq!(out["decisions"]["count"], 1, "{out}");
     assert_eq!(out["decisions"]["items"][0]["choice"], "a", "{out}");
-    assert!(env.decision_files("w").is_empty());
+    // The choice is also recorded as a judgment, the one decision key.
+    assert_eq!(env.decision_files("w").len(), 1);
+    let listed = env.list("w", &["--kind", "judgment"]);
+    let items = listed["decisions"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{listed}");
+    let d = items[0].get("decision").unwrap_or(&items[0]);
+    assert_eq!(d["subject"]["what"], "a", "{listed}");
 }
 
 // ===== R3, R32: concurrent allocation =====

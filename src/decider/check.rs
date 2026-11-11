@@ -498,6 +498,10 @@ pub struct DeciderCheckAnswered {
     /// The answered fallback's unit labels, copied from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_labels: Option<UnitLabels>,
+    /// The decision this answer commits: a `gate-pass` for `pass`, a
+    /// `judgment` otherwise (DESIGN-decision-record.md, Decision 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<serde_json::Value>,
 }
 
 /// One failed criterion's rule handed back in a `koto next` response: the
@@ -847,6 +851,7 @@ mod tests {
             fallback_seq: 9,
             unit: None,
             unit_labels: None,
+            decision: None,
         };
         let v = serde_json::to_value(&ans).unwrap();
         assert_eq!(v["answer"], "fail");

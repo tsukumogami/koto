@@ -746,6 +746,7 @@ mod tests {
             anchor: Sourced::observed(""),
             agent: Sourced::observed("unknown"),
             defaulted: false,
+            unestablished: false,
             note: None,
         }
     }

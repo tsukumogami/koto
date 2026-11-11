@@ -1068,6 +1068,15 @@ pub enum NextErrorCode {
     /// writes nothing more to it. Caller error: continue in the newest
     /// session the message names.
     SessionSuperseded,
+    /// A `--to` past a gate that hasn't passed named no decider with
+    /// `--by`, and neither a harness session identifier nor an anchor
+    /// establishes one (decision record, R24). Nothing was appended; a
+    /// `refused` decision was recorded. Caller error: pass `--by`, or run
+    /// it from an agent session.
+    DeciderMissing,
+    /// A `--to` past a gate that hasn't passed named a decider koto can't
+    /// take, or its decision couldn't be recorded. Nothing was appended.
+    InvalidDecision,
 }
 
 impl NextErrorCode {
@@ -1091,6 +1100,8 @@ impl NextErrorCode {
             NextErrorCode::NestedInvocation => 2,
             NextErrorCode::SessionMigrated => 2,
             NextErrorCode::SessionSuperseded => 2,
+            NextErrorCode::DeciderMissing => 2,
+            NextErrorCode::InvalidDecision => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,
