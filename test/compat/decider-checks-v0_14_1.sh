@@ -277,7 +277,10 @@ new_next() {
 new_koto init wf --template "$WORK_DIR/decider-checks.md" >/dev/null 2>"$SCRATCH/init.err" \
   || fail "session: koto init failed: $(cat "$SCRATCH/init.err")"
 new_next "the veto criterion fails and blocks review" review
-out="$(new_koto overrides record wf --gate comments --rationale "compat: the comment is fine" 2>&1)" \
+# A fixed harness session, so the override (a gate pass) has an
+# established decider.
+out="$(CLAUDE_CODE_SESSION_ID=0f0e0d0c-1111-4222-8333-444455556666 \
+  new_koto overrides record wf --gate comments --rationale "compat: the comment is fine" 2>&1)" \
   || fail "session: the override failed: $out"
 pass "session: the check was overridden"
 new_next "the override moves on to work" work
