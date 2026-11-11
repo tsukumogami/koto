@@ -1763,6 +1763,7 @@ mod tests {
             fallback_seq: 3,
             unit: fallback.unit.clone(),
             unit_labels: fallback.unit_labels.clone(),
+            decision: None,
         });
         backend
             .append_event("wf", &p, &crate::engine::types::now_iso8601())

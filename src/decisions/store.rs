@@ -13,6 +13,12 @@
 //! replaces; the directory is synced before success is reported. Under the
 //! cloud backend the bucket object is put first, with `If-None-Match: *`,
 //! so a refusal there leaves no local key behind.
+//!
+//! A gate-passing command appends its event inside the same critical
+//! section, with the body embedded in it ([`write_with`]). A writer that
+//! stops between the event and the key leaves the event behind; the
+//! session's next write, or its next `koto next` ([`repair`]), publishes
+//! the embedded body under its id (DESIGN-decision-record.md, Decision 3).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -82,6 +88,18 @@ impl Listing {
             .map(|f| f.name.clone())
             .collect()
     }
+}
+
+/// Whether `id` can name a `koto/aimed/<id>/` directory: a header session
+/// id (a UUID today) is 1 to 128 characters from `A-Z a-z 0-9 . _ ~ -`,
+/// not starting with `.`, so it is one path component that can't climb.
+pub fn is_target_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
 }
 
 /// The directory a context key's file sits at in `ctx_dir`.
@@ -205,7 +223,7 @@ pub fn list_local(ctx_dir: &Path) -> Listing {
                         listing.problem = Some(e);
                         return listing;
                     }
-                    if crate::session::validate::validate_session_id(&target).is_err() {
+                    if !is_target_id(&target) {
                         listing.problem =
                             Some(format!("aimed target '{target}' isn't a session id"));
                         return listing;
@@ -276,12 +294,19 @@ pub fn merge_remote(listing: &mut Listing, remote: Vec<RemoteObject>) {
 /// The listing of `session`'s areas: the local copy, and under the cloud
 /// backend the bucket's objects too. Writes nothing anywhere.
 pub fn list(backend: &Backend, session: &str) -> Listing {
+    list_with(backend, session, true)
+}
+
+/// [`list`], reaching the bucket only when `remote` is set. A scan that
+/// reads every session on the host passes `false` for all but one pass, so
+/// a command makes at most one bucket listing per session.
+pub fn list_with(backend: &Backend, session: &str, remote: bool) -> Listing {
     let local_dir = match backend {
         Backend::Local(l) => l.ctx_path(session),
         Backend::Cloud(c) => c.local().ctx_path(session),
     };
     let mut listing = list_local(&local_dir);
-    if let Backend::Cloud(cloud) = backend {
+    if let (true, Backend::Cloud(cloud)) = (remote, backend) {
         match cloud.decision_objects(session) {
             Ok(objects) => merge_remote(&mut listing, objects),
             Err(e) => {
@@ -303,6 +328,69 @@ pub fn write(
     session: &str,
     build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
 ) -> Result<DecisionBody, DecisionError> {
+    write_area(backend, session, &Area::Decisions, build, None)
+}
+
+/// [`write`] into `area`: `koto/decisions/`, or a reversal's
+/// `koto/aimed/<target>/`.
+pub fn write_in(
+    backend: &Backend,
+    session: &str,
+    area: &Area,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+) -> Result<DecisionBody, DecisionError> {
+    write_area(backend, session, area, build, None)
+}
+
+/// A step [`write_with`] runs inside the critical section once the body is
+/// built and size-checked, before the body is published: a gate-passing
+/// command appends its event here with the body embedded in it, so the
+/// event and the key are written in one critical section (DESIGN-decision-
+/// record.md, Decision 3). An error leaves nothing published.
+pub type Commit<'a> = &'a mut dyn FnMut(&DecisionBody) -> Result<(), DecisionError>;
+
+/// The environment variable a debug build reads for its fault point.
+const FAULT_ENV: &str = "KOTO_TEST_DECISION_FAULT";
+
+/// In a debug build with `KOTO_TEST_DECISION_FAULT=<point>`, stop at
+/// `point` as a killed process would: no destructor runs and nothing is
+/// cleaned up. A release build never stops.
+fn crash_at(point: &str) {
+    if cfg!(debug_assertions) && std::env::var(FAULT_ENV).as_deref() == Ok(point) {
+        eprintln!("{FAULT_ENV}: stopping at {point}");
+        std::process::exit(86);
+    }
+}
+
+/// [`write`], with `commit` run after the body is built and size-checked
+/// and before it is published. Before allocating, the critical section
+/// repairs the session ([`repair`]), so the next id is allocated past any
+/// decision an earlier writer committed in its event but never published.
+pub fn write_with(
+    backend: &Backend,
+    session: &str,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+    commit: Option<Commit<'_>>,
+) -> Result<DecisionBody, DecisionError> {
+    write_area(backend, session, &Area::Decisions, build, commit)
+}
+
+/// The one writer behind [`write`], [`write_in`] and [`write_with`].
+fn write_area(
+    backend: &Backend,
+    session: &str,
+    area: &Area,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+    mut commit: Option<Commit<'_>>,
+) -> Result<DecisionBody, DecisionError> {
+    if let Area::Aimed(target) = area {
+        if !is_target_id(target) {
+            return Err(DecisionError::invalid(
+                "target",
+                "the target session id can't name an aimed area",
+            ));
+        }
+    }
     let local = match backend {
         Backend::Local(l) => l,
         Backend::Cloud(c) => c.local(),
@@ -310,6 +398,7 @@ pub fn write(
     let infra = |e: anyhow::Error| DecisionError::new("decision_write_failed", format!("{e:#}"));
     local
         .with_manifest_lock(session, || {
+            repair_locked(backend, session)?;
             let listing = list(backend, session);
             if let Some(problem) = &listing.problem {
                 return Ok(Err(DecisionError::new(
@@ -342,22 +431,153 @@ pub fn write(
                     format!("the decision body is larger than {MAX_BODY_BYTES} bytes"),
                 )));
             }
-            let key = Area::Decisions.key(&id);
-            if let Backend::Cloud(cloud) = backend {
-                if let Err(e) = cloud.put_decision_object(session, &key, &bytes) {
+            if let Some(commit) = commit.as_mut() {
+                if let Err(e) = commit(&body) {
                     return Ok(Err(e));
                 }
+                crash_at("after-event");
             }
-            match publish(&crate::session::SessionBackend::session_dir(local, session), &local.ctx_path(session), &key, &bytes) {
-                Ok(()) => Ok(Ok(body)),
-                Err(PublishError::Exists) => Ok(Err(DecisionError::new(
-                    codes::DECISION_EXISTS,
-                    format!("decision key '{key}' already exists in '{session}'"),
-                ))),
-                Err(PublishError::Io(e)) => Err(e),
-            }
+            let key = area.key(&id);
+            Ok(publish_both(backend, session, &key, &bytes)?.map(|()| body))
         })
         .map_err(infra)?
+}
+
+/// Publish `bytes` at `key`: under the cloud backend the bucket object
+/// first, with `If-None-Match: *`, so a refusal there leaves no local key,
+/// then the local file.
+fn publish_both(
+    backend: &Backend,
+    session: &str,
+    key: &str,
+    bytes: &[u8],
+) -> anyhow::Result<Result<(), DecisionError>> {
+    let local = match backend {
+        Backend::Local(l) => l,
+        Backend::Cloud(c) => c.local(),
+    };
+    if let Backend::Cloud(cloud) = backend {
+        if let Err(e) = cloud.put_decision_object(session, key, bytes) {
+            return Ok(Err(e));
+        }
+    }
+    match publish(
+        &crate::session::SessionBackend::session_dir(local, session),
+        &local.ctx_path(session),
+        key,
+        bytes,
+    ) {
+        Ok(()) => Ok(Ok(())),
+        Err(PublishError::Exists) => Ok(Err(DecisionError::new(
+            codes::DECISION_EXISTS,
+            format!("decision key '{key}' already exists in '{session}'"),
+        ))),
+        Err(PublishError::Io(e)) => Err(e),
+    }
+}
+
+/// The decisions embedded in `events`: the `decision` a gate-passing
+/// command's event carries.
+pub fn embedded(events: &[crate::engine::types::Event]) -> Vec<&serde_json::Value> {
+    use crate::engine::types::EventPayload;
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::GateOverrideRecorded { decision, .. }
+            | EventPayload::DirectedTransition { decision, .. } => decision.as_ref(),
+            EventPayload::DeciderCheckAnswered(a) => a.decision.as_ref(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a decision embedded in `events` has no key on this host: the
+/// cheap check a tick runs before it takes the lock to [`repair`].
+pub fn needs_repair(
+    backend: &Backend,
+    session: &str,
+    events: &[crate::engine::types::Event],
+) -> bool {
+    let local = match backend {
+        Backend::Local(l) => l,
+        Backend::Cloud(c) => c.local(),
+    };
+    let ctx = local.ctx_path(session);
+    embedded(events).into_iter().any(|d| {
+        d["id"]
+            .as_str()
+            .filter(|id| is_decision_id(id))
+            .is_some_and(|id| {
+                std::fs::symlink_metadata(key_path(&ctx, &Area::Decisions.key(id))).is_err()
+            })
+    })
+}
+
+/// Publish every decision embedded in `session`'s events whose key is
+/// missing (its writer stopped between the event and the key), under the
+/// session's manifest lock. A body that fails the checks a fresh record
+/// gets ([`super::body::validate_stored`]) is skipped with a warning.
+pub fn repair(backend: &Backend, session: &str) -> Result<(), DecisionError> {
+    let local = match backend {
+        Backend::Local(l) => l,
+        Backend::Cloud(c) => c.local(),
+    };
+    local
+        .with_manifest_lock(session, || repair_locked(backend, session))
+        .map_err(|e| DecisionError::new("decision_write_failed", format!("{e:#}")))
+}
+
+/// [`repair`]'s work, run with the manifest lock already held.
+fn repair_locked(backend: &Backend, session: &str) -> anyhow::Result<()> {
+    use crate::session::SessionBackend;
+    let Ok((header, events)) = backend.read_events(session) else {
+        // A log that can't be read is the command's to report.
+        return Ok(());
+    };
+    let embedded = embedded(&events);
+    if embedded.is_empty() {
+        return Ok(());
+    }
+    let listing = list(backend, session);
+    if listing.problem.is_some() {
+        // The write that follows refuses on the same listing.
+        return Ok(());
+    }
+    let mut ids: std::collections::BTreeSet<String> = listing.ids().into_iter().collect();
+    for value in embedded {
+        let body: DecisionBody = match serde_json::from_value(value.clone()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "warning: a decision embedded in the log of '{session}' doesn't parse, \
+                     so it isn't repaired: {e}"
+                );
+                continue;
+            }
+        };
+        if ids.contains(&body.id) {
+            continue;
+        }
+        if let Err(e) = super::body::validate_stored(&body, session, &header.session_id) {
+            eprintln!(
+                "warning: decision {} embedded in the log of '{session}' fails its checks, \
+                 so it isn't repaired: {}",
+                body.id, e.message
+            );
+            continue;
+        }
+        let bytes = body.to_bytes()?;
+        let key = Area::Decisions.key(&body.id);
+        if let Err(e) = publish_both(backend, session, &key, &bytes)? {
+            eprintln!(
+                "warning: decision {} of '{session}' isn't repaired: {}",
+                body.id, e.message
+            );
+            continue;
+        }
+        ids.insert(body.id);
+    }
+    Ok(())
 }
 
 enum PublishError {
@@ -451,6 +671,17 @@ mod tests {
         );
         assert_eq!(Area::of_key("koto/decisions/a/b"), None);
         assert_eq!(Area::of_key("koto/links/x"), None);
+    }
+
+    #[test]
+    fn a_header_session_id_names_an_aimed_area_and_a_climb_does_not() {
+        assert!(is_target_id("1a304ea0-f1ad-4779-acef-105b4dface95"));
+        assert!(is_target_id("target-session"));
+        assert!(!is_target_id(""));
+        assert!(!is_target_id(".."));
+        assert!(!is_target_id("../x"));
+        assert!(!is_target_id("a/b"));
+        assert!(!is_target_id(&"a".repeat(129)));
     }
 
     #[cfg(unix)]

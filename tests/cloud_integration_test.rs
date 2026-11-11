@@ -219,8 +219,15 @@ fn cloud_state_sync_on_next() {
         .success();
 
     // Advance state — should sync updated state to R2
-    // Use --no-cleanup to prevent auto-cleanup from deleting everything
+    // Use --no-cleanup to prevent auto-cleanup from deleting everything.
+    // A fixed harness session, so the --to (a gate pass) has an
+    // established decider.
     koto_cmd(dir.path())
+        .env(
+            "CLAUDE_CODE_SESSION_ID",
+            "0f0e0d0c-1111-4222-8333-444455556666",
+        )
+        .env_remove("KOTO_ANCHOR")
         .args(["next", "state-test-2", "--to", "done", "--no-cleanup"])
         .assert()
         .success();

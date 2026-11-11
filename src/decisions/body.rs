@@ -82,6 +82,60 @@ pub struct DecisionBody {
     /// is copied or fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<String>,
+    /// The decision a `reverse` overrules, or a refused reversal aimed at,
+    /// when koto found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Target>,
+    /// A `reverse`'s standing: `verified` or `asserted` (R17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing: Option<String>,
+    /// The chain steps from the original's session up to the session the
+    /// `reverse` is recorded in; empty when it is that session (R17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<PathStep>>,
+    /// A reversal's compensating change, or a record that none exists yet
+    /// (R21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensating: Option<Compensating>,
+    /// The outcome replacing a reversed `verdict` or `judgment` (R21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// Why a reversal was refused, and the reversal that won when it lost
+    /// a race (R18, R19).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
+}
+
+/// The decision a reversal is aimed at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// The original deciding session's name.
+    pub name: String,
+    /// Its session id, which names the `koto/aimed/<id>/` directory.
+    pub id: String,
+    /// The original decision's id.
+    pub decision: String,
+}
+
+pub use super::chain::PathStep;
+
+/// A compensating change; `link` is `null` when none exists yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compensating {
+    pub link: Option<String>,
+}
+
+/// Why a reversal was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// One of the reasons in [`super::standing::reasons`].
+    pub reason: String,
+    /// The reversal that won, for `already_reversed` and `lost_race`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<BasisRef>,
+    /// The session's own reversal that lost, for `lost_race`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversal: Option<BasisRef>,
 }
 
 impl DecisionBody {
@@ -108,6 +162,19 @@ impl DecisionBody {
         }
         if outcomes_of(&body.kind).is_none_or(|o| !o.contains(&body.outcome.as_str())) {
             return Err("body's kind or outcome isn't one koto knows".to_string());
+        }
+        if body.kind == "reverse" {
+            let target_ok = body
+                .target
+                .as_ref()
+                .is_some_and(|t| is_decision_id(&t.decision));
+            let standing_ok = body
+                .standing
+                .as_deref()
+                .is_some_and(|s| s == "verified" || s == "asserted");
+            if !target_ok || !standing_ok || body.path.is_none() {
+                return Err("a reversal's body lacks its target, standing or path".to_string());
+            }
         }
         Ok(body)
     }
@@ -424,6 +491,89 @@ pub fn parse_evidence(entries: &[String]) -> Result<Vec<Value>, DecisionError> {
             Ok(serde_json::json!({"kind": "pointer", "value": entry}))
         })
         .collect()
+}
+
+/// Check a body that reached the store some other way than a fresh record,
+/// such as one repaired from the event it was embedded in, with the checks
+/// a fresh record gets: it parses as a body, it names `session_name` and
+/// `session_id`, it isn't a reversal (those are aimed, never repaired into
+/// `koto/decisions/`), and its kind, outcome, subject, basis, evidence,
+/// reason and tool-call identifier pass [`validate`], [`parse_basis`] and
+/// [`parse_evidence`] and come back as the body holds them.
+pub fn validate_stored(
+    body: &DecisionBody,
+    session_name: &str,
+    session_id: &str,
+) -> Result<(), DecisionError> {
+    let invalid = |m: String| DecisionError::invalid("body", m);
+    let bytes = body
+        .to_bytes()
+        .map_err(|e| invalid(format!("body doesn't serialize: {e}")))?;
+    let parsed = DecisionBody::parse(&bytes).map_err(invalid)?;
+    if parsed.session.name != session_name || parsed.session.id != session_id {
+        return Err(invalid(format!(
+            "body names session '{}' ({}), not '{session_name}' ({session_id})",
+            parsed.session.name, parsed.session.id
+        )));
+    }
+    if parsed.kind == "reverse" {
+        return Err(invalid(
+            "a reversal isn't stored in koto/decisions/".to_string(),
+        ));
+    }
+    let mut subject = Vec::new();
+    for (field, value) in &parsed.subject {
+        match (field.as_str(), value) {
+            ("paths", Value::Array(paths)) => {
+                for p in paths {
+                    let p = p
+                        .as_str()
+                        .ok_or_else(|| invalid("subject.paths holds a non-string".to_string()))?;
+                    subject.push(("path".to_string(), p.to_string()));
+                }
+            }
+            (_, Value::String(v)) => subject.push((field.clone(), v.clone())),
+            _ => return Err(invalid(format!("subject.{field} isn't a string"))),
+        }
+    }
+    let basis: Vec<String> = parsed
+        .basis
+        .iter()
+        .map(|b| format!("{}:{}", b.session, b.id))
+        .collect();
+    let evidence = parsed
+        .evidence
+        .iter()
+        .map(|e| match (e["kind"].as_str(), e["value"].as_str()) {
+            (Some("event"), _) => Ok(format!(
+                "event:{}:{}",
+                e["session"].as_str().unwrap_or_default(),
+                e["seq"].as_u64().unwrap_or_default()
+            )),
+            (Some("pointer"), Some(v)) => Ok(v.to_string()),
+            _ => Err(invalid(
+                "an evidence entry is neither an event nor a pointer".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let req = Request {
+        kind: parsed.kind.clone(),
+        outcome: parsed.outcome.clone(),
+        subject,
+        basis,
+        evidence,
+        reason: parsed.reason.clone(),
+        tool_call: parsed.tool_call.clone(),
+    };
+    if validate(&req)? != parsed.subject
+        || parse_basis(&req.basis)? != parsed.basis
+        || parse_evidence(&req.evidence)? != parsed.evidence
+    {
+        return Err(invalid(
+            "body's subject, basis or evidence isn't as a fresh record stores it".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A short, printable preview of caller input for an error message.

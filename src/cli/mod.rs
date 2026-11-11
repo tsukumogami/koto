@@ -315,6 +315,11 @@ pub enum Command {
         /// (`koto next <coord_workflow>`) do NOT require the flag.
         #[arg(long = "dispatch-epoch")]
         dispatch_epoch: Option<u32>,
+
+        /// Who let a `--to` past a gate that hasn't passed (the decision
+        /// record's decider flags)
+        #[command(flatten)]
+        decider: decisions::DeciderArgs,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -1275,6 +1280,16 @@ pub enum DecisionsSubcommand {
         name: String,
         /// Decision id
         id: String,
+    },
+    /// Reverse a decision, by session name and id, recording the reversal
+    /// in the session named by `--in` or its anchor
+    Reverse {
+        /// The original decision's session name
+        name: String,
+        /// The original decision's id
+        id: String,
+        #[command(flatten)]
+        reversal: decisions::ReverseArgs,
     },
 }
 
@@ -2275,6 +2290,7 @@ pub fn run(app: App) -> Result<()> {
             rationale,
             redelegation_cap,
             dispatch_epoch,
+            decider,
         } => {
             // Leaked so the exit flush can reach it from any exit path,
             // `std::process::exit` included. One per process, which ends.
@@ -2321,6 +2337,7 @@ pub fn run(app: App) -> Result<()> {
                 rationale,
                 redelegation_cap,
                 dispatch_epoch,
+                decider,
             );
             flush_before_exit();
             result
@@ -2984,6 +3001,12 @@ pub fn run(app: App) -> Result<()> {
                     }
                     decisions::handle_show(&backend, &name, &id)
                 }
+                DecisionsSubcommand::Reverse { name, id, reversal } => {
+                    let reverser = reversal.in_session.clone();
+                    refuse_if_unlocated(&backend, &reverser, "decisions reverse");
+                    refuse_if_superseded(&backend, &reverser, "decisions reverse");
+                    decisions::handle_reverse(&backend, &name, &id, reversal)
+                }
             }
         }
         Command::Overrides { subcommand } => {
@@ -2994,10 +3017,13 @@ pub fn run(app: App) -> Result<()> {
                     gate,
                     rationale,
                     with_data,
+                    decider,
                 } => {
                     refuse_if_unlocated(&backend, &name, "overrides record");
                     refuse_if_superseded(&backend, &name, "overrides record");
-                    overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
+                    overrides::handle_overrides_record(
+                        &backend, name, gate, rationale, with_data, decider,
+                    )
                 }
                 overrides::OverridesSubcommand::List { name } => {
                     let read = || Command::Overrides {
@@ -5627,7 +5653,7 @@ fn record_execution_anchor_adoption(
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn handle_next(
-    backend: &dyn SessionBackend,
+    backend: &Backend,
     context_store: &dyn ContextStore,
     // The run journal root of the store `backend` is, for the terminal
     // tick's record (`Backend::journal_root`).
@@ -5640,6 +5666,7 @@ fn handle_next(
     rationale: Option<String>,
     redelegation_cap: Option<u32>,
     dispatch_epoch: Option<u32>,
+    decider_args: decisions::DeciderArgs,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -5945,6 +5972,18 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+
+    // A gate-passing command that stopped between its event and its
+    // decision's key left the decision embedded in the event: publish it
+    // now (decision record, R24). Only a missing key takes the lock.
+    if crate::decisions::store::needs_repair(backend, &name, &events) {
+        if let Err(e) = crate::decisions::store::repair(backend, &name) {
+            eprintln!(
+                "warning: the decisions embedded in the log of '{}' couldn't be repaired: {}",
+                name, e.message
+            );
+        }
+    }
 
     if events.is_empty() {
         let ne = NextError {
@@ -6536,6 +6575,29 @@ fn handle_next(
             }
         }
 
+        // A `--to` that moves past overridable gates that haven't passed is
+        // a gate pass (decision record, R24): its decider is resolved before
+        // anything is written, and with none established the tick refuses
+        // with nothing appended and a `refused` decision recorded.
+        let skipped = crate::engine::advance::directed_target_skipped_gates(
+            current_template_state,
+            current_state,
+            target,
+            &events,
+        );
+        let gate_pass = (!skipped.is_empty()).then(|| {
+            decisions::directed_gate_pass(
+                backend,
+                &name,
+                &header.session_id,
+                current_state,
+                &events,
+                &skipped.join(","),
+                rationale.clone(),
+                &decider_args,
+            )
+        });
+
         // A directed exit from a batching state may record its batch below,
         // so it takes the same lock the advance path holds before it writes
         // anything (Issue #263). Contention refuses with nothing written.
@@ -6545,20 +6607,43 @@ fn handle_next(
             None
         };
 
-        // Append directed_transition event.
-        let payload = EventPayload::DirectedTransition {
+        // Append directed_transition event, with its gate-pass decision in
+        // the decision store's critical section when it passes a gate.
+        let payload = |decision| EventPayload::DirectedTransition {
             from: current_state.clone(),
             to: target.clone(),
             rationale: rationale.clone(),
+            decision,
         };
         // Captured so the in-memory event built below (for the delivery
         // predicate) carries the same timestamp actually persisted,
         // rather than a second, slightly later `now_iso8601()` call.
         let directed_ts = now_iso8601();
-        if let Err(e) = backend.append_event(&name, &payload, &directed_ts) {
+        let appended = match &gate_pass {
+            None => backend
+                .append_event(&name, &payload(None), &directed_ts)
+                .map_err(|e| (NextErrorCode::PersistenceError, e.to_string())),
+            Some(prepared) => crate::decisions::gate_pass::record_with_event(
+                backend,
+                prepared,
+                &directed_ts,
+                |decision| payload(Some(decision)),
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                let code = match e.code {
+                    crate::decisions::gate_pass::EVENT_APPEND_FAILED | "decision_write_failed" => {
+                        NextErrorCode::PersistenceError
+                    }
+                    _ => NextErrorCode::InvalidDecision,
+                };
+                (code, e.message)
+            }),
+        };
+        if let Err((code, message)) = appended {
             let ne = NextError {
-                code: NextErrorCode::PersistenceError,
-                message: e.to_string(),
+                code,
+                message,
                 details: vec![],
             };
             let json = serde_json::json!({"error": ne});
@@ -6666,8 +6751,8 @@ fn handle_next(
                         .chain(std::iter::once(Event {
                             seq: events.len() as u64 + 1,
                             timestamp: directed_ts.clone(),
-                            event_type: payload.type_name().to_string(),
-                            payload: payload.clone(),
+                            event_type: payload(None).type_name().to_string(),
+                            payload: payload(None),
                             idempotency_hash: None,
                         }))
                         .collect();
@@ -8635,7 +8720,7 @@ fn check_output_deliveries(
 /// Non-unix stub for handle_next.
 #[cfg(not(unix))]
 fn handle_next(
-    _backend: &dyn SessionBackend,
+    _backend: &Backend,
     _context_store: &dyn ContextStore,
     _journal_root: Option<&Path>,
     name: String,
@@ -8646,6 +8731,7 @@ fn handle_next(
     _rationale: Option<String>,
     _redelegation_cap: Option<u32>,
     _dispatch_epoch: Option<u32>,
+    _decider_args: decisions::DeciderArgs,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
@@ -8663,11 +8749,7 @@ fn handle_next(
 /// - "choice" (string, required)
 /// - "rationale" (string, required)
 /// - "alternatives_considered" (array of strings, optional)
-fn handle_decisions_record(
-    backend: &dyn SessionBackend,
-    name: String,
-    with_data: String,
-) -> Result<()> {
+fn handle_decisions_record(backend: &Backend, name: String, with_data: String) -> Result<()> {
     // 0. Resolve --with-data source (inline JSON or @file.json). Keeps this
     //    handler aligned with `koto next`; see `resolve_with_data_source`.
     let with_data = match resolve_with_data_source(&with_data) {
@@ -8858,6 +8940,8 @@ fn handle_decisions_record(
 
     // 5. Append DecisionRecorded event
     let current_state = machine_state.current_state.clone();
+    let choice = data["choice"].as_str().unwrap_or_default().to_string();
+    let choice_rationale = data["rationale"].as_str().map(str::to_string);
     let payload = EventPayload::DecisionRecorded {
         state: current_state.clone(),
         decision: data,
@@ -8884,6 +8968,14 @@ fn handle_decisions_record(
         }
     };
     let decision_count = derive_decisions(&updated_events).len();
+    decisions::record_choice_judgment(
+        backend,
+        &name,
+        &header.session_id,
+        &updated_events,
+        choice,
+        choice_rationale,
+    );
 
     // 7. Print confirmation
     println!(

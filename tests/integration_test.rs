@@ -30,6 +30,18 @@ fn koto_cmd(dir: &Path) -> Command {
     cmd
 }
 
+/// [`koto_cmd`] from a fixed harness session, for a gate pass (an override)
+/// that needs an established decider.
+fn gate_pass_cmd(dir: &Path) -> Command {
+    let mut cmd = koto_cmd(dir);
+    cmd.env(
+        "CLAUDE_CODE_SESSION_ID",
+        "0f0e0d0c-1111-4222-8333-444455556666",
+    );
+    cmd.env_remove("KOTO_ANCHOR");
+    cmd
+}
+
 /// Return the sessions base directory for a test, creating it if needed.
 fn sessions_base(dir: &Path) -> PathBuf {
     let base = dir.join("sessions");
@@ -6304,7 +6316,7 @@ fn gate_override_full_flow() {
     );
 
     // Step 2: koto overrides record — record the override with rationale.
-    let record = koto_cmd(dir.path())
+    let record = gate_pass_cmd(dir.path())
         .args([
             "overrides",
             "record",
@@ -6411,7 +6423,7 @@ fn gate_overrides_list_returns_full_history() {
     init_workflow(dir.path(), "list-wf", &template_with_failing_command_gate());
 
     // Record an override in the first epoch.
-    let record1 = koto_cmd(dir.path())
+    let record1 = gate_pass_cmd(dir.path())
         .args([
             "overrides",
             "record",
@@ -6453,7 +6465,7 @@ fn gate_overrides_list_returns_full_history() {
     );
 
     // Record another override in the second epoch (after rewind).
-    let record2 = koto_cmd(dir.path())
+    let record2 = gate_pass_cmd(dir.path())
         .args([
             "overrides",
             "record",
@@ -8508,7 +8520,7 @@ fn overrides_record_with_data_at_file_reads_value_from_file() {
     std::fs::write(&value_path, r#"{"exit_code":0}"#).unwrap();
 
     let arg = format!("@{}", value_path.display());
-    let output = koto_cmd(dir.path())
+    let output = gate_pass_cmd(dir.path())
         .args([
             "overrides",
             "record",

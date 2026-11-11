@@ -1349,6 +1349,10 @@ pub enum EventPayload {
         /// Optional human-readable reason for this directed transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rationale: Option<String>,
+        /// The `gate-pass` decision this event commits, when it passed a gate
+        /// (DESIGN-decision-record.md, Decision 3). Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<serde_json::Value>,
     },
     Rewound {
         from: String,
@@ -1486,6 +1490,10 @@ pub enum EventPayload {
         override_applied: serde_json::Value,
         actual_output: serde_json::Value,
         timestamp: String,
+        /// The `gate-pass` decision this event commits, when it passed a gate
+        /// (DESIGN-decision-record.md, Decision 3). Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<serde_json::Value>,
     },
     /// Per-tick audit record emitted by the batch scheduler on
     /// non-trivial ticks (Decision 11 / Issue #16). `tick_summary`
@@ -2529,6 +2537,7 @@ impl<'de> Deserialize<'de> for Event {
                     from: p.from,
                     to: p.to,
                     rationale: p.rationale,
+                    decision: p.decision,
                 }
             }
             "integration_invoked" => {
@@ -2646,6 +2655,7 @@ impl<'de> Deserialize<'de> for Event {
                     override_applied: p.override_applied,
                     actual_output: p.actual_output,
                     timestamp: p.timestamp,
+                    decision: p.decision,
                 }
             }
             "scheduler_ran" => {
@@ -3046,6 +3056,8 @@ struct DirectedTransitionPayload {
     to: String,
     #[serde(default)]
     rationale: Option<String>,
+    #[serde(default)]
+    decision: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3157,6 +3169,8 @@ struct GateOverrideRecordedPayload {
     override_applied: serde_json::Value,
     actual_output: serde_json::Value,
     timestamp: String,
+    #[serde(default)]
+    decision: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -4205,6 +4219,7 @@ mod tests {
                 override_applied: serde_json::json!({"exit_code": 0, "error": ""}),
                 actual_output: serde_json::json!({"exit_code": 1, "error": "timeout"}),
                 timestamp: "2026-04-01T00:01:00Z".to_string(),
+                decision: None,
             },
             idempotency_hash: None,
         };
@@ -4227,6 +4242,7 @@ mod tests {
             override_applied: serde_json::Value::Null,
             actual_output: serde_json::Value::Null,
             timestamp: "2026-04-01T00:00:00Z".to_string(),
+            decision: None,
         };
         assert_eq!(p.type_name(), "gate_override_recorded");
     }
@@ -4570,6 +4586,7 @@ mod tests {
             fallback_seq: 5,
             unit: None,
             unit_labels: None,
+            decision: None,
         });
         for (p, name) in [
             (fallback, "decider_fallback"),
@@ -4837,6 +4854,7 @@ mod tests {
                 from: "analysis".to_string(),
                 to: "implementation".to_string(),
                 rationale: Some("Design approved by stakeholders".to_string()),
+                decision: None,
             },
             idempotency_hash: None,
         };
@@ -4856,6 +4874,7 @@ mod tests {
                 from: "analysis".to_string(),
                 to: "implementation".to_string(),
                 rationale: None,
+                decision: None,
             },
             idempotency_hash: None,
         };

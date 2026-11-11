@@ -6,9 +6,10 @@
 //! way tooling outside koto reads them (see `docs/reference/run-journal.md`).
 //!
 //! Every test runs the koto binary with `HOME` in its own temporary
-//! directory, `KOTO_SESSIONS_BASE` unset and `CLAUDE_CODE_SESSION_ID`
-//! cleared, so the session store and the journal are that test's own and
-//! the developer's journal is never touched. A test that consults the
+//! directory, `KOTO_SESSIONS_BASE` unset and one fixed
+//! `CLAUDE_CODE_SESSION_ID`, so the session store and the journal are that
+//! test's own, the developer's journal is never touched, and a gate pass has
+//! a decider. A test that consults the
 //! decider points it at the in-process stub, so no test reaches a real
 //! provider.
 //!
@@ -159,10 +160,16 @@ impl Env {
             "KOTO_DECIDER",
             "KOTO_DECIDER_API_KEY",
             "KOTO_DECIDER_ENDPOINT",
-            "CLAUDE_CODE_SESSION_ID",
+            "KOTO_ANCHOR",
         ] {
             cmd.env_remove(unset);
         }
+        // A fixed harness session, so a gate pass (an override) has an
+        // established decider.
+        cmd.env(
+            "CLAUDE_CODE_SESSION_ID",
+            "0f0e0d0c-1111-4222-8333-444455556666",
+        );
         cmd
     }
 
