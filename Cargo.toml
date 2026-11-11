@@ -4,7 +4,7 @@
 # the koto dependency via `path = ".."`. The koto crate itself
 # remains the workspace root package (this is a hybrid layout —
 # `[package]` below + `[workspace]` here).
-members = ["koto-stability-tests"]
+members = ["koto-stability-tests", "koto-session-reader", "koto-reader-trial"]
 
 [package]
 name = "koto"
@@ -98,3 +98,7 @@ cloud-integration-tests = []
 [profile.release]
 lto = true
 strip = true
+
+[lints.rust]
+# Spike trial: the reader crate compiles shared source with this cfg set.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(koto_reader)"] }

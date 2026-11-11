@@ -1,0 +1,18 @@
+[package]
+name = "koto-session-reader"
+# Spike trial only: never published, never merged.
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+toml = "0.8"
+libc = "0.2"
+aho-corasick = "1.1"

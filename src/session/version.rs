@@ -198,6 +198,7 @@ pub fn strict_prefix_classify(local: Option<&[u8]>, remote: Option<&[u8]>) -> St
 ///
 /// Uses the first 8 characters of the SHA-256 hex digest of the hostname.
 /// Falls back to "unknown" if the hostname cannot be determined.
+#[cfg(not(koto_reader))]
 pub fn generate_machine_id() -> String {
     let hostname = get_hostname();
     let hash = crate::cache::sha256_hex(hostname.as_bytes());
@@ -255,6 +256,7 @@ pub fn validate_machine_name(name: &str) -> std::result::Result<(), String> {
 /// and never through the user and project merge, so a project's
 /// `.koto/config.toml` can't supply it. `None` when the file, the table or
 /// the key is absent, or the file can't be read. Never writes.
+#[cfg(not(koto_reader))]
 pub fn user_config_machine_name() -> Option<toml::Value> {
     let path = crate::config::resolve::user_config_path()?;
     if !path.exists() {
@@ -303,6 +305,7 @@ pub fn resolve_machine_name(
 /// [`resolve_machine_name`] from `KOTO_MACHINE_NAME`, the user-level
 /// `machine.name` and the hostname. Resolved once per process, so a skipped
 /// invalid source warns on stderr once however many sessions it creates.
+#[cfg(not(koto_reader))]
 pub fn machine_name() -> String {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -348,6 +351,7 @@ pub fn coerce_machine_name(hostname: &str) -> String {
 /// Reads from the user config file at `~/.koto/config.toml`. If the
 /// `machine.id` key is not set, generates a new ID from the hostname hash
 /// and writes it to the config.
+#[cfg(not(koto_reader))]
 pub fn get_or_create_machine_id() -> Result<String> {
     use crate::config::resolve::{
         ensure_koto_dir, load_toml_value, user_config_path, write_toml_value,

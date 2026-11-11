@@ -15,12 +15,18 @@ use crate::engine::persistence::{
 };
 use crate::engine::types::parse_timestamp_to_systemtime;
 use crate::engine::types::StateFileHeader;
+#[cfg(not(koto_reader))]
 use crate::session::remote_feed::{
     sanitize_bucket_text, ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot,
     RowStatus,
 };
-use crate::session::row::{derive_row, latest_import};
+use crate::session::row::derive_row;
+#[cfg(not(koto_reader))]
+use crate::session::row::latest_import;
+#[cfg(not(koto_reader))]
 use crate::session::{state_file_name, SessionBackend};
+#[cfg(koto_reader)]
+use crate::source::{state_file_name, SessionSource as SessionBackend};
 
 pub use liveness::{attention_key, classify_liveness, Liveness};
 
@@ -240,6 +246,7 @@ pub struct CachedSession {
     /// The source the local session's latest `session_imported` event
     /// names, which a remote scan hides; `None` for a session never
     /// imported and for a remote row.
+    #[cfg(not(koto_reader))]
     pub imported_from: Option<ImportedSource>,
     /// A remote row another remote row's summary names among its `sources`
     /// ([`RemoteRow::receded_by_source`]): it recedes whatever its liveness
@@ -275,6 +282,7 @@ pub struct SessionTree {
     pub remote_hidden: usize,
     /// Why the last feed snapshot couldn't read some or all of the bucket;
     /// `None` once a snapshot reads it without failure.
+    #[cfg(not(koto_reader))]
     pub remote_failure: Option<ReadFailure>,
     /// The last feed snapshot reached a listing ceiling, so some of the
     /// bucket isn't shown; `false` once a snapshot reaches none.
@@ -291,6 +299,7 @@ impl SessionTree {
             unreadable: 0,
             remote_unreadable: 0,
             remote_hidden: 0,
+            #[cfg(not(koto_reader))]
             remote_failure: None,
             remote_truncated: false,
         }
@@ -487,6 +496,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 machine: None,
                 workspace: None,
                 remote: false,
+                #[cfg(not(koto_reader))]
                 imported_from: None,
                 receded_by_source: false,
             };
@@ -514,6 +524,7 @@ pub fn read_session(path: &Path) -> CachedSession {
                 machine: None,
                 workspace: None,
                 remote: false,
+                #[cfg(not(koto_reader))]
                 imported_from: None,
                 receded_by_source: false,
             };
@@ -533,6 +544,7 @@ pub fn read_session(path: &Path) -> CachedSession {
 
     // The source this session was imported from, by its workspace prefix:
     // a remote scan hides that source rather than list it beside its copy.
+    #[cfg(not(koto_reader))]
     let imported_from = latest_import(&events).map(|record| ImportedSource {
         prefix: crate::session::local::prefix_for_workspace(Path::new(&record.from_workspace)).ok(),
         name: record.from_session,
@@ -555,6 +567,7 @@ pub fn read_session(path: &Path) -> CachedSession {
         machine: row.machine,
         workspace: None,
         remote: false,
+        #[cfg(not(koto_reader))]
         imported_from,
         receded_by_source: false,
     }
@@ -637,6 +650,7 @@ fn valid_machine(name: Option<&str>) -> Option<String> {
 /// `header.workflow`; key the row by the name as listed, `row.name`
 /// ([`remote_key`]), since two listed names can sanitize to the same text.
 /// The summary's name was compared with its key before this.
+#[cfg(not(koto_reader))]
 pub fn remote_session(row: &RemoteRow) -> CachedSession {
     let text = |s: &str| sanitize_bucket_text(s);
     let opt = |s: &Option<String>| s.as_deref().map(sanitize_bucket_text);
@@ -666,6 +680,7 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
                 machine: None,
                 workspace: Some(row.workspace.clone()),
                 remote: true,
+                #[cfg(not(koto_reader))]
                 imported_from: None,
                 receded_by_source: row.receded_by_source,
             };
@@ -697,6 +712,7 @@ pub fn remote_session(row: &RemoteRow) -> CachedSession {
         machine: valid_machine(s.machine.as_deref()),
         workspace: Some(row.workspace.clone()),
         remote: true,
+        #[cfg(not(koto_reader))]
         imported_from: None,
         receded_by_source: row.receded_by_source,
     }
@@ -778,11 +794,13 @@ pub fn parent_key(session: &CachedSession) -> Option<String> {
 /// The home prefix is the row's `workspace` when the caller set it, else
 /// the prefix its header recorded at creation; nothing here makes a
 /// request.
+#[cfg(not(koto_reader))]
 pub fn local_view(tree: &SessionTree) -> LocalView {
     local_view_of(tree, |_| true)
 }
 
 /// [`local_view`] over the local rows `keep` accepts by name.
+#[cfg(not(koto_reader))]
 pub fn local_view_of(tree: &SessionTree, keep: impl Fn(&str) -> bool) -> LocalView {
     let mut view = LocalView::default();
     for (name, s) in &tree.sessions {
@@ -812,6 +830,7 @@ pub fn local_view_of(tree: &SessionTree, keep: impl Fn(&str) -> bool) -> LocalVi
 /// so the session shows once, as its local row: by `session_id`, or for a
 /// row that has none (no readable summary) by its workspace and name.
 /// Returns whether any went.
+#[cfg(not(koto_reader))]
 fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
     let local = local_view(tree);
     let before = tree.sessions.len();
@@ -840,6 +859,7 @@ fn drop_shadowed_remote(tree: &mut SessionTree) -> bool {
 /// session this machine holds a copy of stays its local row. The tallies,
 /// the failure and whether a listing ceiling was reached come from the
 /// snapshot.
+#[cfg(not(koto_reader))]
 pub fn apply_snapshot(tree: &mut SessionTree, snapshot: &RemoteSnapshot) {
     tree.sessions
         .retain(|_, s| !s.remote || s.workspace.as_deref().is_some_and(|ws| snapshot.keeps(ws)));
@@ -941,7 +961,10 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
     }
 
     // A session that now has a local copy leaves its remote row.
+    #[cfg(not(koto_reader))]
     let shadowed = drop_shadowed_remote(tree);
+    #[cfg(koto_reader)]
+    let shadowed = false;
 
     // Rebuild roots whenever the session set changed (adds or removes).
     // Also rebuild if any mtime-changed session could have had its parent change.

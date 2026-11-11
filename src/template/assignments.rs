@@ -86,6 +86,7 @@ pub fn parse_refs(value: &str) -> Vec<AssignmentRef> {
 /// names; either makes a `{{NAME}}` legal. The runtime names
 /// (`SESSION_DIR`, `SESSION_NAME`) are refused: they are substituted by the
 /// CLI outside the advance loop, which is where assignments resolve.
+#[cfg(not(koto_reader))]
 pub fn validate_transition_assignments(
     state_name: &str,
     state: &TemplateState,

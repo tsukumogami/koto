@@ -117,6 +117,7 @@ impl ReviewVocabulary {
     /// the run journal's name shape (1 to 128 characters from
     /// `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`), and a name
     /// declared twice.
+    #[cfg(not(koto_reader))]
     pub fn validate(&self) -> Result<(), String> {
         for (list, names) in [("seats", &self.seats), ("sections", &self.sections)] {
             if names.len() > REVIEW_VOCABULARY_MAX {
@@ -1298,6 +1299,7 @@ pub fn request_leg_builtin_default() -> serde_json::Value {
 /// every tick; a value with a reference is checked after substitution, at
 /// tick time, by the evaluator. `expect`, when present, must be a non-empty
 /// map whose every list is non-empty and holds only scalars.
+#[cfg(not(koto_reader))]
 pub fn validate_request_leg_gate(
     state_name: &str,
     gate_name: &str,
@@ -1552,6 +1554,7 @@ impl CompiledTemplate {
     /// D4 (gate reachability / unreferenced-field warnings) is suppressed when
     /// `strict` is `false` — those warnings are aimed at template authors, not
     /// at agents running workflows.
+    #[cfg(not(koto_reader))]
     pub fn validate(&self, strict: bool) -> Result<(), String> {
         if self.format_version != 1 {
             return Err(format!(
@@ -2268,6 +2271,7 @@ impl CompiledTemplate {
     /// it is always set, so it could never say whether the rule was carried.
     ///
     /// [`RULE_ID_MAX_BYTES`]: crate::findings::RULE_ID_MAX_BYTES
+    #[cfg(not(koto_reader))]
     fn validate_directive_rules(
         &self,
         state_name: &str,
@@ -2316,6 +2320,7 @@ impl CompiledTemplate {
     /// older koto repairs the store from assignments it finds in the log and
     /// doesn't know the clearing event, so it would restore the cleared value
     /// (DESIGN-koto-ci-wait-stale-keys.md Decision 2).
+    #[cfg(not(koto_reader))]
     fn validate_clear_on_entry(
         &self,
         state_name: &str,
@@ -2912,6 +2917,7 @@ impl CompiledTemplate {
     /// (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
     /// `KOTO_SESSIONS_BASE`). koto's value always wins, so the declaration
     /// does nothing.
+    #[cfg(not(koto_reader))]
     pub fn collect_pass_env_warnings(&self) -> Vec<String> {
         self.pass_env
             .iter()
@@ -3316,6 +3322,7 @@ impl CompiledTemplate {
     /// be a value `koto init` could store for it (`E-VAR-ROUTE-VALUE`):
     /// non-empty, inside the allowlist, and accepted by its `values:` or
     /// `pattern:`. Any other value is `E-VAR-ROUTE-VALUE` too.
+    #[cfg(not(koto_reader))]
     fn validate_vars_condition(
         &self,
         state_name: &str,
@@ -3401,6 +3408,7 @@ impl CompiledTemplate {
     }
 
     /// Validate evidence routing rules for a single state.
+    #[cfg(not(koto_reader))]
     fn validate_evidence_routing(
         &self,
         state_name: &str,

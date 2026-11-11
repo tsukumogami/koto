@@ -1,0 +1,11 @@
+[package]
+name = "koto-reader-trial"
+# Spike trial only: a second program that reads koto sessions through the
+# separated reader. Never published, never merged.
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+koto-session-reader = { path = "../koto-session-reader" }
+anyhow = "1"

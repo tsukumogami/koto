@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::engine::types::{Event, EventPayload, WorkflowResult};
+#[cfg(not(koto_reader))]
 use crate::session::context::ContextStore;
 use crate::template::result_map::{result_ref_regex, RESULT_MISSING_KEY};
 
@@ -130,6 +131,7 @@ pub const FAILURE_REASON_MAX_CHARS: usize = 500;
 /// store, cut at the rewind so a reason from a run that `retry_failed` or
 /// `koto rewind` restarted is not reported for the new one. A removal or an
 /// empty value is no reason. See [`one_line_reason`] for the bound.
+#[cfg(not(koto_reader))]
 pub fn failure_reason_for_current_run(
     context_store: &dyn ContextStore,
     session: &str,

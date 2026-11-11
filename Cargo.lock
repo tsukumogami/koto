@@ -1092,6 +1092,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "koto-reader-trial"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "koto-session-reader",
+]
+
+[[package]]
+name = "koto-session-reader"
+version = "0.0.0"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "hex",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "koto-stability-tests"
 version = "0.0.0"
 dependencies = [
