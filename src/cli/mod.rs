@@ -232,9 +232,8 @@ pub enum Command {
         /// --attach-live, --replace-terminal or --koto-leg. Refusals exit
         /// 2 with nothing written: PRED already superseded by another
         /// session (`superseded_by=<name>`), `stale_state`, `self`,
-        /// `cycle`, `session_exists`, and the cloud backend in this
-        /// release; a lock still held after 10 seconds exits 3
-        /// `fence_unavailable`. Running the same command again finishes
+        /// `cycle` and `session_exists`; a lock still held after 10
+        /// seconds exits 3 `fence_unavailable`. Running the same command again finishes
         /// an interrupted run, or changes nothing.
         #[arg(long, requires = "continues")]
         supersede: bool,
