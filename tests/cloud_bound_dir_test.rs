@@ -1620,3 +1620,55 @@ fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
         "the stalled listing was asked {asked} time(s), not three"
     );
 }
+
+/// Every listing that fails is named (koto#645). When three other prefixes'
+/// listings of a new name fail on every ask, `context exists` fails, exit 2,
+/// naming each of the three listings and what the bucket answered, not only
+/// the first one to fail.
+#[test]
+fn every_failed_prefix_listing_is_named_in_the_cant_tell_error() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let failing = [1usize, 4, 6].map(|i| format!("{}/{NEVER}/", prefixes[i]));
+
+    for listing in &failing {
+        s3.fail("LIST", listing, 503);
+    }
+    let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
+    assert_ne!(
+        out.code,
+        Some(1),
+        "context exists answers \"absent\" while three listings fail: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(2), "{}", out.describe());
+    let err = out.json();
+    assert_eq!(err["command"], "context exists", "{}", out.describe());
+    let message = err["error"].as_str().unwrap();
+    assert!(message.contains(&format!("'{NEVER}'")), "{message}");
+    assert!(message.contains("can't tell"), "{message}");
+    assert!(message.contains("503"), "{message}");
+    assert!(message.contains("3 listings failed"), "{message}");
+    for listing in &failing {
+        assert!(message.contains(listing.as_str()), "{message}");
+    }
+}
+
+/// A failed listing elsewhere doesn't hide the prefix that holds the
+/// session (koto#645). koto goes on asking the other prefixes after one
+/// listing fails for good, and a hit wins over the failure, so
+/// `context exists` still refuses with `no_local_copy`.
+#[test]
+fn a_failed_listing_elsewhere_still_finds_the_holding_prefix() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+
+    s3.fail("LIST", &format!("{}/{WF}/", prefixes[1]), 503);
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
+    assert_unlocated(&out, "context exists", "no_local_copy");
+}
