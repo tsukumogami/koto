@@ -22,8 +22,10 @@ program, such as a fleet view in shirabe, reads koto sessions and one
 recorded context value per session through the same code, without linking
 koto's S3 client, TLS stack or HTTP clients, and without writing to the
 store? If not, what does reading session logs directly under koto's
-published contract mean for a seat's holders read and a fleet snapshot
-built on it?
+published contract mean for two reads built on it later: a holders read
+(given a seat, a position that sessions fill in turn, list every session
+that has held it) and a fleet snapshot (a one-shot print of every seat in a
+workspace with its current holder)?
 
 ## Context
 
