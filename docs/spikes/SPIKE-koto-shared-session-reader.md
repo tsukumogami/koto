@@ -74,9 +74,12 @@ Yes for the logic, measured; a crate koto itself links is shown possible
 but not built. The reader's code compiles in a crate with no storage or
 network dependency, reports the same rows `koto dashboard` shows, and reads
 a real cloud-host store without writing or connecting. The trial does this
-by compiling koto's own source files a second time with about a dozen
-validation and machine-identity functions fenced off. It does not have
-koto link the crate. Doing that is the real split: those functions have to
+by compiling koto's own source files a second time with fourteen
+validation, machine-identity and context-store functions, plus the
+dashboard's remote overlay, fenced off. It does not have koto link the
+crate. And "without writing" holds by what the reader calls, enforced in
+the trial by a sandbox: the crate still contains koto's append and lock
+code, because the file it reads logs from also writes them. Doing that is the real split: those functions have to
 move off the shared types first (they are inherent methods on a type that
 would then live in another crate), and the reader's read paths have to be
 separated from the write paths they share a file with.
@@ -86,11 +89,11 @@ separated from the write paths they share a file with.
 `src/cli/dashboard_data.rs` (2,731 lines) is the dashboard's data layer. It
 has no terminal types. Its users are the dashboard's other three files,
 `dashboard.rs`, `dashboard_state.rs` and `dashboard_render.rs`, and nothing
-else. It imports:
+else. It uses, by `use` line or inline path:
 
 - `engine::persistence`: `read_header`, `read_events`,
   `derive_state_from_log`, `derive_machine_state`,
-  `derive_last_gate_evaluated`, `is_terminal_state`, `is_failed_state`
+  `derive_last_gate_evaluated`, `is_failed_state` (in its liveness module)
 - `engine::types`: `StateFileHeader`, `Event`, `EventPayload`, timestamp
   parsing
 - `engine::leg_pointer::read_pointer`, the request-leg sidecar
@@ -113,8 +116,8 @@ Followed module by module, the reader's imports reach 120 of koto's 184
 modules, including `session::cloud`, `session::remote_feed` and
 `decider::http`. Read that way, the split looks impossible. The items the
 reader actually uses are a much smaller set, and the compiler confirms it:
-22 of koto's source files compile in the trial crate, unchanged, once the
-following are fenced with `#[cfg(not(koto_reader))]`:
+22 of koto's source files compile in the trial crate, changed only by
+`#[cfg(not(koto_reader))]` attributes on the following:
 
 | File | Fenced off | Why it reaches outside the reader |
 |------|-----------|-----------------------------------|
@@ -169,8 +172,8 @@ koto-reader-trial v0.0.0
 
 | Graph | Distinct packages | rust-s3, rustls, attohttpc, http, url, ratatui, crossterm |
 |-------|------------------:|-----------------------------------------------------------|
-| koto (normal edges) | 169 | all present |
-| reader crate and trial program (normal and build edges) | 40 | none |
+| koto (`cargo tree -p koto -e normal`) | 169 | all present |
+| reader crate and trial program (`cargo tree -p koto-reader-trial -e normal,build`) | 40 | none |
 | scratch program taking the reader as a git dependency (lock) | 41 | none |
 | shirabe before (lock) | 72 | none |
 | shirabe with the reader as a git dependency (lock) | 86 | none |
@@ -183,8 +186,15 @@ format, `aho-corasick` from redaction in the findings types.
 
 ### koto dashboard unchanged, same rows
 
-The comparison used one copy of a real store (5,458 session directories)
-under the local backend, network denied. Columns 3 and 7 of `--once`
+Package counts are distinct `name version` lines of `cargo tree --prefix
+none --no-dedupe` with the edge kinds shown; lock counts are `name =` lines
+in `Cargo.lock`.
+
+The comparison used one copy of this host's cloud-backend mirror (5,458
+session directories), read through the local backend with network denied.
+That is the same set of files the dashboard reads for its local rows under
+the cloud backend, since it refreshes from `cloud.local()`; the rows other
+machines pushed to the bucket were out of the comparison. Columns 3 and 7 of `--once`
 (elapsed and idle) tick with the clock and were left out of the diff;
 every other column was compared.
 
@@ -227,14 +237,18 @@ On this host koto uses its cloud backend, and the dashboard already reads
 the backend's local mirror (`cloud.local()`), never the bucket, for its
 session rows. The trial program read that mirror a hundred times, each run
 a separate process under a macOS sandbox profile that denies `file-write*`
-and `network*`. All hundred runs succeeded with 2,170 rows and nothing on
-stderr, in 284 seconds. A write or a connection would have failed the run.
+and `network*`. All hundred runs exited zero in 284 seconds, with nothing on stderr in any
+run and 2,170 rows in the first and the last. The sandbox refuses any write and any connection,
+so whatever the program attempted, nothing reached the store or the
+network.
 
 The live store changes under other sessions all the time, so the
-before-and-after comparison ran on a copy: a manifest of all 557,157 files
-and directories (path, size, modification and change times, content hash)
-before and after a hundred unsandboxed runs was byte-identical. Nothing was
-pushed: the program contains no network client to push with.
+before-and-after comparison ran on the copy of this host's mirror: a
+manifest of all 557,157 files and directories (path, size, modification
+and change times, content hash) before and after a hundred unsandboxed
+runs was byte-identical. That nothing was pushed rests on the sandbox's
+network denial and on the binary, which contains no network client; the
+bucket itself was not inspected.
 
 A full read of 5,458 sessions takes about 2.6 to 2.8 seconds, because every
 refresh lists the directory and reads every header.
@@ -270,21 +284,23 @@ parsing, row derivation, the leg pointer read, liveness, the
 modification-time tree and refresh over a read-only listing trait, and a
 read-only context read. Outside it: the remote bucket feed, rendering, the
 backends, and template validation. Two cuts are needed that the trial only
-fenced: template validation moves off `CompiledTemplate`'s inherent impls
-(an extension trait or free functions in koto), and `engine::persistence`
+fenced: template validation has to come off
+`CompiledTemplate`'s inherent impls if the type moves crates (how is for
+the design), and `engine::persistence`
 splits its read paths from its append and lock paths, so the shared crate
 can't write rather than merely not writing. Several items the reader needs
 are crate-private today (`compute_elapsed_since`, for one), and the
 dashboard's status buckets live in its entry file.
 
 **How a dependent takes it, and how releases tie.** koto publishes nothing
-to a registry, so a dependent would pin a git tag of a workspace member in
-koto's repository. That adds a compile-time tie on top of the runtime koto
+to a registry, so the option the trial exercised is a git dependency on a
+workspace member in koto's repository, pinned by revision; a registry
+release is the other. That adds a compile-time tie on top of the runtime koto
 version floor shirabe already checks: the reader shirabe links has to read
 the logs the user's koto writes. The log format helps: it is at schema
 version 1, changes additively, rejects a higher version at the header line,
 and maps an event type it doesn't know to `EventPayload::Unknown`. So an
-older reader keeps reading a newer koto's logs, and the pin can trail
+older reader keeps reading a newer koto's logs, and a pin could trail
 koto's releases. What isn't covered is everything outside the log, below.
 
 **Room for koto#556.** That issue wants signals from outside koto recorded
@@ -295,29 +311,39 @@ derivation pure with facts from beside the log passed in by the caller (as
 the request-leg flag already is), and reports a bad source per session
 rather than failing the scan, as the unreadable tally already does.
 
-**What the published contract covers.** `docs/STABILITY.md` freezes eight
-items in `koto::engine::types`, four `SessionBackend` methods and the
-versioned log format. The session directory layout, the state file name,
+**What the published contract covers.** `docs/STABILITY.md` freezes the types
+external code imports from `koto::engine::types`, four `SessionBackend`
+methods (`list`, `read_events`, `create`, `init_state_file`) and the
+versioned log format (its scope and bump protocol sections; the log's
+reader rules are in `docs/reference/session-feed.md`). The session directory layout, the state file name,
 the `ctx/` store and its manifest, the leg pointer and the dashboard's data
-layer are not promised anywhere. A shared crate that koto owns makes that
-gap koto's problem rather than the dependent's, which is the point of
-sharing it.
+layer are not promised anywhere. Whoever owns a shared crate would own that
+gap too; reading the files from outside koto would leave it with the
+dependent.
 
 ### If the split had failed
 
 The fallback was to read session logs directly under koto's published
-contract, plus one koto read for a seat's holders. It isn't needed, but the
-trial shows what it would take. A direct reader would have to rely on the
+contract, plus one koto read for a seat's holders. The trial doesn't call
+for it, though the split a dependent would rely on isn't built yet, so it
+stays the alternative if that split stalls. A direct reader would have to rely on the
 directory layout, the state file name, the `ctx/` layout and the leg
 pointer, none of which is published, and to repeat terminal-state detection
 from the compiled template, which the log reference names as a known gap.
 The contract would have to grow to cover those, or the reader would break
-without warning when koto changed them.
+without warning when koto changed them. The holders read would need the
+same thing under either path: koto recording, at each succession, which
+session took a seat over from which, and a koto read verb that answers a
+seat's holders from that record without listing the store. Under the
+fallback, that verb is the only koto call the reader makes; with a shared
+reader, it could equally be a function in the crate. A fleet snapshot under
+the fallback would carry its own copy of row derivation and liveness, the
+duplication the shared reader exists to avoid.
 
 ### What this means for the holders read and the fleet snapshot
 
-Neither changes because of a failed split. One measured fact bears on
-both. The reader answers by reading every header in the store, about 2.6
+The split held, so neither has to be built on the fallback. One measured
+fact bears on both. The reader answers by reading every header in the store, about 2.6
 to 2.8 seconds for 5,458 sessions on this host, so it can't list a seat's
 holders without a scan. A holders read whose time depends on the seat's
 history needs something koto records at succession, which the shared
@@ -328,10 +354,10 @@ modification-time diff, which re-reads only the sessions that changed.
 
 ## Recommendation
 
-Go. The split works for the reader's logic without koto's storage and
+Go on the feasibility question; how the split is done stays open. The split works for the reader's logic without koto's storage and
 network dependencies and without writing, measured against koto dashboard
-on a real store. Before a dependent relies on it, the real split has to
-land under its own design. That means a crate koto itself links. Template
+on a real store. Before a dependent relies on it, a real split has to
+land under its own design, one in which koto links the code it shares. Template
 validation and machine identity have to move off the shared types, and the
 read paths in `engine::persistence` have to be separated from its write
 paths. It also needs a decision on what of the store layout the crate
