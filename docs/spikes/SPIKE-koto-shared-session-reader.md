@@ -40,7 +40,7 @@ did, so whatever reads the store must not write to it.
 koto today is one package. Its lock file carries rust-s3 with rustls, the
 attohttpc client, the http and url crates, and the ratatui and crossterm
 terminal stack. A dependent can't link koto without them, and shirabe's own
-lock is 72 packages. An earlier read of the dashboard's imports suggested a
+lock is 72 packages (`name =` lines in its `Cargo.lock`). An earlier read of the dashboard's imports suggested a
 small reader could be cut out, but it read imports and signatures only.
 
 ## Approach
@@ -342,7 +342,8 @@ duplication the shared reader exists to avoid.
 
 ### What this means for the holders read and the fleet snapshot
 
-The split held, so neither has to be built on the fallback. One measured
+The trial shows the split is possible, so neither is forced onto the
+fallback, though that stays open until a real split lands. One measured
 fact bears on both. The reader answers by reading every header in the store, about 2.6
 to 2.8 seconds for 5,458 sessions on this host, so it can't list a seat's
 holders without a scan. A holders read whose time depends on the seat's
@@ -354,10 +355,10 @@ modification-time diff, which re-reads only the sessions that changed.
 
 ## Recommendation
 
-Go on the feasibility question; how the split is done stays open. The split works for the reader's logic without koto's storage and
+Go on the feasibility question; how the split is done stays open. The trial shows the reader's logic runs without koto's storage and
 network dependencies and without writing, measured against koto dashboard
 on a real store. Before a dependent relies on it, a real split has to
-land under its own design, one in which koto links the code it shares. Template
+land under its own design. Template
 validation and machine identity have to move off the shared types, and the
 read paths in `engine::persistence` have to be separated from its write
 paths. It also needs a decision on what of the store layout the crate
