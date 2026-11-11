@@ -688,7 +688,7 @@ fn a_value_that_does_not_match_its_manifest_hash_is_never_carried() {
     let local = h.sessions(2).join("s").join("ctx");
     assert!(
         local.join("taken_legs").exists(),
-        "no key reached s locally"
+        "the keys read with record/a reached s locally"
     );
     assert!(!local.join("record").join("a").exists());
 

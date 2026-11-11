@@ -88,10 +88,11 @@ pub(crate) struct CarryIncomplete {
     pub held: usize,
     /// How many this run wrote.
     pub carried: usize,
-    /// The key whose read or write stopped the carry, taken from the plan
-    /// entry, so it has passed `validate_context_key`; `None` when the
-    /// manifest read or the push stopped it. It is the only name from the
-    /// bucket the refusal shows.
+    /// The key whose read or write stopped the carry: a plan entry's key,
+    /// so it has passed `validate_context_key`, or [`CARRY_COMPLETE_KEY`]
+    /// when the marker's write stopped it; `None` when the manifest read or
+    /// the push stopped it. It is the only name from the bucket the refusal
+    /// shows.
     pub key: Option<String>,
     /// What stopped it: the cloud backend's `BucketReadFailed` or
     /// `CarrySourceError`, or an error marked [`CarryWriteFailed`] or
@@ -846,6 +847,9 @@ fn carry_from_bucket(
             ));
         }
     }
+    // End the deferral here, so the batch `flush_window` pushes holds only
+    // the carry's writes. `flush_window` pushes whether or not the guard is
+    // held; this is the order, not a dependency.
     drop(guard);
     let incomplete = |key, cause| CarryIncomplete {
         keys: Some(plan.len()),
