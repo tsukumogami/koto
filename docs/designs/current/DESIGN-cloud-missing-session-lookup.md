@@ -189,7 +189,10 @@ Key assumptions:
   "created after the audit started" from "created before".
 - rust-s3's default single retry and 60-second request timeout stay as they
   are on the sync path. The lookup's own requests use a 10-second timeout
-  since koto#634.
+  since koto#634, and since koto#645 koto waits at most 10 seconds for each
+  of the lookup's asks on its own, name resolution and connect included
+  (koto#635), because the timeout rust-s3 hands the transport starts only
+  once the connection is up.
 
 #### Chosen: A per-name index whose misses are trusted only on a declared bucket
 
@@ -442,6 +445,31 @@ answers. The policy only ever runs against a bucket
 that has already answered the own-prefix probe, so its one choice is where
 the line falls between "answered" and "can't tell".
 
+koto#645 changed how each ask is bounded and what happens after a failure,
+not the retry policy. rust-s3's 10-second timeout starts only once the TCP
+connection is up, connect gets the transport's 30-second default, and name
+resolution has no bound (koto#635), so a listing whose connects hung took
+85 to 150 seconds to fail. Each of the lookup's asks now runs on a request
+thread of its own (`bounded_ask`), and koto stops waiting for it after 10
+seconds, everything included; a request it stopped waiting for, always a
+read, is left to end on its own, and at most 128 such threads live at once.
+A listing whose every ask stalls now fails in about 31 seconds. Inside one
+`any_holds` call, a failed listing no longer stops the others, so a hit
+elsewhere still wins. Once a listing has failed for good, that call starts
+new asks only until 40 seconds after the lookup began, and the error names
+the listings that failed and the prefixes left unasked, at most 10 of them
+with a count for the rest. The index and top-level reads never set the
+budget off: they run before `any_holds`, each with a gate of its own that
+nothing fails, though the 40 seconds still count from the lookup's start.
+Asks under way when a listing first fails keep their full 10 seconds, and
+a listing whose asks all stall takes about 31 seconds to fail, so on an
+undeclared bucket a stalled index listing and then a stalled sweep can take
+a lookup to about a minute. While every listing answers, no such limit
+applies, which is why this doesn't reopen the whole-sweep deadline rejected
+below: a slow bucket that answers every listing gets the same reply as
+before, and the budget only shortens a call whose answer is already "can't
+tell" or a confirmed hit.
+
 Key assumptions:
 
 - The fast path, its own reads and their failure handling are Decision 1's
@@ -458,10 +486,13 @@ Key assumptions:
 
 #### Chosen: Keep today's per-listing policy unchanged
 
-Every listing that remains goes through `list_retrying` exactly as now:
+Every listing that remains keeps `list_retrying`'s policy, now applied per
+bounded ask through `asked_retrying_within`:
 `LIST_ATTEMPTS` 3, `LIST_BACKOFF` 250 ms doubling, the same `is_transient`
 classification, rust-s3's defaults under each ask, `HELD_ELSEWHERE_FANOUT`
-64 in flight, and the existing early stop on the first hit or failure. The
+64 in flight, and the existing early stop on the first hit. Since koto#645 a
+failure no longer stops the other listings; once one has failed, the
+failure-gated budget described above bounds the rest. The
 top-level listing keeps its policy too. It's the only option that keeps
 every reply in every bucket state; the fast path changes how many listings
 are asked, not how any one of them is asked, which is the lever the drivers
@@ -473,7 +504,9 @@ still take minutes to say not-found, as it does today.
 **A whole-sweep deadline**: a wall-clock budget, with listings still
 unanswered at the deadline read as "can't tell". Rejected because a bucket
 that answers every listing, only slowly, would go from answered to "can't
-tell": the same bucket state with a different reply.
+tell": the same bucket state with a different reply. The budget koto#645
+added is not this: it applies only after a listing has failed for good, when
+the reply can no longer be "not held".
 
 **A shared retry budget across the sweep**: each listing gets one ask free
 and repeat asks come from a pool. Rejected because a broad throttle that
