@@ -36,6 +36,7 @@ use crate::engine::persistence::{
 use crate::engine::types::Event;
 use crate::session::context::Manifest;
 use crate::session::links::is_reserved_key;
+use crate::session::remote_feed::{failure_class, FailureClass};
 use crate::session::state_log::{self, LogOrder};
 use crate::session::validate::{validate_context_key, validate_session_id};
 use crate::session::{state_file_name, SessionBackend};
@@ -59,9 +60,26 @@ pub(crate) struct BucketReadFailed {
     pub source: S3Error,
     /// How long the last ask took, so a transport failure that ran the
     /// full request timeout can be told from one that failed at once.
-    /// Nothing classes a failed read yet.
-    #[allow(dead_code)]
     pub took: Duration,
+}
+
+impl BucketReadFailed {
+    /// The read's failure class, as [`failure_class`] gives it, except that
+    /// a transport failure (no HTTP answer) that took the cloud backend's
+    /// full [`super::REQUEST_TIMEOUT`] is `timeout`, whatever error the
+    /// connection's end gave: 401 and 403 are `denied`, 429 and 503
+    /// `throttled`, and any other failure `unreachable`.
+    pub(crate) fn class(&self) -> FailureClass {
+        match failure_class(&self.source) {
+            FailureClass::Unreachable
+                if self.took >= super::REQUEST_TIMEOUT
+                    && matches!(self.source, S3Error::Atto(_) | S3Error::Io(_)) =>
+            {
+                FailureClass::Timeout
+            }
+            class => class,
+        }
+    }
 }
 
 impl std::fmt::Display for BucketReadFailed {
@@ -837,6 +855,64 @@ mod tests {
                 "the bucket couldn't be read at {PREFIX}/p/koto-p.state.jsonl: \
                  Got HTTP 500 with content 'oops'"
             )
+        );
+    }
+
+    fn failed_after(source: S3Error, took: Duration) -> BucketReadFailed {
+        BucketReadFailed {
+            key: KEY.to_string(),
+            source,
+            took,
+        }
+    }
+
+    fn io(kind: std::io::ErrorKind) -> S3Error {
+        S3Error::Io(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn a_failed_read_is_classed_by_its_status() {
+        for (status, class) in [
+            (401, FailureClass::Denied),
+            (403, FailureClass::Denied),
+            (429, FailureClass::Throttled),
+            (503, FailureClass::Throttled),
+            (500, FailureClass::Unreachable),
+            (502, FailureClass::Unreachable),
+        ] {
+            let failed = failed_after(
+                S3Error::HttpFailWithBody(status, String::new()),
+                super::super::REQUEST_TIMEOUT * 2,
+            );
+            assert_eq!(failed.class(), class, "{status}");
+        }
+    }
+
+    /// A transport failure is `timeout` when it says it timed out, or when
+    /// it took the cloud backend's 60 s request timeout, not the remote
+    /// feed's 10 s one; anything quicker is `unreachable`.
+    #[test]
+    fn a_failed_read_is_a_timeout_only_after_the_cloud_request_timeout() {
+        let timeout = super::super::REQUEST_TIMEOUT;
+        assert_eq!(timeout, Duration::from_secs(60));
+        let eof = || io(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            failed_after(io(std::io::ErrorKind::TimedOut), Duration::ZERO).class(),
+            FailureClass::Timeout
+        );
+        assert_eq!(failed_after(eof(), timeout).class(), FailureClass::Timeout);
+        assert_eq!(
+            failed_after(eof(), Duration::from_secs(10)).class(),
+            FailureClass::Unreachable
+        );
+        assert_eq!(
+            failed_after(eof(), timeout - Duration::from_millis(1)).class(),
+            FailureClass::Unreachable
+        );
+        // An answer that arrived late is still classed by its status.
+        assert_eq!(
+            failed_after(S3Error::HttpFailWithBody(500, String::new()), timeout).class(),
+            FailureClass::Unreachable
         );
     }
 }

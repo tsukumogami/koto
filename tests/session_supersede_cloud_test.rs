@@ -501,17 +501,22 @@ fn carried_pred_keys() -> impl Iterator<Item = (&'static str, &'static str)> {
 }
 
 /// A carry whose read of one key keeps failing after the fence leaves the
-/// predecessor fenced and pushes the keys it did read, without the marker.
-/// The same command run again creates nothing new, reads only the key that
-/// failed (no GET of a key the first run carried), and carries just that
-/// one; a third run carries nothing.
+/// predecessor fenced and pushes the keys it did read, without the marker,
+/// and refuses `carry_incomplete` on exit 1. The same command run again
+/// creates nothing new, reads only the key that failed (no GET of a key the
+/// first run carried), and carries just that one, so the two runs' `carried`
+/// add up to every carried key; a third run carries nothing.
 #[test]
 fn a_re_run_after_the_fence_finishes_the_carry_once() {
     let h = Hosts::new();
     h.predecessor();
     h.s3.fail("GET", &h.pred_ctx("record/a"), 500);
     let out = h.supersede(2, "s");
-    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    assert_eq!(exit_of(&out), Some(1), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["code"], "carry_incomplete", "{refused}");
+    assert_eq!(refused["failure"], "unreachable", "{refused}");
+    let first = refused["carried"].as_u64().unwrap();
     assert_eq!(h.fences().len(), 1);
     assert!(!h.has_marker());
     for (key, value) in carried_pred_keys() {
@@ -530,6 +535,10 @@ fn a_re_run_after_the_fence_finishes_the_carry_once() {
     let body = printed_json(&out.stdout);
     assert_eq!(body["outcome"], "unchanged");
     assert_eq!(body["carried"], 1);
+    assert_eq!(
+        first + body["carried"].as_u64().unwrap(),
+        carried_pred_keys().count() as u64
+    );
     assert!(h.has_marker());
     assert_eq!(
         h.s3.object(&h.succ_ctx("record/a")).as_deref(),
@@ -555,7 +564,7 @@ fn a_key_only_the_successor_s_bucket_manifest_lists_is_fetched() {
     h.predecessor();
     h.s3.fail("GET", &h.pred_ctx("record/a"), 500);
     let out = h.supersede(2, "s");
-    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    assert_eq!(exit_of(&out), Some(1), "{out:?}");
     h.s3.clear_faults();
     let pushed: Value =
         serde_json::from_slice(&h.s3.object(&h.succ_ctx("manifest.json")).unwrap()).unwrap();
@@ -667,6 +676,12 @@ fn a_value_that_does_not_match_its_manifest_hash_is_never_carried() {
     h.s3.clear_requests();
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["code"], "carry_incomplete", "{refused}");
+    assert_eq!(refused["failure"], "invalid_source", "{refused}");
+    assert_eq!(refused["retryable"], false, "{refused}");
+    assert_eq!(refused["remaining"], 1, "{refused}");
+    assert!(!error_text(&h, &refused).contains("tampered"), "{refused}");
     assert_eq!(h.gets_of("record/a"), 2);
     assert!(!h.has_marker());
     assert!(h.s3.object(&h.succ_ctx("record/a")).is_none());
@@ -705,6 +720,10 @@ fn a_missing_predecessor_manifest_fails_only_when_its_log_names_a_carried_key() 
     h.s3.clear_requests();
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["code"], "carry_incomplete", "{refused}");
+    assert_eq!(refused["failure"], "invalid_source", "{refused}");
+    assert_no_counts(&refused);
     assert_eq!(h.fences().len(), 1);
     assert!(!h.has_marker());
     assert!(h.carried_gets().is_empty());
@@ -892,5 +911,146 @@ fn names_from_the_bucket_that_fail_validation_are_refused() {
     h.s3.clear_requests();
     let out = h.supersede(2, "s");
     assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["failure"], "invalid_source", "{refused}");
+    assert!(!refused.to_string().contains("escape"), "{refused}");
     assert!(h.s3.requests().iter().all(|r| !r.key.contains("escape")));
+}
+
+/// A `carry_incomplete` refusal whose plan itself failed: `keys`, `held`
+/// and `remaining` are left out, and nothing was carried.
+fn assert_no_counts(refused: &Value) {
+    for field in ["keys", "held", "remaining"] {
+        assert!(refused.get(field).is_none(), "{field}: {refused}");
+    }
+    assert_eq!(refused["carried"], 0, "{refused}");
+}
+
+/// The `error` text of a refusal, checked to hold none of the stand-in's
+/// own error text and not the bucket key the failed read asked for.
+fn error_text(h: &Hosts, refused: &Value) -> String {
+    let error = refused["error"].as_str().unwrap().to_string();
+    for shown in [
+        "injected failure",
+        "InternalError",
+        "<Error>",
+        "HTTP",
+        "127.0.0.1",
+    ] {
+        assert!(!error.contains(shown), "{shown}: {error}");
+    }
+    assert!(!error.contains(&prefix_of(&h.w1)), "{error}");
+    error
+}
+
+/// A key whose read keeps failing with a 503 stops the carry: the refusal
+/// is `carry_incomplete`, `throttled` and retryable, on exit 1, with the
+/// counts of the keys the successor holds and the one that remains. Its
+/// `error` names the key and none of the bucket's own text.
+#[test]
+fn a_transient_read_failure_refuses_carry_incomplete_on_exit_1_with_its_counts() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail("GET", &h.pred_ctx("record/a"), 503);
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(1), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    for (field, value) in [
+        ("command", Value::from("init")),
+        ("code", Value::from("carry_incomplete")),
+        ("superseded", Value::from("p")),
+        ("name", Value::from("s")),
+        ("failure", Value::from("throttled")),
+        ("retryable", Value::from(true)),
+        ("keys", Value::from(5)),
+        ("held", Value::from(4)),
+        ("remaining", Value::from(1)),
+        ("carried", Value::from(4)),
+    ] {
+        assert_eq!(refused[field], value, "{field}: {refused}");
+    }
+    let error = error_text(&h, &refused);
+    assert!(error.contains("'record/a'"), "{error}");
+    assert!(error.contains("4 of 5 keys carried, 1 remain"), "{error}");
+    assert!(!h.has_marker());
+}
+
+/// A 403 on a carried key's read is `denied`, not retryable, on exit 3.
+#[test]
+fn a_denied_read_refuses_carry_incomplete_on_exit_3() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail("GET", &h.pred_ctx("record/a"), 403);
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["code"], "carry_incomplete", "{refused}");
+    assert_eq!(refused["failure"], "denied", "{refused}");
+    assert_eq!(refused["retryable"], false, "{refused}");
+    assert_eq!(refused["remaining"], 1, "{refused}");
+    error_text(&h, &refused);
+}
+
+/// When every key and the marker are written but the push fails, the
+/// refusal is `push_failed`, retryable, on exit 1, with nothing remaining.
+/// The re-run pushes the open batch and returns at the marker.
+#[test]
+fn a_failed_final_push_refuses_push_failed_on_exit_1() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail("PUT", &h.succ_ctx("koto/superseded-carry-complete"), 500);
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(1), "{out:?}");
+    let refused = printed_json(&out.stdout);
+    for (field, value) in [
+        ("code", Value::from("carry_incomplete")),
+        ("failure", Value::from("push_failed")),
+        ("retryable", Value::from(true)),
+        ("keys", Value::from(5)),
+        ("held", Value::from(5)),
+        ("remaining", Value::from(0)),
+        ("carried", Value::from(5)),
+    ] {
+        assert_eq!(refused[field], value, "{field}: {refused}");
+    }
+    error_text(&h, &refused);
+    assert!(!h.has_marker());
+    h.s3.clear_faults();
+
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+    assert_eq!(printed_json(&out.stdout)["carried"], 0);
+    assert!(h.has_marker());
+}
+
+/// A manifest key holding control characters, and one far longer than a
+/// key may be, each fail the carry as `invalid_source` on exit 3 with no
+/// counts, and neither reaches the refusal.
+#[test]
+fn a_manifest_key_the_carry_refuses_never_reaches_the_refusal() {
+    let h = Hosts::new();
+    h.predecessor();
+    let manifest_key = h.pred_ctx("manifest.json");
+    let original: Value = serde_json::from_slice(&h.s3.object(&manifest_key).unwrap()).unwrap();
+    let long = format!("record/{}", "L".repeat(400));
+    for (bad, shown) in [
+        ("record/\u{1b}[31mEVIL\u{7}\r\nX", "EVIL"),
+        (long.as_str(), "LLLLLLLL"),
+    ] {
+        let mut manifest = original.clone();
+        let meta = manifest["keys"]["record/a"].clone();
+        manifest["keys"][bad] = meta;
+        h.s3.put(&manifest_key, manifest.to_string().as_bytes());
+        let out = h.supersede(2, "s");
+        assert_eq!(exit_of(&out), Some(3), "{out:?}");
+        let refused = printed_json(&out.stdout);
+        assert_eq!(refused["code"], "carry_incomplete", "{refused}");
+        assert_eq!(refused["failure"], "invalid_source", "{refused}");
+        assert_no_counts(&refused);
+        let body = refused.to_string();
+        assert!(!body.contains(shown), "{body}");
+        let error = error_text(&h, &refused);
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+    }
+    assert!(!h.has_marker());
 }

@@ -245,7 +245,12 @@ pub enum Command {
         /// already holds with the same value. Repeatable. Keys under
         /// `koto/` are never carried. Once the carry is done the session
         /// holds `koto/superseded-carry-complete`, and a later run carries
-        /// nothing.
+        /// nothing. Under the cloud backend a carry that stops partway
+        /// pushes the keys it wrote and refuses `carry_incomplete` with its
+        /// `failure` class and key counts: exit 1 when running the command
+        /// again can finish it (`unreachable`, `timeout`, `throttled`,
+        /// `push_failed`), else exit 3 (`denied`, `invalid_source`,
+        /// `write_failed`). A re-run reads only the keys still missing.
         #[arg(long = "carry", value_name = "PREFIX", requires = "supersede")]
         carry: Vec<String>,
 

@@ -5862,7 +5862,9 @@ mod continues;
 
 #[path = "cloud_supersede.rs"]
 mod supersede;
-pub(crate) use supersede::{check_fence_names, CarryEntry, CloudFence, PulledState};
+pub(crate) use supersede::{
+    check_fence_names, BucketReadFailed, CarryEntry, CarrySourceError, CloudFence, PulledState,
+};
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
