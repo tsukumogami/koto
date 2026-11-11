@@ -304,7 +304,9 @@ got="$(printf '%s' "$out" | jq -er '.state')" || fail "session: nv's koto next p
 printf '%s' "$out" | jq -e '[.blocking_conditions[] | select(.name == "comments" and .status == "pending")] | length == 1' >/dev/null \
   || fail "session: review shows no pending comments check: $out"
 pass "session: a missing verdict falls back to the agent -> $got"
-out="$(nv_koto decider answer nv --gate comments --criterion comment_reason --answer pass 2>&1)" \
+# A fixed harness session, so this gate pass has an established decider.
+out="$(CLAUDE_CODE_SESSION_ID=0f0e0d0c-1111-4222-8333-444455556666 \
+  nv_koto decider answer nv --gate comments --criterion comment_reason --answer pass 2>&1)" \
   || fail "session: koto decider answer failed: $out"
 pass "session: the agent answered pass"
 out="$(nv_koto next nv --no-cleanup 2>&1)" || fail "session: nv's second koto next exited non-zero: $out"
@@ -361,13 +363,17 @@ un_review() {
 un_koto init un --template "$UN_WORK/decider-units.md" >/dev/null 2>"$SCRATCH/init-un.err" \
   || fail "session: koto init un failed: $(cat "$SCRATCH/init-un.err")"
 un_review "a unit fails and the over-budget unit waits" summary
-out="$(un_koto decider answer un --gate acceptance --criterion ac_binary --unit ac-2 --answer pass 2>&1)" \
+# A fixed harness session, so this gate pass has an established decider.
+out="$(CLAUDE_CODE_SESSION_ID=0f0e0d0c-1111-4222-8333-444455556666 \
+  un_koto decider answer un --gate acceptance --criterion ac_binary --unit ac-2 --answer pass 2>&1)" \
   || fail "session: koto decider answer --unit failed: $out"
 printf '%s' "$out" | jq -e '.unit == "ac-2" or .unit.key == "ac-2"' >/dev/null \
   || fail "session: the answer doesn't name its unit: $out"
 pass "session: the agent answered ac-2 alone"
 un_review "the check fails again with ac-2 answered" full
-out="$(un_koto overrides record un --gate acceptance --rationale "compat: the criterion is fine" 2>&1)" \
+# A fixed harness session, so this gate pass has an established decider.
+out="$(CLAUDE_CODE_SESSION_ID=0f0e0d0c-1111-4222-8333-444455556666 \
+  un_koto overrides record un --gate acceptance --rationale "compat: the criterion is fine" 2>&1)" \
   || fail "session: un's override failed: $out"
 out="$(un_koto next un --no-cleanup 2>&1)" || fail "session: un's last koto next exited non-zero: $out"
 got="$(printf '%s' "$out" | jq -er '.state')" || fail "session: un's last koto next printed no state: $out"
