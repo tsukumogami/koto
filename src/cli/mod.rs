@@ -232,9 +232,8 @@ pub enum Command {
         /// --attach-live, --replace-terminal or --koto-leg. Refusals exit
         /// 2 with nothing written: PRED already superseded by another
         /// session (`superseded_by=<name>`), `stale_state`, `self`,
-        /// `cycle`, `session_exists`, and the cloud backend in this
-        /// release; a lock still held after 10 seconds exits 3
-        /// `fence_unavailable`. Running the same command again finishes
+        /// `cycle` and `session_exists`; a lock still held after 10
+        /// seconds exits 3 `fence_unavailable`. Running the same command again finishes
         /// an interrupted run, or changes nothing.
         #[arg(long, requires = "continues")]
         supersede: bool,
@@ -245,7 +244,12 @@ pub enum Command {
         /// already holds with the same value. Repeatable. Keys under
         /// `koto/` are never carried. Once the carry is done the session
         /// holds `koto/superseded-carry-complete`, and a later run carries
-        /// nothing.
+        /// nothing. Under the cloud backend a carry that stops partway
+        /// pushes the keys it wrote and refuses `carry_incomplete` with its
+        /// `failure` class and key counts: exit 1 when running the command
+        /// again can finish it (`unreachable`, `timeout`, `throttled`,
+        /// `push_failed`), else exit 3 (`denied`, `invalid_source`,
+        /// `write_failed`). A re-run reads only the keys still missing.
         #[arg(long = "carry", value_name = "PREFIX", requires = "supersede")]
         carry: Vec<String>,
 
