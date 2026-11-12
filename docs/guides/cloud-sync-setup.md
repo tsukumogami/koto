@@ -196,8 +196,10 @@ The whole lookup, from the first listing of `<session>/` under the current direc
 A missing name the bucket did answer for still gets the not-found reply, exit 2 with no `code` (`koto context exists` exits 1), so a caller tells "no session has this name" from "koto couldn't find out" by the `code` and the exit status, without reading the message:
 
 ```
-{"error":"session 'review' has no copy on this host and the bucket holds none under this directory's prefix 3f2a9c0d4b1e7a65, and koto can't tell whether another directory's prefix holds it: ...; nothing was read, so run the command again once the bucket answers","command":"status","code":"session_lookup_failed","session":"review"}
+{"error":"session 'review' has no copy on this host and the bucket holds none under this directory's prefix 3f2a9c0d4b1e7a65, and koto can't tell whether another directory's prefix holds it: ...; nothing was read, so run the command again once the bucket answers","command":"status","code":"session_lookup_failed","session":"review","reason":"listing_failed","index":"declared"}
 ```
+
+The refusal's `reason` is `timed_out` when a read got no answer before the deadline or the deadline passed with prefixes unasked (the bucket may only be slow, and asking again can succeed), `unreachable` when the bucket couldn't be reached, and `listing_failed` when the bucket answered a listing with a failure that persisted after koto asked again. Its `index` is `declared`, `undeclared` or `unknown`, as the lookup read the bucket's name index. On an undeclared bucket of many prefixes the top-level listing and the sweep can't fit inside the deadline however often the command runs, so there the message names `koto session index audit` and `koto session index declare`; see [Indexing the bucket's older sessions](#indexing-the-buckets-older-sessions).
 
 The local backend answers a name the same from every directory and never refuses.
 
