@@ -1746,3 +1746,121 @@ fn a_sweep_cut_at_the_deadline_is_cant_tell_never_not_found() {
     );
     println!("cut sweep: {took:?}");
 }
+
+/// The remedy a failed lookup on an undeclared bucket names (koto#675).
+const DECLARE_REMEDY: [&str; 2] = ["`koto session index audit`", "`koto session index declare`"];
+
+/// `session_lookup_failed`'s `reason` and `index` fields (koto#675).
+fn assert_reason(out: &Out, reason: &str, index: &str) {
+    let err = out.json();
+    assert_eq!(err["reason"], reason, "{}", out.describe());
+    assert_eq!(err["index"], index, "{}", out.describe());
+}
+
+/// Whether `message` names both commands of the undeclared remedy.
+fn names_declare_remedy(message: &str) -> bool {
+    DECLARE_REMEDY
+        .iter()
+        .all(|command| message.contains(command))
+}
+
+/// On an undeclared bucket whose top-level listing never answers, a lookup
+/// of a missing name refuses within the bound with `reason: timed_out` and
+/// `index: undeclared`, says asking again can succeed rather than only
+/// "once the bucket answers", and names `koto session index audit` and
+/// `koto session index declare` as what lets the lookup finish (koto#675).
+#[test]
+fn a_stalled_top_level_listing_on_an_undeclared_bucket_is_timed_out_and_names_the_remedy() {
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, 6);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+
+    // Far past the deadline, so no ask of the top-level listing is answered.
+    s3.stall("LIST", "", Duration::from_secs(300));
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["status", GHOST]);
+    let took = started.elapsed();
+    assert!(took < LOOKUP_BOUND, "took {took:?}: {}", out.describe());
+    let message = assert_lookup_failed(&out, "status", GHOST);
+    assert_reason(&out, "timed_out", "undeclared");
+    assert!(
+        message.contains("listing the bucket's workspace prefixes failed"),
+        "{message}"
+    );
+    assert!(message.contains("asking again can succeed"), "{message}");
+    assert!(!message.contains("once the bucket answers"), "{message}");
+    assert!(names_declare_remedy(&message), "{message}");
+}
+
+/// On an undeclared bucket whose sweep is cut at the deadline, the refusal
+/// is `reason: timed_out`, `index: undeclared`, with the remedy (koto#675).
+#[test]
+fn a_sweep_cut_at_the_deadline_is_timed_out_on_an_undeclared_bucket() {
+    const PREFIXES: u32 = 2_000;
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, PREFIXES);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+
+    s3.set_latency(Duration::from_millis(300));
+    let out = h.exists(&dir, GHOST);
+    s3.set_latency(Duration::ZERO);
+    let message = assert_lookup_failed(&out, "context exists", GHOST);
+    assert_reason(&out, "timed_out", "undeclared");
+    assert!(names_declare_remedy(&message), "{message}");
+}
+
+/// On an undeclared bucket whose top-level listing the bucket keeps
+/// failing, the lookup ends with time left: `reason: listing_failed`, and
+/// the message still says to run the command again once the bucket
+/// answers, with the remedy, since the bucket reads undeclared (koto#675).
+#[test]
+fn a_top_level_listing_the_bucket_keeps_failing_is_listing_failed() {
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, 6);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+
+    s3.fail("LIST", "", 503);
+    let out = h.koto(&dir, &["status", GHOST]);
+    s3.clear_faults();
+    let message = assert_lookup_failed(&out, "status", GHOST);
+    assert_reason(&out, "listing_failed", "undeclared");
+    assert!(message.contains("503"), "{message}");
+    assert!(message.contains("once the bucket answers"), "{message}");
+    assert!(names_declare_remedy(&message), "{message}");
+}
+
+/// On a declared bucket a failed index listing is `reason:
+/// listing_failed`, `index: declared`, and names no remedy: the index is
+/// already declared (koto#675).
+#[test]
+fn a_failed_index_listing_on_a_declared_bucket_names_no_remedy() {
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, 6);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+
+    s3.fail("LIST", &format!("koto-names/{GHOST}/"), 503);
+    let out = h.exists(&dir, GHOST);
+    s3.clear_faults();
+    let message = assert_lookup_failed(&out, "context exists", GHOST);
+    assert_reason(&out, "listing_failed", "declared");
+    assert!(!names_declare_remedy(&message), "{message}");
+}
+
+/// A bucket that can't be reached is `reason: unreachable`, `index:
+/// unknown`: the lookup never read the declaration (koto#675).
+#[test]
+fn an_unreachable_bucket_is_reason_unreachable_with_index_unknown() {
+    let s3 = FakeS3::start(BUCKET);
+    let (mut h, dir) = declared_host(&s3, "offline");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    h.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+
+    let out = h.koto(&dir, &["status", GHOST]);
+    let message = assert_lookup_failed(&out, "status", GHOST);
+    assert_reason(&out, "unreachable", "unknown");
+    assert!(!names_declare_remedy(&message), "{message}");
+}
