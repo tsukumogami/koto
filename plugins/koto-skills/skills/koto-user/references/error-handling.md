@@ -11,7 +11,7 @@ This file covers exit codes, error shapes, and how to respond to each category o
 | 0 | Success | Parse and act on the JSON output |
 | 1 | Transient — retry when the condition resolves | Wait, then retry; or report to user if externally blocked |
 | 2 | Caller error — the agent must change behavior | Fix the request; do not retry without changing input |
-| 3 | Infrastructure error — corrupted or misconfigured | Report to user; do not retry automatically |
+| 3 | Infrastructure error — corrupted or misconfigured, or the session bucket couldn't be read | Report to user; do not retry automatically. `session_lookup_failed` is the one to run again once the bucket answers |
 
 Some subcommands also return sysexits values (64, 65, 66, 75) — see the `NextErrorCode` table below. The `koto request` group never does: it uses 0, 1, 2, and 3 and nothing else, so a wrapper can treat any status above 3 from a request command as coming from somewhere other than koto.
 
@@ -99,6 +99,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The commands that would change it refuse; reads still exit 0. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
 | `session_superseded` | 2 | No | The session was superseded with `koto init <succ> --continues <it> --supersede`: its log holds the fence, and koto writes nothing more to it. The message names the newest session in the chain; the body carries `superseded_by`, `newest` and `actor` | Continue in the session the message names. Reads of this session still work. See [session_superseded](#session_superseded) |
 | `session_unlocated` | 2 | No | Under the cloud backend, koto can't tell which bucket copy is the named session's own: no copy on this host and none under this directory's prefix, but one under another directory's (`no_local_copy`; a session the bucket holds nowhere reads as absent, and on a bucket carrying `koto-names/_complete` so does a session only older koto releases have touched, until the next `koto session index audit` revokes that declaration), a recorded copy that is missing or another session's (`recorded_copy_mismatch`), or a session with no recorded prefix, named from outside its own directory, whose two candidate prefixes don't give one copy carrying its `session_id` (`no_candidate_copy`, `ambiguous_copies`, `candidate_copy_mismatch`, `candidate_unreadable`). A session that records its prefix, and one located by its candidates, is read and written there from any directory | Act on the `reason`; for the four candidate reasons, run from the directory the message names. See [session_unlocated](#session_unlocated) |
+| `session_lookup_failed` | 3 | Yes, once the bucket answers | Under the cloud backend, a command named a session with no copy on this host, and koto couldn't finish asking the bucket whether any workspace prefix holds it: the bucket couldn't be reached, or a listing still failed after its retries. The name may be in use, so this is never the not-found reply | Don't treat the name as absent and don't create a session under it on the strength of this reply. Run the command again once the bucket answers; report to the user if it keeps failing. See [session_lookup_failed](#session_lookup_failed) |
 | `session_rebound` | non-zero | No | Under the cloud backend, a write to the session (an event, a context key, a header rewrite) ran from an anchor a `koto session rebind` moved the session away from, or read the session before a rebind. Nothing was written. The message names the anchor the session is bound to now | Stop writing from the old anchor. If this process is the session's current owner, run the command again from the directory the message names; otherwise the session has a successor and this process is done with it |
 | `session conflict` | non-zero | No | Under the cloud backend, this host's state log and the bucket's copy each hold an event the other lacks, so a pull or a push refused instead of overwriting either. The message gives both sides' event counts, byte lengths and last seqs. A refused push leaves the write in this host's log | Escalate: someone decides which history to keep with `koto session resolve <name> --keep local` or `--keep remote`, run from the session's directory. Don't resolve it yourself unless you were told to |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
@@ -218,6 +219,18 @@ When koto can't tell which copy is the session's own, those commands refuse firs
 | `candidate_unreadable` | As above, and a candidate's listing failed | Run the command again once the bucket answers, or from the directory the message names |
 
 `koto session rebind` of a session koto can't locate refuses the same way from a directory that is neither the one it is bound to nor the one it moves to, with the command to run in the message. A session that records its prefix, or that its candidates locate, rebinds from any directory. The local backend never refuses.
+
+## session_lookup_failed
+
+A session with no copy on this host has to be looked for in the bucket before those same commands can answer: under the current directory's prefix first, then under every other workspace's prefix. When that lookup can't finish, koto can't tell a name no session has from one another workspace holds, so the command refuses instead of answering it absent. The error goes to **stdout**, flat, exit 3:
+
+```json
+{"error":"session 'review' has no copy on this host and the bucket holds none under this directory's prefix 3f2a9c0d4b1e7a65, and koto can't tell whether another directory's prefix holds it: ...; nothing was read, so run the command again once the bucket answers","command":"status","code":"session_lookup_failed","session":"review"}
+```
+
+It happens when the bucket can't be reached at all (the message says so), or when a listing the lookup needed still failed after koto asked it again. Nothing was read or written. A missing name answered by a bucket that did answer is still the not-found reply (`workflow '<name>' not found`, exit 2, no `code`; `koto context exists` exits 1), and so is any missing name under the local backend, which makes no request.
+
+Branch on the `code`, not the message. Don't read `session_lookup_failed` as "the session doesn't exist": a workflow that creates a session when a name is absent would make a duplicate of one another workspace holds. Run the command again once the bucket answers, and tell the user if it keeps failing. Creating a new session with `koto init` doesn't go through this lookup, so it still works on a host that can't reach the bucket.
 
 ---
 

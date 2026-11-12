@@ -333,6 +333,21 @@ fn assert_unlocated(out: &Out, command: &str, name: &str, reason: &str) {
     assert_eq!(err["reason"], reason, "{}", out.describe());
 }
 
+/// The `session_lookup_failed` refusal of `command`, exit 3, naming `name`:
+/// the lookup couldn't finish, so koto can't tell whether the name is in
+/// use (koto#638). Returns the message.
+fn assert_lookup_failed(out: &Out, command: &str, name: &str) -> String {
+    assert_eq!(out.code, Some(3), "{command}: {}", out.describe());
+    let err = out.json();
+    assert_eq!(err["code"], "session_lookup_failed", "{}", out.describe());
+    assert_eq!(err["command"], command, "{}", out.describe());
+    assert_eq!(err["session"], name, "{}", out.describe());
+    let message = err["error"].as_str().unwrap().to_string();
+    assert!(message.contains(&format!("'{name}'")), "{message}");
+    assert!(message.contains("can't tell"), "{message}");
+    message
+}
+
 /// `context exists` of a name read as absent: exit 1, nothing printed.
 fn assert_absent(out: &Out) {
     assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
@@ -603,11 +618,7 @@ fn a_failed_top_level_listing_is_cant_tell_even_with_an_index_hit() {
 
     s3.fail("LIST", "", 503);
     let out = second.exists(&b, WF);
-    assert_eq!(out.code, Some(2), "{}", out.describe());
-    let err = out.json();
-    let message = err["error"].as_str().unwrap();
-    assert!(message.contains(&format!("'{WF}'")), "{message}");
-    assert!(message.contains("can't tell"), "{message}");
+    let message = assert_lookup_failed(&out, "context exists", WF);
     assert!(message.contains("503"), "{message}");
     assert!(
         !out.stdout.contains("session_unlocated"),
@@ -1275,8 +1286,31 @@ fn a_declared_bucket_still_refuses_an_indexed_session_from_another_prefix() {
     assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
 }
 
+/// `koto status` of a session another workspace's prefix holds, with its
+/// index entry, on a declared bucket is never answered absent: it refuses
+/// with `session_unlocated` and `no_local_copy`, from the index alone.
+#[test]
+fn status_on_a_declared_bucket_refuses_an_indexed_session_as_unlocated() {
+    let s3 = FakeS3::start(BUCKET);
+    let first = Host::new(&s3);
+    let a = first.dir("a");
+    first.init(&a);
+    assert!(s3
+        .object(&format!("koto-names/{WF}/{}", prefix_of(&a)))
+        .is_some());
+    plant_prefixes(&s3, 30);
+    let (second, b) = declared_host(&s3, "elsewhere");
+
+    s3.clear_requests();
+    let out = second.koto(&b, &["status", WF]);
+    assert_unlocated(&out, "status", WF, "no_local_copy");
+    assert!(!out.stdout.contains("not found"), "{}", out.describe());
+    assert_eq!(top_level_listings(&s3), 0, "{:?}", listings(&s3));
+}
+
 /// On a declared bucket a failed index listing, or a failed confirming
-/// listing, is "can't tell" (exit 2), never not-found.
+/// listing, is "can't tell" (`session_lookup_failed`, exit 3), never
+/// not-found.
 #[test]
 fn a_failed_index_listing_on_a_declared_bucket_is_cant_tell() {
     let s3 = FakeS3::start(BUCKET);
@@ -1289,20 +1323,9 @@ fn a_failed_index_listing_on_a_declared_bucket_is_cant_tell() {
 
     let assert_cant_tell = |name: &str, listing: &str| {
         let out = second.exists(&b, name);
-        assert_eq!(out.code, Some(2), "{name}: {}", out.describe());
-        assert_eq!(
-            out.json()["command"],
-            "context exists",
-            "{}",
-            out.describe()
-        );
+        assert_lookup_failed(&out, "context exists", name);
         let text = format!("{}{}", out.stdout, out.stderr);
-        let needles = [
-            format!("'{name}'"),
-            "can't tell".into(),
-            "503".into(),
-            listing.into(),
-        ];
+        let needles = ["503".to_string(), listing.into()];
         for needle in needles {
             assert!(
                 text.contains(&needle),
@@ -1332,10 +1355,13 @@ fn a_failed_index_listing_on_a_declared_bucket_is_cant_tell() {
     );
 }
 
-/// A host whose memo says "declared", pointed at a closed port, reads a
-/// never-used name as absent after the own-prefix probe alone.
+/// A host whose memo says "declared", pointed at a closed port, can't tell
+/// whether a never-used name is in use (koto#638): after the own-prefix
+/// probe alone, `context exists` and `status` refuse with
+/// `session_lookup_failed`, exit 3, saying the bucket couldn't be reached.
 #[test]
-fn an_unreachable_declared_bucket_still_reads_a_never_used_name_as_absent() {
+fn an_unreachable_declared_bucket_refuses_a_never_used_name_as_lookup_failed() {
+    const NEVER: &str = "never_used";
     let s3 = FakeS3::start(BUCKET);
     let (mut h, dir) = declared_host(&s3, "offline");
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1345,7 +1371,10 @@ fn an_unreachable_declared_bucket_still_reads_a_never_used_name_as_absent() {
     write_memo(&h, &endpoint, true, Duration::from_secs(120));
 
     s3.clear_requests();
-    assert_absent(&h.exists(&dir, "never_used"));
+    let message = assert_lookup_failed(&h.exists(&dir, NEVER), "context exists", NEVER);
+    assert!(message.contains("couldn't be reached"), "{message}");
+    let message = assert_lookup_failed(&h.koto(&dir, &["status", NEVER]), "status", NEVER);
+    assert!(message.contains("couldn't be reached"), "{message}");
     assert!(s3.requests().is_empty(), "{:?}", s3.requests());
 }
 

@@ -38,8 +38,8 @@ use crate::session::sync_stamp::{
     self, clear_summary_owed, mark_summary_owed, summary_owed, Stamp,
 };
 use crate::session::{
-    state_file_name, Fallback, Home, HomeSource, SessionBackend, SessionError, SessionInfo,
-    SessionLock, SessionMigrated, Unlocated, UnlocatedReason,
+    state_file_name, Fallback, Home, HomeSource, LookupFailed, SessionBackend, SessionError,
+    SessionInfo, SessionLock, SessionMigrated, Unlocated, UnlocatedReason,
 };
 
 /// File name of the marker `koto session import` leaves beside a source
@@ -835,12 +835,11 @@ impl CloudBackend {
     ///   and a bucket holding no state there for `id` is `NoLocalCopy` when
     ///   another workspace's prefix holds it ([`CloudBackend::held_elsewhere`]).
     ///   A session the bucket holds nowhere was never used, and the command
-    ///   goes on to answer it absent, as before (koto#518); so does one whose
-    ///   listing under this directory's prefix fails because the bucket
-    ///   can't be reached ([`CloudBackend::located_probe`]). When that
-    ///   listing or the other prefixes' can't all be answered by a bucket
-    ///   that is answering, koto can't tell whether one holds it, and the
-    ///   command fails rather than answer it absent (koto#528, koto#531);
+    ///   goes on to answer it absent, as before (koto#518). When the bucket
+    ///   can't be reached ([`CloudBackend::located_probe`]), or that listing
+    ///   or the other prefixes' can't all be answered, koto can't tell
+    ///   whether one holds it, and the command fails with [`LookupFailed`]
+    ///   rather than answer it absent (koto#528, koto#531, koto#638);
     /// - a home that isn't this directory's own is pulled now, strictly
     ///   ([`CloudBackend::sync_pull_state`]): a bucket that can't answer is
     ///   an error, and a copy there that is missing or another session's is
@@ -852,11 +851,25 @@ impl CloudBackend {
             return Ok(());
         }
         if !self.local.exists(id) {
+            let failed = |message: String| {
+                Err(anyhow::Error::new(LookupFailed {
+                    session: id.to_string(),
+                    message,
+                }))
+            };
             let probe = match self.located_probe(id) {
-                Ok(Some(probe)) => probe,
-                Ok(None) => return Ok(()),
+                Ok(LocatedProbe::Answered(probe)) => probe,
+                Ok(LocatedProbe::Unreachable(e)) => {
+                    return failed(format!(
+                        "session '{id}' has no copy on this host, and koto can't tell whether \
+                         the bucket holds it under this directory's prefix {} or another \
+                         directory's, because the bucket couldn't be reached: {e:#}; nothing \
+                         was read, so run the command again once the bucket answers",
+                        home.prefix
+                    ))
+                }
                 Err(e) => {
-                    return Err(anyhow::anyhow!(
+                    return failed(format!(
                         "session '{id}' has no copy on this host, and koto can't tell whether \
                          the bucket holds it under this directory's prefix {}: {e:#}; nothing \
                          was read, so run the command again once the bucket answers",
@@ -875,7 +888,7 @@ impl CloudBackend {
                     },
                 })),
                 Ok(false) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!(
+                Err(e) => failed(format!(
                     "session '{id}' has no copy on this host and the bucket holds none under \
                      this directory's prefix {}, and koto can't tell whether another \
                      directory's prefix holds it: {e:#}; nothing was read, so run the command \
@@ -894,30 +907,30 @@ impl CloudBackend {
     /// [`CloudBackend::check_located`]'s probe of `id` under this directory's
     /// prefix, for a session with no local copy.
     ///
-    /// `None` when the listing failed without the bucket answering it (a
-    /// connection that failed, an answer it couldn't make sense of), or
-    /// failed earlier in the process: a host that can't reach the bucket
-    /// reads a fresh name as absent, as before koto#518. A listing the bucket
+    /// [`LocatedProbe::Unreachable`] when the listing failed without the
+    /// bucket answering it (a connection that failed, an answer it couldn't
+    /// make sense of), or failed earlier in the process. A listing the bucket
     /// answered with a throttle or a failure on its side
     /// ([`is_answered_failure`]) is asked again ([`list_retrying`]), and an
     /// answer then is this process's probe of `id`; one that still fails is
-    /// `Err`, since koto can't tell whether this prefix holds the session
-    /// (koto#531).
-    fn located_probe(&self, id: &str) -> anyhow::Result<Option<sync_stamp::Probe>> {
+    /// `Err` (koto#531). Either failure leaves koto unable to tell whether
+    /// any prefix holds the session, so the caller refuses with
+    /// [`LookupFailed`] rather than read the name as absent (koto#638).
+    fn located_probe(&self, id: &str) -> anyhow::Result<LocatedProbe> {
         let failed = match self.probe(id) {
-            Ok(probe) => return Ok(Some(probe)),
+            Ok(probe) => return Ok(LocatedProbe::Answered(probe)),
             Err(e) => e,
         };
         if !failed
             .downcast_ref::<ListingFailed>()
             .is_some_and(|f| is_answered_failure(&f.source))
         {
-            return Ok(None);
+            return Ok(LocatedProbe::Unreachable(failed));
         }
         let prefix = self.session_prefix(id);
         let results = list_retrying(&self.bucket, prefix.clone(), None)
             .map_err(|source| anyhow::Error::new(ListingFailed { prefix, source }))?;
-        Ok(Some(self.record_probe(
+        Ok(LocatedProbe::Answered(self.record_probe(
             id,
             &results,
             std::time::SystemTime::now(),
@@ -7529,6 +7542,15 @@ fn list_capped(
             return Ok((pages, false));
         }
     }
+}
+
+/// What [`CloudBackend::located_probe`] learned of a session's state under
+/// this directory's prefix.
+enum LocatedProbe {
+    /// The bucket answered the listing.
+    Answered(sync_stamp::Probe),
+    /// The listing failed without the bucket answering it, with the error.
+    Unreachable(anyhow::Error),
 }
 
 /// What [`CloudBackend::start_lookup`] got back: the index read, and the

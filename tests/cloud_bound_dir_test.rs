@@ -302,6 +302,23 @@ fn assert_unlocated(out: &Out, command: &str, reason: &str) {
     assert!(message.contains(&format!("'{WF}'")), "{message}");
 }
 
+/// The `session_lookup_failed` refusal of `command`, exit 3, naming `name`:
+/// koto couldn't finish looking for the session in the bucket, so it
+/// says it can't tell rather than answer the name absent (koto#638).
+/// Returns the message.
+fn assert_lookup_failed(out: &Out, command: &str, name: &str) -> String {
+    assert_eq!(out.code, Some(3), "{command}: {}", out.describe());
+    let err = out.json();
+    assert_eq!(err["code"], "session_lookup_failed", "{}", out.describe());
+    assert_eq!(err["command"], command, "{}", out.describe());
+    assert_eq!(err["session"], name, "{}", out.describe());
+    let message = err["error"].as_str().unwrap().to_string();
+    assert!(message.contains(&format!("'{name}'")), "{message}");
+    assert!(message.contains("can't tell"), "{message}");
+    assert!(!message.contains("not found"), "{message}");
+    message
+}
+
 /// Replace the `session_id` in the header of the bucket's state object at
 /// `key`, as another session of the same name would carry.
 fn plant_other_session(s3: &FakeS3, key: &str) {
@@ -1357,10 +1374,10 @@ fn plant_prefixes(s3: &FakeS3, count: u32, holder: u32) -> Vec<String> {
 /// A listing that still fails once koto has asked again is "can't tell",
 /// never "not held" (koto#528). With the listing of the prefix that holds
 /// the session failing, or the bucket's top-level listing that names the
-/// prefixes, `context exists` on a name with no copy on this host refuses,
-/// exit 2, naming the listing and what the bucket answered, instead of
-/// answering absent. Once the bucket answers, the probe refuses with
-/// `no_local_copy` again.
+/// prefixes, `context exists` on a name with no copy on this host refuses
+/// with `session_lookup_failed`, exit 3, naming the listing and what the
+/// bucket answered, instead of answering absent. Once the bucket answers,
+/// the probe refuses with `no_local_copy` again.
 #[test]
 fn a_failed_listing_of_the_holding_prefix_is_not_read_as_absent() {
     let s3 = FakeS3::start(BUCKET);
@@ -1379,12 +1396,7 @@ fn a_failed_listing_of_the_holding_prefix_is_not_read_as_absent() {
              listing of {listing:?} fails: {}",
             out.describe()
         );
-        assert_eq!(out.code, Some(2), "{}", out.describe());
-        let err = out.json();
-        assert_eq!(err["command"], "context exists", "{}", out.describe());
-        let message = err["error"].as_str().unwrap();
-        assert!(message.contains(&format!("'{WF}'")), "{message}");
-        assert!(message.contains("can't tell"), "{message}");
+        let message = assert_lookup_failed(&out, "context exists", WF);
         assert!(message.contains("503"), "{message}");
         if !listing.is_empty() {
             assert!(message.contains(&listing), "{message}");
@@ -1449,9 +1461,9 @@ fn a_throttled_listing_that_clears_within_the_retries_still_answers() {
 /// The probe of this directory's own prefix, the listing made before the
 /// other prefixes are asked, is "can't tell" when the bucket answered it
 /// with a throttle or a server error every time it was asked (koto#531).
-/// `context exists` on a session held only under another prefix refuses,
-/// exit 2, naming the listing and what the bucket answered, instead of
-/// answering absent.
+/// `context exists` on a session held only under another prefix refuses
+/// with `session_lookup_failed`, exit 3, naming the listing and what the
+/// bucket answered, instead of answering absent.
 #[test]
 fn a_failed_own_prefix_probe_is_not_read_as_absent() {
     let s3 = FakeS3::start(BUCKET);
@@ -1469,12 +1481,7 @@ fn a_failed_own_prefix_probe_is_not_read_as_absent() {
          the own-prefix probe of {listing:?} fails: {}",
         out.describe()
     );
-    assert_eq!(out.code, Some(2), "{}", out.describe());
-    let err = out.json();
-    assert_eq!(err["command"], "context exists", "{}", out.describe());
-    let message = err["error"].as_str().unwrap();
-    assert!(message.contains(&format!("'{WF}'")), "{message}");
-    assert!(message.contains("can't tell"), "{message}");
+    let message = assert_lookup_failed(&out, "context exists", WF);
     assert!(message.contains(&listing), "{message}");
     assert!(message.contains("503"), "{message}");
 }
@@ -1510,11 +1517,15 @@ fn a_throttled_own_prefix_probe_that_clears_still_refuses() {
     assert_eq!(asked, 3, "two throttled requests, then one answered");
 }
 
-/// A host that can't reach the bucket at all still reads a never-used name
-/// as absent, as it did before koto#518 (koto#531): `context exists` exits 1
-/// and prints nothing.
+/// A host that can't reach the bucket at all can't tell a never-used name
+/// from one another directory's prefix holds (koto#638): `koto status`
+/// and `context exists` of a name with no copy on this host refuse with
+/// `session_lookup_failed`, exit 3, saying the bucket couldn't be reached,
+/// rather than answer it absent. Creating a new session there still works
+/// offline, as before, and reads of it answer from this host's copy.
 #[test]
-fn an_unreachable_bucket_still_reads_a_never_used_name_as_absent() {
+fn an_unreachable_bucket_refuses_a_name_with_no_local_copy_as_lookup_failed() {
+    const NEVER: &str = "never_used";
     let s3 = FakeS3::start(BUCKET);
     let mut h = Host::new(&s3, true);
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1522,9 +1533,22 @@ fn an_unreachable_bucket_still_reads_a_never_used_name_as_absent() {
     drop(closed);
     let dir = h.dir("offline");
 
-    let out = h.koto(&dir, &["context", "exists", "never_used", "k.md"]);
+    for (args, command) in [
+        (&["status", NEVER][..], "status"),
+        (&["context", "exists", NEVER, "k.md"][..], "context exists"),
+        (&["context", "get", NEVER, "k.md"][..], "context get"),
+    ] {
+        let out = h.koto(&dir, args);
+        let message = assert_lookup_failed(&out, command, NEVER);
+        assert!(message.contains("couldn't be reached"), "{message}");
+    }
+
+    h.init(&dir, &[]);
+    let status = h.ok(&dir, &["status", WF]).json();
+    assert_eq!(status["name"], WF, "{status}");
+    assert_eq!(status["current_state"], "wait", "{status}");
+    let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
     assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
-    assert!(out.stdout.trim().is_empty(), "{}", out.describe());
 }
 
 /// One stalled listing doesn't hold a new name's lookup (koto#634). The
@@ -1576,9 +1600,9 @@ fn a_stalled_prefix_listing_is_asked_again_within_a_bound() {
 /// (koto#645, koto#635). The lookup of a name no prefix holds lists every
 /// other workspace prefix; when one of those listings stalls every time it
 /// is asked, koto can't tell whether that prefix holds the name, so
-/// `koto status` fails, exit 2, naming the listing. It gives up within the
-/// 40-second lookup budget plus one ask, rather than waiting out three asks
-/// and rust-s3's own retry of each.
+/// `koto status` fails with `session_lookup_failed`, exit 3, naming the
+/// listing. It gives up within the 40-second lookup budget plus one ask,
+/// rather than waiting out three asks and rust-s3's own retry of each.
 #[test]
 fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
     const NEVER: &str = "never_used";
@@ -1603,12 +1627,7 @@ fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
          answers, past the 40s lookup budget and the {bound:?} bound: {}",
         out.describe()
     );
-    assert_eq!(out.code, Some(2), "koto status: {}", out.describe());
-    let err = out.json();
-    assert_eq!(err["command"], "status", "{}", out.describe());
-    let message = err["error"].as_str().unwrap();
-    assert!(message.contains(&format!("'{NEVER}'")), "{message}");
-    assert!(message.contains("can't tell"), "{message}");
+    let message = assert_lookup_failed(&out, "status", NEVER);
     assert!(message.contains(&listing), "{message}");
     let asked = s3
         .requests()
@@ -1622,7 +1641,7 @@ fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
 }
 
 /// Every listing that fails is named (koto#645). When three other prefixes'
-/// listings of a new name fail on every ask, `context exists` fails, exit 2,
+/// listings of a new name fail on every ask, `context exists` fails, exit 3,
 /// naming each of the three listings and what the bucket answered, not only
 /// the first one to fail.
 #[test]
@@ -1644,12 +1663,7 @@ fn every_failed_prefix_listing_is_named_in_the_cant_tell_error() {
         "context exists answers \"absent\" while three listings fail: {}",
         out.describe()
     );
-    assert_eq!(out.code, Some(2), "{}", out.describe());
-    let err = out.json();
-    assert_eq!(err["command"], "context exists", "{}", out.describe());
-    let message = err["error"].as_str().unwrap();
-    assert!(message.contains(&format!("'{NEVER}'")), "{message}");
-    assert!(message.contains("can't tell"), "{message}");
+    let message = assert_lookup_failed(&out, "context exists", NEVER);
     assert!(message.contains("503"), "{message}");
     assert!(message.contains("3 listings failed"), "{message}");
     for listing in &failing {
@@ -1671,4 +1685,99 @@ fn a_failed_listing_elsewhere_still_finds_the_holding_prefix() {
     s3.fail("LIST", &format!("{}/{WF}/", prefixes[1]), 503);
     let out = h.koto(&dir, &["context", "exists", WF, "k.md"]);
     assert_unlocated(&out, "context exists", "no_local_copy");
+}
+
+// -- a missing name's reply: absent, held elsewhere, or can't tell (koto#638)
+
+/// `koto status` of a session that only another workspace's prefix holds
+/// is never answered absent: on a bucket with no name index entry for it
+/// (an older writer's session, found by the sweep), it refuses with
+/// `session_unlocated` and `no_local_copy`.
+#[test]
+fn status_of_a_session_held_under_another_prefix_refuses_as_unlocated() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    plant_prefixes(&s3, 8, 3);
+    assert!(s3.keys_under("koto-names/").is_empty());
+    let dir = h.dir("probe");
+
+    let out = h.koto(&dir, &["status", WF]);
+    assert_unlocated(&out, "status", "no_local_copy");
+    assert!(!out.stdout.contains("not found"), "{}", out.describe());
+    assert_eq!(out.json()["locations"][0], prefix_of(&dir));
+}
+
+/// A listing of the lookup that still fails once asked again makes
+/// `koto status` of a missing name refuse with `session_lookup_failed`,
+/// exit 3: a reply that shares neither the exit status nor the code of the
+/// not-found one, exit 2 with no code, it gives once the bucket answers.
+#[test]
+fn a_failed_lookup_listing_refuses_status_apart_from_not_found() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let prefixes = plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{NEVER}/", prefixes[5]);
+
+    s3.fail("LIST", &listing, 503);
+    let failed = h.koto(&dir, &["status", NEVER]);
+    let message = assert_lookup_failed(&failed, "status", NEVER);
+    assert!(message.contains(&listing), "{message}");
+    assert!(message.contains("503"), "{message}");
+
+    s3.clear_faults();
+    let absent = h.koto(&dir, &["status", NEVER]);
+    assert_eq!(absent.code, Some(2), "koto status: {}", absent.describe());
+    let err = absent.json();
+    assert_eq!(
+        err["error"],
+        format!("workflow '{NEVER}' not found"),
+        "{}",
+        absent.describe()
+    );
+    assert!(err.get("code").is_none(), "{}", absent.describe());
+    assert_ne!(failed.code, absent.code);
+    assert_ne!(failed.json()["code"], err["code"]);
+}
+
+/// With the local backend chosen, a missing name is not-found, exit 2 with
+/// no code, as it always was, and the lookup never runs: no request reaches
+/// the bucket, even with every cloud setting pointing at it.
+#[test]
+fn the_local_backend_reads_a_missing_name_as_not_found_with_no_request() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, false);
+    plant_prefixes(&s3, 8, 3);
+    let dir = h.dir("local");
+    let run = |args: &[&str]| {
+        let mut cmd = h.cmd(&dir, args);
+        cmd.env("KOTO_SESSION_CLOUD_ENDPOINT", s3.endpoint())
+            .env("KOTO_SESSION_CLOUD_BUCKET", BUCKET)
+            .env("KOTO_SESSION_CLOUD_REGION", "us-east-1")
+            .env("KOTO_SESSION_CLOUD_PATH_STYLE", "true")
+            .env("KOTO_SESSION_CLOUD_ACCESS_KEY", "test-access-key")
+            .env("KOTO_SESSION_CLOUD_SECRET_KEY", "test-secret-key")
+            .env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "0");
+        h.run(cmd)
+    };
+
+    s3.clear_requests();
+    for name in [NEVER, WF] {
+        let out = run(&["status", name]);
+        assert_eq!(out.code, Some(2), "koto status: {}", out.describe());
+        let err = out.json();
+        assert_eq!(
+            err["error"],
+            format!("workflow '{name}' not found"),
+            "{}",
+            out.describe()
+        );
+        assert_eq!(err["command"], "status", "{}", out.describe());
+        assert!(err.get("code").is_none(), "{}", out.describe());
+        let out = run(&["context", "exists", name, "k.md"]);
+        assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
+    }
+    assert!(s3.requests().is_empty(), "{:?}", s3.requests());
 }
