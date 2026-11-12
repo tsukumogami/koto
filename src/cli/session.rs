@@ -824,7 +824,9 @@ pub(crate) fn record_continues_at_init(backend: &Backend, name: &str, target: &C
 /// Every check runs before anything is written: the session name, that the
 /// session exists and wasn't imported elsewhere, and
 /// [`resolve_continues`]'s checks of the predecessor. A refusal exits 2
-/// with `{"error", "command"}`; a write that fails exits 3. Prints
+/// with `{"error", "command"}`; a write that fails exits 3, and so does a
+/// bucket lookup of the session that couldn't finish
+/// (`session_lookup_failed`). Prints
 /// `{"name", "kind": "continues", "peer", "written"}`, `written: false`
 /// when the session already held this relation and nothing changed.
 pub fn handle_link_continues(
@@ -857,6 +859,7 @@ pub fn handle_link_continues(
     // workspace as the successor's: a session whose own copy is under
     // another prefix refuses.
     if let Err(e) = backend.check_located(session) {
+        super::refuse_if_lookup_failed(&e, "session link");
         refuse(e.to_string(), super::EXIT_CALLER_ERROR);
     }
     if !backend

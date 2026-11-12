@@ -1348,7 +1348,9 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 
 /// Refuse, exit 2, before `command` reads or writes `session`, when under
 /// the cloud backend koto can't tell which bucket copy is the session's own
-/// (`session_unlocated`), or the check of its own copy fails. A session that
+/// (`session_unlocated`), or the check of its own copy fails; exit 3 with
+/// `session_lookup_failed` when a session with no copy on this host couldn't
+/// be looked for in the bucket ([`refuse_if_lookup_failed`]). A session that
 /// records the prefix it was created under is read and written there from
 /// any directory, so only an unlocated one refuses. The local backend never
 /// refuses.
@@ -1386,8 +1388,31 @@ fn refuse_if_migrated(backend: &Backend, session: &str, command: &str) {
     }
 }
 
-/// Print [`refuse_if_unlocated`]'s refusal of `e` for `command`, exit 2.
+/// Refuse `command`, exit 3, when `e` says koto couldn't finish looking for
+/// a session with no copy on this host ([`crate::session::LookupFailed`]):
+/// the bucket couldn't be reached, or a listing still failed once asked
+/// again. The refusal carries `code: "session_lookup_failed"` and `session`
+/// beside `error` and `command`, so a caller tells it from a name no
+/// session has, which exits 2. Any other error returns.
+pub(super) fn refuse_if_lookup_failed(e: &anyhow::Error, command: &str) {
+    if let Some(failed) = e.downcast_ref::<crate::session::LookupFailed>() {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": failed.to_string(),
+                "command": command,
+                "code": crate::session::LookupFailed::CODE,
+                "session": failed.session,
+            }),
+            EXIT_INFRASTRUCTURE,
+        );
+    }
+}
+
+/// Print [`refuse_if_unlocated`]'s refusal of `e` for `command`: exit 3
+/// with `session_lookup_failed` when the lookup couldn't finish
+/// ([`refuse_if_lookup_failed`]), exit 2 otherwise.
 fn refuse_unlocated(e: &anyhow::Error, command: &str) -> ! {
+    refuse_if_lookup_failed(e, command);
     let mut error = serde_json::json!({
         "error": e.to_string(),
         "command": command
@@ -2603,6 +2628,7 @@ pub fn run(app: App) -> Result<()> {
                 }
                 SessionCommand::Rebind { name, to } => {
                     if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
+                        refuse_if_lookup_failed(&e, "session rebind");
                         exit_with_error_code(
                             serde_json::json!({
                                 "error": e.to_string(),

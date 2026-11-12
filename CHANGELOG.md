@@ -10,6 +10,26 @@ to `0.9.x`).
 
 ### Compatibility
 
+- **A missing name's lookup that can't finish exits 3 with
+  `session_lookup_failed`
+  ([koto#638](https://github.com/tsukumogami/koto/issues/638),
+  [koto#597](https://github.com/tsukumogami/koto/issues/597)).** Under the
+  cloud backend, a command naming a session with no copy on this host asks
+  the bucket whether any workspace prefix holds it. When that lookup
+  couldn't finish (a listing that still failed after its retries) the
+  command exited 2 with no `code`, the status a plain not-found gets, and
+  when the bucket couldn't be reached at all the name read as absent. Both
+  now exit 3 with `code: "session_lookup_failed"` and `session`, so a caller
+  tells "no session has this name" from "koto couldn't find out" without
+  reading the message. The lookup also has a 6-second deadline from its
+  first request: one that hasn't answered by then gets the same reply,
+  never not-found, and on an undeclared bucket of a few thousand prefixes a
+  never-used name can get it until the bucket is declared with
+  `koto session index audit`. A missing name the bucket answered for is
+  still not-found, exit 2 with no code, and the local backend is unchanged.
+  `koto init` doesn't make the lookup, so a session can still be created
+  offline, and a session koto removed itself on this host still answers
+  `koto status` from its finished record when the bucket can't be reached.
 - **Cloud keys need PUT and LIST under `koto-names/` and GET of
   `koto-names/_complete`
   ([koto#607](https://github.com/tsukumogami/koto/issues/607)).** Before a

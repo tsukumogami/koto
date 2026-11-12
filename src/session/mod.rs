@@ -372,6 +372,33 @@ impl fmt::Display for Unlocated {
 
 impl std::error::Error for Unlocated {}
 
+/// A command refused because koto couldn't finish looking for a session
+/// with no copy on this host: the bucket couldn't be reached, or a listing
+/// the lookup needed still failed once asked again, so koto can't tell
+/// whether any workspace prefix holds the session. Its code,
+/// [`LookupFailed::CODE`], is distinct from the reply for a name no
+/// session has: the name may well be in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupFailed {
+    /// The session that was named.
+    pub session: String,
+    /// What failed and what to do, as the command prints it.
+    pub message: String,
+}
+
+impl LookupFailed {
+    /// The `code` field of the refusal.
+    pub const CODE: &'static str = "session_lookup_failed";
+}
+
+impl fmt::Display for LookupFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LookupFailed {}
+
 /// A bounded prefix read of one context key's local content, from
 /// [`Backend::read_context_prefix`].
 #[derive(Debug, Clone)]

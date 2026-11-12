@@ -23,7 +23,9 @@ decision: |
   that only an operator command writes after an audited backfill and a 7-day
   probation, and that a re-run audit revokes on seeing an older writer's
   session. On an undeclared bucket a miss runs today's sweep unchanged. The
-  remaining listings keep today's retry policy.
+  remaining listings keep today's retry policy. Amended for koto#597: the
+  whole lookup has a 6-second deadline, and a lookup that hasn't answered
+  by then replies "can't tell" (session_lookup_failed), never not-found.
 rationale: |
   Older releases write only under <prefix>/<name>/, which no listing can
   query across prefixes, so no answer is both exact and bounded while they
@@ -468,7 +470,8 @@ a lookup to about a minute. While every listing answers, no such limit
 applies, which is why this doesn't reopen the whole-sweep deadline rejected
 below: a slow bucket that answers every listing gets the same reply as
 before, and the budget only shortens a call whose answer is already "can't
-tell" or a confirmed hit.
+tell" or a confirmed hit. The amendment at the end of this decision
+replaces that budget with a deadline on the whole lookup.
 
 Key assumptions:
 
@@ -496,8 +499,9 @@ failure-gated budget described above bounds the rest. The
 top-level listing keeps its policy too. It's the only option that keeps
 every reply in every bucket state; the fast path changes how many listings
 are asked, not how any one of them is asked, which is the lever the drivers
-name. The trade accepted is that an undeclared bucket answering slowly can
-still take minutes to say not-found, as it does today.
+name. The trade accepted was that an undeclared bucket answering slowly
+could still take minutes to say not-found. The amendment below replaces
+that trade with a bounded deadline.
 
 #### Alternatives Considered
 
@@ -506,7 +510,61 @@ unanswered at the deadline read as "can't tell". Rejected because a bucket
 that answers every listing, only slowly, would go from answered to "can't
 tell": the same bucket state with a different reply. The budget koto#645
 added is not this: it applies only after a listing has failed for good, when
-the reply can no longer be "not held".
+the reply can no longer be "not held". Since adopted in bounded form; see
+the amendment below.
+
+#### Amendment (koto#597): a bounded whole-lookup deadline
+
+The whole-lookup deadline rejected above is now adopted, as one bounded
+deadline. koto#597 showed that a bucket of a few thousand workspace
+prefixes can't answer a missing name exactly inside a bound its callers
+need: an undeclared bucket sweeps every prefix, about one round trip per 64,
+and a slow or degraded one stretches that to minutes, while callers probe
+names under timeouts of seconds. An exact answer that arrives after the
+caller gave up helps no one.
+
+The same change alters three more replies, each resting on koto#597's
+requirement that a check that can't finish says so, in a reply distinct
+from not-found:
+
+- A failed lookup now exits 3 instead of 2. It was an infrastructure
+  failure reported with the caller-error status a plain not-found also
+  gets.
+- That reply now carries `code: "session_lookup_failed"` and `session`,
+  where it had no code, so a caller can branch on it without reading the
+  message. The exit status and the code are koto#638's report.
+- An unreachable bucket is now "can't tell" instead of absent. The
+  own-prefix probe failing without an answer used to read a never-used
+  name as absent, which is the same reply as a name no session has. It now
+  refuses like any other lookup that can't finish, also koto#638. The one
+  exception is a name this host holds a finished record for, a session koto
+  removed itself here: it goes on to answer from the record, as before.
+
+`check_located` starts one `LookupRun` before its first request for a name
+with no local copy, and `LOOKUP_DEADLINE` (6 seconds) counts from there. It
+covers the own-prefix probe, now made as one of the lookup's bounded reads,
+the index, declaration and top-level reads, and every confirming or sweeping
+listing. Each ask waits at most the time left, clamped from
+`LOOKUP_REQUEST_TIMEOUT`, each backoff sleep is cut to it, no ask starts once
+it is spent, and a prefix not asked by then is named as not asked. A lookup
+that hasn't answered by the deadline replies "can't tell", now
+`session_lookup_failed` with exit 3 (koto#638), never not-found. A hit
+confirmed before it still wins, so a session another prefix holds still
+refuses with `no_local_copy` whenever the bucket answers in time. The
+failure-gated `LOOKUP_BUDGET` of koto#645 is removed: counted from a later
+start and 40 seconds long, it could never end before the deadline. The
+per-listing policy is otherwise unchanged: `LIST_ATTEMPTS`, `LIST_BACKOFF`,
+`is_transient`, `LOOKUP_REQUEST_TIMEOUT` and `HELD_ELSEWHERE_FANOUT` stay as
+they were, within the time the deadline leaves.
+
+The reply change is the one the rejection named. A bucket that answers
+every listing, only too slowly to finish inside the deadline, now reads
+"can't tell" where it read not-found or `no_local_copy` before. That
+reply is honest about what koto knows, carries a code a caller can branch
+on, and is retryable. A declared bucket answers a missing name in a few
+round trips and isn't affected; on an undeclared bucket too large to sweep
+in time, declaring it is what turns the reply back into an exact one.
+Nothing here changes which bucket states trust the index.
 
 **A shared retry budget across the sweep**: each listing gets one ask free
 and repeat asks come from a pool. Rejected because a broad throttle that
@@ -622,7 +680,9 @@ can see a state object an older release wrote; the same audit, re-run,
 revokes it when it finds one, and the stray reply that an older writer can
 cause on a declared bucket lasts only until then. The listings that remain
 keep today's retry policy, so no reply moves because a listing was asked
-fewer times.
+fewer times. Since koto#597 the whole lookup also has a 6-second deadline:
+a lookup that can't finish by then replies "can't tell", never not-found
+(Decision 3's amendment).
 
 ### How each reply is kept
 
@@ -644,9 +704,20 @@ For a name with no copy on this host, and in every bucket state:
   the own-prefix probe (unchanged), a confirming listing (the same listing
   the sweep makes), the top-level listing or a sweep listing on an
   undeclared bucket (unchanged), or the index listing on a declared bucket.
-- **Not-found when the bucket is unreachable.** The own-prefix probe fails
-  without an answer and the command reads the name as absent, before any of
-  the new code runs. Unchanged.
+  Since koto#597, also a lookup the 6-second deadline cuts short (Decision
+  3's amendment); since koto#638 the reply carries `session_lookup_failed`
+  and exits 3.
+- **"Can't tell" when the bucket is unreachable.** The own-prefix probe
+  fails without an answer. This used to read the name as absent; since
+  koto#597 and koto#638 it is "can't tell" (`session_lookup_failed`, exit
+  3), since koto can't tell a never-used name from one another prefix
+  holds. A name this host holds a finished record for still answers from
+  that record.
+
+Since koto#597 and koto#638, every "can't tell" above exits 3 with `code`
+`session_lookup_failed`, where before it exited 2 with no code. Not-found
+keeps exit 2 with no code, and `session_unlocated` keeps exit 2 with its
+own code.
 
 ### Why the combination works
 
