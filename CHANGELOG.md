@@ -28,7 +28,8 @@ to `0.9.x`).
   `koto session index audit`. A missing name the bucket answered for is
   still not-found, exit 2 with no code, and the local backend is unchanged.
   `koto init` doesn't make the lookup, so a session can still be created
-  offline.
+  offline, and a session koto removed itself on this host still answers
+  `koto status` from its finished record when the bucket can't be reached.
 - **Cloud keys need PUT and LIST under `koto-names/` and GET of
   `koto-names/_complete`
   ([koto#607](https://github.com/tsukumogami/koto/issues/607)).** Before a

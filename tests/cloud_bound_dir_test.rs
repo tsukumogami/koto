@@ -1521,6 +1521,86 @@ fn a_throttled_own_prefix_probe_that_clears_still_refuses() {
     assert_eq!(asked, 3, "two throttled requests, then one answered");
 }
 
+/// Plant `name`'s finished record in `h`'s local store, as koto leaves one
+/// when it removes a lone session at its terminal tick.
+fn plant_finished_record(h: &Host, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = h.home.join(".koto/sessions/.finished");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let record = serde_json::json!({
+        "v": 1,
+        "name": name,
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "execution_dir": null,
+        "state": "done",
+        "status": "terminal",
+        "failure": false,
+        "result": {"status": "ok"},
+        "finished_at": "2026-11-01T10:00:00Z",
+        "removed_by": "terminal"
+    });
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A session koto removed itself on this host leaves only its finished
+/// record, and `koto status` answers from it. With the bucket unreachable
+/// it still does, as before koto#638, rather than refuse with
+/// `session_lookup_failed`; with the bucket reachable but its own-prefix
+/// listing failing on every ask, it still refuses, as a failed listing
+/// always has.
+#[test]
+fn a_finished_record_is_served_when_the_bucket_is_unreachable() {
+    const DONE: &str = "finished_here";
+    let s3 = FakeS3::start(BUCKET);
+    let mut h = Host::new(&s3, true);
+    let dir = h.dir("ws");
+    plant_finished_record(&h, DONE);
+
+    let answered = |h: &Host| {
+        let out = h.ok(&dir, &["status", DONE]).json();
+        assert_eq!(out["name"], DONE, "{out}");
+        assert_eq!(out["removed"], true, "{out}");
+        assert_eq!(out["current_state"], "done", "{out}");
+    };
+    answered(&h);
+
+    s3.fail("LIST", &format!("{}/{DONE}/", prefix_of(&dir)), 503);
+    assert_lookup_failed(&h.koto(&dir, &["status", DONE]), "status", DONE);
+    s3.clear_faults();
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    h.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    answered(&h);
+}
+
+/// An own-prefix probe the bucket accepts but never answers is cut at the
+/// lookup's deadline, and the refusal says the bucket gave no answer in
+/// time, not that it couldn't be reached.
+#[test]
+fn a_stalled_own_prefix_probe_is_reported_as_no_answer() {
+    const NEVER: &str = "never_used";
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let dir = h.dir("probe");
+    let listing = format!("{}/{NEVER}/", prefix_of(&dir));
+
+    s3.stall("LIST", &listing, std::time::Duration::from_secs(300));
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["status", NEVER]);
+    let took = started.elapsed();
+    assert!(took < LOOKUP_BOUND, "took {took:?}: {}", out.describe());
+    let message = assert_lookup_failed(&out, "status", NEVER);
+    assert!(
+        message.contains("no answer within the lookup's deadline"),
+        "{message}"
+    );
+    assert!(!message.contains("couldn't be reached"), "{message}");
+}
+
 /// A host that can't reach the bucket at all can't tell a never-used name
 /// from one another directory's prefix holds (koto#638): `koto status`
 /// and `context exists` of a name with no copy on this host refuse with

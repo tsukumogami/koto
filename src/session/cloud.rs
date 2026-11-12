@@ -847,7 +847,10 @@ impl CloudBackend {
     ///   can't be reached ([`CloudBackend::located_probe`]), or that listing
     ///   or the other prefixes' can't all be answered, koto can't tell
     ///   whether one holds it, and the command fails with [`LookupFailed`]
-    ///   rather than answer it absent (koto#528, koto#531, koto#638);
+    ///   rather than answer it absent (koto#528, koto#531, koto#638). The
+    ///   one exception is a name this host holds a finished record for
+    ///   whose own-prefix probe got no answer: it goes on, as before, and
+    ///   the command answers from the record;
     /// - a home that isn't this directory's own is pulled now, strictly
     ///   ([`CloudBackend::sync_pull_state`]): a bucket that can't answer is
     ///   an error, and a copy there that is missing or another session's is
@@ -881,13 +884,25 @@ impl CloudBackend {
             let probe = match self.located_probe(id, run, bucket) {
                 Ok(LocatedProbe::Answered(probe)) => probe,
                 Ok(LocatedProbe::Unreachable(e)) => {
+                    // A session koto removed itself on this host left its
+                    // finished record, which the command answers from, as
+                    // it did before a bucket it couldn't reach was a
+                    // refusal (koto#638).
+                    if self.has_finished_record(id) {
+                        return Ok(());
+                    }
+                    let cause = if is_timed_out(&e) {
+                        "the bucket gave no answer within the lookup's deadline"
+                    } else {
+                        "the bucket couldn't be reached"
+                    };
                     return failed(format!(
                         "session '{id}' has no copy on this host, and koto can't tell whether \
                          the bucket holds it under this directory's prefix {} or another \
-                         directory's, because the bucket couldn't be reached: {e:#}; nothing \
-                         was read, so run the command again once the bucket answers",
+                         directory's, because {cause}: {e:#}; nothing was read, so run the \
+                         command again once the bucket answers",
                         home.prefix
-                    ))
+                    ));
                 }
                 Err(e) => {
                     return failed(format!(
@@ -962,6 +977,16 @@ impl CloudBackend {
             return Err(failed);
         }
         Ok(LocatedProbe::Unreachable(failed))
+    }
+
+    /// Whether this host's local store holds a readable finished record for
+    /// `id` ([`crate::session::finished`]): a session koto removed itself
+    /// here, whose status is answered from the record.
+    fn has_finished_record(&self, id: &str) -> bool {
+        matches!(
+            crate::session::finished::read(self.local.base_dir(), id),
+            Ok(Some(_))
+        )
     }
 
     /// Whether a workspace prefix other than this directory's holds `id`'s
@@ -7382,6 +7407,15 @@ impl Unanswered<S3Error> {
 /// `TimedOut`, which [`is_transient`] accepts.
 fn timed_out(text: String) -> S3Error {
     S3Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, text))
+}
+
+/// Whether `e` is a failed listing ([`ListingFailed`]) that got no answer
+/// in time: a [`timed_out`] ask, or a transport timeout. The bucket may be
+/// reachable, only slow, so a message says so rather than "unreachable".
+fn is_timed_out(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ListingFailed>().is_some_and(
+        |f| matches!(&f.source, S3Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut),
+    )
 }
 
 /// `d` cut to whole milliseconds, so a wait clamped to the deadline reads

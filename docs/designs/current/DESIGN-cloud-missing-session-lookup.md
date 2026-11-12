@@ -515,13 +515,30 @@ the amendment below.
 
 #### Amendment (koto#597): a bounded whole-lookup deadline
 
-The whole-lookup deadline rejected above is now adopted, as far as one
-bounded deadline and no further. koto#597 showed that a bucket of a few
-thousand workspace prefixes can't answer a missing name exactly inside a
-bound its callers need: an undeclared bucket sweeps every prefix, about one
-round trip per 64, and a slow or degraded one stretches that to minutes,
-while callers probe names under timeouts of seconds. An exact answer that
-arrives after the caller gave up helps no one.
+The whole-lookup deadline rejected above is now adopted, as one bounded
+deadline. koto#597 showed that a bucket of a few thousand workspace
+prefixes can't answer a missing name exactly inside a bound its callers
+need: an undeclared bucket sweeps every prefix, about one round trip per 64,
+and a slow or degraded one stretches that to minutes, while callers probe
+names under timeouts of seconds. An exact answer that arrives after the
+caller gave up helps no one.
+
+The same change alters three more replies, each resting on koto#597's
+requirement that a check that can't finish says so, in a reply distinct
+from not-found:
+
+- A failed lookup now exits 3 instead of 2. It was an infrastructure
+  failure reported with the caller-error status a plain not-found also
+  gets.
+- That reply now carries `code: "session_lookup_failed"` and `session`,
+  where it had no code, so a caller can branch on it without reading the
+  message. The exit status and the code are koto#638's report.
+- An unreachable bucket is now "can't tell" instead of absent. The
+  own-prefix probe failing without an answer used to read a never-used
+  name as absent, which is the same reply as a name no session has. It now
+  refuses like any other lookup that can't finish, also koto#638. The one
+  exception is a name this host holds a finished record for, a session koto
+  removed itself here: it goes on to answer from the record, as before.
 
 `check_located` starts one `LookupRun` before its first request for a name
 with no local copy, and `LOOKUP_DEADLINE` (6 seconds) counts from there. It
@@ -692,8 +709,15 @@ For a name with no copy on this host, and in every bucket state:
   and exits 3.
 - **"Can't tell" when the bucket is unreachable.** The own-prefix probe
   fails without an answer. This used to read the name as absent; since
-  koto#638 it is "can't tell" too, since koto can't tell a never-used name
-  from one another prefix holds.
+  koto#597 and koto#638 it is "can't tell" (`session_lookup_failed`, exit
+  3), since koto can't tell a never-used name from one another prefix
+  holds. A name this host holds a finished record for still answers from
+  that record.
+
+Since koto#597 and koto#638, every "can't tell" above exits 3 with `code`
+`session_lookup_failed`, where before it exited 2 with no code. Not-found
+keeps exit 2 with no code, and `session_unlocated` keeps exit 2 with its
+own code.
 
 ### Why the combination works
 
