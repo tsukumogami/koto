@@ -38,8 +38,9 @@ use crate::session::sync_stamp::{
     self, clear_summary_owed, mark_summary_owed, summary_owed, Stamp,
 };
 use crate::session::{
-    state_file_name, Fallback, Home, HomeSource, LookupFailed, SessionBackend, SessionError,
-    SessionInfo, SessionLock, SessionMigrated, Unlocated, UnlocatedReason,
+    state_file_name, Fallback, Home, HomeSource, LookupFailed, LookupFailedReason, LookupIndex,
+    SessionBackend, SessionError, SessionInfo, SessionLock, SessionMigrated, Unlocated,
+    UnlocatedReason,
 };
 
 /// File name of the marker `koto session import` leaves beside a source
@@ -242,6 +243,18 @@ const SLOW_SWEEP_HINT_AFTER: std::time::Duration = std::time::Duration::from_sec
 const SLOW_SWEEP_HINT: &str = "hint: cloud sync: looking this session up listed every \
      workspace prefix in the bucket; `koto session index audit` indexes the bucket's older \
      sessions so lookups can be answered from the name index instead";
+
+/// What a failed lookup on an undeclared bucket adds to its message
+/// (koto#675). There a name no session has needs the bucket's top-level
+/// listing and a listing of every workspace prefix, which on a bucket of
+/// many prefixes can't finish inside [`LOOKUP_DEADLINE`] however often it
+/// is asked; a declared index answers the same lookup in a few requests.
+/// Fixed text: it names nothing read from the bucket.
+const UNDECLARED_LOOKUP_REMEDY: &str = ". This bucket's name index isn't declared \
+     complete, so looking up a name no session has lists every workspace prefix in the \
+     bucket; once an operator runs `koto session index audit` and then \
+     `koto session index declare`, the lookup reads the index instead and needs a few \
+     requests";
 
 /// The request timeout of every request koto makes to the bucket, except a
 /// lookup's, which uses [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
@@ -862,10 +875,12 @@ impl CloudBackend {
             return Ok(());
         }
         if !self.local.exists(id) {
-            let failed = |message: String| {
+            let failed = |message: String, reason: LookupFailedReason, index: LookupIndex| {
                 Err(anyhow::Error::new(LookupFailed {
                     session: id.to_string(),
                     message,
+                    reason,
+                    index,
                 }))
             };
             // The lookup's deadline counts from here, the first request it
@@ -874,10 +889,14 @@ impl CloudBackend {
             let bucket = match lookup_bucket(&self.bucket) {
                 Ok(bucket) => bucket,
                 Err(e) => {
-                    return failed(format!(
-                        "session '{id}' has no copy on this host, and koto can't tell whether \
-                         the bucket holds it: {e:#}; nothing was read"
-                    ))
+                    return failed(
+                        format!(
+                            "session '{id}' has no copy on this host, and koto can't tell \
+                             whether the bucket holds it: {e:#}; nothing was read"
+                        ),
+                        LookupFailedReason::Unreachable,
+                        LookupIndex::Unknown,
+                    )
                 }
             };
             let bucket = bucket.as_ref();
@@ -891,32 +910,48 @@ impl CloudBackend {
                     if self.has_finished_record(id) {
                         return Ok(());
                     }
-                    let cause = if is_timed_out(&e) {
-                        "the bucket gave no answer within the lookup's deadline"
+                    let (cause, reason) = if is_timed_out(&e) {
+                        (
+                            "the bucket gave no answer within the lookup's deadline",
+                            LookupFailedReason::TimedOut,
+                        )
                     } else {
-                        "the bucket couldn't be reached"
+                        (
+                            "the bucket couldn't be reached",
+                            LookupFailedReason::Unreachable,
+                        )
                     };
-                    return failed(format!(
-                        "session '{id}' has no copy on this host, and koto can't tell whether \
-                         the bucket holds it under this directory's prefix {} or another \
-                         directory's, because {cause}: {e:#}; nothing was read, so run the \
-                         command again once the bucket answers",
-                        home.prefix
-                    ));
+                    return failed(
+                        format!(
+                            "session '{id}' has no copy on this host, and koto can't tell \
+                             whether the bucket holds it under this directory's prefix {} or \
+                             another directory's, because {cause}: {e:#}; nothing was read, so \
+                             run the command again once the bucket answers",
+                            home.prefix
+                        ),
+                        reason,
+                        LookupIndex::Unknown,
+                    );
                 }
                 Err(e) => {
-                    return failed(format!(
-                        "session '{id}' has no copy on this host, and koto can't tell whether \
-                         the bucket holds it under this directory's prefix {}: {e:#}; nothing \
-                         was read, so run the command again once the bucket answers",
-                        home.prefix
-                    ))
+                    return failed(
+                        format!(
+                            "session '{id}' has no copy on this host, and koto can't tell \
+                             whether the bucket holds it under this directory's prefix {}: \
+                             {e:#}; nothing was read, so run the command again once the \
+                             bucket answers",
+                            home.prefix
+                        ),
+                        LookupFailedReason::ListingFailed,
+                        LookupIndex::Unknown,
+                    )
                 }
             };
             if probe.state_etag.is_some() {
                 return Ok(());
             }
-            return match self.held_elsewhere(id, run, bucket) {
+            let mut index = LookupIndex::Unknown;
+            return match self.held_elsewhere(id, run, bucket, &mut index) {
                 Ok(true) => Err(anyhow::Error::new(Unlocated {
                     session: id.to_string(),
                     reason: UnlocatedReason::NoLocalCopy {
@@ -924,13 +959,34 @@ impl CloudBackend {
                     },
                 })),
                 Ok(false) => Ok(()),
-                Err(e) => failed(format!(
-                    "session '{id}' has no copy on this host and the bucket holds none under \
-                     this directory's prefix {}, and koto can't tell whether another \
-                     directory's prefix holds it: {e:#}; nothing was read, so run the command \
-                     again once the bucket answers",
-                    home.prefix
-                )),
+                Err(e) => {
+                    // The own-prefix probe answered, so the bucket is
+                    // reachable. A lookup that spent its deadline was cut
+                    // short by a slow bucket; one with time left got a
+                    // listing the bucket still failed once asked again.
+                    let reason = if run.deadline_left().is_zero() {
+                        LookupFailedReason::TimedOut
+                    } else {
+                        LookupFailedReason::ListingFailed
+                    };
+                    let next = match reason {
+                        LookupFailedReason::TimedOut => {
+                            "the bucket didn't answer within the lookup's deadline, so asking \
+                             again can succeed"
+                        }
+                        _ => "run the command again once the bucket answers",
+                    };
+                    let mut message = format!(
+                        "session '{id}' has no copy on this host and the bucket holds none \
+                         under this directory's prefix {}, and koto can't tell whether another \
+                         directory's prefix holds it: {e:#}; nothing was read, and {next}",
+                        home.prefix
+                    );
+                    if index == LookupIndex::Undeclared {
+                        message.push_str(UNDECLARED_LOOKUP_REMEDY);
+                    }
+                    failed(message, reason, index)
+                }
             };
         }
         if !home.own_workspace {
@@ -1046,7 +1102,18 @@ impl CloudBackend {
     /// ([`PrefixesUnanswered`]), so a sweep that can't finish in time is
     /// `Err`, never `Ok(false)` (koto#597). `bucket` is the lookup's own
     /// ([`lookup_bucket`]).
-    fn held_elsewhere(&self, id: &str, run: LookupRun, bucket: &Bucket) -> anyhow::Result<bool> {
+    ///
+    /// `read_as` is set to how the lookup read the name index once it has
+    /// decided, so a caller reporting an `Err` can say whether the bucket
+    /// read undeclared (koto#675); it stays as given when the lookup never
+    /// got that far.
+    fn held_elsewhere(
+        &self,
+        id: &str,
+        run: LookupRun,
+        bucket: &Bucket,
+        read_as: &mut LookupIndex,
+    ) -> anyhow::Result<bool> {
         use crate::session::name_index::Memo;
 
         let endpoint = self.bucket.region().endpoint();
@@ -1092,6 +1159,11 @@ impl CloudBackend {
             declaration.as_ref(),
             remembered_within(name_index::MAX_DECLARATION_CARRY),
         );
+        *read_as = if declared {
+            LookupIndex::Declared
+        } else {
+            LookupIndex::Undeclared
+        };
         let top_level = || match top_level {
             Some(listed) => listed,
             None => top_level_prefixes(run, bucket, &self.prefix),
