@@ -100,6 +100,24 @@ to `0.9.x`).
 
 ### Added
 
+- **`session_lookup_failed` says why, and what lets the lookup finish
+  ([koto#675](https://github.com/tsukumogami/koto/issues/675)).** The
+  refusal now carries `reason` and `index` beside `code` and `session`.
+  `reason` is `timed_out` when a read got no answer before the lookup's
+  6-second deadline or the deadline passed with prefixes left unasked, so
+  the bucket may only be slow and asking again can succeed; `unreachable`
+  when the bucket couldn't be reached; and `listing_failed` when the bucket
+  answered a listing with a failure that persisted after koto asked again.
+  `index` is `declared`, `undeclared` or `unknown`, as the lookup read the
+  bucket's name index. On an undeclared bucket a name no session has needs
+  the top-level listing and a listing of every workspace prefix, which on a
+  bucket of many prefixes can't fit inside the deadline however often it is
+  asked, so the message there names `koto session index audit` and
+  `koto session index declare`, after which the lookup reads the index in a
+  few requests. Exit 3 and the existing fields are unchanged. The deadline
+  is unchanged too: giving the top-level listing more time inside it would
+  leave none for the sweep that needs the whole listing.
+
 - **Rules a directive carries, recorded as telemetry.** A state's new
   `directive_rules` list names the rules its directive hands the agent
   (`rule_id`, `check`, `extent` and `when_set`). Each time `koto next`

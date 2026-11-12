@@ -1393,7 +1393,12 @@ fn refuse_if_migrated(backend: &Backend, session: &str, command: &str) {
 /// the bucket couldn't be reached, or a listing still failed once asked
 /// again. The refusal carries `code: "session_lookup_failed"` and `session`
 /// beside `error` and `command`, so a caller tells it from a name no
-/// session has, which exits 2. Any other error returns.
+/// session has, which exits 2. It also carries `reason` (`timed_out`,
+/// `unreachable` or `listing_failed`) and `index` (`declared`,
+/// `undeclared` or `unknown`), so a caller can tell a slow bucket it may
+/// ask again from one that refused, and see when declaring the bucket's
+/// name index would let the lookup finish (koto#675). Any other error
+/// returns.
 pub(super) fn refuse_if_lookup_failed(e: &anyhow::Error, command: &str) {
     if let Some(failed) = e.downcast_ref::<crate::session::LookupFailed>() {
         exit_with_error_code(
@@ -1402,6 +1407,8 @@ pub(super) fn refuse_if_lookup_failed(e: &anyhow::Error, command: &str) {
                 "command": command,
                 "code": crate::session::LookupFailed::CODE,
                 "session": failed.session,
+                "reason": failed.reason.as_str(),
+                "index": failed.index.as_str(),
             }),
             EXIT_INFRASTRUCTURE,
         );

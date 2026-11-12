@@ -384,11 +384,69 @@ pub struct LookupFailed {
     pub session: String,
     /// What failed and what to do, as the command prints it.
     pub message: String,
+    /// Why the lookup couldn't finish: the refusal's `reason` field.
+    pub reason: LookupFailedReason,
+    /// How the lookup read the bucket's name index: the refusal's `index`
+    /// field.
+    pub index: LookupIndex,
 }
 
 impl LookupFailed {
     /// The `code` field of the refusal.
     pub const CODE: &'static str = "session_lookup_failed";
+}
+
+/// Why a lookup couldn't finish ([`LookupFailed`]), so a caller can tell a
+/// bucket that was only slow from one that refused (koto#675).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupFailedReason {
+    /// A read got no answer before the lookup's deadline, or the deadline
+    /// was spent before every prefix was asked. The bucket may only be
+    /// slow, so asking again can succeed.
+    TimedOut,
+    /// The bucket couldn't be reached at all: the connection failed before
+    /// any answer.
+    Unreachable,
+    /// The bucket answered a listing with a failure or a throttle, still,
+    /// once asked again.
+    ListingFailed,
+}
+
+impl LookupFailedReason {
+    /// The value of the refusal's `reason` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookupFailedReason::TimedOut => "timed_out",
+            LookupFailedReason::Unreachable => "unreachable",
+            LookupFailedReason::ListingFailed => "listing_failed",
+        }
+    }
+}
+
+/// How a failed lookup read the bucket's name index
+/// ([`crate::session::name_index`]). On an undeclared bucket a name no
+/// session has costs a listing of every workspace prefix; on a declared one
+/// it costs a few requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupIndex {
+    /// The lookup read the index as declared complete.
+    Declared,
+    /// The lookup read the index as not declared, so it needed the
+    /// bucket's top-level listing and a sweep of every prefix.
+    Undeclared,
+    /// The lookup failed before it read the declaration.
+    Unknown,
+}
+
+impl LookupIndex {
+    /// The value of the refusal's `index` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookupIndex::Declared => "declared",
+            LookupIndex::Undeclared => "undeclared",
+            LookupIndex::Unknown => "unknown",
+        }
+    }
 }
 
 impl fmt::Display for LookupFailed {
