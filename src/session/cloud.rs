@@ -250,10 +250,12 @@ const SLOW_SWEEP_HINT: &str = "hint: cloud sync: looking this session up listed 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long koto waits for each ask of a lookup ([`CloudBackend::held_elsewhere`]):
-/// the index listing, the declaration read, the top-level listing and every
-/// `<prefix>/<id>/` listing. Each is a small read, so one that hasn't
-/// answered in this long has stalled, and koto stops waiting for it and
-/// asks again on a fresh connection.
+/// the own-prefix probe, the index listing, the declaration read, the
+/// top-level listing and every `<prefix>/<id>/` listing. Each is a small
+/// read, so one that hasn't answered in this long has stalled, and koto
+/// stops waiting for it and asks again on a fresh connection. No ask waits
+/// past the lookup's [`LOOKUP_DEADLINE`], which is shorter, so in a lookup
+/// this is the transport's bound more than koto's ([`LookupRun::wait`]).
 ///
 /// The wait is koto's own ([`bounded_ask`]) and covers the whole ask: name
 /// resolution, connect, the request, the reply and rust-s3's own retry.
@@ -264,20 +266,26 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Under [`REQUEST_TIMEOUT`] the transport's own 30 s read timeout dropped
 /// a stalled reply first, and the six requests a listing can make took
 /// about three minutes before it failed (koto#634); here a listing's three
-/// asks take about 31 s.
+/// asks would take about 31 s, and the deadline cuts them shorter.
 const LOOKUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long after a lookup began koto goes on starting asks once a listing
-/// in one [`any_holds`] call has failed for good (koto#645).
+/// The end-to-end deadline of a missing name's lookup
+/// ([`CloudBackend::check_located`]), counted from its first request: the
+/// own-prefix probe ([`CloudBackend::located_probe`]), the index,
+/// declaration and top-level reads, and every confirming or sweeping
+/// listing ([`CloudBackend::held_elsewhere`]) (koto#597).
 ///
-/// While every listing answers there is no wall-clock limit, so a slow
-/// bucket that keeps answering gets the same reply as before. Once a
-/// listing has failed, the answer can only be "can't tell" or a confirmed
-/// hit, so cutting further asks short can't make it wrong. 40 s leaves room
-/// for one listing's three asks of [`LOOKUP_REQUEST_TIMEOUT`] and the
-/// backoff between them (about 31 s), with time over for the prefixes after
-/// the first [`HELD_ELSEWHERE_FANOUT`] to get an ask.
-const LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
+/// Each ask waits at most the time left ([`LookupRun::wait`]), no ask
+/// starts once it is spent, and a prefix not asked by then is recorded as
+/// such ([`PrefixesUnanswered`]). A lookup that hasn't answered by then
+/// refuses with [`LookupFailed`], never not-found; a hit confirmed before
+/// it still wins. A bucket of a few thousand workspace prefixes can't be
+/// swept inside a bound callers can wait for, so past this the reply is
+/// "can't tell" rather than an exact answer that arrives minutes later.
+/// 6 s covers a declared bucket's three requests and an own-prefix probe
+/// throttled through all three of its asks (about 3.75 s), and a sweep of a
+/// few hundred prefixes at a normal round trip.
+const LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// The most lookup request threads alive at once in this process, in
 /// flight and abandoned together ([`bounded_ask`]): twice
@@ -857,7 +865,20 @@ impl CloudBackend {
                     message,
                 }))
             };
-            let probe = match self.located_probe(id) {
+            // The lookup's deadline counts from here, the first request it
+            // makes ([`LOOKUP_DEADLINE`]).
+            let run = LookupRun::new(LookupLimits::lookup());
+            let bucket = match lookup_bucket(&self.bucket) {
+                Ok(bucket) => bucket,
+                Err(e) => {
+                    return failed(format!(
+                        "session '{id}' has no copy on this host, and koto can't tell whether \
+                         the bucket holds it: {e:#}; nothing was read"
+                    ))
+                }
+            };
+            let bucket = bucket.as_ref();
+            let probe = match self.located_probe(id, run, bucket) {
                 Ok(LocatedProbe::Answered(probe)) => probe,
                 Ok(LocatedProbe::Unreachable(e)) => {
                     return failed(format!(
@@ -880,7 +901,7 @@ impl CloudBackend {
             if probe.state_etag.is_some() {
                 return Ok(());
             }
-            return match self.held_elsewhere(id) {
+            return match self.held_elsewhere(id, run, bucket) {
                 Ok(true) => Err(anyhow::Error::new(Unlocated {
                     session: id.to_string(),
                     reason: UnlocatedReason::NoLocalCopy {
@@ -907,34 +928,40 @@ impl CloudBackend {
     /// [`CloudBackend::check_located`]'s probe of `id` under this directory's
     /// prefix, for a session with no local copy.
     ///
+    /// It is [`CloudBackend::probe`]'s listing, made as one of the lookup's
+    /// own reads on `bucket` ([`lookup_bucket`]) within `run`'s deadline
+    /// ([`lookup_list`]): each ask bounded, and one that fails transiently
+    /// asked again while the deadline allows. Its answer is this process's
+    /// probe of `id`, as [`CloudBackend::probe`]'s would be.
+    ///
     /// [`LocatedProbe::Unreachable`] when the listing failed without the
-    /// bucket answering it (a connection that failed, an answer it couldn't
-    /// make sense of), or failed earlier in the process. A listing the bucket
-    /// answered with a throttle or a failure on its side
-    /// ([`is_answered_failure`]) is asked again ([`list_retrying`]), and an
-    /// answer then is this process's probe of `id`; one that still fails is
+    /// bucket answering it (a connection that failed, no answer within the
+    /// deadline, an answer it couldn't make sense of), or failed earlier in
+    /// the process. One the bucket still answered with a throttle or a
+    /// failure on its side ([`is_answered_failure`]) once asked again is
     /// `Err` (koto#531). Either failure leaves koto unable to tell whether
     /// any prefix holds the session, so the caller refuses with
     /// [`LookupFailed`] rather than read the name as absent (koto#638).
-    fn located_probe(&self, id: &str) -> anyhow::Result<LocatedProbe> {
-        let failed = match self.probe(id) {
-            Ok(probe) => return Ok(LocatedProbe::Answered(probe)),
+    fn located_probe(
+        &self,
+        id: &str,
+        run: LookupRun,
+        bucket: &Bucket,
+    ) -> anyhow::Result<LocatedProbe> {
+        let listed = self.probe_with(id, true, |prefix| {
+            lookup_list(run, bucket, &prefix, None).map_err(Unanswered::into_error)
+        });
+        let failed = match listed {
+            Ok((probe, _)) => return Ok(LocatedProbe::Answered(probe)),
             Err(e) => e,
         };
-        if !failed
+        if failed
             .downcast_ref::<ListingFailed>()
             .is_some_and(|f| is_answered_failure(&f.source))
         {
-            return Ok(LocatedProbe::Unreachable(failed));
+            return Err(failed);
         }
-        let prefix = self.session_prefix(id);
-        let results = list_retrying(&self.bucket, prefix.clone(), None)
-            .map_err(|source| anyhow::Error::new(ListingFailed { prefix, source }))?;
-        Ok(LocatedProbe::Answered(self.record_probe(
-            id,
-            &results,
-            std::time::SystemTime::now(),
-        )))
+        Ok(LocatedProbe::Unreachable(failed))
     }
 
     /// Whether a workspace prefix other than this directory's holds `id`'s
@@ -986,18 +1013,17 @@ impl CloudBackend {
     /// makes, name resolution and connect included ([`bounded_ask`]), so a
     /// stalled listing is asked again within seconds instead of holding the
     /// lookup for minutes (koto#634, koto#635). A failed listing doesn't stop
-    /// the other prefixes being asked, so a hit elsewhere still wins. Once a
-    /// listing in one [`any_holds`] call has failed for good, that call
-    /// starts new asks only until [`LOOKUP_BUDGET`] after the lookup began,
-    /// and its error names the listings that failed and the prefixes left
-    /// unasked ([`PrefixesUnanswered`]); while every listing answers there
-    /// is no such limit (koto#645).
-    fn held_elsewhere(&self, id: &str) -> anyhow::Result<bool> {
+    /// the other prefixes being asked, so a hit elsewhere still wins
+    /// (koto#645). Every ask runs within `run`'s deadline
+    /// ([`LOOKUP_DEADLINE`]), which began with the own-prefix probe: once it
+    /// is spent no ask starts, and an [`any_holds`] call's error names the
+    /// listings that failed and the prefixes left unasked
+    /// ([`PrefixesUnanswered`]), so a sweep that can't finish in time is
+    /// `Err`, never `Ok(false)` (koto#597). `bucket` is the lookup's own
+    /// ([`lookup_bucket`]).
+    fn held_elsewhere(&self, id: &str, run: LookupRun, bucket: &Bucket) -> anyhow::Result<bool> {
         use crate::session::name_index::Memo;
 
-        let run = LookupRun::new(LookupLimits::lookup());
-        let bucket = lookup_bucket(&self.bucket)?;
-        let bucket = bucket.as_ref();
         let endpoint = self.bucket.region().endpoint();
         let bucket_name = self.bucket.name();
         let memo_dir = self.local.journal_root();
@@ -1061,9 +1087,8 @@ impl CloudBackend {
         // `MAX_ENTRIES_PER_LOOKUP`, confirm nothing and spare the sweep
         // nothing. On this undeclared path a failed index's Err is dropped
         // on purpose: the sweep asks every prefix the index would have named
-        // and fails on its own if one can't be read. Returning that Err, or
-        // counting it against `LOOKUP_BUDGET`, would turn a lookup the sweep
-        // can still answer into "can't tell".
+        // and fails on its own if one can't be read. Returning that Err
+        // would turn a lookup the sweep can still answer into "can't tell".
         let confirmed_absent = match index {
             Ok(read) if !read.capped => {
                 if any_holds(run, bucket, id, &read.prefixes)? {
@@ -1460,6 +1485,18 @@ impl CloudBackend {
     /// read takes a shared answer (`allow_shared`); a write's probe is a
     /// listing this process made, as it always was.
     fn probe_for(&self, id: &str, allow_shared: bool) -> anyhow::Result<ProbeAnswer> {
+        self.probe_with(id, allow_shared, |prefix| self.bucket.list(prefix, None))
+    }
+
+    /// [`CloudBackend::probe_for`], with the listing of `id`'s prefix made
+    /// by `list` when no answer is kept: the sync bucket's own listing, or
+    /// a lookup's bounded one ([`CloudBackend::located_probe`]).
+    fn probe_with(
+        &self,
+        id: &str,
+        allow_shared: bool,
+        list: impl FnOnce(String) -> Result<Vec<s3::serde_types::ListBucketResult>, S3Error>,
+    ) -> anyhow::Result<ProbeAnswer> {
         if let Some(answer) = self
             .probes
             .answers
@@ -1493,7 +1530,7 @@ impl CloudBackend {
             }
         }
         let prefix = self.session_prefix(id);
-        let results = match self.bucket.list(prefix.clone(), None) {
+        let results = match list(prefix.clone()) {
             Ok(results) => results,
             Err(e) => {
                 self.probes
@@ -7255,9 +7292,9 @@ impl Drop for RequestSlot {
 struct LookupLimits {
     /// The longest koto waits for one ask ([`bounded_ask`]).
     ask_deadline: std::time::Duration,
-    /// How long after the lookup began new asks start, once a listing in
-    /// an [`any_holds`] call has failed for good.
-    budget: std::time::Duration,
+    /// How long after the lookup began asks may start and run: the
+    /// lookup's end-to-end deadline.
+    deadline: std::time::Duration,
     /// How many listings one [`any_holds`] call has in flight at once.
     fanout: usize,
     /// The cap on live request threads.
@@ -7265,20 +7302,22 @@ struct LookupLimits {
 }
 
 impl LookupLimits {
-    /// A command's limits: [`LOOKUP_REQUEST_TIMEOUT`], [`LOOKUP_BUDGET`],
+    /// A command's limits: [`LOOKUP_REQUEST_TIMEOUT`], [`LOOKUP_DEADLINE`],
     /// [`HELD_ELSEWHERE_FANOUT`] and the process-wide slots.
     fn lookup() -> Self {
         LookupLimits {
             ask_deadline: LOOKUP_REQUEST_TIMEOUT,
-            budget: LOOKUP_BUDGET,
+            deadline: LOOKUP_DEADLINE,
             fanout: HELD_ELSEWHERE_FANOUT,
             slots: &LOOKUP_SLOTS,
         }
     }
 }
 
-/// One lookup ([`CloudBackend::held_elsewhere`]): its limits, and when it
-/// began, which is where the budget counts from.
+/// One lookup ([`CloudBackend::check_located`]'s, for a name with no local
+/// copy): its limits, and when it began, which is where its deadline counts
+/// from. Every read of the lookup asks within it: the own-prefix probe, the
+/// index, declaration and top-level reads, and every [`any_holds`] listing.
 #[derive(Clone, Copy)]
 struct LookupRun {
     limits: LookupLimits,
@@ -7293,57 +7332,18 @@ impl LookupRun {
         }
     }
 
-    /// The time left in the budget, from now.
-    fn budget_left(&self) -> std::time::Duration {
-        let end = self.started + self.limits.budget;
+    /// The time left before the deadline, from now.
+    fn deadline_left(&self) -> std::time::Duration {
+        let end = self.started + self.limits.deadline;
         end.saturating_duration_since(std::time::Instant::now())
-    }
-}
-
-/// Whether a listing in one [`any_holds`] call has failed for good, and so
-/// whether the budget applies to the asks after it (koto#645). Each of a
-/// lookup's other reads gets a gate of its own that never fails, so it
-/// keeps the full ask deadline whatever happens elsewhere.
-///
-/// `Relaxed` ordering is enough for the flag: it only makes later asks
-/// shorter or stops them, and never changes an answer already given.
-struct FailureGate {
-    run: LookupRun,
-    failed: std::sync::atomic::AtomicBool,
-}
-
-impl FailureGate {
-    fn new(run: LookupRun) -> Self {
-        FailureGate {
-            run,
-            failed: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// Record that a listing failed for good: from now on, asks start only
-    /// within the budget.
-    fn fail(&self) {
-        use std::sync::atomic::Ordering;
-        self.failed.store(true, Ordering::Relaxed);
-    }
-
-    /// The time left in the budget once a listing has failed; `None` while
-    /// none has, when there is no limit.
-    fn budget_left(&self) -> Option<std::time::Duration> {
-        use std::sync::atomic::Ordering;
-        let failed = self.failed.load(Ordering::Relaxed);
-        failed.then(|| self.run.budget_left())
     }
 
     /// How long an ask starting now may take: the ask deadline, clamped to
-    /// the budget left once a listing has failed. `None` once that budget
-    /// is spent, when no ask starts.
+    /// the time left before the lookup's deadline. `None` once that is
+    /// spent, when no ask starts.
     fn wait(&self) -> Option<std::time::Duration> {
-        match self.budget_left() {
-            None => Some(self.run.limits.ask_deadline),
-            Some(left) if left.is_zero() => None,
-            Some(left) => Some(left.min(self.run.limits.ask_deadline)),
-        }
+        let left = self.deadline_left();
+        (!left.is_zero()).then(|| left.min(self.limits.ask_deadline))
     }
 }
 
@@ -7352,7 +7352,7 @@ impl FailureGate {
 enum Unanswered<E> {
     /// It was asked and failed for good, with this error.
     Failed(E),
-    /// It was never asked: the budget was spent before its first ask.
+    /// It was never asked: the deadline was spent before its first ask.
     NotAsked,
 }
 
@@ -7366,13 +7366,14 @@ impl<E> Unanswered<E> {
 }
 
 impl Unanswered<S3Error> {
-    /// The error a read reports outside [`any_holds`]. Its gate never
-    /// fails, so it is always asked; a read that somehow wasn't still reads
-    /// as a timeout.
+    /// The error a read reports outside [`any_holds`]: a read never asked
+    /// before the deadline reads as a timeout, which is transient.
     fn into_error(self) -> S3Error {
         match self {
             Unanswered::Failed(e) => e,
-            Unanswered::NotAsked => timed_out("not asked before koto stopped waiting".to_string()),
+            Unanswered::NotAsked => timed_out(
+                "not asked before koto stopped waiting at the lookup's deadline".to_string(),
+            ),
         }
     }
 }
@@ -7383,7 +7384,7 @@ fn timed_out(text: String) -> S3Error {
     S3Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, text))
 }
 
-/// `d` cut to whole milliseconds, so a wait clamped to the budget reads
+/// `d` cut to whole milliseconds, so a wait clamped to the deadline reads
 /// `3.2s` in a message rather than to the nanosecond.
 fn whole_ms(d: std::time::Duration) -> std::time::Duration {
     std::time::Duration::from_millis(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -7407,9 +7408,10 @@ fn whole_ms(d: std::time::Duration) -> std::time::Duration {
 /// `TimedOut`, which [`is_transient`] accepts, so the retry policy asks
 /// again on a fresh connection, as it did for a stalled reply (koto#634).
 ///
-/// With [`LOOKUP_REQUEST_TIMEOUT`] this wait and the lookup bucket's own
-/// read deadline are both 10 s, and either can fire first. Both failures
-/// are transient and are asked again alike, so the tie needs no breaking.
+/// The wait is at most [`LOOKUP_REQUEST_TIMEOUT`], the lookup bucket's own
+/// read deadline, and usually less ([`LookupRun::wait`]). When both are
+/// 10 s either can fire first; both failures are transient and are asked
+/// again alike, so the tie needs no breaking.
 fn bounded_ask<T: Send + 'static>(
     run: LookupRun,
     wait: std::time::Duration,
@@ -7452,14 +7454,14 @@ fn bounded_ask<T: Send + 'static>(
 }
 
 /// [`asked_retrying`]'s policy for one of a lookup's reads, where `ask`
-/// takes the longest it may wait. While `gate` has seen no failure that is
-/// the ask deadline, and the policy is unchanged: up to [`LIST_ATTEMPTS`]
-/// asks with [`LIST_BACKOFF`], doubled each time, between them. Once it
-/// has, each ask and each backoff sleep is clamped to the time left in the
-/// budget, and no ask starts once that is spent; a read never asked at all
-/// is [`Unanswered::NotAsked`].
+/// takes the longest it may wait: up to [`LIST_ATTEMPTS`] asks with
+/// [`LIST_BACKOFF`], doubled each time, between them. Each ask is given
+/// [`LookupRun::wait`], the ask deadline clamped to the time left before
+/// the lookup's deadline, each backoff sleep is clamped to that time too,
+/// and no ask starts once it is spent; a read never asked at all is
+/// [`Unanswered::NotAsked`].
 fn asked_retrying_within<T>(
-    gate: &FailureGate,
+    run: LookupRun,
     ask: impl Fn(std::time::Duration) -> Result<T, S3Error>,
     retry: impl Fn(&S3Error) -> bool,
 ) -> Result<T, Unanswered<S3Error>> {
@@ -7467,11 +7469,10 @@ fn asked_retrying_within<T>(
     let mut failed = None;
     for attempt in 1..=LIST_ATTEMPTS {
         if attempt > 1 {
-            let pause = gate.budget_left().map_or(backoff, |left| backoff.min(left));
-            std::thread::sleep(pause);
+            std::thread::sleep(backoff.min(run.deadline_left()));
             backoff *= 2;
         }
-        let Some(wait) = gate.wait() else { break };
+        let Some(wait) = run.wait() else { break };
         match ask(wait) {
             Err(e) if retry(&e) => failed = Some(e),
             Err(e) => return Err(Unanswered::Failed(e)),
@@ -7485,18 +7486,18 @@ fn asked_retrying_within<T>(
 /// each ask bounded ([`bounded_ask`]) and asked again as
 /// [`asked_retrying_within`] asks.
 fn lookup_list(
-    gate: &FailureGate,
+    run: LookupRun,
     bucket: &Bucket,
     prefix: &str,
     delimiter: Option<&str>,
 ) -> Result<Vec<s3::serde_types::ListBucketResult>, Unanswered<S3Error>> {
     asked_retrying_within(
-        gate,
+        run,
         |wait| {
             let bucket = bucket.clone();
             let prefix = prefix.to_string();
             let delimiter = delimiter.map(str::to_string);
-            bounded_ask(gate.run, wait, move || bucket.list(prefix, delimiter))
+            bounded_ask(run, wait, move || bucket.list(prefix, delimiter))
         },
         is_transient,
     )
@@ -7512,13 +7513,12 @@ fn list_capped(
     prefix: &str,
     cap: usize,
 ) -> Result<(Vec<s3::serde_types::ListBucketResult>, bool), S3Error> {
-    let gate = FailureGate::new(run);
     let mut pages = Vec::new();
     let mut keys = 0;
     let mut token: Option<String> = None;
     loop {
         let page = asked_retrying_within(
-            &gate,
+            run,
             |wait| {
                 let bucket = bucket.clone();
                 let prefix = prefix.to_string();
@@ -7580,7 +7580,7 @@ enum DeclarationAsk {
 /// [transient](is_transient) error.
 fn get_declaration_retrying(run: LookupRun, bucket: &Bucket) -> name_index::DeclarationRead {
     asked_retrying_within(
-        &FailureGate::new(run),
+        run,
         |wait| {
             let bucket = bucket.clone();
             bounded_ask(run, wait, move || name_index::get_declaration(&bucket))
@@ -7591,15 +7591,17 @@ fn get_declaration_retrying(run: LookupRun, bucket: &Bucket) -> name_index::Decl
 }
 
 /// [`name_index::read_declaration`], its listing and its read together in
-/// one ask bounded by `run`'s ask deadline ([`bounded_ask`]). One koto
-/// stopped waiting for reads `Unreadable`, which
-/// [`name_index::Memo::record`] ignores, so the memo stays as it was.
+/// one ask bounded by [`LookupRun::wait`] ([`bounded_ask`]). One koto
+/// stopped waiting for, or never started because the lookup's deadline was
+/// spent, reads `Unreadable`, which [`name_index::Memo::record`] ignores,
+/// so the memo stays as it was.
 fn read_declaration_within(run: LookupRun, bucket: &Bucket) -> name_index::DeclarationRead {
+    let Some(wait) = run.wait() else {
+        return name_index::unanswered_get(&Unanswered::NotAsked.into_error());
+    };
     let bucket = bucket.clone();
-    bounded_ask(run, run.limits.ask_deadline, move || {
-        Ok(name_index::read_declaration(&bucket))
-    })
-    .unwrap_or_else(|e| name_index::unanswered_get(&e))
+    bounded_ask(run, wait, move || Ok(name_index::read_declaration(&bucket)))
+        .unwrap_or_else(|e| name_index::unanswered_get(&e))
 }
 
 /// One lookup's read of the name index for a name.
@@ -7634,7 +7636,7 @@ fn read_index(run: LookupRun, bucket: &Bucket, id: &str, own: &str) -> anyhow::R
 /// The workspace prefixes the bucket's top-level listing names, other than
 /// `own`.
 fn top_level_prefixes(run: LookupRun, bucket: &Bucket, own: &str) -> anyhow::Result<Vec<String>> {
-    let pages = lookup_list(&FailureGate::new(run), bucket, "", Some("/")).map_err(|e| {
+    let pages = lookup_list(run, bucket, "", Some("/")).map_err(|e| {
         let e = e.into_error();
         anyhow::anyhow!("listing the bucket's workspace prefixes failed: {e}")
     })?;
@@ -7663,11 +7665,11 @@ fn any_holds(
     id: &str,
     prefixes: &[String],
 ) -> anyhow::Result<bool> {
-    holds_among(run, id, prefixes, |prefix, gate| {
+    holds_among(run, id, prefixes, |prefix, run| {
         let session = format!("{prefix}/{id}/");
         let state = format!("{session}{}", state_file_name(id));
         let pages =
-            lookup_list(gate, bucket, &session, Some("/")).map_err(|e| e.map(|e| e.to_string()))?;
+            lookup_list(run, bucket, &session, Some("/")).map_err(|e| e.map(|e| e.to_string()))?;
         Ok(pages
             .iter()
             .flat_map(|page| page.contents.iter())
@@ -7688,22 +7690,20 @@ const MAX_NAMED_PREFIXES: usize = 10;
 /// name that exists nowhere waiting minutes (koto#526). Once a prefix is
 /// found holding the session, no further listing starts, though those
 /// already in flight finish; a hit wins over any failure. A listing that
-/// fails for good doesn't stop the others: it closes the call's
-/// [`FailureGate`], and from then on a worker takes a new prefix, and an
-/// ask starts, only until the budget is spent, each ask clamped to the
-/// time left (koto#645). A prefix taken after that, or never taken, is
-/// recorded as not asked. Each `holds` returns within one clamped wait, so
-/// the scope joins promptly.
+/// fails for good doesn't stop the others (koto#645). A worker takes a new
+/// prefix, and an ask starts, only until `run`'s deadline is spent, each
+/// ask clamped to the time left ([`LookupRun::wait`]); a prefix taken after
+/// that, or never taken, is recorded as not asked (koto#597). Each `holds`
+/// returns within one clamped wait, so the scope joins promptly.
 ///
 /// `Ok(false)` only when every prefix was asked and answered that it holds
 /// nothing. Otherwise the error holds every listing that failed and every
-/// prefix not asked. Prefixes can only be left unasked once a listing has
-/// failed, since the budget applies only then.
+/// prefix not asked.
 ///
 /// `Relaxed` ordering is enough for every atomic. The index needs only
 /// atomicity: `fetch_add` is a read-modify-write, so each prefix is handed
-/// to exactly one worker whatever the ordering. `found` and the gate are
-/// only early stops: a worker that reads one late makes one listing more,
+/// to exactly one worker whatever the ordering. `found` is only an early
+/// stop: a worker that reads one late makes one listing more,
 /// or one more ask, and never changes the answer, which is read after the
 /// scope has joined every worker, and the join makes all their writes
 /// visible. The answer stays exact: `found` is set only by a listing that
@@ -7714,10 +7714,9 @@ fn holds_among(
     run: LookupRun,
     id: &str,
     prefixes: &[String],
-    holds: impl Fn(&str, &FailureGate) -> Result<bool, Unanswered<String>> + Sync,
+    holds: impl Fn(&str, LookupRun) -> Result<bool, Unanswered<String>> + Sync,
 ) -> Result<bool, PrefixesUnanswered> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let gate = FailureGate::new(run);
     let next = AtomicUsize::new(0);
     let found = AtomicBool::new(false);
     let failed: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -7725,15 +7724,14 @@ fn holds_among(
     std::thread::scope(|scope| {
         for _ in 0..prefixes.len().min(run.limits.fanout) {
             scope.spawn(|| {
-                while !found.load(Ordering::Relaxed) && gate.wait().is_some() {
+                while !found.load(Ordering::Relaxed) && run.wait().is_some() {
                     let Some(prefix) = prefixes.get(next.fetch_add(1, Ordering::Relaxed)) else {
                         break;
                     };
-                    match holds(prefix.as_str(), &gate) {
+                    match holds(prefix.as_str(), run) {
                         Ok(false) => {}
                         Ok(true) => found.store(true, Ordering::Relaxed),
                         Err(Unanswered::Failed(error)) => {
-                            gate.fail();
                             failed
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -7753,28 +7751,25 @@ fn holds_among(
     }
     let mut failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     let mut not_asked = not_asked.into_inner().unwrap_or_else(|e| e.into_inner());
-    // The prefixes no worker took before the budget was spent.
+    // The prefixes no worker took before the deadline was spent.
     let taken = next.into_inner().min(prefixes.len());
     not_asked.extend_from_slice(&prefixes[taken..]);
     if failed.is_empty() && not_asked.is_empty() {
         return Ok(false);
     }
-    debug_assert!(
-        !failed.is_empty(),
-        "prefixes were left unasked with no failed listing"
-    );
     failed.sort();
     not_asked.sort();
     Err(PrefixesUnanswered {
         id: id.to_string(),
         failed,
         not_asked,
+        deadline: run.limits.deadline,
     })
 }
 
 /// The prefixes one [`any_holds`] call got no answer from: each listing
 /// that failed for good, with its error, and each prefix not asked before
-/// the budget was spent, both sorted by prefix.
+/// the lookup's deadline was spent, both sorted by prefix.
 ///
 /// Its message names at most [`MAX_NAMED_PREFIXES`] of them, failed ones
 /// first, and ends each group it cut with "and N more", so a bucket with
@@ -7787,6 +7782,8 @@ struct PrefixesUnanswered {
     /// Each failed listing's prefix and error.
     failed: Vec<(String, String)>,
     not_asked: Vec<String>,
+    /// The lookup's deadline, which the not-asked group names.
+    deadline: std::time::Duration,
 }
 
 impl std::fmt::Display for PrefixesUnanswered {
@@ -7813,7 +7810,11 @@ impl std::fmt::Display for PrefixesUnanswered {
         if !self.not_asked.is_empty() {
             let count = self.not_asked.len();
             let noun = if count == 1 { "prefix" } else { "prefixes" };
-            let mut group = format!("{count} {noun} not asked before koto stopped waiting");
+            let mut group = format!(
+                "{count} {noun} not asked before koto stopped waiting at the lookup's {:?} \
+                 deadline",
+                whole_ms(self.deadline)
+            );
             if named_unasked > 0 {
                 group.push_str(": ");
                 group.push_str(&self.not_asked[..named_unasked].join(", "));
@@ -9353,23 +9354,24 @@ mod tests {
         }
     }
 
-    // -- the lookup's own deadline and budget (koto#645, koto#635) --
+    // -- the lookup's ask deadline and end-to-end deadline (koto#645,
+    // koto#635, koto#597) --
 
     fn ms(millis: u64) -> std::time::Duration {
         std::time::Duration::from_millis(millis)
     }
 
-    /// Lookup limits for a test: `ask` per ask, `budget` once a listing
-    /// has failed, `fanout` workers, and request slots of the test's own,
-    /// so no test shares the process-wide ones.
+    /// Lookup limits for a test: `ask` per ask, the lookup's `deadline`,
+    /// `fanout` workers, and request slots of the test's own, so no test
+    /// shares the process-wide ones.
     fn test_limits(
         ask: std::time::Duration,
-        budget: std::time::Duration,
+        deadline: std::time::Duration,
         fanout: usize,
     ) -> LookupLimits {
         LookupLimits {
             ask_deadline: ask,
-            budget,
+            deadline,
             fanout,
             slots: Box::leak(Box::new(RequestSlots::new(LOOKUP_LIVE_REQUESTS))),
         }
@@ -9503,39 +9505,37 @@ mod tests {
     }
 
     #[test]
-    fn asked_retrying_within_asks_three_times_then_stops_at_the_budget() {
+    fn asked_retrying_within_asks_three_times_then_stops_at_the_deadline() {
         let waits = Mutex::new(Vec::new());
         let ask = |wait: std::time::Duration| -> Result<(), S3Error> {
             waits.lock().unwrap().push(wait);
             Err(stand_in_miss())
         };
 
-        // No listing has failed: no budget, three asks at the full wait.
-        let gate = FailureGate::new(LookupRun::new(test_limits(ms(200), ms(0), 1)));
-        let got = asked_retrying_within(&gate, ask, is_transient);
+        // A deadline far off: three asks at the full wait.
+        let run = LookupRun::new(test_limits(ms(200), ms(30_000), 1));
+        let got = asked_retrying_within(run, ask, is_transient);
         assert!(matches!(got, Err(Unanswered::Failed(_))), "{got:?}");
         assert_eq!(*waits.lock().unwrap(), vec![ms(200); 3]);
 
-        // A listing has failed and the budget is spent: no ask at all.
+        // The deadline is spent: no ask at all.
         waits.lock().unwrap().clear();
-        let gate = FailureGate::new(LookupRun::new(test_limits(ms(200), ms(0), 1)));
-        gate.fail();
-        let got = asked_retrying_within(&gate, ask, is_transient);
+        let run = LookupRun::new(test_limits(ms(200), ms(0), 1));
+        let got = asked_retrying_within(run, ask, is_transient);
         assert!(matches!(got, Err(Unanswered::NotAsked)), "{got:?}");
         assert!(waits.lock().unwrap().is_empty());
 
         // 100 ms left: one ask within it, and no backoff past it.
         waits.lock().unwrap().clear();
-        let gate = FailureGate::new(LookupRun::new(test_limits(ms(200), ms(100), 1)));
-        gate.fail();
+        let run = LookupRun::new(test_limits(ms(200), ms(100), 1));
         let started = std::time::Instant::now();
-        let got = asked_retrying_within(&gate, ask, is_transient);
+        let got = asked_retrying_within(run, ask, is_transient);
         let took = started.elapsed();
         assert!(matches!(got, Err(Unanswered::Failed(_))), "{got:?}");
         let asked = waits.lock().unwrap().clone();
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert!(asked[0] <= ms(100), "{asked:?}");
-        assert!(took < ms(250), "slept past the budget: {took:?}");
+        assert!(took < ms(250), "slept past the deadline: {took:?}");
     }
 
     #[test]
@@ -9610,16 +9610,13 @@ mod tests {
     }
 
     #[test]
-    fn holds_among_stops_asking_at_the_budget_once_a_listing_has_failed() {
+    fn holds_among_stops_asking_at_the_deadline() {
         let run = LookupRun::new(test_limits(ms(1000), ms(500), 2));
         let all = test_prefixes(20);
         let answered = Mutex::new(Vec::new());
         let started = std::time::Instant::now();
-        let got = holds_among(run, "wf", &all, |prefix, gate| {
-            if prefix == all[0] {
-                return Err(Unanswered::Failed("refused".to_string()));
-            }
-            let Some(wait) = gate.wait() else {
+        let got = holds_among(run, "wf", &all, |prefix, run| {
+            let Some(wait) = run.wait() else {
                 return Err(Unanswered::NotAsked);
             };
             // Answers after 300 ms, or fails at its wait when that is
@@ -9634,7 +9631,9 @@ mod tests {
         });
         let took = started.elapsed();
         assert!(took < ms(650), "took {took:?}");
-        let err = got.expect_err("a failed listing is never read as not held");
+        // Every listing answers, only slowly: a sweep cut at the deadline
+        // is never read as not held.
+        let err = got.expect_err("a sweep cut at the deadline is never read as not held");
         assert!(!err.not_asked.is_empty(), "every prefix was asked: {err}");
         let mut seen: Vec<String> = answered.into_inner().unwrap();
         seen.extend(err.failed.iter().map(|(p, _)| p.clone()));
@@ -9643,26 +9642,18 @@ mod tests {
         assert_eq!(seen, all, "each prefix answered, failed or unasked once");
         assert!(err
             .to_string()
-            .contains("not asked before koto stopped waiting"));
+            .contains("not asked before koto stopped waiting at the lookup's 500ms deadline"));
     }
 
     #[test]
-    fn holds_among_is_not_cut_by_the_budget_while_every_listing_answers() {
-        // A budget far shorter than the call: it applies only after a
-        // listing has failed, and none does.
-        let run = LookupRun::new(test_limits(ms(1000), ms(150), 2));
-        let all = test_prefixes(10);
-        let answered = Mutex::new(0);
-        let started = std::time::Instant::now();
-        let got = holds_among(run, "wf", &all, |_, _| {
+    fn a_hit_before_the_deadline_wins_over_prefixes_left_unasked() {
+        let run = LookupRun::new(test_limits(ms(1000), ms(250), 2));
+        let all = test_prefixes(20);
+        let got = holds_among(run, "wf", &all, |prefix, _| {
             std::thread::sleep(ms(100));
-            *answered.lock().unwrap() += 1;
-            Ok(false)
+            Ok(prefix == all[1])
         });
-        let took = started.elapsed();
-        assert!(matches!(got, Ok(false)), "{got:?}");
-        assert_eq!(*answered.lock().unwrap(), 10);
-        assert!(took >= ms(450), "took {took:?}");
+        assert!(matches!(got, Ok(true)), "{got:?}");
     }
 
     #[test]
@@ -9708,10 +9699,10 @@ mod tests {
             .unwrap()
             .with_path_style();
         let bucket = lookup_bucket(&bucket).unwrap();
-        let gate = FailureGate::new(LookupRun::new(test_limits(ms(300), ms(30_000), 1)));
+        let run = LookupRun::new(test_limits(ms(300), ms(30_000), 1));
 
         let started = std::time::Instant::now();
-        let got = lookup_list(&gate, &bucket, "0000000000000005/wf/", Some("/"));
+        let got = lookup_list(run, &bucket, "0000000000000005/wf/", Some("/"));
         let took = started.elapsed();
         assert!(took < ms(3000), "took {took:?}");
         match got {

@@ -39,6 +39,10 @@ use std::path::{Path, PathBuf};
 const BUCKET: &str = "koto-bound";
 const WF: &str = "wf";
 const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// How long a command whose missing-name lookup can't finish may take: the
+/// lookup's 6-second deadline, plus the process's start, its other
+/// requests and slack for a loaded test host.
+const LOOKUP_BOUND: std::time::Duration = std::time::Duration::from_secs(12);
 
 const TEMPLATE: &str = r#"---
 name: flow
@@ -1538,7 +1542,10 @@ fn an_unreachable_bucket_refuses_a_name_with_no_local_copy_as_lookup_failed() {
         (&["context", "exists", NEVER, "k.md"][..], "context exists"),
         (&["context", "get", NEVER, "k.md"][..], "context get"),
     ] {
+        let started = std::time::Instant::now();
         let out = h.koto(&dir, args);
+        let took = started.elapsed();
+        assert!(took < LOOKUP_BOUND, "{command} took {took:?}");
         let message = assert_lookup_failed(&out, command, NEVER);
         assert!(message.contains("couldn't be reached"), "{message}");
     }
@@ -1551,21 +1558,20 @@ fn an_unreachable_bucket_refuses_a_name_with_no_local_copy_as_lookup_failed() {
     assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
 }
 
-/// One stalled listing doesn't hold a new name's lookup (koto#634). The
-/// lookup of a name no prefix holds lists every other workspace prefix;
-/// when one of those listings stalls, with no answer and no refusal, koto
-/// gives up on that request within a bound and asks again, so the lookup
-/// still answers absent. Without a bound of its own, a stalled request is
-/// abandoned only at the HTTP client's 30-second read timeout, and each
-/// listing may be asked six times before the lookup fails.
+/// One stalled listing can't hold a new name's lookup past its deadline
+/// (koto#634, koto#597). The lookup of a name no prefix holds lists every
+/// other workspace prefix; when one of those listings stalls, with no
+/// answer and no refusal, koto stops waiting for it at the lookup's
+/// 6-second deadline, so `context exists` refuses with
+/// `session_lookup_failed`, exit 3, naming the listing, within the bound
+/// and never answering absent. Once the stall is over, the same command
+/// answers absent again.
 #[test]
-fn a_stalled_prefix_listing_is_asked_again_within_a_bound() {
+fn a_stalled_prefix_listing_is_cant_tell_within_the_deadline() {
     const NEVER: &str = "never_used";
     // Longer than the client's read timeout, so the stalled request is
-    // abandoned rather than answered late; the hold covers one request, so
-    // the listing asked again is answered.
+    // abandoned rather than answered late; the hold covers one request.
     let stall = std::time::Duration::from_secs(40);
-    let bound = std::time::Duration::from_secs(25);
     let s3 = FakeS3::start(BUCKET);
     let h = Host::new(&s3, true);
     let prefixes = plant_prefixes(&s3, 8, 3);
@@ -1578,38 +1584,33 @@ fn a_stalled_prefix_listing_is_asked_again_within_a_bound() {
     let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
     let took = started.elapsed();
     assert!(
-        took < bound,
+        took < LOOKUP_BOUND,
         "the lookup of a new name waited {took:?} on one stalled listing of {listing:?}, \
-         past the {bound:?} bound: {}",
+         past the {LOOKUP_BOUND:?} bound: {}",
         out.describe()
     );
+    let message = assert_lookup_failed(&out, "context exists", NEVER);
+    assert!(message.contains(&listing), "{message}");
+    assert!(message.contains("no answer within"), "{message}");
+
+    let out = h.koto(&dir, &["context", "exists", NEVER, "k.md"]);
     assert_eq!(out.code, Some(1), "context exists: {}", out.describe());
     assert!(out.stdout.trim().is_empty(), "{}", out.describe());
-    let asked = s3
-        .requests()
-        .iter()
-        .filter(|r| r.list_prefix.as_deref() == Some(listing.as_str()))
-        .count();
-    assert!(
-        asked >= 2,
-        "the stalled listing was asked {asked} time(s), never again"
-    );
 }
 
-/// A listing that never answers fails a new name's lookup within a bound
-/// (koto#645, koto#635). The lookup of a name no prefix holds lists every
-/// other workspace prefix; when one of those listings stalls every time it
-/// is asked, koto can't tell whether that prefix holds the name, so
-/// `koto status` fails with `session_lookup_failed`, exit 3, naming the
-/// listing. It gives up within the 40-second lookup budget plus one ask,
-/// rather than waiting out three asks and rust-s3's own retry of each.
+/// A listing that never answers fails a new name's lookup within the
+/// lookup's deadline (koto#645, koto#635, koto#597). The lookup of a name
+/// no prefix holds lists every other workspace prefix; when one of those
+/// listings stalls every time it is asked, koto can't tell whether that
+/// prefix holds the name, so `koto status` fails with
+/// `session_lookup_failed`, exit 3, naming the listing, once the 6-second
+/// deadline is spent, rather than waiting out three asks and rust-s3's own
+/// retry of each.
 #[test]
-fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
+fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_deadline() {
     const NEVER: &str = "never_used";
-    // Far past the budget, so no ask of the listing is ever answered.
+    // Far past the deadline, so no ask of the listing is ever answered.
     let stall = std::time::Duration::from_secs(300);
-    // The 40s budget, one 10s ask after it, and slack.
-    let bound = std::time::Duration::from_secs(55);
     let s3 = FakeS3::start(BUCKET);
     let h = Host::new(&s3, true);
     let prefixes = plant_prefixes(&s3, 8, 3);
@@ -1622,9 +1623,9 @@ fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
     let out = h.koto(&dir, &["status", NEVER]);
     let took = started.elapsed();
     assert!(
-        took < bound,
+        took < LOOKUP_BOUND,
         "the lookup of a new name took {took:?} on one listing of {listing:?} that never \
-         answers, past the 40s lookup budget and the {bound:?} bound: {}",
+         answers, past the {LOOKUP_BOUND:?} bound: {}",
         out.describe()
     );
     let message = assert_lookup_failed(&out, "status", NEVER);
@@ -1634,10 +1635,7 @@ fn a_prefix_listing_that_never_answers_fails_the_lookup_within_the_budget() {
         .iter()
         .filter(|r| r.list_prefix.as_deref() == Some(listing.as_str()))
         .count();
-    assert!(
-        asked >= 3,
-        "the stalled listing was asked {asked} time(s), not three"
-    );
+    assert!(asked >= 1, "the stalled listing was never asked");
 }
 
 /// Every listing that fails is named (koto#645). When three other prefixes'

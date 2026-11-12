@@ -1671,3 +1671,78 @@ fn a_declared_bucket_with_no_memo_reads_in_one_round_trip_whatever_the_top_level
     check("top-level listing failed", true);
     s3.clear_faults();
 }
+
+// -- the lookup's end-to-end deadline (koto#597) --
+
+/// How long a `koto status` whose lookup is cut at the 6-second deadline
+/// may take: the deadline, plus the process's start, its other requests
+/// and slack for a loaded test host.
+const LOOKUP_BOUND: Duration = Duration::from_secs(12);
+
+/// On a declared bucket of 2,000 workspace prefixes across a slow network,
+/// four `koto status` lookups of missing names, run one after another, each
+/// answer not-found within the bound and all four together in under 30
+/// seconds: the index answers, so no lookup sweeps.
+#[test]
+fn four_missing_names_on_a_large_declared_bucket_answer_not_found_quickly() {
+    const PREFIXES: u32 = 2_000;
+    let latency = Duration::from_millis(100);
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, PREFIXES);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+
+    s3.set_latency(latency);
+    let all = std::time::Instant::now();
+    for name in ["missing-1", "missing-2", "missing-3", "missing-4"] {
+        let started = std::time::Instant::now();
+        let out = h.koto(&dir, &["status", name]);
+        let took = started.elapsed();
+        assert!(took < LOOKUP_BOUND, "{name} took {took:?}");
+        assert_eq!(out.code, Some(2), "koto status {name}: {}", out.describe());
+        let err = out.json();
+        assert_eq!(
+            err["error"],
+            format!("workflow '{name}' not found"),
+            "{}",
+            out.describe()
+        );
+        assert!(err.get("code").is_none(), "{}", out.describe());
+        println!("koto status {name}: {took:?}");
+    }
+    let total = all.elapsed();
+    s3.set_latency(Duration::ZERO);
+    println!("four lookups: {total:?}");
+    assert!(
+        total < Duration::from_secs(30),
+        "four lookups took {total:?}"
+    );
+}
+
+/// On an undeclared bucket whose sweep can't finish inside the deadline
+/// (2,000 workspace prefixes, each listing answered only after 300 ms, so
+/// about 32 rounds of 64), `koto status` of a missing name refuses with
+/// `session_lookup_failed`, exit 3, within the bound, naming the prefixes
+/// it didn't get to ask, and never answers not-found.
+#[test]
+fn a_sweep_cut_at_the_deadline_is_cant_tell_never_not_found() {
+    const PREFIXES: u32 = 2_000;
+    let latency = Duration::from_millis(300);
+    let s3 = FakeS3::start(BUCKET);
+    plant_prefixes(&s3, PREFIXES);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+
+    s3.set_latency(latency);
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["status", GHOST]);
+    let took = started.elapsed();
+    s3.set_latency(Duration::ZERO);
+    assert!(took < LOOKUP_BOUND, "took {took:?}: {}", out.describe());
+    let message = assert_lookup_failed(&out, "status", GHOST);
+    assert!(!message.contains("not found"), "{message}");
+    assert!(
+        message.contains("not asked before koto stopped waiting at the lookup's 6s deadline"),
+        "{message}"
+    );
+    println!("cut sweep: {took:?}");
+}
