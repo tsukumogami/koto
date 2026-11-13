@@ -108,13 +108,16 @@ requirements cover.
   change to the directory happens during some koto write into it.
 - A false removal of a file koto didn't write is the one failure that can't
   be undone; ownership checks fail closed.
-- The write path runs on every committed step: the common case (a directory
-  within the bound) must cost one directory listing and nothing else.
+- The write path runs on every committed step: a directory within the bound
+  with nothing older than the window must cost one directory listing and
+  nothing else, and any other directory a bounded number of small reads.
 - Whatever status word koto writes must be one Claude Code's screen already
   knows, and provably so: the conventions guard has no status-value probe
   today.
 - koto should have one definition of "went quiet", shared by the dashboard
   and the file.
+- koto ships for Linux and macOS only, so Unix file APIs such as no-follow
+  opens need no Windows fallback.
 - Reuse what exists: the best-effort envelope around `try_materialize`,
   `atomic_write`, the 60-second temp-file age in `src/cli/batch.rs`, and the
   dashboard's thresholds.
@@ -296,7 +299,9 @@ Anything that fails a check is left exactly as it was and doesn't count
 toward N. A `.koto-wf-*.tmp` file is removed when its modification time is
 more than A = 60 seconds ago, the same age `sweep_stale_tempfiles` in
 `src/cli/batch.rs` uses for koto's other temp files (a unit test pins them
-equal). No other file is opened.
+equal). Temp files carry no marker to check, which is acceptable because the
+`.koto-wf-` prefix is koto's own and the age rule only removes files no koto
+write is still using. No other file is opened.
 
 Each removal and rewrite is its own best-effort step. Before removing a
 candidate the sweep re-reads its modification time and skips it if it
@@ -380,8 +385,10 @@ of limits, so tests drive it directly with a temporary directory and a fixed
     increments per file opened.
 - **`materialize.rs` (changed).** After `atomic_write(&dir, &target,
   &bytes)?`, call `retention::apply(&dir, &target, SystemTime::now(),
-  &Limits::default())`. `atomic_write`'s temp-and-rename body is factored into
-  a helper the reconcile path also uses.
+  &Limits::default())`. In Phase 3, `atomic_write`'s temp-and-rename body is
+  factored into a helper the reconcile path also uses, so a reconciled file
+  gets the same `tempfile` creation (new file, owner-only mode) as every other
+  koto write.
 - **`contract.rs` (changed).** `CONTRACT_VERSION = 6` with a history line;
   `ScreenStatus` gains `Killed`, serialized `killed`; `KotoBlock` gains
   `stale_since: Option<u64>`, serialized `staleSince` and skipped when
@@ -417,7 +424,8 @@ fields:
 ```
 
 `koto.contractVersion` is set to 6 on reconcile, since the entry now carries
-a version-6 field. Every other field is kept as it was.
+a version-6 field, even when its other fields were written under an older
+version; the field reference says so. Every other field is kept as it was.
 
 The ownership marker is `id == "koto-" + koto.sessionId`, `koto.sessionId ==
 <filename id>`, numeric `koto.contractVersion`, string `status`.
@@ -427,7 +435,8 @@ The ownership marker is `id == "koto-" + koto.sessionId`, `koto.sessionId ==
 1. A koto command commits an event; `append_event` calls
    `materialize_after_commit`; `try_materialize` writes the session's entry.
 2. `retention::apply` lists the directory once and splits the listing into
-   name-matching entries (with `symlink_metadata`) and temp files.
+   name-matching entries and temp files, using `DirEntry::file_type`, which
+   doesn't follow links.
 3. Temp files older than A are removed.
 4. Fast path: at most N name-matching files and none modified more than W
    ago, so it returns.
@@ -551,7 +560,9 @@ written, and warnings log the file name and error kind, not file contents.
 - The file and the dashboard share one definition of "went quiet".
 - The guard checks status words for the first time, so a Claude Code release
   that drops any of the four fails CI.
-- The common case costs one directory listing per write.
+- A directory within the bound with nothing older than 2 hours costs one
+  directory listing per write; once older entries exist, a write reads at
+  most the ten or so name-matching files, each small.
 
 ### Negative
 
@@ -564,6 +575,9 @@ written, and warnings log the file name and error kind, not file contents.
 - A commit that lands in the few system calls between reconciliation's
   re-check and its rename reads `killed` until that session's next commit.
 - The file contract gains a version and the guard four probes to maintain.
+- The first write after an upgrade into a directory with a large backlog
+  reads every name-matching file once; there is no cap on reads per sweep,
+  because a cap would let the bound fail to hold after that write.
 
 ### Mitigations
 
