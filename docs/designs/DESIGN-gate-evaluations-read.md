@@ -207,8 +207,10 @@ Key assumptions:
   bucket has plus the batch's own: a flush leaves the local copy equal to
   the bucket's, and if another host had pushed in between, the flush would
   refuse as a conflict anyway.
-- A pull that fetches a newer bucket copy over this host's local file is a
-  cache refresh, not a write to the session. Every read verb does it today.
+- The ordinary pull replaces this host's local file with a newer bucket
+  copy only when that copy holds every local event (koto#477), but a tick
+  can append between that comparison and the replace. A read that never
+  replaces the file has no such window.
 - The sweep groups by `template.name`, falls back to `template.hash` when no
   name was recorded, and keys a gate on (state, gate).
 - A sweep filters by outcome, state or gate itself, so filter flags can
@@ -239,9 +241,13 @@ every item with no second lookup. That's where `overrides list` and
 Under the cloud backend the read never flushes, never clears an unopened
 batch and never takes the batch lock. If this host has the session's batch
 open, or the command runs inside a tick on it, the read takes the local
-copy as it is, which is the newest copy there is. Otherwise it runs the
-pull's probe and fetch, which take no lock. It skips the back-reference PUT,
-appends no event, logs no `context_read` and writes no journal record.
+copy as it is, which is the newest copy there is. Otherwise it probes the
+bucket and, when the bucket's copy moved, fetches it into memory and
+answers from it if it holds every local event, without replacing this
+host's file; a copy that diverges from the local log refuses, as the pull
+does. It skips the back-reference PUT, appends no event, logs no
+`context_read`, writes no journal record and leaves the local file as it
+found it.
 
 #### Alternatives Considered
 
@@ -355,7 +361,10 @@ this host's store, not to the bucket, not to the run journal.
 - **`src/cli/evaluations.rs`** (new). The `EvaluationsSubcommand` enum with
   one variant, `List { name }`; `handle_list(backend, name)`, which reads,
   projects and prints; and the pure projection `evaluation_items(&[Event])
-  -> Vec<EvaluationItem>`, unit-tested on its own.
+  -> Vec<EvaluationItem>`, unit-tested on its own. The projection bounds
+  each string it emits and holds the findings and rule lists to the
+  writer's caps, since a log read through `--workspace` is untrusted input
+  (see Security Considerations).
 - **`src/cli/mod.rs`**. A `Command::Evaluations { subcommand }` variant with
   the help text "Gate evaluation retrieval (reads only)", and its dispatch
   arm. The arm checks where the session lives and serves a migrated source
@@ -368,9 +377,14 @@ this host's store, not to the bucket, not to the run journal.
 - **`src/session/cloud.rs`**. `CloudBackend` overrides it: run
   `check_not_migrated`; if this host's batch journal for the session is open,
   an opening file is there, or the process runs inside a tick on the
-  session, read the local copy (`read_events_local`); otherwise run the
-  pull's probe and fetch without `try_clear_unopened_batch` and without
-  `flush_pending`, then read the local copy. It never takes the batch lock.
+  session, read the local copy (`read_events_local`). Otherwise probe the
+  bucket as `sync_pull_state` does, with its home, session-id and
+  cross-import checks; when the bucket's copy moved, fetch it into memory,
+  compare it with the local log (`state_log::compare`), and parse the copy
+  that holds every event. A copy that diverges from the local log refuses,
+  as the pull does. It never calls `try_clear_unopened_batch` or
+  `flush_pending`, never takes the batch lock, and never writes the local
+  file or its sync stamp.
 - **`src/cli/workspace_read.rs`**. `read_verb` gains
   `Command::Evaluations { subcommand: List { name } }` as `"evaluations
   list"`; `serve` gains its dispatch arm; the refusal message that lists the
@@ -462,7 +476,9 @@ Exit codes:
    back-reference.
 3. `read_events_unflushed` returns the header and events. Under the cloud
    backend, an open batch on this host means the local copy is read as it
-   is; otherwise the bucket's copy is fetched if newer, with no lock.
+   is; otherwise the bucket's copy is fetched into memory if it moved, with
+   no lock, and read in place of the local copy when it holds every local
+   event. The local file isn't touched either way.
 4. `evaluation_items` keeps the `GateEvaluated` events and projects each
    to an item; the handler adds the header fields and the current state,
    derived from the same events.
@@ -481,7 +497,10 @@ Deliverables:
 - Cloud tests against the in-process fake S3: with a batch open on this
   host, the read returns the batch's events, the batch stays open and
   unflushed, and the fake S3 sees no write; with no batch open, a newer
-  bucket copy is fetched; the batch lock is never taken.
+  bucket copy is read and the local file and its sync stamp are
+  byte-identical afterwards; a local append made after the probe is never
+  lost; a bucket copy that diverges from the local log refuses; the batch
+  lock is never taken.
 
 ### Phase 2: The verb
 
@@ -492,7 +511,9 @@ Deliverables:
 - Unit tests on `evaluation_items`: a failed command gate with findings
   and `rule_counts`, a pass, a pending poll, a truncated findings list, a
   rewind with evaluations on both sides, two states with a gate of the same
-  name, a `default_action_executed` check left out, an empty log.
+  name, a `default_action_executed` check left out, an empty log, and a
+  hostile event with an oversized rule id and more findings than the cap,
+  which comes out bounded with its truncation flags set.
 - `tests/evaluations_list_test.rs`: the issue's one-state probe template
   gives one failed item with `prd/ac-numbered` and the template name; a
   missing session exits 2; the log is byte-identical after the read; the
@@ -522,7 +543,68 @@ Deliverables:
 
 ## Security Considerations
 
-Written after the security review.
+The verb reads and prints. It writes nothing, runs no command, opens no new
+network endpoint and adds no dependency, so supply chain trust doesn't
+change. What needs care follows from where its input comes from and what it
+prints.
+
+**Input another party may control.** For a session in the caller's own
+store the log is a file koto wrote. Under `--workspace`, and for a session
+imported elsewhere, the log is the bucket copy under another workspace's
+prefix, and whoever can write that prefix controls its bytes. koto's write
+path bounds rule ids at 128 bytes, caps findings and rule counts at 50 per
+evaluation and redacts known credentials, but none of that is applied again
+on read. So the projection bounds what it prints itself: each string it
+emits (state, gate, outcome, reason, rule id, template fields) is cut to a
+fixed length, the findings and rule lists are held to the writer's caps
+with the truncation flags set when the read cuts them, and a log that can't
+be parsed exits 3 with a message naming the problem and the event's
+position, never a slice of the raw line. The output is one JSON document
+serialized by serde, so quotes and control characters in a hostile value
+are escaped and can't change the document's shape. Callers still treat
+every string as data: a sweep doesn't pass a rule id or gate name unquoted
+to a shell, a query, a path or a model prompt, and tolerates outcome and
+reason values it doesn't know. The CLI guide says so.
+
+**What it can reach.** `--workspace` stays fail-closed: the verb is added
+to the allowlist as one more read, and every other verb keeps refusing with
+`workspace_read_only` before anything is read. The `WorkspaceReader` is
+read-only and removes its scratch directory however the command exits. The
+verb grants nothing new: a caller who can point it at another workspace
+already holds bucket credentials that let `koto context get` and `koto
+overrides list` read that workspace's sessions, and this output is a subset
+of what those credentials expose.
+
+**The read that never flushes.** The new backend read drops the flush, the
+unopened-batch cleanup, the batch lock and the back-reference PUT, which
+removes writes a reader had no reason to make. It also never replaces this
+host's local file: when the bucket's copy moved, the read fetches it into
+memory and answers from it only if it holds every local event. An append a
+tick makes while the read runs can't be lost, because the read never writes
+the file the tick appends to. Phase 1's cloud tests cover an append made
+after the probe.
+
+**What it prints.** The session name and id, current state, template name,
+hash and source file name, and per evaluation the seq, time, state, gate,
+outcome, reason, attempt numbers, error rule ids with counts, findings
+reduced to rule id and level, the truncation flags and the poll record. It
+leaves out finding messages, paths and rule references, the gate's output,
+the captured stdout and stderr, and the duration: the fields that carry
+file contents, repository paths and tool output. Leaving them out means the
+verb doesn't depend on redaction being complete. Rule ids, gate and state
+names and template names are identifiers that check and template authors
+choose; they show what a workspace runs and which rules keep firing, which
+`koto status` and `koto overrides list` already show. Check authors should
+keep per-instance data, such as names taken from the reviewed content, out
+of rule ids, because redaction masks only values koto knows are secret. The
+template source file is the header's bare file name, never a directory or
+the compiled cache path.
+
+**Residual risk.** Output read through `--workspace` is only as trustworthy
+as the bucket prefix it comes from; the verb doesn't authenticate the log's
+writer. When gates ran and how often they failed is visible to anyone with
+the workspace's bucket access, as it already is through `koto status` and
+`koto overrides list`.
 
 ## Consequences
 
