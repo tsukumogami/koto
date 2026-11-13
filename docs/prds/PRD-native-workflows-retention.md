@@ -14,8 +14,9 @@ goals: |
   sessions than that are live there at once, a koto session that stopped without
   finishing stops claiming to be running once a stated window has passed (or the
   docs say how to tell), and nothing koto didn't write is ever touched.
-upstream: docs/briefs/BRIEF-native-workflows-retention.md
 source_issue: 190
+absorbed:
+  - docs/briefs/BRIEF-native-workflows-retention.md
 ---
 
 # PRD: bounded and honest koto entries in Claude Code's `/workflows`
@@ -24,11 +25,36 @@ source_issue: 190
 
 Accepted
 
+Absorbed [BRIEF-native-workflows-retention](docs/briefs/BRIEF-native-workflows-retention.md); carried in Absorbed Brief.
+
 Requirements for the lifecycle of the files koto writes into Claude Code's
 `/workflows` directories. The brief left two calls open, the retention policy
 and how crash-staleness is handled; this PRD states what either answer must
 satisfy and leaves the mechanism, the numbers and the choice between the two
 crash-staleness outcomes to the design.
+
+## Absorbed Brief
+
+The feature was framed before these requirements existed. Every koto session
+run inside Claude Code leaves a `/workflows` entry that nothing removes, so
+over a long Claude Code session koto's finished entries pile up and crowd out
+Claude Code's own workflows, and a koto session that stopped without finishing
+reads as running forever; the list stops saying what is live. The framed
+outcome: an operator opens `/workflows` at any point and reads it at a glance,
+with koto's finished entries under a stated count, a dead koto session no
+longer claiming to run once a stated window has passed (or koto's docs saying
+how to tell a live entry from a stale one), and no file koto didn't write ever
+touched, all without running a command or turning on a setting. The framing
+named four journeys, carried as this PRD's user stories: many koto sessions run
+to completion in one Claude Code session, returning to a session that died
+mid-run, Claude Code's own files kept safe in a shared directory, and a
+maintainer changing the file with the conventions guard extended in step. It
+fixed the boundary the Requirements and Out of Scope operationalize: a stated
+count bound per directory, the same policy for every finished outcome, the
+crash-staleness outcome, the ownership rule, docs, tests and the guard are in;
+any niwa dependency, koto's own store retention, hierarchy and fan-out
+entries, a blocked bucket, the rendered smoke check, a daemon or per-turn hook,
+and Claude Code's own files are out.
 
 ## Problem Statement
 
