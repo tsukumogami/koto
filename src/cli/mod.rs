@@ -1154,6 +1154,13 @@ pub enum ContextCommand {
         #[arg(long)]
         prefix: Option<String>,
     },
+    /// Print a key's write history as a JSON array, oldest first
+    History {
+        /// Session name
+        session: String,
+        /// Context key
+        key: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, clap::ValueEnum)]
@@ -2679,6 +2686,7 @@ pub fn run(app: App) -> Result<()> {
                 ContextCommand::Exists { session, .. } => (session, "context exists"),
                 ContextCommand::Remove { session, .. } => (session, "context remove"),
                 ContextCommand::List { session, .. } => (session, "context list"),
+                ContextCommand::History { session, .. } => (session, "context history"),
             };
             // A session bound to another directory refuses first, naming
             // where to run the command (koto#457); a session imported away
@@ -2847,6 +2855,34 @@ pub fn run(app: App) -> Result<()> {
                         context::handle_list(store, events.as_deref(), &session, prefix.as_deref())
                     {
                         context::exit_with_failed_read("context list", &e);
+                    }
+                    Ok(())
+                }
+                ContextCommand::History { session, key } => {
+                    // Exit 2 for what the caller must fix: a key that isn't
+                    // a usable key, or a session that isn't there. A key the
+                    // session never wrote is no error: it prints `[]`. Exit 3
+                    // only when the log exists and can't be read.
+                    if let Err(e) = crate::session::validate::validate_context_key(&key) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "context history"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
+                    if !backend.exists(&session) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!("workflow '{}' not found", session),
+                                "command": "context history"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
+                    if let Err(e) = context::handle_history(&backend, &session, &key) {
+                        context::exit_with_failed_read("context history", &e);
                     }
                     Ok(())
                 }

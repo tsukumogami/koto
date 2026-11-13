@@ -416,6 +416,92 @@ fn list_keys(
     Ok(keys)
 }
 
+/// One write of a context key, as `koto context history` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KeyWrite {
+    /// The `seq` of the event that records the write.
+    pub seq: u64,
+    /// When the write was recorded, as the event's `timestamp`.
+    pub timestamp: String,
+    /// Who wrote the key: `agent`, `koto` or `transition`. `null` for a
+    /// write logged before writers were recorded.
+    pub writer: Option<String>,
+    /// Lowercase hex SHA-256 of the content written.
+    pub hash: String,
+    /// Size of the content written, in bytes.
+    pub size: u64,
+    /// The state the session was in when the write was recorded: the state
+    /// the log names up to and including the write's event, so a
+    /// transition's assignment is in the state it entered. `null` only for
+    /// a write logged before the session's first state.
+    pub state: Option<String>,
+}
+
+/// Every write of `key` in `events`, oldest first.
+///
+/// A write is a `context_added` event for the key, or a `transitioned` event
+/// whose `context_assignments` name it (writer `transition`, hashed over the
+/// assigned value as the store holds it). A `context_added` written by
+/// `sync` is left out: it records a cloud pull bringing the remote copy
+/// down to one host, not a write, and only the hosts that pulled carry it.
+/// Removals and `clear_on_entry` clearings are not writes and are not
+/// listed.
+pub fn write_history(events: &[Event], key: &str) -> Vec<KeyWrite> {
+    let mut state: Option<&str> = None;
+    let mut writes = Vec::new();
+    for event in events {
+        match &event.payload {
+            EventPayload::Transitioned {
+                to,
+                context_assignments,
+                ..
+            } => {
+                state = Some(to.as_str());
+                if let Some(value) = context_assignments.as_ref().and_then(|a| a.get(key)) {
+                    writes.push(KeyWrite {
+                        seq: event.seq,
+                        timestamp: event.timestamp.clone(),
+                        writer: Some(context_log::WRITER_TRANSITION.to_string()),
+                        hash: sha256_hex(value.as_bytes()),
+                        size: value.len() as u64,
+                        state: state.map(str::to_string),
+                    });
+                }
+            }
+            EventPayload::DirectedTransition { to, .. } | EventPayload::Rewound { to, .. } => {
+                state = Some(to.as_str());
+            }
+            EventPayload::ContextAdded {
+                key: k,
+                hash,
+                size,
+                writer,
+            } if k == key && writer.as_deref() != Some(context_log::WRITER_SYNC) => {
+                writes.push(KeyWrite {
+                    seq: event.seq,
+                    timestamp: event.timestamp.clone(),
+                    writer: writer.clone(),
+                    hash: hash.clone(),
+                    size: *size,
+                    state: state.map(str::to_string),
+                });
+            }
+            _ => {}
+        }
+    }
+    writes
+}
+
+/// Print `key`'s write history in `session` as a JSON array, as
+/// [`write_history`] finds it in the session's log. A key never written
+/// prints `[]`. Reads the log only: nothing is stored, and no read is
+/// logged anywhere.
+pub fn handle_history(backend: &dyn SessionBackend, session: &str, key: &str) -> Result<()> {
+    let (_, events) = backend.read_events(session)?;
+    println!("{}", serde_json::to_string(&write_history(&events, key))?);
+    Ok(())
+}
+
 /// The error envelope `command` (`context get` or `context list`) prints
 /// when its read fails. The error's text goes through
 /// [`without_url_userinfo`], as the cloud backend's own errors do, so a URL
@@ -964,5 +1050,124 @@ mod tests {
                 "command": "context list",
             })
         );
+    }
+
+    fn ev(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: format!("2026-01-01T00:00:{seq:02}Z"),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn added(seq: u64, key: &str, content: &[u8], writer: Option<&str>) -> Event {
+        ev(
+            seq,
+            EventPayload::ContextAdded {
+                key: key.to_string(),
+                hash: sha256_hex(content),
+                size: content.len() as u64,
+                writer: writer.map(str::to_string),
+            },
+        )
+    }
+
+    /// A `transitioned` event into `to`, carrying `assignments`, built from
+    /// JSON so the test names only the fields it cares about.
+    fn moved(seq: u64, from: Option<&str>, to: &str, assignments: serde_json::Value) -> Event {
+        let mut payload = serde_json::json!({"from": from, "to": to, "condition_type": "auto"});
+        if !assignments.is_null() {
+            payload["context_assignments"] = assignments;
+        }
+        let line = serde_json::json!({
+            "seq": seq,
+            "timestamp": format!("2026-01-01T00:00:{seq:02}Z"),
+            "type": "transitioned",
+            "payload": payload,
+        });
+        serde_json::from_value(line).unwrap()
+    }
+
+    #[test]
+    fn history_lists_each_write_with_the_state_it_was_made_in() {
+        let events = vec![
+            moved(1, None, "first", serde_json::Value::Null),
+            added(2, "k", b"one", Some(WRITER_AGENT)),
+            added(3, "other", b"x", Some(WRITER_AGENT)),
+            moved(4, Some("first"), "second", serde_json::Value::Null),
+            added(5, "k", b"two", Some(WRITER_AGENT)),
+        ];
+        let history = write_history(&events, "k");
+        let summary: Vec<_> = history
+            .iter()
+            .map(|w| (w.seq, w.state.as_deref(), w.hash.clone(), w.size))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (2, Some("first"), sha256_hex(b"one"), 3),
+                (5, Some("second"), sha256_hex(b"two"), 3),
+            ]
+        );
+        assert_eq!(history[0].timestamp, "2026-01-01T00:00:02Z");
+        assert_eq!(history[0].writer.as_deref(), Some(WRITER_AGENT));
+    }
+
+    #[test]
+    fn history_counts_a_transition_assignment_in_the_state_it_entered() {
+        let events = vec![
+            moved(1, None, "work", serde_json::Value::Null),
+            moved(2, Some("work"), "done", serde_json::json!({"k": "v"})),
+        ];
+        let history = write_history(&events, "k");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].writer.as_deref(), Some("transition"));
+        assert_eq!(history[0].state.as_deref(), Some("done"));
+        assert_eq!(history[0].hash, sha256_hex(b"v"));
+        assert_eq!(history[0].size, 1);
+    }
+
+    #[test]
+    fn history_skips_sync_pulls_and_removals_and_follows_rewinds() {
+        let events = vec![
+            moved(1, None, "a", serde_json::Value::Null),
+            added(2, "k", b"one", None),
+            added(3, "k", b"one", Some("sync")),
+            ev(
+                4,
+                EventPayload::Rewound {
+                    from: "a".to_string(),
+                    to: "z".to_string(),
+                    rationale: None,
+                },
+            ),
+            ev(
+                5,
+                EventPayload::ContextRemoved {
+                    key: "k".to_string(),
+                    writer: Some(WRITER_AGENT.to_string()),
+                },
+            ),
+            added(6, "k", b"two", Some("koto")),
+        ];
+        let history = write_history(&events, "k");
+        let summary: Vec<_> = history
+            .iter()
+            .map(|w| (w.seq, w.writer.as_deref(), w.state.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(2, None, Some("a")), (6, Some("koto"), Some("z"))]
+        );
+    }
+
+    #[test]
+    fn history_of_a_key_never_written_is_empty_json_array() {
+        let events = vec![moved(1, None, "a", serde_json::Value::Null)];
+        let history = write_history(&events, "k");
+        assert!(history.is_empty());
+        assert_eq!(serde_json::to_string(&history).unwrap(), "[]");
     }
 }
