@@ -647,7 +647,11 @@ You can also publish a location explicitly (e.g. for a specific session id):
 koto workflows publish --dir <workflows-dir> --session <session-id>
 ```
 
-`workflows publish` records the directory in the session's context store under the reserved key `workflows/publish-location`; it writes no event. koto resolves the directory on each commit by walking from the session up its parent chain to the nearest published location, so a child session renders into an ancestor's published directory automatically. Under the cloud backend the key stays on the host that wrote it: it isn't uploaded, and `koto session import` doesn't carry it, so an imported session publishes its own location on its first commit on the new host.
+`workflows publish` records the directory in the session's context store under the reserved key `workflows/publish-location`, plus a marker key `workflows/publish-explicit` holding the same directory, and appends a `context_added` event for each. koto resolves the directory on each commit by walking from the session up its parent chain to the nearest published location, so a child session renders into an ancestor's published directory automatically.
+
+A location koto found itself from `CLAUDE_CODE_SESSION_ID` follows the Claude Code session driving the run. After you resume a run in a new Claude Code session, or pick it up from another checkout with a new one (after `koto session rebind`, say), the next commit writes the file into the new session's `/workflows` folder, and the session that owns the key records the new folder. A child session renders into the new folder without getting a key of its own; its parent's key moves on the parent's next commit. The old folder's file is left in place with its last state and stops changing. A location set with `workflows publish` is pinned: a change of driving session doesn't move it. `KOTO_WORKFLOWS_DIR` still wins for any call it's set on.
+
+Under the cloud backend both keys stay on the host that wrote them: they aren't uploaded, and `koto session import` doesn't carry them, so an imported session publishes its own location on its first commit on the new host.
 
 To verify the path end-to-end without a live Claude Code TUI, run `scripts/verify-native-workflows.sh`; the manual TUI procedure is in `docs/guides/native-workflows-verification.md`.
 

@@ -333,7 +333,7 @@ The new session holds the source's events plus a `session_imported` event, every
 
 Running the same import again on a copy an earlier release built, which has no relation, adds the relation and exits 0. If the copy's relation names a different session, the import exits 2 with `relation_conflict` and changes nothing.
 
-One key is the exception. `workflows/publish-location`, the Claude Code `/workflows` folder koto renders the session into, names a folder on the host that wrote it, so it never goes to the bucket and the import doesn't carry it. A manifest pushed by koto 0.19.0 or earlier can list it without its object; the import skips that entry too. On its first commit on the new host, the session publishes its own location from `KOTO_WORKFLOWS_DIR` or the Claude Code session there.
+Two keys are the exception. `workflows/publish-location`, the Claude Code `/workflows` folder koto renders the session into, names a folder on the host that wrote it, so it never goes to the bucket and the import doesn't carry it. `workflows/publish-explicit`, which `koto workflows publish` writes to mark that same folder as set by hand, stays on the host with it. A manifest pushed by koto 0.19.0 or earlier can list the location without its object; the import skips that entry too. On its first commit on the new host, the session publishes its own location from `KOTO_WORKFLOWS_DIR` or the Claude Code session there.
 
 A child session isn't imported on its own, and importing a parent doesn't bring its children: the import copies only the named session's own objects. Neither is an anchor's close session (a session whose header has `kind: "anchor-close"`): the import refuses one with `import_source_is_anchor_close`.
 

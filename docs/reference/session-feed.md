@@ -3331,7 +3331,11 @@ JSON's backslash doubling): roughly 28 KiB.
 
 On every event append, a session with a published `/workflows` location (the
 `workflows/publish-location` context key) writes a `koto-<uuid>.json` file into
-that directory for Claude Code's workflow view. The screen titles the entry
+that directory for Claude Code's workflow view. A location koto found from the
+Claude Code session follows the session driving the run: after a resume or a
+rebind under a new `CLAUDE_CODE_SESSION_ID`, the file goes to the new session's
+folder and the old folder's file stops changing. A location set with
+`koto workflows publish` stays where it was put. The screen titles the entry
 from `workflowName` (the session's intent, else its template and state) and
 shows `summary` (`koto · <session> · <state>`) beneath it; `name` carries the
 same title for readers of contract versions before 4. These field names were
