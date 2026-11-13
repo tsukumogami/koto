@@ -22,7 +22,9 @@ decision: |
   frozen name resolve unchanged. Every write, lock, fsync, hash, machine
   identity function and template validator stays in koto. A per-crate clippy
   ban list, forbid(unsafe_code), a dependency allowlist and a guard script
-  run in a CI job make the crate unable to write. docs/STABILITY.md gains a
+  run in a CI job make the crate unable to write, and every read of the
+  store goes through one capped, non-blocking read that refuses symlinks
+  and non-regular files. docs/STABILITY.md gains a
   scoped, additive-only promise of exactly the store layout the reader reads,
   guarded by a layout marker that is absent today. Dependents pin a koto
   release tag, and the crate carries koto's version. A dashboard golden test
