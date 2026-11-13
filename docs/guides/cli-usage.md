@@ -1508,7 +1508,7 @@ koto session resolve <name> --keep remote
 - `<name>` -- Workflow/session name.
 
 **Required flag:**
-- `--keep` -- Which version to keep: `local` (discard the remote version) or `remote` (discard local changes and pull the remote version).
+- `--keep` -- Which version to keep: `local` (discard the remote version) or `remote` (discard local changes and pull the remote version). `local` never drops a supersede fence: when the bucket's state log holds one this host's copy lacks, the context keys and manifest still go up, but the bucket's log stays and the fence is taken into this host's copy, with a warning on stderr.
 
 **Optional flag:**
 - `--children` -- How to reconcile the parent's children during the same call. One of four modes:

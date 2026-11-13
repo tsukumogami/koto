@@ -1252,6 +1252,40 @@ fn a_carry_of_a_key_the_bucket_lost_finishes_once_the_holding_host_puts_it_back(
     assert_eq!(printed_json(&out.stdout)["carried"], 0);
 }
 
+/// `koto session resolve --keep local` on a host whose copy of the
+/// predecessor predates the fence, as a copy no pull brought the fence into
+/// is, still uploads the lost key but leaves the bucket's fenced log alone,
+/// and takes the fence into that copy; the carry then finishes.
+#[test]
+fn a_resolve_from_a_copy_without_the_fence_keeps_the_bucket_s_fence() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.lose_a_key();
+    assert_lost_key_refusal(&h, &h.supersede(2, "s"));
+
+    let out = h.run(1, &h.w1, &["session", "resolve", "p", "--keep", "local"]);
+    assert_eq!(exit_of(&out), Some(0), "{}", shown(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("supersede fence"),
+        "{}",
+        shown(&out)
+    );
+    assert_eq!(
+        h.s3.object(&h.pred_ctx(LOST)).as_deref(),
+        Some(LOST_VALUE.as_bytes())
+    );
+    assert_eq!(h.fences().len(), 1, "the resolve kept the fence");
+    let local =
+        std::fs::read_to_string(h.sessions(1).join("p").join("koto-p.state.jsonl")).unwrap();
+    assert!(local.contains("session_superseded"), "{local}");
+
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{}", shown(&out));
+    assert_eq!(printed_json(&out.stdout)["carried"], 1);
+    assert!(h.has_marker());
+    assert_eq!(h.fences().len(), 1);
+}
+
 /// A carried key whose read keeps failing is carried from this host's copy
 /// of the predecessor when that copy matches the manifest's hash; the GET
 /// is still asked first.

@@ -31,7 +31,8 @@ use super::{
 };
 use crate::cache::sha256_hex;
 use crate::engine::persistence::{
-    append_supersede_fence, superseded_by, SessionSupersededError, SupersedeFence,
+    append_supersede_fence, superseded_by, superseded_by_in_log, SessionSupersededError,
+    SupersedeFence,
 };
 use crate::engine::types::Event;
 use crate::session::context::Manifest;
@@ -566,6 +567,49 @@ impl CloudBackend {
         use crate::session::context::ContextStore;
         let value = self.local.get(pred, &entry.key).ok()?;
         (sha256_hex(&value) == entry.hash).then_some(value)
+    }
+
+    /// Whether `koto session resolve --keep local` must leave the bucket's
+    /// state log of `id` in place: it holds a supersede fence this host's
+    /// copy lacks. A copy can predate the fence when nothing pulled it in
+    /// since, or when the pull that would have was skipped because a recent
+    /// check said the copy was current; pushing it would drop the fence and
+    /// let the old run write again (koto#560). The fence is taken into this
+    /// host's copy as [`CloudBackend::adopt_fenced_copy`] takes it: the
+    /// bucket's log replaces a copy it extends, and is appended to one that
+    /// holds events the bucket lacks. A bucket log that can't be read, or
+    /// another session's, leaves the push as it always was.
+    pub(crate) fn keeps_bucket_fence(&self, id: &str) -> bool {
+        let Some(local) = self.read_local_state_bytes(id) else {
+            return false;
+        };
+        if superseded_by_in_log(&String::from_utf8_lossy(&local)).is_some() {
+            return false;
+        }
+        let Ok(Some((remote, etag))) = self.get_with_etag(&self.state_key(id)) else {
+            return false;
+        };
+        let Some(fence) = superseded_by_in_log(&String::from_utf8_lossy(&remote)) else {
+            return false;
+        };
+        self.forget_probe(id);
+        match state_log::compare(&local, &remote) {
+            LogOrder::Same | LogOrder::RemoteExtends | LogOrder::HeaderOnly => {
+                if self.write_local_state_bytes(id, &remote).is_ok() {
+                    self.record_synced(id, Some(&etag), &remote, false);
+                }
+            }
+            LogOrder::LocalExtends | LogOrder::Diverged => {
+                let path = self.local.session_dir(id).join(state_file_name(id));
+                let _ = append_supersede_fence(&path, &fence, &fence.at, LOCAL_FENCE_WAIT);
+            }
+            LogOrder::Unrelated => return false,
+        }
+        eprintln!(
+            "warning: the bucket's state log of '{id}' holds a supersede fence this host's \
+             copy lacked; kept the bucket's log and took the fence into this copy"
+        );
+        true
     }
 
     /// Hold `session`'s writes in this process for one push, as a write

@@ -4444,8 +4444,12 @@ impl CloudBackend {
         // The state file directly, not through `sync_push_state`, which
         // would flush an open batch and refuse on the very conflict this
         // upload resolves; the context files above cover the batch's keys.
-        if let Err(e) = self.push_local_state_bytes(id) {
-            eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+        // Never over a fence this copy lacks: the bucket's log stays and
+        // the fence comes into this copy instead.
+        if !self.keeps_bucket_fence(id) {
+            if let Err(e) = self.push_local_state_bytes(id) {
+                eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+            }
         }
 
         self.push_version(id)?;
