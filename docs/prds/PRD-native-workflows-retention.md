@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   Every koto session run inside Claude Code writes a `koto-<session-id>.json`
   entry into that Claude Code session's `workflows` directory, next to Claude
@@ -22,7 +22,7 @@ source_issue: 190
 
 ## Status
 
-Draft
+Accepted
 
 Requirements for the lifecycle of the files koto writes into Claude Code's
 `/workflows` directories. The brief left two calls open, the retention policy
