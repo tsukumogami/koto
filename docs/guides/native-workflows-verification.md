@@ -351,6 +351,75 @@ which advance, block and complete the session, are still done by hand.
    workflows.native false`) and no `KOTO_WORKFLOWS_DIR`, run a koto session and
    confirm `/workflows` is unaffected and no `koto-*.json` is written.
 
+## Retention
+
+A `/workflows` directory holds at most 10 koto entries. Every koto write into
+the directory ends with a sweep of it: when more than 10 files there are koto's,
+the sweep removes finished entries (any top-level `status` other than
+`running`), the one with the oldest `startTime` first, until 10 are left. An
+entry without a numeric `startTime` is ordered by its file's modification time,
+and entries that tie are removed in ascending filename order. Each directory is
+bounded on its own.
+
+A live entry (`running`) is never removed to make room, and neither is the
+entry the write just made, whatever its `startTime`. So while more than 10
+sessions are live, the directory holds more than 10 koto entries; it comes back
+to 10 as they finish and later writes sweep it.
+
+The sweep only touches a file it can prove koto wrote: a regular file named
+`koto-<session-id>.json` whose content carries koto's marker (`id` equal to
+`koto-<session-id>`, `koto.sessionId` equal to `<session-id>`, a numeric
+`koto.contractVersion` and a string `status`). Claude Code's own `wf_*.json`
+files, and any other file, are left as they are and don't count toward the 10.
+A directory already within the bound costs one listing per write and nothing
+is read.
+
+`tests/native_workflows_retention_test.rs` drives 30 sessions to completion
+through the koto binary into one directory, checks that at most 10 entries are
+there after each and that the 10 newest are left, and checks that a seeded
+`wf_test.json` is untouched:
+
+```bash
+CARGO_BUILD_JOBS=2 cargo test --test native_workflows_retention_test
+```
+
+To see it by hand, build koto and run 30 one-step sessions into a scratch
+directory with the same commands the test uses:
+
+```bash
+cargo build
+scratch=$(mktemp -d)
+export KOTO_HOME="$scratch/koto-home" KOTO_WORKFLOWS_DIR="$scratch/workflows"
+cat > "$scratch/retention.md" <<'EOF'
+---
+name: retention-check
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Begin.
+
+## done
+
+Finished.
+EOF
+for n in $(seq -w 1 30); do
+  target/debug/koto init "r$n" --template "$scratch/retention.md" >/dev/null
+  target/debug/koto next "r$n" >/dev/null
+done
+ls "$KOTO_WORKFLOWS_DIR"/koto-*.json | wc -l
+```
+
+The count printed is 10 or fewer.
+
 ## Notes
 
 - koto writes `koto-<uuid>.json`, namespaced so it never collides with Claude

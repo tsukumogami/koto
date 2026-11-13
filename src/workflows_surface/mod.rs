@@ -11,11 +11,13 @@
 //! - [`project`]   -- the minimal projection derived from koto's read seam.
 //! - [`discover`]  -- context-store publish + the nearest-published-ancestor walk.
 //! - [`materialize`] -- the commit-funnel entry point tying it together.
+//! - [`retention`] -- the sweep that bounds a `/workflows` directory after each write.
 
 pub mod contract;
 pub mod discover;
 pub mod materialize;
 pub mod project;
+pub mod retention;
 
 pub use contract::{
     gate_name_display, workflow_filename, HoldingKey, Holdings, Phase, ProgressNode, RenderStatus,

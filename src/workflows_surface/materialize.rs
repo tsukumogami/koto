@@ -27,6 +27,7 @@ use super::contract::{
 };
 use super::discover;
 use super::project::{self, PhaseEntry, PhaseStatus, StateOutcome};
+use super::retention;
 
 /// Max characters in a `promptPreview` / `resultPreview` line before it is
 /// truncated with an ellipsis (keeps the entry legible, not a full dump).
@@ -157,7 +158,11 @@ fn try_materialize(
         file = file.with_blocked_gate(gate);
     }
     let bytes = file.to_json_bytes()?;
-    atomic_write(&dir, &target, &bytes)
+    atomic_write(&dir, &target, &bytes)?;
+    // Bound the directory now that this entry is the newest on disk. The
+    // sweep never fails, so it can't turn a written entry into an error.
+    retention::apply(&dir, &target, &retention::Limits::default());
+    Ok(())
 }
 
 /// The shape of the active phase's `workflow_agent` step.
