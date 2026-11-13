@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   The koto-skills start hook learns its own anchor's name only from the output
   of `koto session anchor open`, which now talks to the configured cloud store
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
