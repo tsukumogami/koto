@@ -245,7 +245,7 @@ The dashboard keeps its TUI, its status buckets and formatting in
 `cli/dashboard.rs`, and the bucket overlay, in koto. `CachedSession`'s
 `imported_from` becomes the crate's import record, `SessionTree`'s
 `remote_failure` moves into koto's dashboard state, and koto adds a
-same-named `refresh` wrapper that calls the crate's `refresh`, then
+`refresh_with_overlay` wrapper that calls the crate's `refresh`, then
 `drop_shadowed_remote`, rebuilding roots if anything was dropped, plus
 `impl SessionSource for LocalBackend`.
 
@@ -340,9 +340,9 @@ Key assumptions:
    or `TEMPLATE_OPEN_FLAGS` (`O_NONBLOCK`, since a template given with
    `--template` may legitimately be a symlink outside the store). It checks
    with `fstat` that the opened file is a regular file, reads at most `cap`
-   bytes, and in `InStore` mode rechecks after the open that the canonical
-   path is still inside the canonicalized store root, as `koto context get`
-   does. It is the
+   bytes, and in `InStore` mode canonicalizes the path again after the
+   open and checks it is still inside the canonicalized store root, as
+   `koto context get` does. It is the
    crate's only `custom_flags` call. The context read, the layout
    marker and the dashboard's store scan (Decision 3) use it. Two reads
    switch to it for every caller, koto's commands included, and apart from
@@ -376,7 +376,9 @@ Key assumptions:
    `cargo metadata` comes from the crates.io registry; `open_plain` is
    called only from the two log readers; nothing under `dashboard.rs` or
    `source.rs` names `read_events`, `read_header`, `read_header_only`,
-   `read_log` or `open_plain`; and the two `cargo tree`
+   `read_log` or `open_plain` (a rule that joins the script in Phase 4,
+   with the scan's switch to the hardened read, since the moved dashboard
+   still calls `read_events` until then); and the two `cargo tree`
    checks pass. A `--self-test` plants each violation in a temporary copy
    and expects a failure.
 5. validate.yml gains a `reader-write-guard` job, "Reader Write Guard":
@@ -538,8 +540,9 @@ check and the cap; the detail view's template read goes the same way.
 Every log read the scan makes is a hardened one: `read_session`'s full
 read, the header-only fallback it takes when a log won't parse whole, and
 `read_detail`'s re-read for the detail view all go through
-`read_store_file` and then `parse_state_log` or a header-only parse of
-those bytes, never through `read_events` or `read_header`, and the guard
+`read_store_file` and then `parse_state_log` or `parse_header_bytes`, a
+header-only parse of those bytes that shares `parse_header` with
+`read_header`, never through `read_events` or `read_header`, and the guard
 script fails if `dashboard.rs` or `source.rs` names either.
 Listing skips a symlinked session directory, as `LocalBackend::list` already does.
 On every store koto itself writes, none of this changes a row; the
@@ -573,7 +576,7 @@ backend and never fails the scan. It returns one of:
 - `Absent`: `ctx/`, an intermediate directory or the file doesn't exist.
 - `Unreadable(reason)`: a symlink at any component (checked with
   `symlink_metadata` on each, then an `O_NOFOLLOW` open of the leaf and a
-  containment recheck of the opened path), a non-regular leaf (opened
+  containment recheck after the open), a non-regular leaf (opened
   non-blocking and re-checked with `fstat`, so a FIFO can't hang the scan),
   a value over 16 MiB, or any I/O error. Refusing symlinks is a deliberate
   difference from `koto context get`; koto never writes one.
@@ -837,8 +840,8 @@ protocol.
 
 ### Overview
 
-After the split the repository is a three-member workspace: koto, the new
-`koto-session-reader`, and `koto-session-list`, beside the existing
+After the split the repository is a four-package workspace: koto, the new
+`koto-session-reader` and `koto-session-list`, and the existing
 `koto-stability-tests`. `koto dashboard` and any outside program call the
 same crate functions to list, read, derive and classify. koto alone writes.
 
@@ -871,7 +874,7 @@ koto (root package)
   src/template/types.rs       mixed: ValidateTemplate and friends + tests
   src/template/variables.rs   VariableDeclExt over the moved VariableDecl
   src/session/version.rs      mixed: machine identity, SessionVersion
-  src/cli/dashboard_data.rs   mixed: bucket overlay, refresh wrapper,
+  src/cli/dashboard_data.rs   mixed: bucket overlay, refresh_with_overlay,
                               impl SessionSource for LocalBackend
   src/cli/dashboard*.rs       TUI and formatting, unchanged
 
@@ -985,7 +988,7 @@ Inside koto, with no new crate: the persistence write half moves into its
 own file and `plan_append` is extracted; validation moves onto the
 `ValidateTemplate`, `ValidateSteps`, `ValidateVocabulary` and
 `VariableDeclExt` trait headers; the dashboard's bucket overlay becomes free
-functions with the `refresh` wrapper; `SessionSource` is introduced and
+functions with the `refresh_with_overlay` wrapper; `SessionSource` is introduced and
 `LocalBackend` implements it. The golden test passes unchanged, and the
 public-API snapshot of `koto::engine::types` and `koto::error` that Phase 3
 diffs against is taken here.
@@ -1020,8 +1023,12 @@ Deliverables:
 ### Phase 4: The read surface
 
 `LocalDirSource`, `sessions_dir`, `read_context`, the layout constants and
-the marker check land in the crate, and the dashboard scan reads through
-`read_store_file` with its caps; koto's backends call `sessions_dir` and
+the marker check land in the crate, and the dashboard scan reads its state
+files, leg pointers, context values and the marker through
+`read_store_file` with their caps (its template reads follow in Phase 5,
+with `is_terminal_state`), at which point the guard script gains its
+rule that `dashboard.rs` and `source.rs` name no plain log reader; koto's
+backends call `sessions_dir` and
 import the constants; `koto session dir --json` gains `sessions`.
 docs/STABILITY.md gains the "Session store read surface" section and the
 dependent's compatibility promise, `docs/workspace-layout.md` gains the
@@ -1049,7 +1056,8 @@ Deliverables:
 
 Terminal detection switches to the minimal projection that tolerates
 unknown fields, and `is_terminal_state` reads the template through
-`read_store_file` in `Template` mode for every caller. This is its own
+`read_store_file` in `Template` mode for every caller, as does the
+dashboard detail view's template read. This is its own
 change because the `/workflows` projection that runs after each commit
 calls `is_terminal_state`; it changes no answer on any template a current
 koto parses, which the golden test and a template-corpus test show.
@@ -1203,8 +1211,10 @@ running where the environment isn't trusted passes an explicit directory.
   pull request that creates the crate, so there's no window where the moved
   tests don't run.
 - The `#[doc(hidden)]` helpers stay outside STABILITY.md, which says so.
-- The rule that a mixed module defines no name the crate exports is checked
-  by the compiler's ambiguity errors and named in the module headers.
+- The rule that a mixed module defines no name the crate exports is named
+  in each mixed module's header and checked by a source-scanning test in
+  koto's `tests/`, since a local item silently shadows a glob import and the
+  compiler reports nothing.
 - The promised read surface is narrow on purpose; everything else in a
   session directory stays free to change, and a breaking change has a
   dual-layout crate release and the marker to carry it.
