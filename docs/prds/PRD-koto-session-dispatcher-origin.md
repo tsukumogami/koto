@@ -2,7 +2,7 @@
 schema: prd/v1
 absorbed:
   - docs/briefs/BRIEF-koto-session-dispatcher-origin.md
-status: Accepted
+status: In Progress
 problem: |
   koto can't reliably say which agent session dispatched a session on the same
   host. The start hook's automatic link has stopped being written on the
@@ -19,7 +19,7 @@ goals: |
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF](docs/briefs/BRIEF-koto-session-dispatcher-origin.md); carried in Absorbed Brief.
 
