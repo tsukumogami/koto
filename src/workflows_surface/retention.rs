@@ -665,6 +665,12 @@ mod tests {
 
     /// A rewrite that can't land (the directory is read-only) leaves the
     /// entry exactly as it was, and the sweep still returns its counts.
+    ///
+    /// This runs at the sweep, not through a koto command: a read-only
+    /// directory fails the command's own entry write first, so the sweep
+    /// would never run, and an unwritable entry file doesn't stop a rename
+    /// over it. The command's result can't change anyway, since `apply`
+    /// returns counts and `try_materialize` ignores them.
     #[cfg(unix)]
     #[test]
     fn a_failed_rewrite_leaves_the_entry_unchanged() {
