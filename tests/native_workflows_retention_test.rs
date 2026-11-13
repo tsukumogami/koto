@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use koto::workflows_surface::retention::{self, Limits, KEEP};
+use koto::workflows_surface::CONTRACT_VERSION;
 use serde_json::{json, Value};
 
 /// A one-step workflow: `koto next` takes a session from `start` straight to
@@ -152,7 +153,7 @@ fn entry(id: &str, status: &str, start_time: Value) -> Value {
             "sessionId": id,
             "workflow": id,
             "currentState": "done",
-            "contractVersion": 5,
+            "contractVersion": CONTRACT_VERSION,
             "status": status,
         },
     })
