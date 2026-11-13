@@ -68,6 +68,8 @@ the behaviour it adds.
 
 **Goal**: The sweep rewrites an owned entry still `running` whose last write (file modification time) is more than two hours old as `killed`, with ` · no activity since <YYYY-MM-DD HH:MM UTC>` on its summary and `koto.staleSince` in its koto block, contract version 6; the owning session's next commit restores `running`; and the Claude Code conventions guard proves the recorded release knows `killed` and checks top-level status words.
 
+**Builds on Step 1**: the sweep is `retention::apply(dir, written, &Limits)` in `src/workflows_surface/retention.rs`, called from `try_materialize` in `materialize.rs` right after the entry's atomic write. `Limits` holds only `keep` (default `KEEP = 10`) and `apply` takes no clock, so this step adds the two-hour window to `Limits` and passes the current time in, keeping both injectable for the fixed-clock tests. Owned entries are recognized by an id allowlist that accepts a leading digit (session UUIDs), not `validate_session_id`. The operator guide's Retention section says a directory within the bound costs one listing and nothing is read; that stops being true once the stale check reads running entries, so this step rewrites that sentence. Step 1's tests live in `tests/native_workflows_retention_test.rs`.
+
 **Acceptance Criteria**:
 
 - [ ] Running `scripts/check-claude-code-conventions.sh` against the recorded release passes the probe for `killed` (and the probes for `running`, `completed` and `failed`), and the same run with `--alter` fails on them. If no acceptable anchor in the recorded release proves `killed`, the step stops here, before any reconciliation code lands.
