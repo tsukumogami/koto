@@ -108,11 +108,15 @@ impl Scratch {
     }
 }
 
-/// The koto-owned entries in `dir`, by file name: files named
-/// `koto-<id>.json` whose content carries koto's marker.
+/// The koto-owned entries in `dir`, by file name: regular files of at most
+/// 1 MiB named `koto-<id>.json` whose content carries koto's whole marker.
 fn owned_entries(dir: &Path) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let meta = entry.metadata().unwrap();
+        if !meta.is_file() || meta.len() > 1024 * 1024 {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(id) = name
             .strip_prefix("koto-")
@@ -123,7 +127,11 @@ fn owned_entries(dir: &Path) -> BTreeMap<String, Value> {
         let Ok(v) = serde_json::from_slice::<Value>(&std::fs::read(entry.path()).unwrap()) else {
             continue;
         };
-        if v["id"] == format!("koto-{id}") && v["koto"]["sessionId"] == id {
+        if v["id"] == format!("koto-{id}")
+            && v["koto"]["sessionId"] == id
+            && v["koto"]["contractVersion"].is_u64()
+            && v["status"].is_string()
+        {
             out.insert(name, v);
         }
     }
@@ -502,4 +510,133 @@ fn a_directory_within_the_bound_is_not_read() {
     assert_eq!(sweep.matched, KEEP);
     assert_eq!(sweep.read, 0);
     assert_eq!(sweep.removed, 0);
+}
+
+/// What a path is on disk, read without following a link: a regular file's
+/// bytes, a link's target and that target's bytes, or a directory's files.
+#[derive(Debug, PartialEq)]
+enum OnDisk {
+    File(Vec<u8>),
+    Link(PathBuf, Vec<u8>),
+    Dir(BTreeMap<String, Vec<u8>>),
+}
+
+fn on_disk(path: &Path) -> OnDisk {
+    let kind = std::fs::symlink_metadata(path).unwrap().file_type();
+    if kind.is_symlink() {
+        OnDisk::Link(
+            std::fs::read_link(path).unwrap(),
+            std::fs::read(path).unwrap(),
+        )
+    } else if kind.is_dir() {
+        OnDisk::Dir(snapshot(path))
+    } else {
+        OnDisk::File(std::fs::read(path).unwrap())
+    }
+}
+
+/// Every `koto-*.json` the sweep can't prove koto wrote stays exactly as it
+/// was while the directory is driven past the bound through the binary, and
+/// none counts toward the bound: lookalikes each missing one marker field,
+/// an unparseable file, an owned-looking file over the 1 MiB read cap,
+/// links to an owned-looking entry and to a lookalike, and a directory.
+#[cfg(unix)]
+#[test]
+fn files_koto_cannot_prove_it_wrote_stay_byte_identical() {
+    let scratch = Scratch::new();
+    let dir = scratch.workflows();
+    let elsewhere = scratch.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let mut no_id = entry("no-id", "completed", json!(1));
+    no_id.as_object_mut().unwrap().remove("id");
+    let mut no_session = entry("no-session", "completed", json!(1));
+    no_session["koto"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sessionId");
+    let mut no_version = entry("no-version", "completed", json!(1));
+    no_version["koto"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contractVersion");
+    let mut no_status = entry("no-status", "completed", json!(1));
+    no_status["status"] = json!(3);
+    let mut big = entry("big", "completed", json!(1));
+    big["padding"] = json!("x".repeat(1024 * 1024));
+
+    let mut kept = vec![
+        seed(&dir, "no-id", &no_id),
+        seed(&dir, "no-session", &no_session),
+        seed(&dir, "no-version", &no_version),
+        seed(&dir, "no-status", &no_status),
+        seed(&dir, "big", &big),
+    ];
+    assert!(std::fs::metadata(&kept[4]).unwrap().len() > 1024 * 1024);
+    let garbage = dir.join("koto-garbage.json");
+    std::fs::write(&garbage, b"{not json").unwrap();
+    kept.push(garbage);
+
+    let owned_target = seed(
+        &elsewhere,
+        "linked",
+        &entry("linked", "completed", json!(1)),
+    );
+    let linked = dir.join("koto-linked.json");
+    std::os::unix::fs::symlink(&owned_target, &linked).unwrap();
+    kept.push(linked);
+    let lookalike_target = elsewhere.join("lookalike.json");
+    std::fs::write(
+        &lookalike_target,
+        br#"{"id":"koto-look","status":"completed"}"#,
+    )
+    .unwrap();
+    let look = dir.join("koto-look.json");
+    std::os::unix::fs::symlink(&lookalike_target, &look).unwrap();
+    kept.push(look);
+    let subdir = dir.join("koto-dir.json");
+    std::fs::create_dir(&subdir).unwrap();
+    std::fs::write(subdir.join("inner"), b"inner").unwrap();
+    kept.push(subdir);
+
+    let before: Vec<OnDisk> = kept.iter().map(|p| on_disk(p)).collect();
+    assert!(owned_entries(&dir).is_empty());
+
+    let names: Vec<String> = (1..=KEEP + 2).map(|n| format!("p{n:02}")).collect();
+    for name in &names {
+        scratch.run_session(name);
+        assert!(owned_entries(&dir).len() <= KEEP);
+    }
+
+    assert_eq!(session_names(&dir), names[2..].to_vec());
+    for (path, was) in kept.iter().zip(&before) {
+        assert_eq!(&on_disk(path), was, "{} changed", path.display());
+    }
+}
+
+/// A `/workflows` directory koto can write into but not list: the entry is
+/// written, the sweep does nothing, and the koto command succeeds as usual.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_directory_leaves_the_command_result_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root ignores the mode bits, so the directory would still list.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let scratch = Scratch::new();
+    let dir = scratch.workflows();
+    for n in 1..=KEEP + 2 {
+        let id = format!("seed{n:02}");
+        seed(&dir, &id, &entry(&id, "completed", json!(n as u64)));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    // `run_session` asserts each koto command exits successfully.
+    scratch.run_session("blind");
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let names = session_names(&dir);
+    assert_eq!(names.len(), KEEP + 3, "nothing was swept: {names:?}");
+    assert!(names.contains(&"blind".to_string()));
 }

@@ -11,10 +11,13 @@
 //! entries (a top-level `status` other than `running`) oldest `startTime`
 //! first, and never removes a live entry or the entry just written, so a
 //! directory with more than [`KEEP`] live sessions holds more until they
-//! finish. A file is koto's only when its name is `koto-<id>.json` with a
-//! session-id-shaped id and its content carries koto's marker (see [`owned`]);
-//! anything else is left exactly as it was and doesn't count toward the
-//! bound, since a false removal in a shared directory can't be undone.
+//! finish. A file is koto's only when it is a regular file named
+//! `koto-<id>.json` with a session-id-shaped id and its content carries koto's
+//! marker (see [`owned`]); anything else is left exactly as it was and doesn't
+//! count toward the bound, since a false removal in a shared directory can't
+//! be undone. A file the sweep judged is checked again right before it is
+//! rewritten or removed, so one its session rewrote meanwhile stays as that
+//! session wrote it.
 //!
 //! A session whose driver died leaves its entry `running` forever, so the
 //! sweep also reconciles stale entries: an owned entry still `running` whose
@@ -24,9 +27,14 @@
 //! dashboard's own threshold for calling a session stalled, and the session's
 //! next commit rewrites its entry from its projection, `running` again.
 //!
+//! A koto command killed between staging an entry and renaming it leaves a
+//! `.koto-wf-*.tmp` file behind, so the sweep also clears those once they are
+//! older than [`TEMP_MIN_AGE`].
+//!
 //! Every step is best-effort: the sweep returns counts, never an error, so it
 //! can't change the outcome of the commit that triggered it.
 
+use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,6 +58,14 @@ pub const KEEP: usize = 10;
 /// (`cli::dashboard_data::liveness::STALLED_THRESHOLD`); a test pins the two
 /// equal so the file and the dashboard never disagree about the same session.
 pub const STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How old a `.koto-wf-*.tmp` file must be before the sweep removes it.
+///
+/// A write stages and renames its temp file within milliseconds, so one a
+/// minute old was left by a koto command that died between the two. The
+/// batch scheduler clears its own temp files after the same age
+/// (`cli::batch::TEMPFILE_SWEEP_MIN_AGE`); a test pins the two equal.
+pub const TEMP_MIN_AGE: Duration = Duration::from_secs(60);
 
 /// The most bytes the sweep reads from one file. An entry koto writes is a
 /// few kilobytes; a larger file is not one of koto's.
@@ -80,23 +96,65 @@ pub struct Sweep {
     /// Regular files whose name matches `koto-<id>.json`, the entry just
     /// written included.
     pub matched: usize,
-    /// Files the sweep opened and read. Zero on the fast path.
+    /// Files the sweep opened and read. Within the bound, only those last
+    /// written more than the stale window ago.
     pub read: usize,
-    /// Owned entries before removal, the entry just written included.
-    /// Zero on the fast path, where nothing is read.
+    /// Owned entries among those read, plus the entry just written. Zero
+    /// when nothing was read.
     pub owned: usize,
     /// Stale entries rewritten as `killed`.
     pub reconciled: usize,
-    /// Entries removed.
+    /// Entries removed, by this sweep or by another process after this
+    /// sweep listed them.
     pub removed: usize,
+    /// koto's own `.koto-wf-*.tmp` files removed.
+    pub temps_removed: usize,
 }
 
-/// One owned entry other than the one just written.
+/// Who a file is, as far as a later check can tell: its last write, its
+/// length and, on Unix, its inode. koto replaces an entry by renaming a new
+/// file over it, so a commit always changes the inode even within one
+/// timestamp tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: SystemTime,
+    len: u64,
+    inode: u64,
+}
+
+impl Stamp {
+    /// The stamp of a regular file; `None` for anything else, or when the
+    /// platform can't give a modification time.
+    fn of(metadata: &Metadata) -> Option<Stamp> {
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Some(Stamp {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            inode,
+        })
+    }
+
+    /// The stamp `path` has now, read without following a link.
+    fn at(path: &Path) -> std::io::Result<Option<Stamp>> {
+        std::fs::symlink_metadata(path).map(|m| Stamp::of(&m))
+    }
+}
+
+/// An owned, finished entry other than the one just written: a candidate
+/// for removal.
 struct Candidate {
     name: String,
     /// The ordering key: `startTime` when the entry has a numeric one, else
     /// the file's modification time, both in epoch milliseconds.
     key: u64,
+    /// The file as the sweep judged it, checked again before removal.
+    stamp: Stamp,
 }
 
 /// A name-matching file from the listing, other than the one just written.
@@ -104,35 +162,67 @@ struct Listed {
     name: String,
     id: String,
     /// The listing's modification time, read without following a link. Only
-    /// decides whether the fast path holds; classification uses the time
-    /// read from the opened file.
+    /// decides which files get read; classification uses the time read from
+    /// the opened file.
     modified: Option<SystemTime>,
+}
+
+/// What the one listing of a directory found.
+struct Listing {
+    /// Name-matching regular files, the entry just written included.
+    matched: usize,
+    /// Name-matching regular files other than the entry just written.
+    others: Vec<Listed>,
+    /// `.koto-wf-*.tmp` regular files and their modification times.
+    temps: Vec<(String, SystemTime)>,
 }
 
 /// Sweep `dir` after koto wrote `written` into it, at time `now`.
 ///
-/// Lists `dir` once, with the modification time of each file that matches
-/// koto's entry name. When at most `limits.keep` match and none but `written`
-/// was last written more than `limits.stale_after` before `now`, returns
-/// having opened nothing. Otherwise reads each name-matching file except
-/// `written` and keeps the owned ones. A stale one (`running`, last written
-/// more than the window ago) is rewritten as `killed` and joins the finished
-/// entries; then finished owned entries are removed from the oldest end
-/// (`startTime`, else modification time, then filename in ascending byte
-/// order) until `limits.keep` owned entries remain or no finished one is
-/// left. A removal that finds the file already gone counts as done; any other
-/// failure skips that file.
+/// Lists `dir` once, with a stat (not following links) of each regular file
+/// named like an entry or like koto's temp file, and clears temp files older
+/// than [`TEMP_MIN_AGE`]. Within the bound (at most `limits.keep` matching
+/// files) it reads only the matching files last written more than
+/// `limits.stale_after` before `now`, which are the only ones that can need a
+/// rewrite; past the bound it reads every matching file except `written`.
+/// Of the files read it keeps the owned ones. A stale one (`running`, last
+/// written more than the window ago) is rewritten as `killed` and joins the
+/// finished entries; then finished owned entries are removed from the oldest
+/// end (`startTime`, else modification time, then filename in ascending byte
+/// order) until `limits.keep` owned entries remain or no finished one is left.
+/// A candidate rewritten since it was read is kept; one already gone counts
+/// as removed; any other failure skips that file.
 pub fn apply(dir: &Path, written: &Path, now: SystemTime, limits: &Limits) -> Sweep {
-    let mut sweep = Sweep::default();
-    let Ok(listing) = std::fs::read_dir(dir) else {
-        return sweep;
-    };
-    let written_name = written.file_name();
+    match list(dir, written) {
+        Some(listing) => finish(dir, listing, now, limits),
+        None => Sweep::default(),
+    }
+}
 
-    let mut others = Vec::new();
-    for entry in listing.flatten() {
-        // `DirEntry::file_type` doesn't follow links, so a symlink or a
-        // directory named like an entry is never matched.
+/// Everything [`apply`] does after its listing.
+fn finish(dir: &Path, listing: Listing, now: SystemTime, limits: &Limits) -> Sweep {
+    let mut sweep = Sweep {
+        matched: listing.matched,
+        ..Sweep::default()
+    };
+    sweep.temps_removed = clear_temps(dir, &listing.temps, now);
+    let candidates = classify(dir, listing.others, now, limits, &mut sweep);
+    evict(dir, candidates, limits, &mut sweep);
+    sweep
+}
+
+/// List `dir` once. `None` when it can't be listed.
+fn list(dir: &Path, written: &Path) -> Option<Listing> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let written_name = written.file_name();
+    let mut listing = Listing {
+        matched: 0,
+        others: Vec::new(),
+        temps: Vec::new(),
+    };
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` doesn't follow links, so a symlink, a FIFO or
+        // a directory named like an entry is never matched.
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
@@ -140,60 +230,119 @@ pub fn apply(dir: &Path, written: &Path, now: SystemTime, limits: &Limits) -> Sw
         let Some(name) = file_name.to_str() else {
             continue;
         };
+        // `DirEntry::metadata` doesn't follow links either; a stat, not an
+        // open.
+        let modified = || entry.metadata().ok().and_then(|m| m.modified().ok());
+        if is_temp(name) {
+            if let Some(modified) = modified() {
+                listing.temps.push((name.to_string(), modified));
+            }
+            continue;
+        }
         let Some(id) = entry_id(name) else {
             continue;
         };
-        sweep.matched += 1;
+        listing.matched += 1;
         if Some(file_name.as_os_str()) == written_name {
             continue;
         }
-        // `DirEntry::metadata` doesn't follow links either; a stat, not an
-        // open, so the fast path still reads no file.
-        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-        others.push(Listed {
+        listing.others.push(Listed {
             name: name.to_string(),
             id: id.to_string(),
-            modified,
+            modified: modified(),
         });
     }
+    Some(listing)
+}
 
-    let any_old = others.iter().any(|o| {
-        o.modified
-            .is_some_and(|m| is_stale(m, now, limits.stale_after))
-    });
-    if sweep.matched <= limits.keep && !any_old {
-        return sweep;
+/// Whether `name` is one of the temp files koto stages entries in
+/// (`materialize::stage`).
+fn is_temp(name: &str) -> bool {
+    name.starts_with(".koto-wf-") && name.ends_with(".tmp")
+}
+
+/// Remove each listed temp file last written more than [`TEMP_MIN_AGE`]
+/// before `now` and still the same regular file; return how many went.
+fn clear_temps(dir: &Path, temps: &[(String, SystemTime)], now: SystemTime) -> usize {
+    let mut removed = 0;
+    for (name, modified) in temps {
+        if !now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > TEMP_MIN_AGE)
+        {
+            continue;
+        }
+        let path = dir.join(name);
+        // A link or directory swapped in under the name since the listing
+        // is not koto's temp file.
+        let still = std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.is_file() && m.modified().ok() == Some(*modified));
+        if still && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
     }
+    removed
+}
 
-    // The entry just written is owned: koto wrote it a moment ago.
-    sweep.owned = 1;
+/// Read the listed files the sweep needs, reconcile the stale ones, and
+/// return the finished owned entries.
+fn classify(
+    dir: &Path,
+    others: Vec<Listed>,
+    now: SystemTime,
+    limits: &Limits,
+    sweep: &mut Sweep,
+) -> Vec<Candidate> {
+    // Within the bound nothing is removed, so only a file old enough to be
+    // stale can need anything; past it, every file is a possible candidate.
+    let over = sweep.matched > limits.keep;
     let mut candidates = Vec::new();
     for listed in others {
+        let old = listed
+            .modified
+            .is_some_and(|m| is_stale(m, now, limits.stale_after));
+        if !over && !old {
+            continue;
+        }
         sweep.read += 1;
         let Some(entry) = owned(&dir.join(&listed.name), &listed.id) else {
             continue;
         };
         sweep.owned += 1;
-        // A stale entry that is reconciled is finished from here on; one
-        // whose rewrite didn't land is still live and stays.
-        let finished = if entry.status != "running" {
-            true
-        } else if is_stale(entry.modified, now, limits.stale_after)
-            && reconcile(dir, &listed.name, &entry)
-        {
-            sweep.reconciled += 1;
-            true
+        // A stale entry that is reconciled is finished from here on, with
+        // the stamp of the file the rewrite put in place; one whose rewrite
+        // didn't land is still live and stays.
+        let stamp = if entry.status != "running" {
+            Some(entry.stamp)
+        } else if is_stale(entry.stamp.modified, now, limits.stale_after) {
+            let rewritten = reconcile(dir, &listed.name, &entry);
+            if rewritten.is_some() {
+                sweep.reconciled += 1;
+            }
+            rewritten
         } else {
-            false
+            None
         };
-        if finished {
+        if let Some(stamp) = stamp {
             candidates.push(Candidate {
-                key: entry.start_time.unwrap_or_else(|| millis(entry.modified)),
+                key: entry
+                    .start_time
+                    .unwrap_or_else(|| millis(entry.stamp.modified)),
                 name: listed.name,
+                stamp,
             });
         }
     }
+    // The entry just written is owned: koto wrote it a moment ago.
+    if sweep.read > 0 {
+        sweep.owned += 1;
+    }
+    candidates
+}
 
+/// Remove finished entries oldest first until `limits.keep` owned entries
+/// remain or no candidate is left.
+fn evict(dir: &Path, mut candidates: Vec<Candidate>, limits: &Limits, sweep: &mut Sweep) {
     // Oldest first; equal keys in ascending filename order. The names are
     // ASCII (they passed the session-id check), so `str` order is byte order.
     candidates.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.name.cmp(&b.name)));
@@ -203,22 +352,44 @@ pub fn apply(dir: &Path, written: &Path, now: SystemTime, limits: &Limits) -> Sw
         if remaining <= limits.keep {
             break;
         }
-        match std::fs::remove_file(dir.join(&candidate.name)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                eprintln!(
-                    "warning: /workflows retention left {}: {:?}",
-                    candidate.name,
-                    e.kind()
-                );
-                continue;
-            }
+        if remove_unchanged(dir, &candidate) {
+            sweep.removed += 1;
+            remaining -= 1;
         }
-        sweep.removed += 1;
-        remaining -= 1;
     }
-    sweep
+}
+
+/// Remove `candidate` when it is still the file the sweep judged; `true`
+/// when it is gone.
+///
+/// A file whose stamp changed was rewritten since it was read, most likely
+/// by its session committing again as `running`, and stays. What remains
+/// between that check and the removal is one system call. A file already
+/// gone (another koto command's sweep took it) counts as removed. Any other
+/// failure leaves the file and warns once, naming it.
+fn remove_unchanged(dir: &Path, candidate: &Candidate) -> bool {
+    let path = dir.join(&candidate.name);
+    match Stamp::at(&path) {
+        Ok(stamp) if stamp == Some(candidate.stamp) => {}
+        Ok(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(e) => {
+            warn_left(&candidate.name, &e);
+            return false;
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn_left(&candidate.name, &e);
+            false
+        }
+    }
+}
+
+fn warn_left(name: &str, e: &std::io::Error) {
+    eprintln!("warning: /workflows retention left {name}: {:?}", e.kind());
 }
 
 /// Whether a file last written at `last_write` is stale at `now`: written
@@ -288,22 +459,24 @@ pub fn reconciled(entry: &Value, last_write: SystemTime) -> Value {
     value
 }
 
-/// Rewrite the stale entry `name` in `dir` as [`reconciled`] says; `true`
-/// when the rewrite landed.
+/// Rewrite the stale entry `name` in `dir` as [`reconciled`] says; the stamp
+/// of the file now in place when the rewrite landed.
 ///
 /// The new content is staged in a temp file in the same directory, the way
 /// every koto entry write is, so a reader never sees half a file and the
-/// rename replaces the path rather than writing through it. Right before the
-/// rename the entry's modification time and length are read again: if either
-/// changed since the sweep judged it, its session committed meanwhile and the
-/// entry is left as that commit wrote it. What remains between that check and
-/// the rename is a few system calls; a commit landing there reads `killed`
-/// until the session's next commit. Any failure leaves the entry as it was.
-fn reconcile(dir: &Path, name: &str, entry: &OwnedEntry) -> bool {
+/// rename replaces the path rather than writing through it. A rename keeps
+/// the staged file's stamp, so the one returned is read from the staged file
+/// before the rename, not from the path after it, which a commit landing
+/// right after the rename could already have replaced. Right before the
+/// rename the entry's stamp is read again: if it changed since the sweep
+/// judged the entry, its session committed meanwhile and the entry is left as
+/// that commit wrote it. What remains between that check and the rename is a
+/// few system calls; a commit landing there reads `killed` until the
+/// session's next commit. Any failure leaves the entry as it was.
+fn reconcile(dir: &Path, name: &str, entry: &OwnedEntry) -> Option<Stamp> {
     let path = dir.join(name);
-    let Ok(mut bytes) = serde_json::to_vec_pretty(&reconciled(&entry.value, entry.modified)) else {
-        return false;
-    };
+    let mut bytes =
+        serde_json::to_vec_pretty(&reconciled(&entry.value, entry.stamp.modified)).ok()?;
     bytes.push(b'\n');
     let staged = match stage(dir, &bytes) {
         Ok(staged) => staged,
@@ -312,24 +485,26 @@ fn reconcile(dir: &Path, name: &str, entry: &OwnedEntry) -> bool {
                 "warning: /workflows retention could not reconcile {name}: {:?}",
                 e.kind()
             );
-            return false;
+            return None;
         }
     };
-    let unchanged = std::fs::symlink_metadata(&path).is_ok_and(|m| {
-        m.is_file() && m.len() == entry.len && m.modified().ok() == Some(entry.modified)
-    });
-    if !unchanged {
-        // Dropping the staged file removes it.
-        return false;
+    // Dropping the staged file on any early return removes it.
+    let stamp = staged
+        .as_file()
+        .metadata()
+        .ok()
+        .and_then(|m| Stamp::of(&m))?;
+    if !Stamp::at(&path).is_ok_and(|now| now == Some(entry.stamp)) {
+        return None;
     }
     match staged.persist(&path) {
-        Ok(_) => true,
+        Ok(_) => Some(stamp),
         Err(e) => {
             eprintln!(
                 "warning: /workflows retention could not reconcile {name}: {:?}",
                 e.error.kind()
             );
-            false
+            None
         }
     }
 }
@@ -358,10 +533,35 @@ struct OwnedEntry {
     value: Value,
     status: String,
     start_time: Option<u64>,
-    /// The opened file's modification time and length, which a reconcile
-    /// compares against right before its rename.
-    modified: SystemTime,
-    len: u64,
+    /// The opened file's stamp, which a reconcile or a removal compares
+    /// against right before it acts.
+    stamp: Stamp,
+}
+
+/// Open `path` for reading without following a link and without blocking.
+///
+/// The listing saw a regular file, but the name can be swapped before the
+/// open: `O_NOFOLLOW` fails the open on a symlink instead of reading
+/// whatever it points at, and `O_NONBLOCK` makes the open of a FIFO return
+/// at once instead of waiting for a writer, which would hang the koto
+/// command. The caller checks the handle's type before reading.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Without `O_NOFOLLOW`, refuse a link by its own metadata before opening;
+/// a swap between the two calls is the window this leaves.
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::other("symlink"));
+    }
+    File::open(path)
 }
 
 /// Read `path` and return it when it is koto's entry for session `id`.
@@ -369,13 +569,14 @@ struct OwnedEntry {
 /// The marker every contract version koto has written carries: a JSON object
 /// whose `id` is `koto-<id>`, whose `koto.sessionId` is `<id>`, whose
 /// `koto.contractVersion` is an unsigned integer and whose top-level
-/// `status` is a string. A file that can't be read, is larger than
-/// [`READ_CAP`], or lacks any part of the marker is not owned.
+/// `status` is a string. A file that isn't a regular file when opened (see
+/// [`open_no_follow`]), can't be read, is larger than [`READ_CAP`], or lacks
+/// any part of the marker is not owned.
 fn owned(path: &Path, id: &str) -> Option<OwnedEntry> {
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    let modified = metadata.modified().ok()?;
-    let len = metadata.len();
+    let file = open_no_follow(path).ok()?;
+    // The handle's own metadata (`fstat`): what was opened, not whatever
+    // the name points at by now.
+    let stamp = Stamp::of(&file.metadata().ok()?)?;
     let mut bytes = Vec::new();
     file.take(READ_CAP + 1).read_to_end(&mut bytes).ok()?;
     if bytes.len() as u64 > READ_CAP {
@@ -392,8 +593,7 @@ fn owned(path: &Path, id: &str) -> Option<OwnedEntry> {
     Some(OwnedEntry {
         status: value.get("status")?.as_str()?.to_string(),
         start_time: value.get("startTime").and_then(Value::as_u64),
-        modified,
-        len,
+        stamp,
         value,
     })
 }
@@ -594,14 +794,14 @@ mod tests {
             QUIET_SINCE_SECS,
         );
         let judged = owned(&path, "quiet").unwrap();
-        assert!(is_stale(judged.modified, now(), STALE_AFTER));
+        assert!(is_stale(judged.stamp.modified, now(), STALE_AFTER));
 
         let mut committed = entry("quiet", "running", "running", 1_000);
         committed["koto"]["currentState"] = json!("review");
         let committed_bytes = serde_json::to_vec_pretty(&committed).unwrap();
         std::fs::write(&path, &committed_bytes).unwrap();
 
-        assert!(!reconcile(dir.path(), "koto-quiet.json", &judged));
+        assert!(reconcile(dir.path(), "koto-quiet.json", &judged).is_none());
         assert_eq!(std::fs::read(&path).unwrap(), committed_bytes);
         assert_eq!(read(&path)["status"], "running");
         assert!(
@@ -738,5 +938,352 @@ mod tests {
         assert_eq!(out["status"], "killed");
         assert_eq!(out["koto"]["contractVersion"], CONTRACT_VERSION);
         assert!(out["koto"].get("status").is_none());
+    }
+
+    /// Seed `n` finished entries `<prefix>NN` in `dir` with `startTime`s
+    /// from `first_start` up, last written a minute before the fixed clock,
+    /// and return their paths oldest first.
+    fn seed_finished(dir: &Path, prefix: &str, n: usize, first_start: u64) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let id = format!("{prefix}{i:02}");
+                seed(
+                    dir,
+                    &id,
+                    &entry(&id, "completed", "completed", first_start + i as u64),
+                    NOW_SECS - 60,
+                )
+            })
+            .collect()
+    }
+
+    fn written_entry(dir: &Path) -> PathBuf {
+        seed(
+            dir,
+            "written",
+            &entry("written", "running", "running", 9_999),
+            NOW_SECS,
+        )
+    }
+
+    fn keep(n: usize) -> Limits {
+        Limits {
+            keep: n,
+            ..Limits::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn the_temp_file_age_is_the_batch_schedulers() {
+        assert_eq!(TEMP_MIN_AGE, Duration::from_secs(60));
+        assert_eq!(TEMP_MIN_AGE, crate::cli::batch::TEMPFILE_SWEEP_MIN_AGE);
+    }
+
+    /// A listed entry swapped for a FIFO before the sweep opens it: the open
+    /// returns at once, the FIFO isn't read as an entry, and it stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_listing_neither_blocks_nor_goes() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let finished = seed_finished(dir.path(), "done", 3, 1);
+        let written = written_entry(dir.path());
+        let listing = list(dir.path(), &written).unwrap();
+        assert_eq!(listing.matched, 4);
+
+        let fifo = finished[0].clone();
+        std::fs::remove_file(&fifo).unwrap();
+        mkfifo(&fifo);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(finish(&path, listing, now(), &keep(1)));
+        });
+        let sweep = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sweep blocked on a FIFO");
+
+        assert_eq!(sweep.read, 3);
+        assert_eq!(sweep.owned, 3, "the FIFO is not an owned entry");
+        assert_eq!(sweep.removed, 2);
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        assert!(written.exists());
+    }
+
+    /// A listed entry swapped for a link to an owned-looking, stale entry
+    /// elsewhere: the link isn't followed, so the target is neither counted
+    /// nor changed, and the link stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_in_after_the_listing_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = seed(
+            elsewhere.path(),
+            "swap",
+            &entry("swap", "running", "running", 1),
+            QUIET_SINCE_SECS,
+        );
+        let target_bytes = std::fs::read(&target).unwrap();
+        let a = seed(
+            dir.path(),
+            "a",
+            &entry("a", "completed", "completed", 2),
+            NOW_SECS - 60,
+        );
+        let swap = seed(
+            dir.path(),
+            "swap",
+            &entry("swap", "completed", "completed", 3),
+            NOW_SECS - 60,
+        );
+        let written = written_entry(dir.path());
+        let listing = list(dir.path(), &written).unwrap();
+
+        std::fs::remove_file(&swap).unwrap();
+        std::os::unix::fs::symlink(&target, &swap).unwrap();
+        let sweep = finish(dir.path(), listing, now(), &keep(1));
+
+        assert_eq!(sweep.read, 2);
+        assert_eq!(sweep.owned, 2, "only `a` and the entry just written");
+        assert_eq!(sweep.reconciled, 0);
+        assert_eq!(sweep.removed, 1);
+        assert!(!a.exists());
+        assert_eq!(std::fs::read_link(&swap).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), target_bytes);
+    }
+
+    /// koto's temp files are cleared once they are over a minute old; a
+    /// fresh one, and a link or directory with the same name shape, stay.
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_over_a_minute_old_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = |name: &str, age: i64| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"partial").unwrap();
+            set_file_mtime(&path, FileTime::from_unix_time(NOW_SECS - age, 0)).unwrap();
+            path
+        };
+        let old = temp(".koto-wf-old.tmp", 61);
+        let fresh = temp(".koto-wf-fresh.tmp", 59);
+        let other = temp(".koto-other-old.tmp", 3600);
+        let link = dir.path().join(".koto-wf-link.tmp");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        filetime::set_symlink_file_times(
+            &link,
+            FileTime::from_unix_time(NOW_SECS - 3600, 0),
+            FileTime::from_unix_time(NOW_SECS - 3600, 0),
+        )
+        .unwrap();
+        let subdir = dir.path().join(".koto-wf-dir.tmp");
+        std::fs::create_dir(&subdir).unwrap();
+        set_file_mtime(&subdir, FileTime::from_unix_time(NOW_SECS - 3600, 0)).unwrap();
+        let written = written_entry(dir.path());
+
+        let sweep = apply(dir.path(), &written, now(), &Limits::default());
+
+        assert_eq!(sweep.temps_removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(other.exists(), "not koto's /workflows temp file");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(subdir.is_dir());
+    }
+
+    /// A finished candidate its session rewrote as `running` after the sweep
+    /// read it is not removed, and the next oldest goes instead.
+    #[test]
+    fn a_candidate_rewritten_after_it_was_read_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let finished = seed_finished(dir.path(), "done", 2, 1);
+        let written = written_entry(dir.path());
+        let listing = list(dir.path(), &written).unwrap();
+        let limits = keep(1);
+        let mut sweep = Sweep {
+            matched: listing.matched,
+            ..Sweep::default()
+        };
+        let candidates = classify(dir.path(), listing.others, now(), &limits, &mut sweep);
+        assert_eq!(candidates.len(), 2);
+
+        let running = serde_json::to_vec_pretty(&entry("done00", "running", "running", 1)).unwrap();
+        std::fs::write(&finished[0], &running).unwrap();
+        evict(dir.path(), candidates, &limits, &mut sweep);
+
+        assert_eq!(sweep.removed, 1);
+        assert_eq!(std::fs::read(&finished[0]).unwrap(), running);
+        assert!(!finished[1].exists());
+    }
+
+    /// A candidate another process removed after the listing counts as
+    /// removed, and the sweep goes on to the next one.
+    #[test]
+    fn a_candidate_that_vanished_counts_as_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let finished = seed_finished(dir.path(), "done", 3, 1);
+        let written = written_entry(dir.path());
+        let listing = list(dir.path(), &written).unwrap();
+        let limits = keep(2);
+        let mut sweep = Sweep {
+            matched: listing.matched,
+            ..Sweep::default()
+        };
+        let candidates = classify(dir.path(), listing.others, now(), &limits, &mut sweep);
+
+        std::fs::remove_file(&finished[0]).unwrap();
+        evict(dir.path(), candidates, &limits, &mut sweep);
+
+        assert_eq!(sweep.removed, 2);
+        assert!(!finished[1].exists());
+        assert!(finished[2].exists() && written.exists());
+    }
+
+    /// A removal that fails for a reason other than not-found (the directory
+    /// is read-only) skips the file, and the sweep still returns.
+    #[cfg(unix)]
+    #[test]
+    fn an_unremovable_candidate_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root ignores the mode bits, so the removal would succeed.
+        if is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let finished = seed_finished(dir.path(), "done", 3, 1);
+        let written = written_entry(dir.path());
+        let before: Vec<Vec<u8>> = finished.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let sweep = apply(dir.path(), &written, now(), &keep(1));
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(sweep.read, 3);
+        assert_eq!(sweep.removed, 0);
+        for (path, bytes) in finished.iter().zip(&before) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    /// Two sweeps of one directory at once both return, the directory ends at
+    /// the bound, and only the oldest finished entries go.
+    #[test]
+    fn two_sweeps_at_once_end_at_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let finished = seed_finished(dir.path(), "done", 15, 100);
+        let live: Vec<PathBuf> = (0..2)
+            .map(|i| {
+                let id = format!("live{i}");
+                seed(
+                    dir.path(),
+                    &id,
+                    &entry(&id, "running", "running", i),
+                    NOW_SECS - 60,
+                )
+            })
+            .collect();
+        let written = written_entry(dir.path());
+        let claude = dir.path().join("wf_test.json");
+        std::fs::write(&claude, br#"{"id":"wf_test","status":"completed"}"#).unwrap();
+        let kept: Vec<(PathBuf, Vec<u8>)> = live
+            .iter()
+            .chain(&finished[8..])
+            .chain([&written, &claude])
+            .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let sweeps: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let dir = dir.path().to_path_buf();
+                let written = written.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply(&dir, &written, now(), &Limits::default())
+                })
+            })
+            .collect();
+        let removed: usize = sweeps.into_iter().map(|t| t.join().unwrap().removed).sum();
+
+        assert!(removed >= 8, "{removed}");
+        for path in &finished[..8] {
+            assert!(!path.exists(), "{}", path.display());
+        }
+        for (path, bytes) in &kept {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+        let left = list(dir.path(), &written).unwrap().matched;
+        assert_eq!(left, KEEP);
+    }
+
+    /// A directory that can't be listed is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        seed_finished(dir.path(), "done", KEEP + 2, 1);
+        let written = written_entry(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let sweep = apply(dir.path(), &written, now(), &keep(1));
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(sweep, Sweep::default());
+        assert_eq!(list(dir.path(), &written).unwrap().matched, KEEP + 3);
+    }
+
+    /// Within the bound the sweep reads only files old enough to be stale:
+    /// one old finished entry among eight fresh ones costs one read per
+    /// write. Past the bound every other matched file is read.
+    #[test]
+    fn within_the_bound_only_old_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = seed(
+            dir.path(),
+            "old",
+            &entry("old", "completed", "completed", 1),
+            QUIET_SINCE_SECS,
+        );
+        seed_finished(dir.path(), "fresh", 8, 10);
+        let written = written_entry(dir.path());
+
+        for _ in 0..2 {
+            let sweep = apply(dir.path(), &written, now(), &Limits::default());
+            assert_eq!(sweep.matched, KEEP);
+            assert_eq!(sweep.read, 1);
+            assert_eq!(sweep.removed, 0);
+            assert!(old.exists());
+        }
+
+        seed_finished(dir.path(), "more", 1, 50);
+        let sweep = apply(dir.path(), &written, now(), &Limits::default());
+        assert_eq!(sweep.matched, KEEP + 1);
+        assert_eq!(sweep.read, KEEP);
+        assert_eq!(sweep.removed, 1);
+        assert!(!old.exists());
     }
 }
