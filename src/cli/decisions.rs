@@ -282,7 +282,14 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
 
     // A reversal entered through this session may have lost since (R19).
     standing::settle(backend, name);
-    let written = store::write(backend, name, |id| {
+    // A decision whose basis names a reversal replaces the reversed
+    // decision (R22): it is aimed at that decision's session, where the
+    // reversal read at `koto next` finds it.
+    let replaces = crate::decisions::read::replacement_target(backend, &basis);
+    let area = replaces
+        .as_ref()
+        .map_or(Area::Decisions, |t| Area::Aimed(t.id.clone()));
+    let written = store::write_in(backend, name, &area, |id| {
         Ok(DecisionBody {
             v: FORMAT_VERSION,
             id: id.to_string(),
@@ -303,7 +310,7 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             evidence,
             reason: req.reason.clone(),
             tool_call: req.tool_call.clone(),
-            target: None,
+            target: replaces,
             standing: None,
             path: None,
             compensating: None,

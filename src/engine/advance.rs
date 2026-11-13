@@ -729,12 +729,15 @@ pub(crate) fn advisories(in_tick: &[Event]) -> Advisories {
 }
 
 /// Options for [`advance_until_stop_recording`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AdvanceOptions {
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AdvanceOptions<'a> {
     /// Whether this invocation recorded evidence for the starting state
     /// before the loop started. One of the two things that make a finding's
     /// `effect_landed` true.
     pub evidence_recorded: bool,
+    /// The decision conditions [`decision_block`] found. When set, the loop
+    /// doesn't run: the result stops in the starting state on them.
+    pub decision_block: Option<&'a BTreeMap<String, StructuredGateResult>>,
 }
 
 /// Most check/rule pairs a response's `attempts.rules` lists.
@@ -1222,7 +1225,7 @@ pub fn advance_until_stop_recording<F, G, I, A>(
     overlay: &VariableOverlay,
     shutdown: &AtomicBool,
     decider: Option<&mut dyn DeciderPort>,
-    options: AdvanceOptions,
+    options: AdvanceOptions<'_>,
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
@@ -1232,6 +1235,11 @@ where
     I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
     A: Fn(&str, &ActionDecl, bool) -> ActionResult,
 {
+    // A reversed decision stops the tick where it stands: nothing is
+    // evaluated, run or appended.
+    if let Some(conditions) = options.decision_block {
+        return Ok(decision_blocked(current_state, conditions.clone()));
+    }
     // The pre-tick log plus every event this invocation appends, in order.
     // Only `.payload` and position matter to the readers of this list, so
     // the in-tick events carry placeholder metadata.
@@ -2779,6 +2787,221 @@ pub fn merge_epoch_evidence(events: &[Event]) -> BTreeMap<String, serde_json::Va
         }
     }
     merged
+}
+
+// ===== A reversed decision stops a live workflow (decision record) =====
+
+/// The conditions `koto next` on `session` stops on before it evaluates
+/// anything (PRD R22, R23): `__decision_reversed__` for each of its
+/// decisions whose winning reversal, read from the sessions on its chain,
+/// nothing has cleared, and `__decision_unreadable__` for each chain
+/// session that can't be read. `None` when nothing blocks. Writes nothing
+/// anywhere. The caller skips it for a terminal workflow.
+pub fn decision_block(
+    backend: &crate::session::Backend,
+    session: &str,
+    session_id: &str,
+    events: &[Event],
+) -> Option<BTreeMap<String, StructuredGateResult>> {
+    let read = crate::decisions::read::aimed_on_chain(backend, session, session_id);
+    decision_conditions(backend, session, &read, events)
+}
+
+/// [`decision_block`] over a chain read already made.
+pub fn decision_conditions(
+    backend: &crate::session::Backend,
+    session: &str,
+    read: &crate::decisions::read::ChainRead,
+    events: &[Event],
+) -> Option<BTreeMap<String, StructuredGateResult>> {
+    use crate::template::types::{DECISION_REVERSED_CONDITION, DECISION_UNREADABLE_CONDITION};
+    if read.skipped {
+        return None;
+    }
+    let mut conditions = BTreeMap::new();
+    let reversed = reversed_decisions(backend, session, read, events);
+    if !reversed.is_empty() {
+        conditions.insert(
+            DECISION_REVERSED_CONDITION.to_string(),
+            decision_condition(serde_json::json!({
+                "decisions": reversed,
+                "clears_when": "koto rewind takes the workflow back to the state the decision \
+                                recorded or an earlier one, or the reverser or a session above \
+                                it records a new decision of the same kind naming the reversal \
+                                in its basis",
+            })),
+        );
+    }
+    if !read.unreadable.is_empty() {
+        let sessions: Vec<serde_json::Value> = read
+            .unreadable
+            .iter()
+            .map(|u| serde_json::json!({"session": u.session, "reason": u.reason}))
+            .collect();
+        conditions.insert(
+            DECISION_UNREADABLE_CONDITION.to_string(),
+            decision_condition(serde_json::json!({ "sessions": sessions })),
+        );
+    }
+    (!conditions.is_empty()).then_some(conditions)
+}
+
+/// The result a blocked tick reports: it stays in `state` and advances
+/// nothing.
+pub fn decision_blocked(
+    state: &str,
+    conditions: BTreeMap<String, StructuredGateResult>,
+) -> AdvanceResult {
+    AdvanceResult {
+        final_state: state.to_string(),
+        advanced: false,
+        stop_reason: StopReason::GateBlocked(conditions),
+        attempts: None,
+        advisories: Advisories::default(),
+    }
+}
+
+fn decision_condition(output: serde_json::Value) -> StructuredGateResult {
+    StructuredGateResult {
+        outcome: GateOutcome::Failed,
+        output,
+        failure: None,
+        findings: Vec::new(),
+        duration_ms: None,
+        context_reads: Vec::new(),
+        poll: None,
+        decider_checks: Vec::new(),
+        decider_fallbacks: Vec::new(),
+        markers: Default::default(),
+    }
+}
+
+/// Each decision of `session` that reads reversed and isn't cleared, as
+/// the condition lists it. R19's winner among the reversals of a decision
+/// is the one that counts; the others block nothing. A decision koto
+/// can't read in `session` stays blocked, since nothing can show it
+/// cleared.
+fn reversed_decisions(
+    backend: &crate::session::Backend,
+    session: &str,
+    read: &crate::decisions::read::ChainRead,
+    events: &[Event],
+) -> Vec<serde_json::Value> {
+    use crate::decisions::body::DecisionBody;
+    let mut by_target: BTreeMap<(String, String), Vec<&DecisionBody>> = BTreeMap::new();
+    for (_, body) in &read.found {
+        if let (true, Some(t)) = (body.kind == "reverse", &body.target) {
+            if read.aim_ids.contains(&t.id) {
+                by_target
+                    .entry((t.id.clone(), t.decision.clone()))
+                    .or_default()
+                    .push(body);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ((_, decision), reversals) in by_target {
+        let Some(winner) = crate::decisions::standing::winner(reversals.iter().copied()) else {
+            continue;
+        };
+        let original =
+            crate::decisions::read::own_decision(backend, session, &read.aim_ids, &decision);
+        if let Ok(Some(o)) = &original {
+            if rewound_past(o, events) || replaced(backend, session, o, winner, &read.found) {
+                continue;
+            }
+        }
+        let (kind, state) = match &original {
+            Ok(Some(o)) => (Some(o.kind.clone()), Some(o.state.clone())),
+            _ => (None, None),
+        };
+        out.push(serde_json::json!({
+            "session": session,
+            "id": decision,
+            "kind": kind,
+            "state": state,
+            "unreadable": original.as_ref().err(),
+            "reversal": {
+                "session": winner.session.name,
+                "id": winner.id,
+                "time": winner.time,
+                "standing": winner.standing,
+                "reason": winner.reason,
+            },
+            "decider": winner.decider,
+        }));
+    }
+    out
+}
+
+/// Whether the log holds a `rewound` event appended after `original`
+/// whose target is the state it recorded or a state the workflow entered
+/// before it.
+fn rewound_past(original: &crate::decisions::body::DecisionBody, events: &[Event]) -> bool {
+    let entered = |e: &Event| match &e.payload {
+        EventPayload::Transitioned { to, .. }
+        | EventPayload::DirectedTransition { to, .. }
+        | EventPayload::Rewound { to, .. } => Some(to.clone()),
+        _ => None,
+    };
+    let mut before: BTreeSet<String> = events
+        .iter()
+        .filter(|e| e.seq <= original.log_seq)
+        .filter_map(entered)
+        .collect();
+    before.insert(original.state.clone());
+    events.iter().any(|e| {
+        e.seq > original.log_seq
+            && matches!(&e.payload, EventPayload::Rewound { to, .. } if before.contains(to))
+    })
+}
+
+/// Whether a decision found on the chain replaces `original` past
+/// `reversal` (PRD R22): the same kind (for a gate pass, the same workflow,
+/// state and gate), naming the reversal in its `basis`, recorded by a
+/// decider with standing over the reversal under R17's rules. The deciding
+/// session deciding as a session never counts, and in its own aimed area
+/// only a person's replacement does. An `asserted` replacement doesn't
+/// clear a `verified` reversal.
+fn replaced(
+    backend: &crate::session::Backend,
+    session: &str,
+    original: &crate::decisions::body::DecisionBody,
+    reversal: &crate::decisions::body::DecisionBody,
+    found: &[(String, crate::decisions::body::DecisionBody)],
+) -> bool {
+    use crate::decisions::decider::Decider;
+    use crate::decisions::standing::{judge, ASSERTED, VERIFIED};
+    let named = crate::decisions::body::BasisRef {
+        session: reversal.session.name.clone(),
+        id: reversal.id.clone(),
+    };
+    found.iter().any(|(holder, r)| {
+        if r.kind == "reverse" || r.kind != original.kind || !r.basis.contains(&named) {
+            return false;
+        }
+        let (person, entered) = match &r.decider {
+            Decider::Person { entering, .. } => (true, entering.session.value.as_str()),
+            Decider::Session { session, .. } | Decider::Check { session, .. } => {
+                (false, session.value.as_str())
+            }
+        };
+        if !person && (holder == session || entered == session) {
+            return false;
+        }
+        if original.kind == "gate-pass"
+            && ["workflow", "state", "gate"]
+                .iter()
+                .any(|f| r.subject.get(*f) != original.subject.get(*f))
+        {
+            return false;
+        }
+        match judge(backend, reversal, holder, &r.decider, None) {
+            Ok(p) if p.standing == VERIFIED => true,
+            Ok(_) => reversal.standing.as_deref() == Some(ASSERTED),
+            Err(_) => false,
+        }
+    })
 }
 
 #[cfg(test)]

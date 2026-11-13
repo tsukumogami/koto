@@ -47,7 +47,7 @@ pub struct ChainSnapshot {
 /// when readable. `Err` when the links directory can't be listed, or isn't
 /// a directory. A link file that is a symlink or not a regular file is
 /// skipped as no link.
-fn peers(
+pub(super) fn peers(
     store: &dyn SessionBackend,
     session: &str,
     kind: LinkKind,

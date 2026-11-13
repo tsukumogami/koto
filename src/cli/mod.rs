@@ -6519,6 +6519,30 @@ fn handle_next(
         checks: check_evaluator.as_ref(),
     };
 
+    // A reversed decision, or a chain session koto can't read for
+    // reversals, stops a live workflow before anything is written
+    // (decision record, PRD R22 and R23). `--to` and `--with-data` refuse.
+    let decision_block = compiled
+        .states
+        .get(&machine_state.current_state)
+        .is_some_and(|s| !s.terminal)
+        .then(|| {
+            crate::engine::advance::decision_block(backend, &name, &header.session_id, &events)
+        })
+        .flatten();
+    if let (Some(block), true) = (&decision_block, to.is_some() || with_data.is_some()) {
+        let ne = NextError {
+            code: NextErrorCode::PreconditionFailed,
+            message: "a decision of this workflow was reversed, or a session on its chain \
+                      can't be read; see blocking_conditions"
+                .to_string(),
+            details: vec![],
+        };
+        let blocking = blocking_conditions_from_gates(block, &Default::default());
+        let json = serde_json::json!({"error": ne, "blocking_conditions": blocking});
+        exit_with_error_code(json, ne.code.exit_code());
+    }
+
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
         let current_state = &machine_state.current_state;
@@ -7818,7 +7842,10 @@ fn handle_next(
         decider_port
             .as_mut()
             .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
-        crate::engine::advance::AdvanceOptions { evidence_recorded },
+        crate::engine::advance::AdvanceOptions {
+            evidence_recorded,
+            decision_block: decision_block.as_ref(),
+        },
     );
     drop(decider_port);
 

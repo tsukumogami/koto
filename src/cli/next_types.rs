@@ -1429,10 +1429,11 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::Error => "error",
                 GateOutcome::Pending => "pending",
             };
-            if name == ACTION_CONDITION_NAME {
+            let decision = crate::template::types::is_decision_condition(name);
+            if name == ACTION_CONDITION_NAME || decision {
                 return Some(BlockingCondition {
                     name: name.clone(),
-                    condition_type: "action".to_string(),
+                    condition_type: if decision { "decision" } else { "action" }.to_string(),
                     status: status.to_string(),
                     category: "corrective".to_string(),
                     agent_actionable: false,
