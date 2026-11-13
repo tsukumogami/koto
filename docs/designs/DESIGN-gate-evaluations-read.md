@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   No read-only koto verb prints a session's gate evaluations. The session's
   event log records each one as a `gate_evaluated` event (gate, outcome,
@@ -36,7 +36,7 @@ user_visible_surface: true
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
