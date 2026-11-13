@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto dashboard's session reader (log parsing, row derivation, liveness, the
   modification-time diff and the session tree) lives inside koto's one
@@ -48,7 +48,7 @@ rationale: |
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
