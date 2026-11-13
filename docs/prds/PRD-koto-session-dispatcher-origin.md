@@ -1,7 +1,8 @@
 ---
 schema: prd/v1
+absorbed:
+  - docs/briefs/BRIEF-koto-session-dispatcher-origin.md
 status: Accepted
-upstream: docs/briefs/BRIEF-koto-session-dispatcher-origin.md
 problem: |
   koto can't reliably say which agent session dispatched a session on the same
   host. The start hook's automatic link has stopped being written on the
@@ -20,9 +21,48 @@ goals: |
 
 Accepted
 
-Requirements for recording each session's dispatcher in koto, derived from the
-Accepted `docs/briefs/BRIEF-koto-session-dispatcher-origin.md`. This document
-fixes what must be true and how it is checked; the mechanism is the design's.
+Absorbed [BRIEF](docs/briefs/BRIEF-koto-session-dispatcher-origin.md); carried in Absorbed Brief.
+
+Requirements for recording each session's dispatcher in koto, with the framing
+that motivated them carried in the section below. This document fixes what
+must be true and how it is checked; the mechanism is the design's.
+
+## Absorbed Brief
+
+This is the first piece of a larger effort to read a fleet of agent sessions
+from what koto records. It covers only the link from a session to the session
+that dispatched it; seats, roles and any view over the records come later.
+
+A coordinating agent session hands work to other sessions, on the reference
+host through a workspace launcher that starts each worker as a fresh
+coding-assistant session in its own checkout. Anyone who later wants to know
+how the work is organized, a person or a program, needs to ask koto one
+question about a session: who started it? koto already has the place for the
+answer: `koto init` and `koto session link` write a dispatched-by link, and
+koto's decision records read the nearest such link as the decider's
+dispatcher. So the gap isn't a missing field. It's that the link isn't written
+reliably, the working substitute costs the agent turns, and a session nobody
+dispatched looks the same as one whose link was lost.
+
+The outcome a user should experience: for every session started on a host, a
+reader of koto sees the session that dispatched it, whether the launcher or a
+person started it, or an explicit record that it has none, told apart from a
+failed link. The agent in the session does none of this and pays nothing for
+it, and a machine with koto and shirabe and no launcher gets the parentless
+record with no error, warning or install prompt. Three journeys test that
+outcome, and each became an acceptance criterion below: ten dispatches in a
+row from one coordinator each record it (AC1); a hand-started shirabe session
+on a launcher-free machine reads as having no parent (AC3); and a measured
+before-and-after read shows the agent's koto calls cost the same, with no
+dispatcher text in its transcript (AC7, AC8).
+
+The questions the framing left to this document were how the starter hands
+its dispatcher to koto, the shape of the record including the no-parent case,
+why the automatic link stopped being written and whether its repair is the
+same change, and whether the launcher has to change. The starting points in
+the code are `docs/designs/current/DESIGN-session-retention.md` (which
+introduced the per-agent-session anchor), `src/session/anchor.rs`, and
+`plugins/koto-skills/hooks/session-start.sh`.
 
 ## Problem Statement
 
