@@ -4,13 +4,12 @@ status: Accepted
 problem: |
   No read-only koto verb prints a session's gate evaluations, so a program
   that counts how often the same gate fails on the same rule across sessions
-  has to parse koto's state files itself, and has no answer at all for a
-  session in another workspace.
+  has to parse koto's files itself, and no verb reads another workspace's
+  gate evaluations either.
 outcome: |
-  A program lists a session's gate evaluations through a koto verb, with the
-  gate name, outcome, rule ids, template and time of each, and reads a
-  session in another workspace the way the other read verbs do, without
-  knowing koto's file layouts.
+  A read-only way to list a session's gate evaluations with, for each one,
+  the gate name, the outcome, the rule ids of its findings, the template,
+  and the time.
 ---
 
 # BRIEF: Reading a session's gate evaluations
@@ -21,47 +20,46 @@ Accepted
 
 This brief frames the problem in koto#688 for the design that answers it,
 `docs/designs/DESIGN-gate-evaluations-read.md`. It restates the issue and
-adds no requirement of its own: the need is the issue's, and the open
-questions are all about how to meet it.
+adds no requirement of its own: the need is the issue's, and how it's met
+is the design's question.
 
 ## Problem Statement
 
-koto evaluates a state's gates on every `koto next` and records each
-evaluation: the session's event log gets a `gate_evaluated` event with the
-gate, the outcome, the time and the findings' rule ids, and the run journal
-gets matching check records. Neither is reachable through a verb. `koto
-status`, `koto dashboard <session> --detail`, `koto overrides list`, `koto
-decisions list` and `koto context list` show other things.
+No read-only koto verb prints a session's gate evaluations: the gate name,
+the rule id of each finding, the template, and the time of each evaluation.
+`koto status`, `koto overrides list`, `koto dashboard <session> --detail`,
+`koto decisions list` and `koto context list` print none of them.
 
-So a program that wants to know which gates failed in a session, and on
-which rules, parses koto's files. The case that raised this is a sweep that
-counts repeats of the same gate failing on the same rule across many
-sessions. It also can't reach a session in another workspace, because
-`--workspace` serves only the read verbs it lists.
+The data lives in files, not verbs. Each `gate_evaluated` event in the
+session's event log carries the gate, the outcome, the timestamp and the
+findings' rule ids, with the template named only in the session header. The
+per-host run journal holds the same evaluations as check records.
+
+So a program that wants to count how often the same gate fails on the same
+rule across sessions has to parse koto's files itself. `--workspace`
+accepts only `status`, `context get`, `context exists`, `context list`,
+`decisions list`, `decisions show` and `overrides list`, so no verb reads
+another workspace's gate evaluations either.
 
 ## User Outcome
 
-A program asks koto for a session's gate evaluations and gets, for each
-one, the gate name, the outcome, the rule ids of its findings, the template
-and the time, in a documented shape. It can group and count them without
-reading a state file, and it gets the same answer for a session in another
-workspace that the other read verbs give.
+A read-only way to list a session's gate evaluations with, for each one,
+the gate name, the outcome, the rule ids of its findings, the template, and
+the time.
 
 ## User Journeys
 
-A maintainer runs a sweep over the sessions a store holds. For each
-session it lists the gate evaluations, keeps the failed ones, and counts
-(template, gate, rule) triples, so a rule that keeps firing stands out. When
-a session lives in another workspace, the sweep asks for it with
-`--workspace` and gets the same records.
+A program counts how often the same gate fails on the same rule across
+sessions. It lists each session's gate evaluations through koto rather than
+parsing koto's files.
 
 ## Scope Boundary
 
-In scope: a read-only way to list one session's gate evaluations with the
-fields above, and how it behaves for a session in another workspace.
+In scope: a read-only way to list a session's gate evaluations with the
+fields above.
 
-Out of scope: the sweep itself, how its counts are stored or shown, and
-evaluations of sessions koto has already removed.
+Out of scope: how it's exposed, which is the design's question and not
+settled here.
 
 ## References
 
