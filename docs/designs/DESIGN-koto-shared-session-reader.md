@@ -341,7 +341,8 @@ Key assumptions:
    `--template` may legitimately be a symlink outside the store). It checks
    with `fstat` that the opened file is a regular file, reads at most `cap`
    bytes, and in `InStore` mode rechecks after the open that the canonical
-   path is still inside the store, as `koto context get` does. It is the
+   path is still inside the canonicalized store root, as `koto context get`
+   does. It is the
    crate's only `custom_flags` call. The context read, the layout
    marker and the dashboard's store scan (Decision 3) use it. Two reads
    switch to it for every caller, koto's commands included, and apart from
@@ -373,7 +374,9 @@ Key assumptions:
    `build.rs`; neither the crate's manifest nor the workspace root's
    carries `[patch]` or `[replace]`; every dependency of the crate in
    `cargo metadata` comes from the crates.io registry; `open_plain` is
-   called only from the two log readers; and the two `cargo tree`
+   called only from the two log readers; nothing under `dashboard.rs` or
+   `source.rs` names `read_events`, `read_header`, `read_header_only`,
+   `read_log` or `open_plain`; and the two `cargo tree`
    checks pass. A `--self-test` plants each violation in a temporary copy
    and expects a failure.
 5. validate.yml gains a `reader-write-guard` job, "Reader Write Guard":
@@ -532,6 +535,12 @@ goes on. The template read uses `Template` mode, which follows a symlink
 and skips the containment check, since a template given with `--template`
 lives outside the store, but keeps the non-blocking open, the regular-file
 check and the cap; the detail view's template read goes the same way.
+Every log read the scan makes is a hardened one: `read_session`'s full
+read, the header-only fallback it takes when a log won't parse whole, and
+`read_detail`'s re-read for the detail view all go through
+`read_store_file` and then `parse_state_log` or a header-only parse of
+those bytes, never through `read_events` or `read_header`, and the guard
+script fails if `dashboard.rs` or `source.rs` names either.
 Listing skips a symlinked session directory, as `LocalBackend::list` already does.
 On every store koto itself writes, none of this changes a row; the
 reviewer run in Decision 5 records the largest state log in the reference
@@ -1028,6 +1037,9 @@ Deliverables:
 - tests in koto's `tests/` that build a store at run time with a FIFO, a
   symlink, an over-cap file and a planted marker, each marking one session
   or refusing the store as described, and the golden test unchanged
+- a test that a malformed log, pointer, template and marker each yield a
+  reason holding only a fixed category string and the path, with none of
+  the file's bytes
 - protected `v*` tags on the koto repository, a repository setting the
   release owner turns on before the first dependent pins a tag
 - the STABILITY.md and workspace-layout.md sections
@@ -1067,6 +1079,12 @@ is what those writers recorded. A program built on it displays
 agent-written state; it isn't a monitor of agents, and "status comes from
 koto" means it comes from koto's records, not that koto vouches for them.
 An agent that wants a session to look finished can already write that log.
+Under the cloud backend the local mirror can also take files from the
+bucket when koto pulls a session, so other machines' writers can be among
+those writers too; the reader treats
+their files exactly like local ones. A writer that touches every state file
+on every refresh forces each to be re-read, up to its cap, on each
+refresh; that time cost is an accepted residual of the same kind.
 
 **Untrusted files.** Every read of a path inside the store, and of the
 compiled template a log names, goes through `read_store_file`: a
