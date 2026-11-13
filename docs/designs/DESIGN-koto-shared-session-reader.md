@@ -131,9 +131,10 @@ Out of scope:
 - **The frozen surface holds.** `docs/STABILITY.md` freezes the types under
   `koto::engine::types` and four `SessionBackend` methods. Moving their
   definitions mustn't change a path or a shape a dependent imports.
-- **The agent's calls cost what they did.** Nothing in the split changes what
-  runs when a session is ticked, so a measured run's koto calls are
-  unaffected.
+- **The agent's calls cost what they did.** The split moves code without
+  changing what a tick computes, so an agent's koto calls do the same work.
+  Where a read koto's commands share with the reader has to change, it
+  keeps every answer for the files koto writes, and the design names it.
 - **The layout gap is owned.** The session directory layout, the state file
   name, the `ctx/` store and the leg pointer are promised nowhere today. A
   reader outside koto relies on them, so whatever the shared code promises
@@ -327,9 +328,11 @@ Key assumptions:
    clippy::disallowed_types)]`. Every file open in the crate lives in one
    module, `fs_read.rs`, which holds the only allows and offers two
    functions. `open_plain(path)` is today's `File::open`, kept for the
-   reads koto's own commands already make through `read_events`,
-   `read_header` and `is_terminal_state`, so the tick path reads exactly as
-   it does now. `read_store_file(path, cap, mode)` is the hardened read. It
+   reads koto's own commands make of their own session's log through
+   `read_events` and `read_header`, so those read exactly as they do now.
+   The guard script allows it to be called only from those log readers in
+   `persistence.rs`; the dashboard scan and the read surface can't reach
+   it. `read_store_file(path, cap, mode)` is the hardened read. It
    takes no flag argument: `mode` is `InStore` or `Template`, and each maps
    to a fixed constant, `IN_STORE_OPEN_FLAGS` (`O_NOFOLLOW | O_NONBLOCK`)
    or `TEMPLATE_OPEN_FLAGS` (`O_NONBLOCK`, since a template given with
@@ -338,10 +341,15 @@ Key assumptions:
    bytes, and in `InStore` mode rechecks after the open that the canonical
    path is still inside the store, as `koto context get` does. It is the
    crate's only `custom_flags` call. The context read, the layout
-   marker and the dashboard's store scan (Decision 3) use it, and so does
-   `read_pointer` for every caller: it already opens with `O_NOFOLLOW`, and
-   the non-blocking open and regular-file check change no answer for a
-   regular file, only for a FIFO or device that blocks it today.
+   marker and the dashboard's store scan (Decision 3) use it. Two reads
+   switch to it for every caller, koto's commands included, and these are
+   the only places the split changes what a koto command runs:
+   `read_pointer`, which already opens with `O_NOFOLLOW`, and
+   `is_terminal_state`, which today calls `fs::read` on the template path
+   and is also what the `/workflows` projection calls after each commit.
+   For a regular file under the cap neither changes an answer; only a FIFO,
+   device or over-cap file, which blocks or reads without bound today, is
+   refused.
 3. `cargo tree -p koto-session-reader --depth 1` must list only an
    allowlist of direct dependencies: anyhow, serde, serde_json, thiserror,
    regex, aho-corasick, toml, libc, sha2, hex (the template declaration
@@ -358,8 +366,10 @@ Key assumptions:
    constants, whose definitions read exactly `O_NOFOLLOW | O_NONBLOCK` and
    `O_NONBLOCK`;
    `clippy.toml` still holds every required entry; the crate has no
-   `build.rs` and no `[patch]` or `[replace]`; every dependency in `cargo
-   metadata` comes from the crates.io registry; and the two `cargo tree`
+   `build.rs`; neither the crate's manifest nor the workspace root's
+   carries `[patch]` or `[replace]`; every dependency of the crate in
+   `cargo metadata` comes from the crates.io registry; `open_plain` is
+   called only from the two log readers; and the two `cargo tree`
    checks pass. A `--self-test` plants each violation in a temporary copy
    and expects a failure.
 5. validate.yml gains a `reader-write-guard` job, "Reader Write Guard":
@@ -487,8 +497,9 @@ the crate and so in koto, reads a minimal projection,
 template a current koto parses, its answer is the same as today's.
 
 *Breaking changes.* The marker is `<sessions dir>/.koto-store-layout`, and a
-missing file means layout 1, so nothing is written today. The reader checks
-it before listing and refuses the whole store with a named error, giving
+missing file means layout 1, so nothing is written today. The check sits in
+the crate's `scan_sessions`, so `koto dashboard` makes it too and the two
+can't diverge. The reader checks it before listing and refuses the whole store with a named error, giving
 the marker's path and the found and supported numbers, when the number is
 higher than it knows, as the log refuses a higher `schema_version`. A marker
 that isn't a regular file, is over 64 bytes or doesn't parse as a number is
@@ -512,8 +523,8 @@ marks that one session or value unreadable with its reason, and the scan
 goes on. The template read uses `Template` mode, which follows a symlink
 and skips the containment check, since a template given with `--template`
 lives outside the store, but keeps the non-blocking open, the regular-file
-check and the cap. Listing
-skips a symlinked session directory, as `LocalBackend::list` already does.
+check and the cap; the detail view's template read goes the same way.
+Listing skips a symlinked session directory, as `LocalBackend::list` already does.
 On every store koto itself writes, none of this changes a row; the
 reviewer run in Decision 5 records the largest state log in the reference
 store, which must sit well under its cap.
@@ -745,8 +756,10 @@ code `koto dashboard` reads sessions with, and a guard that makes that
 member unable to write. Files move with `git mv`; koto depends on the member
 by path and re-exports each moved module at its old path, so
 `koto::engine::types`, `derive_state_from_log`, `koto::error::Error` and
-every internal caller resolve as they do today, and the tick path runs the
-same function bodies. Everything that writes stays in koto: the append and
+every internal caller resolve as they do today. koto's commands run the same
+function bodies, except that two reads (`read_pointer` and
+`is_terminal_state`) gain the hardened open, which changes no answer for a
+regular file. Everything that writes stays in koto: the append and
 lock half of `engine::persistence`, `jsonl_append`, `write_pointer`,
 `SessionVersion::save`, machine identity, template validation (moved onto
 koto-local traits by changing only `impl` headers) and the context store's
@@ -865,6 +878,7 @@ impl LocalDirSource {
 pub enum BackendKind { Local, Cloud }
 pub fn sessions_dir(backend: Option<BackendKind>) -> anyhow::Result<PathBuf>;
 
+// Debug prints the variant, the source and the byte length, never the bytes.
 pub enum ContextRead {
     Unusable(String),
     Absent,
@@ -983,22 +997,26 @@ packaging job lands.
 Deliverables:
 - `koto-session-reader/src/source.rs` and the capped scan in
   `src/dashboard.rs`
-- tests with a FIFO, a symlink, an over-cap file and a planted marker in a
-  generated store, each marking one session or refusing the store as
-  described, and the golden test unchanged
+- tests in koto's `tests/` that build a store at run time with a FIFO, a
+  symlink, an over-cap file and a planted marker, each marking one session
+  or refusing the store as described, and the golden test unchanged
+- protected `v*` tags on the koto repository, a repository setting the
+  release owner turns on before the first dependent pins a tag
 - the STABILITY.md and workspace-layout.md sections
 - the version-equality and `cargo package` CI job
 
 ### Phase 5: Terminal projection
 
 Terminal detection switches to the minimal projection that tolerates
-unknown fields. This is its own change because the `/workflows` projection
-that runs after each commit calls `is_terminal_state`; it changes no answer
-on any template a current koto parses, which the golden test and a
-template-corpus test show.
+unknown fields, and `is_terminal_state` reads the template through
+`read_store_file` in `Template` mode for every caller. This is its own
+change because the `/workflows` projection that runs after each commit
+calls `is_terminal_state`; it changes no answer on any template a current
+koto parses, which the golden test and a template-corpus test show.
 
 Deliverables:
-- the projection in `koto-session-reader/src/engine/persistence.rs`
+- the projection and the hardened read in
+  `koto-session-reader/src/engine/persistence.rs`
 - a test over every template under `plugins/` and the test fixtures
 
 ### Phase 6: The minimal program and its checks
@@ -1028,7 +1046,12 @@ non-blocking open, a regular-file check with `fstat`, a byte cap per kind
 of file, and for paths inside the store `O_NOFOLLOW` plus a containment
 recheck of the opened path. A symlink, FIFO, device or over-cap file marks
 that one session or value unreadable with a reason, and the scan goes on;
-nothing a writer plants can hang the scan or make it read without bound. A
+nothing a writer plants can hang the scan, and each file it reads is capped
+(the caps are per file, so a store of many large files still costs time in
+proportion). koto's commands reading their own session's log through
+`read_events` keep today's plain read; a dependent that calls `read_events`
+on a path itself gets that behavior, and the supported way to read a store
+is the scan and `read_context`. A
 crafted `template_path`, absolute or not, goes through the same read, so it
 can at worst mark one session unreadable or set that session's terminal
 flag. The template isn't checked against `template_hash`, as `koto
@@ -1036,8 +1059,13 @@ dashboard` doesn't check it today; under the trust model that is
 acceptable, because the writer who could plant a template could equally
 write the log. The containment recheck after an open leaves a narrow race
 in which a swapped directory makes the reader return another file the user
-can read, capped, as one value. That grants a writer nothing it lacks,
-since it could copy the same file into `ctx/` directly. The layout marker
+can read, capped, as one value. That grants a writer nothing it lacks when
+it runs as the same user as the reader, which is the case this design
+assumes, since it could copy the same file into `ctx/` directly. An agent
+confined by a sandbox that can't read a file the reader can is the case
+where the race matters; a dependent running a reader for such agents
+should treat values from `ctx/` as able to hold any file the reader can
+see. The layout marker
 is a store-wide switch a writer can flip; that availability risk is
 accepted for the same reason (it can already delete every session), and
 the refusal names the file.
@@ -1064,7 +1092,9 @@ sequences and applies its own redaction; a fleet view does better to show
 that a key exists than its value by default. The host-local key
 `workflows/publish-location` names a folder on this host and doesn't
 belong in anything shared across hosts. Error reasons carry absolute paths,
-which reveal the home directory and user name if forwarded. `sessions_dir`
+which reveal the home directory and user name if forwarded, and never any
+of a file's contents; `ContextRead`'s `Debug` prints a value's length, not
+its bytes. `sessions_dir`
 reads `KOTO_HOME` and `KOTO_SESSIONS_BASE`, so a process that controls the
 reader's environment chooses its store, as it does for koto; a dependent
 running where the environment isn't trusted passes an explicit directory.
@@ -1108,8 +1138,11 @@ running where the environment isn't trusted passes an explicit directory.
   committed fixtures only.
 - On a pathological store (a FIFO, a symlink or an over-cap file where a
   state file, pointer or context value belongs) `koto dashboard` now marks
-  that session unreadable where today it would hang or read through. That
-  is the one place its behavior changes, and no store koto writes has it.
+  that session unreadable where today it would hang or read through, and a
+  planted or unparseable layout marker makes it refuse the whole store with
+  the marker's path. koto's commands that read a leg pointer or check a
+  terminal state refuse the same pathological files. Those are the only
+  places behavior changes, and no store koto writes has them.
 
 ### Mitigations
 
