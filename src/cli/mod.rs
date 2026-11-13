@@ -249,7 +249,10 @@ pub enum Command {
         /// `failure` class and key counts: exit 1 when running the command
         /// again can finish it (`unreachable`, `timeout`, `throttled`,
         /// `push_failed`), else exit 3 (`denied`, `invalid_source`,
-        /// `write_failed`). A re-run reads only the keys still missing.
+        /// `object_missing`, `write_failed`). A re-run reads only the keys
+        /// still missing. A key the bucket lacks, or can't be read, is
+        /// carried from this host's copy of PRED when it has the manifest's
+        /// hash.
         #[arg(long = "carry", value_name = "PREFIX", requires = "supersede")]
         carry: Vec<String>,
 
@@ -9379,6 +9382,19 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // `superseded_branches` above.
     if let Some(stale) = derive_stale_template_source_dir(&header, backend.is_cloud()) {
         response["stale_template_source_dir"] = stale;
+    }
+
+    // Optional `bucket_missing_keys`, under the cloud backend only: the
+    // context keys the bucket's manifest names whose object the bucket
+    // lacks, which a fetch or a `--supersede` carry would fail on
+    // (koto#560). Absent when there are none, or when the bucket couldn't
+    // be asked.
+    if let Some(missing) = backend
+        .as_cloud()
+        .and_then(|cloud| cloud.bucket_missing_keys(name))
+        .filter(|missing| !missing.is_empty())
+    {
+        response["bucket_missing_keys"] = serde_json::json!(missing);
     }
 
     println!("{}", serde_json::to_string(&response)?);

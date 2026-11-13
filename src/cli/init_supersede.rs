@@ -40,10 +40,15 @@
 //! skips the keys this host's copy of the successor already holds with the
 //! manifest's hash, reads the rest eight at a time, each checked against
 //! that hash, and writes them into the successor, under this directory's
-//! prefix, as one push with the marker last. A carry that stops pushes what
-//! it wrote, without the marker, so a re-run reads only what is left, and
-//! refuses `carry_incomplete` with the failure's class and the counts: exit
-//! 1 when running it again can finish the carry, else 3.
+//! prefix, as one push with the marker last. A key the bucket holds no
+//! object for, or whose read fails for good, is taken from this host's copy
+//! of the predecessor when that copy has the manifest's hash. A carry that
+//! stops pushes what it wrote, without the marker, so a re-run reads only
+//! what is left, and refuses `carry_incomplete` with the failure's class
+//! and the counts: exit 1 when running it again can finish the carry, else
+//! 3. A key no copy here can give is `object_missing`, and its refusal says
+//! how a host whose copy holds the key puts it back in the bucket, after
+//! which the same command finishes the carry.
 //!
 //! Names read from a log or the bucket (a fence's successor and session id,
 //! a home prefix, a carried key) are validated before anything is built
@@ -114,6 +119,9 @@ enum CarryFailure {
     Denied,
     /// What the bucket holds for the predecessor doesn't check out.
     InvalidSource,
+    /// The bucket holds no object for a key the predecessor's manifest
+    /// names, and this host holds no copy of it with the manifest's hash.
+    ObjectMissing,
     /// A write into the successor's local store failed.
     WriteFailed,
     /// Every key and the marker were written, and the push failed.
@@ -122,7 +130,8 @@ enum CarryFailure {
 
 impl CarryFailure {
     /// The class of `cause`. The markers [`carry_from_bucket`] attaches are
-    /// looked for first. A cause that is none of the known ones can only be
+    /// looked for first, then a missing object, which another host's copy
+    /// can still give. A cause that is none of the known ones can only be
     /// the predecessor's prefix or id failing its check before a key is
     /// built, so it is `invalid_source`, which a retry can't fix.
     fn of(cause: &anyhow::Error) -> Self {
@@ -131,6 +140,9 @@ impl CarryFailure {
         }
         if cause.downcast_ref::<CarryWriteFailed>().is_some() {
             return Self::WriteFailed;
+        }
+        if cause.downcast_ref::<CarrySourceError>() == Some(&CarrySourceError::ObjectMissing) {
+            return Self::ObjectMissing;
         }
         match cause.downcast_ref::<BucketReadFailed>().map(|r| r.class()) {
             Some(FailureClass::Unreachable) => Self::Unreachable,
@@ -149,6 +161,7 @@ impl CarryFailure {
             Self::Throttled => "throttled",
             Self::Denied => "denied",
             Self::InvalidSource => "invalid_source",
+            Self::ObjectMissing => "object_missing",
             Self::WriteFailed => "write_failed",
             Self::PushFailed => "push_failed",
         }
@@ -205,6 +218,13 @@ fn carry_incomplete(
                 None => why,
             }
         }
+        CarryFailure::ObjectMissing => match &incomplete.key {
+            Some(key) => format!(
+                "the bucket holds no object for '{pred}''s key '{key}', which its context \
+                 manifest names, and this host holds no copy of it with the manifest's hash"
+            ),
+            None => CarrySourceError::ObjectMissing.to_string(),
+        },
         CarryFailure::WriteFailed => match &incomplete.key {
             Some(key) => format!("'{key}' couldn't be written into this host's copy of '{name}'"),
             None => format!("a key couldn't be written into this host's copy of '{name}'"),
@@ -233,6 +253,18 @@ fn carry_incomplete(
         ),
         CarryFailure::WriteFailed => {
             "Run the same command again once this host's koto store can be written".to_string()
+        }
+        CarryFailure::ObjectMissing => {
+            let held = match &incomplete.key {
+                Some(key) => format!("'{key}'"),
+                None => "the key".to_string(),
+            };
+            format!(
+                "To finish it, put {held} back in the bucket from a host whose copy of '{pred}' \
+                 holds it: there, `koto status {pred}` pulls the fence into that copy and lists \
+                 the key under bucket_missing_keys, and then `koto session resolve {pred} \
+                 --keep local` uploads it. Then run the same command here again"
+            )
         }
         _ => "Run the same command again to finish it".to_string(),
     };
@@ -1112,6 +1144,43 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("no key was carried"), "{message}");
+    }
+
+    /// A missing object is its own class, not retryable here, on exit 3; the
+    /// refusal says what the run left and the commands that finish it.
+    #[test]
+    fn a_missing_object_is_object_missing_and_names_the_commands_that_finish_it() {
+        assert_eq!(
+            CarryFailure::of(&CarrySourceError::ObjectMissing.into()),
+            CarryFailure::ObjectMissing
+        );
+        let (message, exit, body) = carry_incomplete(
+            "p",
+            "s",
+            &stopped(
+                Some(5),
+                Some("record/a"),
+                CarrySourceError::ObjectMissing.into(),
+            ),
+        );
+        assert_eq!(exit, 3);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "superseded": "p", "name": "s", "failure": "object_missing",
+                "retryable": false, "keys": 5, "held": 4, "remaining": 1, "carried": 3,
+            })
+        );
+        assert_eq!(
+            message,
+            "--supersede: 'p' is fenced and 's' exists, but the carry stopped: the bucket holds \
+             no object for 'p''s key 'record/a', which its context manifest names, and this \
+             host holds no copy of it with the manifest's hash; 4 of 5 keys carried, 1 remain. \
+             To finish it, put 'record/a' back in the bucket from a host whose copy of 'p' \
+             holds it: there, `koto status p` pulls the fence into that copy and lists the key \
+             under bucket_missing_keys, and then `koto session resolve p --keep local` uploads \
+             it. Then run the same command here again"
+        );
     }
 
     /// Whatever the class, the text holds none of the cause's own text.

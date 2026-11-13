@@ -502,6 +502,14 @@ impl CloudBackend {
     /// [`CarrySourceError::HashMismatch`]. An object the bucket doesn't hold
     /// is [`CarrySourceError::ObjectMissing`], read once; a read that fails
     /// is the [`BucketReadFailed`] from [`CloudBackend::get_with_etag`].
+    ///
+    /// Either of those last two falls back to this host's copy of `pred`'s
+    /// key, which is returned in its place when its sha256 is the entry's
+    /// hash, with a warning on stderr (koto#560). A key whose upload failed
+    /// can still be named by the manifest, since every push uploads the
+    /// whole local manifest; the host that wrote it holds the bytes the
+    /// manifest names. The GET is always asked first, and a copy with any
+    /// other bytes is never used.
     pub(crate) fn fetch_carried(
         &self,
         prefix: &str,
@@ -516,17 +524,48 @@ impl CloudBackend {
                 .collect();
         }
         each_in_parallel(entries, |entry| {
-            let key = format!("{prefix}/{pred}/ctx/{}", entry.key);
-            for _ in 0..2 {
-                let (value, _) = self
-                    .get_with_etag(&key)?
-                    .ok_or(CarrySourceError::ObjectMissing)?;
-                if sha256_hex(&value) == entry.hash {
-                    return Ok(value);
-                }
-            }
-            Err(CarrySourceError::HashMismatch.into())
+            self.read_carried(prefix, pred, entry).or_else(|e| {
+                let Some((why, value)) = local_fallback(&e)
+                    .and_then(|why| Some((why, self.local_copy_of(pred, entry)?)))
+                else {
+                    return Err(e);
+                };
+                eprintln!(
+                    "warning: {why} '{pred}''s key '{}'; carried this host's copy, which \
+                     matches the hash the manifest gives it",
+                    entry.key
+                );
+                Ok(value)
+            })
         })
+    }
+
+    /// One carried key's value from the bucket, as
+    /// [`CloudBackend::fetch_carried`] reads it before any fallback.
+    fn read_carried(
+        &self,
+        prefix: &str,
+        pred: &str,
+        entry: &CarryEntry,
+    ) -> anyhow::Result<Vec<u8>> {
+        let key = format!("{prefix}/{pred}/ctx/{}", entry.key);
+        for _ in 0..2 {
+            let (value, _) = self
+                .get_with_etag(&key)?
+                .ok_or(CarrySourceError::ObjectMissing)?;
+            if sha256_hex(&value) == entry.hash {
+                return Ok(value);
+            }
+        }
+        Err(CarrySourceError::HashMismatch.into())
+    }
+
+    /// This host's copy of `pred`'s key `entry`, when its bytes have the
+    /// entry's hash; `None` when there is no copy or it differs.
+    fn local_copy_of(&self, pred: &str, entry: &CarryEntry) -> Option<Vec<u8>> {
+        use crate::session::context::ContextStore;
+        let value = self.local.get(pred, &entry.key).ok()?;
+        (sha256_hex(&value) == entry.hash).then_some(value)
     }
 
     /// Hold `session`'s writes in this process for one push, as a write
@@ -594,6 +633,21 @@ impl Drop for DeferGuard<'_> {
             .deferred_to
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Why a carried key's read lets [`CloudBackend::fetch_carried`] fall back
+/// to this host's copy, worded for its warning: the bucket holds no object
+/// for the key, or the read failed for good. `None` for anything else, a
+/// hash mismatch included. Fixed wording, so no text from the bucket is
+/// shown.
+fn local_fallback(e: &anyhow::Error) -> Option<&'static str> {
+    if e.downcast_ref::<CarrySourceError>() == Some(&CarrySourceError::ObjectMissing) {
+        Some("the bucket holds no object for")
+    } else if e.downcast_ref::<BucketReadFailed>().is_some() {
+        Some("the bucket read failed for")
+    } else {
+        None
     }
 }
 

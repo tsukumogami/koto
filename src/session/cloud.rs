@@ -474,6 +474,12 @@ struct Probes {
     /// the declaration is read once and the refusal's retry sleep is paid
     /// once. Kept here, in the box, for the same reason.
     entries_refused: Mutex<HashSet<String>>,
+    /// By session id: the context keys this process's own listing of the
+    /// session's prefix found an object for, which `koto status` checks the
+    /// bucket's manifest against ([`CloudBackend::bucket_missing_keys`]).
+    /// Filled with [`Probes::answers`] and dropped with it; a listing
+    /// another process shared carries no keys.
+    ctx_listed: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl CloudBackend {
@@ -532,6 +538,7 @@ impl CloudBackend {
                 located: Mutex::default(),
                 deferred_to: Mutex::default(),
                 entries_refused: Mutex::default(),
+                ctx_listed: Mutex::default(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -1655,8 +1662,13 @@ impl CloudBackend {
             self.state_key(id),
             self.manifest_key(id),
         );
+        let ctx = format!("{}ctx/", self.session_prefix(id));
+        let mut ctx_listed = HashSet::new();
         let mut probe = sync_stamp::Probe::default();
         for obj in results.iter().flat_map(|page| page.contents.iter()) {
+            if let Some(key) = obj.key.strip_prefix(&ctx) {
+                ctx_listed.insert(key.to_string());
+            }
             let etag = || {
                 Some(
                     obj.e_tag
@@ -1687,6 +1699,11 @@ impl CloudBackend {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string(), Some((probe.clone(), false)));
+        self.probes
+            .ctx_listed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), ctx_listed);
         probe
     }
 
@@ -1707,6 +1724,11 @@ impl CloudBackend {
     fn forget_probe(&self, id: &str) {
         self.probes
             .answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.probes
+            .ctx_listed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
@@ -4291,6 +4313,50 @@ impl CloudBackend {
     /// network or non-success response.
     pub fn remote_state_exists(&self, id: &str) -> bool {
         self.s3_session_exists(id)
+    }
+
+    /// The context keys the bucket's manifest of `id` names whose object
+    /// the bucket doesn't hold, sorted, for `koto status` (koto#560). A key
+    /// whose upload failed is named there as soon as another push uploads
+    /// the whole local manifest, and only a fetch of it would fail. Read
+    /// from the manifest a read would use and the listing of the session's
+    /// prefix this process already made for it, so a session the read
+    /// checked costs no request; a listing another process shared is made
+    /// again here, since it carries no keys. Only keys `koto context add`
+    /// accepts are named. `None` when the listing or the manifest can't be
+    /// read.
+    pub fn bucket_missing_keys(&self, id: &str) -> Option<Vec<String>> {
+        self.prime_manifest(id);
+        let manifest = self.manifest_cache.get(id)?;
+        if manifest.keys.is_empty() {
+            return Some(Vec::new());
+        }
+        let listed = || {
+            self.probes
+                .ctx_listed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .cloned()
+        };
+        let listed = match listed() {
+            Some(listed) => listed,
+            None => {
+                self.probe_for(id, false).ok()?;
+                listed()?
+            }
+        };
+        Some(
+            manifest
+                .keys
+                .into_keys()
+                .filter(|key| {
+                    !is_pin_record_key(key)
+                        && crate::session::validate::validate_context_key(key).is_ok()
+                        && !listed.contains(key)
+                })
+                .collect(),
+        )
     }
 
     /// Force-upload the local session to S3: every context key the bucket

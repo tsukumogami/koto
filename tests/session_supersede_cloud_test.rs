@@ -5,8 +5,9 @@
 //! two successors racing for one predecessor, a re-run that finishes an
 //! interrupted carry, the refusal of every later write to the
 //! predecessor from either workspace, and a carried key the bucket's
-//! manifest names but the bucket lost: `koto status` names it, and the
-//! carry takes a host's copy that matches the manifest.
+//! manifest names but the bucket lost: `koto status` names it, the carry
+//! takes this host's copy when it matches the manifest, and a host without
+//! one is told how to finish.
 //!
 //! Each test runs up to two hosts over one in-process stand-in bucket
 //! (`support/fake_s3.rs`): a scratch `HOME`, `KOTO_HOME` and cache per
@@ -1090,10 +1091,9 @@ fn shown(out: &std::process::Output) -> String {
 }
 
 /// `koto status` names a key the bucket's manifest lists but the bucket
-/// lacks, from the host that wrote it and from one that never held it, and
-/// leaves the field out for a session whose objects are all there. Once
-/// `koto session resolve --keep local` on the host holding the key puts it
-/// back, the field is gone.
+/// lacks, and leaves the field out for a session whose objects are all
+/// there. Once `koto session resolve --keep local` on the host holding the
+/// key puts it back, the field is gone.
 #[test]
 fn status_names_a_key_the_bucket_lost() {
     let h = Hosts::new();
@@ -1102,14 +1102,12 @@ fn status_names_a_key_the_bucket_lost() {
     assert!(status.get("bucket_missing_keys").is_none(), "{status}");
 
     h.lose_a_key();
-    for host in [1, 2] {
-        let status = h.ok(host, &h.w1, &["status", "p"]);
-        assert_eq!(
-            status["bucket_missing_keys"],
-            serde_json::json!([LOST]),
-            "host {host}: {status}"
-        );
-    }
+    let status = h.ok(1, &h.w1, &["status", "p"]);
+    assert_eq!(
+        status["bucket_missing_keys"],
+        serde_json::json!([LOST]),
+        "{status}"
+    );
 
     h.ok(1, &h.w1, &["session", "resolve", "p", "--keep", "local"]);
     assert_eq!(
@@ -1120,75 +1118,128 @@ fn status_names_a_key_the_bucket_lost() {
     assert!(status.get("bucket_missing_keys").is_none(), "{status}");
 }
 
+/// Asserts `out` is the `object_missing` refusal for [`LOST`]: the
+/// predecessor fenced once, the successor there with every other key, the
+/// marker and the lost key not written, and the text saying what the run
+/// left and which commands finish it.
+fn assert_lost_key_refusal(h: &Hosts, out: &std::process::Output) {
+    let refused = printed_json(&out.stdout);
+    assert_eq!(refused["failure"], "object_missing", "{}", shown(out));
+    assert_eq!(exit_of(out), Some(3), "{}", shown(out));
+    for (field, value) in [
+        ("code", Value::from("carry_incomplete")),
+        ("superseded", Value::from("p")),
+        ("name", Value::from("s")),
+        ("retryable", Value::from(false)),
+        ("keys", Value::from(7)),
+        ("held", Value::from(6)),
+        ("remaining", Value::from(1)),
+    ] {
+        assert_eq!(refused[field], value, "{field}: {refused}");
+    }
+    let error = error_text(h, &refused);
+    for said in [
+        "'p' is fenced and 's' exists",
+        &format!("the bucket holds no object for 'p''s key '{LOST}'"),
+        "6 of 7 keys carried, 1 remain",
+        &format!("put '{LOST}' back in the bucket from a host whose copy of 'p' holds it"),
+        "`koto status p`",
+        "`koto session resolve p --keep local`",
+        "Then run the same command here again",
+    ] {
+        assert!(error.contains(said), "{said}: {error}");
+    }
+    assert_eq!(h.fences().len(), 1);
+    assert!(!h.has_marker());
+    assert!(h.s3.object(&h.succ_ctx(LOST)).is_none());
+}
+
 /// The takeover koto#560 reports: a carried key the bucket's manifest names
-/// with no object. On a host that holds no copy of it the carry stops after
-/// the fence, every time, as `object_missing` (exit 3), and the refusal says
-/// what it left (the predecessor fenced, the successor there, how many keys
-/// carried, which key the bucket lacks) and that the same command on a host
-/// whose copy holds the key finishes it. A copy whose bytes don't match the
-/// manifest's hash is never carried. The command the refusal names, run on
-/// the host that wrote the key, carries that host's copy and finishes; a
-/// re-run on the first host then changes nothing.
+/// with no object. On the host that wrote it, whose copy matches the
+/// manifest's hash, the carry takes that copy and finishes at once. A copy
+/// whose bytes differ is never carried: the carry stops after the fence,
+/// every time, as `object_missing` (exit 3), leaving the predecessor fenced
+/// and the successor without the key. Once the copy matches again, the same
+/// command finishes the carry from it.
 #[test]
-fn a_carry_of_a_key_the_bucket_lost_finishes_on_a_host_that_holds_it() {
+fn a_carry_of_a_key_the_bucket_lost_takes_this_host_s_matching_copy() {
     let h = Hosts::new();
     h.predecessor();
     h.lose_a_key();
-
-    for _ in 0..2 {
-        let out = h.supersede(2, "s");
-        let refused = printed_json(&out.stdout);
-        assert_eq!(refused["failure"], "object_missing", "{}", shown(&out));
-        assert_eq!(exit_of(&out), Some(3), "{}", shown(&out));
-        for (field, value) in [
-            ("code", Value::from("carry_incomplete")),
-            ("superseded", Value::from("p")),
-            ("name", Value::from("s")),
-            ("retryable", Value::from(false)),
-            ("keys", Value::from(7)),
-            ("held", Value::from(6)),
-            ("remaining", Value::from(1)),
-        ] {
-            assert_eq!(refused[field], value, "{field}: {refused}");
-        }
-        let error = error_text(&h, &refused);
-        for said in [
-            "'p' is fenced and 's' exists",
-            &format!("the bucket holds no object for 'p''s key '{LOST}'"),
-            "6 of 7 keys carried, 1 remain",
-            &format!(
-                "Run the same command on a host whose copy of 'p' holds '{LOST}' to finish it"
-            ),
-        ] {
-            assert!(error.contains(said), "{said}: {error}");
-        }
-        assert_eq!(h.fences().len(), 1);
-        assert!(!h.has_marker());
-        assert!(h.s3.object(&h.succ_ctx(LOST)).is_none());
-    }
-
-    // Host 1's copy, changed so it no longer matches the manifest's hash.
-    let local = h.sessions(1).join("p").join("ctx").join(LOST);
-    assert_eq!(std::fs::read(&local).unwrap(), LOST_VALUE.as_bytes());
-    std::fs::write(&local, "changed since").unwrap();
     let out = h.supersede(1, "s");
-    assert_eq!(exit_of(&out), Some(3), "{}", shown(&out));
-    assert_eq!(
-        printed_json(&out.stdout)["failure"],
-        "object_missing",
+    assert_eq!(exit_of(&out), Some(0), "{}", shown(&out));
+    let body = printed_json(&out.stdout);
+    assert_eq!(body["outcome"], "superseded", "{body}");
+    assert_eq!(body["carried"], 7, "{body}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "the bucket holds no object for 'p''s key '{LOST}'; carried this host's copy"
+        )),
         "{}",
         shown(&out)
     );
-    assert!(h.s3.object(&h.succ_ctx(LOST)).is_none());
-    assert!(!h.has_marker());
+    assert_eq!(
+        h.s3.object(&h.succ_ctx(LOST)).as_deref(),
+        Some(LOST_VALUE.as_bytes())
+    );
+    assert!(h.has_marker());
 
-    // The command the refusal names, on the host whose copy holds the key.
+    let h = Hosts::new();
+    h.predecessor();
+    h.lose_a_key();
+    let local = h.sessions(1).join("p").join("ctx").join(LOST);
+    assert_eq!(std::fs::read(&local).unwrap(), LOST_VALUE.as_bytes());
+    std::fs::write(&local, "changed since").unwrap();
+    for _ in 0..2 {
+        assert_lost_key_refusal(&h, &h.supersede(1, "s"));
+    }
+
     std::fs::write(&local, LOST_VALUE).unwrap();
     let out = h.supersede(1, "s");
     assert_eq!(exit_of(&out), Some(0), "{}", shown(&out));
     let body = printed_json(&out.stdout);
     assert_eq!(body["outcome"], "unchanged", "{body}");
-    assert!(body["carried"].as_u64().unwrap() >= 1, "{body}");
+    assert_eq!(body["carried"], 1, "{body}");
+    assert_eq!(
+        h.s3.object(&h.succ_ctx(LOST)).as_deref(),
+        Some(LOST_VALUE.as_bytes())
+    );
+    assert!(h.has_marker());
+    assert_eq!(h.fences().len(), 1);
+}
+
+/// On a host with no copy of the lost key the carry stops after the fence,
+/// every time, as `object_missing`, and the refusal names the commands that
+/// finish it. Run as it says on the host that wrote the key, they put the
+/// key back without touching the fence, and the same command then finishes
+/// the carry; a further run changes nothing.
+#[test]
+fn a_carry_of_a_key_the_bucket_lost_finishes_once_the_holding_host_puts_it_back() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.lose_a_key();
+    for _ in 0..2 {
+        assert_lost_key_refusal(&h, &h.supersede(2, "s"));
+    }
+
+    let status = h.ok(1, &h.w1, &["status", "p"]);
+    assert_eq!(
+        status["bucket_missing_keys"],
+        serde_json::json!([LOST]),
+        "{status}"
+    );
+    h.ok(1, &h.w1, &["session", "resolve", "p", "--keep", "local"]);
+    assert_eq!(
+        h.s3.object(&h.pred_ctx(LOST)).as_deref(),
+        Some(LOST_VALUE.as_bytes())
+    );
+    assert_eq!(h.fences().len(), 1, "the resolve kept the fence");
+
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{}", shown(&out));
+    let body = printed_json(&out.stdout);
+    assert_eq!(body["outcome"], "unchanged", "{body}");
+    assert_eq!(body["carried"], 1, "{body}");
     assert_eq!(
         h.s3.object(&h.succ_ctx(LOST)).as_deref(),
         Some(LOST_VALUE.as_bytes())
