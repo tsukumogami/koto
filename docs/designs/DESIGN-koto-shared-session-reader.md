@@ -330,18 +330,21 @@ Key assumptions:
    clippy::disallowed_types)]`. Every file open in the crate lives in one
    module, `fs_read.rs`, which holds the only allows and offers two
    functions. `open_plain(path)` is today's `File::open`, kept for the
-   reads koto's own commands make of their own session's log through
-   `read_events` and `read_header`, so those read exactly as they do now.
-   The guard script allows it to be called only from those log readers in
-   `persistence.rs`; the dashboard scan and the read surface can't reach
-   it. `read_store_file(path, cap, mode)` is the hardened read. It
-   takes no flag argument: `mode` is `InStore` or `Template`, and each maps
-   to a fixed constant, `IN_STORE_OPEN_FLAGS` (`O_NOFOLLOW | O_NONBLOCK`)
+   reads koto's own commands make of their own session's log through the
+   three log readers in `persistence.rs` (`read_header_only`, the full-log
+   read behind `read_events` and `read_log`, and `read_fence`), and for
+   `generate_session_id`'s read of `/dev/urandom`, so those read exactly as
+   they do now. Once the build is done the dashboard scan and the read
+   surface can't reach it; the guard script's schedule below says which
+   callers each phase allows. `read_store_file(path, cap, mode)` is the
+   hardened read. It takes no flag argument: `mode` is
+   `InStore { root }`, naming the store root the containment check uses, or
+   `Template`, and each maps to a fixed constant, `IN_STORE_OPEN_FLAGS` (`O_NOFOLLOW | O_NONBLOCK`)
    or `TEMPLATE_OPEN_FLAGS` (`O_NONBLOCK`, since a template given with
    `--template` may legitimately be a symlink outside the store). It checks
    with `fstat` that the opened file is a regular file, reads at most `cap`
    bytes, and in `InStore` mode canonicalizes the path again after the
-   open and checks it is still inside the canonicalized store root, as
+   open and checks it is still inside the canonicalized `root`, as
    `koto context get` does. It is the
    crate's only `custom_flags` call. The context read, the layout
    marker and the dashboard's store scan (Decision 3) use it. Two reads
@@ -373,14 +376,19 @@ Key assumptions:
    `clippy.toml` still holds every required entry; the crate has no
    `build.rs`; neither the crate's manifest nor the workspace root's
    carries `[patch]` or `[replace]`; every dependency of the crate in
-   `cargo metadata` comes from the crates.io registry; `open_plain` is
-   called only from the two log readers; nothing under `dashboard.rs` or
-   `source.rs` names `read_events`, `read_header`, `read_header_only`,
-   `read_log` or `open_plain` (a rule that joins the script in Phase 4,
-   with the scan's switch to the hardened read, since the moved dashboard
-   still calls `read_events` until then); and the two `cargo tree`
+   `cargo metadata` comes from the crates.io registry; the `open_plain`
+   caller rule holds for the current phase; and the two `cargo tree`
    checks pass. A `--self-test` plants each violation in a temporary copy
    and expects a failure.
+
+   The `open_plain` caller rule tightens as the build lands, so every
+   phase passes its own guard:
+
+   | From | `open_plain` may be called from | `dashboard.rs` and `source.rs` may not name |
+   |------|---------------------------------|---------------------------------------------|
+   | Phase 3 | the three log readers, `generate_session_id`, and, until Phase 5, `is_terminal_state` and the dashboard's template read | nothing yet |
+   | Phase 4 | the same | `read_events`, `read_header`, `read_header_only`, `read_log` |
+   | Phase 5 | the three log readers and `generate_session_id` only | those four and `open_plain` |
 5. validate.yml gains a `reader-write-guard` job, "Reader Write Guard":
    `cargo clippy -p koto-session-reader --all-targets --locked -- -D
    warnings`, then the script.
@@ -898,7 +906,9 @@ impl LocalDirSource {
     pub fn new(sessions_dir: impl Into<PathBuf>) -> Result<Self, LayoutError>;
 }
 pub fn check_layout(sessions_dir: &Path) -> Result<(), LayoutError>;
-pub fn read_session_events(session_dir: &Path, id: &str)
+// id is checked against the session-name grammar; the path is built from
+// source.session_dir(id) and read InStore { root: source.sessions_dir() }.
+pub fn read_session_events(source: &dyn SessionSource, id: &str)
     -> Result<(StateFileHeader, Vec<Event>), SessionReadError>;
 pub enum BackendKind { Local, Cloud }
 pub fn sessions_dir(backend: Option<BackendKind>) -> anyhow::Result<PathBuf>;
@@ -1013,8 +1023,10 @@ after.
 Deliverables:
 - `koto-session-reader/` with its manifest, `clippy.toml` and moved sources,
   including `src/source.rs` carrying `SessionSource` from Phase 2
-- `koto-session-reader/src/fs_read.rs`, with every existing open routed
-  through `open_plain` and `read_pointer` switched to `read_store_file`
+- `koto-session-reader/src/fs_read.rs`, with every existing open in the
+  moved files routed through `open_plain` as the guard schedule's Phase 3
+  row allows, and `read_pointer` switched to `read_store_file` with its
+  64 KiB cap and the session's store root
 - the dashboard data layer's fixture-building unit tests moved to koto's
   `tests/`
 - `[workspace.package] version` and `version.workspace = true` on both
@@ -1026,8 +1038,8 @@ Deliverables:
 the marker check land in the crate, and the dashboard scan reads its state
 files, leg pointers, context values and the marker through
 `read_store_file` with their caps (its template reads follow in Phase 5,
-with `is_terminal_state`), at which point the guard script gains its
-rule that `dashboard.rs` and `source.rs` name no plain log reader; koto's
+with `is_terminal_state`), and the guard script moves to its Phase 4
+row; koto's
 backends call `sessions_dir` and
 import the constants; `koto session dir --json` gains `sessions`.
 docs/STABILITY.md gains the "Session store read surface" section and the
@@ -1038,9 +1050,9 @@ packaging job lands.
 
 Deliverables:
 - `LocalDirSource`, `check_layout`, `sessions_dir`, `read_session_events`
-  and `read_context` in `koto-session-reader/src/source.rs`, and the capped
-  scan in
-  `src/dashboard.rs`
+  and `read_context` in `koto-session-reader/src/source.rs`, the capped
+  scan in `src/dashboard.rs`, and `parse_header_bytes` beside
+  `parse_state_log`
 - tests in koto's `tests/` that build a store at run time with a FIFO, a
   symlink, an over-cap file and a planted marker, each marking one session
   or refusing the store as described, and the golden test unchanged
@@ -1060,7 +1072,8 @@ unknown fields, and `is_terminal_state` reads the template through
 dashboard detail view's template read. This is its own
 change because the `/workflows` projection that runs after each commit
 calls `is_terminal_state`; it changes no answer on any template a current
-koto parses, which the golden test and a template-corpus test show.
+koto parses, which the golden test and a template-corpus test show. The
+guard script moves to its Phase 5 row in the same change.
 
 Deliverables:
 - the projection and the hardened read in
@@ -1094,11 +1107,13 @@ their files exactly like local ones. A writer that touches every state file
 on every refresh forces each to be re-read, up to its cap, on each
 refresh; that time cost is an accepted residual of the same kind.
 
-**Untrusted files.** Every read of a path inside the store, and of the
-compiled template a log names, goes through `read_store_file`: a
-non-blocking open, a regular-file check with `fstat`, a byte cap per kind
-of file, and for paths inside the store `O_NOFOLLOW` plus a containment
-recheck of the opened path. A symlink, FIFO, device or over-cap file marks
+**Untrusted files.** Once Phase 5 lands, every read the scan and the read
+surface make of a path inside the store, and of the compiled template a
+log names, goes through `read_store_file`: a non-blocking open, a
+regular-file check with `fstat`, a byte cap per kind of file, and for paths
+inside the store `O_NOFOLLOW` plus a containment recheck after the open.
+Before then the template reads are still plain, which is acceptable
+because no dependent ships before Phase 6. A symlink, FIFO, device or over-cap file marks
 that one session or value unreadable with a reason, and the scan goes on;
 nothing a writer plants can hang the scan, and each file it reads is capped
 (the caps are per file, so a store of many large files still costs time in
