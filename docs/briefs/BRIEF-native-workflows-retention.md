@@ -2,18 +2,15 @@
 schema: brief/v1
 status: Draft
 problem: |
-  Every koto session an operator runs inside Claude Code leaves an entry in
-  that Claude Code session's `/workflows` list, and nothing ever removes one.
-  Over a long working session koto's finished entries pile up and crowd out
-  Claude Code's own workflows, and a koto session that stopped without
-  finishing keeps reading as running forever, so the list stops saying what
-  is actually live.
+  Every koto session run inside Claude Code leaves a `/workflows` entry that
+  nothing ever removes, so over a long session koto's finished entries pile up
+  and crowd out Claude Code's own, and a koto session that stopped without
+  finishing reads as running forever. The list stops saying what is live.
 outcome: |
-  An operator opens `/workflows` at any point in a long Claude Code session
-  and reads it at a glance: koto's finished entries stay under a stated count
-  next to Claude Code's own, and a koto session that died mid-run stops
-  claiming to be running after a stated window, or the operator knows from
-  koto's docs how to tell a live entry from a stale one.
+  An operator opens `/workflows` at any point in a long Claude Code session and
+  reads it at a glance: koto's finished entries stay under a stated count, and a
+  koto session that died mid-run stops claiming to be running after a stated
+  window, or koto's docs say how to tell a live entry from a stale one.
 ---
 
 # BRIEF: keep koto's `/workflows` entries bounded and honest over time
