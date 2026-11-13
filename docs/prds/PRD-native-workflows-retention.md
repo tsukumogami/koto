@@ -74,8 +74,8 @@ This is the work tracked in koto issue #190.
 ## User Stories
 
 - As an operator who drives many koto workflows to completion in one Claude
-  Code session, I want koto's entries in `/workflows` to stay under a fixed
-  count, so that I can still find Claude Code's own workflows late in the
+  Code session, I want koto's entries in `/workflows` to stay under a stated
+  bound, so that I can still find Claude Code's own workflows late in the
   day.
 - As an operator upgrading koto with a directory that already holds dozens of
   old koto entries, I want the first koto write after the upgrade to bring
@@ -99,6 +99,8 @@ This is the work tracked in koto issue #190.
 - **koto write**: koto writing a session's entry into a `workflows`
   directory, which it does on every committed step of that session. The
   policy runs after each one, in the directory just written.
+- **Entry filename pattern**: `koto-<session-id>.json`, where the session id
+  is whatever koto recorded for the session (not necessarily a UUID).
 - **Owned entry**: a file in a `workflows` directory that passes R5's
   ownership check.
 - **Last write**: the entry file's modification time. koto rewrites an entry
@@ -116,8 +118,10 @@ This is the work tracked in koto issue #190.
   whose last write is W ago or less, or lies in the future.
 - **Bound (N)**, **temp-file age (A)**: stated values the design fixes.
 
-Classification reads only the entry file itself, so it works the same for
-entries whose session koto's store has already removed. Tests read N, W and A
+`running` is the only top-level status koto writes for a session that hasn't
+finished, including a gate-blocked one. Classification reads only the entry
+file itself, so it works the same for entries whose session koto's store has
+already removed. Tests read N, W and A
 from the named values the implementation defines rather than from literals.
 
 ### Functional
@@ -127,9 +131,11 @@ from the named values the implementation defines rather than from literals.
 N has a stated default, documented with its reasoning. Each directory is
 bounded on its own: writes into one never remove entries from another. After
 any koto write into a directory completes, that directory holds at most N
-owned entries, except in the case R3 allows. Temporary files (R5) don't count
+owned entries, except when the live entries plus the entry just written
+already exceed N (R3). Temporary files (R5) don't count
 toward N. Whether N is a setting or a fixed value is the design's call; if it
 is a setting, a value below 1 is refused with an error naming the setting.
+Either way, tests can set N for a run.
 
 **R2. The same policy for every finished outcome.** Completed, failed and
 cancelled sessions' entries fall under the same policy. A finished entry's
@@ -137,9 +143,9 @@ status word doesn't exempt it from the bound.
 
 **R3. Live entries are kept.** The entry koto is writing in the current
 operation is never removed by that operation, even when it is the oldest, and
-no live entry is removed to make room. When more live entries exist in one
-directory than N allows, the directory may hold more than N owned entries
-until enough of them finish or go stale; the docs state this case.
+no live entry is removed to make room. When the live entries plus the entry
+just written exceed N, the directory may hold more than N owned entries until
+enough of them finish or go stale; the docs state this case.
 
 **R4. Eviction order.** When entries must be removed to meet the bound, only
 finished and stale entries are candidates, and they are removed oldest first
@@ -175,8 +181,8 @@ settles on exactly one of:
   immediately before replacing it, and leaves an entry that changed.
 - (b) *Accept as a limitation.* The entry keeps its last status. koto's docs
   state the limitation, a command or check an operator runs to tell a live
-  koto entry from a stale one, and that a stale entry remains only until the
-  bound removes it as a candidate.
+  koto entry from a stale one, and that a stale entry is removed only when the
+  bound makes it a candidate and stays otherwise.
 
 W applies under both outcomes, since it also decides when a dead session's
 entry becomes a removal candidate.
@@ -295,11 +301,15 @@ Crash-staleness (whichever R6 outcome the design chose):
       still `running` with the commit's content.
 - [ ] Under R6(a): a reconciled entry in a directory over the bound is removed
       in `startTime` order like any finished entry.
+- [ ] Under R6(a): a test in which the reconcile rewrite fails (the entry made
+      unwritable) shows the koto command exits with its normal result and the
+      entry is unchanged.
 - [ ] Under R6(b): a test with a stale entry in a directory within the bound
       leaves it byte-identical after a koto write.
 - [ ] Under R6(b): the operator guide has a section that names the
       limitation, gives the command an operator runs to tell a live koto entry
-      from a stale one, and states that a stale entry is removed by the bound.
+      from a stale one, and states that a stale entry is removed only when the
+      bound makes it a candidate.
 - [ ] The design document states which R6 outcome it chose, the values of N, W
       and A, and the reasoning for each.
 
@@ -337,7 +347,8 @@ Guard, docs and independence:
 - [ ] Each of the operator guide, the field reference and the koto-user
       skill's `/workflows` section states the default value of N, the value of
       W, the eviction order, the ownership rule, the many-live-sessions case
-      and the R6 outcome chosen.
+      and the R6 outcome chosen; under R6(a), each also says reconciliation
+      needs a later koto write into the same directory.
 - [ ] Any new setting appears in the CLI configuration reference with its
       default and its environment override.
 - [ ] A test runs the policy with no koto setting changed from its default
