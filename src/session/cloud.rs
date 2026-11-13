@@ -869,6 +869,30 @@ impl CloudBackend {
     ///   an error, and a copy there that is missing or another session's is
     ///   `Unlocated`, before anything is read or written.
     pub fn check_located(&self, id: &str) -> anyhow::Result<()> {
+        self.check_located_with(id, true)
+    }
+
+    /// [`CloudBackend::check_located`] for `koto session resolve`, which
+    /// replaces one side of `id` with the other: every refusal is the same,
+    /// but a home that isn't this directory's own isn't pulled. Its copy is
+    /// only confirmed to be the session's own
+    /// ([`CloudBackend::confirm_home_copy`]), so `--keep local` can't write
+    /// over another session's copy, nor `--keep remote` bring one here.
+    ///
+    /// The pull would defeat the resolve. With a batch open it flushes the
+    /// batch first, and a flush that meets the very version conflict the
+    /// resolve is run to settle refuses. With none open it merges the logs,
+    /// which turns a local log the bucket's extends into the bucket's before
+    /// `--keep local` pushes it, and refuses on a diverged one. The resolve
+    /// replaces one side whole either way, so there is nothing to merge.
+    pub fn check_located_to_replace(&self, id: &str) -> anyhow::Result<()> {
+        self.check_located_with(id, false)
+    }
+
+    /// [`CloudBackend::check_located`], with a home that isn't this
+    /// directory's own pulled when `pull`, or only its copy confirmed as
+    /// the session's own when not.
+    fn check_located_with(&self, id: &str, pull: bool) -> anyhow::Result<()> {
         self.local_guard(id)?;
         let home = self.home_prefix(id).map_err(anyhow::Error::new)?;
         if self.probes.read_only {
@@ -991,7 +1015,61 @@ impl CloudBackend {
         }
         if !home.own_workspace {
             self.check_not_migrated(id)?;
-            self.sync_pull_state(id)?;
+            if pull {
+                self.sync_pull_state(id)?;
+            } else {
+                self.confirm_home_copy(id, &home)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `home`'s copy is the session's own, without pulling it: the
+    /// refusals a strict pull ([`CloudBackend::sync_pull_state`]) makes of
+    /// a missing copy or another session's, asked of the copy's header
+    /// alone (one listing, which the probe may already hold, and one ranged
+    /// GET). Nothing is written locally, no sync is recorded, and an open
+    /// batch is left as it is.
+    fn confirm_home_copy(&self, id: &str, home: &Home) -> anyhow::Result<()> {
+        let probe = self.probe(id).map_err(|e| {
+            e.context(format!(
+                "cloud sync: the bucket's copy of session '{}' under prefix {} couldn't be \
+                 checked",
+                id, home.prefix
+            ))
+        })?;
+        if probe.state_etag.is_none() {
+            return Err(anyhow::Error::new(self.copy_mismatch(id, home, None, true)));
+        }
+        let key = self.state_key(id);
+        let response = self
+            .bucket
+            .get_object_range(&key, 0, Some(DELETE_HEADER_BYTES))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cloud sync: reading the header of {} failed: {}",
+                    key,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
+        match response.status_code() {
+            200 | 206 => {}
+            404 => return Err(anyhow::Error::new(self.copy_mismatch(id, home, None, true))),
+            status => anyhow::bail!(
+                "cloud sync: reading the header of {} answered {}",
+                key,
+                status
+            ),
+        }
+        let state_path = self.local.session_dir(id).join(state_file_name(id));
+        let local_id = first_line(&state_path)
+            .and_then(|line| header_session_id(line.as_bytes()))
+            .filter(|s| !s.is_empty());
+        let remote_id = header_session_id(response.bytes()).filter(|s| !s.is_empty());
+        if !copy_is_own(local_id.as_deref(), remote_id.as_deref(), home.via) {
+            return Err(anyhow::Error::new(
+                self.copy_mismatch(id, home, remote_id, false),
+            ));
         }
         Ok(())
     }
@@ -2494,20 +2572,13 @@ impl CloudBackend {
         }
         // A home found any other way than as this directory's own holds the
         // session's copy only when it carries the local header's
-        // `session_id`: one that carries another is a different session
-        // under the name, and is neither read nor written. A located home
-        // needs both ids to confirm it, since nothing else says the copy
-        // the listing found is this session's.
+        // `session_id` ([`copy_is_own`]).
         if strict {
             let local_id = first_line(&state_path)
                 .and_then(|line| header_session_id(line.as_bytes()))
                 .filter(|s| !s.is_empty());
             let remote_id = header_session_id(response.bytes()).filter(|s| !s.is_empty());
-            let confirmed = match (&local_id, &remote_id) {
-                (Some(local_id), Some(remote_id)) => local_id == remote_id,
-                _ => home.via != HomeSource::Located,
-            };
-            if !confirmed {
+            if !copy_is_own(local_id.as_deref(), remote_id.as_deref(), home.via) {
                 return Err(anyhow::Error::new(
                     self.copy_mismatch(id, &home, remote_id, false),
                 ));
@@ -4023,6 +4094,12 @@ impl CloudBackend {
     }
 
     /// Resolve a version conflict by keeping local or remote state.
+    ///
+    /// Every key goes to `id`'s home, so the commands run after it from the
+    /// same directory read the copy it settled. Its caller checks the
+    /// session's location without pulling it
+    /// ([`CloudBackend::check_located_to_replace`]): a pull would flush an
+    /// open batch first, and meet the very conflict this settles.
     pub fn resolve_conflict(&self, id: &str, keep: &str) -> anyhow::Result<()> {
         use crate::session::version::{get_or_create_machine_id, resolved_version, SessionVersion};
 
@@ -8089,6 +8166,19 @@ fn header_session_id(state: &[u8]) -> Option<String> {
     header.get("session_id")?.as_str().map(str::to_string)
 }
 
+/// Whether a bucket copy found under a home `via` that isn't this
+/// directory's own is the session's own, given the non-empty `session_id`s
+/// of the local header and of the copy's. One that carries another id is a
+/// different session under the name, and is neither read nor written. With
+/// either id missing, a recorded home is trusted, but a located one isn't:
+/// nothing else says the copy its listing found is this session's.
+fn copy_is_own(local_id: Option<&str>, remote_id: Option<&str>, via: HomeSource) -> bool {
+    match (local_id, remote_id) {
+        (Some(local_id), Some(remote_id)) => local_id == remote_id,
+        _ => via != HomeSource::Located,
+    }
+}
+
 /// Build the refusal a marker's bytes describe for session `id`.
 ///
 /// Read leniently: a field that is missing or of another shape reads as
@@ -8875,6 +8965,30 @@ mod tests {
         // remote_list_keys returns None (S3 unreachable), so only local keys.
         let keys = backend.list_keys("sess", None).unwrap();
         assert_eq!(keys, vec!["alpha.md", "beta.md"]);
+    }
+
+    // -- Whose copy a home holds --
+
+    #[test]
+    fn copy_is_own_when_both_ids_match() {
+        for via in [HomeSource::Recorded, HomeSource::Located] {
+            assert!(copy_is_own(Some("a"), Some("a"), via));
+        }
+    }
+
+    #[test]
+    fn copy_is_not_own_when_the_ids_differ() {
+        for via in [HomeSource::Recorded, HomeSource::Located] {
+            assert!(!copy_is_own(Some("a"), Some("b"), via));
+        }
+    }
+
+    #[test]
+    fn copy_missing_an_id_is_own_only_under_a_recorded_home() {
+        for (local, remote) in [(Some("a"), None), (None, Some("a")), (None, None)] {
+            assert!(copy_is_own(local, remote, HomeSource::Recorded));
+            assert!(!copy_is_own(local, remote, HomeSource::Located));
+        }
     }
 
     // -- S3 key construction --

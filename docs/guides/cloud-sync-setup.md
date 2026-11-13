@@ -463,13 +463,15 @@ koto session resolve <name> --keep remote  # download the bucket's version
 
 `--keep local` uploads in one pass: it reads the bucket's manifest once and uploads only the context keys whose content the bucket doesn't already hold, several at a time, then the manifest, the state file and the version. The response's `elapsed_ms` says how long the session took.
 
+The resolve works from any directory on the host that holds the session's copy. It doesn't first push a batch that a failed push left open: `--keep local` uploads that batch's writes with the rest of the session, and `--keep remote` drops them.
+
 The state log is checked the same way on every sync. A pull replaces this host's log with the bucket's copy only when the copy holds every local event (or is another session's under the same name, which it replaces as before); a copy that lacks some, such as another directory's older copy, leaves the local log as it is. A push goes up only over the copy this host last synced (an `If-Match` on its ETag, or `If-None-Match: *` for a first push), and when that copy moved, only if the push holds every event the copy has. When the two sides each hold an event the other lacks, the command refuses and overwrites nothing:
 
 ```
 session conflict: session 'review' has diverged between this host's log (14 events, 5210 bytes, last seq 14) and the bucket's copy at 3f9a1c0d2b4e6f81/review/koto-review.state.jsonl (14 events, 5198 bytes, last seq 14); the pull was refused. Nothing was overwritten. ...
 ```
 
-Resolve it with `koto session resolve` as above, run from the session's directory. A push that refuses this way after an append leaves the event in this host's log, and the command exits non-zero.
+Resolve it with `koto session resolve` as above. A push that refuses this way after an append leaves the event in this host's log, and the command exits non-zero.
 
 Context keys are compared one at a time when they're read. When this host's copy of a key differs from the home's, the read keeps whichever is newer. Which one that is comes from the hash this host last synced for the key, kept beside the session in `cloud-ctx-synced.json` and never uploaded: a local copy still at that hash means the home moved on, and the home's copy is pulled; a home still at it means this host's copy moved on. Only a key that changed on both sides since, or that this host never synced with this home, falls back to the manifests' write times, which come from each host's clock. A read that keeps this host's copy, or finds a key the home's manifest doesn't list, pushes the copy and then says on stderr whether the push went up or failed, and why. A key the home lacks because another host removed it after this host synced it isn't pushed back.
 

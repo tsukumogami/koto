@@ -1377,6 +1377,18 @@ fn refuse_if_unlocated(backend: &Backend, session: &str, command: &str) {
     backend.ensure_backref(session);
 }
 
+/// [`refuse_if_unlocated`] for `koto session resolve`, with the same
+/// refusals and exit codes, but a session homed under another directory's
+/// prefix isn't pulled first ([`Backend::check_located_to_replace`]). The
+/// pull would flush an open batch, and refuse on the very conflict the
+/// resolve is run to settle.
+fn refuse_if_unlocated_to_replace(backend: &Backend, session: &str, command: &str) {
+    if let Err(e) = backend.check_located_to_replace(session) {
+        refuse_unlocated(&e, command);
+    }
+    backend.ensure_backref(session);
+}
+
 /// Refuse, exit 2 with `{"error", "command"}`, before `command` writes
 /// `session`, when the session was imported into another workspace: the
 /// source is kept as a read-only predecessor, and the message names the
@@ -2583,7 +2595,7 @@ pub fn run(app: App) -> Result<()> {
                     // Migrated first: a source imported elsewhere refuses
                     // before an owed back-reference goes up for it.
                     refuse_if_migrated(&backend, &name, "session resolve");
-                    refuse_if_unlocated(&backend, &name, "session resolve");
+                    refuse_if_unlocated_to_replace(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
                 }
                 SessionCommand::Flush { name } => {

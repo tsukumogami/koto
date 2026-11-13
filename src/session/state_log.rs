@@ -100,8 +100,8 @@ pub fn conflict(id: &str, key: &str, doing: &str, local: &[u8], remote: &[u8]) -
     anyhow::anyhow!(
         "session conflict: session '{id}' has diverged between this host's log ({}) and the \
          bucket's copy at {key} ({}); {doing}. Nothing was overwritten. Run `koto session \
-         resolve {id} --keep local` or `--keep remote` from the session's directory to keep \
-         one of them",
+         resolve {id} --keep local` or `--keep remote` to keep one of \
+         them",
         describe(local),
         describe(remote)
     )

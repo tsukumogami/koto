@@ -1170,6 +1170,17 @@ impl Backend {
         }
     }
 
+    /// [`Backend::check_located`] for a command that replaces one side of
+    /// `id` with the other (`koto session resolve`): the same refusals, but
+    /// a home under another directory's prefix is only confirmed to hold the
+    /// session's own copy, never pulled. Always `Ok` on the local backend.
+    pub fn check_located_to_replace(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_located_to_replace(id),
+        }
+    }
+
     /// Read at most `bound` leading bytes of a key's LOCAL content, for
     /// bounded display (`crate::session_view`). Never a pull and never a
     /// remote request on either variant: a key with no local content is

@@ -1120,6 +1120,8 @@ koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
 
+It works from any directory on the host that holds the session's copy, and it doesn't first push a batch a failed push left open: `--keep local` uploads that batch's writes with the rest of the session, and `--keep remote` drops them.
+
 `--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
 
 | Value | Behavior |
