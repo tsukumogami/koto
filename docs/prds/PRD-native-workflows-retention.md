@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   Every koto session run inside Claude Code writes a `koto-<session-id>.json`
   entry into that Claude Code session's `workflows` directory, next to Claude
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-native-workflows-retention](docs/briefs/BRIEF-native-workflows-retention.md); carried in Absorbed Brief.
 
