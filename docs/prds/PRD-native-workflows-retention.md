@@ -96,12 +96,17 @@ This is the work tracked in koto issue #190.
 
 ### Terms
 
+- **koto write**: koto writing a session's entry into a `workflows`
+  directory, which it does on every committed step of that session. The
+  policy runs after each one, in the directory just written.
 - **Owned entry**: a file in a `workflows` directory that passes R5's
   ownership check.
-- **Last write**: the time koto last wrote an owned entry. koto rewrites an
-  entry on every committed step of its session, so it is the session's last
-  recorded activity in that directory.
-- **Staleness window (W)**: a stated duration the design fixes.
+- **Last write**: the entry file's modification time. koto rewrites an entry
+  on every committed step of its session, so this is the session's last
+  recorded activity in that directory, and it is known without reading the
+  file.
+- **Staleness window (W)**: a stated duration the design fixes. A last write
+  exactly W ago is still live.
 - **Finished entry**: an owned entry whose top-level `status` is anything but
   `running`. That covers completed, failed, cancelled, and (under R6(a))
   reconciled entries.
@@ -140,33 +145,41 @@ until enough of them finish or go stale; the docs state this case.
 finished and stale entries are candidates, and they are removed oldest first
 until the directory is within N or no candidates remain. An entry's age is its
 `startTime` when that parses as a timestamp, otherwise its last write; all
-candidates are compared on that one key, and ties are broken by filename.
+candidates are compared on that one key, and ties are broken by filename in
+ascending byte order.
 
 **R5. Ownership.** koto removes or rewrites only files it can show it wrote:
 a regular file (not a symlink or directory) whose name matches koto's entry
-filename pattern and whose content carries koto's marker, an entry `id` and
-`koto` block that agree with the filename. Every contract version koto has
-written carries that marker, so older entries qualify. A file that fails
-either check, including an unparseable `koto-*.json`, is left exactly as it
-was. Claude Code's `wf_*.json` files and every other file are never deleted,
-rewritten, renamed or changed in mode. A leftover temporary file from an
-interrupted koto write (the `.koto-wf-*.tmp` files koto's atomic write
-creates) is also koto-written: one whose last modification is more than A ago
-may be removed, and a younger one is left.
+filename pattern and whose content carries koto's marker: an entry `id` and
+`koto` block that agree with the filename, and a string top-level `status`.
+Every contract version koto has written carries that marker, so older entries
+qualify. A file that fails either check, including an unparseable
+`koto-*.json`, is left exactly as it was and doesn't count toward N. Claude
+Code's `wf_*.json` files and every other file are never deleted, rewritten,
+renamed or changed in mode. A leftover temporary file from an interrupted
+koto write (the `.koto-wf-*.tmp` files koto's atomic write creates) is also
+koto-written: one whose modification time is more than A ago is removed, and
+one A ago or younger is left.
 
 **R6. Crash-staleness, one of two outcomes.** For a stale entry, the design
 settles on exactly one of:
 
 - (a) *Reconcile.* The next koto write into that directory after the entry
-  became stale rewrites it so its top-level `status` is a word the recorded
-  Claude Code release already recognizes and that isn't `running`, and its
-  `summary` says the session went quiet and gives the time of its last write.
-  The entry is then a finished entry for R4. A later commit by the same
-  session rewrites it as live again.
+  became stale rewrites it so its top-level `status` isn't `running` and is a
+  word the conventions fixture has a probe for, proving the recorded Claude
+  Code release knows it, and its `summary` says the session went quiet and
+  gives the time of its last write in the same format as `startTime`. The
+  entry is then a finished entry for R4. A later commit by the same session
+  rewrites it as live again. Reconciliation never replaces a write made after
+  it judged the entry stale: it checks the entry's last write again
+  immediately before replacing it, and leaves an entry that changed.
 - (b) *Accept as a limitation.* The entry keeps its last status. koto's docs
   state the limitation, a command or check an operator runs to tell a live
   koto entry from a stale one, and that a stale entry remains only until the
   bound removes it as a candidate.
+
+W applies under both outcomes, since it also decides when a dead session's
+entry becomes a removal candidate.
 
 The design records which it chose and why. Under (a) the docs also state that
 reconciliation needs some koto write into the same directory after the window,
@@ -203,13 +216,14 @@ configuration reference with its default and environment override.
 
 **R11. Bounded cost per write.** The policy lists a directory at most once per
 koto write into it. When the number of files matching koto's entry filename
-pattern is at most N and no `running` entry's last write is older than W, it
-reads no file contents. Otherwise it reads contents only of files matching the
-pattern.
+pattern is at most N and none of them has a last write older than W, it reads
+no file contents. Otherwise it reads contents only of files matching that
+pattern, never of any other file.
 
 **R12. Concurrency-safe.** Two koto processes applying the policy to the same
-directory at once never remove a live entry or a file R5 protects, and neither
-reports an error because the other already removed a file.
+directory at once never remove a live entry or a file R5 protects, never
+replace a newer write (R6(a)), and neither reports an error because the other
+already removed a file.
 
 **R13. Testable without Claude Code.** Every requirement above can be checked
 by tests that point koto at a temporary `workflows` directory, with a clock
@@ -217,6 +231,9 @@ the test controls for every time comparison, and no Claude Code or niwa
 installed.
 
 ## Acceptance Criteria
+
+Tests set every time comparison through a clock they control and read N, W
+and A from the named values the implementation defines.
 
 Bound and order:
 
@@ -230,17 +247,21 @@ Bound and order:
 - [ ] A test seeds a directory with 3N finished entries, the oldest of them in
       the first contract version's shape, then makes one koto write: N owned
       entries remain and the first-version entry is gone.
-- [ ] A test where the entry being written has the oldest `startTime` in a
-      directory over the bound finds that entry still present after the write.
+- [ ] A test with N = 1, one finished entry, and a new session whose entry has
+      the oldest `startTime` finds only the new session's entry left.
 - [ ] A test with a directory over the bound holding one live entry older
       than every finished entry removes finished entries, not the live one.
-- [ ] A test with N+2 live entries in one directory and one more write removes
-      none of them.
+- [ ] A test with N+2 live entries and three finished entries in one directory
+      makes one more write: all three finished entries are gone, every live
+      entry and the entry just written remain.
 - [ ] A test with a stale entry and finished entries over the bound treats the
       stale entry as a candidate in `startTime` order.
 - [ ] A test with candidates where one lacks a parseable `startTime` orders it
       by its last write among the others, and two candidates with equal keys
-      are removed in filename order.
+      are removed in ascending filename order.
+- [ ] Staleness boundary: with the test clock set so a `running` entry's last
+      write is exactly W ago it is kept as live; one second past W it is a
+      candidate; with its last write in the future it is kept as live.
 - [ ] A test writes into two directories, one at the bound, and finds the
       other directory's entries unchanged.
 
@@ -248,24 +269,34 @@ Ownership and temp files:
 
 - [ ] A test seeds the directory with `wf_test.json`, `koto-notours.json`
       lacking koto's marker, a `koto-<id>.json` whose `id` disagrees with its
-      filename, an unparseable `koto-broken.json`, a symlink named
-      `koto-<id>.json`, a directory named `koto-<id>.json` and `notes.txt`,
-      drives the directory well past the bound, and asserts each is present
-      and byte-identical with the same mode and modification time.
-- [ ] A test leaves one `.koto-wf-*.tmp` file older than A and one younger;
-      after a koto write the older one is gone, the younger remains, and
-      neither changed the owned-entry count.
+      filename, an owned-looking `koto-<id>.json` with no `status`, an
+      unparseable `koto-broken.json`, a symlink named `koto-<id>.json`, a
+      directory named `koto-<id>.json` and `notes.txt`, drives the directory
+      well past the bound, and asserts each is present and byte-identical with
+      the same mode and modification time.
+- [ ] A test leaves `.koto-wf-*.tmp` files whose modification times are one
+      second past A, exactly A, and younger than A; after a koto write only
+      the first is gone.
+- [ ] A test with N owned entries plus three `.koto-wf-*.tmp` files younger
+      than A and one koto write by an existing session removes no owned entry.
 
 Crash-staleness (whichever R6 outcome the design chose):
 
 - [ ] Under R6(a): a test writes a running entry, sets the test clock past W,
       makes a koto write from another session into the same directory, and
-      finds the entry's top-level `status` not `running`, a word already
-      covered by a probe in the conventions fixture, and its `summary`
-      containing the entry's last-write time.
+      finds the entry's top-level `status` not `running`, a word with a probe
+      in the conventions fixture, and its `summary` containing its last-write
+      time in the same format as `startTime`.
 - [ ] Under R6(a): the same test with the clock short of W leaves the entry's
       `status` as `running`, and a commit by the original session after
       reconciliation sets it back to `running`.
+- [ ] Under R6(a): a test where the original session's commit lands after the
+      policy judged its entry stale and before it rewrites it finds the entry
+      still `running` with the commit's content.
+- [ ] Under R6(a): a reconciled entry in a directory over the bound is removed
+      in `startTime` order like any finished entry.
+- [ ] Under R6(b): a test with a stale entry in a directory within the bound
+      leaves it byte-identical after a koto write.
 - [ ] Under R6(b): the operator guide has a section that names the
       limitation, gives the command an operator runs to tell a live koto entry
       from a stale one, and states that a stale entry is removed by the bound.
@@ -278,13 +309,19 @@ Failure, cost and concurrency:
       lists the directory and before it removes the file shows the
       triggering koto command exits with its normal result, reports no error
       for that file, and its own entry is up to date.
+- [ ] A test in which a candidate can't be removed (its directory made
+      read-only for the removal, skipped when the test runs with privileges
+      that ignore it) shows the koto command exits with its normal result and
+      its own entry is up to date.
 - [ ] A test pointing koto at a `workflows` path it can't list shows the koto
       command exits with its normal result.
-- [ ] A test with a directory holding at most N name-matching files and no
-      stale candidate shows the policy reads no file contents, through a
-      counter the implementation exposes to tests.
-- [ ] A test runs the policy twice over the same directory interleaved, so
-      both pick the same candidates, and finds no error from either, no live
+- [ ] Through a counter the implementation exposes to tests: with at most N
+      name-matching files, all with a last write within W, the policy lists
+      the directory once and reads no file contents; with more than N
+      name-matching files plus non-matching files present, it lists the
+      directory once and reads no non-matching file.
+- [ ] A test runs two policy passes over the same directory so both list it
+      before either removes anything, and finds no error from either, no live
       or protected file removed, and at most N owned entries left.
 - [ ] If N is a setting: a test sets it to 0 and finds the command refused
       with an error naming the setting.
@@ -298,10 +335,13 @@ Guard, docs and independence:
       `status` word added to the shape fixture fails naming the word. If it
       adds neither, both fixtures are unchanged and the pull request says so.
 - [ ] Each of the operator guide, the field reference and the koto-user
-      skill's `/workflows` section contains the default value of N, and, under
-      R6(a), the value of W.
+      skill's `/workflows` section states the default value of N, the value of
+      W, the eviction order, the ownership rule, the many-live-sessions case
+      and the R6 outcome chosen.
 - [ ] Any new setting appears in the CLI configuration reference with its
       default and its environment override.
+- [ ] A test runs the policy with no koto setting changed from its default
+      and finds the bound enforced.
 - [ ] The implementation pull request names the test that runs 3N sessions
       and the exact command a reader runs to reproduce it locally, and that
       command passes.
@@ -363,6 +403,10 @@ Guard, docs and independence:
   already records `completed` or `failed`; a store lookup would need a scan
   of every session and would still say nothing about a killed one. The
   entry's own status and last write are enough and cost nothing extra.
+- **A file koto can't prove it wrote is left forever.** An unparseable or
+  marker-less `koto-*.json` never counts toward N and is never removed,
+  because removing a file koto didn't write is the one failure the policy
+  must not have; such files are rare and cost a reader one line in the list.
 - **Ownership is name plus content, not name alone.** A file named
   `koto-*.json` that another tool or a person wrote must survive, and koto's
   session ids aren't guaranteed to be UUIDs, so a filename pattern can't carry
