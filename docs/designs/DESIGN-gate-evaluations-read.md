@@ -279,7 +279,12 @@ found it.
 - **The cloud read the sibling verbs use.** Inherit `read_events`, flush
   included, as `status` and `overrides list` do. Rejected because a reader
   would take the batch lock a running tick's writes wait on and push the
-  tick's batch early.
+  tick's batch early. The sibling verbs mostly read the session the caller
+  is driving, between its own ticks; a sweep reads every session in the
+  store, including ones other agents are ticking right now, so the flush would land on
+  exactly the sessions it hurts and undo the one-push-per-tick batching
+  koto#548 introduced. A sweep run often enough to be useful would turn
+  every read into a cost on someone else's tick.
 - **The local copy only.** Read `read_events_local` and never pull.
   Rejected because a cloud session continued on another host would be
   answered from a stale copy, and two hosts would give two answers.
@@ -400,6 +405,22 @@ The verb and the cloud backend both stay in the `koto` crate. If the shared
 session reader (`DESIGN-koto-shared-session-reader.md`) moves the event
 types into `koto-session-reader` first, the projection reads them at the
 paths koto re-exports, and nothing here changes.
+
+Neighbouring code this leaves alone:
+
+- `koto context history` (#685) and the other read verbs keep
+  `read_events` and its flush. Moving them to `read_events_unflushed` is a
+  separate change with its own tests.
+- koto#657 (a read verb's flush pushes a run's unpushed writes and leaves
+  no event for that push) is about the flushing read. The new read never
+  flushes, so it neither fixes nor changes that behaviour, and #657's fix
+  doesn't change this read.
+- A session whose bucket copy carries a supersede fence is read the way
+  `koto status` reads it; the new read never locks or replaces the local
+  file, so it doesn't touch the fence.
+- The `locate_or_serve` parameter only skips `ensure_backref` on a located
+  session. It changes nothing about how a session name is looked up, so
+  the path for a name that isn't there stays as it is.
 
 ### Key Interfaces
 
@@ -525,7 +546,7 @@ Deliverables:
   more findings than the cap, which comes out bounded with its truncation
   flags set, and one whose `seq` or counts aren't unsigned integers, which
   exits 3. A bucket copy over `MAX_STATE_BYTES` exits 3 without parsing.
-- `tests/evaluations_list_test.rs`: the issue's one-state probe template
+- `tests/evaluations_list_test.rs`: #688's one-state probe template
   gives one failed item with `prd/ac-numbered` and the template name; a
   missing session exits 2; the log is byte-identical after the read; the
   cloud backend gives the same items as the local one, and a second host
@@ -575,8 +596,7 @@ the attempt numbers, the `rule_counts` values and the poll record's counts
 are parsed as unsigned integers, and an event whose fields don't parse
 counts as an unreadable log; the findings and rule lists are held to the
 writer's caps with the truncation flags set when the read cuts them. A log
-that can't
-be parsed exits 3 with a message naming the problem and the event's
+that can't be parsed exits 3 with a message naming the problem and the event's
 position, never a slice of the raw line. The output is one JSON document
 serialized by serde, so quotes and control characters in a hostile value
 are escaped and can't change the document's shape. Callers still treat
