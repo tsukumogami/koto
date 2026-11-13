@@ -387,6 +387,15 @@ fn is_real_dir(path: &std::path::Path) -> Result<bool, String> {
 
 /// Whether `session`'s own two areas hold any entry, without reading one.
 /// An area that can't be listed counts as holding something.
+///
+/// This looks at the local copy only, under the cloud backend too, and
+/// that is enough because of an ordering this relies on: only the
+/// session's own commands write its own areas, and they write the local
+/// copy before the bucket's; and `handle_next` reads the session's log
+/// (`Backend::read_events`) before it computes the block, which under the
+/// cloud backend pulls the session first, decision keys included, and
+/// strictly when its home is another workspace. A caller that reaches this
+/// without that pull would need to list the bucket's areas as well.
 fn holds_decisions(backend: &Backend, session: &str) -> bool {
     let ctx = ctx_dir(backend, session);
     [super::DECISIONS_AREA, super::AIMED_AREA]
