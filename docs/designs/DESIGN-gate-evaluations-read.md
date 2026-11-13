@@ -29,6 +29,7 @@ rationale: |
   payload public as a raw dump would. The read that never flushes keeps a
   sweep from making running ticks wait. The cost is that sessions koto has
   already removed can't be read, which the design states.
+user_visible_surface: true
 ---
 
 # DESIGN: A read-only verb for a session's gate evaluations
@@ -285,7 +286,7 @@ found it.
 
 ### Decision 3: Which evaluations the list holds
 
-Writing the architecture surfaced three smaller choices about what goes in
+Writing the architecture surfaced four smaller choices about what goes in
 the list. Each could reasonably have gone the other way.
 
 #### Chosen: every `gate_evaluated` event, pending and pre-rewind included, `__action__` left out, a removed session as not found
@@ -367,13 +368,18 @@ this host's store, not to the bucket, not to the run journal.
   (see Security Considerations).
 - **`src/cli/mod.rs`**. A `Command::Evaluations { subcommand }` variant with
   the help text "Gate evaluation retrieval (reads only)", and its dispatch
-  arm. The arm checks where the session lives and serves a migrated source
-  the way `locate_or_serve` does, but without the `ensure_backref` call, so
-  the read sends no back-reference PUT.
+  arm. The arm calls `locate_or_serve`, which gains a parameter that skips
+  its `ensure_backref` call, so the read sends no back-reference PUT and
+  the locate and migrated-source logic isn't copied. The current state
+  comes from `derive_machine_state`, as `overrides list` derives it.
 - **`src/session/mod.rs`**. A new additive method on `SessionBackend`,
   `read_events_unflushed(&self, id) -> Result<(StateFileHeader,
   Vec<Event>)>`, whose default is `read_events`. The local backend keeps
-  the default: it has no batch to flush.
+  the default: it has no batch to flush. The `Backend` enum, which
+  forwards each trait method to its local or cloud backend by hand, gains
+  the forwarding arm; without it every caller holding a `Backend`,
+  `WorkspaceReader`'s included, would fall back to the flushing default
+  with nothing to say so.
 - **`src/session/cloud.rs`**. `CloudBackend` overrides it: run
   `check_not_migrated`; if this host's batch journal for the session is open,
   an opening file is there, or the process runs inside a tick on the
@@ -493,7 +499,10 @@ Add `read_events_unflushed` to `SessionBackend` with its default, and the
 locking behaviour, and the verb shouldn't ship on the flushing read.
 
 Deliverables:
-- `src/session/mod.rs`, `src/session/cloud.rs`.
+- `src/session/mod.rs` (the trait method and the `Backend` forwarding
+  arm), `src/session/cloud.rs`.
+- The tests below run through a `Backend`, and one through the backend a
+  `WorkspaceReader` hands out, so a missing forwarding arm fails them.
 - Cloud tests against the in-process fake S3: with a batch open on this
   host, the read returns the batch's events, the batch stays open and
   unflushed, and the fake S3 sees no write; with no batch open, a newer
@@ -512,8 +521,10 @@ Deliverables:
   and `rule_counts`, a pass, a pending poll, a truncated findings list, a
   rewind with evaluations on both sides, two states with a gate of the same
   name, a `default_action_executed` check left out, an empty log, and a
-  hostile event with an oversized rule id and more findings than the cap,
-  which comes out bounded with its truncation flags set.
+  hostile event with an oversized rule id, an oversized poll status and
+  more findings than the cap, which comes out bounded with its truncation
+  flags set, and one whose `seq` or counts aren't unsigned integers, which
+  exits 3. A bucket copy over `MAX_STATE_BYTES` exits 3 without parsing.
 - `tests/evaluations_list_test.rs`: the issue's one-state probe template
   gives one failed item with `prd/ac-numbered` and the template name; a
   missing session exits 2; the log is byte-identical after the read; the
@@ -554,10 +565,17 @@ imported elsewhere, the log is the bucket copy under another workspace's
 prefix, and whoever can write that prefix controls its bytes. koto's write
 path bounds rule ids at 128 bytes, caps findings and rule counts at 50 per
 evaluation and redacts known credentials, but none of that is applied again
-on read. So the projection bounds what it prints itself: each string it
-emits (state, gate, outcome, reason, rule id, template fields) is cut to a
-fixed length, the findings and rule lists are held to the writer's caps
-with the truncation flags set when the read cuts them, and a log that can't
+on read. So the read bounds what it takes in and what it prints. A bucket
+copy larger than `MAX_STATE_BYTES` (16 MiB, the cap koto already puts on a
+fetched state file) is refused with exit 3 before it's parsed, which also
+bounds how many items one response can hold. Each string the projection
+emits (state, gate, outcome, reason, rule id, template fields, the poll
+record's status and since, the timestamp) is cut to a fixed length; `seq`,
+the attempt numbers, the `rule_counts` values and the poll record's counts
+are parsed as unsigned integers, and an event whose fields don't parse
+counts as an unreadable log; the findings and rule lists are held to the
+writer's caps with the truncation flags set when the read cuts them. A log
+that can't
 be parsed exits 3 with a message naming the problem and the event's
 position, never a slice of the raw line. The output is one JSON document
 serialized by serde, so quotes and control characters in a hostile value
@@ -602,7 +620,9 @@ the compiled cache path.
 
 **Residual risk.** Output read through `--workspace` is only as trustworthy
 as the bucket prefix it comes from; the verb doesn't authenticate the log's
-writer. When gates ran and how often they failed is visible to anyone with
+writer, so counts drawn from another workspace's or an imported session can
+be fabricated by whoever can write that prefix, and a sweep shouldn't treat
+them as authenticated. When gates ran and how often they failed is visible to anyone with
 the workspace's bucket access, as it already is through `koto status` and
 `koto overrides list`.
 
