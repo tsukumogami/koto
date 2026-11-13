@@ -1096,8 +1096,10 @@ pub enum ChildrenPolicy {
 #[derive(Subcommand)]
 pub enum WorkflowsAction {
     /// Publish a Claude Code session's `/workflows` directory so koto sessions
-    /// driven in that session render into it natively (opt-in). Records the
-    /// directory in the target session's context store; writes no event.
+    /// driven in that session render into it natively. Records the directory
+    /// in the target session's context store, marked explicit so a later
+    /// change of driving Claude Code session doesn't move it, and appends a
+    /// `context_added` event for each key.
     Publish {
         /// Absolute path to the Claude Code session's `/workflows` directory.
         #[arg(long)]
@@ -1680,7 +1682,12 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
                     )
                 })?,
             };
-            crate::workflows_surface::publish_location(&backend, &backend, &session_id, &dir)?;
+            crate::workflows_surface::publish_explicit_location(
+                &backend,
+                &backend,
+                &session_id,
+                &dir,
+            )?;
             Ok(())
         }
     }

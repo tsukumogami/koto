@@ -1,12 +1,14 @@
 //! Context keys koto writes for itself, on the cloud backend (koto#386).
 //!
 //! Every key koto writes for a session either reaches the bucket with its
-//! object or is host-local and stays off the bucket's manifest. The one
-//! host-local key is `workflows/publish-location`, the Claude Code
+//! object or is host-local and stays off the bucket's manifest. The
+//! host-local keys are `workflows/publish-location`, the Claude Code
 //! `/workflows` folder koto renders a session into, which koto publishes on
-//! the commit funnel through the local store. koto 0.19.0 listed it in the
-//! bucket's manifest without uploading its object, so `koto session import`
-//! refused the session with `import_source_unreadable`.
+//! the commit funnel through the local store, and
+//! `workflows/publish-explicit`, which `koto workflows publish` writes beside
+//! it. koto 0.19.0 listed the location in the bucket's manifest without
+//! uploading its object, so `koto session import` refused the session with
+//! `import_source_unreadable`.
 //!
 //! Every test drives the koto binary against the in-process endpoint in
 //! `tests/support/fake_s3.rs`, with the backend chosen through
@@ -29,6 +31,9 @@ const BUCKET: &str = "koto-host-local";
 const NAME: &str = "coord";
 const TEMPLATE_FILE: &str = "coord.md";
 const LOCATION: &str = "workflows/publish-location";
+/// The marker `koto workflows publish` writes beside the location, naming
+/// the same folder; host-local too.
+const EXPLICIT: &str = "workflows/publish-explicit";
 
 /// A system `PATH` for the action's shell, after the directory holding the
 /// koto under test.
@@ -239,14 +244,16 @@ fn assert_session_manifest_whole(s3: &FakeS3, ws: &Path, session: &str) -> Vec<S
             "{name}'s object doesn't match the manifest"
         );
     }
-    assert!(
-        !keys.contains_key(LOCATION),
-        "the bucket's manifest lists the host-local {LOCATION}: {manifest}"
-    );
-    assert!(
-        s3.object(&key(&format!("ctx/{}", LOCATION))).is_none(),
-        "the bucket holds the host-local {LOCATION}"
-    );
+    for host_local in [LOCATION, EXPLICIT] {
+        assert!(
+            !keys.contains_key(host_local),
+            "the bucket's manifest lists the host-local {host_local}: {manifest}"
+        );
+        assert!(
+            s3.object(&key(&format!("ctx/{}", host_local))).is_none(),
+            "the bucket holds the host-local {host_local}"
+        );
+    }
     keys.keys().cloned().collect()
 }
 
@@ -366,6 +373,9 @@ fn every_manifest_entry_has_its_object_and_the_location_stays_on_its_host() {
     assert!(out.ok(), "workflows publish: {}", out.describe());
     let out = h.koto(&ws, &["context", "get", NAME, LOCATION], &[]);
     assert_eq!(out.stdout.trim(), other.to_str().unwrap());
+    let out = h.koto(&ws, &["context", "get", NAME, EXPLICIT], &[]);
+    assert!(out.ok(), "get {EXPLICIT}: {}", out.describe());
+    assert_eq!(out.stdout.trim(), other.to_str().unwrap());
     assert_eq!(assert_bucket_manifest_whole(&s3, &ws), ["one.md"]);
 
     // The push the import guide asks for before a move uploads the whole
@@ -387,6 +397,9 @@ fn every_manifest_entry_has_its_object_and_the_location_stays_on_its_host() {
     assert!(out.ok(), "resolve --keep remote: {}", out.describe());
     let out = h.koto(&ws, &["context", "get", NAME, LOCATION], &[]);
     assert!(out.ok(), "get {LOCATION}: {}", out.describe());
+    assert_eq!(out.stdout.trim(), other.to_str().unwrap());
+    let out = h.koto(&ws, &["context", "get", NAME, EXPLICIT], &[]);
+    assert!(out.ok(), "get {EXPLICIT}: {}", out.describe());
     assert_eq!(out.stdout.trim(), other.to_str().unwrap());
     let out = h.koto(&ws, &["context", "get", NAME, "one.md"], &[]);
     assert_eq!(out.stdout, "one", "{}", out.describe());

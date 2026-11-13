@@ -22,7 +22,10 @@ pub use contract::{
     ScreenStatus, WorkflowFile, CONTRACT_VERSION, GATE_NAME_CAP, HOLDINGS_KEY_CAP,
     HOLDINGS_STORE_CAP,
 };
-pub use discover::{publish_location, resolve_publish_location, PUBLISH_LOCATION_KEY};
+pub use discover::{
+    is_explicit_location, publish_explicit_location, publish_location, resolve_publish_location,
+    resolve_publish_owner, EXPLICIT_LOCATION_KEY, PUBLISH_LOCATION_KEY,
+};
 pub use materialize::{materialize_after_commit, WORKFLOWS_DIR_ENV};
 pub use project::{
     derive_enriched_projection, derive_minimal_projection, ordered_phases, per_state_outcomes,

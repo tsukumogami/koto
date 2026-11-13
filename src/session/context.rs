@@ -56,11 +56,13 @@ pub fn is_pin_record_key(key: &str) -> bool {
 /// A host-local key is written to the local store only, no manifest pushed
 /// to the bucket names it, and an import skips it, even when a manifest an
 /// older koto pushed lists it. The destination resolves its own value on its
-/// first commit. The one such key is `workflows/publish-location`, which
-/// names a Claude Code `/workflows` folder on this host and is meaningless
-/// on any other.
+/// first commit. There are two such keys: `workflows/publish-location`,
+/// which names a Claude Code `/workflows` folder on this host and is
+/// meaningless on any other, and `workflows/publish-explicit`, which marks
+/// that same folder as set with `koto workflows publish`.
 pub fn is_host_local_key(key: &str) -> bool {
     key == crate::workflows_surface::PUBLISH_LOCATION_KEY
+        || key == crate::workflows_surface::EXPLICIT_LOCATION_KEY
 }
 
 /// Content store for workflow context artifacts.
@@ -216,6 +218,7 @@ mod tests {
         let mut manifest = Manifest::default();
         for key in [
             "workflows/publish-location",
+            "workflows/publish-explicit",
             "workflows/other",
             "batch_final_view",
         ] {
@@ -227,6 +230,21 @@ mod tests {
             ["batch_final_view", "workflows/other"]
         );
         assert!(!manifest.drop_host_local());
+    }
+
+    #[test]
+    fn both_workflows_location_keys_are_host_local() {
+        for key in ["workflows/publish-location", "workflows/publish-explicit"] {
+            assert!(is_host_local_key(key), "{key}");
+        }
+        for key in [
+            "workflows/other",
+            "workflows/publish-location/x",
+            "workflows",
+            "notes.md",
+        ] {
+            assert!(!is_host_local_key(key), "{key}");
+        }
     }
 
     #[test]

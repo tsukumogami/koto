@@ -368,14 +368,20 @@ fn cap_preview(escaped: &str) -> String {
 ///
 /// Resolution order:
 /// 1. `KOTO_WORKFLOWS_DIR` -- an explicit host handoff (e.g. a SessionStart
-///    hook). Self-published into this session's store so descendants discover
-///    it by the ancestor walk.
+///    hook). Wins for this call. Self-published into this session's store
+///    only when it has no location yet, so descendants discover it by the
+///    ancestor walk.
 /// 2. The nearest published ancestor (a location this session self-published on
-///    a prior commit, or an ancestor's). A cheap key probe; no config load.
+///    a prior commit, or an ancestor's). A cheap key probe; no config load
+///    while the location still belongs to the driving Claude Code session.
+///    When it names another Claude Code session's folder and a different
+///    session now drives the run (a resume or a rebind, koto#361), the
+///    location follows the new driver: see [`follow_driving_session`].
 /// 3. `workflows.native` (default on): self-discover the hosting Claude Code
-///    session's `/workflows` directory from the environment. Only reached on a
-///    participating session's first commit, before it self-publishes; skipped
-///    when the operator has opted out (`workflows.native = false`).
+///    session's `/workflows` directory from the environment. Reached when no
+///    session in the chain has a location yet, which is a participating
+///    session's first commit; skipped when the operator has opted out
+///    (`workflows.native = false`).
 ///
 /// `None` means no target resolved: write nothing, default path untouched
 /// (fully headless, or opted out).
@@ -392,9 +398,13 @@ fn resolve_target_dir(
             return Some(PathBuf::from(env_dir));
         }
     }
-    // 2. Nearest published ancestor (self-published or hierarchy).
-    if let Some(dir) = discover::resolve_publish_location(backend, store, session_id) {
-        return Some(dir);
+    // 2. Nearest published ancestor (self-published or hierarchy), moved to
+    //    the driving Claude Code session's folder when that has changed.
+    if let Some((owner, stored)) = discover::resolve_publish_owner(backend, store, session_id) {
+        if let Some(moved) = follow_driving_session(backend, store, session_id, &owner, &stored) {
+            return Some(moved);
+        }
+        return Some(stored);
     }
     // 3. Config gate (on by default): self-discover from the Claude Code
     //    session environment unless the operator opted out.
@@ -409,8 +419,85 @@ fn resolve_target_dir(
     None
 }
 
+/// The driving Claude Code session's `/workflows` folder, when the stored
+/// location `stored` (published on `owner`) belongs to a different Claude
+/// Code session and should follow the driver (koto#361). `None` keeps the
+/// stored location.
+///
+/// The session a self-discovered location was resolved for is part of its
+/// path, `$HOME/.claude/projects/<project>/<session>/workflows`, so the check
+/// starts with a string compare against the current `CLAUDE_CODE_SESSION_ID`
+/// and stops there when nothing changed. It moves the location only when all
+/// of these hold:
+///
+/// - the current id is set and non-empty;
+/// - `stored` is a Claude Code session folder under this `HOME`'s projects
+///   root, for a session other than the current one (a custom directory never
+///   moves);
+/// - the location wasn't set with `koto workflows publish`
+///   ([`discover::is_explicit_location`]);
+/// - `workflows.native` is on;
+/// - the current session's transcript exists under the projects root (a
+///   stale id or a non-Claude agent keeps the stored folder).
+///
+/// When `session_id` owns the location, the new folder is published on it
+/// (which rewrites the key and appends one `context_added`). When the
+/// location belongs to an ancestor, nothing is written: the descendant
+/// renders into the new folder for this commit only, gets no key of its own
+/// to shadow the ancestor's, and no event lands in another session's log.
+/// The ancestor's key moves on the ancestor's own next commit.
+///
+/// The old folder is left as it is.
+fn follow_driving_session(
+    backend: &dyn SessionBackend,
+    store: &dyn ContextStore,
+    session_id: &str,
+    owner: &str,
+    stored: &Path,
+) -> Option<PathBuf> {
+    let current = host_env(CLAUDE_SESSION_ID_ENV)?;
+    let current = current.trim();
+    if current.is_empty() {
+        return None;
+    }
+    let projects = claude_projects_root()?;
+    let stored_session = claude_session_of(stored, &projects)?;
+    if stored_session == std::ffi::OsStr::new(current) {
+        return None;
+    }
+    if discover::is_explicit_location(store, owner, stored) || !workflows_native_enabled() {
+        return None;
+    }
+    let project_dir = find_session_project_dir(&projects, current)?;
+    let dir = project_dir.join(current).join("workflows");
+    if owner == session_id {
+        if let Some(s) = dir.to_str() {
+            let _ = discover::publish_location(backend, store, session_id, s);
+        }
+    }
+    Some(dir)
+}
+
+/// The Claude Code session a `/workflows` folder belongs to, when `location`
+/// has the shape self-discovery gives it:
+/// `<projects>/<project>/<session>/workflows`. `None` for any other path.
+fn claude_session_of<'a>(location: &'a Path, projects: &Path) -> Option<&'a std::ffi::OsStr> {
+    if location.file_name()? != "workflows" {
+        return None;
+    }
+    let session_dir = location.parent()?;
+    let project_dir = session_dir.parent()?;
+    if project_dir.file_name().is_none() || project_dir.parent()? != projects {
+        return None;
+    }
+    session_dir.file_name()
+}
+
 /// Publish `dir` as `session_id`'s location if it has not already published one
-/// (so descendants can discover it by the ancestor walk). Best-effort.
+/// (so descendants can discover it by the ancestor walk). Best-effort. It
+/// never replaces a location; the only rewrite on the commit path is
+/// [`follow_driving_session`]'s, when another Claude Code session drives the
+/// run.
 fn self_publish_if_absent(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
@@ -447,10 +534,16 @@ fn resolve_from_claude_env() -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
     }
-    let home = std::env::var_os("HOME")?;
-    let projects = Path::new(&home).join(".claude").join("projects");
+    let projects = claude_projects_root()?;
     let project_dir = find_session_project_dir(&projects, session_id)?;
     Some(project_dir.join(session_id).join("workflows"))
+}
+
+/// `$HOME/.claude/projects`, where Claude Code keeps each project's session
+/// transcripts and `/workflows` folders. `None` when `HOME` is unset.
+fn claude_projects_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".claude").join("projects"))
 }
 
 /// Find the project directory under `projects` that holds `<session_id>.jsonl`.
@@ -1471,5 +1564,374 @@ mod tests {
             one_before,
             "sess-two's commit does not update sess-one's file"
         );
+    }
+
+    // ----- Following the driving Claude Code session (koto#361) -----
+
+    /// A temporary `HOME` holding Claude Code transcripts: `<project>/<sid>.jsonl`
+    /// for each `(project, sid)` pair. Returns the projects root.
+    fn claude_home(home: &Path, transcripts: &[(&str, &str)]) -> PathBuf {
+        let projects = home.join(".claude").join("projects");
+        for (project, sid) in transcripts {
+            let dir = projects.join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{sid}.jsonl")), b"").unwrap();
+        }
+        projects
+    }
+
+    /// The `/workflows` folder self-discovery gives `sid` in `project`.
+    fn session_folder(projects: &Path, project: &str, sid: &str) -> PathBuf {
+        projects.join(project).join(sid).join("workflows")
+    }
+
+    fn init_child(backend: &LocalBackend, workflow: &str, parent: &str) {
+        let mut header = make_header(workflow);
+        header.parent_workflow = Some(parent.to_string());
+        let init = Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "workflow_initialized".to_string(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "template.json".to_string(),
+                variables: Default::default(),
+                spawn_entry: None,
+                machine: None,
+            },
+            idempotency_hash: None,
+        };
+        backend
+            .init_state_file(workflow, header, vec![init])
+            .expect("init child session");
+    }
+
+    /// `id`'s own stored location, trimmed.
+    fn stored_location(backend: &LocalBackend, id: &str) -> Option<String> {
+        use crate::session::context::ContextStore;
+        backend
+            .get(id, discover::PUBLISH_LOCATION_KEY)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+    }
+
+    /// How many `context_added` events for the location `id`'s log holds.
+    fn location_publishes(backend: &LocalBackend, id: &str) -> usize {
+        let (_, events) = backend.read_events(id).unwrap();
+        events
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::ContextAdded { key, .. }
+                    if key == discover::PUBLISH_LOCATION_KEY)
+            })
+            .count()
+    }
+
+    fn state_in(dir: &Path, uuid: &str) -> Option<String> {
+        read_file(dir, uuid).and_then(|v| v["koto"]["currentState"].as_str().map(str::to_string))
+    }
+
+    fn driver(sid: Option<&str>) {
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, sid);
+    }
+
+    #[test]
+    fn the_same_driver_publishes_once_and_keeps_one_folder() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        for state in ["building", "testing", "review"] {
+            transition(&backend, "solo", state);
+        }
+        driver(None);
+
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("review"));
+        assert_eq!(location_publishes(&backend, "solo"), 1);
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+        let sessions: Vec<_> = std::fs::read_dir(projects.join("proj"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert_eq!(sessions.len(), 1, "one session folder: {sessions:?}");
+    }
+
+    #[test]
+    fn no_driver_keeps_the_stored_folder() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        transition(&backend, "solo", "building");
+        driver(None);
+        transition(&backend, "solo", "review");
+
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("review"));
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+        assert_eq!(location_publishes(&backend, "solo"), 1);
+    }
+
+    #[test]
+    fn a_new_driver_without_a_transcript_keeps_the_stored_folder() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        transition(&backend, "solo", "building");
+        driver(Some("sess-stale"));
+        transition(&backend, "solo", "review");
+        driver(None);
+
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("review"));
+        assert!(!session_folder(&projects, "proj", "sess-stale").exists());
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+        assert_eq!(location_publishes(&backend, "solo"), 1);
+    }
+
+    #[test]
+    fn opting_out_of_native_rendering_keeps_the_stored_folder() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one"), ("proj", "sess-two")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let two = session_folder(&projects, "proj", "sess-two");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        transition(&backend, "solo", "building");
+        let koto_dir = home.path().join(".koto");
+        std::fs::create_dir_all(&koto_dir).unwrap();
+        std::fs::write(
+            koto_dir.join("config.toml"),
+            "[workflows]\nnative = false\n",
+        )
+        .unwrap();
+        driver(Some("sess-two"));
+        transition(&backend, "solo", "review");
+        driver(None);
+
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("review"));
+        assert!(read_file(&two, "solo-uuid").is_none());
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+    }
+
+    #[test]
+    fn the_host_handoff_wins_and_leaves_the_stored_key_alone() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one"), ("proj", "sess-two")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let two = session_folder(&projects, "proj", "sess-two");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        transition(&backend, "solo", "building");
+        driver(Some("sess-two"));
+        set_host_env_for_test(WORKFLOWS_DIR_ENV, wf.path().to_str());
+        transition(&backend, "solo", "review");
+        set_host_env_for_test(WORKFLOWS_DIR_ENV, None);
+        driver(None);
+
+        assert_eq!(state_in(wf.path(), "solo-uuid").as_deref(), Some("review"));
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("building"));
+        assert!(read_file(&two, "solo-uuid").is_none());
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+        assert_eq!(location_publishes(&backend, "solo"), 1);
+    }
+
+    #[test]
+    fn a_custom_folder_never_moves_with_the_driver() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-two")]);
+        let two = session_folder(&projects, "proj", "sess-two");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        driver(Some("sess-two"));
+        transition(&backend, "solo", "building");
+        driver(None);
+
+        assert_eq!(
+            state_in(wf.path(), "solo-uuid").as_deref(),
+            Some("building")
+        );
+        assert!(read_file(&two, "solo-uuid").is_none());
+        assert_eq!(
+            stored_location(&backend, "solo").as_deref(),
+            wf.path().to_str()
+        );
+    }
+
+    #[test]
+    fn an_explicit_publish_stays_until_something_else_rewrites_the_location() {
+        use crate::session::context::ContextStore;
+
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(
+            home.path(),
+            &[
+                ("proj", "sess-one"),
+                ("proj", "sess-two"),
+                ("proj", "sess-three"),
+            ],
+        );
+        let one = session_folder(&projects, "proj", "sess-one");
+        let two = session_folder(&projects, "proj", "sess-two");
+        let three = session_folder(&projects, "proj", "sess-three");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        // `koto workflows publish` of sess-one's folder, then sess-two drives.
+        driver(Some("sess-two"));
+        discover::publish_explicit_location(&backend, &backend, "solo", one.to_str().unwrap())
+            .unwrap();
+        transition(&backend, "solo", "building");
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("building"));
+        assert!(read_file(&two, "solo-uuid").is_none());
+        assert_eq!(stored_location(&backend, "solo").as_deref(), one.to_str());
+
+        // The location is removed and self-discovered again under sess-two;
+        // the marker still names sess-one's folder, so it no longer counts.
+        backend
+            .remove("solo", discover::PUBLISH_LOCATION_KEY)
+            .unwrap();
+        transition(&backend, "solo", "testing");
+        assert_eq!(stored_location(&backend, "solo").as_deref(), two.to_str());
+        assert_eq!(state_in(&two, "solo-uuid").as_deref(), Some("testing"));
+
+        // So the next driver change moves it.
+        driver(Some("sess-three"));
+        transition(&backend, "solo", "review");
+        driver(None);
+        assert_eq!(state_in(&three, "solo-uuid").as_deref(), Some("review"));
+        assert_eq!(stored_location(&backend, "solo").as_deref(), three.to_str());
+    }
+
+    #[test]
+    fn only_the_owner_moves_its_key_and_a_child_renders_without_one() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(home.path(), &[("proj", "sess-one"), ("proj", "sess-two")]);
+        let one = session_folder(&projects, "proj", "sess-one");
+        let two = session_folder(&projects, "proj", "sess-two");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "root");
+        init_child(&backend, "kid", "root");
+
+        // Under sess-one the parent publishes and the child inherits.
+        driver(Some("sess-one"));
+        transition(&backend, "root", "plan");
+        transition(&backend, "kid", "work");
+        assert_eq!(state_in(&one, "kid-uuid").as_deref(), Some("work"));
+        assert_eq!(stored_location(&backend, "kid"), None);
+
+        // sess-two drives the child: it renders into sess-two's folder, gets
+        // no key of its own, and nothing lands in the parent's log.
+        driver(Some("sess-two"));
+        let (_, root_events) = backend.read_events("root").unwrap();
+        transition(&backend, "kid", "check");
+        assert_eq!(state_in(&two, "kid-uuid").as_deref(), Some("check"));
+        assert_eq!(state_in(&one, "kid-uuid").as_deref(), Some("work"));
+        assert_eq!(stored_location(&backend, "kid"), None);
+        assert_eq!(location_publishes(&backend, "kid"), 0);
+        assert_eq!(stored_location(&backend, "root").as_deref(), one.to_str());
+        assert_eq!(
+            backend.read_events("root").unwrap().1.len(),
+            root_events.len(),
+            "the child's commit appended to the parent's log"
+        );
+
+        // The parent's own commit under sess-two moves the parent's key.
+        transition(&backend, "root", "wait");
+        assert_eq!(stored_location(&backend, "root").as_deref(), two.to_str());
+        assert_eq!(location_publishes(&backend, "root"), 2);
+        assert_eq!(state_in(&two, "root-uuid").as_deref(), Some("wait"));
+
+        // The child now finds a location that already names sess-two.
+        transition(&backend, "kid", "done");
+        driver(None);
+        assert_eq!(state_in(&two, "kid-uuid").as_deref(), Some("done"));
+        assert_eq!(stored_location(&backend, "kid"), None);
+    }
+
+    #[test]
+    fn a_rebind_moves_the_location_across_project_folders() {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let projects = claude_home(
+            home.path(),
+            &[("proj-a", "sess-one"), ("proj-b", "sess-two")],
+        );
+        let one = session_folder(&projects, "proj-a", "sess-one");
+        let two = session_folder(&projects, "proj-b", "sess-two");
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        driver(Some("sess-one"));
+        transition(&backend, "solo", "building");
+        driver(Some("sess-two"));
+        transition(&backend, "solo", "testing");
+        transition(&backend, "solo", "review");
+        driver(None);
+
+        assert_eq!(state_in(&two, "solo-uuid").as_deref(), Some("review"));
+        assert_eq!(stored_location(&backend, "solo").as_deref(), two.to_str());
+        assert_eq!(location_publishes(&backend, "solo"), 2);
+        // The old folder's file stays, with the state it had when it was
+        // last written.
+        assert_eq!(state_in(&one, "solo-uuid").as_deref(), Some("building"));
+    }
+
+    #[test]
+    fn claude_session_of_reads_only_self_discovered_paths() {
+        let projects = Path::new("/home/u/.claude/projects");
+        let of = |p: &str| claude_session_of(Path::new(p), projects).map(|s| s.to_owned());
+        assert_eq!(
+            of("/home/u/.claude/projects/proj/sess-one/workflows"),
+            Some("sess-one".into())
+        );
+        assert_eq!(
+            of("/home/u/.claude/projects/proj/sess-one/workflows/"),
+            Some("sess-one".into())
+        );
+        for other in [
+            "/srv/wf",
+            "/home/u/.claude/projects/proj/sess-one/other",
+            "/home/u/.claude/projects/sess-one/workflows",
+            "/home/u/.claude/projects/a/b/sess-one/workflows",
+            "/home/v/.claude/projects/proj/sess-one/workflows",
+            "workflows",
+        ] {
+            assert_eq!(of(other), None, "{other}");
+        }
     }
 }
