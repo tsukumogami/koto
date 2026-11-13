@@ -3358,8 +3358,7 @@ but never listed in `keys` (so `keyCount` can exceed the list length with
 `keysTruncated` still false), and anchor and store strings are sanitized and
 length-capped before they are written.
 
-From contract version 5 (the current version, `koto.contractVersion: 5`) the
-file separates the screen's word from koto's:
+From contract version 5 the file separates the screen's word from koto's:
 
 - **Top-level `status`** is written in the vocabulary Claude Code 2.1.314
   knows: `running`, `completed` or `failed`. It never reads `blocked`. That
@@ -3392,6 +3391,47 @@ failed step's `error`, is cut at 128 characters with the cut marker. A gate's ca
 file. `koto.workflow` and `koto.currentState` are the exception: they are
 written unescaped, as the session records them. Claude Code 2.1.314 doesn't
 draw them, but a reader of the file must treat them as untrusted text.
+
+### Retention and stale entries
+
+Contract version 6 (the current version, `koto.contractVersion: 6`) adds
+what koto writes into an entry it didn't project. Every write into a
+`/workflows` directory ends with a sweep of that directory, which keeps at
+most 10 koto entries (oldest `startTime` first among finished ones; live
+entries and the entry just written stay) and reconciles stale ones.
+
+An entry is stale when its top-level `status` is `running` and its file was
+last written more than **2 hours** ago, the same window after which
+`koto dashboard` calls a session stalled. A last write exactly 2 hours ago,
+or one in the future, is live. The sweep rewrites a stale entry in three
+fields and leaves every other field as it was:
+
+- **Top-level `status`** becomes `killed`, which Claude Code heads "stopped"
+  and counts out of the running total.
+- **`summary`** gains ` · no activity since <YYYY-MM-DD HH:MM UTC>`, the
+  last write in UTC to the minute. When the line would pass the fact cap,
+  the existing summary is cut before the suffix. An entry written before
+  contract version 4 has no summary and gets `no activity since <time>`.
+- **`koto.staleSince`** is the last write in epoch milliseconds. koto's
+  projection never writes it, so its presence marks a reconciled entry.
+
+`koto.contractVersion` is set to 6 on the rewrite, whatever version wrote the
+rest of the entry, since the entry now carries a version-6 field.
+`koto.status` keeps koto's last classification of the session (`running` or
+`blocked`): the session's log hasn't changed. A reconciled entry is finished
+from then on, so the bound removes it in `startTime` order like any other.
+
+koto can't tell a session whose driver died from one that is alive but quiet,
+waiting on a person, say. Both read "stopped · no activity since ..." once the
+window passes, and the session's next commit writes its entry from its
+projection again: `running`, no `staleSince`, no suffix. If that commit lands
+in the few system calls between the sweep's last check of the entry and its
+rename, the entry reads `killed` until the commit after it.
+
+Reconciliation needs a later koto write into the same directory: nothing
+runs between writes, so a stale entry keeps `running` until another session
+writes there. `koto dashboard --once` is the live view; it classifies every
+session from its log whenever it runs.
 
 ## Lifecycle Metadata Surface
 

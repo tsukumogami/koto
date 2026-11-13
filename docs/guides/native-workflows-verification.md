@@ -9,9 +9,10 @@ guard that checks a Claude Code release against the conventions koto relies
 on, the rendered smoke check a maintainer runs against a real Claude Code, and
 the manual live-TUI check.
 
-The entry file is at contract version 5. Its top-level `status` uses only the
-words Claude Code's screen knows (`running`, `completed`, `failed`); it never
-reads `blocked`. koto's own classification (`running`, `blocked`, `completed`
+The entry file is at contract version 6. Its top-level `status` uses only the
+words Claude Code's screen knows (`running`, `completed`, `failed`, and
+`killed` on an entry the retention sweep found stale; see "Stale entries"
+below); it never reads `blocked`. koto's own classification (`running`, `blocked`, `completed`
 or `failed`) is in `koto.status`. A gate-blocked session is written `running`,
 with its active step as an `error` step carrying `blocked: true` and
 `error: "gate <name>: FAIL"`, and a `summary` ending `· blocked on gate <name>`.
@@ -64,9 +65,9 @@ so a change on Claude Code's side is the convention guard's to catch.
 ## The Claude Code convention guard
 
 `scripts/check-claude-code-conventions.sh` checks a Claude Code release for the
-four conventions koto's entry depends on: the file shape, the directory
-convention, the `CLAUDE_CODE_SESSION_ID` session variable and the SessionStart
-hook input. It fetches the release's Linux x64 npm package, never runs it, and
+five conventions koto's entry depends on: the file shape, the status words koto
+writes, the directory convention, the `CLAUDE_CODE_SESSION_ID` session variable
+and the SessionStart hook input. It fetches the release's Linux x64 npm package, never runs it, and
 searches the executable's bytes for the probes in
 `tests/fixtures/native-workflows/claude-code-conventions.json`. A probe is a
 stable literal (the anchor) and a name that has to appear within a number of
@@ -161,6 +162,7 @@ guard fail on that convention by name. Each command exits 1:
 
 ```bash
 scripts/check-claude-code-conventions.sh --alter file-shape        # FAIL file shape: workflowName ...
+scripts/check-claude-code-conventions.sh --alter status-words      # FAIL status words: killed ...
 scripts/check-claude-code-conventions.sh --alter directory         # FAIL directory convention: "workflows" directory ...
 scripts/check-claude-code-conventions.sh --alter session-variable  # FAIL session variable: CLAUDE_CODE_SESSION_ID not found
 scripts/check-claude-code-conventions.sh --alter hook-input        # FAIL SessionStart hook input: transcript_path ...
@@ -196,6 +198,24 @@ file-shape convention's `unread`, with the reason; `id`, `name` and a phase's
    `--self-test`, and see each pass.
 6. Finish with `scripts/check-claude-code-conventions.sh --alter file-shape` and
    see it still exit 1 naming `file shape`.
+
+### When koto writes a new status word
+
+Claude Code parses an entry's top-level `status` against its own list of
+statuses and drops an entry whose word isn't on it, so every word koto writes
+needs a probe in the status-words convention. Claude Code 2.1.316 lists them in
+the workflow snapshot schema, `["pending","running","completed","failed","killed","paused"]`,
+about 220 bytes before the progress-node state values
+`["start","progress","done","error"]`, which is the anchor; each probe's token
+is the quoted word, within 400 bytes. The window stops short of an unrelated
+`status:"running"` about 750 bytes away, so a release that drops a word from
+the list fails its probe.
+
+`tests/native_workflows_conventions.rs` collects the top-level `status` of
+every shape fixture (`enriched-shape.json`, and `reconciled-shape.json` for the
+retention sweep's `killed`) and fails naming any word without a status-words
+probe. Add the probe, then run the guard against the recorded release and with
+`--alter status-words`, which renames `"killed"` and fails naming `killed`.
 
 ## The rendered smoke check
 
@@ -371,8 +391,9 @@ The sweep only touches a file it can prove koto wrote: a regular file named
 `koto-<session-id>`, `koto.sessionId` equal to `<session-id>`, a numeric
 `koto.contractVersion` and a string `status`). Claude Code's own `wf_*.json`
 files, and any other file, are left as they are and don't count toward the 10.
-A directory already within the bound costs one listing per write and nothing
-is read.
+A directory already within the bound, where no koto entry was last written
+more than 2 hours ago, costs one listing per write (with a stat of each
+`koto-*.json` file) and no file is opened.
 
 `tests/native_workflows_retention_test.rs` drives 30 sessions to completion
 through the koto binary into one directory, checks that at most 10 entries are
@@ -419,6 +440,38 @@ ls "$KOTO_WORKFLOWS_DIR"/koto-*.json | wc -l
 ```
 
 The count printed is 10 or fewer.
+
+### Stale entries
+
+A session whose driver died (a crashed agent, a closed terminal) leaves its
+entry `running`, and nothing else would ever change it. So the same sweep
+reconciles stale entries: an owned entry still `running` whose file was last
+written more than **2 hours** ago, the window after which `koto dashboard`
+calls a session stalled, is rewritten as `killed`. Claude Code heads it
+"stopped" and counts it out of the running total. Its summary gains
+` · no activity since <YYYY-MM-DD HH:MM UTC>` and its `koto` block gains
+`staleSince`; `docs/reference/session-feed.md` lists the exact fields. A
+reconciled entry is finished, so the bound removes it in `startTime` order like
+any other.
+
+koto can't tell a dead driver from a session that is alive but quiet, such as
+one waiting on a person's answer. Both read stopped once 2 hours pass, and the
+session's next commit writes its entry as `running` again. A commit that lands
+in the few system calls between the sweep's last check and its rewrite reads
+`killed` until the commit after it.
+
+Reconciliation needs a later koto write into the same directory, from any
+session: nothing runs between writes, so a stale entry stays `running` until
+then. `koto dashboard --once` is the live view; it classifies every session
+from its log each time it runs.
+
+The window, the race and a failed rewrite are covered by the retention
+module's unit tests, which run on a fixed clock, and the restore on the next
+commit by a materialize test that drives two sessions into one directory:
+
+```bash
+CARGO_BUILD_JOBS=2 cargo test --lib workflows_surface
+```
 
 ## Notes
 
