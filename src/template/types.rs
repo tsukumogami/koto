@@ -1011,6 +1011,21 @@ pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 /// in the same map.
 pub const ACTION_CONDITION_NAME: &str = "__action__";
 
+/// Condition name reserved for the synthetic result `koto next` stops on when
+/// one of the session's decisions was reversed and nothing has cleared it
+/// (decision record, PRD R22). Refused as a gate name for the same reason as
+/// [`ACTION_CONDITION_NAME`].
+pub const DECISION_REVERSED_CONDITION: &str = "__decision_reversed__";
+
+/// Condition name reserved for the synthetic result `koto next` stops on when
+/// a session on the chain can't be read for reversals (PRD R23).
+pub const DECISION_UNREADABLE_CONDITION: &str = "__decision_unreadable__";
+
+/// Whether `name` is one of the two reserved decision conditions.
+pub fn is_decision_condition(name: &str) -> bool {
+    name == DECISION_REVERSED_CONDITION || name == DECISION_UNREADABLE_CONDITION
+}
+
 /// Prefix used in when-clause keys to match on the presence of an agent-submitted
 /// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
 /// expressions like `evidence.retry_failed: present` that fire when the named field
@@ -1972,6 +1987,13 @@ impl CompiledTemplate {
                     "state {:?}: gate name {:?} is reserved for default_action failures\n  \
                      remedy: rename the gate",
                     state_name, ACTION_CONDITION_NAME
+                ));
+            }
+            if let Some(name) = state.gates.keys().find(|n| is_decision_condition(n)) {
+                return Err(format!(
+                    "state {:?}: gate name {:?} is reserved for koto's decision conditions\n  \
+                     remedy: rename the gate",
+                    state_name, name
                 ));
             }
 
@@ -4978,6 +5000,41 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn rejects_gates_named_with_the_reserved_decision_conditions() {
+        for reserved in [DECISION_REVERSED_CONDITION, DECISION_UNREADABLE_CONDITION] {
+            let mut t = minimal_template();
+            let state = t.states.get_mut("start").unwrap();
+            state.gates.insert(
+                reserved.to_string(),
+                Gate {
+                    gate_type: GATE_TYPE_COMMAND.to_string(),
+                    command: "true".to_string(),
+                    timeout: 0,
+                    key: String::new(),
+                    pattern: String::new(),
+                    override_default: None,
+                    completion: None,
+                    name_filter: None,
+                    overridable: true,
+                    request: String::new(),
+                    leg: String::new(),
+                    expect: None,
+                    poll: None,
+                    decider_check: None,
+                    not_ready_exit_codes: Vec::new(),
+                },
+            );
+            let err = t.validate(true).unwrap_err();
+            assert!(
+                err.contains("is reserved for koto's decision conditions")
+                    && err.contains(reserved),
+                "got: {}",
+                err
+            );
+        }
     }
 
     #[test]
