@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   Every koto session run inside Claude Code leaves a `/workflows` entry that
   nothing ever removes, so over a long session koto's finished entries pile up
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 Framing for the lifecycle work the native `/workflows` render left for later:
 the initial render, the phase detail and the blocked status made a koto
@@ -148,18 +148,6 @@ stops recognizing it fails CI rather than an operator's screen.
   reconciliation happens while koto is already running for another reason.
 - Cleaning up Claude Code's own workflow entries. Those belong to Claude
   Code.
-
-## Open Questions
-
-- What is the numeric bound, and is it a count, an age, or both? The PRD
-  states the requirement; the design picks the number and says why.
-- Is staleness reconciled from what koto can observe, or accepted as a
-  documented limitation? Both satisfy the outcome; the design decides.
-- Which of koto issue #190's acceptance criteria this work covers, and so
-  whether it closes the issue. The PRD records the call.
-
-None of these questions block the brief: each one is a decision the PRD or
-the design owns.
 
 ## References
 
