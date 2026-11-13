@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Proposed
 problem: |
   No read-only koto verb prints a session's gate evaluations. The session's
   event log records each one as a `gate_evaluated` event (gate, outcome,
@@ -29,6 +29,7 @@ rationale: |
   payload public as a raw dump would. The read that never flushes keeps a
   sweep from making running ticks wait. The cost is that sessions koto has
   already removed can't be read, which the design states.
+upstream: docs/briefs/BRIEF-gate-evaluations-read.md
 user_visible_surface: true
 ---
 
@@ -36,7 +37,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Proposed
 
 ## Context and Problem Statement
 
