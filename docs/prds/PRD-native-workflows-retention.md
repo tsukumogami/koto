@@ -25,6 +25,10 @@ absorbed:
 
 In Progress
 
+Edited after acceptance: R6(a) and its criterion now leave the last-write
+time's format to the design, since `startTime` is a millisecond count no
+reader would want in a summary.
+
 Absorbed [BRIEF-native-workflows-retention](docs/briefs/BRIEF-native-workflows-retention.md); carried in Absorbed Brief.
 
 Requirements for the lifecycle of the files koto writes into Claude Code's
@@ -200,7 +204,8 @@ settles on exactly one of:
   became stale rewrites it so its top-level `status` isn't `running` and is a
   word the conventions fixture has a probe for, proving the recorded Claude
   Code release knows it, and its `summary` says the session went quiet and
-  gives the time of its last write in the same format as `startTime`. The
+  gives the time of its last write in a human-readable format the design
+  states. The
   entry is then a finished entry for R4. A later commit by the same session
   rewrites it as live again. Reconciliation never replaces a write made after
   it judged the entry stale: it checks the entry's last write again
@@ -318,7 +323,7 @@ Crash-staleness (whichever R6 outcome the design chose):
       makes a koto write from another session into the same directory, and
       finds the entry's top-level `status` not `running`, a word with a probe
       in the conventions fixture, and its `summary` containing its last-write
-      time in the same format as `startTime`.
+      time in the format the design states.
 - [ ] Under R6(a): the same test with the clock short of W leaves the entry's
       `status` as `running`, and a commit by the original session after
       reconciliation sets it back to `running`.
