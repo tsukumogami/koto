@@ -1414,4 +1414,62 @@ mod tests {
             .count();
         assert_eq!(published, 1);
     }
+
+    /// A session self-discovers its view's folder from the driving Claude Code
+    /// session. When a different Claude Code session takes over driving it,
+    /// the next commit writes the view into the new driver's folder, and the
+    /// stored location follows. The old driver's file is left alone.
+    #[test]
+    fn a_new_driving_session_moves_the_view_to_its_own_folder() {
+        use crate::session::context::ContextStore;
+
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let proj = home.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sess-one.jsonl"), b"").unwrap();
+        std::fs::write(proj.join("sess-two.jsonl"), b"").unwrap();
+        let one_dir = proj.join("sess-one").join("workflows");
+        let two_dir = proj.join("sess-two").join("workflows");
+
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        // Driven by sess-one: the view lands in sess-one's folder.
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("sess-one"));
+        transition(&backend, "solo", "building");
+        let one_before = read_file(&one_dir, "solo-uuid");
+        assert!(
+            one_before.is_some(),
+            "the view renders under sess-one while it drives"
+        );
+
+        // sess-two takes over driving and commits.
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("sess-two"));
+        transition(&backend, "solo", "review");
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, None);
+
+        let stored = backend
+            .get("solo", discover::PUBLISH_LOCATION_KEY)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        assert!(
+            read_file(&two_dir, "solo-uuid").is_some(),
+            "Expected: the file appears under sess-two. Actual: it keeps going to sess-one \
+             (stored {}: {:?})",
+            discover::PUBLISH_LOCATION_KEY,
+            stored
+        );
+        assert_eq!(
+            stored.as_deref().map(str::trim),
+            two_dir.to_str(),
+            "the stored location names sess-two's folder"
+        );
+        assert_eq!(
+            read_file(&one_dir, "solo-uuid"),
+            one_before,
+            "sess-two's commit does not update sess-one's file"
+        );
+    }
 }
