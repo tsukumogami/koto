@@ -52,8 +52,8 @@ it, and a machine with koto and shirabe and no launcher gets the parentless
 record with no error, warning or install prompt. Three journeys test that
 outcome, and each became an acceptance criterion below: ten dispatches in a
 row from one coordinator each record it (AC1); a hand-started shirabe session
-on a launcher-free machine reads as having no parent (AC3); and a measured
-before-and-after read shows the agent's koto calls cost the same, with no
+on a launcher-free machine reads as having no parent (AC3); and a
+before-and-after comparison of worker runs shows the agent's koto calls cost the same, with no
 dispatcher text in its transcript (AC7, AC8).
 
 The questions the framing left to this document were how the starter hands
@@ -167,7 +167,7 @@ text in its transcript, and records nothing when the agent skips it.
 
 - **R9. No agent cost.** The agent issues no new koto call and writes nothing
   new for this feature; the work happens in the start hook and in koto.
-  Measured before and after, the cost of a worker's koto calls is unchanged
+  Compared before and after, the cost of a worker's koto calls is unchanged
   beyond run-to-run variation.
 - **R10. Start-up budget.** The start hook's time limit and the agent's
   start-up time are not raised to achieve R1.
@@ -201,8 +201,8 @@ text in its transcript, and records nothing when the agent skips it.
 - [ ] **AC6 (R7).** The R7 read verb's JSON output carries the origin state
   under a field its reference documents, with the dispatcher's name in the
   dispatched state and the reason in the named-but-not-recorded state.
-- [ ] **AC7 (R9).** A reviewer takes measured reads of the same worker task,
-  at least three runs before the change and three after. The count of the
+- [ ] **AC7 (R9).** A reviewer runs the same worker task at least three
+  times before the change and three times after. The count of the
   agent's koto calls is the same, and the median cost of those calls after
   the change, in input plus output tokens the agent spends on them, falls
   within the range of the before runs.

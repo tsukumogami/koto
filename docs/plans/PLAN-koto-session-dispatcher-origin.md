@@ -48,8 +48,8 @@ The shirabe change (Issue 4) waits on that release being installed. The
 design's fourth decision retires the manual link step only once the hook
 writes the link on its own; dropping the step earlier would leave dispatched
 workers with no link at all while the old koto is still on the host. The
-release gate below carries that ordering, and it also fixes when the before
-reads for the cost check must be taken.
+release gate below carries that ordering, and it also fixes when the baseline
+runs for the cost check must be taken.
 
 Verification (Issue 5) is the design's fourth phase: no code, run by a
 reviewer once the koto release and the shirabe change are both installed. It
@@ -114,6 +114,7 @@ is its own group so the koto pull request does not wait on it.
 - [ ] Any non-empty inherited value, cut to 256 bytes, is passed in `--flag=value` form; when the open exits 2 with no `anchor=` line and the value missed the anchor pattern, the hook opens again without it.
 - [ ] A hostile session id (quotes, `$(...)`, a newline) produces no export line.
 - [ ] `hooks/test/session-start.test.sh` passes, with the hook still exiting 0 and printing nothing on stderr.
+- [ ] Before the koto release carrying this group is installed on the reference host, three baseline runs of one worker task are taken there on the current koto, and each run's count of agent koto calls and the input plus output tokens those calls spent are kept for Issue 5's comparison (AC7).
 
 **Dependencies**: Blocked by <<ISSUE:1>>
 
@@ -127,7 +128,7 @@ is its own group so the koto pull request does not wait on it.
 
 **Before**: Issue 4
 
-**Condition**: a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and the three before reads for the cost check were taken on the earlier koto before it was installed.
+**Condition**: a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and the three baseline worker runs for the cost check (Issue 3's last criterion) were taken on the earlier koto before it was installed.
 
 ### Issue 4: feat(coordinate): drop the manual dispatcher link step from worker briefs
 
@@ -135,7 +136,7 @@ is its own group so the koto pull request does not wait on it.
 
 **Group**: brief
 
-**Goal**: the brief the coordinator renders for a dispatched worker no longer tells the agent to record its dispatcher.
+**Goal**: the brief the coordinator renders for a dispatched worker no longer tells the agent to record its dispatcher. This outline waits on the `koto-release-installed` gate above even though it depends on no other outline: it does not merge until a koto release carrying Issues 1 to 3 is installed on the reference host, or dispatched workers would get no link while the old koto is still there.
 
 **Acceptance Criteria**:
 - [ ] The brief template and its renderer emit no link step, and the golden briefs drop it (AC8, golden half).
@@ -160,7 +161,7 @@ is its own group so the koto pull request does not wait on it.
 **Acceptance Criteria**:
 - [ ] Ten workers dispatched in a row from one coordinator through the launcher, with the cloud store in use and briefs carrying no link step, each report the coordinator's anchor from `koto session origin` on the workflow session and on the anchor (AC1).
 - [ ] On a machine with koto and shirabe and no launcher, a shirabe session started from a plain directory reports `none` on its workflow session and on its anchor, with no error, warning or install prompt in the hook output, command output or transcript (AC3).
-- [ ] Three measured runs of one worker task after the change, against the three before runs, show the same count of agent koto calls and a median cost inside the before range, and a case-insensitive search of each after transcript for `dispatched-by`, `link-dispatcher` and `dispatcher_session` finds nothing (AC7, AC8).
+- [ ] Three runs of the same worker task after the change, against Issue 3's three baseline runs, show the same count of agent koto calls and a median cost inside the baseline range, and a case-insensitive search of each after transcript for `dispatched-by`, `link-dispatcher` and `dispatcher_session` finds nothing (AC7, AC8).
 
 **Dependencies**: Blocked by <<ISSUE:4>>
 
@@ -217,6 +218,6 @@ is in; they touch different files and share nothing beyond the record.
 
 **Merge order**: the koto `core` pull request (Issues 1 to 3) merges and
 ships in a koto release; once that release and its koto-skills plugin are
-installed on the reference host, after the before reads are taken, the
+installed on the reference host, after the baseline runs are taken, the
 shirabe `brief` pull request (Issue 4) merges; Issue 5 runs last, on the
 reference host and on a machine with no launcher.

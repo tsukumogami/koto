@@ -185,7 +185,7 @@ starting environment named can't be lost separately from the anchor. The
 dispatched-by link is still a second write, and its failure is what the
 `unrecorded` state records. Three changes go with it. A malformed
 `--dispatched-by` value no longer refuses the whole open: the anchor is
-created and records `unrecorded` with the validation message as its reason.
+created and records `unrecorded` with `malformed: not an anchor name` as its reason.
 An empty value records `none`. When the dispatched-by link write fails after
 the anchor exists, `open` appends an `origin_unrecorded` event with the
 error and still prints its `anchor=` line, instead of failing. The hook stops
@@ -392,8 +392,8 @@ No code. The three acceptance checks from the roadmap, run by a reviewer:
   on the workflow session and, when the plugin is installed, on the anchor.
   Both report `none`, and the hook output, every command's output and the
   transcript hold no error, warning or install prompt (AC3).
-- **No cost to the agent.** Take measured reads of the same worker task, at
-  least three runs before the change and three after. The count of the
+- **No cost to the agent.** Run the same worker task at least three times
+  before the change and three times after. The count of the
   agent's koto calls matches, the median cost of those calls after falls
   inside the before range, and a case-insensitive search of each after
   transcript for `dispatched-by`, `link-dispatcher` and `dispatcher_session`
@@ -414,7 +414,7 @@ check. No credential, token or store configuration enters the record or the
 verb's output, and the verb is read-only. Dropping the link step removes
 nothing a worker relied on for authority.
 
-Four rules keep the record from carrying more than it should:
+Five rules keep the record from carrying more than it should:
 
 - Every `reason` is one of a closed list, never a store's raw error text,
   which can carry endpoints or fragments of credentials: `malformed: not an
@@ -422,7 +422,8 @@ Four rules keep the record from carrying more than it should:
   `link not found`, `anchor not found`, and `recorded before koto tracked
   origin`. A test feeds a store error carrying a marker string through the
   link writer and checks the marker never reaches the record or the verb.
-- The hook cuts the value to 256 bytes and koto refuses longer. The `named`
+- The hook cuts the value to 256 bytes, and koto records a longer one as
+  `unrecorded` with `malformed: not an anchor name`. The `named`
   preview is bounded, and control characters and newlines in it are
   replaced, so a value can't forge an `anchor=` line in the open's output or
   put terminal escapes in a reader's output. A value with characters outside
