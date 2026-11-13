@@ -91,7 +91,27 @@ the behaviour it adds.
 
 ### Step 3: the sweep leaves every file it can't prove koto wrote untouched, and survives races and errors
 
-Lookalike, unparseable, symlinked and directory `koto-*.json` files stay byte-identical, koto temp files older than a minute are cleared, and vanished, unremovable or concurrently swept files never fail a koto command or cost it more than one listing.
+**Goal**: The sweep opens a candidate only through a no-follow, non-blocking open whose handle is checked as a regular file, so a `koto-*.json` swapped for a symlink, a FIFO or a directory between listing and open is never followed and never hangs a koto command; it clears koto's own `.koto-wf-*.tmp` files older than a minute; it re-checks a candidate's modification time before removing it; and within the bound it reads only the entries old enough to be stale, so one old finished entry no longer costs a read of every other entry on each write. Lookalike, unparseable, oversized, symlinked and directory `koto-*.json` files stay byte-identical, and a vanished, unremovable or concurrently swept file never fails a koto command or costs it more than one listing.
+
+**Builds on Step 2**: `retention::apply(dir, written, now, &Limits)` lists the directory once with `read_dir`, keeps only `DirEntry::file_type().is_file()` entries whose name passes `entry_id`, and takes the fast path when `matched <= keep` and no other matched file's last write is older than `stale_after`. Past the fast path it calls `owned()` on every other matched file. `owned()` opens with a plain `File::open(path)`: a link swapped in after the listing is followed, and a FIFO swapped in blocks the open. `Limits` holds `keep` and `stale_after`; `Sweep` counts `matched`, `read`, `owned`, `reconciled` and `removed`. Eviction removes by name with no re-check. Reconcile stages through `materialize::stage` (which names temp files `.koto-wf-*.tmp`) and re-checks `symlink_metadata` before `persist`. No `.koto-wf-*.tmp` file is swept, and `TEMPFILE_SWEEP_MIN_AGE` in `src/cli/batch.rs` is private. Every failure is skipped or warned about and none reaches the koto command, since `try_materialize` ignores the returned `Sweep`.
+
+**Acceptance Criteria**:
+
+- [ ] `owned()` opens with no-follow and non-blocking flags and checks the opened handle's file type with `fstat` before reading. A unit test that swaps a listed `koto-<id>.json` for a FIFO between listing and open sees the sweep return without blocking and leave the FIFO in place. A test that swaps one for a symlink to an owned-looking entry elsewhere sees that target neither read as owned nor changed.
+- [ ] In a directory driven past the bound, a `koto-*.json` symlink (to an owned-looking entry and to a lookalike), a `koto-*.json` directory, an unparseable `koto-*.json`, a `koto-*.json` larger than 1 MiB, and lookalikes each missing one marker field (`id`, `koto.sessionId`, `koto.contractVersion`, string `status`) are all present and byte-identical afterwards, and none counts toward the bound.
+- [ ] A `.koto-wf-*.tmp` regular file whose last write is more than 60 seconds ago is removed by the next koto write into the directory. One written less than 60 seconds ago, and a `.koto-wf-*.tmp` symlink or directory of any age, are left in place. `Sweep` reports the temp files removed. `retention::TEMP_MIN_AGE` is 60 seconds, and a unit test pins it equal to `TEMPFILE_SWEEP_MIN_AGE` in `src/cli/batch.rs`, which becomes `pub(crate)`.
+- [ ] A finished candidate whose modification time changed between the listing and its removal (rewritten by its session as `running`) is not removed, and holds the rewritten content afterwards.
+- [ ] A candidate removed by another process between listing and removal counts as removed, and the sweep goes on to the next candidate. A candidate whose removal fails with an error other than not-found (its directory made read-only) is skipped with one warning that names the file and the error kind, and the koto command exits with its normal result.
+- [ ] Two sweeps started together on two threads over the same over-bound directory both return, the directory ends at the bound, and no file outside the finished candidates is removed or changed.
+- [ ] Within the bound, the sweep reads only matched files whose last write is older than the stale window. A directory holding one old finished entry and nine fresh ones reads one file per write, not nine. Over the bound, every matched file is read as before. In every case the sweep lists the directory once.
+- [ ] An unlistable `workflows` directory (no read permission) leaves the koto command's result unchanged.
+- [ ] The operator guide's Retention section and the field reference say that only koto-owned regular files are counted or touched, that `.koto-wf-*.tmp` files older than a minute are cleared, and what a write costs within and over the bound.
+
+**Check**: Run `cargo test --lib workflows_surface::retention` and see the FIFO-swap, symlink-swap, temp-file age, modification-time re-check, vanished-candidate, unremovable-candidate, double-sweep, unlistable-directory and read-count cases pass, and the `TEMP_MIN_AGE` pin hold. Run `cargo test --test native_workflows_retention_test` and see the lookalike, unparseable, oversized, symlinked and directory `koto-*.json` files byte-identical after the directory is driven past the bound through the koto binary. Run `cargo test --test doc_names` after the docs change.
+
+**Dependencies**: Step 2
+
+**Files**: `src/workflows_surface/retention.rs`, `src/cli/batch.rs`, `tests/native_workflows_retention_test.rs`, `docs/guides/native-workflows-verification.md`, `docs/reference/session-feed.md`
 
 ## Implementation Sequence
 
