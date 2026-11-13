@@ -90,7 +90,8 @@ text in its transcript, and records nothing when the agent skips it.
 - **R1. Automatic link on every dispatch.** A session launched from another
   agent session's shell, directly or through a launcher that passes the
   environment through, is recorded in koto as dispatched by the launching
-  agent session, with no action by either agent.
+  agent session, with no action by either agent. (Known Limitations names the
+  one case this rule gets wrong.)
 - **R2. Independent of store latency.** R1 holds when the session store is
   slow or the anchor open in the dispatcher's start hook exceeds the hook's
   time limit. The dispatcher's identity reaches its shells without waiting on
@@ -99,7 +100,8 @@ text in its transcript, and records nothing when the agent skips it.
   its environment is recorded with an explicit statement that it has none.
 - **R4. A failed link reads as failed.** When a dispatcher was named but koto
   could not record the link, koto records that it was named and that the link
-  failed, distinct from R3's record.
+  failed, distinct from R3's record. A named value koto refuses as malformed
+  gets this record too, with the refusal as its reason.
 - **R5. One handoff, owned by koto.** The dispatcher reaches koto through a
   variable koto and the koto-skills plugin define. Any launcher conveys it by
   passing the environment through. koto, the plugin and shirabe read no
@@ -108,12 +110,16 @@ text in its transcript, and records nothing when the agent skips it.
   launcher installed, a shirabe session started from a plain directory gets
   R3's record, and nothing in koto, the plugin or shirabe prints an error, a
   warning or a prompt about a missing launcher or dispatcher.
-- **R7. Readable from koto.** A reader gets a session's dispatcher, or R3's or
-  R4's record, from an existing koto read verb, for a workflow session as well
-  as for an anchor.
-- **R8. The manual link step retires.** Once R1 holds, a dispatched worker's
-  brief no longer instructs the agent to record its dispatcher, and a worker
-  whose brief carried no such step is still recorded per R1.
+- **R7. Readable from koto.** Every session's origin is in exactly one of
+  three states: dispatched by a named session (R1), no dispatcher (R3), or
+  named but not recorded (R4). One koto read verb, invoked on an anchor or on
+  a workflow session the anchor holds, reports that state in its JSON output;
+  for a workflow session it follows the session's own link to its anchor, so
+  the reader makes one call and walks nothing by hand.
+- **R8. The manual link step retires.** Once R1 holds, the brief that
+  shirabe's coordinator renders for a dispatched worker no longer instructs the
+  agent to record its dispatcher, and a worker whose brief carried no such step
+  is still recorded per R1. This is a change to shirabe, not to the launcher.
 
 ### Non-functional
 
@@ -130,31 +136,39 @@ text in its transcript, and records nothing when the agent skips it.
 
 - [ ] **AC1 (R1, R2).** On the reference host, with the cloud session store in
   use, a reviewer dispatches ten workers in a row from one coordinator through
-  the launcher, with briefs that carry no link step. For each worker, a koto
-  read verb shows the coordinator's agent session as the dispatcher of the
-  worker's anchor and, through the anchor, of the worker's workflow session.
-  Ten of ten.
-- [ ] **AC2 (R2).** With the anchor open made to exceed the start hook's time
-  limit (a test double or an injected delay), a session launched from that
-  agent session's shell still records it as dispatcher.
-- [ ] **AC3 (R3, R6).** On a machine with koto and shirabe and no launcher, a
-  reviewer starts a shirabe session from a plain directory. A koto read verb
-  shows its anchor with the explicit no-parent record, and the session's
-  output and transcript hold no error, warning or install prompt.
-- [ ] **AC4 (R4).** With the link write made to fail after a dispatcher was
-  named, the anchor shows the failed-link record, and a read of it never
-  shows R3's record.
+  the launcher, with briefs that carry no link step. For each worker, the R7
+  read verb invoked on the worker's workflow session, and again on its
+  anchor, reports the coordinator's agent session as dispatcher. Ten of ten.
+- [ ] **AC2 (R2, R10).** In an automated test, the anchor open in a start
+  hook is made to take five seconds longer than the hook's time limit (a test
+  double for koto). The hook still returns within its limit, and a session
+  launched from that agent session's shell records it as dispatcher.
+- [ ] **AC3 (R3, R6, R7).** On a machine with koto and shirabe and no
+  launcher, a reviewer starts a shirabe session from a plain directory and
+  opens one workflow. The R7 read verb, on the anchor and on the workflow
+  session, reports the no-dispatcher state. The start hook's output, every
+  koto and shirabe command's stdout and stderr in the session, and the
+  session's transcript hold no error, warning or install prompt.
+- [ ] **AC4 (R4, R7).** In an automated test, a dispatcher is named and the
+  link write is made to fail; in a second test the named value is malformed.
+  In both, the R7 read verb, on the anchor and on a workflow session it holds,
+  reports the named-but-not-recorded state with a reason, and never the
+  no-dispatcher state.
 - [ ] **AC5 (R5, R11).** A search of koto, the koto-skills plugin and shirabe
   finds no read of a launcher-defined variable used to learn the dispatcher.
-- [ ] **AC6 (R7).** The read verb named in AC1 returns the dispatcher, the
-  no-parent record and the failed-link record in its JSON output, each under a
-  documented field.
-- [ ] **AC7 (R8, R9).** A reviewer compares before-and-after measured reads of
-  a worker run. The cost of the agent's koto calls is unchanged beyond
-  run-to-run variation, and a search of the agent's transcript finds no text
-  about a dispatcher: no link instruction and no link command.
-- [ ] **AC8 (R10).** The start hook's time limit is the value it was before
-  the change.
+- [ ] **AC6 (R7).** The R7 read verb's JSON output carries the origin state
+  under a field its reference documents, with the dispatcher's name in the
+  dispatched state and the reason in the named-but-not-recorded state.
+- [ ] **AC7 (R9).** A reviewer takes measured reads of the same worker task,
+  at least three runs before the change and three after. The count of the
+  agent's koto calls is the same, and the median cost of those calls after
+  the change falls within the range of the before runs.
+- [ ] **AC8 (R8).** A search of the agent's transcript in each AC7 after run,
+  case-insensitive, for `dispatcher`, `dispatched-by` and `link-dispatcher`
+  finds nothing, and the brief shirabe's coordinator renders for a worker, in
+  its own golden test, carries no link step.
+- [ ] **AC9 (R10).** The start hook's time limit is the value it was before
+  the change, and in AC2's slow case the hook returns within it.
 
 ## Out of Scope
 
