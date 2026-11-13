@@ -180,8 +180,10 @@ carries one of:
 - `{"state": "none"}`
 - `{"state": "unrecorded", "named": "<value preview>", "reason": "<text>"}`
 
-The event is written in the same call that creates the anchor, so the record
-can't be lost on its own. Three changes go with it. A malformed
+The event is written in the same call that creates the anchor, so what the
+starting environment named can't be lost separately from the anchor. The
+dispatched-by link is still a second write, and its failure is what the
+`unrecorded` state records. Three changes go with it. A malformed
 `--dispatched-by` value no longer refuses the whole open: the anchor is
 created and records `unrecorded` with the validation message as its reason.
 An empty value records `none`. When the dispatched-by link write fails after
@@ -255,7 +257,7 @@ into the event that creates the anchor and reports it through a verb no agent
 calls. The launcher already passes the environment through and is left alone;
 its own copy of the parent's id stays unused.
 
-This settles the four questions the roadmap left open for this milestone. The
+This settles the four questions the framing left open. The
 launcher hands the dispatcher to koto by passing `KOTO_DISPATCHER_ANCHOR`
 through, a variable koto defines. koto records it as the `origin` of the
 anchor's creating event, in three states, read by `koto session origin`. The
@@ -284,26 +286,47 @@ reader: koto session origin <workflow session | anchor>  -> JSON
 ### Components
 
 - **Start hook** (`plugins/koto-skills/hooks/session-start.sh`). Computes
-  `derived="anchor-$session_id"` after the id check. Exports
-  `KOTO_ANCHOR` and `KOTO_DISPATCHER_ANCHOR` from the printed anchor when
-  there is one, else from `derived`; the `unset` branch is reached only when
-  koto or jq is missing, as today. Passes any non-empty inherited dispatcher value to the open in
-  `--flag=value` form. The watchdog, the limit and the additionalContext
-  fallback are unchanged; the fallback also names the derived dispatcher.
+  `derived="anchor-$session_id"` after the id check, so the name holds only
+  plain-name characters and is safe inside the single quotes the env-file
+  block already uses. It keeps two values apart: `anchor`, the name the open
+  printed, and `exported`, the name the env file carries. `exported` is
+  `anchor` when the open printed one, `derived` when the open was cut off by
+  the watchdog or failed without a refusal, and empty when koto refused the
+  open (exit 2 with no `anchor=` line, such as a session id koto won't name
+  an anchor after); only an empty `exported` writes the `unset` line. The
+  watchers and the additionalContext fallback keep reading `anchor`, so
+  nothing runs against an anchor that wasn't confirmed. The hook passes any
+  non-empty inherited dispatcher value, cut to 256 bytes, to the open in
+  `--flag=value` form. An older koto refuses a malformed value outright, so
+  when the open exits 2 with no `anchor=` line and the value missed the
+  anchor-name pattern, the hook opens again without it, the same fallback
+  it already uses for `--record-authority`. The watchdog and the limit are
+  unchanged.
 - **Anchor open** (`src/session/anchor.rs`). `OpenRequest` carries the raw
   dispatcher value. `open` validates it without refusing, computes the
-  origin, and puts it on the creating `AnchorStarted`. A link-write error after
-  creation becomes an `origin_unrecorded` event and an `origin=unrecorded`
-  output line, and the open still succeeds. Continuing or reopening an anchor
-  writes no new origin; the creating event's stands.
+  origin, and puts it on every `AnchorStarted` that creates a session (a new
+  family, a reopen, a successor). A link-write error after creation becomes
+  one `origin_unrecorded` event, at most one per anchor, and an
+  `origin=unrecorded` output line, and the open still succeeds. Continuing a
+  live anchor writes no new origin; the creating event's stands.
 - **Event payload** (`src/engine/types.rs`). `AnchorStarted` gains an optional
   `origin` (absent in older logs). A new `OriginUnrecorded` payload holds the
   named preview and the reason.
 - **Read verb** (`src/cli/session.rs` and a small `src/session/origin.rs`).
   `koto session origin <name>` resolves the session, finds the anchor by the
-  rules in Decision 3, folds the creating event and any `origin_unrecorded`
-  event into one state, and prints it. It reads through the same store path
-  as `koto status`, writes nothing, and exits 0 for any of the three states.
+  rules in Decision 3, folds the creating event, the link and any
+  `origin_unrecorded` event into one state, and prints it. A creating event
+  that names a dispatcher with no dispatched-by link beside it reads as
+  `unrecorded` whether or not the event recording the failure got written.
+  It reads through the configured store backend, the path `koto status`
+  uses, not the local-directory helpers in `src/session/anchor.rs`, writes
+  nothing, and exits 0 for any of the three states.
+- **Mixed versions.** Older koto readers ignore the new field and event, as
+  serde already does for unknown optional fields. Anchors created by an older
+  koto have no `origin` and read by the legacy rule in Decision 3.
+- **koto-skills skills.** The `koto-user` skill gains the new verb and the
+  `origin=` output line, per the repository's rule for source changes under
+  `src/cli/`.
 - **shirabe coordinator brief** (in the shirabe repository). The brief
   template and its renderer drop the link row; the golden test's expected
   briefs drop it too.
@@ -319,7 +342,10 @@ reader: koto session origin <workflow session | anchor>  -> JSON
 
 with `origin` being `{"state": "none"}` or
 `{"state": "unrecorded", "named": "<preview>", "reason": "<text>"}` in the
-other states. The verb's reference documents the `origin` field (AC6). The
+other states. In the dispatched state `dispatcher_kind` says what
+`dispatcher` names: `anchor` when the answer came through an anchor, or
+`workflow` when it came from a link on the workflow session itself, as the
+older manual step wrote. The verb's reference documents the `origin` field (AC6). The
 anchor open's output gains `origin=<state>`; the hook doesn't need to read it.
 
 ### Data Flow
@@ -390,13 +416,21 @@ nothing a worker relied on for authority.
 
 Four rules keep the record from carrying more than it should:
 
-- Every `reason` is a fixed category, such as `link write failed: store
-  error` or `malformed: not an anchor name`, never a store's raw error text,
-  which can carry endpoints or fragments of credentials.
-- The `named` preview is bounded, and control characters and newlines in it
-  are replaced, so a value can't forge an `anchor=` line in the open's output
-  or put terminal escapes in a reader's output. A value with characters
-  outside the plain-name set is kept as a digest and a length, not as text.
+- Every `reason` is one of a closed list, never a store's raw error text,
+  which can carry endpoints or fragments of credentials: `malformed: not an
+  anchor name`, `self: names this anchor`, `link write failed: store error`,
+  `link not found`, `anchor not found`, and `recorded before koto tracked
+  origin`. A test feeds a store error carrying a marker string through the
+  link writer and checks the marker never reaches the record or the verb.
+- The hook cuts the value to 256 bytes and koto refuses longer. The `named`
+  preview is bounded, and control characters and newlines in it are
+  replaced, so a value can't forge an `anchor=` line in the open's output or
+  put terminal escapes in a reader's output. A value with characters outside
+  the plain-name set is kept as a SHA-256 prefix and a length, not as text.
+- The derived name is built from a session id that passed the hook's
+  plain-name check, so the single-quoted export can't be broken out of; the
+  hook test runs a hostile id (quotes, `$(...)`, a newline) and checks the
+  env file carries no export for it.
 - The existing `dispatched_by` field on the event is set only for a value
   that passed validation, so older readers never see a malformed one.
 - A value naming the anchor being opened records `unrecorded` with a fixed
@@ -404,7 +438,15 @@ Four rules keep the record from carrying more than it should:
   `dispatched`, since the dispatcher's own open may still be creating it.
 
 The verb's reference says plainly that `dispatched` means the starting
-environment named that dispatcher, and that the claim isn't authenticated.
+environment named that dispatcher, and that the claim isn't authenticated;
+decision records and shirabe read it the same way, as a claim and never as a
+grant. Two things are new surface rather than today's: malformed values now
+reach koto, which the rules above bound, and the exported name no longer
+waits for the store to confirm the anchor. In a store shared by several
+hosts, a name derived from one session id could match an anchor another
+party created under the same id; harness session ids are random UUIDs, so
+that needs a collision or a forged id, and the forged case is the same
+environment trust the hook already extends.
 
 ## Consequences
 
