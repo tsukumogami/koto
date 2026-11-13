@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   koto can't reliably say which session dispatched a session on the same host:
   the automatic link has stopped being written on the reference host, the
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 This brief frames the first piece of a larger effort to read a fleet of agent
 sessions from what koto records. It covers only the link from a session to the
