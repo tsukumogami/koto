@@ -388,6 +388,24 @@ check. No credential, token or store configuration enters the record or the
 verb's output, and the verb is read-only. Dropping the link step removes
 nothing a worker relied on for authority.
 
+Four rules keep the record from carrying more than it should:
+
+- Every `reason` is a fixed category, such as `link write failed: store
+  error` or `malformed: not an anchor name`, never a store's raw error text,
+  which can carry endpoints or fragments of credentials.
+- The `named` preview is bounded, and control characters and newlines in it
+  are replaced, so a value can't forge an `anchor=` line in the open's output
+  or put terminal escapes in a reader's output. A value with characters
+  outside the plain-name set is kept as a digest and a length, not as text.
+- The existing `dispatched_by` field on the event is set only for a value
+  that passed validation, so older readers never see a malformed one.
+- A value naming the anchor being opened records `unrecorded` with a fixed
+  reason. A value naming an anchor that doesn't exist yet records
+  `dispatched`, since the dispatcher's own open may still be creating it.
+
+The verb's reference says plainly that `dispatched` means the starting
+environment named that dispatcher, and that the claim isn't authenticated.
+
 ## Consequences
 
 ### Positive
