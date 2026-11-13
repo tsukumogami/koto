@@ -44,6 +44,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto context exists` | Runner — primary |
 | `koto context remove` | Runner — primary |
 | `koto context list` | Runner — primary |
+| `koto context history` | Runner — when a script checks how a key came to hold its value |
 | `koto config get/set/unset/list` | Runner — setup only |
 | `koto decider answer` | Runner — primary, when a decider-check criterion waits on your answer |
 | `koto decider report` | Maintainer — decider promotion |
@@ -1376,6 +1377,30 @@ Lists all context keys as a JSON array sorted alphabetically.
 A key a transition assigned whose store write was lost is listed too, as `koto context get` answers it from the session's log; nothing is stored (see `koto context get`).
 
 `--prefix <prefix>` filters to keys that start with the given prefix. Returns `[]` when no keys exist or no keys match.
+
+## koto context history
+
+```
+koto context history <session> <key>
+```
+
+Prints how `<key>` came to hold its value: a JSON array with one record per write, oldest first, read from the session's log.
+
+```json
+[
+  {"seq": 12, "timestamp": "2026-11-13T01:01:55.905Z", "writer": "agent", "hash": "2ba5...", "size": 41, "state": "analysis"},
+  {"seq": 30, "timestamp": "2026-11-13T01:03:58.152Z", "writer": "transition", "hash": "d0d8...", "size": 8, "state": "done"}
+]
+```
+
+- `writer` -- `agent` (`koto context add`), `transition` (a transition's `context_assignments`) or `koto` (koto's own writes); `null` for a write logged before writers were recorded.
+- `hash` and `size` -- SHA-256 (lowercase hex) and byte length of the content written. Compare `hash` with the SHA-256 of what `koto context get` returns to check that the last write is the current value.
+- `state` -- the state the session was in when the write was recorded. A transition's assignment counts in the state it entered.
+- `seq` and `timestamp` -- the log event that records the write.
+
+A cloud pull of the key (writer `sync`) is not a write and isn't listed, so the records are the same on the local and cloud backends and on every host. A removal or a `clear_on_entry` clearing isn't a write either; a removed key has no current value to match.
+
+Exit codes: 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<session>' not found`), a key that isn't a usable key, or a cloud session this host holds no copy of (`code: "no_local_copy"`; take one with `koto session resolve <session> --keep remote`); 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and records no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
 
 ---
 

@@ -1210,6 +1210,35 @@ koto context list <name> --prefix "review/"
 
 Returns an empty array `[]` when no keys exist (or none match the prefix).
 
+#### context history
+
+Prints one key's write history as a JSON array: one record per write, oldest first, read from the session's log.
+
+```bash
+koto context history <name> <key>
+```
+
+**Positional arguments:**
+- `<name>` -- Workflow/session name.
+- `<key>` -- Context key.
+
+**Output (JSON):**
+
+```json
+[
+  {"seq": 12, "timestamp": "2026-11-13T01:01:55.905Z", "writer": "agent", "hash": "2ba5...", "size": 41, "state": "analysis"},
+  {"seq": 30, "timestamp": "2026-11-13T01:03:58.152Z", "writer": "transition", "hash": "d0d8...", "size": 8, "state": "done"}
+]
+```
+
+Each record names the log event that recorded the write (`seq`, `timestamp`), who wrote it (`writer`: `agent` for `koto context add`, `transition` for a transition's `context_assignments`, `koto` for koto's own writes, `null` for a write logged before writers were recorded), the SHA-256 and byte length of the content written (`hash`, `size`), and the state the session was in when the write was recorded (`state`; a transition's assignment counts in the state it entered).
+
+A script can accept a value when the history shows exactly one write, made in the state it expects, whose `hash` matches the SHA-256 of what `koto context get` returns, and refuse anything else.
+
+A cloud pull of the key (writer `sync`) only copies the remote value to one host, so it isn't listed: the records are the same on the local and cloud backends and on every host that reads the session. Removals and `clear_on_entry` clearings aren't writes and aren't listed either.
+
+**Exit codes:** 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<name>' not found`), a key that isn't a usable key, or a cloud session this host holds no copy of (`code: "no_local_copy"`; take one with `koto session resolve <name> --keep remote`); 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and logs no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
+
 ### template
 
 The `template` subcommand group contains authoring tools for template development. These commands aren't needed for running workflows -- they're for people writing and debugging templates.
