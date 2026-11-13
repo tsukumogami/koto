@@ -1,6 +1,34 @@
 ---
 schema: design/v1
+status: Proposed
+problem: |
+  koto writes one `koto-<session-id>.json` entry per session into the Claude
+  Code session's `workflows` directory, beside Claude Code's own files, and
+  nothing ever lists or deletes them. Finished entries pile up without bound,
+  and a session whose driver was killed keeps the `running` it last wrote,
+  because koto has no daemon, heartbeat or process id for a workflow session.
+  The fix has to run from a command-line tool that only acts when called, and
+  must never touch a file it didn't write.
+decision: |
+  Every entry write ends with a sweep of its directory. It lists the directory
+  once, removes `.koto-wf-*.tmp` files older than 60 seconds, and stops there
+  when at most ten name-matching files exist and none is older than two hours.
+  Otherwise it reads only name-matching files, keeps those carrying koto's
+  marker, rewrites any still `running` and untouched for over two hours as
+  `killed` with "no activity since <time>" and `koto.staleSince`, and removes
+  finished entries oldest `startTime` first until ten remain. Live entries
+  and the one just written are never removed. Contract version 6; the
+  conventions guard gains status-word probes.
+rationale: |
+  A count is the only rule that bounds a busy directory, and the only place
+  that knows the directory and runs often enough is the write itself. The two
+  hours is the dashboard's own stalled threshold, so koto has one definition
+  of "went quiet", and `killed` is the screen word that reads "stopped" and
+  leaves the running count without colliding with real failures. Documenting
+  the stale entry as a limitation would leave the running count wrong. Name
+  plus content marker fails closed, which is what a shared directory needs.
 upstream: docs/prds/PRD-native-workflows-retention.md
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: retention and crash-staleness for koto's `/workflows` entries
@@ -227,7 +255,7 @@ can prove the screen handles it. Rejected.
 
 **A 7-day window (the dashboard's abandoned threshold)**: Rejected because an
 operator who kills a session and checks back the same day would still see it
-running, which is the evidence journey the feature exists for.
+running, which is the case the feature exists for.
 
 **Exempt gate-blocked entries from the window**: Rejected because a session
 killed while blocked would then read running forever, and the summary already
@@ -256,7 +284,11 @@ A file is owned when all of these hold:
 - `symlink_metadata` says it is a regular file, not a symlink or directory;
 - its name is `koto-<id>.json` where `<id>` passes the session-name character
   check (`validate_session_id`) and contains no path separator;
-- it is at most 1 MiB, parses as a JSON object, has `id` equal to
+- opened with no-follow and non-blocking flags, the opened handle is a
+  regular file (checked with `fstat` on the handle, not the earlier listing),
+  so a file swapped for a link, a pipe or a device between listing and open
+  is neither followed nor able to hang the commit;
+- a bounded read of at most 1 MiB parses as a JSON object with `id` equal to
   `koto-<id>`, `koto.sessionId` equal to `<id>`, an unsigned integer
   `koto.contractVersion`, and a string top-level `status`.
 
@@ -272,7 +304,8 @@ changed, so a file a live session just rewrote is never removed. `NotFound`
 from a removal is success, any other error skips that file, and an
 unlistable directory ends the sweep. Rewrites use the same temp-file-and-rename
 path as `atomic_write`, so a reader never sees half a file and a rename
-replaces a path rather than writing through it.
+replaces a path rather than writing through it; the target is never opened
+for writing. Warnings name the file and the error kind, never file contents.
 
 #### Alternatives Considered
 
@@ -338,7 +371,10 @@ of limits, so tests drive it directly with a temporary directory and a fixed
     &Limits) -> Sweep`, where `Sweep` reports counts (removed, reconciled,
     temp files removed, files read) for tests and never an error.
   - `fn owned(path) -> Option<OwnedEntry>`: the ownership check, returning
-    the parsed object, `startTime`, status and modification time.
+    the parsed object, `startTime`, status and modification time. The listing
+    uses `DirEntry::file_type` (no link following); the open uses
+    `O_NOFOLLOW | O_NONBLOCK` through `OpenOptionsExt::custom_flags`, then
+    `fstat`s the handle and reads through `take(1 MiB + 1)`.
   - `fn reconcile(entry, now) -> bool`: the re-check, edit and atomic rename.
   - a test-only read counter, like `MATERIALIZE_RUNS`, that `apply`
     increments per file opened.
@@ -466,7 +502,42 @@ Deliverables:
 
 ## Security Considerations
 
-<to be written in Phase 5>
+The sweep reads, deletes and rewrites files in a directory that Claude Code
+and the user also write to, so every step treats file names and contents as
+untrusted and fails closed. A file is touched only when it is a regular file
+(checked without following links), its name is `koto-<id>.json` with a valid
+session id and no path separator, and a bounded read of at most 1 MiB parses
+to JSON carrying koto's marker: `id` equal to `koto-<id>`, `koto.sessionId`
+equal to `<id>`, a numeric `koto.contractVersion` and a string `status`.
+Anything that fails a check is left unchanged and ignored. Leftover
+`.koto-wf-*.tmp` files are removed only when they are regular files older
+than 60 seconds. No path used for a read, removal or rewrite comes from file
+contents, the sweep never recurses, and it runs with the invoking user's own
+privileges, so it can't delete or overwrite anything outside the one
+directory it was handed. Removal uses unlink and rewriting uses a temp file
+in the same directory plus a rename; neither follows a symlink at the final
+path component.
+
+A check and the action after it are separate system calls, so a file can
+change in between. For reads, koto opens the file with no-follow and
+non-blocking flags, confirms from the opened handle that it is a regular
+file, and reads at most 1 MiB, so a file swapped for a link, a pipe or a
+device can't be followed or make a commit hang. For removal and
+reconciliation, koto re-reads the modification time just before acting and
+skips the file if it changed; a session that commits inside the remaining
+window of a few system calls can read `killed` until its next commit, which
+the docs state. A local actor who can swap files in the directory can
+already edit them directly, so this isn't treated as a privilege boundary.
+The directory comes from `KOTO_WORKFLOWS_DIR` or from the Claude Code project
+path and is trusted configuration; if it points somewhere unexpected, the
+ownership marker still limits the sweep to koto's own entries.
+
+The change adds no dependency and no network access. The weekly conventions
+guard reads a downloaded Claude Code release as text and never runs it. The
+reconciled entry adds a UTC time and an epoch-millisecond value derived from
+the file's own modification time, which the same user could already read
+from the file system; no paths, credentials or environment values are
+written, and warnings log the file name and error kind, not file contents.
 
 ## Consequences
 
