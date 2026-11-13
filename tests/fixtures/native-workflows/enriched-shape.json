@@ -79,7 +79,7 @@
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "workflow": "impl-feature",
     "currentState": "verify",
-    "contractVersion": 5,
+    "contractVersion": 6,
     "status": "blocked",
     "holdings": {
       "keyCount": 3,

@@ -16,6 +16,7 @@ mod koto_command;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use koto::workflows_surface::retention::{self, Limits, KEEP};
 use serde_json::{json, Value};
@@ -312,7 +313,15 @@ fn the_entry_just_written_survives_a_bound_of_one() {
         &entry("written", "completed", json!(1_000)),
     );
 
-    let sweep = retention::apply(dir.path(), &written, &Limits { keep: 1 });
+    let sweep = retention::apply(
+        dir.path(),
+        &written,
+        SystemTime::now(),
+        &Limits {
+            keep: 1,
+            ..Limits::default()
+        },
+    );
 
     assert_eq!(sweep.removed, 1);
     assert!(!older.exists());
@@ -339,7 +348,7 @@ fn a_live_entry_older_than_every_finished_one_stays() {
         &entry("written", "running", json!(9_999)),
     );
 
-    let sweep = retention::apply(dir.path(), &written, &Limits::default());
+    let sweep = retention::apply(dir.path(), &written, SystemTime::now(), &Limits::default());
 
     assert_eq!(sweep.removed, 2);
     assert!(live.exists());
@@ -372,7 +381,7 @@ fn live_entries_past_the_bound_all_stay() {
         &entry("written", "running", json!(9_999)),
     );
 
-    let sweep = retention::apply(dir.path(), &written, &Limits::default());
+    let sweep = retention::apply(dir.path(), &written, SystemTime::now(), &Limits::default());
 
     assert_eq!(sweep.removed, 3);
     let owned = owned_entries(dir.path());
@@ -410,18 +419,42 @@ fn ordering_falls_back_to_modification_time_and_then_the_filename() {
     );
 
     // Five owned entries; each lower bound removes exactly the next oldest.
-    retention::apply(dir.path(), &written, &Limits { keep: 4 });
+    retention::apply(
+        dir.path(),
+        &written,
+        SystemTime::now(),
+        &Limits {
+            keep: 4,
+            ..Limits::default()
+        },
+    );
     assert!(
         !b.exists(),
         "the entry ordered by its 3000 ms mtime goes first"
     );
     assert!(c.exists() && d.exists() && a.exists());
 
-    retention::apply(dir.path(), &written, &Limits { keep: 3 });
+    retention::apply(
+        dir.path(),
+        &written,
+        SystemTime::now(),
+        &Limits {
+            keep: 3,
+            ..Limits::default()
+        },
+    );
     assert!(!c.exists(), "c-tie sorts before d-tie");
     assert!(d.exists() && a.exists());
 
-    retention::apply(dir.path(), &written, &Limits { keep: 2 });
+    retention::apply(
+        dir.path(),
+        &written,
+        SystemTime::now(),
+        &Limits {
+            keep: 2,
+            ..Limits::default()
+        },
+    );
     assert!(!d.exists());
     assert!(a.exists() && written.exists());
 }
@@ -463,7 +496,7 @@ fn a_directory_within_the_bound_is_not_read() {
         &entry("written", "running", json!(9_999)),
     );
 
-    let sweep = retention::apply(dir.path(), &written, &Limits::default());
+    let sweep = retention::apply(dir.path(), &written, SystemTime::now(), &Limits::default());
 
     assert_eq!(sweep.matched, KEEP);
     assert_eq!(sweep.read, 0);
