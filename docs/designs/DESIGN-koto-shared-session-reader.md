@@ -42,6 +42,7 @@ rationale: |
   can't protect a binary already shipped. A tag pin with lockstep versions
   fits koto's release flow with no second version line, and CI keeps the
   crate packageable so a registry publish stays one step away.
+upstream: docs/briefs/BRIEF-koto-shared-session-reader.md
 ---
 
 # DESIGN: A session reader koto shares with other programs
