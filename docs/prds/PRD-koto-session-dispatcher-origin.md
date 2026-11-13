@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 upstream: docs/briefs/BRIEF-koto-session-dispatcher-origin.md
 problem: |
   koto can't reliably say which agent session dispatched a session on the same
@@ -18,7 +18,7 @@ goals: |
 
 ## Status
 
-Draft
+Accepted
 
 Requirements for recording each session's dispatcher in koto, derived from the
 Accepted `docs/briefs/BRIEF-koto-session-dispatcher-origin.md`. This document
@@ -100,8 +100,10 @@ text in its transcript, and records nothing when the agent skips it.
   its environment is recorded with an explicit statement that it has none.
 - **R4. A failed link reads as failed.** When a dispatcher was named but koto
   could not record the link, koto records that it was named and that the link
-  failed, distinct from R3's record. A named value koto refuses as malformed
-  gets this record too, with the refusal as its reason.
+  failed, with the failure as its reason, distinct from R3's record. A named
+  value koto refuses as malformed gets this record too, with the refusal as
+  its reason. A variable that is unset or set to the empty string names no
+  dispatcher and gets R3's record.
 - **R5. One handoff, owned by koto.** The dispatcher reaches koto through a
   variable koto and the koto-skills plugin define. Any launcher conveys it by
   passing the environment through. koto, the plugin and shirabe read no
@@ -162,10 +164,12 @@ text in its transcript, and records nothing when the agent skips it.
 - [ ] **AC7 (R9).** A reviewer takes measured reads of the same worker task,
   at least three runs before the change and three after. The count of the
   agent's koto calls is the same, and the median cost of those calls after
-  the change falls within the range of the before runs.
+  the change, in input plus output tokens the agent spends on them, falls
+  within the range of the before runs.
 - [ ] **AC8 (R8).** A search of the agent's transcript in each AC7 after run,
-  case-insensitive, for `dispatcher`, `dispatched-by` and `link-dispatcher`
-  finds nothing, and the brief shirabe's coordinator renders for a worker, in
+  case-insensitive, for `dispatched-by`, `link-dispatcher` and
+  `dispatcher_session`, run on a worker task whose own text doesn't use those
+  terms, finds nothing, and the brief shirabe's coordinator renders for a worker, in
   its own golden test, carries no link step.
 - [ ] **AC9 (R10).** The start hook's time limit is the value it was before
   the change, and in AC2's slow case the hook returns within it.
