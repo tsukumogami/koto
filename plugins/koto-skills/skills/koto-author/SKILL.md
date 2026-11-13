@@ -102,6 +102,8 @@ Each item in `blocking_conditions` has six fields, plus `failure` on a failed co
 
 `__action__` is reserved: the compiler rejects a state that declares a gate by that name, so the condition can never be confused with one of yours. Route on `failure_kind` (`nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`) rather than on `status` or on message wording. When an action fails, the state's gates are not evaluated at all -- the tick returns first -- so a state whose action failed reports exactly one condition.
 
+`__decision_reversed__` and `__decision_unreadable__` are reserved the same way. koto stops a live workflow on them, with `type: "decision"`, when one of its decisions was reversed from its chain or a session on the chain can't be read, and the compiler rejects a gate by either name.
+
 To check where you are at any point, call `koto next <session-name>` without `--with-data` — it returns the current state directive and is idempotent. If you don't know the session name, `koto workflows` lists active sessions.
 
 ## What to expect
