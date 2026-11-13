@@ -1400,7 +1400,7 @@ Prints how `<key>` came to hold its value: a JSON array with one record per writ
 
 A cloud pull of the key (writer `sync`) is not a write and isn't listed, so the records are the same on the local and cloud backends and on every host. A removal or a `clear_on_entry` clearing isn't a write either; a removed key has no current value to match.
 
-Exit codes: 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<session>' not found`) or a key that isn't a usable key; 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and records no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
+Exit codes: 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<session>' not found`), a key that isn't a usable key, or a cloud session this host holds no copy of (`code: "no_local_copy"`; take one with `koto session resolve <session> --keep remote`); 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and records no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
 
 ---
 

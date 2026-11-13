@@ -1237,7 +1237,7 @@ A script can accept a value when the history shows exactly one write, made in th
 
 A cloud pull of the key (writer `sync`) only copies the remote value to one host, so it isn't listed: the records are the same on the local and cloud backends and on every host that reads the session. Removals and `clear_on_entry` clearings aren't writes and aren't listed either.
 
-**Exit codes:** 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<name>' not found`) or a key that isn't a usable key; 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and logs no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
+**Exit codes:** 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<name>' not found`), a key that isn't a usable key, or a cloud session this host holds no copy of (`code: "no_local_copy"`; take one with `koto session resolve <name> --keep remote`); 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and logs no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
 
 ### template
 

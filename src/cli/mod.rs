@@ -2881,6 +2881,26 @@ pub fn run(app: App) -> Result<()> {
                             EXIT_CALLER_ERROR,
                         );
                     }
+                    // A cloud session this host holds no copy of: the pull
+                    // that refreshes a log never creates one, so say how to
+                    // take a copy rather than fail on writing the pull.
+                    let state_path = backend
+                        .session_dir(&session)
+                        .join(crate::session::state_file_name(&session));
+                    if !state_path.exists() {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": format!(
+                                    "session '{session}' has no copy on this host; take one with \
+                                     `koto session resolve {session} --keep remote`, then read \
+                                     its history"
+                                ),
+                                "code": "no_local_copy",
+                                "command": "context history"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     if let Err(e) = context::handle_history(&backend, &session, &key) {
                         context::exit_with_failed_read("context history", &e);
                     }

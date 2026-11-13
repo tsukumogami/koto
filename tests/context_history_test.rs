@@ -155,7 +155,14 @@ impl Host {
         std::fs::write(&file, content).unwrap();
         self.ok(
             ws,
-            &["context", "add", NAME, key, "--from-file", file.to_str().unwrap()],
+            &[
+                "context",
+                "add",
+                NAME,
+                key,
+                "--from-file",
+                file.to_str().unwrap(),
+            ],
         );
     }
 
@@ -168,9 +175,27 @@ impl Host {
     fn drive(&self, ws: &Path) {
         self.ok(ws, &["init", NAME, "--template", TEMPLATE_FILE]);
         self.add(ws, "k", "one");
-        self.ok(ws, &["next", NAME, "--with-data", r#"{"go":"go"}"#, "--no-cleanup"]);
+        self.ok(
+            ws,
+            &[
+                "next",
+                NAME,
+                "--with-data",
+                r#"{"go":"go"}"#,
+                "--no-cleanup",
+            ],
+        );
         self.add(ws, "k", "two");
-        self.ok(ws, &["next", NAME, "--with-data", r#"{"go":"go"}"#, "--no-cleanup"]);
+        self.ok(
+            ws,
+            &[
+                "next",
+                NAME,
+                "--with-data",
+                r#"{"go":"go"}"#,
+                "--no-cleanup",
+            ],
+        );
     }
 }
 
@@ -206,7 +231,12 @@ fn expected_k() -> Vec<(Value, String, u64, String)> {
 }
 
 fn expected_outcome() -> Vec<(Value, String, u64, String)> {
-    vec![("transition".into(), sha256(b"finished"), 8, "done".to_string())]
+    vec![(
+        "transition".into(),
+        sha256(b"finished"),
+        8,
+        "done".to_string(),
+    )]
 }
 
 /// Every record carries the fields the command documents, oldest first.
@@ -308,15 +338,26 @@ fn cloud_history_matches_local_and_reads_the_same_on_another_host() {
     assert_eq!(writes(&a_outcome), expected_outcome());
     assert_eq!(writes(&a_outcome), writes(&local_outcome));
 
-    // A second host with no local copy reads the synced log from the bucket
-    // and gets the very same records, timestamps and seqs included.
+    // A second host with no local copy is told how to take one, exit 2,
+    // rather than failing on the store; once it has pulled the synced log
+    // from the bucket it gets the very same records, timestamps and seqs
+    // included.
     let b = Host::new(Some(s3.endpoint()));
+    let out = b.run(&ws, &["context", "history", NAME, "k"]);
+    assert_eq!(out.code, Some(2), "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(out.json()["code"], "no_local_copy");
+    b.ok(&ws, &["session", "resolve", NAME, "--keep", "remote"]);
     assert_eq!(b.history(&ws, "k"), a_k);
     assert_eq!(b.history(&ws, "outcome"), a_outcome);
 
     // A key never written is `[]` on the cloud backend too, and a session
     // the bucket doesn't hold is exit 2 naming the session.
-    assert_eq!(b.ok(&ws, &["context", "history", NAME, "never.md"]).stdout.trim(), "[]");
+    assert_eq!(
+        b.ok(&ws, &["context", "history", NAME, "never.md"])
+            .stdout
+            .trim(),
+        "[]"
+    );
     let out = b.run(&ws, &["context", "history", "nosuch", "k"]);
     assert_eq!(out.code, Some(2), "{}\n{}", out.stdout, out.stderr);
     assert_eq!(out.json()["error"], "workflow 'nosuch' not found");
