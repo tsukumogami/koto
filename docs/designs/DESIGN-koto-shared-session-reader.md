@@ -314,17 +314,34 @@ Key assumptions:
    functions; `File::create`, `create_new`, `set_len`, `set_times`,
    `sync_*` and the `lock*` family; the `OpenOptions` modes `write`,
    `append`, `create`, `create_new` and `truncate`; `OpenOptionsExt::mode`
-   and `custom_flags`; the unix `symlink` and `chown` family; and the root
-   file's two `home_dir` entries. `disallowed-types` lists `DirBuilder`,
-   `std::process::Command` and the TCP, UDP and unix socket types.
-   `File::open` and a read-only `OpenOptions` stay allowed.
+   and `custom_flags`; the unix `symlink` and `chown` family;
+   `ToSocketAddrs::to_socket_addrs`; `std::env::set_var` and `remove_var`;
+   and the root file's two `home_dir` entries. `disallowed-types` lists
+   `DirBuilder`, `std::process::Command` and the TCP, UDP and unix socket
+   types. The read calls themselves (`File::open`, `fs::read`,
+   `fs::read_to_string`, `OpenOptions::new`) are banned too, outside one
+   module.
 2. The crate's `lib.rs` carries `#![forbid(unsafe_code)]`, which makes every
    libc function and any FFI call uncallable, so libc stays only for
    constants, and `#![deny(clippy::disallowed_methods,
-   clippy::disallowed_types)]`. Exactly one function holds an allow: an
-   `open_read_nofollow(path)` helper, the crate's only `custom_flags` call,
-   passing `O_NOFOLLOW | O_NONBLOCK`. `read_pointer` and the context read
-   both use it.
+   clippy::disallowed_types)]`. Every file open in the crate lives in one
+   module, `fs_read.rs`, which holds the only allows and offers two
+   functions. `open_plain(path)` is today's `File::open`, kept for the
+   reads koto's own commands already make through `read_events`,
+   `read_header` and `is_terminal_state`, so the tick path reads exactly as
+   it does now. `read_store_file(path, cap, mode)` is the hardened read. It
+   takes no flag argument: `mode` is `InStore` or `Template`, and each maps
+   to a fixed constant, `IN_STORE_OPEN_FLAGS` (`O_NOFOLLOW | O_NONBLOCK`)
+   or `TEMPLATE_OPEN_FLAGS` (`O_NONBLOCK`, since a template given with
+   `--template` may legitimately be a symlink outside the store). It checks
+   with `fstat` that the opened file is a regular file, reads at most `cap`
+   bytes, and in `InStore` mode rechecks after the open that the canonical
+   path is still inside the store, as `koto context get` does. It is the
+   crate's only `custom_flags` call. The context read, the layout
+   marker and the dashboard's store scan (Decision 3) use it, and so does
+   `read_pointer` for every caller: it already opens with `O_NOFOLLOW`, and
+   the non-blocking open and regular-file check change no answer for a
+   regular file, only for a FIFO or device that blocks it today.
 3. `cargo tree -p koto-session-reader --depth 1` must list only an
    allowlist of direct dependencies: anyhow, serde, serde_json, thiserror,
    regex, aho-corasick, toml, libc, sha2, hex (the template declaration
@@ -336,14 +353,32 @@ Key assumptions:
    `check-decider-purity.sh`, checks what the lint can't: both attributes
    are still in `lib.rs`; no file under the crate's `src/` carries an
    `allow`, `expect` or `cfg_attr` naming the two lints or `clippy::all`
-   outside the two sanctioned sites (the nofollow helper and the moved
-   `home_dir` call); `custom_flags` appears exactly once; `clippy.toml`
-   still holds every required entry; the crate has no `build.rs`; and the
-   two `cargo tree` checks pass. A `--self-test` plants each violation in a
-   temporary copy and expects a failure.
+   outside the two sanctioned sites (`fs_read.rs` and the moved `home_dir`
+   call); `custom_flags` appears exactly once, passed one of the two mode
+   constants, whose definitions read exactly `O_NOFOLLOW | O_NONBLOCK` and
+   `O_NONBLOCK`;
+   `clippy.toml` still holds every required entry; the crate has no
+   `build.rs` and no `[patch]` or `[replace]`; every dependency in `cargo
+   metadata` comes from the crates.io registry; and the two `cargo tree`
+   checks pass. A `--self-test` plants each violation in a temporary copy
+   and expects a failure.
 5. validate.yml gains a `reader-write-guard` job, "Reader Write Guard":
    `cargo clippy -p koto-session-reader --all-targets --locked -- -D
    warnings`, then the script.
+
+Because `--all-targets` lints the crate's own `tests/` under the same ban,
+those tests read committed fixture files only. Tests that need a store
+written at run time, including the dashboard data layer's current unit
+tests that build fixtures with `append_event` and `tempfile`, move to
+koto's `tests/`, which reaches the crate through koto's re-exports. The
+graph checks use normal and build edges, so dev-dependencies don't count
+against the allowlist.
+
+What this guarantees is a property of the crate's own source, enforced in
+koto's CI at every tag. It isn't a process sandbox: a dependency's code
+runs with the caller's privileges, which is why the dependency set is an
+allowlist checked for name and source, and a dependent's build doesn't run
+these lints.
 
 `persistence.rs` divides so that the shared crate gets a read module with
 no write vocabulary in it. The pure merged-line detection both halves
@@ -453,12 +488,35 @@ template a current koto parses, its answer is the same as today's.
 
 *Breaking changes.* The marker is `<sessions dir>/.koto-store-layout`, and a
 missing file means layout 1, so nothing is written today. The reader checks
-it before listing and refuses the whole store with a named error when the
-number is higher than it knows, as the log refuses a higher
-`schema_version`. A breaking change to the promised surface goes through
-STABILITY.md's major-bump protocol, with a crate release that reads both
-layouts shipped first; only then does a koto release's migration write the
-marker.
+it before listing and refuses the whole store with a named error, giving
+the marker's path and the found and supported numbers, when the number is
+higher than it knows, as the log refuses a higher `schema_version`. A marker
+that isn't a regular file, is over 64 bytes or doesn't parse as a number is
+refused the same way rather than guessed at. A breaking change to the
+promised surface goes through STABILITY.md's major-bump protocol, with a
+crate release that reads both layouts shipped first; only then does a koto
+release's migration write the marker. The marker sits in a directory any
+session's commands can write, so a writer can plant a high number and make
+every dependent refuse the store. That availability risk is accepted: the
+same writer can already delete or rewrite every session, and the refusal
+is loud and names the file to remove.
+
+*How the store is read.* The dashboard's scan, in the crate and so in
+`koto dashboard` too, reads each state file, compiled template, leg pointer,
+context value and the marker through `read_store_file` with a fixed cap per
+kind: 512 MiB for a state log, 32 MiB for a template, 64 KiB for a leg
+pointer or the marker, 16 MiB for a context value. The bytes then go to the
+same parsers koto's commands use (`parse_state_log`, the terminal
+projection, the pointer parser). A symlinked, non-regular or over-cap file
+marks that one session or value unreadable with its reason, and the scan
+goes on. The template read uses `Template` mode, which follows a symlink
+and skips the containment check, since a template given with `--template`
+lives outside the store, but keeps the non-blocking open, the regular-file
+check and the cap. Listing
+skips a symlinked session directory, as `LocalBackend::list` already does.
+On every store koto itself writes, none of this changes a row; the
+reviewer run in Decision 5 records the largest state log in the reference
+store, which must sit well under its cap.
 
 *Finding the root.* The crate's source constructor takes an explicit
 sessions directory, and nothing reads the environment implicitly. Beside it
@@ -486,11 +544,16 @@ backend and never fails the scan. It returns one of:
   exactly as `koto context get` answers. This covers the lost store write.
 - `Absent`: `ctx/`, an intermediate directory or the file doesn't exist.
 - `Unreadable(reason)`: a symlink at any component (checked with
-  `symlink_metadata` and an `O_NOFOLLOW` open of the leaf), a non-regular
-  leaf (opened non-blocking and re-checked with `fstat`, so a FIFO can't
-  hang the scan), or any I/O error. Refusing symlinks is a deliberate
+  `symlink_metadata` on each, then an `O_NOFOLLOW` open of the leaf and a
+  containment recheck of the opened path), a non-regular leaf (opened
+  non-blocking and re-checked with `fstat`, so a FIFO can't hang the scan),
+  a value over 16 MiB, or any I/O error. Refusing symlinks is a deliberate
   difference from `koto context get`; koto never writes one.
 - `Present { bytes, from: Store }`: a regular file, returned whole.
+
+A value from the log comes from what a transition assigned, not from
+`ctx/`, so a dependent that reasons "I only read `ctx/`" is wrong in the
+same way it would be about `koto context get`.
 
 The host-local key `workflows/publish-location` reads like any other key and
 matches `koto context get` on this host. Two limits are documented: a read
@@ -694,9 +757,13 @@ koto's repairing write and the crate's tolerant read can't drift.
 "Cannot write" then has three layers that CI runs: a per-crate clippy ban
 list over the `std::fs` write surface, process and socket types; a
 `forbid(unsafe_code)` that makes libc calls impossible; and a dependency
-allowlist plus a guard script that closes the `#[allow]` escapes and allows
-exactly one `custom_flags` call, the `O_NOFOLLOW | O_NONBLOCK` open the leg
-pointer and context reads share.
+allowlist plus a guard script that closes the `#[allow]` escapes and keeps
+every file open in one module. That module's hardened read, which refuses
+symlinks inside the store, never blocks on a FIFO, accepts only regular
+files and caps what it reads, is how the dashboard scan, the leg pointer,
+the context read and the layout marker touch a store any session's
+commands can write to. koto's own commands keep reading their logs and
+templates as they do now.
 
 A second program uses the crate by giving it a sessions directory, usually
 from `sessions_dir(None)`, which is koto's own root rule moved into the
@@ -765,7 +832,8 @@ koto-session-reader/          (new member; no writer, no network)
   src/dashboard.rs            liveness, CachedSession, SessionTree, refresh
   src/source.rs               SessionSource, LocalDirSource, sessions_dir,
                               read_context, layout constants and marker
-  src/fs_read.rs              open_read_nofollow, the one custom_flags call
+  src/fs_read.rs              every file open: open_plain, read_store_file
+                              (the one custom_flags call), read caps
 
 koto (root package)
   src/engine/mod.rs           pub use koto_session_reader::engine::types; ...
@@ -826,10 +894,11 @@ For `koto dashboard`: koto builds its backend from config as today, hands
 `cloud.local()` or the `LocalBackend` to the crate's `refresh` as a
 `SessionSource`, and then applies its bucket overlay (`drop_shadowed_remote`,
 remote rows) in its wrapper before rendering. The crate stats each session's
-state file, re-reads only those whose modification time changed, parses
-header and events, resolves the template path, reads `states.<name>.terminal`
-through the minimal projection, reads the leg pointer, and derives rows,
-liveness and the tree.
+state file, re-reads only those whose modification time changed through
+`read_store_file`, parses header and events with `parse_state_log`,
+resolves the template path, reads `states.<name>.terminal` through the
+minimal projection, reads the leg pointer, and derives rows, liveness and
+the tree.
 
 For a dependent: it calls `sessions_dir(None)`, constructs a
 `LocalDirSource` (which checks the marker), and calls the same `refresh`.
@@ -892,13 +961,18 @@ after.
 
 Deliverables:
 - `koto-session-reader/` with its manifest, `clippy.toml` and moved sources
+- `koto-session-reader/src/fs_read.rs`, with every existing open routed
+  through `open_plain` and `read_pointer` switched to `read_store_file`
+- the dashboard data layer's fixture-building unit tests moved to koto's
+  `tests/`
 - `[workspace.package] version` and `version.workspace = true` on both
 - the guard script and the validate.yml jobs
 
 ### Phase 4: The read surface
 
 `LocalDirSource`, `sessions_dir`, `read_context`, the layout constants and
-the marker check land in the crate; koto's backends call `sessions_dir` and
+the marker check land in the crate, and the dashboard scan reads through
+`read_store_file` with its caps; koto's backends call `sessions_dir` and
 import the constants; `koto session dir --json` gains `sessions`.
 docs/STABILITY.md gains the "Session store read surface" section and the
 dependent's compatibility promise, `docs/workspace-layout.md` gains the
@@ -907,7 +981,11 @@ pins. `set-version.sh` checks the crate's lock entry and the version and
 packaging job lands.
 
 Deliverables:
-- `koto-session-reader/src/source.rs` and `src/fs_read.rs`
+- `koto-session-reader/src/source.rs` and the capped scan in
+  `src/dashboard.rs`
+- tests with a FIFO, a symlink, an over-cap file and a planted marker in a
+  generated store, each marking one session or refusing the store as
+  described, and the golden test unchanged
 - the STABILITY.md and workspace-layout.md sections
 - the version-equality and `cargo package` CI job
 
@@ -935,34 +1013,61 @@ Deliverables:
 
 ## Security Considerations
 
-The crate reads files under a sessions directory that other processes, some
-of them agents running arbitrary commands, can write to. Three things follow.
-A planted symlink must not redirect a read outside the store, so the context
-read and the leg pointer read refuse symlinks at every component and open
-leaves with `O_NOFOLLOW`; a FIFO or device planted as a key must not hang or
-redirect a scan, so the leaf is opened non-blocking and re-checked as a
-regular file. A crafted `template_path` is bounded by the existing rule: a
-relative path resolves inside the session directory and the fallback for a
-missing absolute path accepts only a 64-hex-digit `.json` name there. An
-absolute path that exists is read as given, as `koto dashboard` reads it
-today without checking `template_hash`; the most a crafted one can do is
-flip that one session's terminal flag, since the reader takes a single
-boolean from the file and writes nothing. A malformed or oversized log must not take
-down the scan, so a bad session is reported unreadable with its reason and
-the rest continue.
+**Trust model.** The crate reads a sessions directory that other processes
+can write to, including agents running arbitrary commands under the same
+user. Everything it reads (state logs, compiled templates, leg pointers,
+context values, the layout marker) is untrusted input, and what it reports
+is what those writers recorded. A program built on it displays
+agent-written state; it isn't a monitor of agents, and "status comes from
+koto" means it comes from koto's records, not that koto vouches for them.
+An agent that wants a session to look finished can already write that log.
 
-The crate's own permissions are narrower than koto's: it can't write,
-lock, spawn a process or open a socket, and CI enforces that (Decision 2).
-That narrowing is the main security property of this design, since it means
-a program built on the crate can be given read access to the store without
-being trusted to change it.
+**Untrusted files.** Every read of a path inside the store, and of the
+compiled template a log names, goes through `read_store_file`: a
+non-blocking open, a regular-file check with `fstat`, a byte cap per kind
+of file, and for paths inside the store `O_NOFOLLOW` plus a containment
+recheck of the opened path. A symlink, FIFO, device or over-cap file marks
+that one session or value unreadable with a reason, and the scan goes on;
+nothing a writer plants can hang the scan or make it read without bound. A
+crafted `template_path`, absolute or not, goes through the same read, so it
+can at worst mark one session unreadable or set that session's terminal
+flag. The template isn't checked against `template_hash`, as `koto
+dashboard` doesn't check it today; under the trust model that is
+acceptable, because the writer who could plant a template could equally
+write the log. The containment recheck after an open leaves a narrow race
+in which a swapped directory makes the reader return another file the user
+can read, capped, as one value. That grants a writer nothing it lacks,
+since it could copy the same file into `ctx/` directly. The layout marker
+is a store-wide switch a writer can flip; that availability risk is
+accepted for the same reason (it can already delete every session), and
+the refusal names the file.
 
-On supply chain, a dependent takes the crate from koto's repository at a
-release tag, and its lock records the commit, so a moved tag can't change a
-locked build. The crate's direct dependencies are an allowlist in CI, all
-already in koto's lock. Context values are returned as raw bytes; a
-dependent that prints them is responsible for escaping terminal control
-sequences, as `koto dashboard` is for its own columns.
+**What "cannot write" covers.** The crate's own source can't write, lock,
+spawn a process, resolve a host name or open a socket, and koto's CI
+enforces that at every tag (Decision 2). It isn't a process sandbox: a
+dependency's code and the dependent's own code run with the caller's
+privileges, which is why the dependency set is an allowlist checked for
+name and registry source.
+
+**Supply chain.** A dependent takes the crate from koto's repository at a
+release tag, and its `Cargo.lock` records the commit, so a tag moved later
+can't change a locked build. The first resolve does trust the tag, so koto
+protects its release tags and a dependent builds its release with
+`--locked`. The crate has no `build.rs`, so fetching koto's repository runs
+nothing. A dependent resolves the allowlisted crates at versions of its own
+choosing and audits them as it does any dependency.
+
+**Data exposure.** Context values come back as raw bytes, up to 16 MiB,
+from `ctx/` or from what a transition assigned in the log, unredacted. A
+dependent that prints, stores or forwards them escapes terminal control
+sequences and applies its own redaction; a fleet view does better to show
+that a key exists than its value by default. The host-local key
+`workflows/publish-location` names a folder on this host and doesn't
+belong in anything shared across hosts. Error reasons carry absolute paths,
+which reveal the home directory and user name if forwarded. `sessions_dir`
+reads `KOTO_HOME` and `KOTO_SESSIONS_BASE`, so a process that controls the
+reader's environment chooses its store, as it does for koto; a dependent
+running where the environment isn't trusted passes an explicit directory.
 
 ## Consequences
 
@@ -999,8 +1104,12 @@ sequences, as `koto dashboard` is for its own columns.
 - The ban list follows std: a write API added in a future Rust release isn't
   banned until someone lists it.
 - Dashboard data-layer unit tests that build fixtures with `append_event`
-  and `tempfile` have to live in koto's test tree or the crate's `tests/`,
-  not in the crate's `src/`.
+  and `tempfile` move to koto's test tree; the crate's own tests read
+  committed fixtures only.
+- On a pathological store (a FIFO, a symlink or an over-cap file where a
+  state file, pointer or context value belongs) `koto dashboard` now marks
+  that session unreadable where today it would hang or read through. That
+  is the one place its behavior changes, and no store koto writes has it.
 
 ### Mitigations
 
