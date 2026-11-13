@@ -55,7 +55,10 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
         Command::Decisions { subcommand } => match subcommand {
             DecisionsSubcommand::List { name, .. } => Some(("decisions list", name)),
             DecisionsSubcommand::Show { name, .. } => Some(("decisions show", name)),
-            DecisionsSubcommand::Record { .. } | DecisionsSubcommand::Reverse { .. } => None,
+            DecisionsSubcommand::Record { .. }
+            | DecisionsSubcommand::Reverse { .. }
+            | DecisionsSubcommand::Report { .. }
+            | DecisionsSubcommand::Import { .. } => None,
         },
         Command::Overrides { subcommand } => match subcommand {
             overrides::OverridesSubcommand::List { name } => Some(("overrides list", name)),

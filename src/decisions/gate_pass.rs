@@ -134,6 +134,7 @@ impl Prepared {
             compensating: None,
             replacement: None,
             refusal: None,
+            imported: None,
         }
     }
 }

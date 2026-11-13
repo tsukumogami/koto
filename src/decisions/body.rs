@@ -104,6 +104,22 @@ pub struct DecisionBody {
     /// a race (R18, R19).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// Where an imported decision came from and when it was imported
+    /// (R28); absent from every decision koto recorded itself. An imported
+    /// decision's `time` is its source's time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<Imported>,
+}
+
+/// The source of a decision `koto decisions import` recorded. The pair
+/// `source` and `source_id` identifies the entry, so importing it again
+/// adds nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Imported {
+    pub source: String,
+    pub source_id: String,
+    /// UTC, to the millisecond, stamped by the importer from the clock.
+    pub imported_at: String,
 }
 
 /// The decision a reversal is aimed at.

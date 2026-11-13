@@ -7,6 +7,12 @@
 //! pinned, 200 pins in all, which hold to the same bounds
 //! (DESIGN-session-pin.md, R28).
 //!
+//! The decision record's listing bound (PRD-decision-record.md, R36) runs
+//! beside it: over one hierarchy of 1,000 sessions in four levels holding
+//! 100 decisions each, the median of five warm runs of `koto decisions
+//! list <root> --below` and of `koto decisions report --below <root>` each
+//! stays under five seconds.
+//!
 //! The bounds hold for a release build, which CI runs in its own job
 //! (`cargo test --release --test retention_cost`). A debug build runs the
 //! same code on a store a tenth the size and checks only that every
@@ -281,5 +287,217 @@ fn the_engine_answers_within_its_bounds_on_a_large_store() {
     if RELEASE {
         assert!(query < Duration::from_secs(1), "query took {query:?}");
         assert!(full < Duration::from_secs(10), "full pass took {full:?}");
+    }
+}
+
+/// The sessions on each level of the decision store's one hierarchy: 1,000
+/// in four levels, or a tenth of that in a debug build.
+const DECISION_LEVELS: [usize; 4] = if RELEASE {
+    [1, 9, 90, 900]
+} else {
+    [1, 3, 24, 72]
+};
+
+/// The decisions each session of the decision store holds.
+const DECISIONS_PER_SESSION: usize = 100;
+
+/// The limit R36 puts on a listing below the root and on the report.
+const DECISION_LIMIT: Duration = Duration::from_secs(5);
+
+/// One stored decision body, as `koto decisions record` writes it.
+fn decision_body(name: &str, n: usize, ancestors: &[String]) -> Vec<u8> {
+    let id = format!("{n:012}");
+    let observed = |v: &str| json!({"value": v, "source": "observed"});
+    let (kind, outcome, subject, defaulted) = match n % 3 {
+        0 => (
+            "gate-pass",
+            "passed",
+            json!({"workflow": name, "state": "work", "gate": "ci"}),
+            true,
+        ),
+        1 => (
+            "judgment",
+            "settled",
+            json!({"what": format!("finding {n}")}),
+            false,
+        ),
+        _ => (
+            "accept",
+            "accepted",
+            json!({"location": format!("req-{n}")}),
+            false,
+        ),
+    };
+    let body = json!({
+        "v": 1,
+        "id": id,
+        "session": {"name": name, "id": format!("id-{name}")},
+        "time": format!("2026-11-{:02}T{:02}:{:02}:00.000Z", 1 + n % 28, n % 24, n % 60),
+        "state": "work",
+        "log_seq": 2,
+        "kind": kind,
+        "outcome": outcome,
+        "subject": subject,
+        "decider": {"kind": "session", "session": observed(name), "harness": observed(""),
+                    "anchor": observed(""), "agent": observed("unknown"), "defaulted": defaulted},
+        "authority": {"kind": "dispatch", "level": null, "grants": [], "source": "handed",
+                      "dispatcher": ancestors.first().map(String::as_str).unwrap_or("none"),
+                      "run_mode": observed("unknown")},
+        "chain": {"links": ancestors.iter().map(|a| json!({"session": a, "via": "init"})).collect::<Vec<_>>(),
+                  "incomplete": false},
+        "basis": [],
+        "evidence": [],
+    });
+    let mut bytes = serde_json::to_vec(&body).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// A store holding one hierarchy of [`DECISION_LEVELS`] sessions, each
+/// dispatched by one on the level above and holding
+/// [`DECISIONS_PER_SESSION`] decisions written straight to its decision
+/// area. Returns the temporary directory, the store's base and the root.
+fn build_decision_store() -> (tempfile::TempDir, PathBuf, String) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("sessions");
+    std::fs::create_dir_all(&base).unwrap();
+    let backend = LocalBackend::with_base_dir(base.clone());
+    let long_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    let mut above: Vec<(String, Vec<String>)> = Vec::new();
+    for (level, &count) in DECISION_LEVELS.iter().enumerate() {
+        let mut this_level = Vec::with_capacity(count);
+        for i in 0..count {
+            let name = format!("d{level}-{i}");
+            let events = [event(
+                1,
+                long_ago,
+                "transitioned",
+                json!({"from": null, "to": "work", "condition_type": "auto"}),
+            )];
+            write_log(&base, &name, json!({}), &events);
+            // The parent on the level above, spread evenly; its ancestors
+            // follow it on the chain.
+            let ancestors = match above.get(i * above.len().max(1) / count) {
+                Some((parent, theirs)) => {
+                    let body = json!({"v": 1, "session": parent, "session_id": format!("id-{parent}"),
+                                      "workspace": null, "at": iso(long_ago), "via": "init"});
+                    backend
+                        .add_with_writer(
+                            &name,
+                            &format!("koto/links/dispatched-by/{parent}"),
+                            body.to_string().as_bytes(),
+                            "koto",
+                        )
+                        .unwrap();
+                    let mut chain = vec![parent.clone()];
+                    chain.extend(theirs.iter().cloned());
+                    chain
+                }
+                None => Vec::new(),
+            };
+            let dir = base.join(&name).join("ctx/koto/decisions");
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in 1..=DECISIONS_PER_SESSION {
+                std::fs::write(
+                    dir.join(format!("{n:012}")),
+                    decision_body(&name, n, &ancestors),
+                )
+                .unwrap();
+            }
+            this_level.push((name, ancestors));
+        }
+        above = this_level;
+    }
+    (tmp, base, "d0-0".to_string())
+}
+
+/// The median of five timed runs of `args`, after one warm-up run whose
+/// output is returned for checking.
+fn median_of_five(base: &Path, args: &[&str]) -> (Duration, serde_json::Value) {
+    let run = || {
+        let started = Instant::now();
+        let out = koto_command::koto()
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("KOTO_ANCHOR")
+            .env("HOME", base.parent().unwrap())
+            .env("KOTO_SESSIONS_BASE", base)
+            .current_dir(base.parent().unwrap())
+            .args(args)
+            .output()
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (took, out.stdout)
+    };
+    let (_, warm) = run();
+    let mut times: Vec<Duration> = (0..5).map(|_| run().0).collect();
+    times.sort();
+    (times[2], serde_json::from_slice(&warm).unwrap())
+}
+
+#[test]
+fn the_decision_listing_and_report_answer_within_five_seconds_on_a_large_store() {
+    let (_tmp, base, root) = build_decision_store();
+    let sessions: usize = DECISION_LEVELS.iter().sum();
+
+    // A freshly built binary can pay once for the OS checking it.
+    koto_command::koto().arg("version").output().unwrap();
+
+    let (list, listed) = median_of_five(
+        &base,
+        &["decisions", "list", &root, "--below", "--format", "v1"],
+    );
+    // Every session below the root, the root itself not included.
+    assert_eq!(
+        listed["decisions"].as_array().unwrap().len(),
+        (sessions - 1) * DECISIONS_PER_SESSION
+    );
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), sessions - 1);
+
+    let (report, reported) = median_of_five(
+        &base,
+        &[
+            "decisions",
+            "report",
+            "--since",
+            "2026-11-01",
+            "--until",
+            "2026-12-01",
+            "--below",
+            &root,
+        ],
+    );
+    assert_eq!(reported["sessions_read"], sessions);
+    let made: u64 = ["gate-pass", "judgment", "accept"]
+        .iter()
+        .map(|k| reported["made"][k]["session"]["made"].as_u64().unwrap())
+        .sum();
+    assert_eq!(made as usize, sessions * DECISIONS_PER_SESSION);
+    assert_eq!(
+        reported["defaulted_gate_passes"],
+        sessions * (DECISIONS_PER_SESSION / 3)
+    );
+
+    eprintln!(
+        "decisions cost: {sessions} sessions, {} decisions; list --below median {list:?}; \
+         report median {report:?}",
+        sessions * DECISIONS_PER_SESSION
+    );
+    for (what, median) in [("list --below", list), ("report", report)] {
+        if median >= DECISION_LIMIT * 4 / 5 {
+            eprintln!(
+                "decisions cost: NOTE: the {what} median {median:?} is within 20 percent of \
+                 the {DECISION_LIMIT:?} limit; a bulk listing format under koto/packs/ is the \
+                 follow-up"
+            );
+        }
+    }
+    if RELEASE {
+        assert!(list < DECISION_LIMIT, "list --below median took {list:?}");
+        assert!(report < DECISION_LIMIT, "report median took {report:?}");
     }
 }

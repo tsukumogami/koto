@@ -309,6 +309,7 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             compensating: None,
             replacement: None,
             refusal: None,
+            imported: None,
         })
     })
     .unwrap_or_else(|e| refuse(COMMAND, &e));
@@ -861,6 +862,7 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
                 compensating,
                 replacement: args.replacement.clone(),
                 refusal: None,
+                imported: None,
             })
         },
     )
@@ -899,6 +901,101 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
             "id": written.id,
             "status": "in-effect",
             "decision": written,
+        }))?
+    );
+    Ok(())
+}
+
+/// The flags `report` takes.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ReportArgs {
+    /// The window's start, included: a date (2026-11-01) or an RFC 3339
+    /// UTC time
+    #[arg(long, required = true)]
+    pub since: String,
+    /// The window's end, excluded: a date or an RFC 3339 UTC time
+    #[arg(long, required = true)]
+    pub until: String,
+    /// Count only this session and every session below it
+    #[arg(long, value_name = "SESSION")]
+    pub below: Option<String>,
+}
+
+/// `koto decisions report --since <t> --until <t> [--below <session>]`
+/// (R29).
+pub fn handle_report(backend: &Backend, args: &ReportArgs) -> Result<()> {
+    const COMMAND: &str = "decisions report";
+    let window = crate::decisions::report::Window::new(&args.since, &args.until)
+        .unwrap_or_else(|e| refuse(COMMAND, &e));
+    if let Some(root) = &args.below {
+        if !chain::session_present(backend, root) {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!("no state file found for workflow '{}'", root),
+                    "command": COMMAND
+                }),
+                EXIT_CALLER_ERROR,
+            );
+        }
+    }
+    let out = crate::decisions::report::report(backend, &window, args.below.as_deref());
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+/// Print an import refusal and exit: 3 for a write that failed, 2 for
+/// anything the caller has to change.
+fn refuse_import(e: crate::decisions::import::ImportError) -> ! {
+    let mut out = serde_json::json!({
+        "error": e.error.message,
+        "code": e.error.code,
+        "command": "decisions import",
+    });
+    if let Some(field) = &e.error.field {
+        out["field"] = serde_json::json!(field);
+    }
+    if let Some(line) = e.line {
+        out["line"] = serde_json::json!(line);
+    }
+    if let Some(reason) = e.reason {
+        out["reason"] = serde_json::json!(reason);
+    }
+    let code = if e.error.code == "decision_write_failed" {
+        EXIT_INFRASTRUCTURE
+    } else {
+        EXIT_CALLER_ERROR
+    };
+    exit_with_error_code(out, code)
+}
+
+/// `koto decisions import <session> <file>` (R28). The caller has refused
+/// a session that is unlocated or superseded.
+pub fn handle_import(backend: &Backend, name: &str, file: &std::path::Path) -> Result<()> {
+    use crate::decisions::import::{self, ImportError};
+    require_session(backend, name, "decisions import");
+    let reader = std::fs::File::open(file)
+        .map(std::io::BufReader::new)
+        .unwrap_or_else(|e| {
+            refuse_import(ImportError::from(DecisionError::invalid(
+                "file",
+                format!("'{}' can't be opened: {e}", file.display()),
+            )))
+        });
+    let now = crate::engine::types::now_iso8601();
+    let entries = import::parse(reader, &now).unwrap_or_else(|e| refuse_import(e));
+    let outcome = import::import(backend, name, &entries).unwrap_or_else(|e| refuse_import(e));
+    let lines = |v: &[(usize, String)]| -> Vec<serde_json::Value> {
+        v.iter()
+            .map(|(line, id)| serde_json::json!({"line": line, "id": id}))
+            .collect()
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "v": FORMAT_VERSION,
+            "session": name,
+            "imported": lines(&outcome.imported),
+            "skipped": lines(&outcome.skipped),
         }))?
     );
     Ok(())

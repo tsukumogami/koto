@@ -1298,6 +1298,20 @@ pub enum DecisionsSubcommand {
         #[command(flatten)]
         reversal: decisions::ReverseArgs,
     },
+    /// Count decisions and reversals by kind and decider kind over a UTC
+    /// window, for every session or the hierarchy below one
+    Report {
+        #[command(flatten)]
+        window: decisions::ReportArgs,
+    },
+    /// Import decisions recorded elsewhere from a JSON Lines file into a
+    /// session; importing the same entries again adds nothing
+    Import {
+        /// Session name
+        name: String,
+        /// JSON Lines file, one entry per line
+        file: PathBuf,
+    },
 }
 
 /// Read and validate a compiled template JSON file.
@@ -3095,6 +3109,14 @@ pub fn run(app: App) -> Result<()> {
                     refuse_if_unlocated(&backend, &reverser, "decisions reverse");
                     refuse_if_superseded(&backend, &reverser, "decisions reverse");
                     decisions::handle_reverse(&backend, &name, &id, reversal)
+                }
+                DecisionsSubcommand::Report { window } => {
+                    decisions::handle_report(&backend, &window)
+                }
+                DecisionsSubcommand::Import { name, file } => {
+                    refuse_if_unlocated(&backend, &name, "decisions import");
+                    refuse_if_superseded(&backend, &name, "decisions import");
+                    decisions::handle_import(&backend, &name, &file)
                 }
             }
         }

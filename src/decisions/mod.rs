@@ -25,12 +25,18 @@
 //! - [`read`]: the pure read path behind `list` and `show`.
 //! - [`standing`]: who may reverse what, where a reversal is recorded,
 //!   racing reversals and each decision's status.
+//! - [`report`]: the counts by kind and decider kind behind
+//!   `koto decisions report`.
+//! - [`import`]: the idempotent import of decisions recorded elsewhere,
+//!   behind `koto decisions import`.
 
 pub mod body;
 pub mod chain;
 pub mod decider;
 pub mod gate_pass;
+pub mod import;
 pub mod read;
+pub mod report;
 pub mod standing;
 pub mod store;
 

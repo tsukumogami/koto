@@ -443,6 +443,92 @@ fn write_area(
         .map_err(infra)?
 }
 
+/// Record several decisions in `session` under one hold of its manifest
+/// lock, for `koto decisions import`. Inside the critical section the
+/// session is repaired and listed once; `plan` gets that listing and the
+/// first free id, and returns the bodies to write with the areas they go
+/// in, plus anything it wants handed back. The bodies must carry distinct
+/// ids at or past the first free one. Nothing is published unless `plan`
+/// succeeds and every body passes the size cap, so a refusal records
+/// nothing. The bodies are then published in the order given; a stop
+/// partway through leaves the ones before it written, since a write-once
+/// key isn't removed.
+pub fn write_batch<T>(
+    backend: &Backend,
+    session: &str,
+    plan: impl FnOnce(&Listing, u64) -> Result<(Vec<(Area, DecisionBody)>, T), DecisionError>,
+) -> Result<(Vec<DecisionBody>, T), DecisionError> {
+    let local = match backend {
+        Backend::Local(l) => l,
+        Backend::Cloud(c) => c.local(),
+    };
+    let infra = |e: anyhow::Error| DecisionError::new("decision_write_failed", format!("{e:#}"));
+    local
+        .with_manifest_lock(session, || {
+            repair_locked(backend, session)?;
+            let listing = list(backend, session);
+            if let Some(problem) = &listing.problem {
+                return Ok(Err(DecisionError::new(
+                    codes::INVALID_DECISION,
+                    format!("'{session}' holds decision files koto can't read, so it records no more: {problem}"),
+                )));
+            }
+            let ids = listing.ids();
+            let first = ids
+                .iter()
+                .filter_map(|id| id.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let (bodies, extra) = match plan(&listing, first) {
+                Ok(p) => p,
+                Err(e) => return Ok(Err(e)),
+            };
+            if ids.len() + bodies.len() > MAX_AREA_ENTRIES {
+                return Ok(Err(DecisionError::new(
+                    codes::INVALID_DECISION,
+                    format!("'{session}' would hold more than {MAX_AREA_ENTRIES} decisions, the most one session may"),
+                )));
+            }
+            let mut planned = Vec::with_capacity(bodies.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for (area, body) in bodies {
+                if let Area::Aimed(target) = &area {
+                    if !is_target_id(target) {
+                        return Ok(Err(DecisionError::invalid(
+                            "target",
+                            "the target session id can't name an aimed area",
+                        )));
+                    }
+                }
+                let n = body.id.parse::<u64>().ok().filter(|_| is_decision_id(&body.id));
+                if n.is_none_or(|n| n < first) || !seen.insert(body.id.clone()) {
+                    return Ok(Err(DecisionError::invalid(
+                        "id",
+                        format!("decision id '{}' isn't a free id of '{session}'", body.id),
+                    )));
+                }
+                let bytes = body.to_bytes()?;
+                if bytes.len() > MAX_BODY_BYTES {
+                    return Ok(Err(DecisionError::invalid(
+                        "body",
+                        format!("the decision body is larger than {MAX_BODY_BYTES} bytes"),
+                    )));
+                }
+                planned.push((area.key(&body.id), bytes, body));
+            }
+            let mut written = Vec::with_capacity(planned.len());
+            for (key, bytes, body) in planned {
+                if let Err(e) = publish_both(backend, session, &key, &bytes)? {
+                    return Ok(Err(e));
+                }
+                written.push(body);
+            }
+            Ok(Ok((written, extra)))
+        })
+        .map_err(infra)?
+}
+
 /// Publish `bytes` at `key`: under the cloud backend the bucket object
 /// first, with `If-None-Match: *`, so a refusal there leaves no local key,
 /// then the local file.

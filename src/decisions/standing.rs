@@ -598,6 +598,7 @@ pub fn refused_body(
         compensating: None,
         replacement: None,
         refusal: Some(what.refusal),
+        imported: None,
     })
 }
 
@@ -814,6 +815,7 @@ mod tests {
             compensating: None,
             replacement: None,
             refusal: None,
+            imported: None,
         }
     }
 
