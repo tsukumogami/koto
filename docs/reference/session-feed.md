@@ -3400,6 +3400,17 @@ what koto writes into an entry it didn't project. Every write into a
 most 10 koto entries (oldest `startTime` first among finished ones; live
 entries and the entry just written stay) and reconciles stale ones.
 
+The sweep counts and touches only koto-owned regular files: a file of at most
+1 MiB named `koto-<session-id>.json` whose `id` is `koto-<session-id>`, whose
+`koto.sessionId` is `<session-id>`, whose `koto.contractVersion` is an unsigned
+integer and whose top-level `status` is a string. Anything else in the
+directory, a `koto-*.json` symlink, directory or lookalike included, is left
+as it is and doesn't count toward the bound. It also removes koto's own
+`.koto-wf-*.tmp` staging files once they are more than a minute old. Each
+write lists the directory once; within the bound it reads only entries last
+written more than 2 hours ago, and over the bound it reads every
+`koto-*.json` file.
+
 An entry is stale when its top-level `status` is `running` and its file was
 last written more than **2 hours** ago, the same window after which
 `koto dashboard` calls a session stalled. A last write exactly 2 hours ago,

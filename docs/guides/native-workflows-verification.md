@@ -386,14 +386,34 @@ entry the write just made, whatever its `startTime`. So while more than 10
 sessions are live, the directory holds more than 10 koto entries; it comes back
 to 10 as they finish and later writes sweep it.
 
-The sweep only touches a file it can prove koto wrote: a regular file named
-`koto-<session-id>.json` whose content carries koto's marker (`id` equal to
-`koto-<session-id>`, `koto.sessionId` equal to `<session-id>`, a numeric
-`koto.contractVersion` and a string `status`). Claude Code's own `wf_*.json`
-files, and any other file, are left as they are and don't count toward the 10.
-A directory already within the bound, where no koto entry was last written
-more than 2 hours ago, costs one listing per write (with a stat of each
-`koto-*.json` file) and no file is opened.
+The sweep only counts or touches a file it can prove koto wrote: a regular file
+of at most 1 MiB named `koto-<session-id>.json` whose content carries koto's
+marker (`id` equal to `koto-<session-id>`, `koto.sessionId` equal to
+`<session-id>`, a numeric `koto.contractVersion` and a string `status`). Claude
+Code's own `wf_*.json` files, and any other file, are left as they are and
+don't count toward the 10: a `koto-*.json` that is a symlink, a directory, a
+FIFO, unparseable, oversized or missing any part of the marker stays byte for
+byte. The sweep opens a file without following a link and without blocking,
+and checks the opened handle is a regular file before reading, so a name
+swapped for a link or a FIFO after the listing is never followed and never
+hangs the koto command. Right before it rewrites or removes an entry it checks
+the file again, and leaves one that changed since it was read (its session
+committed meanwhile).
+
+A koto command killed between staging an entry and renaming it into place
+leaves a `.koto-wf-*.tmp` file. The sweep removes those once they are more than
+a minute old; a newer one may still be in flight, and a link or directory with
+that name is left alone.
+
+What a write costs: every sweep lists the directory once, with a stat (not
+following links) of each `koto-*.json` and `.koto-wf-*.tmp` file. Within the
+bound it reads only the entries last written more than 2 hours ago, the only
+ones that can need a rewrite, so a directory of fresh entries costs the listing
+and nothing more, and one old finished entry costs one read per write. Over the
+bound it reads every `koto-*.json` file, up to 1 MiB each, to find the oldest
+finished entries. A file that vanished, can't be removed or was removed by
+another koto command's sweep at the same moment never fails the command, and
+neither does a directory that can't be listed.
 
 `tests/native_workflows_retention_test.rs` drives 30 sessions to completion
 through the koto binary into one directory, checks that at most 10 entries are
