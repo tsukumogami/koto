@@ -369,7 +369,9 @@ fn resolve_and_continue_against(
 
     let out = a.koto_in(&dir, &["status", NAME]);
     assert!(out.ok(), "status after the resolve: {}", out.describe());
-    let out = a.koto_in(&dir, &["next", NAME, "--no-cleanup"]);
+    // `koto next` runs only from the session's own directory (its execution
+    // anchor), wherever the resolve ran, so the tick goes there.
+    let out = a.koto_in(&a.ws, &["next", NAME, "--no-cleanup"]);
     assert!(out.ok(), "next after the resolve: {}", out.describe());
 }
 
