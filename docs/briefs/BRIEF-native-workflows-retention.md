@@ -93,9 +93,10 @@ tell this entry is stale rather than live.
 
 ### Keep Claude Code's own files safe
 
-An operator's `workflows` directory holds Claude Code's own workflow files
-and possibly files from other tools. Trigger: koto applying its retention
-policy after a session finishes. Outcome shape: only files koto wrote, and
+An operator runs Claude Code's own workflows alongside koto sessions in the
+same Claude Code session, so its `workflows` directory holds both kinds of
+entry. Trigger: the operator finishes a koto session after many others and
+opens `/workflows`. Outcome shape: only files koto wrote, and
 can recognize as its own, are ever removed or rewritten; every other file is
 untouched.
 
@@ -111,40 +112,42 @@ stops recognizing it fails CI rather than an operator's screen.
 
 **In:**
 
-- A retention policy for koto-written `/workflows` files in each Claude Code
-  session's `workflows` directory, with a stated numeric bound that holds
-  across any number of runs.
+- A retention policy for koto's entries in each Claude Code session's
+  workflow list, with a stated numeric bound that holds across any number of
+  runs.
 - The same policy applied to completed, failed and cancelled sessions'
-  files alike.
+  entries alike.
 - What the operator sees for a koto session that stopped without finishing:
-  either the entry is reconciled away from "running" within a stated window,
-  or the limitation is documented with a stated way to tell live from
-  stale. The design picks which, with reasoning.
-- The ownership rule: which files koto treats as its own, so nothing else in
-  the directory is deleted or modified.
+  either the entry stops reading as running within a stated window, or the
+  limitation is documented with a stated way to tell live from stale. The
+  design picks which, with reasoning.
+- koto only ever removing or rewriting entries it wrote itself, and leaving
+  every other entry in the list alone.
 - Operator-facing documentation of the policy and the staleness behavior,
-  and tests that show the bound holds and foreign files are untouched.
-- Extending the existing Claude Code conventions guard in the same change
-  when the file's shape or status vocabulary changes.
+  and tests that show the bound holds and other tools' entries are
+  untouched.
+- Keeping koto's compatibility check against Claude Code releases in step
+  with any change this work makes to what koto writes.
 
 **Out:**
 
 - Any dependency on niwa or any other workspace tool. A koto user who
   doesn't use niwa gets the full behavior; nothing here asks a niwa user to
   use koto.
-- Pruning koto's own session store. Store retention is a separate, existing
-  policy; this work governs only the files koto writes into Claude Code's
-  directory.
-- Rendering coordinator and delegate hierarchies, or fan-out, as
-  `/workflows` entries. That is separate work.
+- Pruning koto's own session records. Their retention is a separate,
+  existing policy; this work governs only koto's entries in Claude Code's
+  workflow list.
+- Showing coordinator and delegate hierarchies, or fan-out, as workflow
+  entries. That is separate work.
 - A separate blocked count or bucket in the list. Claude Code's screen
   decides its buckets; that limitation is tracked on its own.
-- The rendered smoke check and the guard's verdict on it. This work extends
-  the guard's fixture where its own change needs it and nothing more.
-- A long-running koto process, daemon or per-turn hook to watch sessions.
-  koto stays a command-line tool; any reconciliation happens when koto
-  already runs.
-- Cleaning up Claude Code's own workflow files. Those belong to Claude Code.
+- Checking by hand that Claude Code still displays koto's entries, and the
+  verdict on that check. This work touches the compatibility check only
+  where its own change needs it.
+- Background watching of sessions. koto stays a command-line tool, and any
+  reconciliation happens while koto is already running for another reason.
+- Cleaning up Claude Code's own workflow entries. Those belong to Claude
+  Code.
 
 ## Open Questions
 
@@ -152,8 +155,8 @@ stops recognizing it fails CI rather than an operator's screen.
   states the requirement; the design picks the number and says why.
 - Is staleness reconciled from what koto can observe, or accepted as a
   documented limitation? Both satisfy the outcome; the design decides.
-- Does this work close koto issue #190 in full? The PRD should say which of
-  its acceptance criteria it covers.
+- Which of koto issue #190's acceptance criteria this work covers, and so
+  whether it closes the issue. The PRD records the call.
 
 None of these questions block the brief: each one is a decision the PRD or
 the design owns.
