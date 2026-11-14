@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   Every koto session run inside Claude Code writes a `koto-<session-id>.json`
   entry into that Claude Code session's `workflows` directory, next to Claude
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Edited after acceptance: R6(a) and its criterion now leave the last-write
 time's format to the design, since `startTime` is a millisecond count no
