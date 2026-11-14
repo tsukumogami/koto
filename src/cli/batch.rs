@@ -611,7 +611,7 @@ pub(crate) fn classify_task(
 /// in-progress tempfile is never collected mid-flight.
 ///
 /// Documented in DESIGN-batch-child-spawning.md Decision 12 Q7.
-const TEMPFILE_SWEEP_MIN_AGE: Duration = Duration::from_secs(60);
+pub(crate) const TEMPFILE_SWEEP_MIN_AGE: Duration = Duration::from_secs(60);
 
 /// Pre-classification repair of half-initialised children and stale
 /// tempfiles from crashed `init_state_file` calls.

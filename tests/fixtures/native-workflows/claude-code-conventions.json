@@ -35,6 +35,17 @@
       ]
     },
     {
+      "name": "status words",
+      "slug": "status-words",
+      "demo": {"from": "\"killed\"", "to": "\"killeX\""},
+      "probes": [
+        {"item": "running", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"running\"", "window": 400},
+        {"item": "completed", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"completed\"", "window": 400},
+        {"item": "failed", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"failed\"", "window": 400},
+        {"item": "killed", "anchor": "[\"start\",\"progress\",\"done\",\"error\"]", "token": "\"killed\"", "window": 400}
+      ]
+    },
+    {
       "name": "directory convention",
       "slug": "directory",
       "demo": {"from": "\"workflows\"", "to": "\"workflowz\""},

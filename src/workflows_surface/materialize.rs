@@ -27,6 +27,7 @@ use super::contract::{
 };
 use super::discover;
 use super::project::{self, PhaseEntry, PhaseStatus, StateOutcome};
+use super::retention;
 
 /// Max characters in a `promptPreview` / `resultPreview` line before it is
 /// truncated with an ellipsis (keeps the entry legible, not a full dump).
@@ -157,7 +158,17 @@ fn try_materialize(
         file = file.with_blocked_gate(gate);
     }
     let bytes = file.to_json_bytes()?;
-    atomic_write(&dir, &target, &bytes)
+    atomic_write(&dir, &target, &bytes)?;
+    // Bound the directory, and reconcile entries whose sessions went quiet,
+    // now that this entry is the newest on disk. The sweep never fails, so
+    // it can't turn a written entry into an error.
+    retention::apply(
+        &dir,
+        &target,
+        SystemTime::now(),
+        &retention::Limits::default(),
+    );
+    Ok(())
 }
 
 /// The shape of the active phase's `workflow_agent` step.
@@ -493,15 +504,25 @@ fn now_millis() -> u64 {
 /// never observes a half-written file.
 fn atomic_write(dir: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
+    stage(dir, bytes)?
+        .persist(target)
+        .map_err(|e| anyhow::anyhow!("persist /workflows file: {}", e.error))?;
+    Ok(())
+}
+
+/// Write `bytes` to a new `.koto-wf-*.tmp` file in `dir` (created fresh,
+/// owner-only), synced, for the caller to rename over its target. Dropping
+/// it unrenamed removes it. Every koto write into a `/workflows` directory
+/// goes through here: an entry write and the retention sweep's reconcile,
+/// which checks the entry between staging and renaming.
+pub(super) fn stage(dir: &Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
     let mut tmp = tempfile::Builder::new()
         .prefix(".koto-wf-")
         .suffix(".tmp")
         .tempfile_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(target)
-        .map_err(|e| anyhow::anyhow!("persist /workflows file: {}", e.error))?;
-    Ok(())
+    Ok(tmp)
 }
 
 #[cfg(test)]
@@ -1211,6 +1232,44 @@ mod tests {
             read_file(wf.path(), "solo-uuid").unwrap()["koto"]["currentState"],
             "review"
         );
+    }
+
+    /// A session quiet past the stale window reads `killed` after another
+    /// session's commit into the same directory, and `running` again, with
+    /// no trace of the reconcile, on its own next commit.
+    #[test]
+    fn a_reconciled_entry_reads_running_again_on_its_sessions_next_commit() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        let dir = wf.path().to_str().unwrap();
+        init_session(&backend, "quiet");
+        discover::publish_location(&backend, &backend, "quiet", dir).unwrap();
+        transition(&backend, "quiet", "building");
+        init_session(&backend, "busy");
+        discover::publish_location(&backend, &backend, "busy", dir).unwrap();
+
+        let quiet_path = wf.path().join(workflow_filename("quiet-uuid"));
+        let three_hours_ago = SystemTime::now() - std::time::Duration::from_secs(3 * 60 * 60);
+        filetime::set_file_mtime(
+            &quiet_path,
+            filetime::FileTime::from_system_time(three_hours_ago),
+        )
+        .unwrap();
+
+        transition(&backend, "busy", "building");
+        let v = read_file(wf.path(), "quiet-uuid").unwrap();
+        assert_eq!(v["status"], "killed");
+        assert!(v["koto"]["staleSince"].is_u64());
+        assert!(v["summary"].as_str().unwrap().contains("no activity since"));
+
+        transition(&backend, "quiet", "review");
+        let v = read_file(wf.path(), "quiet-uuid").unwrap();
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["koto"]["currentState"], "review");
+        assert!(v["koto"].get("staleSince").is_none());
+        assert!(!v["summary"].as_str().unwrap().contains("no activity since"));
+        assert_eq!(v["koto"]["contractVersion"], 6);
     }
 
     #[test]
