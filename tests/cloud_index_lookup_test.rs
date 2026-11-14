@@ -1042,6 +1042,130 @@ fn an_index_hit_prints_no_hint_however_slow() {
     assert!(!out.stderr.contains(HINT), "{}", out.describe());
 }
 
+/// What every line of the slow-sweep hint starts with (koto#637).
+const HINT_PREFIX: &str = "hint: cloud sync:";
+
+/// How long the slow-sweep tests hold a sweep's own `<prefix>/<name>/`
+/// listings. Only those listings wait, so the sweep takes about this long
+/// and the whole lookup not much more: 1.5 s over the hint's two-second
+/// threshold and 2.5 s inside the lookup's 6 s deadline, so neither bound is
+/// a close call on a loaded machine.
+const SWEEP_STALL: Duration = Duration::from_millis(3_500);
+
+/// The lines of `out`'s stderr that are the slow-sweep hint.
+fn hint_lines(out: &Out) -> Vec<&str> {
+    out.stderr
+        .lines()
+        .filter(|l| l.starts_with(HINT_PREFIX))
+        .collect()
+}
+
+/// On an undeclared bucket, a sweep that answers after more than two
+/// seconds prints one hint that says the bucket's index isn't declared and
+/// names `koto session index declare`, which reports what the bucket still
+/// needs, rather than `koto session index audit`, which doesn't make the
+/// lookup quicker and restarts declare's probation (koto#637). The hint
+/// names nothing read from the bucket, and stdout and the exit code are
+/// what a fast lookup gives.
+#[test]
+fn a_slow_sweep_on_an_undeclared_bucket_names_declare_not_audit() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let planted = plant_prefixes(&s3, 6);
+    let dir = h.dir("elsewhere");
+
+    let fast = h.exists(&dir, GHOST);
+    assert_absent(&fast);
+    assert!(hint_lines(&fast).is_empty(), "{}", fast.describe());
+
+    for p in planted.iter().take(2) {
+        s3.stall("LIST", &format!("{p}/{GHOST}/"), SWEEP_STALL);
+    }
+    let slow = h.exists(&dir, GHOST);
+    assert_eq!(
+        (slow.code, &slow.stdout),
+        (fast.code, &fast.stdout),
+        "{}",
+        slow.describe()
+    );
+    let hint = hint_lines(&slow);
+    assert_eq!(hint.len(), 1, "{}", slow.describe());
+    assert!(
+        hint[0].contains("`koto session index declare`"),
+        "the hint doesn't name declare: {}",
+        hint[0]
+    );
+    assert!(
+        hint[0].contains("isn't declared"),
+        "the hint doesn't say the bucket isn't declared: {}",
+        hint[0]
+    );
+    assert!(
+        !hint[0].contains("koto session index audit"),
+        "the hint names audit: {}",
+        hint[0]
+    );
+    assert!(!hint[0].contains(BUCKET), "{}", hint[0]);
+    assert!(!hint[0].contains(GHOST), "{}", hint[0]);
+    assert!(
+        planted.iter().all(|p| !hint[0].contains(p.as_str())),
+        "{}",
+        hint[0]
+    );
+}
+
+/// A slow sweep that fails prints no hint: the refusal's own message
+/// already names the remedy for an undeclared bucket, and a hint after it
+/// would point at a lookup that never answered (koto#637). One prefix's
+/// listing never answers, so the lookup is cut at its deadline.
+#[test]
+fn a_slow_sweep_that_fails_prints_no_hint() {
+    let s3 = FakeS3::start(BUCKET);
+    let planted = plant_prefixes(&s3, 6);
+    let h = Host::new(&s3);
+    let dir = h.dir("elsewhere");
+
+    // Far past the deadline, so the stalled listing is never answered.
+    let never = format!("{}/{GHOST}/", planted[0]);
+    s3.stall("LIST", &never, Duration::from_secs(300));
+    let started = std::time::Instant::now();
+    let out = h.koto(&dir, &["status", GHOST]);
+    let took = started.elapsed();
+    assert!(took < LOOKUP_BOUND, "took {took:?}: {}", out.describe());
+    let message = assert_lookup_failed(&out, "status", GHOST);
+    assert!(names_declare_remedy(&message), "{message}");
+    assert!(
+        hint_lines(&out).is_empty(),
+        "a failed sweep printed the hint: {}",
+        out.describe()
+    );
+}
+
+/// On a declared bucket, a name whose index listing stopped at the cap
+/// sweeps every prefix, and neither index command would make that lookup
+/// quicker, so a slow one prints no hint (koto#637).
+#[test]
+fn a_slow_sweep_for_a_capped_name_on_a_declared_bucket_prints_no_hint() {
+    let s3 = FakeS3::start(BUCKET);
+    let planted = plant_prefixes(&s3, 6);
+    let (h, dir) = declared_host(&s3, "elsewhere");
+    for i in 0..300u32 {
+        plant_entry(&s3, GHOST, &format!("{:016x}", 0x1000_0000 + i));
+    }
+
+    for p in planted.iter().take(2) {
+        s3.stall("LIST", &format!("{p}/{GHOST}/"), SWEEP_STALL);
+    }
+    let out = h.exists(&dir, GHOST);
+    assert_absent(&out);
+    assert_swept(&s3, &planted, GHOST);
+    assert!(
+        hint_lines(&out).is_empty(),
+        "a declared bucket's capped sweep printed the hint: {}",
+        out.describe()
+    );
+}
+
 // -- the declared branch (koto#609) --
 
 /// The check window the declared tests set when they need one above 0.
