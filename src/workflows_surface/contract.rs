@@ -43,9 +43,9 @@ use serde::Serialize;
 /// (`src/workflows_surface/retention.rs`) rewrites an entry still `running`
 /// whose last write is more than two hours old as `killed`, appends
 /// `· no activity since <time>` to its `summary`, records that last write as
-/// `staleSince`, and sets `contractVersion` to 6 whatever version wrote the
-/// rest of the entry. The session's next commit writes the entry from its
-/// projection again, without either.
+/// `staleSince`, and sets `contractVersion` to the current version whatever
+/// version wrote the rest of the entry. The session's next commit writes the
+/// entry from its projection again, without either.
 ///
 /// Version 7 writes a gate-blocked session's `workflowName` as
 /// `blocked · <session label>` ([`BLOCKED_TITLE_PREFIX`]), while `name` keeps
