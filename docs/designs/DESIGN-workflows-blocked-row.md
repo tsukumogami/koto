@@ -531,7 +531,43 @@ koto#590 without a closing keyword.
 
 ## Security Considerations
 
-To be completed in the security review.
+**Untrusted text in another program's screen.** This change writes one more
+piece of session-derived text, the marker plus the session label, into a file
+that Claude Code reads and draws in a terminal. An intent is user or template
+content and a state name comes from a template, so both are untrusted. The
+label passes through `sanitize_capped`, the sanitizer the summary already
+uses, which escapes control characters (ESC and 8-bit CSI included), bidi
+overrides, zero-width and tag characters, and folds newlines, so an intent
+can't inject terminal escapes or reorder the row. Claude Code strips control
+characters from the label itself as well. The cut applies to the session
+label and never to the prefix, and the tests cover a 2,000-character intent
+with wide characters, control characters and ESC in the intent and the state
+name, and the cap boundary.
+
+**The marker is a convenience, not an authority.** Nothing stops an intent
+that literally starts with the word "blocked", so a running row could read
+like a blocked one. The authoritative reading stays `koto.status`, the summary
+suffix and the Blocked step, which come from the same classification; the
+session-feed reference says so.
+
+**No new permissions, reads or data.** The write path reads nothing it didn't
+read before, adds no network call, and the gate name stays out of the row.
+The retention sweep copies `name`, a string koto already wrote and sanitized,
+into `workflowName`.
+
+**The convention guard and its pinned release.** The guard downloads a Claude
+Code npm package koto doesn't control; the new `list-row` convention adds a
+probe without changing how that package is handled. It is fetched with install
+scripts disabled into a fresh temporary directory outside the checkout, from a
+fixed package name and a `MAJOR.MINOR.PATCH` version; the helper runs under
+`python3 -I`, extracts only the one expected member (size-capped, no links),
+and searches its bytes without running, importing or decoding them, so a
+hostile release can only make a probe pass or fail wrongly. A cached tarball
+is reused only when its sha512 matches the registry's integrity value. The
+remaining trust is in the registry and in the reviewer who moves the pin,
+which is a version string with no recorded hash: the guard detects honest
+format drift, not a malicious release. Moving the pin is reviewed as a
+fixture change, and the PR names the release.
 
 ## Consequences
 
