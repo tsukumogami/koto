@@ -15,7 +15,8 @@ goals: |
   goes back to the running reading on the first write after the gate passes or
   the session moves on, and the shape is pinned by the native-workflows guard
   fixture so a regression fails a test.
-upstream: docs/briefs/BRIEF-workflows-blocked-row.md
+absorbed:
+  - docs/briefs/BRIEF-workflows-blocked-row.md
 ---
 
 # PRD: a gate-blocked koto session's `/workflows` row reads blocked
@@ -24,12 +25,34 @@ upstream: docs/briefs/BRIEF-workflows-blocked-row.md
 
 Accepted
 
+Absorbed [BRIEF-workflows-blocked-row](docs/briefs/BRIEF-workflows-blocked-row.md); carried in Absorbed Brief.
+
 Statements below about what the screen draws refer to Claude Code 2.1.325, the
 release installed when these requirements were researched. The outcome is
 verified on that release; a later release that draws the row differently is
 what R17's guard exists to catch, not a failure of these requirements. Its list-row code is
 the same in 2.1.322 and 2.1.323 and matches the account of 2.1.314 in
 `docs/designs/current/DESIGN-koto-workflows-blocked-status.md`.
+
+## Absorbed Brief
+
+An operator running several koto sessions under one Claude Code session can't
+tell, from the `/workflows` list, a session stopped on a failing gate from one
+that is advancing: both rows show the same icon and title, because the blocked
+reading koto writes lives only in the detail view. Finding the stuck session
+means opening every entry, and a different status word isn't an answer,
+because it would move the session into the completed count.
+
+The outcome the operator should get: from the list alone, the gate-blocked
+session's row reads blocked and the running one's doesn't, both still counted
+running, and the row reads running again once the session recovers. A reviewer
+can confirm the same thing from the file koto writes without starting Claude
+Code, and a regression fails a test. The feature holds in what koto writes for
+the row, its clearing, a revisit of the earlier decision against a blocked
+title, a recorded choice for when Claude Code adds a blocked count, automated
+coverage and a manual list check; it pushes out the summary counts, the
+upstream blocked count, the detail view, starting Claude Code in tests, other
+`/workflows` milestones, and anything requiring niwa.
 
 ## Problem Statement
 
