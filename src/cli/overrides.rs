@@ -387,29 +387,9 @@ pub fn handle_overrides_record(
         Err(e) => refuse(&e),
     }
 
-    // 7. An override of a blocking decider check is recorded in the decider
-    //    ledger against each criterion it moved past: a candidate false fail
-    //    for each one the decider failed. A criterion waiting on the agent,
-    //    or one the agent answered `fail`, says nothing about the decider,
-    //    so it gets none (DESIGN-decider-fallback.md, Decision 3), which is
-    //    why nothing here writes `overridden_unanswered`: that kind is read
-    //    from older ledgers only, and `LedgerRecord::check_overridden` can't
-    //    write it. A ledger that can't be written warns and changes nothing
-    //    else.
-    if gate_def.gate_type == crate::template::types::GATE_TYPE_DECIDER_CHECK {
-        let session_id = Some(header.session_id.as_str()).filter(|s| !s.is_empty());
-        let ledger_root = super::ledger_root();
-        for record in crate::cli::check_evaluator::override_records(
-            &events,
-            &current_state,
-            &gate,
-            &actual_output,
-            &name,
-            session_id,
-        ) {
-            crate::decider::ledger::append_or_warn(ledger_root.as_deref(), &record);
-        }
-    }
+    // An override of a blocking decider check needs nothing more: `koto
+    // decider report` reads what it moved past from this event and the
+    // visit's `decider_checked` events.
 
     println!(
         "{}",

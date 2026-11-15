@@ -11,8 +11,8 @@
 //! - `types`, `request`, `evaluate`, `record`: pure and provider-neutral. The engine
 //!   depends only on these.
 //! - `jev`, `http`: the Jev client and its bounded transport.
-//! - `ledger`: the append-only `_decider_ledger.jsonl` writers.
-//! - `report`: the ledger reader, the metrics, the fixture runner, and
+//! - `ledger`: the decider's records, rebuilt from session logs.
+//! - `report`: the session reader, the metrics, the fixture runner, and
 //!   promotion eligibility behind `koto decider report`.
 //! - [`build_decider`]: the only production constructor of a provider.
 

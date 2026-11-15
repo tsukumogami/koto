@@ -2,9 +2,8 @@
 //!
 //! For a non-durable signal file see [`crate::engine::wake_signal::ring`].
 //!
-//! [`append_bounded_line`] is the append discipline the workspace-wide
-//! JSONL files share: the terminal index (`_terminal_index.jsonl`) and the
-//! decider ledger (`_decider_ledger.jsonl`). The run journal
+//! [`append_bounded_line`] is the append discipline of the workspace-wide
+//! terminal index (`_terminal_index.jsonl`). The run journal
 //! (`_run_journal.jsonl`) uses [`append_bounded_lines_no_follow`], the same
 //! discipline with symlinks refused, under a lock that lets it recover from
 //! a partial last line, for several lines at a time and with the flush to

@@ -1201,15 +1201,6 @@ fn a_slow_provider_is_bounded_by_the_timeout() {
 // spend, overrides and the report
 // ---------------------------------------------------------------------------
 
-fn ledger(h: &Harness) -> Vec<Value> {
-    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
-}
-
 #[test]
 fn a_billed_answer_koto_cannot_use_still_counts_its_tokens() {
     // A 2xx answer that can't be read as pass, fail or escape was billed.
@@ -1290,18 +1281,26 @@ fn an_override_records_only_the_failed_criterion_as_a_candidate() {
     assert_eq!(actual["failed"], json!(["a"]));
     assert_eq!(actual["unanswered"], json!(["b"]));
 
-    let overridden: Vec<Value> = ledger(&h)
-        .into_iter()
-        .filter(|l| l["kind"] == "check_overridden")
-        .collect();
-    // b got no verdict, which never blocked, so the override didn't move
-    // past it: no overridden_unanswered record.
-    assert_eq!(overridden.len(), 1, "{:?}", overridden);
-    assert_eq!(overridden[0]["rule_id"], "a");
-    assert_eq!(overridden[0]["override_kind"], "candidate_false_fail");
+    // The report reads the override against a's consultation only: b got
+    // no verdict, which never blocked, so the override didn't move past it.
+    let report = report_json(&h);
+    let tally = |id: &str| -> Value {
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["rule_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no tally for {}: {}", id, report))
+    };
     let c = checks(&h);
-    assert_eq!(overridden[0]["visit_seq"], c[0]["visit_seq"]);
-    assert_eq!(overridden[0]["declaration_hash"], c[0]["declaration_hash"]);
+    let a = tally("a");
+    assert_eq!(a["candidate_false_fail"], 1, "{}", a);
+    assert_eq!(a["overridden_unanswered"], 0, "{}", a);
+    assert_eq!(a["declaration_hash"], c[0]["declaration_hash"]);
+    let b = tally("b");
+    assert_eq!(b["candidate_false_fail"], 0, "{}", b);
+    assert_eq!(b["overridden_unanswered"], 0, "{}", b);
 
     // The override holds for the visit: nothing is extracted or asked.
     let before = extractions(&h);
@@ -1330,15 +1329,7 @@ fn the_report_tallies_each_criterion() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", describe(&out));
-    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
-    let out = h
-        .koto()
-        .args(["decider", "report", "--json", "--ledger"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", describe(&out));
-    let report = json_out(&out);
+    let report = report_json(&h);
     let checks = report["checks"].as_array().unwrap();
     assert_eq!(checks.len(), 2, "{}", report);
     let a = checks.iter().find(|c| c["rule_id"] == "a").unwrap();
@@ -1349,12 +1340,7 @@ fn the_report_tallies_each_criterion() {
     assert_eq!(b["escape"], 1);
     assert_eq!(b["candidate_false_fail"], 0);
 
-    let table = h
-        .koto()
-        .args(["decider", "report", "--ledger"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let table = h.koto().args(["decider", "report"]).output().unwrap();
     let text = String::from_utf8_lossy(&table.stdout);
     assert!(
         text.contains("check review.comments criterion a"),
@@ -1365,11 +1351,9 @@ fn the_report_tallies_each_criterion() {
 }
 
 fn report_json(h: &Harness) -> Value {
-    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
     let out = h
         .koto()
-        .args(["decider", "report", "--json", "--ledger"])
-        .arg(&path)
+        .args(["decider", "report", "--json"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", describe(&out));
@@ -1406,54 +1390,13 @@ fn the_report_counts_no_verdicts_per_criterion_by_cause() {
     assert_eq!(r["unanswered_by_reason"]["busy"], 1, "busy stays visible");
     assert_eq!(r["overridden_unanswered"], 0);
 
-    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
-    let table = h
-        .koto()
-        .args(["decider", "report", "--ledger"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let table = h.koto().args(["decider", "report"]).output().unwrap();
     let text = String::from_utf8_lossy(&table.stdout);
     assert!(
         text.contains("no verdict: provider didn't answer 1, koto didn't ask 1, input bad 1"),
         "{}",
         text
     );
-}
-
-#[test]
-fn a_ledger_with_an_overridden_unanswered_line_still_reads() {
-    // Ledgers written before a missing verdict stopped blocking hold
-    // `overridden_unanswered` lines; the report still counts them.
-    let h = harness(&check_template(&criterion("a", "veto")), SLICE);
-    h.stub.push(fail("a"));
-    run(&h, "auto");
-    let out = gate_passer(&h)
-        .args([
-            "overrides",
-            "record",
-            WF,
-            "--gate",
-            "comments",
-            "--rationale",
-            "fine",
-        ])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", describe(&out));
-    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
-    let mut line = ledger(&h)
-        .into_iter()
-        .find(|l| l["kind"] == "check_overridden")
-        .unwrap();
-    line["override_kind"] = json!("overridden_unanswered");
-    let mut text = std::fs::read_to_string(&path).unwrap();
-    text.push_str(&format!("{}\n", line));
-    std::fs::write(&path, text).unwrap();
-
-    let a = &report_json(&h)["checks"][0];
-    assert_eq!(a["candidate_false_fail"], 1);
-    assert_eq!(a["overridden_unanswered"], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1599,11 +1542,11 @@ fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts
 }
 
 #[test]
-fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
+fn overriding_a_check_that_blocks_nothing_reports_no_candidate_false_fail() {
     // A shadow criterion never blocks, and a veto criterion that passed or
     // escaped didn't either, so an override finds nothing listed as failed
-    // and writes nothing. The veto fail is the control: the same steps
-    // write exactly one record, so the empty cases aren't empty by accident.
+    // and the report counts nothing. The veto fail is the control: the same
+    // steps count exactly one, so the empty cases aren't empty by accident.
     for (mode, reply, want) in [
         ("shadow", fail("r"), 0),
         ("veto", pass("r"), 0),
@@ -1627,14 +1570,10 @@ fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", describe(&out));
-        let written: Vec<Value> = ledger(&h)
-            .into_iter()
-            .filter(|l| l["kind"] == "check_overridden")
-            .collect();
-        assert_eq!(written.len(), want, "{} {:?}", mode, written);
-        for line in &written {
-            assert_eq!(line["override_kind"], "candidate_false_fail", "{}", line);
-        }
+        let report = report_json(&h);
+        let tally = &report["checks"][0];
+        assert_eq!(tally["candidate_false_fail"], want, "{} {}", mode, report);
+        assert_eq!(tally["overridden_unanswered"], 0, "{} {}", mode, report);
     }
 }
 

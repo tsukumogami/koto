@@ -13,7 +13,7 @@
 //!
 //! Appends go through
 //! [`append_bounded_line`](crate::engine::jsonl_append::append_bounded_line),
-//! which the decider ledger shares: `OpenOptions::append(true)` (sets
+//! which is `OpenOptions::append(true)` (sets
 //! POSIX `O_APPEND`) and `fsync` after each write. Under POSIX, writes
 //! ≤ `PIPE_BUF` (4 KiB on Linux) to a single file descriptor opened
 //! with `O_APPEND` are

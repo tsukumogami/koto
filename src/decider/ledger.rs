@@ -1,90 +1,56 @@
-//! The decider ledger: `<koto_root>/_decider_ledger.jsonl`.
+//! The decider's records, rebuilt from a session's own log.
 //!
-//! Every consultation, every agent answer to a consulted visit, and every
-//! `koto next --to` that leaves such a visit unanswered is appended here as
-//! one JSON line. Session logs are deleted on cleanup and prune, and most
-//! sessions are cleaned up on their terminal tick (only a failure terminal,
-//! or one kept with `--no-cleanup`, stays until something removes it), so
-//! the ledger is the only place the pairs that promotion is judged on
-//! survive. It is
-//! authoritative state: it can't be rebuilt, nothing in koto deletes or
-//! compacts it, and it is created mode 0600.
+//! `koto decider report` joins five kinds of record: every consultation,
+//! every agent answer to a consulted visit, every `koto next --to` that
+//! leaves such a visit unanswered, every decider-check consultation, and
+//! every override that moved past a failed decider check. Each of them is
+//! already in the session that made it, so [`records_from_session`] reads
+//! them from there:
 //!
-//! ## Line format
+//! | Record | Read from |
+//! |---|---|
+//! | `consulted` | a `decider_consulted` event |
+//! | `answered` | an `evidence_submitted` event paired with its visit's `decider_consulted`, as the run journal's `decider_answered` relay pairs them |
+//! | `directed_exit` | a `directed_transition` event leaving a consulted visit unanswered |
+//! | `checked` | a `decider_checked` event |
+//! | `check_overridden` | a `gate_override_recorded` event and the `decider_checked` events of its visit |
 //!
-//! Each line is one [`LedgerRecord`], tagged by `kind`:
+//! The host-wide ledger file koto once appended these records to
+//! (`~/.koto/_decider_ledger.jsonl`) is no longer used: nothing writes,
+//! reads or deletes it, and one that still exists is left as it is.
 //!
-//! - `{"kind":"consulted","v":1,"at":…,"session":…,"session_id":…,
-//!   …every DeciderConsultation field…}` with `"trimmed":true` when the
-//!   probabilities were dropped to fit the line bound;
-//! - `{"kind":"answered","v":1,"at":…,"session":…,"session_id":…,
-//!   "state":…,"visit_seq":…,"values":{field: value}}`;
-//! - `{"kind":"directed_exit","v":1,"at":…,"session":…,"session_id":…,
-//!   "state":…,"visit_seq":…,"target":…}`, written when `koto next --to`
-//!   leaves a visit whose consultation wasn't applied, before the agent
-//!   answered it.
+//! Records pair on `(session_id, visit_seq)`, because session names are
+//! reused across runs. A session whose header has no `session_id` gives
+//! records with `None`, which are counted but never paired.
 //!
-//! `at` is RFC 3339 UTC. `session_id` is the session header's UUID, or
-//! `null` for a header that has none; records with a null id can't be
-//! paired. Pairs join on `(session_id, visit_seq)`, because session names
-//! are reused across runs.
-//!
-//! Lines are capped at [`MAX_LEDGER_LINE_BYTES`] including the newline, so
-//! every append is a single atomic `O_APPEND` write. A `consulted` line
-//! over the cap is rewritten without any `probabilities` map; one still
-//! over it is not written.
-//!
-//! No record carries input content, the API key, a response body, or error
-//! text: [`DeciderConsultation`] holds none, an `answered` record holds
-//! only the values the agent submitted for declared fields, and a
-//! `directed_exit` record holds only state names.
-//!
-//! This module holds the writers. Reading the ledger belongs to
-//! [`super::report`], behind `koto decider report`.
+//! Everything here is pure: the caller reads the log.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use super::check::DeciderCheck;
+use super::record::{ConsultationOutcome, DeciderConsultation};
+use crate::engine::decider::{prior_consultation, visit_start_index};
+use crate::engine::persistence::arrival_index;
+use crate::engine::types::{Event, EventPayload};
 
-use super::record::DeciderConsultation;
-use crate::engine::jsonl_append::append_bounded_line;
-
-/// File name of the ledger, joined under `<koto_root>`.
-pub const LEDGER_FILE_NAME: &str = "_decider_ledger.jsonl";
-
-/// Maximum ledger line length in bytes, trailing newline included.
-pub const MAX_LEDGER_LINE_BYTES: usize = 4096;
-
-/// The `v` every record carries.
-pub const LEDGER_VERSION: u32 = 1;
-
-/// `<koto_root>/_decider_ledger.jsonl`. Creates nothing.
-pub fn ledger_path(koto_root: &Path) -> PathBuf {
-    koto_root.join(LEDGER_FILE_NAME)
-}
-
-/// The keys every record kind carries after `kind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The keys every record kind carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordEnvelope {
-    /// Always [`LEDGER_VERSION`].
-    pub v: u32,
-    /// When the record was written, RFC 3339 UTC.
+    /// The timestamp of the event the record was read from, RFC 3339 UTC.
     pub at: String,
     /// The session name. Names are reused across runs; don't join on it.
     pub session: String,
-    /// The session header's `session_id`, or `None` (serialized `null`)
-    /// when the header has none.
+    /// The session header's `session_id`, or `None` when the header has
+    /// none.
     pub session_id: Option<String>,
 }
 
 impl RecordEnvelope {
-    /// An envelope stamped now. An empty `session_id` becomes `None`.
-    pub fn now(session: &str, session_id: Option<&str>) -> Self {
+    /// An envelope for an event recorded `at`. An empty `session_id`
+    /// becomes `None`.
+    pub fn new(at: &str, session: &str, session_id: Option<&str>) -> Self {
         RecordEnvelope {
-            v: LEDGER_VERSION,
-            at: crate::engine::types::now_iso8601(),
+            at: at.to_string(),
             session: session.to_string(),
             session_id: session_id.filter(|s| !s.is_empty()).map(str::to_string),
         }
@@ -92,28 +58,21 @@ impl RecordEnvelope {
 }
 
 /// One consultation: the envelope plus every [`DeciderConsultation`] field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConsultedRecord {
-    #[serde(flatten)]
     pub envelope: RecordEnvelope,
-    #[serde(flatten)]
     pub consultation: DeciderConsultation,
-    /// `true` when every `probabilities` map was dropped to fit the line
-    /// bound. `winning`, `confidence`, `at_threshold`, and `outcome` stay.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub trimmed: bool,
 }
 
 /// The agent's answer on a visit whose consultation wasn't applied.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnsweredRecord {
-    #[serde(flatten)]
     pub envelope: RecordEnvelope,
     /// The state the evidence was submitted on.
     pub state: String,
     /// The consultation's `visit_seq`, which this answer pairs with.
     pub visit_seq: u64,
-    /// The submitted value of each field that carries a `decider` block.
+    /// The submitted value of each field the consultation covered.
     pub values: BTreeMap<String, serde_json::Value>,
 }
 
@@ -124,9 +83,8 @@ pub struct AnsweredRecord {
 /// unknown, so it never forms a paired observation. It is kept because
 /// `--to` is how an agent overrides a routing decision, so these are the
 /// visits where it most likely disagreed with the decider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DirectedExitRecord {
-    #[serde(flatten)]
     pub envelope: RecordEnvelope,
     /// The state the agent left.
     pub state: String,
@@ -137,37 +95,29 @@ pub struct DirectedExitRecord {
 }
 
 /// One consultation of one decider-check criterion: the envelope plus every
-/// [`DeciderCheck`](super::check::DeciderCheck) field
-/// (DESIGN-koto-decider-checks.md, Decision 5).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// [`DeciderCheck`] field (DESIGN-koto-decider-checks.md, Decision 5).
+#[derive(Debug, Clone, PartialEq)]
 pub struct CheckedRecord {
-    #[serde(flatten)]
     pub envelope: RecordEnvelope,
-    #[serde(flatten)]
-    pub check: super::check::DeciderCheck,
-    /// `true` when `probabilities` was dropped to fit the line bound.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub trimmed: bool,
+    pub check: DeciderCheck,
 }
 
 /// What an override of a blocking decider check moved past, for one
 /// criterion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckOverrideKind {
     /// The criterion was failing on a verdict: the override is a candidate
     /// false fail for whoever judges the criterion's accuracy.
     CandidateFalseFail,
     /// The criterion was unanswered: the override moved past a checker
-    /// fault, not a judgment. Only builds from before a missing verdict
-    /// stopped blocking wrote it; it is kept so their ledgers still read.
+    /// fault, not a judgment. A missing verdict no longer blocks, so no
+    /// override earns it; the report keeps its column.
     OverriddenUnanswered,
 }
 
 /// `koto overrides record` moving past one blocking decider-check criterion.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CheckOverriddenRecord {
-    #[serde(flatten)]
     pub envelope: RecordEnvelope,
     pub state: String,
     /// The visit the overridden consultation belongs to.
@@ -178,21 +128,8 @@ pub struct CheckOverriddenRecord {
     pub override_kind: CheckOverrideKind,
 }
 
-/// The criterion a [`LedgerRecord::check_overridden`] record names: the
-/// consultation of it the override moved past.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverriddenCriterion<'a> {
-    pub state: &'a str,
-    /// The visit the overridden consultation belongs to.
-    pub visit_seq: u64,
-    pub gate: &'a str,
-    pub rule_id: &'a str,
-    pub declaration_hash: &'a str,
-}
-
-/// One ledger line.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+/// One decider record.
+#[derive(Debug, Clone, PartialEq)]
 pub enum LedgerRecord {
     Consulted(ConsultedRecord),
     Answered(AnsweredRecord),
@@ -202,7 +139,7 @@ pub enum LedgerRecord {
 }
 
 impl LedgerRecord {
-    /// The wire `kind`.
+    /// The record's kind.
     pub fn kind(&self) -> &'static str {
         match self {
             LedgerRecord::Consulted(_) => "consulted",
@@ -212,523 +149,507 @@ impl LedgerRecord {
             LedgerRecord::CheckOverridden(_) => "check_overridden",
         }
     }
-
-    /// A `checked` record stamped now.
-    pub fn checked(
-        session: &str,
-        session_id: Option<&str>,
-        check: super::check::DeciderCheck,
-    ) -> Self {
-        LedgerRecord::Checked(CheckedRecord {
-            envelope: RecordEnvelope::now(session, session_id),
-            check,
-            trimmed: false,
-        })
-    }
-
-    /// A `check_overridden` record stamped now, for an override that moved
-    /// past `criterion`'s failed verdict: always
-    /// [`CheckOverrideKind::CandidateFalseFail`]. Only a fail blocks, so
-    /// that is the only kind an override can earn; there is deliberately no
-    /// way to write [`CheckOverrideKind::OverriddenUnanswered`], which
-    /// survives only so ledgers from older builds still read.
-    pub fn check_overridden(
-        session: &str,
-        session_id: Option<&str>,
-        criterion: OverriddenCriterion<'_>,
-    ) -> Self {
-        LedgerRecord::CheckOverridden(CheckOverriddenRecord {
-            envelope: RecordEnvelope::now(session, session_id),
-            state: criterion.state.to_string(),
-            visit_seq: criterion.visit_seq,
-            gate: criterion.gate.to_string(),
-            rule_id: criterion.rule_id.to_string(),
-            declaration_hash: criterion.declaration_hash.to_string(),
-            override_kind: CheckOverrideKind::CandidateFalseFail,
-        })
-    }
-
-    /// A `consulted` record stamped now.
-    pub fn consulted(
-        session: &str,
-        session_id: Option<&str>,
-        consultation: DeciderConsultation,
-    ) -> Self {
-        LedgerRecord::Consulted(ConsultedRecord {
-            envelope: RecordEnvelope::now(session, session_id),
-            consultation,
-            trimmed: false,
-        })
-    }
-
-    /// An `answered` record stamped now.
-    pub fn answered(
-        session: &str,
-        session_id: Option<&str>,
-        state: &str,
-        visit_seq: u64,
-        values: BTreeMap<String, serde_json::Value>,
-    ) -> Self {
-        LedgerRecord::Answered(AnsweredRecord {
-            envelope: RecordEnvelope::now(session, session_id),
-            state: state.to_string(),
-            visit_seq,
-            values,
-        })
-    }
-
-    /// A `directed_exit` record stamped now.
-    pub fn directed_exit(
-        session: &str,
-        session_id: Option<&str>,
-        state: &str,
-        visit_seq: u64,
-        target: &str,
-    ) -> Self {
-        LedgerRecord::DirectedExit(DirectedExitRecord {
-            envelope: RecordEnvelope::now(session, session_id),
-            state: state.to_string(),
-            visit_seq,
-            target: target.to_string(),
-        })
-    }
 }
 
-fn is_false(b: &bool) -> bool {
-    !*b
+/// What one session's log holds for the report.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionRecords {
+    /// Records in log order.
+    pub records: Vec<LedgerRecord>,
+    /// `decider_consulted` and `decider_checked` events whose payload this
+    /// build can't read (they parse as `Unknown`).
+    pub malformed: u64,
 }
 
-/// Whether `line` plus its newline fits the bound.
-fn fits(line: &str) -> bool {
-    line.len() < MAX_LEDGER_LINE_BYTES
-}
-
-/// Serialize `record` as one ledger line (no newline), trimming a
-/// `consulted` record's probabilities when the full line doesn't fit.
+/// Rebuild the decider records of session `session`, whose header carries
+/// `session_id`, from its `events` in log order.
 ///
-/// Fails when the line is still over [`MAX_LEDGER_LINE_BYTES`].
-pub fn render_line(record: &LedgerRecord) -> Result<String> {
-    let line = serde_json::to_string(record).context("failed to serialize ledger record")?;
-    if fits(&line) {
-        return Ok(line);
-    }
-    // Probabilities are the one droppable part: a trimmed line keeps the
-    // outcome, which is what the report counts.
-    let trimmed = match record {
-        LedgerRecord::Consulted(c) => {
-            let mut t = c.clone();
-            for field in t.consultation.fields.values_mut() {
-                field.probabilities.clear();
+/// At each event the log before it is the log the command that appended it
+/// saw, so each record follows the rule its old writer followed:
+///
+/// - an agent's `evidence_submitted` on a visit whose consultation (the
+///   visit's first `decider_consulted`) wasn't applied is an `answered`
+///   record holding the submitted values of the fields the consultation
+///   covered, and none when it holds no such field;
+/// - a `directed_transition` from such a visit, to another state, before
+///   any submission answered one of those fields is a `directed_exit`; a
+///   `--to` naming the current state starts a new lap, not an exit;
+/// - a `gate_override_recorded` is one `check_overridden` per criterion
+///   [`override_records`] finds.
+pub fn records_from_session(
+    session: &str,
+    session_id: Option<&str>,
+    events: &[Event],
+) -> SessionRecords {
+    let mut out = SessionRecords::default();
+    // Only a consulted session can hold an answer or a directed exit, so
+    // the visit lookups below run only for one.
+    let consulted = events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::DeciderConsulted(_)));
+    for (i, e) in events.iter().enumerate() {
+        let before = &events[..i];
+        let envelope = || RecordEnvelope::new(&e.timestamp, session, session_id);
+        match &e.payload {
+            EventPayload::DeciderConsulted(c) => {
+                out.records.push(LedgerRecord::Consulted(ConsultedRecord {
+                    envelope: envelope(),
+                    consultation: c.clone(),
+                }));
             }
-            t.trimmed = true;
-            LedgerRecord::Consulted(t)
+            EventPayload::EvidenceSubmitted {
+                state,
+                fields,
+                source: None,
+                ..
+            } if consulted => {
+                let Some(c) = unapplied_consultation(before, state) else {
+                    continue;
+                };
+                let values: BTreeMap<String, serde_json::Value> = fields
+                    .iter()
+                    .filter(|(f, _)| c.fields.contains_key(*f))
+                    .map(|(f, v)| (f.clone(), v.clone()))
+                    .collect();
+                if values.is_empty() {
+                    continue;
+                }
+                out.records.push(LedgerRecord::Answered(AnsweredRecord {
+                    envelope: envelope(),
+                    state: state.clone(),
+                    visit_seq: c.visit_seq,
+                    values,
+                }));
+            }
+            EventPayload::DirectedTransition { from, to, .. } if consulted && from != to => {
+                let Some(c) = unapplied_consultation(before, from) else {
+                    continue;
+                };
+                if answered_in_visit(before, from, c) {
+                    continue;
+                }
+                out.records
+                    .push(LedgerRecord::DirectedExit(DirectedExitRecord {
+                        envelope: envelope(),
+                        state: from.clone(),
+                        visit_seq: c.visit_seq,
+                        target: to.clone(),
+                    }));
+            }
+            EventPayload::DeciderChecked(check) => {
+                out.records.push(LedgerRecord::Checked(CheckedRecord {
+                    envelope: envelope(),
+                    check: check.clone(),
+                }));
+            }
+            EventPayload::GateOverrideRecorded {
+                state,
+                gate,
+                actual_output,
+                ..
+            } => {
+                out.records.extend(override_records(
+                    before,
+                    state,
+                    gate,
+                    actual_output,
+                    &envelope(),
+                ));
+            }
+            EventPayload::Unknown { type_name, .. }
+                if type_name == "decider_consulted" || type_name == "decider_checked" =>
+            {
+                out.malformed += 1;
+            }
+            _ => {}
         }
-        LedgerRecord::Checked(c) => {
-            let mut t = c.clone();
-            t.check.probabilities.clear();
-            t.trimmed = true;
-            LedgerRecord::Checked(t)
-        }
-        _ => anyhow::bail!(
-            "{} record is {} bytes, over the {}-byte line bound",
-            record.kind(),
-            line.len() + 1,
-            MAX_LEDGER_LINE_BYTES
-        ),
-    };
-    let line = serde_json::to_string(&trimmed).context("failed to serialize ledger record")?;
-    if fits(&line) {
-        return Ok(line);
     }
-    anyhow::bail!(
-        "{} record is {} bytes without probabilities, over the {}-byte line bound",
-        record.kind(),
-        line.len() + 1,
-        MAX_LEDGER_LINE_BYTES
-    )
+    out
 }
 
-/// Append `record` to the ledger under `koto_root`, creating the directory
-/// and (mode 0600) the file when absent.
-pub fn append_record(koto_root: &Path, record: &LedgerRecord) -> Result<()> {
-    let line = render_line(record)?;
-    append_bounded_line(
-        koto_root,
-        &ledger_path(koto_root),
-        &line,
-        MAX_LEDGER_LINE_BYTES,
-    )
+/// The current visit's consultation of `state` in `before`, when it wasn't
+/// applied.
+fn unapplied_consultation<'a>(before: &'a [Event], state: &str) -> Option<&'a DeciderConsultation> {
+    prior_consultation(before, state).filter(|c| c.outcome != ConsultationOutcome::Applied)
 }
 
-/// [`append_record`], turning any failure into one warning on stderr. A
-/// ledger that can't be written never changes a tick's outcome.
-///
-/// `koto_root` is `None` when there is no home directory.
-pub fn append_or_warn(koto_root: Option<&Path>, record: &LedgerRecord) {
-    let Some(root) = koto_root else {
-        eprintln!("warning: decider ledger write failed (no home directory)");
-        return;
+/// Whether an `evidence_submitted` in the current visit to `state` already
+/// answered a field consultation `c` covered.
+fn answered_in_visit(before: &[Event], state: &str, c: &DeciderConsultation) -> bool {
+    let Some(start) = visit_start_index(before, state) else {
+        return false;
     };
-    if let Err(e) = append_record(root, record) {
-        eprintln!(
-            "warning: decider ledger write failed ({}: {})",
-            ledger_path(root).display(),
-            e.root_cause()
-        );
+    before[start.index + 1..].iter().any(|e| match &e.payload {
+        EventPayload::EvidenceSubmitted {
+            state: s, fields, ..
+        } => s == state && fields.keys().any(|f| c.fields.contains_key(f)),
+        _ => false,
+    })
+}
+
+/// The `check_overridden` records for an override of the decider check
+/// `gate` in `state`, given the log `before` it: one `candidate_false_fail`
+/// per criterion the check's last output (`actual_output`) lists as failed
+/// by the decider. A criterion the agent answered `fail` is listed under
+/// `agent_answered` too and gets none: an override of the agent's own
+/// judgment says nothing about the decider. A criterion waiting on the
+/// agent is never under `failed`, so it gets none either. Each record takes
+/// its visit and declaration hash from the latest `decider_checked` for
+/// that criterion in the current visit to `state`, the visit the override
+/// applies to; a reused verdict appended none, but the consultation it
+/// reused is in the same visit. A criterion with no such record in this
+/// visit gets none, even when an earlier visit has one: that consultation
+/// isn't what the override moved past. A gate that isn't a decider check
+/// has no `decider_checked` events, so its overrides give none.
+pub fn override_records(
+    before: &[Event],
+    state: &str,
+    gate: &str,
+    actual_output: &serde_json::Value,
+    envelope: &RecordEnvelope,
+) -> Vec<LedgerRecord> {
+    let visit = match arrival_index(before, state) {
+        Some(i) => &before[i + 1..],
+        None => before,
+    };
+    let agent_answered: Vec<&str> = actual_output["agent_answered"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let failed = actual_output["failed"].as_array();
+    for rule_id in failed
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|id| !agent_answered.contains(id))
+    {
+        let latest = visit.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::DeciderChecked(c)
+                if c.state == state && c.gate == gate && c.rule_id == rule_id =>
+            {
+                Some((c.visit_seq, c.declaration_hash.as_str()))
+            }
+            _ => None,
+        });
+        if let Some((visit_seq, declaration_hash)) = latest {
+            out.push(LedgerRecord::CheckOverridden(CheckOverriddenRecord {
+                envelope: envelope.clone(),
+                state: state.to_string(),
+                visit_seq,
+                gate: gate.to_string(),
+                rule_id: rule_id.to_string(),
+                declaration_hash: declaration_hash.to_string(),
+                override_kind: CheckOverrideKind::CandidateFalseFail,
+            }));
+        }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decider::evaluate::FieldOutcome;
-    use crate::decider::record::{ConsultationOutcome, FieldConsultation};
-    use crate::decider::types::{ErrorClass, SettingOrigin};
-    use crate::template::decider::DeciderMode;
+    use serde_json::{json, Value};
 
-    fn field(values: &[&str]) -> FieldConsultation {
-        FieldConsultation {
-            declaration_hash: "d".repeat(64),
-            modes: values
-                .iter()
-                .map(|v| (v.to_string(), DeciderMode::Shadow))
-                .collect(),
-            probabilities: values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (v.to_string(), 0.1234 + i as f64 / 10_000.0))
-                .collect(),
-            winning: Some(values[0].to_string()),
-            confidence: Some(0.1234),
-            threshold: Some(0.9),
-            at_threshold: false,
-            outcome: Some(FieldOutcome::BelowThreshold),
-        }
+    /// Log events from JSON lines, numbered from 1.
+    fn log(lines: &[Value]) -> Vec<Event> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut l = l.clone();
+                l["seq"] = json!(i as u64 + 1);
+                l["timestamp"] = json!("2026-01-01T00:00:00Z");
+                serde_json::from_value(l).unwrap()
+            })
+            .collect()
     }
 
-    fn consultation(fields: BTreeMap<String, FieldConsultation>) -> DeciderConsultation {
-        DeciderConsultation {
-            state: "review".to_string(),
-            visit_seq: 7,
-            provider: "jev".to_string(),
-            model: "jev-1".to_string(),
-            input_sha256: Some("a".repeat(64)),
-            outcome: ConsultationOutcome::NotApplied,
-            error_class: None,
-            latency_ms: 12,
-            directive_bytes: 300,
-            endpoint_origin: SettingOrigin::Default,
-            fields,
-            input_tokens: None,
-            output_tokens: None,
-            unread_usage_attempts: 0,
-            reason: None,
-            input_label: None,
-            input_bytes: None,
-        }
+    fn init() -> Value {
+        json!({"type": "workflow_initialized",
+            "payload": {"template_path": "t.json", "variables": {}}})
     }
 
-    fn check(rule_ref: &str) -> crate::decider::check::DeciderCheck {
-        use crate::decider::check::{DeciderCheck, RecordedOutcome};
-        DeciderCheck {
-            state: "review".into(),
-            visit_seq: 7,
-            gate: "comments".into(),
-            rule_id: "comment_reason".into(),
-            rule_ref: rule_ref.into(),
-            declaration_hash: "d".repeat(64),
-            mode: crate::template::decider_check::CheckMode::Veto,
-            threshold: 0.9,
-            outcome: RecordedOutcome::Fail,
-            reason: None,
-            blocked: true,
-            provider: "jev".into(),
-            model: "jev-1".into(),
-            probabilities: [("pass", 0.01), ("fail", 0.97), ("unclear", 0.02)]
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
-            input_sha256: Some("a".repeat(64)),
-            input_bytes: Some(120),
-            input_tokens: Some(300),
-            output_tokens: Some(3),
-            unread_usage_attempts: 0,
-            attempts: 1,
-            latency_ms: 250,
-            error_class: None,
-            endpoint_origin: Some(SettingOrigin::Default),
-            unit: None,
-            unit_labels: None,
-        }
+    fn arrive(from: Option<&str>, to: &str) -> Value {
+        json!({"type": "transitioned",
+            "payload": {"from": from, "to": to, "condition_type": "auto"}})
     }
 
-    #[test]
-    fn checked_and_check_overridden_round_trip_and_parse() {
-        let checked = LedgerRecord::checked("wf", Some("sid"), check("ref"));
-        let hash = "d".repeat(64);
-        let overridden = LedgerRecord::check_overridden(
-            "wf",
-            Some("sid"),
-            OverriddenCriterion {
-                state: "review",
-                visit_seq: 7,
-                gate: "comments",
-                rule_id: "comment_reason",
-                declaration_hash: &hash,
-            },
-        );
-        let mut body = String::new();
-        for r in [&checked, &overridden] {
-            let line = render_line(r).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(v["kind"], r.kind());
-            body.push_str(&line);
-            body.push('\n');
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&render_line(&overridden).unwrap()).unwrap();
-        assert_eq!(v["kind"], "check_overridden");
-        assert_eq!(v["override_kind"], "candidate_false_fail");
-        let read = crate::decider::report::parse_ledger(body.as_bytes());
-        assert_eq!(read.malformed, 0);
-        assert_eq!(read.unknown_kind, 0);
-        assert_eq!(read.records, vec![checked, overridden]);
+    fn consulted(visit_seq: u64, outcome: &str) -> Value {
+        json!({"type": "decider_consulted", "payload": {
+            "state": "review", "visit_seq": visit_seq, "provider": "jev",
+            "model": "m", "outcome": outcome, "latency_ms": 1,
+            "directive_bytes": 1, "endpoint_origin": "default",
+            "fields": {"verdict": {"declaration_hash": "h",
+                "modes": {"proceed": "shadow", "exit": "shadow"},
+                "at_threshold": false}}}})
     }
 
-    #[test]
-    fn an_oversized_checked_line_drops_its_probabilities_first() {
-        // A rule_ref near the finding bound plus a long hash pushes the line
-        // past 4 KiB only with a padded rule_ref; build one that fits only
-        // once the probabilities go.
-        let mut c = check("r");
-        let base = render_line(&LedgerRecord::checked("wf", None, c.clone()))
-            .unwrap()
-            .len();
-        let probs = serde_json::to_string(&c.probabilities).unwrap().len();
-        c.rule_ref = "x".repeat(MAX_LEDGER_LINE_BYTES - base - 1 + probs / 2);
-        let line = render_line(&LedgerRecord::checked("wf", None, c)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["trimmed"], true);
-        assert!(v.get("probabilities").is_none());
-        assert_eq!(v["outcome"], "fail");
+    fn evidence(fields: Value) -> Value {
+        json!({"type": "evidence_submitted",
+            "payload": {"state": "review", "fields": fields}})
     }
 
-    fn one_field() -> DeciderConsultation {
-        let mut fields = BTreeMap::new();
-        fields.insert(
-            "verdict".to_string(),
-            field(&["proceed", "exit", "unclear"]),
-        );
-        consultation(fields)
+    fn directed(from: &str, to: &str) -> Value {
+        json!({"type": "directed_transition", "payload": {"from": from, "to": to}})
     }
 
-    #[test]
-    fn ledger_path_is_under_the_koto_root() {
-        assert_eq!(
-            ledger_path(Path::new("/h/.koto")),
-            PathBuf::from("/h/.koto/_decider_ledger.jsonl")
-        );
+    fn checked(visit_seq: u64, hash: &str) -> Value {
+        json!({"type": "decider_checked", "payload": {
+            "state": "review", "visit_seq": visit_seq, "gate": "comments",
+            "rule_id": "r", "rule_ref": "ref", "declaration_hash": hash,
+            "mode": "veto", "threshold": 0.9, "outcome": "fail", "blocked": true,
+            "provider": "jev", "model": "m", "attempts": 1, "latency_ms": 1}})
     }
 
-    #[test]
-    fn a_consulted_record_round_trips_with_every_field_flattened() {
-        let rec = LedgerRecord::consulted("wf", Some("uuid-1"), one_field());
-        let line = render_line(&rec).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["kind"], "consulted");
-        assert_eq!(v["v"], 1);
-        assert_eq!(v["session"], "wf");
-        assert_eq!(v["session_id"], "uuid-1");
-        assert!(v["at"].as_str().unwrap().ends_with('Z'));
-        for key in [
-            "state",
-            "visit_seq",
-            "provider",
-            "model",
-            "input_sha256",
-            "outcome",
-            "latency_ms",
-            "directive_bytes",
-            "endpoint_origin",
-            "fields",
-        ] {
-            assert!(v.get(key).is_some(), "missing {}: {}", key, line);
-        }
-        let f = &v["fields"]["verdict"];
-        for key in [
-            "declaration_hash",
-            "modes",
-            "probabilities",
-            "winning",
-            "confidence",
-            "threshold",
-            "at_threshold",
-            "outcome",
-        ] {
-            assert!(f.get(key).is_some(), "field missing {}: {}", key, f);
-        }
-        assert!(v.get("trimmed").is_none());
-        let back: LedgerRecord = serde_json::from_str(&line).unwrap();
-        assert_eq!(back, rec);
+    fn override_of(output: Value) -> Value {
+        json!({"type": "gate_override_recorded", "payload": {
+            "state": "review", "gate": "comments", "rationale": "x",
+            "override_applied": {}, "actual_output": output,
+            "timestamp": "2026-01-01T00:00:00Z"}})
     }
 
-    #[test]
-    fn error_class_is_carried_when_present() {
-        let mut c = one_field();
-        c.outcome = ConsultationOutcome::Error;
-        c.error_class = Some(ErrorClass::Timeout);
-        let rec = LedgerRecord::consulted("wf", Some("u"), c);
-        let line = render_line(&rec).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["error_class"], "timeout");
-        assert_eq!(serde_json::from_str::<LedgerRecord>(&line).unwrap(), rec);
+    fn kinds(events: &[Event]) -> Vec<&'static str> {
+        records_from_session("wf", Some("u"), events)
+            .records
+            .iter()
+            .map(LedgerRecord::kind)
+            .collect()
     }
 
-    #[test]
-    fn an_answered_record_round_trips() {
-        let mut values = BTreeMap::new();
-        values.insert("verdict".to_string(), serde_json::json!("exit"));
-        let rec = LedgerRecord::answered("wf", Some("uuid-1"), "review", 7, values);
-        let line = render_line(&rec).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["kind"], "answered");
-        assert_eq!(v["v"], 1);
-        assert_eq!(v["visit_seq"], 7);
-        assert_eq!(v["state"], "review");
-        assert_eq!(v["values"]["verdict"], "exit");
-        assert_eq!(serde_json::from_str::<LedgerRecord>(&line).unwrap(), rec);
-    }
-
-    #[test]
-    fn an_empty_or_absent_session_id_serializes_null() {
-        for id in [None, Some("")] {
-            let c = LedgerRecord::consulted("wf", id, one_field());
-            let a = LedgerRecord::answered("wf", id, "review", 7, BTreeMap::new());
-            for rec in [c, a] {
-                let v: serde_json::Value =
-                    serde_json::from_str(&render_line(&rec).unwrap()).unwrap();
-                assert!(v.as_object().unwrap().contains_key("session_id"));
-                assert!(v["session_id"].is_null(), "{}", v);
+    fn overridden(events: &[Event]) -> Vec<(u64, String)> {
+        override_records(
+            events,
+            "review",
+            "comments",
+            &json!({"failed": ["r"], "unanswered": [], "error": ""}),
+            &RecordEnvelope::new("t", "wf", None),
+        )
+        .into_iter()
+        .map(|r| match r {
+            LedgerRecord::CheckOverridden(c) => {
+                assert_eq!(c.override_kind, CheckOverrideKind::CandidateFalseFail);
+                (c.visit_seq, c.declaration_hash)
             }
-        }
-    }
-
-    /// A field with `n` values named `<prefix><i>`.
-    fn wide(prefix: &str, n: usize) -> DeciderConsultation {
-        let names: Vec<String> = (0..n).map(|i| format!("{}{:03}", prefix, i)).collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut fields = BTreeMap::new();
-        fields.insert("verdict".to_string(), field(&refs));
-        consultation(fields)
+            other => panic!("unexpected record {:?}", other),
+        })
+        .collect()
     }
 
     #[test]
-    fn an_oversized_consulted_line_drops_probabilities_and_fits() {
-        let c = wide("value-name-", 80);
-        let full =
-            serde_json::to_string(&LedgerRecord::consulted("wf", Some("u"), c.clone())).unwrap();
-        assert!(full.len() > MAX_LEDGER_LINE_BYTES, "fixture too small");
-
-        let rec = LedgerRecord::consulted("wf", Some("u"), c);
-        let line = render_line(&rec).unwrap();
-        assert!(line.len() < MAX_LEDGER_LINE_BYTES, "{}", line.len());
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["trimmed"], true);
-        let f = &v["fields"]["verdict"];
-        assert!(f.get("probabilities").is_none());
-        assert_eq!(f["winning"], "value-name-000");
-        assert_eq!(f["confidence"], 0.1234);
-        assert_eq!(f["at_threshold"], false);
-        assert_eq!(f["outcome"], "below_threshold");
-        let back: LedgerRecord = serde_json::from_str(&line).unwrap();
-        let LedgerRecord::Consulted(back) = back else {
+    fn every_kind_is_read_from_its_event() {
+        let events = log(&[
+            init(),
+            arrive(None, "review"),
+            consulted(2, "not_applied"),
+            evidence(json!({"verdict": "exit", "notes": "free text"})),
+            checked(2, "h"),
+            override_of(json!({"failed": ["r"]})),
+            directed("review", "done"),
+        ]);
+        let read = records_from_session("wf", Some("u"), &events);
+        assert_eq!(read.malformed, 0);
+        assert_eq!(
+            read.records
+                .iter()
+                .map(LedgerRecord::kind)
+                .collect::<Vec<_>>(),
+            vec!["consulted", "answered", "checked", "check_overridden"]
+        );
+        let LedgerRecord::Answered(a) = &read.records[1] else {
             panic!("kind");
         };
-        assert!(back.trimmed);
-        assert!(back.consultation.fields["verdict"].probabilities.is_empty());
+        assert_eq!(a.visit_seq, 2);
+        assert_eq!(a.values, [("verdict".to_string(), json!("exit"))].into());
+        assert_eq!(a.envelope.session_id.as_deref(), Some("u"));
+        assert_eq!(a.envelope.at, "2026-01-01T00:00:00Z");
     }
 
     #[test]
-    fn a_line_still_over_the_bound_is_refused_and_not_written() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rec = LedgerRecord::consulted("wf", Some("u"), wide(&"v".repeat(60), 80));
-        let err = render_line(&rec).unwrap_err();
-        assert!(err.to_string().contains("without probabilities"), "{}", err);
-        assert!(append_record(tmp.path(), &rec).is_err());
-        assert!(!ledger_path(tmp.path()).exists());
+    fn answered_needs_an_unapplied_consultation_and_a_consulted_field() {
+        let answer = evidence(json!({"verdict": "exit"}));
+        // No consultation on the visit.
+        assert_eq!(
+            kinds(&log(&[init(), arrive(None, "review"), answer.clone()])),
+            Vec::<&str>::new()
+        );
+        // Applied.
+        let applied = log(&[
+            init(),
+            arrive(None, "review"),
+            consulted(2, "applied"),
+            answer.clone(),
+        ]);
+        assert_eq!(kinds(&applied), vec!["consulted"]);
+        // A consultation from an earlier visit doesn't count.
+        let earlier = log(&[
+            init(),
+            arrive(None, "review"),
+            consulted(2, "not_applied"),
+            arrive(Some("review"), "review"),
+            answer.clone(),
+        ]);
+        assert_eq!(kinds(&earlier), vec!["consulted"]);
+        // Nothing the consultation covered was submitted.
+        let undeclared = log(&[
+            init(),
+            arrive(None, "review"),
+            consulted(2, "error"),
+            evidence(json!({"notes": "x"})),
+        ]);
+        assert_eq!(kinds(&undeclared), vec!["consulted"]);
+        // Two submissions in one visit: two answers.
+        let twice = log(&[
+            init(),
+            arrive(None, "review"),
+            consulted(2, "not_applied"),
+            answer.clone(),
+            answer,
+        ]);
+        assert_eq!(kinds(&twice), vec!["consulted", "answered", "answered"]);
     }
 
     #[test]
-    fn append_record_writes_one_line_per_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join(".koto");
-        append_record(
-            &root,
-            &LedgerRecord::consulted("wf", Some("u"), one_field()),
-        )
-        .unwrap();
-        append_record(
-            &root,
-            &LedgerRecord::answered("wf", Some("u"), "review", 7, BTreeMap::new()),
-        )
-        .unwrap();
-        let body = std::fs::read_to_string(ledger_path(&root)).unwrap();
-        let kinds: Vec<String> = body
-            .lines()
-            .map(|l| {
-                serde_json::from_str::<LedgerRecord>(l)
-                    .unwrap()
-                    .kind()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(kinds, vec!["consulted", "answered"]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(ledger_path(&root))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
+    fn an_empty_header_session_id_reads_none() {
+        let events = log(&[init(), arrive(None, "review"), consulted(2, "not_applied")]);
+        for id in [None, Some("")] {
+            let read = records_from_session("wf", id, &events);
+            let LedgerRecord::Consulted(c) = &read.records[0] else {
+                panic!("kind");
+            };
+            assert_eq!(c.envelope.session_id, None);
         }
     }
 
-    /// Mirrors the terminal index's `race_n_writers_produce_n_parseable_lines`.
     #[test]
-    fn race_n_writers_produce_n_parseable_ledger_lines() {
-        use std::sync::Arc;
-        use std::thread;
+    fn a_directed_exit_needs_an_unanswered_consulted_visit_left_for_another_state() {
+        let base = || vec![init(), arrive(None, "review"), consulted(2, "not_applied")];
+        let with = |extra: Vec<Value>| {
+            let mut v = base();
+            v.extend(extra);
+            kinds(&log(&v))
+        };
+        assert_eq!(
+            with(vec![directed("review", "done")]),
+            vec!["consulted", "directed_exit"]
+        );
+        // A self-loop is a lap, not an exit.
+        assert_eq!(with(vec![directed("review", "review")]), vec!["consulted"]);
+        // Answered first: already a paired observation.
+        assert_eq!(
+            with(vec![
+                evidence(json!({"verdict": "exit"})),
+                directed("review", "done")
+            ]),
+            vec!["consulted", "answered"]
+        );
+        // An unconsulted visit.
+        let unconsulted = log(&[init(), arrive(None, "review"), directed("review", "done")]);
+        assert_eq!(kinds(&unconsulted), Vec::<&str>::new());
+        // Only the consulted visit, not a later one.
+        assert_eq!(
+            with(vec![
+                directed("review", "done"),
+                directed("done", "review"),
+                directed("review", "done"),
+            ]),
+            vec!["consulted", "directed_exit"]
+        );
+    }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Arc::new(tmp.path().to_path_buf());
-        let n = 32_usize;
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let root = Arc::clone(&root);
-                thread::spawn(move || {
-                    let mut c = one_field();
-                    c.visit_seq = i as u64;
-                    let rec = LedgerRecord::consulted("wf", Some("u"), c);
-                    let line = render_line(&rec).unwrap();
-                    append_bounded_line(&root, &ledger_path(&root), &line, MAX_LEDGER_LINE_BYTES)
-                        .unwrap();
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
+    #[test]
+    fn an_unreadable_decider_event_counts_as_malformed() {
+        let events = log(&[
+            init(),
+            json!({"type": "decider_consulted", "payload": {"state": "review"}}),
+            json!({"type": "decider_checked", "payload": {"visit_seq": "x"}}),
+            json!({"type": "something_else", "payload": {}}),
+        ]);
+        let read = records_from_session("wf", Some("u"), &events);
+        assert!(read.records.is_empty());
+        assert_eq!(read.malformed, 2);
+    }
+
+    #[test]
+    fn an_override_names_the_consultation_of_the_current_visit_only() {
+        // Visit 1 (seq 2) failed r and was left; visit 2 (seq 5) failed it
+        // again. The override names visit 2's consultation.
+        let two_visits = log(&[
+            init(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+            checked(5, "new"),
+        ]);
+        assert_eq!(overridden(&two_visits), vec![(5, "new".to_string())]);
+
+        // The current visit has no consultation of r: an earlier visit's is
+        // not what the override moved past, so nothing is read. Looking
+        // across the whole log would name visit 1 here.
+        let stale = log(&[
+            init(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+        ]);
+        assert_eq!(overridden(&stale), vec![]);
+
+        // One visit: its consultation.
+        let one = log(&[init(), arrive(None, "review"), checked(2, "only")]);
+        assert_eq!(overridden(&one), vec![(2, "only".to_string())]);
+    }
+
+    #[test]
+    fn an_override_skips_criteria_the_agent_answered() {
+        let events = log(&[init(), arrive(None, "review"), checked(2, "h")]);
+        let records = override_records(
+            &events,
+            "review",
+            "comments",
+            &json!({"failed": ["r"], "unanswered": [], "awaiting": [],
+                "agent_answered": ["r"], "error": ""}),
+            &RecordEnvelope::new("t", "wf", None),
+        );
+        assert!(records.is_empty());
+    }
+
+    /// No source file names the old host ledger file except in a comment
+    /// saying it is no longer used.
+    #[test]
+    fn no_source_file_names_the_host_ledger() {
+        let needle = ["_decider", "_ledger.jsonl"].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let lines: Vec<&str> = body.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.contains(&needle) {
+                        continue;
+                    }
+                    let comment = line.trim_start().starts_with("//");
+                    // The comment's sentence may end on the next line.
+                    let says = lines[i..lines.len().min(i + 3)]
+                        .iter()
+                        .any(|l| l.contains("no longer used"));
+                    if !(comment && says) {
+                        offenders.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
         }
-        let body = std::fs::read_to_string(ledger_path(&root)).unwrap();
-        let mut seqs: Vec<u64> = body
-            .lines()
-            .map(|l| match serde_json::from_str::<LedgerRecord>(l).unwrap() {
-                LedgerRecord::Consulted(c) => c.consultation.visit_seq,
-                _ => panic!("kind"),
-            })
-            .collect();
-        assert_eq!(seqs.len(), n);
-        seqs.sort();
-        assert_eq!(seqs, (0..n as u64).collect::<Vec<_>>());
+        assert!(offenders.is_empty(), "{:?}", offenders);
     }
 }

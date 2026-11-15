@@ -3295,25 +3295,9 @@ struct DeciderOutcome {
     steps: Vec<Step>,
     /// The masked session log.
     log: Vec<Value>,
-    /// The decider ledger's bytes with the values that vary between runs
-    /// (times, ids, latencies, the temporary directory) masked, or `None`
-    /// when the home holds no ledger.
-    ledger: Option<String>,
-}
-
-/// `text` with every time, id, latency and the temporary directory `tmp`
-/// replaced by a marker, and nothing else changed.
-fn masked_text(text: &str, tmp: &str) -> String {
-    let uuid =
-        regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
-    let time = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z").unwrap();
-    let latency = regex::Regex::new(r#""latency_ms":\d+"#).unwrap();
-    let text = text.replace(tmp, "<tmp>");
-    let text = uuid.replace_all(&text, "<id>");
-    let text = time.replace_all(&text, "<time>");
-    latency
-        .replace_all(&text, r#""latency_ms":"<masked>""#)
-        .into_owned()
+    /// Whether the koto home holds the host decider ledger file koto no
+    /// longer writes.
+    ledger_file: bool,
 }
 
 /// The decider and override scenario's commands in `env`. The routing
@@ -3354,23 +3338,18 @@ fn decider_outcome(env: &Env) -> DeciderOutcome {
         .lines()
         .map(|l| masked(&serde_json::from_str(l).unwrap(), &tmp))
         .collect();
-    let ledger = std::fs::read_to_string(env.koto_home().join("_decider_ledger.jsonl"))
-        .ok()
-        .map(|text| masked_text(&text, &tmp));
     DeciderOutcome {
         steps: outs,
         log,
-        ledger,
+        ledger_file: env.koto_home().join("_decider_ledger.jsonl").exists(),
     }
 }
 
 /// With the journal unwritable (a read-only koto home, a read-only journal
 /// file, or a symlink at its path), the decider and override scenario gives
 /// the same exit codes, standard output and session log as with a writable
-/// journal, and each command prints exactly one run-journal warning. Where
-/// the ledger can still be written (everywhere but the read-only home,
-/// which holds it), its bytes match too once times, ids and latencies are
-/// masked.
+/// journal, and each command prints exactly one run-journal warning. No
+/// home gains a decider ledger file.
 #[test]
 fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     if running_as_root() {
@@ -3389,13 +3368,7 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
         "{:?}",
         expected.steps
     );
-    let ledger = expected.ledger.clone().expect("a decider ledger");
-    for kind in ["consulted", "checked", "check_overridden"] {
-        assert!(
-            ledger.contains(&format!(r#""kind":"{kind}""#)),
-            "{kind}: {ledger}"
-        );
-    }
+    assert!(!expected.ledger_file, "koto wrote a decider ledger file");
     let written = kinds(&decider_records(&good, "same"))
         .into_iter()
         .map(str::to_string)
@@ -3439,7 +3412,6 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     )
     .unwrap();
     assert!(!read_only.journal_path().exists());
-    assert_eq!(got.ledger, None, "the read-only home holds the ledger too");
 
     let read_only_file = Env::new();
     std::fs::create_dir_all(read_only_file.koto_home()).unwrap();
@@ -3463,10 +3435,10 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     let got_linked = decider_outcome(&linked);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
 
-    for (label, got, compare_ledger) in [
-        ("read-only home", got, false),
-        ("read-only file", got_file, true),
-        ("symlink", got_linked, true),
+    for (label, got) in [
+        ("read-only home", got),
+        ("read-only file", got_file),
+        ("symlink", got_linked),
     ] {
         assert_eq!(got.steps.len(), expected.steps.len());
         for (i, ((code, stdout, warnings), (e_code, e_stdout, _))) in
@@ -3477,9 +3449,10 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
             assert_eq!(*warnings, 1, "{label} step {i}");
         }
         assert_eq!(got.log, expected.log, "{label}");
-        if compare_ledger {
-            assert_eq!(got.ledger, expected.ledger, "{label}");
-        }
+        assert!(
+            !got.ledger_file,
+            "{label}: koto wrote a decider ledger file"
+        );
     }
 }
 

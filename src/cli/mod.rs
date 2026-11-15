@@ -418,7 +418,7 @@ pub enum Command {
         subcommand: ConfigCommand,
     },
 
-    /// Decider ledger report and promotion eligibility
+    /// Decider report and promotion eligibility
     Decider {
         #[command(subcommand)]
         subcommand: decider::DeciderCommand,
@@ -1309,13 +1309,6 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
     template
         .validate(true)
         .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// The root the decider ledger is written under (the koto root, `~/.koto`
-/// unless `KOTO_HOME` moves it), or `None` when there is none, in which case
-/// each ledger write warns.
-pub(super) fn ledger_root() -> Option<PathBuf> {
-    crate::koto_home::koto_home()
 }
 
 /// Load a compiled template from a cache path.
@@ -3134,16 +3127,17 @@ pub fn run(app: App) -> Result<()> {
             review::handle(&backend, subcommand)
         }
         Command::Config { subcommand } => handle_config(subcommand),
-        Command::Decider { subcommand } => match subcommand {
-            // The one decider verb that writes to a session. A future verb
-            // that writes to one is wired here, with a backend, as well as in
-            // decider::handle's match.
-            decider::DeciderCommand::Answer(args) => {
-                let backend = build_backend()?;
-                decider_answer::handle_answer(&backend, args)
+        Command::Decider { subcommand } => {
+            let backend = build_backend()?;
+            match subcommand {
+                // The one decider verb that writes to a session.
+                decider::DeciderCommand::Answer(args) => {
+                    decider_answer::handle_answer(&backend, args)
+                }
+                // Reads the decider's records from the session store.
+                decider::DeciderCommand::Report(args) => decider::handle_report(&backend, args),
             }
-            other => decider::handle(other),
-        },
+        }
         Command::Workspace { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -6496,7 +6490,6 @@ fn handle_next(
             &execution_dir,
             &command_env,
         )
-        .with_ledger_root(ledger_root())
         .with_unit_budget(unit_budget)
         // Every tick that consults waits for the lock; an evaluator built
         // without this tries it once.
@@ -6757,22 +6750,6 @@ fn handle_next(
                     target, e
                 );
             }
-        }
-
-        // The decider ledger's `directed_exit` record: this `--to` left a
-        // visit whose consultation wasn't applied, before the agent answered,
-        // paired with that consultation by `visit_seq` (koto#254). Written
-        // only once the transition is recorded, so a `--to` refused above
-        // leaves no ledger record either. A failed write is one warning.
-        if let Some(record) = crate::cli::decider_port::directed_exit_record(
-            &name,
-            Some(header.session_id.as_str()),
-            &events,
-            current_state,
-            current_template_state.accepts.as_ref(),
-            target,
-        ) {
-            crate::decider::ledger::append_or_warn(ledger_root().as_deref(), &record);
         }
 
         // Dispatch on the new (target) state, skip gate evaluation.
@@ -7340,23 +7317,6 @@ fn handle_next(
                 let json = serde_json::json!({"error": ne});
                 exit_with_error_code(json, ne.code.exit_code());
             }
-
-            // The decider ledger's `answered` record: the agent's answer on
-            // a visit whose consultation wasn't applied, paired with it by
-            // `visit_seq`. Written whatever the decider mode is now, so a
-            // user who turned the decider off still completes the pair. A
-            // failed write is one warning and nothing more.
-            if let Some(record) = crate::cli::decider_port::answered_record(
-                &name,
-                Some(header.session_id.as_str()),
-                &events,
-                current_state,
-                accepts,
-                data.as_object()
-                    .expect("validate_evidence guarantees object input"),
-            ) {
-                crate::decider::ledger::append_or_warn(ledger_root().as_deref(), &record);
-            }
         }
     }
 
@@ -7797,7 +7757,6 @@ fn handle_next(
                     Box::new(render_for_decider),
                     full,
                 )
-                .with_ledger_root(ledger_root())
                 .with_budget(consult_budget.clone())
             })
         } else {

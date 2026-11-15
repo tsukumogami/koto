@@ -619,8 +619,9 @@ fn unrelated_sessions_untouched() {
     );
 }
 
-/// The decider ledger lives next to the session tree, not in it, and prune
-/// only removes session directories: its bytes survive a prune untouched.
+/// koto no longer uses the host decider ledger file, and never deletes one
+/// an older koto left next to the session tree: prune only removes session
+/// directories, so its bytes survive a prune untouched.
 #[test]
 fn prune_leaves_the_decider_ledger_unchanged() {
     let dir = TempDir::new().unwrap();

@@ -1,5 +1,6 @@
-//! The decider ledger (`~/.koto/_decider_ledger.jsonl`), written by real
-//! `koto next` runs against the `std::net` stub.
+//! The decider's records -- consultations, the agent's answers and directed
+//! exits -- as `koto decider report` reads them back from the session logs
+//! real `koto next` runs write against the `std::net` stub.
 //!
 //! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Every opted-in
 //! command points `KOTO_DECIDER_ENDPOINT` at the stub and sets
@@ -14,15 +15,12 @@ mod decider_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Output;
 
 use decider_session::*;
 use decider_stub::Reply;
 use serde_json::{json, Value};
-
-const MAX_LINE: usize = 4096;
-const WARNING: &str = "warning: decider ledger write failed (";
 
 fn go() -> Reply {
     verdict(0.95, 0.03, 0.02)
@@ -37,36 +35,35 @@ fn ready(tpl: &str, replies: Vec<Reply>) -> Harness {
     h
 }
 
-fn ledger_file(h: &Harness) -> PathBuf {
-    h.home().join(".koto").join("_decider_ledger.jsonl")
+/// `koto decider report --json` over the harness's store, with `extra`.
+fn report_with(h: &Harness, extra: &[&str]) -> Value {
+    let out = h
+        .koto()
+        .args(["decider", "report", "--json"])
+        .args(extra)
+        .output()
+        .unwrap();
+    ok(&out);
+    json_out(&out)
 }
 
-/// Every ledger line, parsed. Each must end in a newline and fit the bound.
-fn ledger(h: &Harness) -> Vec<Value> {
-    read_ledger(&ledger_file(h))
+fn report(h: &Harness) -> Value {
+    report_with(h, &[])
 }
 
-fn read_ledger(path: &Path) -> Vec<Value> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    assert!(body.is_empty() || body.ends_with('\n'), "{}", body);
-    body.lines()
-        .map(|l| {
-            assert!(l.len() < MAX_LINE, "line over the bound: {} bytes", l.len());
-            serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {}", e, l))
-        })
-        .collect()
+/// What the report's header counts.
+fn counts(h: &Harness) -> Value {
+    report(h)["header"].clone()
 }
 
-fn of_kind(lines: &[Value], kind: &str) -> Vec<Value> {
-    lines
-        .iter()
-        .filter(|l| l["kind"] == kind)
-        .cloned()
-        .collect()
+/// The report's one question.
+fn only_question(r: &Value) -> Value {
+    let qs = r["questions"].as_array().unwrap();
+    assert_eq!(qs.len(), 1, "{}", r);
+    qs[0].clone()
 }
 
+/// The session log's header line.
 fn header(h: &Harness) -> Value {
     let body = h.raw_log();
     serde_json::from_str(body.lines().next().unwrap()).unwrap()
@@ -76,10 +73,11 @@ fn ok(out: &Output) {
     assert!(out.status.success(), "{}", describe(out));
 }
 
+/// stderr lines that mention a ledger. koto writes none any more.
 fn warnings(out: &Output) -> Vec<String> {
     stderr(out)
         .lines()
-        .filter(|l| l.contains(WARNING))
+        .filter(|l| l.contains("ledger"))
         .map(str::to_string)
         .collect()
 }
@@ -95,62 +93,44 @@ fn a_shadow_consultation_and_the_agent_answer_pair_on_session_id_and_visit_seq()
     ok(&h.next_mode("shadow"));
     ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
 
-    let lines = ledger(&h);
-    let consulted = of_kind(&lines, "consulted");
-    let answered = of_kind(&lines, "answered");
-    assert_eq!(consulted.len(), 1, "{:?}", lines);
-    assert_eq!(answered.len(), 1, "{:?}", lines);
-    let (c, a) = (&consulted[0], &answered[0]);
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["answered"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_answered"], 0);
+    assert_eq!(r["header"]["null_session_id"], 0);
+    // The stub is an env endpoint.
+    assert_eq!(r["header"]["custom_endpoint_consultations"], 1);
 
+    let event = &h.consultations()[0];
+    let q = only_question(&r);
+    assert_eq!(q["state"], "review");
+    assert_eq!(q["field"], "verdict");
+    assert_eq!(
+        q["declaration_hash"],
+        event["fields"]["verdict"]["declaration_hash"]
+    );
+    assert_eq!(q["consultations"], 1);
+    assert_eq!(q["paired"], 1);
+
+    // The decider chose proceed at threshold and the agent answered exit:
+    // the pair joins on the header's session_id and the visit's seq.
     let hdr = header(&h);
     let sid = hdr["session_id"].as_str().unwrap();
     assert!(!sid.is_empty());
-    assert_eq!(c["session_id"], sid);
-    assert_eq!(a["session_id"], sid);
-    assert_eq!(c["visit_seq"], a["visit_seq"]);
-    assert_eq!(c["session"], WF);
-    assert_eq!(a["session"], WF);
-    for line in [c, a] {
-        assert_eq!(line["v"], 1);
-        assert!(line["at"].as_str().unwrap().ends_with('Z'));
-    }
-
-    // The consulted record mirrors the event.
-    let event = &h.consultations()[0];
-    for key in [
-        "state",
-        "visit_seq",
-        "provider",
-        "model",
-        "input_sha256",
-        "outcome",
-        "latency_ms",
-        "directive_bytes",
-        "endpoint_origin",
-        "fields",
-    ] {
-        assert_eq!(c[key], event[key], "{}", key);
-    }
-    assert_eq!(c["outcome"], "not_applied");
-    assert_eq!(c["endpoint_origin"], "env");
-    assert_eq!(c["input_sha256"].as_str().unwrap().len(), 64);
-    assert!(c["directive_bytes"].as_u64().unwrap() > 0);
-    assert!(c["latency_ms"].is_u64());
-    let f = &c["fields"]["verdict"];
-    assert_eq!(f["declaration_hash"].as_str().unwrap().len(), 64);
-    assert_eq!(f["modes"], json!({"proceed": "shadow", "exit": "shadow"}));
-    assert_eq!(f["winning"], "proceed");
-    assert!(c.get("trimmed").is_none());
-
-    assert_eq!(a["state"], "review");
-    assert_eq!(a["values"], json!({"verdict": "exit"}));
+    let d = &q["disagreements"][0];
+    assert_eq!(d["session"], WF);
+    assert_eq!(d["session_id"], sid);
+    assert_eq!(d["visit_seq"], event["visit_seq"]);
+    assert_eq!(d["agent"], "exit");
+    assert_eq!(d["decider"], "proceed");
+    assert_eq!(d["endpoint_origin"], "env");
 
     // The header's schema_version is untouched.
     assert_eq!(hdr["schema_version"], schema_before);
 }
 
 #[test]
-fn every_outcome_writes_exactly_one_consulted_line() {
+fn every_outcome_is_read_as_exactly_one_consultation() {
     let unset = standard("auto", "never")
         .replace(
             "- {var: PLAN_DOC, label: plan_path}",
@@ -173,30 +153,42 @@ fn every_outcome_writes_exactly_one_consulted_line() {
     for (outcome, tpl, reply) in cases {
         let h = ready(&tpl, reply.into_iter().collect());
         ok(&h.next_mode("auto"));
-        let lines = ledger(&h);
-        assert_eq!(lines.len(), 1, "{}: {:?}", outcome, lines);
-        assert_eq!(lines[0]["kind"], "consulted", "{}", outcome);
-        assert_eq!(lines[0]["outcome"], outcome);
-        assert_eq!(lines[0]["visit_seq"], h.consultations()[0]["visit_seq"]);
+        assert_eq!(h.consultations()[0]["outcome"], outcome);
+        let r = report(&h);
+        assert_eq!(r["header"]["lines"], 1, "{}: {}", outcome, r["header"]);
+        assert_eq!(r["header"]["consulted"], 1, "{}", outcome);
+        let q = only_question(&r);
+        assert_eq!(q["outcomes"][outcome], 1, "{}: {}", outcome, q["outcomes"]);
     }
 }
 
 #[test]
-fn no_answered_record_without_an_unapplied_consultation_or_a_declared_field() {
+fn no_answer_is_read_without_an_unapplied_consultation_or_a_declared_field() {
     // No consultation: the user isn't opted in.
     let h = ready(&standard("shadow", "shadow"), vec![]);
     ok(&h.next_mode("off"));
     ok(&h.next_with("off", r#"{"verdict": "exit"}"#));
-    assert!(!ledger_file(&h).exists());
+    assert_eq!(counts(&h)["lines"], 0);
 
     // Applied: the decider's evidence moved the session on; the agent's
-    // next submission is on another state.
+    // next submission is on another state. It finishes the session, so the
+    // log is kept to be read.
     let h = ready(&standard("auto", "never"), vec![go()]);
     ok(&h.next_mode("auto"));
-    ok(&h.next_with("auto", r#"{"done": true}"#));
-    let lines = ledger(&h);
-    assert_eq!(lines.len(), 1, "{:?}", lines);
-    assert_eq!(lines[0]["outcome"], "applied");
+    ok(&h
+        .koto_mode("auto")
+        .args([
+            "next",
+            WF,
+            "--with-data",
+            r#"{"done": true}"#,
+            "--no-cleanup",
+        ])
+        .output()
+        .unwrap());
+    let c = counts(&h);
+    assert_eq!(c["consulted"], 1, "{}", c);
+    assert_eq!(c["answered"], 0, "{}", c);
 
     // Not applied, but the submission holds no declared field.
     let tpl = standard("shadow", "shadow")
@@ -211,27 +203,34 @@ fn no_answered_record_without_an_unapplied_consultation_or_a_declared_field() {
     let h = ready(&tpl, vec![go()]);
     ok(&h.next_mode("shadow"));
     ok(&h.next_with("shadow", r#"{"note": "looked at it"}"#));
-    assert!(of_kind(&ledger(&h), "answered").is_empty());
-    assert_eq!(of_kind(&ledger(&h), "consulted").len(), 1);
+    let c = counts(&h);
+    assert_eq!(c["answered"], 0, "{}", c);
+    assert_eq!(c["consulted"], 1, "{}", c);
 
-    // And with the declared field alongside, only the declared one lands.
+    // And with the declared field alongside, only the declared one counts.
     ok(&h.next_with(
         "shadow",
         r#"{"note": "free text zq-sentinel", "verdict": "proceed"}"#,
     ));
-    let answered = of_kind(&ledger(&h), "answered");
-    assert_eq!(answered.len(), 1);
-    assert_eq!(answered[0]["values"], json!({"verdict": "proceed"}));
-    // The sentinel holds non-hex letters: every ledger line also carries a
-    // random session id and SHA-256 hashes, which a hex sentinel could
-    // match by chance.
-    assert!(!std::fs::read_to_string(ledger_file(&h))
-        .unwrap()
-        .contains("zq-sentinel"));
+    let r = report(&h);
+    assert_eq!(r["header"]["answered"], 1, "{}", r["header"]);
+    let q = only_question(&r);
+    assert_eq!(q["confusion"]["rows"]["proceed"]["proceed"], 1, "{}", q);
+    // The sentinel holds non-hex letters, so a session id or a hash can't
+    // match it by chance.
+    for args in [&["--json"][..], &[][..]] {
+        let out = h
+            .koto()
+            .args(["decider", "report"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("zq-sentinel"));
+    }
 }
 
 #[test]
-fn two_submissions_in_one_visit_each_write_an_answered_record() {
+fn two_submissions_in_one_visit_are_each_read_as_an_answer() {
     // `proceed` also needs FLAG set, and FLAG is empty, so an agent's
     // `proceed` matches no transition and the session stays on `review`.
     let tpl = standard("shadow", "shadow")
@@ -249,15 +248,15 @@ fn two_submissions_in_one_visit_each_write_an_answered_record() {
     ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
     assert_eq!(h.stub.request_count(), 1);
 
-    let lines = ledger(&h);
-    let c = of_kind(&lines, "consulted");
-    let a = of_kind(&lines, "answered");
-    assert_eq!(c.len(), 1);
-    assert_eq!(a.len(), 2, "{:?}", lines);
-    assert_eq!(a[0]["visit_seq"], c[0]["visit_seq"]);
-    assert_eq!(a[1]["visit_seq"], c[0]["visit_seq"]);
-    assert_eq!(a[0]["values"]["verdict"], "proceed");
-    assert_eq!(a[1]["values"]["verdict"], "exit");
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["answered"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_answered"], 0);
+    // Both pair with the one consultation, and the later answer wins.
+    let q = only_question(&r);
+    assert_eq!(q["paired"], 1);
+    assert_eq!(q["confusion"]["rows"]["exit"]["proceed"], 1, "{}", q);
+    assert_eq!(q["confusion"]["rows"]["proceed"]["proceed"], 0, "{}", q);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,69 +271,63 @@ fn directed(h: &Harness, target: &str) -> Output {
     cmd.output().unwrap()
 }
 
+/// The directed exits the report lists for its one question.
+fn listed_exits(r: &Value) -> Vec<Value> {
+    only_question(r)["disagreements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["agent"] == "directed_exit")
+        .cloned()
+        .collect()
+}
+
 #[test]
-fn a_directed_exit_from_a_consulted_visit_is_recorded_against_its_visit_seq() {
+fn a_directed_exit_from_a_consulted_visit_is_read_against_its_visit_seq() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
     ok(&directed(&h, "rethink"));
 
-    let lines = ledger(&h);
-    let consulted = of_kind(&lines, "consulted");
-    let exits = of_kind(&lines, "directed_exit");
-    assert_eq!(consulted.len(), 1, "{:?}", lines);
-    assert_eq!(exits.len(), 1, "{:?}", lines);
-    assert!(of_kind(&lines, "answered").is_empty(), "{:?}", lines);
-    let (c, d) = (&consulted[0], &exits[0]);
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["directed_exits"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_directed_exits"], 0);
+    assert_eq!(r["header"]["answered"], 0);
+    let exits = listed_exits(&r);
+    assert_eq!(exits.len(), 1, "{:?}", exits);
+    let d = &exits[0];
     let sid = header(&h)["session_id"].as_str().unwrap().to_string();
     assert_eq!(d["session_id"], sid.as_str());
     assert_eq!(d["session"], WF);
-    assert_eq!(d["v"], 1);
-    assert!(d["at"].as_str().unwrap().ends_with('Z'));
-    assert_eq!(d["state"], "review");
-    assert_eq!(d["visit_seq"], c["visit_seq"]);
-    assert_eq!(d["target"], "rethink");
-    // Names and a number only.
-    let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-    keys.sort();
-    assert_eq!(
-        keys,
-        vec![
-            "at",
-            "kind",
-            "session",
-            "session_id",
-            "state",
-            "target",
-            "v",
-            "visit_seq"
-        ]
-    );
+    assert_eq!(d["visit_seq"], h.consultations()[0]["visit_seq"]);
+    assert_eq!(d["directed_to"], "rethink");
+    assert_eq!(d["decider"], "proceed");
 
     // The session log is what it always was: one directed_transition.
     assert_eq!(h.events_of("directed_transition").len(), 1);
 }
 
 #[test]
-fn a_directed_exit_from_an_unconsulted_visit_writes_nothing() {
+fn a_directed_exit_from_an_unconsulted_visit_reads_as_none() {
     // Not opted in: no consultation, so nothing to pair with.
     let h = ready(&standard("shadow", "shadow"), vec![]);
     ok(&h.next_mode("off"));
     ok(&directed(&h, "rethink"));
-    assert!(!ledger_file(&h).exists());
+    assert_eq!(counts(&h)["lines"], 0);
 
     // A consultation on `review` doesn't reach an exit from a later state.
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
     ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
     ok(&directed(&h, "review"));
-    let lines = ledger(&h);
-    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
-    assert_eq!(of_kind(&lines, "consulted").len(), 1);
-    assert_eq!(of_kind(&lines, "answered").len(), 1);
+    let c = counts(&h);
+    assert_eq!(c["directed_exits"], 0, "{}", c);
+    assert_eq!(c["consulted"], 1, "{}", c);
+    assert_eq!(c["answered"], 1, "{}", c);
 }
 
 #[test]
-fn a_directed_exit_after_an_answer_in_the_same_visit_writes_nothing() {
+fn a_directed_exit_after_an_answer_in_the_same_visit_reads_as_none() {
     // `proceed` also needs FLAG set, and FLAG is empty, so the answer
     // matches no transition and the agent leaves with `--to` instead.
     let tpl = standard("shadow", "shadow")
@@ -350,13 +343,13 @@ fn a_directed_exit_after_an_answer_in_the_same_visit_writes_nothing() {
     ok(&h.next_mode("shadow"));
     ok(&h.next_with("shadow", r#"{"verdict": "proceed"}"#));
     ok(&directed(&h, "work"));
-    let lines = ledger(&h);
-    assert_eq!(of_kind(&lines, "answered").len(), 1, "{:?}", lines);
-    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+    let c = counts(&h);
+    assert_eq!(c["answered"], 1, "{}", c);
+    assert_eq!(c["directed_exits"], 0, "{}", c);
 }
 
 #[test]
-fn only_the_consulted_visit_records_an_exit_not_a_later_one() {
+fn only_the_consulted_visit_reads_as_an_exit_not_a_later_one() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
     ok(&directed(&h, "rethink"));
@@ -364,9 +357,11 @@ fn only_the_consulted_visit_records_an_exit_not_a_later_one() {
     // has no consultation, so leaving it again has nothing to pair with.
     ok(&directed(&h, "review"));
     ok(&directed(&h, "rethink"));
-    let exits = of_kind(&ledger(&h), "directed_exit");
+    let r = report(&h);
+    assert_eq!(r["header"]["directed_exits"], 1, "{}", r["header"]);
+    let exits = listed_exits(&r);
     assert_eq!(exits.len(), 1, "{:?}", exits);
-    assert_eq!(exits[0]["target"], "rethink");
+    assert_eq!(exits[0]["directed_to"], "rethink");
     assert_eq!(h.stub.request_count(), 1);
 }
 
@@ -386,39 +381,41 @@ fn a_self_loop_directed_transition_is_a_lap_not_an_exit() {
         );
     let h = ready(&tpl, vec![go()]);
     ok(&h.next_mode("shadow"));
-    assert_eq!(of_kind(&ledger(&h), "consulted").len(), 1);
+    assert_eq!(counts(&h)["consulted"], 1);
     ok(&directed(&h, "review"));
-    let lines = ledger(&h);
-    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+    let c = counts(&h);
+    assert_eq!(c["directed_exits"], 0, "{}", c);
+    assert_eq!(c["consulted"], 1, "{}", c);
     assert_eq!(h.events_of("directed_transition").len(), 1);
 }
 
 #[test]
-fn an_answer_with_data_writes_no_directed_exit() {
+fn an_answer_with_data_reads_as_no_directed_exit() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
     ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
-    let lines = ledger(&h);
-    assert_eq!(of_kind(&lines, "consulted").len(), 1, "{:?}", lines);
-    assert_eq!(of_kind(&lines, "answered").len(), 1, "{:?}", lines);
-    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
-    assert_eq!(lines.len(), 2, "{:?}", lines);
+    let c = counts(&h);
+    assert_eq!(c["consulted"], 1, "{}", c);
+    assert_eq!(c["answered"], 1, "{}", c);
+    assert_eq!(c["directed_exits"], 0, "{}", c);
+    assert_eq!(c["lines"], 2, "{}", c);
 }
 
 #[test]
-fn the_answer_is_recorded_after_the_decider_is_switched_off() {
+fn the_answer_is_read_after_the_decider_is_switched_off() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
     // No KOTO_DECIDER at all on the answering command.
     let mut cmd = h.koto();
     cmd.args(["next", WF, "--with-data", r#"{"verdict": "exit"}"#]);
     ok(&cmd.output().unwrap());
-    let lines = ledger(&h);
-    assert_eq!(of_kind(&lines, "answered").len(), 1, "{:?}", lines);
+    let c = counts(&h);
+    assert_eq!(c["answered"], 1, "{}", c);
+    assert_eq!(c["orphaned_answered"], 0, "{}", c);
 }
 
 #[test]
-fn an_empty_header_session_id_records_null_and_changes_nothing_else() {
+fn an_empty_header_session_id_reads_as_none_and_changes_nothing_else() {
     let control = ready(&standard("shadow", "shadow"), vec![go()]);
     let control_first = json_out(&control.next_mode("shadow"));
     let control_second = json_out(&control.next_with("shadow", r#"{"verdict": "exit"}"#));
@@ -444,12 +441,12 @@ fn an_empty_header_session_id_records_null_and_changes_nothing_else() {
         assert_eq!(mine[0][key], theirs[0][key], "{}", key);
     }
 
-    let lines = ledger(&h);
-    assert_eq!(lines.len(), 2, "{:?}", lines);
-    for l in &lines {
-        assert!(l.as_object().unwrap().contains_key("session_id"), "{}", l);
-        assert!(l["session_id"].is_null(), "{}", l);
-    }
+    // Both records are read, with no session id, so they never pair.
+    let r = report(&h);
+    assert_eq!(r["header"]["lines"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["null_session_id"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_answered"], 1, "{}", r["header"]);
+    assert_eq!(only_question(&r)["paired"], 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +514,7 @@ d
 }
 
 #[test]
-fn a_line_over_the_bound_even_trimmed_is_skipped_with_a_warning() {
+fn a_wide_consultation_is_read_whole_from_the_session_with_no_warning() {
     let (tpl, names) = wide_template(80);
     let h = Harness::new(&tpl);
     h.init();
@@ -532,27 +529,24 @@ fn a_line_over_the_bound_even_trimmed_is_skipped_with_a_warning() {
     let out = h.next_mode("shadow");
     ok(&out);
     assert_eq!(h.stub.request_count(), 1);
+    assert!(warnings(&out).is_empty(), "{}", stderr(&out));
 
-    let w = warnings(&out);
-    assert_eq!(w.len(), 1, "{}", stderr(&out));
-    assert!(
-        w[0].contains(&ledger_file(&h).display().to_string()),
-        "{}",
-        w[0]
-    );
-    assert!(ledger(&h).is_empty());
-
-    // The session log still carries every probability.
+    // The session log carries every probability, and the report reads the
+    // consultation with every declared value.
     let c = h.consultations();
     assert_eq!(c.len(), 1);
     let p = c[0]["fields"]["verdict"]["probabilities"]
         .as_object()
         .unwrap();
     assert_eq!(p.len(), names.len() + 1);
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 1);
+    let q = only_question(&r);
+    assert_eq!(q["values"].as_array().unwrap().len(), names.len(), "{}", q);
 }
 
 #[test]
-fn no_input_string_or_key_reaches_the_log_or_the_ledger() {
+fn no_input_string_or_key_reaches_the_log_or_the_report() {
     // Context inputs only, so the log's own variables block holds no input.
     let tpl =
         standard("auto", "never").replace("            - {var: PLAN_DOC, label: plan_path}\n", "");
@@ -579,12 +573,15 @@ fn no_input_string_or_key_reaches_the_log_or_the_ledger() {
         assert!(inputs.iter().any(|i| i == OUTLINE));
 
         let log = h.raw_log();
-        let ledger_body = std::fs::read_to_string(ledger_file(&h)).unwrap();
+        let report_json = report(&h).to_string();
+        let table = h.koto().args(["decider", "report"]).output().unwrap();
+        let table = String::from_utf8_lossy(&table.stdout).into_owned();
         for text in inputs.iter().map(String::as_str).chain([KEY]) {
             assert!(!log.contains(text), "session log carries {:?}", text);
-            assert!(!ledger_body.contains(text), "ledger carries {:?}", text);
+            assert!(!report_json.contains(text), "report carries {:?}", text);
+            assert!(!table.contains(text), "report table carries {:?}", text);
         }
-        assert!(!ledger(&h).is_empty());
+        assert_eq!(report(&h)["header"]["consulted"], 1);
     }
 }
 
@@ -598,41 +595,11 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// A consulting run with no koto root it can create: nothing is written
+/// there, so nothing warns and nothing else changes.
 #[cfg(unix)]
 #[test]
-fn a_read_only_ledger_warns_once_and_changes_nothing_else() {
-    use std::os::unix::fs::PermissionsExt;
-    if running_as_root() {
-        return; // root writes through a 0400 file
-    }
-    let control = ready(&standard("shadow", "shadow"), vec![go()]);
-    let control_out = control.next_mode("shadow");
-    ok(&control_out);
-    assert!(
-        warnings(&control_out).is_empty(),
-        "{}",
-        stderr(&control_out)
-    );
-
-    let h = ready(&standard("shadow", "shadow"), vec![go()]);
-    let path = ledger_file(&h);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-
-    let out = h.next_mode("shadow");
-    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
-    assert_eq!(json_out(&out), json_out(&control_out));
-    let w = warnings(&out);
-    assert_eq!(w.len(), 1, "{}", stderr(&out));
-    assert!(w[0].contains(&path.display().to_string()), "{}", w[0]);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
-    assert_eq!(h.consultations().len(), 1);
-}
-
-#[cfg(unix)]
-#[test]
-fn an_uncreatable_koto_dir_warns_and_changes_nothing_else() {
+fn an_uncreatable_koto_dir_changes_nothing() {
     use std::os::unix::fs::PermissionsExt;
     if running_as_root() {
         return;
@@ -650,13 +617,13 @@ fn an_uncreatable_koto_dir_warns_and_changes_nothing_else() {
 
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
     assert_eq!(json_out(&out), json_out(&control_out));
-    assert_eq!(warnings(&out).len(), 1, "{}", stderr(&out));
+    assert!(warnings(&out).is_empty(), "{}", stderr(&out));
     assert!(!home.join(".koto").exists());
     assert_eq!(h.consultations().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
-// Survival across child cleanup
+// Children read from below their parent
 // ---------------------------------------------------------------------------
 
 const PARENT: &str = r#"---
@@ -754,7 +721,7 @@ Done.
 "#;
 
 #[test]
-fn child_records_survive_child_cleanup() {
+fn child_records_are_read_from_the_child_sessions() {
     let h = Harness::new(PARENT);
     std::fs::write(h.dir.join("child.md"), CHILD).unwrap();
     let run = |mode: &str, args: &[&str]| {
@@ -803,32 +770,28 @@ fn child_records_survive_child_cleanup() {
     );
     assert_eq!(json_out(&out)["state"], "summarize", "{}", describe(&out));
     // The children have lineage to the parent, so their terminal ticks kept
-    // them with its hierarchy; remove them by hand.
+    // them with its hierarchy, and their records with them.
     for child in ["parent.A", "parent.B"] {
-        run("off", &["session", "cleanup", child]);
-        assert!(!sessions.join(child).exists());
+        assert!(sessions.join(child).exists());
     }
 
-    let lines = ledger(&h);
-    let consulted = of_kind(&lines, "consulted");
-    let answered = of_kind(&lines, "answered");
-    assert_eq!(consulted.len(), 2, "{:?}", lines);
-    assert_eq!(answered.len(), 1, "{:?}", lines);
-    let a = consulted
-        .iter()
-        .find(|c| c["session"] == "parent.A")
-        .unwrap();
-    let b = consulted
-        .iter()
-        .find(|c| c["session"] == "parent.B")
-        .unwrap();
-    assert_eq!(a["outcome"], "not_applied");
-    assert_eq!(b["outcome"], "applied");
-    assert_ne!(a["session_id"], b["session_id"]);
-    assert!(a["session_id"].is_string() && b["session_id"].is_string());
-    assert_eq!(answered[0]["session"], "parent.A");
-    assert_eq!(answered[0]["session_id"], a["session_id"]);
-    assert_eq!(answered[0]["visit_seq"], a["visit_seq"]);
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["answered"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_answered"], 0, "{}", r["header"]);
+    let q = only_question(&r);
+    assert_eq!(q["outcomes"]["applied"], 1, "{}", q);
+    assert_eq!(q["outcomes"]["not_applied"], 1, "{}", q);
+    // A's answer pairs with A's consultation, under A's own session id.
+    assert_eq!(q["paired"], 1);
+    let d = &q["disagreements"][0];
+    assert_eq!(d["session"], "parent.A");
+    assert_eq!(d["agent"], "exit");
+    let a_log =
+        std::fs::read_to_string(sessions.join("parent.A").join("koto-parent.A.state.jsonl"))
+            .unwrap();
+    let a_header: Value = serde_json::from_str(a_log.lines().next().unwrap()).unwrap();
+    assert_eq!(d["session_id"], a_header["session_id"]);
 }
 
 // ---------------------------------------------------------------------------

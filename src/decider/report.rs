@@ -1,11 +1,13 @@
-//! `koto decider report`: read the ledger, join its records into per-question
-//! metrics, run golden fixtures, and judge promotion eligibility.
+//! `koto decider report`: read the decider's records from session logs,
+//! join them into per-question metrics, run golden fixtures, and judge
+//! promotion eligibility.
 //!
 //! See docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Everything
-//! here is read-only: the ledger is read, never written, and the fixture
+//! here is read-only: session logs are read, never written, and the fixture
 //! runner sends requests through the caller's [`Decider`] but records
-//! nothing. The only I/O is [`read_ledger`]; the CLI in `src/cli/decider.rs`
-//! resolves settings, compiles the template, and prints.
+//! nothing. The only I/O is [`read_sessions`], which rebuilds each session's
+//! records with [`records_from_session`]; the CLI in `src/cli/decider.rs`
+//! picks the sessions, resolves settings, compiles the template, and prints.
 //!
 //! ## Terms
 //!
@@ -35,15 +37,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::session::SessionBackend;
 use crate::template::decider::DeciderMode;
 
 use super::evaluate::{evaluate, EffectiveModes, FieldEvaluation, FieldOutcome};
-use super::ledger::{AnsweredRecord, ConsultedRecord, DirectedExitRecord, LedgerRecord};
+use super::ledger::{
+    records_from_session, AnsweredRecord, ConsultedRecord, DirectedExitRecord, LedgerRecord,
+    SessionRecords,
+};
 use super::record::{ConsultationOutcome, FieldConsultation};
 use super::request::{build_request, AssembledInputs, DeclaredField, DeclaredKind};
 use super::types::{Decider, DeciderError, ErrorClass, SettingOrigin};
@@ -83,82 +88,53 @@ pub const COL_NO_ANSWER: &str = "no_answer";
 // Reading
 // ---------------------------------------------------------------------------
 
-/// The ledger's parsed records and what was skipped.
+/// The decider records read from sessions, and what was skipped.
 #[derive(Debug, Clone, Default)]
 pub struct LedgerRead {
-    /// Records in file order.
+    /// Records, session by session in the order read, each session's in
+    /// log order.
     pub records: Vec<LedgerRecord>,
-    /// Non-blank lines seen, skipped ones included.
+    /// Records read plus everything skipped.
     pub lines: u64,
-    /// Lines skipped as malformed: bad JSON, a missing or mistyped key, or
-    /// a final line with no newline.
+    /// Skipped as malformed: a session whose log can't be read, or a
+    /// `decider_consulted` or `decider_checked` event this build can't
+    /// read.
     pub malformed: u64,
-    /// Well-formed lines whose `kind` is not `consulted`, `answered`, or
-    /// `directed_exit`.
+    /// Always 0 when read from sessions, since every record comes from an
+    /// event this build knows. Kept so the report's header keeps its shape.
     pub unknown_kind: u64,
 }
 
-/// One classified line.
-enum Line {
-    Record(Box<LedgerRecord>),
-    Malformed,
-    UnknownKind,
-}
-
-fn parse_line(bytes: &[u8]) -> Line {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return Line::Malformed;
-    };
-    match value.get("kind").and_then(Value::as_str) {
-        None => return Line::Malformed,
-        Some("consulted")
-        | Some("answered")
-        | Some("directed_exit")
-        | Some("checked")
-        | Some("check_overridden") => {}
-        Some(_) => return Line::UnknownKind,
+impl LedgerRead {
+    /// Add one session's records.
+    pub fn push_session(&mut self, read: SessionRecords) {
+        self.lines += read.records.len() as u64 + read.malformed;
+        self.malformed += read.malformed;
+        self.records.extend(read.records);
     }
-    match serde_json::from_value::<LedgerRecord>(value) {
-        Ok(r) => Line::Record(Box::new(r)),
-        Err(_) => Line::Malformed,
+
+    /// Count a session whose log couldn't be read.
+    pub fn push_unreadable(&mut self) {
+        self.lines += 1;
+        self.malformed += 1;
     }
 }
 
-/// Parse a ledger body. Blank lines are ignored; a final line without its
-/// newline is a torn write and counts as malformed.
-pub fn parse_ledger(body: &[u8]) -> LedgerRead {
+/// Read the decider records of each of `sessions`, in that order, from the
+/// local copy of its log. Nothing is written and nothing is fetched.
+pub fn read_sessions(backend: &dyn SessionBackend, sessions: &[String]) -> LedgerRead {
     let mut read = LedgerRead::default();
-    let mut rest = body;
-    while !rest.is_empty() {
-        let (line, terminated, next) = match rest.iter().position(|b| *b == b'\n') {
-            Some(i) => (&rest[..i], true, &rest[i + 1..]),
-            None => (rest, false, &rest[rest.len()..]),
-        };
-        rest = next;
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        read.lines += 1;
-        if !terminated {
-            read.malformed += 1;
-            continue;
-        }
-        match parse_line(line) {
-            Line::Record(r) => read.records.push(*r),
-            Line::Malformed => read.malformed += 1,
-            Line::UnknownKind => read.unknown_kind += 1,
+    for name in sessions {
+        match backend.read_events_local(name) {
+            Ok((header, events)) => read.push_session(records_from_session(
+                name,
+                Some(header.session_id.as_str()),
+                &events,
+            )),
+            Err(_) => read.push_unreadable(),
         }
     }
     read
-}
-
-/// Read and parse the ledger at `path`. A missing file is an empty ledger.
-pub fn read_ledger(path: &Path) -> std::io::Result<LedgerRead> {
-    match std::fs::read(path) {
-        Ok(body) => Ok(parse_ledger(&body)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(LedgerRead::default()),
-        Err(e) => Err(e),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1411,9 @@ pub fn judge(input: &JudgeInput<'_>, results: Vec<CaseResult>) -> FixtureReport 
 /// The whole report, as `--json` prints it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
+    /// Where the records were read from: the session store's directory,
+    /// with ` (below <session>)` when `--below` narrowed it. The key keeps
+    /// the name it had when the report read a ledger file.
     pub ledger: String,
     pub header: Header,
     pub questions: Vec<QuestionReport>,
@@ -1479,7 +1458,7 @@ fn render_confusion(out: &mut String, c: &Confusion, corner: &str) {
 pub fn render_table(report: &Report) -> String {
     let mut out = String::new();
     let h = &report.header;
-    let _ = writeln!(out, "decider ledger: {}", report.ledger);
+    let _ = writeln!(out, "decider sessions: {}", report.ledger);
     let _ = writeln!(
         out,
         "  {} lines: {} consulted, {} answered; skipped {} malformed, {} unknown kind",
@@ -1729,7 +1708,7 @@ fn render_fixtures(out: &mut String, f: &FixtureReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decider::ledger::render_line;
+    use crate::decider::ledger::RecordEnvelope;
     use crate::decider::record::DeciderConsultation;
 
     fn modes(auto: bool) -> BTreeMap<String, DeciderMode> {
@@ -1767,10 +1746,9 @@ mod tests {
             at_threshold: at,
             outcome: fo,
         };
-        LedgerRecord::consulted(
-            "wf",
-            sid,
-            DeciderConsultation {
+        LedgerRecord::Consulted(ConsultedRecord {
+            envelope: RecordEnvelope::new("t", "wf", sid),
+            consultation: DeciderConsultation {
                 state: "review".to_string(),
                 visit_seq: seq,
                 provider: "jev".to_string(),
@@ -1789,47 +1767,94 @@ mod tests {
                 input_label: None,
                 input_bytes: None,
             },
-        )
+        })
     }
 
     fn answered(sid: Option<&str>, seq: u64, v: &str) -> LedgerRecord {
-        LedgerRecord::answered(
-            "wf",
-            sid,
-            "review",
-            seq,
-            [("verdict".to_string(), Value::String(v.to_string()))]
+        LedgerRecord::Answered(AnsweredRecord {
+            envelope: RecordEnvelope::new("t", "wf", sid),
+            state: "review".to_string(),
+            visit_seq: seq,
+            values: [("verdict".to_string(), Value::String(v.to_string()))]
                 .into_iter()
                 .collect(),
-        )
+        })
     }
 
-    fn body(records: &[LedgerRecord]) -> String {
-        records
-            .iter()
-            .map(|r| render_line(r).unwrap() + "\n")
-            .collect()
+    fn read_of(records: Vec<LedgerRecord>) -> LedgerRead {
+        let mut read = LedgerRead::default();
+        read.push_session(SessionRecords {
+            records,
+            malformed: 0,
+        });
+        read
     }
 
     #[test]
-    fn reader_skips_and_counts_bad_lines() {
-        let mut b = body(&[consulted(
-            Some("s"),
-            1,
+    fn the_reader_counts_records_and_skipped_sessions_and_events() {
+        let mut read = LedgerRead::default();
+        read.push_session(SessionRecords {
+            records: vec![consulted(
+                Some("s"),
+                1,
+                ConsultationOutcome::NotApplied,
+                Some("proceed"),
+                true,
+            )],
+            malformed: 2,
+        });
+        read.push_unreadable();
+        read.push_session(SessionRecords {
+            records: vec![answered(Some("s"), 1, "proceed")],
+            malformed: 0,
+        });
+        assert_eq!(read.records.len(), 2);
+        assert_eq!(read.lines, 5);
+        assert_eq!(read.malformed, 3);
+        assert_eq!(read.unknown_kind, 0);
+    }
+
+    #[test]
+    fn read_sessions_reads_each_named_session_and_counts_a_missing_one() {
+        use crate::engine::types::{Event, EventPayload, StateFileHeader};
+        use crate::session::local::LocalBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        backend.create("wf").unwrap();
+        let header: StateFileHeader = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow": "wf",
+            "template_hash": "0".repeat(64),
+            "created_at": "2026-01-01T00:00:00Z",
+            "session_id": "sid-1",
+        }))
+        .unwrap();
+        let LedgerRecord::Consulted(c) = consulted(
+            None,
+            2,
             ConsultationOutcome::NotApplied,
             Some("proceed"),
             true,
-        )]);
-        b.push_str("{not json\n");
-        b.push_str("{\"kind\":\"answered\",\"v\":1}\n");
-        b.push_str("{\"kind\":\"future\",\"v\":2}\n");
-        b.push('\n');
-        b.push_str(&render_line(&answered(Some("s"), 1, "proceed")).unwrap());
-        let read = parse_ledger(b.as_bytes());
+        ) else {
+            unreachable!()
+        };
+        let payload = EventPayload::DeciderConsulted(c.consultation);
+        let events = vec![Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }];
+        backend.init_state_file("wf", header, events).unwrap();
+        let read = read_sessions(&backend, &["wf".to_string(), "gone".to_string()]);
         assert_eq!(read.records.len(), 1);
-        assert_eq!(read.lines, 5);
-        assert_eq!(read.malformed, 3);
-        assert_eq!(read.unknown_kind, 1);
+        assert_eq!(read.malformed, 1);
+        let LedgerRecord::Consulted(c) = &read.records[0] else {
+            panic!("kind");
+        };
+        assert_eq!(c.envelope.session, "wf");
+        assert_eq!(c.envelope.session_id.as_deref(), Some("sid-1"));
     }
 
     #[test]
@@ -1864,7 +1889,7 @@ mod tests {
             consulted(None, 2, ConsultationOutcome::NotApplied, Some("exit"), true),
             answered(None, 2, "exit"),
         ];
-        let read = parse_ledger(body(&records).as_bytes());
+        let read = read_of(records);
         let r = analyze(&read, &ReportOptions::default());
         assert_eq!(r.header.duplicate_consulted, 1);
         assert_eq!(r.header.orphaned_answered, 2);

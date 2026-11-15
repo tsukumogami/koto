@@ -1,11 +1,11 @@
-//! `koto decider report`: the ledger join, the metrics, the fixture runner,
-//! and promotion eligibility.
+//! `koto decider report`: the join of the decider's records read from
+//! session logs, the metrics, the fixture runner, and promotion eligibility.
 //!
 //! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Every harness
-//! sets `HOME` to a temp directory, so no test reads or writes a developer's
-//! real ledger. Only commands that run fixtures opt in, each on its own
-//! `Command`, and every one of them points the endpoint at the `std::net`
-//! loopback stub.
+//! sets `HOME` to a temp directory and its sessions base to another, so no
+//! test reads or writes a developer's real store. Only commands that run
+//! fixtures opt in, each on its own `Command`, and every one of them points
+//! the endpoint at the `std::net` loopback stub.
 
 #[path = "support/decider_stub.rs"]
 mod decider_stub;
@@ -30,16 +30,110 @@ use serde_json::{json, Value};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ledger_file(h: &Harness) -> PathBuf {
+/// The host file koto once kept these records in. koto no longer uses it;
+/// tests plant one to show the report ignores it.
+fn old_ledger_file(h: &Harness) -> PathBuf {
     h.home().join(".koto").join("_decider_ledger.jsonl")
 }
 
-/// Write `lines` (each followed by a newline) as the harness's ledger.
-fn write_ledger(h: &Harness, lines: &[Value]) {
-    let path = ledger_file(h);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let body: String = lines.iter().map(|l| format!("{}\n", l)).collect();
-    std::fs::write(path, body).unwrap();
+/// The harness's session store.
+fn sessions_dir(h: &Harness) -> PathBuf {
+    h.dir.join("sessions")
+}
+
+/// The fixture session holding visit `seq` of `sid` (`none` for a header
+/// with no session id), padded so the store's name order is visit order.
+fn fixture_session(sid: Option<&str>, seq: u64) -> String {
+    format!("fx-{}-{:04}", sid.unwrap_or("none"), seq)
+}
+
+/// Write a session log: `header` and `events`, numbered from 1.
+fn write_log(h: &Harness, name: &str, session_id: &str, events: &[Value]) {
+    let dir = sessions_dir(h).join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut body = format!(
+        "{}\n",
+        json!({
+            "schema_version": 1,
+            "workflow": name,
+            "template_hash": "0".repeat(64),
+            "created_at": "2026-01-01T00:00:00Z",
+            "session_id": session_id,
+        })
+    );
+    for (i, e) in events.iter().enumerate() {
+        let mut e = e.clone();
+        e["seq"] = json!(i as u64 + 1);
+        e["timestamp"] = json!("2026-01-01T00:00:00Z");
+        body.push_str(&format!("{}\n", e));
+    }
+    std::fs::write(dir.join(format!("koto-{}.state.jsonl", name)), body).unwrap();
+}
+
+fn transitioned(from: Option<&str>, to: &str) -> Value {
+    json!({"type": "transitioned",
+        "payload": {"from": from, "to": to, "condition_type": "auto"}})
+}
+
+/// The events a record is read from.
+fn record_event(line: &Value) -> Value {
+    let state = line["state"].as_str().unwrap();
+    match line["kind"].as_str().unwrap() {
+        "consulted" => {
+            let mut payload = line.clone();
+            for key in ["kind", "v", "at", "session", "session_id"] {
+                payload.as_object_mut().unwrap().remove(key);
+            }
+            json!({"type": "decider_consulted", "payload": payload})
+        }
+        "answered" => json!({"type": "evidence_submitted",
+            "payload": {"state": state, "fields": line["values"]}}),
+        "directed_exit" => json!({"type": "directed_transition",
+            "payload": {"from": state, "to": line["target"]}}),
+        other => panic!("no session event for {}", other),
+    }
+}
+
+/// Write `lines`, each a record `koto decider report` reads, as session
+/// logs: one session per `(session_id, visit_seq)`, its header carrying the
+/// session id and its visit to the record's state beginning at event
+/// `visit_seq`, so the report rebuilds each record from the events koto
+/// itself appends. Replaces the fixture sessions written before.
+fn write_sessions(h: &Harness, lines: &[Value]) {
+    let base = sessions_dir(h);
+    std::fs::create_dir_all(&base).unwrap();
+    for entry in std::fs::read_dir(&base).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("fx-") {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+    type Key = (Option<String>, u64);
+    let mut groups: Vec<(Key, Vec<&Value>)> = Vec::new();
+    for l in lines {
+        let key = (
+            l["session_id"].as_str().map(str::to_string),
+            l["visit_seq"].as_u64().unwrap(),
+        );
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(l),
+            None => groups.push((key, vec![l])),
+        }
+    }
+    for ((sid, seq), group) in groups {
+        let state = group[0]["state"].as_str().unwrap();
+        let mut events = Vec::new();
+        if seq > 1 {
+            events.push(json!({"type": "workflow_initialized",
+                "payload": {"template_path": "t.json", "variables": {}}}));
+        }
+        while (events.len() as u64) + 1 < seq {
+            events.push(transitioned(None, "intake"));
+        }
+        events.push(transitioned(None, state));
+        events.extend(group.iter().map(|l| record_event(l)));
+        let name = fixture_session(sid.as_deref(), seq);
+        write_log(h, &name, sid.as_deref().unwrap_or(""), &events);
+    }
 }
 
 /// A `consulted` line for `review.verdict`. `winning` is `None` for a
@@ -314,7 +408,7 @@ fn run_scenario(s: &Scenario, extra: &[&str]) -> Value {
 }
 
 fn run_scenario_in(h: &Harness, s: &Scenario, extra: &[&str]) -> Value {
-    write_ledger(h, &s.ledger);
+    write_sessions(h, &s.ledger);
     write_fixtures(h, &fixture_body(&s.labels));
     for a in &s.answers {
         h.stub.push(say(a));
@@ -342,7 +436,7 @@ fn help_lists_every_flag() {
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     for flag in [
-        "--ledger",
+        "--below",
         "--state",
         "--json",
         "--include-custom-endpoints",
@@ -352,6 +446,10 @@ fn help_lists_every_flag() {
     ] {
         assert!(help.contains(flag), "{} missing from:\n{}", flag, help);
     }
+    // The flag that named a ledger file is gone.
+    assert!(!help.contains("--ledger"), "{}", help);
+    let out = report(&h, &["--ledger", "x.jsonl"]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
 }
 
 #[test]
@@ -381,7 +479,7 @@ fn clap_enforces_the_fixture_flag_pairings() {
 }
 
 #[test]
-fn default_ledger_is_under_home_and_a_missing_one_is_an_empty_report() {
+fn the_report_reads_the_session_store_and_an_empty_one_is_an_empty_report() {
     let h = Harness::new(&standard("shadow", "shadow"));
     let r = report_json(&h, &[]);
     assert_eq!(r["questions"], json!([]));
@@ -389,7 +487,7 @@ fn default_ledger_is_under_home_and_a_missing_one_is_an_empty_report() {
     assert_eq!(r["fixtures"], Value::Null);
     assert_eq!(
         r["ledger"].as_str().unwrap(),
-        ledger_file(&h).display().to_string()
+        sessions_dir(&h).display().to_string()
     );
     assert!(
         !h.home().join(".koto").exists(),
@@ -397,16 +495,19 @@ fn default_ledger_is_under_home_and_a_missing_one_is_an_empty_report() {
     );
     let out = report(&h, &[]);
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let table = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        table.starts_with(&format!(
+            "decider sessions: {}\n",
+            sessions_dir(&h).display()
+        )),
+        "{}",
+        table
+    );
 
-    write_ledger(&h, &pair("s1", 1, "h1", "proceed", "proceed"));
+    write_sessions(&h, &pair("s1", 1, "h1", "proceed", "proceed"));
     let r = report_json(&h, &[]);
     assert_eq!(r["questions"].as_array().unwrap().len(), 1);
-
-    // --ledger names another file.
-    let other = h.dir.join("other.jsonl");
-    std::fs::write(&other, "").unwrap();
-    let r = report_json(&h, &["--ledger", other.to_str().unwrap()]);
-    assert_eq!(r["questions"], json!([]));
 }
 
 #[test]
@@ -416,7 +517,7 @@ fn state_limits_the_questions_in_json_and_table() {
     let mut other = consulted(Some("s1"), 5, "h9", "not_applied", Some("exit"), true);
     other["state"] = json!("triage");
     lines.push(other);
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
 
     let all = report_json(&h, &[]);
     assert_eq!(all["questions"].as_array().unwrap().len(), 2);
@@ -457,7 +558,7 @@ fn the_report_changes_no_byte_with_or_without_fixtures() {
     h.project_config("[decider]\nmode = \"auto\"\n");
     let mut lines = eligible_ledger(&hash);
     lines.push(consulted(Some("s2"), 1, &hash, "error", None, false));
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
     write_fixtures(&h, &fixture_body(&["proceed", "exit"]));
     h.stub.set_default(say("proceed"));
 
@@ -466,7 +567,12 @@ fn the_report_changes_no_byte_with_or_without_fixtures() {
         h.dir.join("template.md"),
         h.home().join(".koto").join("config.toml"),
         h.dir.join(".koto").join("config.toml"),
-        ledger_file(&h),
+        sessions_dir(&h)
+            .join(fixture_session(Some("s2"), 1))
+            .join(format!(
+                "koto-{}.state.jsonl",
+                fixture_session(Some("s2"), 1)
+            )),
     ] {
         assert!(
             before.contains_key(&key),
@@ -502,11 +608,8 @@ fn the_report_changes_no_byte_with_or_without_fixtures() {
         "a file or directory was created or removed (compile cache, session dir, ...)"
     );
     assert_eq!(before, after, "a byte changed");
-    // No session directory, and so no session event.
-    assert_eq!(
-        std::fs::read_dir(h.dir.join("sessions")).unwrap().count(),
-        0
-    );
+    // Only the fixture sessions: no session created, and no event appended.
+    assert_eq!(std::fs::read_dir(sessions_dir(&h)).unwrap().count(), 31);
 
     // The cache probe works: compiling through the cache does create it.
     assert!(!cache.exists());
@@ -561,7 +664,7 @@ fn metrics_ledger() -> Vec<Value> {
 #[test]
 fn json_reports_the_exact_metrics_for_a_known_ledger() {
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(&h, &metrics_ledger());
+    write_sessions(&h, &metrics_ledger());
     let r = report_json(&h, &[]);
     assert_eq!(r["questions"].as_array().unwrap().len(), 2);
 
@@ -612,7 +715,7 @@ fn json_reports_the_exact_metrics_for_a_known_ledger() {
     assert_eq!(
         a["disagreements"],
         json!([{
-            "session": "wf",
+            "session": "fx-s1-0002",
             "session_id": "s1",
             "visit_seq": 2,
             "agent": "exit",
@@ -662,7 +765,7 @@ fn pct(x: &Value) -> String {
 #[test]
 fn the_table_shows_the_same_numbers_as_json() {
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(&h, &metrics_ledger());
+    write_sessions(&h, &metrics_ledger());
     let r = report_json(&h, &[]);
     let out = report(&h, &[]);
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
@@ -784,7 +887,7 @@ fn coverage_ignores_unavailable_and_error_consultations_but_rates_do_not() {
     ] {
         base.push(consulted(Some("s"), seq, "h", "not_applied", Some(w), at));
     }
-    write_ledger(&h, &base);
+    write_sessions(&h, &base);
     let before = report_json(&h, &[]);
     let b = question(&before, "h").clone();
 
@@ -798,7 +901,7 @@ fn coverage_ignores_unavailable_and_error_consultations_but_rates_do_not() {
         false,
     ));
     more.push(consulted(Some("s"), 6, "h", "error", None, false));
-    write_ledger(&h, &more);
+    write_sessions(&h, &more);
     let after = report_json(&h, &[]);
     let a = question(&after, "h");
 
@@ -824,7 +927,7 @@ fn coverage_ignores_unavailable_and_error_consultations_but_rates_do_not() {
         Some("proceed"),
         true,
     ));
-    write_ledger(&h, &applied_base);
+    write_sessions(&h, &applied_base);
     let fb_before = f(&question(&report_json(&h, &[]), "h")["rates"]["fallback"]);
     applied_base.push(consulted(
         Some("s"),
@@ -835,7 +938,7 @@ fn coverage_ignores_unavailable_and_error_consultations_but_rates_do_not() {
         false,
     ));
     applied_base.push(consulted(Some("s"), 6, "h", "error", None, false));
-    write_ledger(&h, &applied_base);
+    write_sessions(&h, &applied_base);
     let fb_after = f(&question(&report_json(&h, &[]), "h")["rates"]["fallback"]);
     assert_eq!(fb_before, 4.0 / 5.0);
     assert_eq!(fb_after, 6.0 / 7.0);
@@ -854,7 +957,7 @@ fn latency_percentiles_exclude_input_unavailable() {
     let mut iu = consulted(Some("s"), 4, "h", "input_unavailable", None, false);
     iu["latency_ms"] = json!(99_999);
     lines.push(iu);
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
     let r = report_json(&h, &[]);
     let q = question(&r, "h");
     assert_eq!(q["consultations"], 4);
@@ -864,12 +967,11 @@ fn latency_percentiles_exclude_input_unavailable() {
 #[test]
 fn a_null_session_id_is_counted_but_never_paired() {
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(
+    write_sessions(
         &h,
         &[
             consulted(None, 3, "h", "not_applied", Some("proceed"), true),
             answered(None, 3, json!("exit")),
-            answered(Some("s"), 3, json!("exit")),
         ],
     );
     let r = report_json(&h, &[]);
@@ -878,27 +980,30 @@ fn a_null_session_id_is_counted_but_never_paired() {
     assert_eq!(q["paired"], 0);
     assert_eq!(q["disagreements"], json!([]));
     assert_eq!(r["header"]["null_session_id"], 1);
-    assert_eq!(r["header"]["orphaned_answered"], 2);
+    // The answer is read from the session but can't be paired.
+    assert_eq!(r["header"]["answered"], 1);
+    assert_eq!(r["header"]["orphaned_answered"], 1);
 }
 
 #[test]
-fn later_answers_win_duplicates_are_counted_once_and_orphans_are_counted() {
+fn later_answers_win_and_duplicates_are_counted_once() {
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(
+    write_sessions(
         &h,
         &[
             consulted(Some("s"), 1, "h", "not_applied", Some("proceed"), true),
             answered(Some("s"), 1, json!("exit")),
             consulted(Some("s"), 1, "h", "not_applied", Some("proceed"), true),
             answered(Some("s"), 1, json!("proceed")),
+            // No consultation in visit 42: its evidence is no answer to one.
             answered(Some("s"), 42, json!("exit")),
         ],
     );
     let r = report_json(&h, &[]);
     assert_eq!(r["header"]["consulted"], 2);
     assert_eq!(r["header"]["duplicate_consulted"], 1);
-    assert_eq!(r["header"]["answered"], 3);
-    assert_eq!(r["header"]["orphaned_answered"], 1);
+    assert_eq!(r["header"]["answered"], 2);
+    assert_eq!(r["header"]["orphaned_answered"], 0);
     let q = question(&r, "h");
     assert_eq!(q["consultations"], 1);
     assert_eq!(q["paired"], 1);
@@ -908,31 +1013,33 @@ fn later_answers_win_duplicates_are_counted_once_and_orphans_are_counted() {
 }
 
 #[test]
-fn malformed_lines_are_skipped_and_counted_and_the_report_is_full() {
+fn unreadable_sessions_and_events_are_skipped_and_counted_and_the_report_is_full() {
     let h = Harness::new(&standard("shadow", "shadow"));
     let good = metrics_ledger();
     let clean = {
-        write_ledger(&h, &good);
+        write_sessions(&h, &good);
         report_json(&h, &[])
     };
 
+    // A consultation event this build can't read, beside a readable one.
     let mut missing_key = consulted(Some("s9"), 1, "ha", "not_applied", Some("proceed"), true);
     missing_key.as_object_mut().unwrap().remove("visit_seq");
-    let mut body = String::new();
-    for (i, l) in good.iter().enumerate() {
-        body.push_str(&format!("{}\n", l));
-        if i == 2 {
-            body.push_str("{this is not json\n");
-            body.push_str(&format!("{}\n", missing_key));
-            body.push_str("{\"kind\":\"retracted\",\"v\":2}\n");
-        }
-    }
-    body.push_str(&answered(Some("s1"), 8, json!("exit")).to_string());
-    std::fs::write(ledger_file(&h), body).unwrap();
+    let mut bad = record_event(&missing_key);
+    bad["payload"]["state"] = json!("review");
+    write_log(
+        &h,
+        "fx-s9-0001",
+        "s9",
+        &[transitioned(None, "review"), bad.clone(), bad],
+    );
+    // A session whose log can't be read at all.
+    let dir = sessions_dir(&h).join("fx-torn");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("koto-fx-torn.state.jsonl"), "{this is not json\n").unwrap();
 
     let r = report_json(&h, &[]);
     assert_eq!(r["header"]["skipped_malformed"], 3);
-    assert_eq!(r["header"]["unknown_kind"], 1);
+    assert_eq!(r["header"]["unknown_kind"], 0);
     assert_eq!(r["questions"], clean["questions"]);
 
     let out = report(&h, &[]);
@@ -940,7 +1047,7 @@ fn malformed_lines_are_skipped_and_counted_and_the_report_is_full() {
     let table = String::from_utf8_lossy(&out.stdout);
     let header: String = table.lines().take(4).collect::<Vec<_>>().join("\n");
     assert!(
-        header.contains("skipped 3 malformed, 1 unknown kind"),
+        header.contains("skipped 3 malformed, 0 unknown kind"),
         "{}",
         header
     );
@@ -966,7 +1073,7 @@ fn auto_ledger(n: u64, covered: u64) -> Vec<Value> {
 fn low_coverage_is_flagged_only_past_its_boundaries() {
     let h = Harness::new(&standard("shadow", "shadow"));
     for (n, covered, flagged) in [(30, 8, true), (29, 8, false), (30, 9, false), (31, 9, true)] {
-        write_ledger(&h, &auto_ledger(n, covered));
+        write_sessions(&h, &auto_ledger(n, covered));
         let r = report_json(&h, &[]);
         let flags = question(&r, "h")["flags"].as_array().unwrap().clone();
         assert_eq!(
@@ -982,7 +1089,7 @@ fn low_coverage_is_flagged_only_past_its_boundaries() {
     let lines: Vec<Value> = (0..40)
         .map(|i| consulted(Some("s"), i + 1, "h", "not_applied", Some("proceed"), false))
         .collect();
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
     assert_eq!(question(&report_json(&h, &[]), "h")["flags"], json!([]));
 }
 
@@ -1091,7 +1198,7 @@ fn a_fixture_run_against_the_stub_counts_only_with_the_flag() {
 
     // The table says why too.
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(&h, &eligible_ledger(&hash));
+    write_sessions(&h, &eligible_ledger(&hash));
     write_fixtures(&h, &fixture_body(&baseline(&hash).labels));
     h.stub.set_default(say("proceed"));
     let mut cmd = opted_in(&h);
@@ -1127,7 +1234,7 @@ fn metrics_keep_custom_endpoint_consultations_and_the_header_counts_them() {
     user[0]["endpoint_origin"] = json!("user");
     lines.extend(env);
     lines.extend(user);
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
 
     let r = report_json(&h, &[]);
     assert_eq!(r["header"]["custom_endpoint_consultations"], 2);
@@ -1590,24 +1697,25 @@ fn a_directed_exit_where_the_decider_chose_the_value_is_disqualifying() {
 #[test]
 fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
     let h = Harness::new(&standard("shadow", "shadow"));
-    write_ledger(
+    write_sessions(
         &h,
         &[
             consulted(Some("s"), 1, "h", "not_applied", Some("proceed"), true),
-            directed_exit(Some("s"), 1, "rethink"),
-            // A repeated line is counted in the header but joined once.
             directed_exit(Some("s"), 1, "rethink"),
             consulted(Some("s"), 2, "h", "not_applied", Some("exit"), false),
             directed_exit(Some("s"), 2, "work"),
             consulted(Some("s"), 3, "h", "not_applied", Some("exit"), true),
             answered(Some("s"), 3, json!("exit")),
+            // Unconsulted visit 99: its `--to` is no exit from a consultation.
             directed_exit(Some("s"), 99, "work"),
+            // A session with no id: counted, never joined.
+            consulted(None, 1, "h", "not_applied", Some("exit"), false),
             directed_exit(None, 1, "work"),
         ],
     );
     let r = report_json(&h, &[]);
-    assert_eq!(r["header"]["directed_exits"], 5, "{}", r["header"]);
-    assert_eq!(r["header"]["orphaned_directed_exits"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["directed_exits"], 3, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_directed_exits"], 1, "{}", r["header"]);
     assert_eq!(r["header"]["unknown_kind"], 0);
     assert_eq!(r["header"]["skipped_malformed"], 0);
 
@@ -1657,10 +1765,10 @@ fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
     let table = String::from_utf8_lossy(&out.stdout);
     for e in [
-        "5 directed exits (2 orphaned)",
+        "3 directed exits (1 orphaned)",
         "directed exits 2 (2 counted)",
-        "s/1 (wf): agent left with --to rethink, decider proceed",
-        "s/2 (wf): agent left with --to work, decider below_threshold",
+        "s/1 (fx-s-0001): agent left with --to rethink, decider proceed",
+        "s/2 (fx-s-0002): agent left with --to work, decider below_threshold",
     ] {
         assert!(table.contains(e), "missing {:?} in:\n{}", e, table);
     }
@@ -1712,7 +1820,7 @@ fn one_no_answer_case_makes_every_value_ineligible() {
     let h = Harness::new(&standard("shadow", "shadow"));
     let mut s = baseline(&hash);
     s.labels.push("proceed");
-    write_ledger(&h, &s.ledger);
+    write_sessions(&h, &s.ledger);
     write_fixtures(&h, &fixture_body(&s.labels));
     for a in &s.answers {
         h.stub.push(say(a));
@@ -1866,7 +1974,7 @@ fn a_boolean_declaration_needs_ten_of_each_side_and_reports_both() {
         ledger.push(c);
         ledger.push(a);
     }
-    write_ledger(&h, &ledger);
+    write_sessions(&h, &ledger);
 
     let run = |trues: usize, falses: usize| -> Value {
         let lines: String = (0..trues)
@@ -1931,7 +2039,7 @@ fn a_never_value_is_evaluated_noted_and_can_be_eligible() {
 
     // The table carries the note.
     let h = Harness::new(&standard("shadow", "never"));
-    write_ledger(&h, &s.ledger);
+    write_sessions(&h, &s.ledger);
     write_fixtures(&h, &fixture_body(&s.labels));
     for a in &s.answers {
         h.stub.push(say(a));
@@ -1983,6 +2091,365 @@ fn the_report_pairs_records_written_by_koto_next() {
     assert_eq!(q["confusion"]["rows"]["exit"]["proceed"], 1);
     assert_eq!(q["disagreements"][0]["agent"], "exit");
     assert_eq!(q["disagreements"][0]["decider"], "proceed");
+}
+
+// ---------------------------------------------------------------------------
+// Every record kind read from the session that made it
+// ---------------------------------------------------------------------------
+
+/// [`STANDARD`] in shadow, with a veto decider check `comments` on `work`.
+fn checked_template() -> String {
+    standard("shadow", "shadow").replace(
+        "  work:\n    accepts:",
+        r#"  work:
+    gates:
+      comments:
+        type: decider-check
+        command: "cat slice.txt"
+        label: comments
+        criteria:
+          r:
+            rule_ref: "https://example.org/rules/r"
+            question: "Does each comment give a reason?"
+            pass: "Every comment says why."
+            fail: "A comment restates the code."
+            escape: "No comment, or can't tell."
+            mode: veto
+    accepts:"#,
+    )
+}
+
+/// The decider check's failing verdict on criterion `r`.
+fn check_fails() -> Reply {
+    Reply::json(&json!({
+        "model": "jev-test-1.2.3",
+        "answers": {"r": {"type": "choice", "choice": "fail",
+            "probabilities": {"pass": 0.02, "fail": 0.95, "unclear": 0.03}}},
+        "usage": {"input_tokens": 100, "output_tokens": 3}
+    }))
+}
+
+/// Run `cmd` and require it to succeed with nothing on stderr about a
+/// decider ledger.
+fn step(cmd: &mut Command, what: &str) {
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}: {}", what, describe(&out));
+    assert!(
+        !stderr(&out).contains("ledger"),
+        "{}: {}",
+        what,
+        describe(&out)
+    );
+}
+
+/// A run that consults the grader, answers the consultation, has a check
+/// graded and overridden, and leaves a second consulted visit with `--to`.
+/// Returns the session id.
+fn run_every_kind(h: &Harness) -> String {
+    std::fs::write(h.dir.join("slice.txt"), "let x = 1; // set x to 1\n").unwrap();
+    h.ready();
+    // In request order: two consultations of `review`, the check on `work`,
+    // and the third consultation of `review`.
+    h.stub.push(say("proceed"));
+    h.stub.push(say("proceed"));
+    h.stub.push(check_fails());
+    h.stub.push(say("proceed"));
+    step(h.koto_mode("auto").args(["next", WF]), "consult");
+    step(
+        h.koto_mode("auto")
+            .args(["next", WF, "--with-data", r#"{"verdict": "exit"}"#]),
+        "answer",
+    );
+    step(
+        h.koto_mode("auto")
+            .args(["next", WF, "--with-data", r#"{"again": true}"#]),
+        "back to review",
+    );
+    step(
+        h.koto_mode("auto")
+            .args(["next", WF, "--with-data", r#"{"verdict": "proceed"}"#]),
+        "answer and check",
+    );
+    step(
+        h.koto()
+            .env(
+                "CLAUDE_CODE_SESSION_ID",
+                "0f0e0d0c-1111-4222-8333-444455556666",
+            )
+            .env_remove("KOTO_ANCHOR")
+            .args([
+                "overrides",
+                "record",
+                WF,
+                "--gate",
+                "comments",
+                "--rationale",
+                "the comment gives the reason",
+            ]),
+        "override",
+    );
+    step(
+        h.koto_mode("auto")
+            .args(["next", WF, "--with-data", r#"{"done": false}"#]),
+        "back to review again",
+    );
+    step(
+        h.koto()
+            .args(["next", WF, "--to", "rethink", "--no-cleanup"]),
+        "directed transition",
+    );
+    assert_eq!(h.stub.request_count(), 4, "three consultations, one check");
+    let body = h.raw_log();
+    let header: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    header["session_id"].as_str().unwrap().to_string()
+}
+
+/// Every file under `dir`, recursively, skipping `skip`.
+fn files_under(dir: &Path, skip: &[&Path]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for p in entries.flatten().map(|e| e.path()) {
+            if skip.iter().any(|s| p.starts_with(s)) {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_run_with_a_directory_at_the_old_ledger_path_keeps_its_answers_in_the_session() {
+    let h = Harness::new(&checked_template());
+    // A directory where the old ledger file was: any write to it would fail.
+    std::fs::create_dir_all(old_ledger_file(&h)).unwrap();
+    let sid = run_every_kind(&h);
+
+    // Each kind of record is in the session log.
+    for kind in [
+        "decider_consulted",
+        "evidence_submitted",
+        "decider_checked",
+        "gate_override_recorded",
+        "directed_transition",
+    ] {
+        assert!(!h.events_of(kind).is_empty(), "no {} event", kind);
+    }
+    // Nothing under ~/.koto outside sessions/ holds them: no file names the
+    // session, and the old path is still an empty directory.
+    let koto = h.home().join(".koto");
+    let sessions = koto.join("sessions");
+    for file in files_under(&koto, &[&sessions]) {
+        let body = std::fs::read(&file).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains(&sid), "{} names the session", file.display());
+        assert!(
+            !text.contains("visit_seq"),
+            "{} holds a record",
+            file.display()
+        );
+    }
+    assert_eq!(std::fs::read_dir(old_ledger_file(&h)).unwrap().count(), 0);
+    // The run journal still relays the consultations, the answers and the
+    // check, as it did when the ledger was written.
+    let journal = std::fs::read_to_string(sessions_dir(&h).join("_run_journal.jsonl")).unwrap();
+    let kinds: Vec<String> = journal
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["kind"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    for kind in ["decider_consulted", "decider_answered", "decider_checked"] {
+        assert!(
+            kinds.iter().any(|k| k == kind),
+            "no {} in {:?}",
+            kind,
+            kinds
+        );
+    }
+}
+
+#[test]
+fn the_report_reads_every_ledger_kind_from_the_session() {
+    let h = Harness::new(&checked_template());
+    let sid = run_every_kind(&h);
+    let r = report_json(&h, &[]);
+
+    // consulted: the three decider_consulted events.
+    assert_eq!(r["header"]["consulted"], 3, "{}", r["header"]);
+    assert_eq!(r["header"]["duplicate_consulted"], 0);
+    // answered: the two evidence_submitted events on consulted visits.
+    assert_eq!(r["header"]["answered"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_answered"], 0);
+    // directed_exit: the directed_transition leaving the third visit.
+    assert_eq!(r["header"]["directed_exits"], 1, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_directed_exits"], 0);
+    assert_eq!(r["header"]["skipped_malformed"], 0);
+    // Eight records: three consultations, two answers, the exit, the check
+    // and the override.
+    assert_eq!(r["header"]["lines"], 8, "{}", r["header"]);
+
+    let hash = current_hash(&h, "review", "verdict");
+    let q = question(&r, &hash);
+    assert_eq!(q["consultations"], 3);
+    assert_eq!(q["paired"], 2);
+    assert_eq!(q["confusion"]["rows"]["exit"]["proceed"], 1);
+    assert_eq!(q["confusion"]["rows"]["proceed"]["proceed"], 1);
+    assert_eq!(q["directed_exits"], 1);
+    let listed = q["disagreements"].as_array().unwrap();
+    let exit = listed
+        .iter()
+        .find(|d| d["agent"] == "directed_exit")
+        .unwrap_or_else(|| panic!("no directed exit in {}", q));
+    assert_eq!(exit["session"], WF);
+    assert_eq!(exit["session_id"], sid.as_str());
+    assert_eq!(exit["directed_to"], "rethink");
+    let consultations = h.consultations();
+    assert_eq!(exit["visit_seq"], consultations[2]["visit_seq"]);
+    let answer = listed.iter().find(|d| d["agent"] == "exit").unwrap();
+    assert_eq!(answer["visit_seq"], consultations[0]["visit_seq"]);
+
+    // checked and check_overridden: the decider_checked event and the
+    // override that moved past its fail.
+    let checks = r["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "{}", r["checks"]);
+    let c = &checks[0];
+    assert_eq!(c["state"], "work");
+    assert_eq!(c["gate"], "comments");
+    assert_eq!(c["rule_id"], "r");
+    assert_eq!(c["consultations"], 1);
+    assert_eq!(c["fail"], 1);
+    assert_eq!(c["candidate_false_fail"], 1);
+    let event = &h.events_of("decider_checked")[0]["payload"];
+    assert_eq!(c["declaration_hash"], event["declaration_hash"]);
+}
+
+#[test]
+fn a_stale_answer_in_the_old_ledger_file_is_omitted() {
+    let h = Harness::new(&standard("shadow", "shadow"));
+    write_sessions(&h, &pair("s1", 1, "h1", "proceed", "exit"));
+    let clean = report_json(&h, &[]);
+
+    // The old file holds an answer, and its consultation, for a session the
+    // store doesn't have, and a second answer for s1's visit.
+    let path = old_ledger_file(&h);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let stale = [
+        consulted(
+            Some("s-gone"),
+            1,
+            "h1",
+            "not_applied",
+            Some("proceed"),
+            true,
+        ),
+        answered(Some("s-gone"), 1, json!("exit")),
+        answered(Some("s1"), 1, json!("proceed")),
+    ];
+    let body: String = stale.iter().map(|l| format!("{}\n", l)).collect();
+    std::fs::write(&path, &body).unwrap();
+
+    let r = report_json(&h, &[]);
+    assert_eq!(r, clean);
+    assert_eq!(r["header"]["answered"], 1);
+    let q = question(&r, "h1");
+    assert_eq!(q["consultations"], 1);
+    assert_eq!(q["confusion"]["rows"]["exit"]["proceed"], 1);
+    // The report neither read nor touched the file.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// Append `events` to session `name`'s log, numbered after its last event.
+fn append_events(h: &Harness, name: &str, events: &[Value]) {
+    let path = sessions_dir(h)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name));
+    let mut body = std::fs::read_to_string(&path).unwrap();
+    let last = body
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|e| e["seq"].as_u64())
+        .max()
+        .unwrap_or(0);
+    for (i, e) in events.iter().enumerate() {
+        let mut e = e.clone();
+        e["seq"] = json!(last + 1 + i as u64);
+        e["timestamp"] = json!("2026-01-01T00:00:00Z");
+        body.push_str(&format!("{}\n", e));
+    }
+    std::fs::write(&path, body).unwrap();
+}
+
+/// Give session `name` a visit to `review` consulted under `hash`.
+fn consult_in(h: &Harness, name: &str, hash: &str) {
+    let path = sessions_dir(h)
+        .join(name)
+        .join(format!("koto-{}.state.jsonl", name));
+    let entry = std::fs::read_to_string(&path).unwrap().lines().count() as u64;
+    let mut c = consulted(None, entry, hash, "not_applied", Some("proceed"), true);
+    c["state"] = json!("review");
+    append_events(h, name, &[transitioned(None, "review"), record_event(&c)]);
+}
+
+#[test]
+fn below_reads_only_that_sessions_hierarchy() {
+    let h = Harness::new(&standard("shadow", "shadow"));
+    let init = |name: &str, extra: &[&str]| {
+        let mut cmd = h.koto();
+        cmd.args(["init", name, "--template", "template.md"])
+            .args(extra);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "init {}: {}", name, describe(&out));
+    };
+    init("root", &[]);
+    init("child", &["--dispatched-by", "root"]);
+    init("grandchild", &["--dispatched-by", "child"]);
+    init("other", &[]);
+    consult_in(&h, "root", "h-root");
+    consult_in(&h, "child", "h-child");
+    consult_in(&h, "grandchild", "h-grandchild");
+    consult_in(&h, "other", "h-other");
+
+    let hashes = |r: &Value| -> Vec<String> {
+        let mut v: Vec<String> = r["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q["declaration_hash"].as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let all = report_json(&h, &[]);
+    assert_eq!(
+        hashes(&all),
+        vec!["h-child", "h-grandchild", "h-other", "h-root"]
+    );
+    let below = report_json(&h, &["--below", "root"]);
+    assert_eq!(hashes(&below), vec!["h-child", "h-grandchild", "h-root"]);
+    assert_eq!(
+        below["ledger"].as_str().unwrap(),
+        format!("{} (below root)", sessions_dir(&h).display())
+    );
+    let below = report_json(&h, &["--below", "child"]);
+    assert_eq!(hashes(&below), vec!["h-child", "h-grandchild"]);
+
+    // A session the store doesn't have is a caller error.
+    let out = report(&h, &["--below", "nobody"]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    assert!(out.stdout.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -2127,7 +2594,7 @@ fn input_unavailable_is_counted_by_reason_when_the_ledger_gives_one() {
         }
         lines.push(v);
     }
-    write_ledger(&h, &lines);
+    write_sessions(&h, &lines);
     let r = report_json(&h, &[]);
     assert_eq!(
         question(&r, "ha")["outcomes"],

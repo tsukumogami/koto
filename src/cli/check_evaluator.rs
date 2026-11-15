@@ -9,9 +9,9 @@
 //! criteria go unanswered with `busy`, reads the local log for the visit and
 //! for verdicts it can reuse, consults the provider once per criterion (one
 //! retry for a transient failure) under the per-call cap it shares with the
-//! routing decider, appends a ledger `checked` line per consultation, and
-//! returns a [`StructuredGateResult`] carrying the blocking findings and the
-//! records the advance loop appends as `decider_checked` events.
+//! routing decider, and returns a [`StructuredGateResult`] carrying the
+//! blocking findings and the records the advance loop appends as
+//! `decider_checked` events, which `koto decider report` reads.
 //!
 //! A criterion that gets no verdict falls back to the agent
 //! (DESIGN-decider-fallback.md): unless an answer the agent recorded for the
@@ -24,7 +24,7 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,6 @@ use crate::decider::check::{
     recorded_probabilities, verdict, AgentAnswer, CheckOutcome, DeciderCheck, DeciderFallback,
     UnansweredReason, UnitLabels, UnitRef,
 };
-use crate::decider::ledger::{append_or_warn, LedgerRecord};
 use crate::decider::types::{
     Decider, DecisionRequest, ErrorClass, GlobalMode, SettingOrigin, UsageTally,
 };
@@ -266,74 +265,6 @@ pub fn without_checks(
     compiled
 }
 
-/// The ledger's `check_overridden` records for an override of the decider
-/// check `gate` in `state`: one `candidate_false_fail` per criterion the
-/// check's last output (`actual_output`) lists as failed by the decider. A
-/// criterion the agent answered `fail` is listed under `agent_answered` too
-/// and gets none: an override of the agent's own judgment says nothing
-/// about the decider. A criterion waiting on the agent is never under
-/// `failed`, so it gets none either; `overridden_unanswered` survives only
-/// in ledgers written before that rule. Each record takes its
-/// visit and declaration hash from the latest `decider_checked` for that
-/// criterion in the current visit to `state`, the visit the override applies
-/// to; a reused verdict appended none, but the consultation it reused is in
-/// the same visit. A criterion with no such record in this visit gets none,
-/// even when an earlier visit has one: that consultation isn't what the
-/// override moved past.
-pub fn override_records(
-    events: &[Event],
-    state: &str,
-    gate: &str,
-    actual_output: &serde_json::Value,
-    session: &str,
-    session_id: Option<&str>,
-) -> Vec<LedgerRecord> {
-    use crate::decider::ledger::OverriddenCriterion;
-    let visit = match arrival_index(events, state) {
-        Some(i) => &events[i + 1..],
-        None => events,
-    };
-    let mut out = Vec::new();
-    let ids = actual_output["failed"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    // A criterion the agent failed is the agent's own judgment, not a
-    // decider verdict an override could prove wrong.
-    let agent_answered: Vec<&str> = actual_output["agent_answered"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    for rule_id in ids
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|id| !agent_answered.contains(id))
-    {
-        let latest = visit.iter().rev().find_map(|e| match &e.payload {
-            EventPayload::DeciderChecked(c)
-                if c.state == state && c.gate == gate && c.rule_id == rule_id =>
-            {
-                Some((c.visit_seq, c.declaration_hash.as_str()))
-            }
-            _ => None,
-        });
-        if let Some((visit_seq, declaration_hash)) = latest {
-            out.push(LedgerRecord::check_overridden(
-                session,
-                session_id,
-                OverriddenCriterion {
-                    state,
-                    visit_seq,
-                    gate,
-                    rule_id,
-                    declaration_hash,
-                },
-            ));
-        }
-    }
-    out
-}
-
 /// How long a tick waits for `decider.lock` before its criteria go
 /// unanswered with `busy`: the longest another tick can hold it (every
 /// consultation of the per-call cap, each with its retry, at the provider
@@ -438,7 +369,6 @@ pub struct CliCheckEvaluator<'a> {
     /// Unit-mode consultations this call; never shared with the routing
     /// decider.
     unit_budget: UnitBudget,
-    ledger_root: Option<PathBuf>,
     /// How long to wait for `decider.lock` ([`lock_wait_for`]); zero tries
     /// once.
     lock_wait: Duration,
@@ -466,7 +396,6 @@ impl<'a> CliCheckEvaluator<'a> {
             endpoint_origin,
             budget,
             unit_budget: UnitBudget::new(),
-            ledger_root: None,
             lock_wait: Duration::ZERO,
             working_dir,
             env,
@@ -477,12 +406,6 @@ impl<'a> CliCheckEvaluator<'a> {
     /// built without this gets a fresh one.
     pub fn with_unit_budget(mut self, budget: UnitBudget) -> Self {
         self.unit_budget = budget;
-        self
-    }
-
-    /// Where ledger lines go (`~/.koto`); `None` writes none.
-    pub fn with_ledger_root(mut self, koto_root: Option<PathBuf>) -> Self {
-        self.ledger_root = koto_root;
         self
     }
 
@@ -583,13 +506,9 @@ impl<'a> CliCheckEvaluator<'a> {
         // have been spent for nothing here; an unreadable log is rare
         // enough not to read it twice.
         let read = self.backend.read_events_local(self.session).ok();
-        let Some((session_id, events, state)) = read.as_ref().and_then(|(header, events)| {
+        let Some((events, state)) = read.as_ref().and_then(|(_, events)| {
             let state = derive_state_from_log(events).filter(|s| !s.is_empty())?;
-            Some((
-                Some(header.session_id.as_str()).filter(|s| !s.is_empty()),
-                events.as_slice(),
-                state,
-            ))
+            Some((events.as_slice(), state))
         }) else {
             drop(lock);
             return unreadable_log_result(name, spec, self.global, duration_ms);
@@ -616,7 +535,7 @@ impl<'a> CliCheckEvaluator<'a> {
             ));
         }
         drop(lock);
-        self.finish(name, spec, graded, session_id, None, duration_ms)
+        self.finish(name, spec, graded, None, duration_ms)
     }
 
     /// Evaluate a unit-mode check (DESIGN-doc-rule-checks-m4.md, Decisions 1
@@ -675,13 +594,9 @@ impl<'a> CliCheckEvaluator<'a> {
             None
         };
         let read = self.backend.read_events_local(self.session).ok();
-        let Some((session_id, events, state)) = read.as_ref().and_then(|(header, events)| {
+        let Some((events, state)) = read.as_ref().and_then(|(_, events)| {
             let state = derive_state_from_log(events).filter(|s| !s.is_empty())?;
-            Some((
-                Some(header.session_id.as_str()).filter(|s| !s.is_empty()),
-                events.as_slice(),
-                state,
-            ))
+            Some((events.as_slice(), state))
         }) else {
             drop(lock);
             return unreadable_log_result(name, spec, self.global, duration_ms);
@@ -754,24 +669,20 @@ impl<'a> CliCheckEvaluator<'a> {
             .flatten()
             .map(|u| u.reference.clone())
             .collect();
-        self.finish(name, spec, graded, session_id, Some(&printed), duration_ms)
+        self.finish(name, spec, graded, Some(&printed), duration_ms)
     }
 
-    /// Append each new record's ledger line and build the gate's result.
+    /// Build the gate's result. Each new record becomes a `decider_checked`
+    /// event, which is where `koto decider report` reads it.
     fn finish(
         &self,
         name: &str,
         spec: &DeciderCheckSpec,
         graded: Vec<Graded>,
-        session_id: Option<&str>,
         units: Option<&[UnitRef]>,
         duration_ms: Option<u64>,
     ) -> StructuredGateResult {
         let records: Vec<DeciderCheck> = graded.iter().filter_map(|g| g.record.clone()).collect();
-        for record in &records {
-            let line = LedgerRecord::checked(self.session, session_id, record.clone());
-            append_or_warn(self.ledger_root.as_deref(), &line);
-        }
         result_for(
             self.session,
             name,
@@ -1642,89 +1553,6 @@ mod tests {
         assert_eq!(shell_word(""), "''");
     }
 
-    /// Log events from JSON lines, numbered from 1.
-    fn log(lines: &[serde_json::Value]) -> Vec<Event> {
-        lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let mut l = l.clone();
-                l["seq"] = serde_json::json!(i as u64 + 1);
-                l["timestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
-                serde_json::from_value(l).unwrap()
-            })
-            .collect()
-    }
-
-    fn arrive(from: Option<&str>, to: &str) -> serde_json::Value {
-        serde_json::json!({"type": "transitioned",
-            "payload": {"from": from, "to": to, "condition_type": "auto"}})
-    }
-
-    fn checked(visit_seq: u64, hash: &str) -> serde_json::Value {
-        serde_json::json!({"type": "decider_checked", "payload": {
-            "state": "review", "visit_seq": visit_seq, "gate": "comments",
-            "rule_id": "r", "rule_ref": "ref", "declaration_hash": hash,
-            "mode": "veto", "threshold": 0.9, "outcome": "fail", "blocked": true,
-            "provider": "jev", "model": "m", "attempts": 1, "latency_ms": 1}})
-    }
-
-    fn overridden(events: &[Event]) -> Vec<(u64, String)> {
-        override_records(
-            events,
-            "review",
-            "comments",
-            &serde_json::json!({"failed": ["r"], "unanswered": [], "error": ""}),
-            "wf",
-            None,
-        )
-        .into_iter()
-        .map(|r| match r {
-            LedgerRecord::CheckOverridden(c) => {
-                assert_eq!(
-                    c.override_kind,
-                    crate::decider::ledger::CheckOverrideKind::CandidateFalseFail
-                );
-                (c.visit_seq, c.declaration_hash)
-            }
-            other => panic!("unexpected record {:?}", other),
-        })
-        .collect()
-    }
-
-    #[test]
-    fn an_override_names_the_consultation_of_the_current_visit_only() {
-        let init = serde_json::json!({"type": "workflow_initialized",
-            "payload": {"template_path": "t.json", "variables": {}}});
-        // Visit 1 (seq 2) failed r and was left; visit 2 (seq 5) failed it
-        // again. The override names visit 2's consultation.
-        let two_visits = log(&[
-            init.clone(),
-            arrive(None, "review"),
-            checked(2, "old"),
-            arrive(Some("review"), "work"),
-            arrive(Some("work"), "review"),
-            checked(5, "new"),
-        ]);
-        assert_eq!(overridden(&two_visits), vec![(5, "new".to_string())]);
-
-        // The current visit has no consultation of r: an earlier visit's is
-        // not what the override moved past, so nothing is written. Looking
-        // across the whole log would name visit 1 here.
-        let stale = log(&[
-            init.clone(),
-            arrive(None, "review"),
-            checked(2, "old"),
-            arrive(Some("review"), "work"),
-            arrive(Some("work"), "review"),
-        ]);
-        assert_eq!(overridden(&stale), vec![]);
-
-        // One visit: its consultation.
-        let one = log(&[init, arrive(None, "review"), checked(2, "only")]);
-        assert_eq!(overridden(&one), vec![(2, "only".to_string())]);
-    }
-
     #[test]
     fn a_readable_log_records_under_its_state() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1863,22 +1691,5 @@ mod tests {
         assert!(at < f.message.find("Q?").unwrap(), "{}", f.message);
         assert!(f.message.contains("(over_budget)"));
         assert!(f.message.contains("Answer unclear if: can't tell"));
-    }
-
-    #[test]
-    fn an_override_skips_criteria_the_agent_answered() {
-        let init = serde_json::json!({"type": "workflow_initialized",
-            "payload": {"template_path": "t.json", "variables": {}}});
-        let events = log(&[init, arrive(None, "review"), checked(2, "h")]);
-        let records = override_records(
-            &events,
-            "review",
-            "comments",
-            &serde_json::json!({"failed": ["r"], "unanswered": [], "awaiting": [],
-                "agent_answered": ["r"], "error": ""}),
-            "wf",
-            None,
-        );
-        assert!(records.is_empty());
     }
 }

@@ -1572,11 +1572,6 @@ fn the_default_budget_is_8192_bytes() {
     }
 }
 
-/// The decider ledger, in the harness's koto home.
-fn ledger_path(h: &Harness) -> std::path::PathBuf {
-    h.home().join(".koto").join("_decider_ledger.jsonl")
-}
-
 /// The run journal, which a store on `KOTO_SESSIONS_BASE` keeps in that
 /// base.
 fn journal_path(h: &Harness) -> std::path::PathBuf {
@@ -1593,7 +1588,7 @@ fn jsonl(path: &std::path::Path) -> Vec<Value> {
 }
 
 #[test]
-fn an_input_over_its_budget_is_named_in_the_event_the_ledger_and_the_journal() {
+fn an_input_over_its_budget_is_named_in_the_event_the_report_and_the_journal() {
     let h = Harness::new(&standard("shadow", "shadow"));
     h.init();
     h.context_add("outline.md", &"x".repeat(8193));
@@ -1607,12 +1602,20 @@ fn an_input_over_its_budget_is_named_in_the_event_the_ledger_and_the_journal() {
     assert_eq!(c["input_label"], "outline_item");
     assert_eq!(c["input_bytes"], 8193);
 
-    let ledger = jsonl(&ledger_path(&h));
-    let consulted: Vec<&Value> = ledger.iter().filter(|l| l["kind"] == "consulted").collect();
-    assert_eq!(consulted.len(), 1, "{ledger:?}");
-    assert_eq!(consulted[0]["reason"], "over_budget");
-    assert_eq!(consulted[0]["input_label"], "outline_item");
-    assert_eq!(consulted[0]["input_bytes"], 8193);
+    // `koto decider report` reads the reason from the event.
+    let out = h
+        .koto()
+        .args(["decider", "report", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let report = json_out(&out);
+    assert_eq!(report["header"]["consulted"], 1, "{report}");
+    assert_eq!(
+        report["questions"][0]["outcomes"]["input_unavailable_by_reason"],
+        json!({"over_budget": 1}),
+        "{report}"
+    );
 
     let journal = jsonl(&journal_path(&h));
     let records: Vec<&Value> = journal
@@ -1860,24 +1863,6 @@ fn routing_counts_every_billed_answer_with_its_provider_and_model() {
         // Written on every record, zero included.
         assert_eq!(c["unread_usage_attempts"], unread, "{}", label);
         assert_consulted_meets_the_contract(c);
-
-        // The ledger's `consulted` line carries the same accounting.
-        let ledger =
-            std::fs::read_to_string(h.home().join(".koto").join("_decider_ledger.jsonl")).unwrap();
-        let line: Value = ledger
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .find(|l| l["kind"] == "consulted")
-            .unwrap_or_else(|| panic!("no consulted line: {}", ledger));
-        for key in [
-            "input_tokens",
-            "output_tokens",
-            "unread_usage_attempts",
-            "provider",
-            "model",
-        ] {
-            assert_eq!(line.get(key), c.get(key), "ledger {}: {}", key, line);
-        }
     }
 }
 

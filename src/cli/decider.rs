@@ -1,11 +1,13 @@
-//! `koto decider report`: the ledger report and the fixture runner.
+//! `koto decider report`: the decider report and the fixture runner.
 //! (`koto decider answer`, the one decider verb that writes to a session,
 //! lives in `decider_answer.rs`.)
 //!
-//! The command only reads. It reads the ledger, and with `--fixtures` it
-//! reads the config files, compiles the named template in memory (no
-//! compile cache), and reads the fixture file. It writes no ledger line,
-//! no session event, and no file of any kind, and it never changes a mode.
+//! The command only reads. It reads the decider's records from the local
+//! session store, every session or with `--below` one session and those
+//! below it, and with `--fixtures` it reads the config files, compiles the
+//! named template in memory (no compile cache), and reads the fixture file.
+//! It writes no session event and no file of any kind, and it never changes
+//! a mode.
 //!
 //! Whether a fixture run may send anything is decided by
 //! [`crate::decider::build_decider`], which asks
@@ -13,29 +15,30 @@
 //!
 //! Exit codes: 0 when the report printed (whether or not any value is
 //! eligible); 2 for a caller problem (not opted in, a bad template, state,
-//! field, or fixture line, or an endpoint the run can't use); 3 when the
-//! ledger exists but can't be read.
+//! field, or fixture line, an endpoint the run can't use, or a `--below`
+//! session that doesn't exist).
 
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use crate::decider::ledger::ledger_path;
 use crate::decider::report::{
-    analyze, judge, parse_fixtures, read_ledger, render_table, run_fixtures, FixtureReport,
+    analyze, judge, parse_fixtures, read_sessions, render_table, run_fixtures, FixtureReport,
     JudgeInput, LedgerRead, Report, ReportOptions,
 };
 use crate::decider::request::{declared_fields, DeclaredField};
 use crate::decider::{build_decider, EffectiveModes};
+use crate::decisions::read::{local_sessions, sessions_below};
 use crate::engine::decider::DeciderPolicy;
+use crate::session::{Backend, SessionBackend};
 use crate::template::decider::declaration_hash;
 
-use super::{EXIT_CALLER_ERROR, EXIT_INFRASTRUCTURE};
+use super::EXIT_CALLER_ERROR;
 
 /// Subverbs under `koto decider`.
 #[derive(clap::Subcommand)]
 pub enum DeciderCommand {
-    /// Report decider agreement from the ledger and, with --fixtures,
+    /// Report decider agreement from session logs and, with --fixtures,
     /// judge promotion eligibility against a golden fixture set
     Report(ReportArgs),
     /// Record your answer to a decider-check criterion the decider gave no
@@ -46,10 +49,10 @@ pub enum DeciderCommand {
 /// Flags of `koto decider report`.
 #[derive(Args, Debug, Clone)]
 pub struct ReportArgs {
-    /// Ledger to read (default: _decider_ledger.jsonl in the koto root,
-    /// ~/.koto or $KOTO_HOME)
-    #[arg(long, value_name = "PATH")]
-    pub ledger: Option<PathBuf>,
+    /// Read only this session and the sessions below it (default: every
+    /// session in the local store)
+    #[arg(long, value_name = "SESSION")]
+    pub below: Option<String>,
 
     /// Report only questions and decider checks on this state; with --fixtures, the state
     /// whose declaration the fixtures exercise
@@ -86,49 +89,43 @@ fn fail(code: i32, msg: impl std::fmt::Display) -> ! {
     std::process::exit(code);
 }
 
-pub fn handle(cmd: DeciderCommand) -> anyhow::Result<()> {
-    match cmd {
-        DeciderCommand::Report(args) => handle_report(args),
-        // Dispatched with a session backend in `cli::run`, never here.
-        DeciderCommand::Answer(_) => unreachable!("decider answer is dispatched in cli::run"),
+/// The sessions the report reads, and how its output names them: the
+/// store's directory, and `--below`'s session when one is named.
+fn report_sessions(backend: &Backend, below: Option<&str>) -> (Vec<String>, String) {
+    let probe = backend.session_dir("x");
+    let base = probe.parent().map(Path::to_path_buf).unwrap_or(probe);
+    match below {
+        None => (local_sessions(backend), base.display().to_string()),
+        Some(root) => {
+            if crate::discover::validate_workflow_name(root).is_err() || !backend.exists(root) {
+                fail(
+                    EXIT_CALLER_ERROR,
+                    format!("--below names no session in the local store: {:?}", root),
+                );
+            }
+            let mut sessions = vec![root.to_string()];
+            sessions.extend(sessions_below(backend, root));
+            (sessions, format!("{} (below {})", base.display(), root))
+        }
     }
 }
 
-fn default_ledger() -> PathBuf {
-    match crate::koto_home::koto_home() {
-        Some(root) => ledger_path(&root),
-        None => fail(
-            EXIT_CALLER_ERROR,
-            "no koto root (KOTO_HOME or a home directory) to find the ledger in; pass --ledger",
-        ),
-    }
-}
-
-fn load_ledger(path: &Path) -> LedgerRead {
-    read_ledger(path).unwrap_or_else(|e| {
-        fail(
-            EXIT_INFRASTRUCTURE,
-            format!("failed to read ledger {}: {}", path.display(), e),
-        )
-    })
-}
-
-fn handle_report(args: ReportArgs) -> anyhow::Result<()> {
-    let ledger = args.ledger.clone().unwrap_or_else(default_ledger);
+pub fn handle_report(backend: &Backend, args: ReportArgs) -> anyhow::Result<()> {
     let opts = ReportOptions {
         state: args.state.clone(),
         include_custom_endpoints: args.include_custom_endpoints,
     };
+    let (sessions, source) = report_sessions(backend, args.below.as_deref());
+    let read = read_sessions(backend, &sessions);
 
     let fixtures = args
         .fixtures
         .as_ref()
-        .map(|path| fixture_run(&args, path, &ledger, &opts));
+        .map(|path| fixture_run(&args, path, &read, &opts));
 
-    let read = load_ledger(&ledger);
     let ledger_report = analyze(&read, &opts);
     let report = Report {
-        ledger: ledger.display().to_string(),
+        ledger: source,
         header: ledger_report.header,
         questions: ledger_report.questions,
         checks: ledger_report.checks,
@@ -147,7 +144,7 @@ fn handle_report(args: ReportArgs) -> anyhow::Result<()> {
 fn fixture_run(
     args: &ReportArgs,
     fixtures_path: &Path,
-    ledger: &Path,
+    read: &LedgerRead,
     opts: &ReportOptions,
 ) -> FixtureReport {
     // clap guarantees both with --fixtures.
@@ -229,7 +226,7 @@ fn fixture_run(
     });
 
     let hash = declaration_hash(field.decider, field.description);
-    let ledger_report = analyze(&load_ledger(ledger), opts);
+    let ledger_report = analyze(read, opts);
     judge(
         &JudgeInput {
             template: template_path.display().to_string(),

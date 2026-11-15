@@ -2,7 +2,7 @@
 //!
 //! Sessions (`<root>/sessions`), the request store (`<root>/requests`), the
 //! user config (`<root>/config.toml`), the terminal index, coordinator cursors,
-//! the decider ledger and the run journal are all built from [`koto_home`].
+//! and the run journal are all built from [`koto_home`].
 //! `KOTO_HOME` moves all of them at once, and the compiled-template cache
 //! with them (`<root>/cache`, see `crate::cache`); unset, the root is
 //! `~/.koto` and the cache stays on `XDG_CACHE_HOME`.

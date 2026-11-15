@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Checks that koto v0.14.1 reads a session and a decider ledger the new build
-# writes while a template uses a decider check
+# Checks that koto v0.14.1 reads a session the new build writes while a
+# template uses a decider check
 # (DESIGN-koto-decider-checks.md), including a criterion that falls back to
 # the agent (DESIGN-decider-fallback.md).
 #
@@ -23,34 +23,33 @@
 # connect and bills nothing. The logs must hold every event in EVENT_CHECKS
 # and NV_EVENT_CHECKS, and the new build's
 # `koto template validate-feed` must accept them against
-# docs/reference/session-feed.md. The ledger must hold a `checked` and a
-# `check_overridden` line, which the new build's `koto decider report`
-# tallies.
+# docs/reference/session-feed.md. The new build writes no decider ledger
+# file, and its `koto decider report` tallies the check and the override
+# from the session logs.
 #
 # A third session, un, drives fixtures-decider-checks/decider-units.md: a
 # veto check in unit mode (`units: jsonl`, with `unit_document`,
 # `unit_section`, and a criterion declaring `summary` and `rule_text`) over
-# two units, under its own home so its ledger stands apart. The stub fails
+# two units, under its own home so its records stand apart. The stub fails
 # ac-1, and ac-2 is over `max_bytes`, so it falls back to the agent. The
 # first tick hands back the rule at `summary` for ac-1, the script answers
 # ac-2 with `koto decider answer --unit`, the second tick hands the rule back
 # at `full`, and the check is overridden so the session moves on to work.
 # The log must hold every event in UN_EVENT_CHECKS: per-unit
 # `decider_checked`, `decider_fallback` and `decider_check_answered`, and
-# `rule_delivered`. The ledger must hold a per-unit `checked` line.
+# `rule_delivered`. The new build's report must tally the failed unit.
 #
 # v0.14.1 can't compile a template with a decider check, so it is handed
 # each session after it left the check: it must run `koto status` and
 # `koto next` on each, exit 0 and report the state the new build reports
-# (skipping the `rule_delivered` event it doesn't know), and run
-# `koto decider report` over each ledger, exit 0, and count the new line
-# kinds as unknown rather than failing.
+# (skipping the `rule_delivered` event it doesn't know).
 #
 # The other direction: v0.14.1 drives fixtures-decider-checks/decider-routing.md
 # (a routing consultation, no decider check) against the stub, and the new
-# build must read the log and ledger it wrote unchanged: `koto status`, and
-# `koto decider report` tallying the consultation, leave both files as they
-# were, and `koto next` reports the state v0.14.1 reported.
+# build must read the log it wrote unchanged: `koto status`, and
+# `koto decider report` tallying the consultation from that log, leave the
+# log and v0.14.1's ledger file as they were, and `koto next` reports the
+# state v0.14.1 reported.
 #
 # Templates without a decider check are covered by the failure-reporting job,
 # which compiles every fixture under both builds.
@@ -59,11 +58,9 @@
 #   drop-event:N       delete the log lines matching EVENT_CHECKS[N]
 #   drop-nv-event:N    delete nv's log lines matching NV_EVENT_CHECKS[N]
 #   drop-un-event:N    delete un's log lines matching UN_EVENT_CHECKS[N]
-#   drop-un-ledger     delete un's per-unit `checked` ledger lines
 #   strip-field:K      delete payload field K from the events that carry it
 #   alter-value:N      change one value as ALTERED_VALUES[N] says, leaving
 #                      every key in place
-#   drop-ledger:KIND   delete the ledger's lines of kind KIND
 #   drop-transition    delete the last `transitioned` event
 # --self-test runs the script clean, then once per mutation, and passes only
 # if the clean run passes and every mutated run fails.
@@ -138,8 +135,6 @@ ALTERED_VALUES=(
   'the routing tokens miscounted|wf|.type? == "decider_consulted"|.payload.input_tokens = 49'
 )
 
-LEDGER_KINDS=(checked check_overridden)
-
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -160,15 +155,11 @@ mutations() {
   for i in "${!UN_EVENT_CHECKS[@]}"; do
     echo "drop-un-event:$i"
   done
-  echo drop-un-ledger
   for i in "${!STRIPPED_FIELDS[@]}"; do
     echo "strip-field:${STRIPPED_FIELDS[$i]%%|*}"
   done
   for i in "${!ALTERED_VALUES[@]}"; do
     echo "alter-value:$i"
-  done
-  for i in "${LEDGER_KINDS[@]}"; do
-    echo "drop-ledger:$i"
   done
   echo drop-transition
 }
@@ -316,8 +307,7 @@ pass "session: the agent's answer passes review -> $got"
 NV_STATE="$(nv_koto status nv | jq -er '.current_state')" || fail "session: koto status nv failed"
 NV_LOG="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-nv.state.jsonl' -type f | head -n 1)"
 [ -n "$NV_LOG" ] || fail "session: no koto-nv.state.jsonl was written"
-LEDGER="$HOME_DIR/.koto/_decider_ledger.jsonl"
-[ -f "$LEDGER" ] || fail "session: no ledger was written"
+[ ! -e "$HOME_DIR/.koto/_decider_ledger.jsonl" ] || fail "session: the new build wrote a decider ledger file"
 
 # in_dir HOME WORK BIN ARGS...: run BIN in WORK with its own HOME and no
 # decider settings or sessions-base override.
@@ -382,8 +372,7 @@ pass "session: the override moves un on to work"
 UN_STATE="$(un_koto status un | jq -er '.current_state')" || fail "session: koto status un failed"
 UN_LOG="$(find "$UN_HOME" "$UN_WORK" -name 'koto-un.state.jsonl' -type f | head -n 1)"
 [ -n "$UN_LOG" ] || fail "session: no koto-un.state.jsonl was written"
-UN_LEDGER="$UN_HOME/.koto/_decider_ledger.jsonl"
-[ -f "$UN_LEDGER" ] || fail "session: un wrote no ledger"
+[ ! -e "$UN_HOME/.koto/_decider_ledger.jsonl" ] || fail "session: un wrote a decider ledger file"
 
 # The older writer: v0.14.1 drives a routing consultation against the stub
 # and writes a log and a ledger from before unit mode and rule delivery.
@@ -437,10 +426,6 @@ case "$MUTATION" in
     echo "MUTATION: deleting un's log lines for '${entry%%|*}'"
     rewrite_lines "$UN_LOG" "${entry#*|}" ""
     ;;
-  drop-un-ledger)
-    echo "MUTATION: deleting un's per-unit checked ledger lines"
-    rewrite_lines "$UN_LEDGER" '.kind? == "checked" and .unit != null' ""
-    ;;
   strip-field:*)
     key="${MUTATION#strip-field:}"
     for entry in "${STRIPPED_FIELDS[@]}"; do
@@ -464,11 +449,6 @@ case "$MUTATION" in
     before="$(cksum <"$target")"
     rewrite_lines "$target" "$filter" "$program"
     [ "$before" != "$(cksum <"$target")" ] || fail "alter-value: '$label' changed nothing"
-    ;;
-  drop-ledger:*)
-    kind="${MUTATION#drop-ledger:}"
-    echo "MUTATION: deleting the ledger's '$kind' lines"
-    rewrite_lines "$LEDGER" ".kind? == \"$kind\"" ""
     ;;
   drop-transition)
     last_seq="$(jq -s '[.[] | select(.type? == "transitioned") | .seq] | max' "$LOG_FILE")"
@@ -509,20 +489,17 @@ for log in "$LOG_FILE" "$NV_LOG" "$UN_LOG"; do
   pass "contract: the session-feed spec accepts $(basename "$log")"
 done
 
-for kind in "${LEDGER_KINDS[@]}"; do
-  n="$(jq -s "[.[] | select(.kind? == \"$kind\")] | length" "$LEDGER")"
-  [ "$n" -ge 1 ] || fail "ledger: no '$kind' line"
-  pass "ledger: $kind ($n)"
-done
-out="$(koto_in "$KOTO_NEW_BIN" decider report --json --ledger "$LEDGER" 2>&1)" \
-  || fail "ledger: the new build's report failed: $out"
+out="$(koto_in "$KOTO_NEW_BIN" decider report --json 2>&1)" \
+  || fail "report: the new build's report failed: $out"
 printf '%s' "$out" | jq -e '.checks[0].rule_id == "comment_reason" and .checks[0].fail == 1 and .checks[0].candidate_false_fail == 1 and .checks[0].unanswered == 1 and .checks[0].unanswered_by_cause.provider == 1' >/dev/null \
-  || fail "ledger: the new build's report doesn't tally the check: $out"
-pass "ledger: the new build tallies the check"
+  || fail "report: the new build's report doesn't tally the check from the sessions: $out"
+pass "report: the new build tallies the check from the sessions"
 
-n="$(jq -s '[.[] | select(.kind? == "checked" and .unit.key? == "ac-1" and .outcome == "fail")] | length' "$UN_LEDGER")"
-[ "$n" -ge 1 ] || fail "ledger: un's ledger has no per-unit checked line for ac-1"
-pass "ledger: un's per-unit checked lines ($n for ac-1)"
+out="$(in_dir "$UN_HOME" "$UN_WORK" "$KOTO_NEW_BIN" decider report --json 2>&1)" \
+  || fail "report: the new build's report over un failed: $out"
+printf '%s' "$out" | jq -e '[.checks[] | select(.rule_id == "ac_binary")][0].fail >= 1' >/dev/null \
+  || fail "report: the new build's report doesn't tally un's failed unit: $out"
+pass "report: the new build tallies un's failed unit"
 
 # --- v0.14.1 reads the log and the ledger ------------------------------------
 
@@ -558,11 +535,6 @@ state="$(printf '%s' "$out" | jq -er '.state')" || fail "floor: koto next nv has
 [ "$state" = "$NV_STATE" ] || fail "floor: koto next nv says '$state', the new build said '$NV_STATE'"
 pass "v$FLOOR_VERSION koto next reads the no-verdict log (state $state)"
 
-out="$(floor_koto decider report --json --ledger "$LEDGER" 2>&1)" || fail "floor: koto decider report exited non-zero: $out"
-unknown="$(printf '%s' "$out" | jq -er '.header.unknown_kind')" || fail "floor: the report has no unknown_kind: $out"
-[ "$unknown" -ge 2 ] || fail "floor: expected the two new line kinds counted as unknown, got $unknown"
-pass "v$FLOOR_VERSION koto decider report reads the ledger ($unknown lines of an unknown kind)"
-
 un_floor() { in_dir "$UN_HOME" "$UN_WORK" "$KOTO_FLOOR_BIN" "$@"; }
 
 out="$(un_floor status un 2>&1)" || fail "floor: koto status un exited non-zero: $out"
@@ -578,13 +550,6 @@ state="$(printf '%s' "$out" | jq -er '.state')" || fail "floor: koto next un has
 [ "$state" = "$UN_STATE" ] || fail "floor: koto next un says '$state', the new build said '$UN_STATE'"
 pass "v$FLOOR_VERSION koto next reads the unit-mode log past rule_delivered (state $state)"
 
-out="$(un_floor decider report --json --ledger "$UN_LEDGER" 2>&1)" || fail "floor: koto decider report over un's ledger exited non-zero: $out"
-unknown="$(printf '%s' "$out" | jq -er '.header.unknown_kind')" || fail "floor: un's report has no unknown_kind: $out"
-want="$(jq -s '[.[] | select(.kind? == "checked" or .kind? == "check_overridden")] | length' "$UN_LEDGER")"
-[ "$unknown" -ge "$want" ] && [ "$want" -ge 1 ] \
-  || fail "floor: expected un's $want checked and check_overridden lines counted as unknown, got $unknown"
-pass "v$FLOOR_VERSION koto decider report reads the per-unit ledger ($unknown lines of an unknown kind)"
-
 # --- the new build reads what v0.14.1 wrote ----------------------------------
 
 old_new() { in_dir "$OLD_HOME" "$OLD_WORK" "$KOTO_NEW_BIN" "$@"; }
@@ -595,11 +560,11 @@ state="$(printf '%s' "$out" | jq -er '.current_state')" || fail "older writer: k
 [ "$state" = "$OLD_STATE" ] || fail "older writer: the new build says '$state', v$FLOOR_VERSION said '$OLD_STATE'"
 pass "older writer: the new build's koto status reads v$FLOOR_VERSION's log (state $state)"
 
-out="$(old_new decider report --json --ledger "$OLD_LEDGER" 2>&1)" \
+out="$(old_new decider report --json 2>&1)" \
   || fail "older writer: the new build's koto decider report exited non-zero: $out"
-printf '%s' "$out" | jq -e '.header.unknown_kind == 0' >/dev/null \
-  || fail "older writer: the new build doesn't know a line kind v$FLOOR_VERSION wrote: $out"
-pass "older writer: the new build's koto decider report reads v$FLOOR_VERSION's ledger"
+printf '%s' "$out" | jq -e '.header.consulted >= 1 and .header.skipped_malformed == 0' >/dev/null \
+  || fail "older writer: the new build doesn't read the consultation from v$FLOOR_VERSION's log: $out"
+pass "older writer: the new build's koto decider report reads v$FLOOR_VERSION's log"
 
 [ "$before" = "$(cksum <"$OLD_LOG") $(cksum <"$OLD_LEDGER")" ] \
   || fail "older writer: reading changed v$FLOOR_VERSION's log or ledger"
