@@ -1468,11 +1468,11 @@ A unit check adds three refusals: `unit_required` (the criterion waits on units 
 ## koto decider report
 
 ```
-koto decider report [--ledger <path>] [--state <state>] [--json] [--include-custom-endpoints]
+koto decider report [--below <session>] [--state <state>] [--json] [--include-custom-endpoints]
 koto decider report --fixtures <path> --template <path> --state <state> [--field <field>] [--json] [--include-custom-endpoints]
 ```
 
-Read-only. Reports how often the decider agreed with agents, read from the decider ledger (`~/.koto/_decider_ledger.jsonl` unless `--ledger` names another file; a missing ledger is an empty report). An agent running a workflow doesn't need it; a maintainer uses it to decide whether a value can move from `shadow` to `auto`. It never changes a mode.
+Read-only. Reports how often the decider agreed with agents, read from the session logs in the local store (every session, or with `--below <session>` that session and the sessions below it; a store with none is an empty report). The old `~/.koto/_decider_ledger.jsonl` file is no longer used. An agent running a workflow doesn't need it; a maintainer uses it to decide whether a value can move from `shadow` to `auto`. It never changes a mode.
 
 Per question (state, field, and declaration hash) it prints consultations by outcome, paired observations, directed exits (visits the agent left with `koto next --to` instead of answering), per-value recall, coverage, and disagreements, a confusion matrix, fallback and error rates, latency p50/p95, agent stops removed, and directive bytes not delivered. `--state` limits the output to one state.
 
@@ -1482,7 +1482,7 @@ Flags:
 
 | Flag | Meaning |
 |------|---------|
-| `--ledger <path>` | Ledger to read instead of `~/.koto/_decider_ledger.jsonl` |
+| `--below <session>` | Read only this session and the sessions below it |
 | `--state <state>` | Report only questions on this state; with `--fixtures`, the state whose declaration the fixtures exercise |
 | `--json` | Print JSON instead of a table |
 | `--include-custom-endpoints` | Count consultations and fixture runs against a user-config or env endpoint toward eligibility |

@@ -1695,15 +1695,15 @@ koto review record <name> code-round --round <n> --head <head> --file <json>
 
 ### decider report
 
-Reads the decider ledger and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes the ledger or a session log, and compiles the template in memory without touching the compile cache. The promotion workflow it supports is described in [decider-authoring.md](decider-authoring.md#promoting-a-value-to-auto).
+Reads the decider's consultations, the agents' answers, directed exits and decider checks from the session logs in the local store, and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes a session log, and compiles the template in memory without touching the compile cache. The promotion workflow it supports is described in [decider-authoring.md](decider-authoring.md#promoting-a-value-to-auto).
 
 ```bash
-koto decider report [--ledger <path>] [--state <state>] [--json] [--include-custom-endpoints]
+koto decider report [--below <session>] [--state <state>] [--json] [--include-custom-endpoints]
 koto decider report --fixtures <path> --template <path> --state <state> [--field <field>] [--json] [--include-custom-endpoints]
 ```
 
 **Optional flags:**
-- `--ledger <path>` -- Ledger to read. Defaults to `_decider_ledger.jsonl` in the koto root (`~/.koto/_decider_ledger.jsonl`, or under `KOTO_HOME` when it's set). A missing ledger is an empty report, not an error.
+- `--below <session>` -- Read only this session and the sessions below it. Without it, the report reads every session in the local store; a store with none is an empty report, not an error. The old `~/.koto/_decider_ledger.jsonl` file is no longer read or written, and can be deleted.
 - `--state <state>` -- Report only questions on this state, in the table and in JSON. With `--fixtures`, it's also the state whose declaration the fixtures exercise.
 - `--json` -- Print the report as JSON instead of a table.
 - `--include-custom-endpoints` -- Count consultations and fixture runs sent to a user-config or `KOTO_DECIDER_ENDPOINT` endpoint toward promotion eligibility. Without it, only the default endpoint counts, so stub and redirected runs can't reach the bar. Metrics include custom-endpoint consultations either way.
