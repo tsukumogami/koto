@@ -794,6 +794,27 @@ fn child_records_are_read_from_the_child_sessions() {
     assert_eq!(d["session_id"], a_header["session_id"]);
 }
 
+// The records live in the session, so removing the session removes them: a
+// cleaned-up session's answers drop out of the report, where the old host
+// ledger kept them.
+#[test]
+fn a_cleaned_up_session_takes_its_records_out_of_the_report() {
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
+    let before = counts(&h);
+    assert_eq!(before["consulted"], 1, "{}", before);
+    assert_eq!(before["answered"], 1, "{}", before);
+
+    ok(&h.koto().args(["session", "cleanup", WF]).output().unwrap());
+    assert!(!h.state_path().exists());
+
+    let r = report(&h);
+    assert_eq!(r["header"]["consulted"], 0, "{}", r["header"]);
+    assert_eq!(r["header"]["answered"], 0, "{}", r["header"]);
+    assert_eq!(r["questions"].as_array().unwrap().len(), 0, "{}", r);
+}
+
 // ---------------------------------------------------------------------------
 // Session-feed contract
 // ---------------------------------------------------------------------------

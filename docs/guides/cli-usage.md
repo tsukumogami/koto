@@ -1703,7 +1703,7 @@ koto decider report --fixtures <path> --template <path> --state <state> [--field
 ```
 
 **Optional flags:**
-- `--below <session>` -- Read only this session and the sessions below it. Without it, the report reads every session in the local store; a store with none is an empty report, not an error. The old `~/.koto/_decider_ledger.jsonl` file is no longer read or written, and can be deleted.
+- `--below <session>` -- Read only this session and the sessions below it. Without it, the report reads every session in the local store; a store with none is an empty report, not an error. The records live in each session's log, so a session removed by `koto session cleanup` or `koto session prune` takes its answers out of the report with it. The old `~/.koto/_decider_ledger.jsonl` file is no longer read or written, and can be deleted.
 - `--state <state>` -- Report only questions on this state, in the table and in JSON. With `--fixtures`, it's also the state whose declaration the fixtures exercise.
 - `--json` -- Print the report as JSON instead of a table.
 - `--include-custom-endpoints` -- Count consultations and fixture runs sent to a user-config or `KOTO_DECIDER_ENDPOINT` endpoint toward promotion eligibility. Without it, only the default endpoint counts, so stub and redirected runs can't reach the bar. Metrics include custom-endpoint consultations either way.
