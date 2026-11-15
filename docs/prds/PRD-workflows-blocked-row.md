@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   An operator scanning Claude Code's `/workflows` list can't tell a koto session
   stopped on a failing gate from one that is advancing. Both rows draw the same
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-workflows-blocked-row](docs/briefs/BRIEF-workflows-blocked-row.md); carried in Absorbed Brief.
 
