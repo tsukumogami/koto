@@ -159,17 +159,23 @@ fn enriched_shape_matches_golden_fixture() {
     );
 }
 
-/// The fixture pins contract version 6 and the additive fields, holdings,
+/// The fixture pins contract version 7 and the additive fields, holdings,
 /// the /workflows title fields and the blocked step included, so a future
 /// reader can assert the shape it targets. Version 6's own fields are the
 /// reconciled shape's (below); a projected entry carries neither.
 #[test]
-fn fixture_pins_contract_v6_and_new_fields() {
+fn fixture_pins_contract_v7_and_new_fields() {
     let fixture = std::fs::read_to_string(FIXTURE).unwrap();
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 6);
+    assert_eq!(v["koto"]["contractVersion"], 7);
     assert!(v["koto"].get("staleSince").is_none());
+    // v7: the blocked row's label is marked; `name` keeps the label.
+    assert_eq!(
+        v["workflowName"],
+        "blocked \u{b7} impl-feature \u{b7} verify"
+    );
+    assert_eq!(v["name"], "impl-feature \u{b7} verify");
     // v5: the top-level status is the screen's word, and a blocked session
     // is running; koto's classification is koto.status.
     assert_eq!(v["status"], "running");
@@ -274,7 +280,7 @@ fn reconciled_shape_matches_golden_fixture() {
     );
 }
 
-/// The reconciled fixture is version 6's own shape: `killed`, the summary
+/// The reconciled fixture carries version 6's own fields: `killed`, the summary
 /// suffix, `koto.staleSince`, and koto's classification left as it was.
 #[test]
 fn reconciled_fixture_pins_killed_and_stale_since() {
@@ -288,7 +294,7 @@ fn reconciled_fixture_pins_killed_and_stale_since() {
     assert_eq!(v["koto"]["staleSince"], QUIET_SINCE_SECS * 1000);
     assert_eq!(v["koto"]["status"], "running");
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 6);
+    assert_eq!(v["koto"]["contractVersion"], 7);
 }
 
 /// Regeneration helper (ignored by default): prints the canonical reconciled

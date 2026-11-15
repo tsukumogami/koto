@@ -15,10 +15,14 @@ mod host_session;
 use koto::engine::types::{Event, EventPayload, StateFileHeader};
 use koto::session::local::LocalBackend;
 use koto::session::SessionBackend;
-use koto::workflows_surface::{publish_location, workflow_filename, CONTRACT_VERSION};
+use koto::workflows_surface::{
+    publish_location, workflow_filename, BLOCKED_TITLE_PREFIX, CONTRACT_VERSION,
+};
 
 const WORKFLOW: &str = "impl-feature";
 const SESSION_UUID: &str = "blocked-uuid";
+/// The session's intent: its `/workflows` label.
+const INTENT: &str = "Fix the login bug";
 
 /// gather_context -> implement -> verify -> review (terminal), with a command
 /// gate on `verify`.
@@ -55,6 +59,7 @@ fn header() -> StateFileHeader {
         "session_id": SESSION_UUID,
         "template_hash": "h",
         "created_at": "2026-01-01T00:00:00Z",
+        "intent": INTENT,
     }))
     .unwrap()
 }
@@ -162,6 +167,12 @@ fn a_gate_blocked_session_reads_blocked_in_the_running_bucket() {
     );
     assert_eq!(v["koto"]["status"], "blocked");
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
+    assert_eq!(v["koto"]["contractVersion"], 7);
+
+    // tsukumogami/koto#590: the list row is labeled from workflowName, so a
+    // blocked session's label is marked there; `name` keeps the plain label.
+    assert_eq!(v["workflowName"], format!("blocked \u{b7} {INTENT}"));
+    assert_eq!(v["name"], INTENT);
 
     let step = verify_step(&v);
     assert_eq!(step["state"], "error");
@@ -202,6 +213,8 @@ fn a_passing_gate_keeps_the_running_shape() {
     assert!(step.get("blocked").is_none(), "{step}");
     assert!(step.get("error").is_none(), "{step}");
     assert_eq!(v["summary"], "koto \u{b7} impl-feature \u{b7} verify");
+    assert_eq!(v["workflowName"], INTENT);
+    assert_eq!(v["name"], INTENT);
 }
 
 /// A gate name carrying a control character reaches the step's `error` and
@@ -244,10 +257,14 @@ fn move_to(backend: &LocalBackend, kind: &str, from: &str, to: &str) {
         .unwrap();
 }
 
-/// No `workflow_agent` step is flagged blocked and the summary says nothing
-/// about being blocked.
+/// No `workflow_agent` step is flagged blocked, the summary says nothing
+/// about being blocked, and the row label is the plain session label.
 fn assert_not_blocked(v: &serde_json::Value) {
     assert_ne!(v["koto"]["status"], "blocked", "{v}");
+    assert_eq!(v["workflowName"], v["name"], "{v}");
+    assert_eq!(v["name"], INTENT, "{v}");
+    let title = v["workflowName"].as_str().unwrap();
+    assert!(!title.starts_with(BLOCKED_TITLE_PREFIX), "{title}");
     let steps = v["workflowProgress"].as_array().expect("workflowProgress");
     for step in steps.iter().filter(|n| n["type"] == "workflow_agent") {
         assert!(step.get("blocked").is_none(), "a blocked step: {step}");

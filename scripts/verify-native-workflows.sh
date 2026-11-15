@@ -19,6 +19,9 @@
 #              gate-blocked session rendering as blocked: top-level
 #              `running`, `koto.status` `blocked`, a Blocked `error` step
 #              naming the gate, and a summary ending `blocked on gate <name>`.
+#   Row label: a blocked session's `workflowName` (the list row's label) reads
+#              `blocked · <intent>` while `name` stays the plain intent, and
+#              once the gate passes `workflowName` equals `name` again.
 #
 # The hello-koto template's `awakening` state carries a command gate
 # (spirit_greeting) that fails until a greeting file exists, so the first
@@ -83,7 +86,10 @@ active_step_field() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]))
 active_directive() { active_step_field "$1" promptPreview; }
 
 # ---- Setup: init a real session and publish the /workflows location ----
-"$KOTO" init verify --template "$TEMPLATE" --var SPIRIT_NAME=Koto --intent "verify" >/dev/null
+# The intent is the entry's label, so it differs from the session name and the
+# row-label checks can't pass on a fallback label.
+INTENT="Greet the spirit Koto"
+"$KOTO" init verify --template "$TEMPLATE" --var SPIRIT_NAME=Koto --intent "$INTENT" >/dev/null
 "$KOTO" workflows publish --dir "$WF_DIR" --session verify >/dev/null
 
 # ---- render #1: advancing shows an entry with the current state ----
@@ -136,6 +142,12 @@ case "$(phase_detail "$F" Awakening)" in
   *) fail "AC3: blocked phase does not show the failed gate outcome (got '$(phase_detail "$F" Awakening)')" ;;
 esac
 pass "AC3: gate-blocked session renders as blocked with the failed gate outcome"
+# The list row is labeled from workflowName: a blocked row reads
+# `blocked · <intent>`, and `name` keeps the plain intent for programs.
+[ "$(field "$F" workflowName)" = "blocked · $INTENT" ] || fail "AC3: workflowName != 'blocked · $INTENT' (got '$(field "$F" workflowName)')"
+[ "$(field "$F" name)" = "$INTENT" ] || fail "AC3: name != '$INTENT' (got '$(field "$F" name)')"
+[ "$(field "$F" status)" = "running" ] || fail "AC3: marked row's status != running (got '$(field "$F" status)')"
+pass "AC3: row label reads 'blocked · $INTENT', name is the plain intent, status running"
 
 # ---- render #2: after advancing, the entry shows the new state ----
 mkdir -p wip; echo "hello Koto" > wip/spirit-greeting.txt
@@ -143,6 +155,15 @@ mkdir -p wip; echo "hello Koto" > wip/spirit-greeting.txt
 F="$(wf_file)"
 [ "$(koto_field "$F" currentState)" = "eternal" ] || fail "render#2: currentState did not advance to eternal"
 pass "render#2: entry reflects the advanced state on re-read"
+# The gate passed, so the next entry's row label is the plain label again.
+[ "$(field "$F" workflowName)" = "$(field "$F" name)" ] || fail "render#2: workflowName != name after the gate passed (got '$(field "$F" workflowName)' vs '$(field "$F" name)')"
+case "$(field "$F" workflowName)" in
+  "blocked · "*) fail "render#2: workflowName still marked blocked after the gate passed" ;;
+esac
+case "$(field "$F" summary)" in
+  *"blocked on gate"*) fail "render#2: summary still blocked after the gate passed" ;;
+esac
+pass "render#2: after the gate passed, workflowName equals name with no blocked marker"
 
 # ---- AC1 (completed phase outcome): the now-completed phase shows its gate PASS ----
 case "$(phase_detail "$F" Awakening)" in

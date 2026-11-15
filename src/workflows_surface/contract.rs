@@ -46,7 +46,20 @@ use serde::Serialize;
 /// `staleSince`, and sets `contractVersion` to 6 whatever version wrote the
 /// rest of the entry. The session's next commit writes the entry from its
 /// projection again, without either.
-pub const CONTRACT_VERSION: u32 = 6;
+///
+/// Version 7 writes a gate-blocked session's `workflowName` as
+/// `blocked · <session label>` ([`BLOCKED_TITLE_PREFIX`]), while `name` keeps
+/// the session label unmarked. The two fields now differ exactly on blocked
+/// entries; on every other entry they are equal, as before.
+pub const CONTRACT_VERSION: u32 = 7;
+
+/// What a gate-blocked entry's `workflowName` starts with (contract v7).
+///
+/// Claude Code's `/workflows` list labels a row from `workflowName` and draws
+/// a blocked session as running, so without it a blocked row looks like a
+/// working one. It goes first so the list's column cut takes the end of a long
+/// label, never the marker.
+pub const BLOCKED_TITLE_PREFIX: &str = "blocked \u{b7} ";
 
 /// Longest gate name, in raw characters, written into a step's `error` or a
 /// blocked `summary` before the cut marker. The name is cut before it is
@@ -300,11 +313,14 @@ pub struct WorkflowFile {
     /// `wf_*` ids: `koto-<session-uuid>`.
     pub id: String,
     /// Human-readable entry name (the session's derived display label),
-    /// sanitized and capped. Kept for readers of contract versions 1-3; the
-    /// `/workflows` screen titles the entry from `workflow_name`.
+    /// sanitized and capped. Never marked: a program reading the session
+    /// label reads it here. The `/workflows` screen titles the entry from
+    /// `workflow_name`.
     pub name: String,
     /// The entry's title on Claude Code's `/workflows` screen: the same
-    /// sanitized label as `name`.
+    /// sanitized label as `name`, except on a gate-blocked entry, where
+    /// [`WorkflowFile::with_blocked_gate`] puts [`BLOCKED_TITLE_PREFIX`] in
+    /// front of it (contract v7).
     ///
     /// Observed, not documented: the native workflow file Claude Code
     /// v2.1.296 writes titles a run with `workflowName` and describes it with
@@ -335,6 +351,13 @@ pub struct WorkflowFile {
     pub workflow_progress: Vec<ProgressNode>,
     /// koto's namespaced identification + extension block.
     pub koto: KotoBlock,
+    /// The session label exactly as [`WorkflowFile::new`] received it, before
+    /// sanitizing or capping. Never written: it exists so
+    /// [`WorkflowFile::with_blocked_gate`] builds the marked title from the
+    /// raw label, not from the already capped `name`, which would carry a
+    /// second cut marker.
+    #[serde(skip)]
+    raw_label: String,
 }
 
 impl WorkflowFile {
@@ -377,18 +400,40 @@ impl WorkflowFile {
                 holdings: None,
                 stale_since: None,
             },
+            raw_label: name,
         }
     }
 
-    /// Rebuild the summary for a session blocked on `gate`:
-    /// `koto · <workflow> · <state> · blocked on gate <name>`.
+    /// Rebuild the title and the summary for a session blocked on `gate`: the
+    /// title becomes `blocked · <session label>` and the summary
+    /// `koto · <workflow> · <state> · blocked on gate <name>`. Both come from
+    /// this one call, so the row, the summary and the Blocked step always
+    /// agree, and the next write after the session stops being blocked, which
+    /// doesn't call this, carries none of them.
     ///
     /// The gate name is cut at [`GATE_NAME_CAP`] and escaped on its own, and
     /// the `koto · <workflow> · <state>` prefix is capped so the whole line
     /// stays within the fact cap: a long workflow or state name is what gets
-    /// cut, never the "blocked on gate" suffix.
+    /// cut, never the "blocked on gate" suffix. The title is held to the same
+    /// cap, cut marker included: the label is cut, never the marker.
     pub fn with_blocked_gate(mut self, gate: &str) -> Self {
-        use crate::session_view::{sanitize_capped, CUT_MARKER, FACT_CAP};
+        use crate::session_view::{sanitize_capped, sanitize_one_line, CUT_MARKER, FACT_CAP};
+        // The label is cut after escaping (so the cap counts what is written)
+        // and through `cut_escaped`, so the cut never leaves half an escape.
+        let label = sanitize_one_line(&self.raw_label).into_string();
+        let budget = FACT_CAP
+            .saturating_sub(BLOCKED_TITLE_PREFIX.chars().count() + CUT_MARKER.chars().count());
+        let (mut shown, cut) = cut_escaped(&label, budget);
+        if cut {
+            shown.push_str(CUT_MARKER);
+        }
+        // A label empty after sanitizing would leave a dangling separator.
+        self.workflow_name = if shown.is_empty() {
+            "blocked".to_string()
+        } else {
+            format!("{BLOCKED_TITLE_PREFIX}{shown}")
+        };
+
         let workflow = &self.koto.workflow;
         let prefix = match self.koto.current_state.as_deref() {
             Some(state) if !state.is_empty() => format!("koto \u{b7} {workflow} \u{b7} {state}"),
@@ -508,10 +553,48 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_six() {
-        // Version 6 added the `killed` status word and koto.staleSince, both
-        // written only by the retention sweep; the shape fixtures pin it.
-        assert_eq!(CONTRACT_VERSION, 6);
+    fn contract_version_is_seven() {
+        // Version 7 marks a gate-blocked entry's workflowName; the shape
+        // fixtures pin it.
+        assert_eq!(CONTRACT_VERSION, 7);
+    }
+
+    #[test]
+    fn a_blocked_title_is_marked_and_the_name_is_not() {
+        let wf = WorkflowFile::new(
+            "s",
+            "impl-feature",
+            "Fix the login bug".to_string(),
+            Some("verify".to_string()),
+            RenderStatus::Blocked,
+            0,
+        )
+        .with_blocked_gate("tests-pass");
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["workflowName"], "blocked \u{b7} Fix the login bug");
+        assert_eq!(v["name"], "Fix the login bug");
+        assert_eq!(v["status"], "running");
+        assert_eq!(
+            v["summary"],
+            "koto \u{b7} impl-feature \u{b7} verify \u{b7} blocked on gate tests-pass"
+        );
+        // The raw label the title is built from is never written.
+        assert!(v.get("raw_label").is_none() && v.get("rawLabel").is_none());
+    }
+
+    #[test]
+    fn a_running_title_equals_the_name() {
+        let wf = WorkflowFile::new(
+            "s",
+            "impl-feature",
+            "Fix the login bug".to_string(),
+            Some("verify".to_string()),
+            RenderStatus::Running,
+            0,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["workflowName"], "Fix the login bug");
+        assert_eq!(v["workflowName"], v["name"]);
     }
 
     #[test]

@@ -21,8 +21,8 @@ pub mod retention;
 
 pub use contract::{
     gate_name_display, workflow_filename, HoldingKey, Holdings, Phase, ProgressNode, RenderStatus,
-    ScreenStatus, WorkflowFile, CONTRACT_VERSION, GATE_NAME_CAP, HOLDINGS_KEY_CAP,
-    HOLDINGS_STORE_CAP,
+    ScreenStatus, WorkflowFile, BLOCKED_TITLE_PREFIX, CONTRACT_VERSION, GATE_NAME_CAP,
+    HOLDINGS_KEY_CAP, HOLDINGS_STORE_CAP,
 };
 pub use discover::{publish_location, resolve_publish_location, PUBLISH_LOCATION_KEY};
 pub use materialize::{materialize_after_commit, WORKFLOWS_DIR_ENV};
