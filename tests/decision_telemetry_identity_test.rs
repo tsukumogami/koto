@@ -645,13 +645,58 @@ fn install_sink(home: &Path) -> PathBuf {
     log
 }
 
+/// The fields `emit` may append to the queued copy of a record, and no
+/// others (docs/designs/DESIGN-event-sink.md, "Stamps").
+const STAMP_KEYS: &[&str] = &[
+    "koto.run.template.name",
+    "koto.run.template.hash",
+    "koto.check.outcome",
+];
+
 /// Whether the sink's `sent` line is the journal's `record`, or the record
-/// with stamps appended after its last field.
+/// with stamps appended after its last field. Every appended field must be a
+/// stamp, so a record that gained any other field, `decision` among them,
+/// does not match.
 fn sent_as(sent: &str, record: &str) -> bool {
-    sent == record
-        || record
-            .strip_suffix('}')
-            .is_some_and(|open| sent.starts_with(&format!("{open},")))
+    if sent == record {
+        return true;
+    }
+    let Some(open) = record.strip_suffix('}') else {
+        return false;
+    };
+    let Some(rest) = sent.strip_prefix(&format!("{open},")) else {
+        return false;
+    };
+    match serde_json::from_str::<Value>(&format!("{{{rest}")) {
+        Ok(Value::Object(appended)) => {
+            !appended.is_empty() && appended.keys().all(|k| STAMP_KEYS.contains(&k.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// The sink comparison runs only once the emit path exists, so its matcher is
+/// held here on its own: a record matches its stamped copy and nothing that
+/// gained another field.
+#[test]
+fn a_sink_line_matches_its_record_only_with_stamps_appended() {
+    let record = r#"{"kind":"state_entered","session":"telemetry","at":"PINNED"}"#;
+    let open = record.strip_suffix('}').unwrap();
+    assert!(sent_as(record, record));
+    assert!(sent_as(
+        &format!(r#"{open},"koto.run.template.name":"t","koto.run.template.hash":"h"}}"#),
+        record
+    ));
+    assert!(!sent_as(
+        &format!(r#"{open},"decision":{{"kind":"gate-pass"}}}}"#),
+        record
+    ));
+    assert!(!sent_as(
+        &format!(r#"{open},"koto.run.template.name":"t","decision":"d"}}"#),
+        record
+    ));
+    assert!(!sent_as(&format!("{open},}}"), record));
+    assert!(!sent_as(r#"{"kind":"state_entered"}"#, record));
 }
 
 #[test]
@@ -684,6 +729,7 @@ fn records_handed_to_the_event_sink_are_byte_identical_with_and_without_the_deci
 
     // Every record the field-free replay journals reached the sink from the
     // run whose events carried the field, unchanged but for its stamps.
+    // `emit` never queues `context_reads`, so those stay journal-only.
     let (_, without) = both_replays(&env);
     for line in without
         .iter()
