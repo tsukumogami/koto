@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   Claude Code's `/workflows` list builds each row from the entry's top-level
   `status` (the icon), `workflowName` falling back to `summary` (the label,
@@ -35,7 +35,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
