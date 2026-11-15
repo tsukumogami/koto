@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   Claude Code's `/workflows` list builds each row from the entry's top-level
   `status` (the icon), `workflowName` falling back to `summary` (the label,
@@ -35,7 +35,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
@@ -273,7 +273,9 @@ Key assumptions:
 
 A new convention, slug `list-row`, with a probe whose token is the row
 label's source expression (on 2.1.325, `workflowName??` inside the row model
-`label:h.workflowName??h.summary??h.description`), anchored on a nearby
+`label:h.workflowName??h.summary??h.description`, where `description` is
+itself `summary` or "Dynamic workflow" for an entry loaded from a file, which
+is the chain the Context section gives), anchored on a nearby
 literal of the row model, and a same-length `--alter` demonstration that
 renames the token so the run fails naming this convention. The implementer
 picks the anchor by reading the pinned release, the way the file-shape
@@ -358,13 +360,20 @@ exactly as today.
 - `WorkflowFile` keeps the unmarked label it was built with available to
   `with_blocked_gate` (`name` already holds it, sanitized and capped).
 - `with_blocked_gate(gate)` rebuilds `workflow_name` in addition to
-  `summary`: the raw session label is sanitized and cut to
-  `FACT_CAP - prefix_len - CUT_MARKER_len` with `sanitize_capped`, then the
-  prefix is put in front. The marker is never cut; the label is. A label that
-  fits is written whole. To keep the raw label for this, `WorkflowFile::new`
-  stores it in a non-serialized field, or `with_blocked_gate` takes the raw
-  label as a second argument from `try_materialize`; the implementer picks
-  whichever keeps the existing `new` callers unchanged.
+  `summary`: the raw session label is sanitized with `sanitize_one_line`
+  and cut with `cut_escaped` (so the cut never splits an escape sequence) to
+  `FACT_CAP - prefix_len - CUT_MARKER_len` characters, with `CUT_MARKER`
+  appended when it cut, then the prefix is put in front, so the whole title,
+  cut marker included, stays within `FACT_CAP`. The cap counts characters,
+  not terminal columns; the prefix comes first, so wide characters can't
+  push it out of the 50-column row. The marker is never cut; the label is. A label that fits
+  is written whole. The source is always the raw label, never the already
+  capped `name`, which would carry a second cut marker: `WorkflowFile::new`
+  keeps the raw label in a field marked `#[serde(skip)]`, so the unsanitized
+  label never reaches the file, or `with_blocked_gate` takes it as a second
+  argument from `try_materialize`, whichever keeps the existing `new` callers
+  unchanged. A label that is empty after sanitizing
+  gives a title of `blocked` alone.
 - The doc comments on `name` and `workflow_name` say which carries the marker.
 
 **`src/workflows_surface/materialize.rs`**
@@ -377,9 +386,13 @@ exactly as today.
 **`src/workflows_surface/retention.rs`**
 
 - `reconciled` sets `workflowName` to the entry's `name` when both are
-  strings, so a swept entry has no marker. An entry whose `name` is missing
-  keeps whatever `workflowName` it had. Everything else about the sweep
-  stays.
+  strings, so a swept entry has no marker. The entry is JSON read back from
+  disk, which a foreign or edited file could control, so `name` is passed
+  through `sanitize_one_line` (a no-op on a koto-written `name`, which is
+  already escaped and has no raw control characters) and then cut with
+  `cut_escaped` at `FACT_CAP`, the cut `reconciled` already makes on
+  `summary`, before it's copied. An entry whose `name` is missing keeps
+  whatever `workflowName` it had. Everything else about the sweep stays.
 
 **Tests and fixtures**
 
@@ -392,7 +405,10 @@ exactly as today.
   then `<template> · <state>`), a 2,000-character intent with wide characters
   (the full prefix survives, total within the cap plus the cut marker), and a
   control character and ESC in the intent and the state name (escaped as the
-  summary escapes them). A terminal state and a cancel after a failed gate
+  summary escapes them). The long-intent test checks the full prefix is
+  present and the whole title, cut marker included, is within `FACT_CAP`; a
+  unit test puts an escape sequence across the cut point and checks it's
+  dropped whole. A terminal state and a cancel after a failed gate
   each produce an unmarked label; add those two if the existing finished and
   cancel tests don't already cover a prior failed gate.
 - `tests/native_workflows_shape.rs`: the canonical blocked entry's golden
@@ -459,38 +475,47 @@ labels each row from `workflowName`.
 
 ## Implementation Approach
 
-One pull request, in this order, each step a commit.
+One pull request, in this order, each step a commit that leaves the targeted
+tests it touches passing: a golden file, a version assertion or an
+integration assertion changes in the same commit as the behavior it pins.
 
 ### Phase 1: The marker in the file
 
 `CONTRACT_VERSION` 7, the prefix constant, `with_blocked_gate` writing the
 title, the unit tests in `contract.rs` (prefix present, label after it, cap
-cuts the label, escapes), and `materialize.rs` if the raw label is passed in.
+cuts the label, escapes, empty label), `materialize.rs` if the raw label is
+passed in, and, in the same commit, everything the version and the marker
+break: the regenerated blocked golden with its pinning test, the reconciled
+golden's version, the version assertions in the retention and blocked tests,
+and the marker assertions in `tests/native_workflows_blocked_test.rs`.
 
 Deliverables:
 - `src/workflows_surface/contract.rs`
 - `src/workflows_surface/materialize.rs` (only if the signature changes)
+- `tests/native_workflows_shape.rs`,
+  `tests/fixtures/native-workflows/enriched-shape.json`,
+  `tests/fixtures/native-workflows/reconciled-shape.json`
+- `tests/native_workflows_blocked_test.rs`
 
 ### Phase 2: The sweep
 
-`reconciled` restores `workflowName` from `name`; its unit tests and the
-reconciled golden at version 7.
+`reconciled` restores `workflowName` from `name`, with its unit tests (a
+blocked entry loses the marker, a running entry keeps its label, and a
+`name` holding a raw ESC or over the cap is escaped and cut before it's
+copied).
 
 Deliverables:
 - `src/workflows_surface/retention.rs`
-- `tests/fixtures/native-workflows/reconciled-shape.json`
 
-### Phase 3: The guard fixture
+### Phase 3: The guard fixture's running twin and the new cases
 
-The regenerated blocked golden, the new running golden with its tests and
-printer, `SHAPES` updated, and the fail-then-pass assertions in the blocked
-integration tests, including the new no-intent, long-intent, escape, terminal
-and cancel cases.
+The new running golden with its comparison and pinning tests and its printer,
+`SHAPES` updated, and the new integration cases: no intent, long intent,
+escapes, and a terminal state and a cancel after a failed gate.
 
 Deliverables:
 - `tests/native_workflows_shape.rs`, `tests/native_workflows_conventions.rs`
-- `tests/fixtures/native-workflows/enriched-shape.json`,
-  `tests/fixtures/native-workflows/running-shape.json`
+- `tests/fixtures/native-workflows/running-shape.json`
 - `tests/native_workflows_blocked_test.rs`
 
 ### Phase 4: The convention guard
@@ -498,7 +523,10 @@ Deliverables:
 The `list-row` convention and its `--alter` demo, checked with
 `scripts/check-claude-code-conventions.sh` on the release the work checks,
 and the pin moved to it once every convention passes there. If another
-convention fails on the newer release, the pin stays and the PR says why.
+convention fails on the newer release, the pin stays, the `list-row` probe is
+written so it also matches the pinned release (checked with the guard on that
+release), the probe's match on the newer release is checked with `--evidence`
+and recorded in the PR, and the PR says why the pin stayed.
 
 Deliverables:
 - `tests/fixtures/native-workflows/claude-code-conventions.json`
@@ -535,25 +563,30 @@ koto#590 without a closing keyword.
 piece of session-derived text, the marker plus the session label, into a file
 that Claude Code reads and draws in a terminal. An intent is user or template
 content and a state name comes from a template, so both are untrusted. The
-label passes through `sanitize_capped`, the sanitizer the summary already
+label passes through `sanitize_one_line`, the sanitizer the summary already
 uses, which escapes control characters (ESC and 8-bit CSI included), bidi
 overrides, zero-width and tag characters, and folds newlines, so an intent
-can't inject terminal escapes or reorder the row. Claude Code strips control
-characters from the label itself as well. The cut applies to the session
-label and never to the prefix, and the tests cover a 2,000-character intent
-with wide characters, control characters and ESC in the intent and the state
-name, and the cap boundary.
+can't inject terminal escapes or reorder the row. The cut is made with
+`cut_escaped`, so it never leaves half an escape sequence. Claude Code happens
+to strip control characters from the label too, but that varies by release
+and koto doesn't rely on it. The cut applies to the session label and never
+to the prefix, and the tests cover a 2,000-character intent with wide
+characters, control characters and ESC in the intent and the state name, an
+escape across the cut point, and the cap boundary.
 
 **The marker is a convenience, not an authority.** Nothing stops an intent
-that literally starts with the word "blocked", so a running row could read
-like a blocked one. The authoritative reading stays `koto.status`, the summary
-suffix and the Blocked step, which come from the same classification; the
-session-feed reference says so.
+that literally starts with the word "blocked", contains `blocked · ` further
+in, or spells it with lookalike characters, so a running row could read like
+a blocked one. The authoritative reading stays `koto.status`, the summary
+suffix and the Blocked step, which come from the same classification. The
+session-feed reference says so, and says programs read `koto.status` and
+`name` rather than parsing the prefix off `workflowName`.
 
 **No new permissions, reads or data.** The write path reads nothing it didn't
 read before, adds no network call, and the gate name stays out of the row.
-The retention sweep copies `name`, a string koto already wrote and sanitized,
-into `workflowName`.
+The retention sweep copies `name` into `workflowName` only after escaping and
+cutting it, since the file it reads back could have been edited by something
+other than koto.
 
 **The convention guard and its pinned release.** The guard downloads a Claude
 Code npm package koto doesn't control; the new `list-row` convention adds a
