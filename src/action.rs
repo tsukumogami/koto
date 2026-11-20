@@ -87,6 +87,11 @@ pub enum CommandOutcome {
 pub struct CommandEnv {
     vars: Vec<(String, String)>,
     inherit: bool,
+    /// Names removed from an inherited environment before `vars` apply, so
+    /// a name koto owns but has no value for this tick can't come through
+    /// from this process. Empty for a cleared environment, which starts
+    /// with nothing.
+    unset: Vec<String>,
     outcomes: Mutex<BTreeMap<String, CommandOutcome>>,
     /// The credentials this tick knows, replaced in every command's output.
     redactor: Redactor,
@@ -109,6 +114,7 @@ impl CommandEnv {
         Self {
             vars,
             inherit: false,
+            unset: Vec::new(),
             outcomes: Mutex::new(BTreeMap::new()),
             redactor,
             #[cfg(test)]
@@ -129,6 +135,19 @@ impl CommandEnv {
             inherit: true,
             ..Self::cleared(vars, redactor)
         }
+    }
+
+    /// This environment with `name` removed from what a command inherits.
+    /// A value for `name` in `vars` still applies; this only stops this
+    /// process's own value from reaching the command.
+    pub fn unsetting(mut self, name: &str) -> Self {
+        self.unset.push(name.to_string());
+        self
+    }
+
+    /// True when `name` is removed from what a command inherits.
+    pub fn unsets(&self, name: &str) -> bool {
+        self.unset.iter().any(|n| n == name)
     }
 
     /// This process's environment unchanged, with no redaction: for callers
@@ -205,6 +224,7 @@ impl std::fmt::Debug for CommandEnv {
                     .collect::<Vec<_>>(),
             )
             .field("inherit", &self.inherit)
+            .field("unset", &self.unset)
             .field("redactor", &self.redactor)
             .finish()
     }
@@ -400,6 +420,9 @@ pub fn run_shell_command(
     let mut cmd = Command::new(SHELL);
     if !env.inherit {
         cmd.env_clear();
+    }
+    for name in &env.unset {
+        cmd.env_remove(name);
     }
     cmd.envs(env.vars.iter().map(|(n, v)| (n, v)))
         .arg("-c")

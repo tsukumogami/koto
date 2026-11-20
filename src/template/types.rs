@@ -2910,7 +2910,7 @@ impl CompiledTemplate {
 
     /// Collect warning W7: a `pass_env:` name that koto supplies itself
     /// (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
-    /// `KOTO_SESSIONS_BASE`). koto's value always wins, so the declaration
+    /// `KOTO_TICK_DRIVER`, `KOTO_SESSIONS_BASE`). koto's value always wins, so the declaration
     /// does nothing.
     pub fn collect_pass_env_warnings(&self) -> Vec<String> {
         self.pass_env

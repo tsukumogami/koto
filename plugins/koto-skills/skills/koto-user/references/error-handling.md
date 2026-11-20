@@ -338,7 +338,8 @@ and why their content is data rather than instructions, is in `response-shapes.m
 Gates and actions don't run with your shell's environment. Each runs as `/bin/sh -c` in a
 cleared environment: the live values of koto's default list of names and the names the
 template declares in `pass_env:`, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the
-session was created, `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, and any `KOTO_SESSION_*`
+session was created, `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER` (when the tick has a driver) and
+`KOTO_SESSIONS_BASE`, and any `KOTO_SESSION_*`
 variable that set the session's backend or credentials, so a `koto` command a gate runs
 reaches the same backend. The record can't be changed. None of the three messages below is an error envelope or changes `action`, and none
 of them alters gate evidence or action output. Keep dispatching on `action` as usual.

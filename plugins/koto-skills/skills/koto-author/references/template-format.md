@@ -1212,7 +1212,7 @@ states:
 | `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
 | `polling` | No | map | `interval_secs` + `timeout_secs`. Re-runs the command on an interval, re-evaluating the state's gates between runs, until they pass or `timeout_secs` expires |
 
-**Invocation.** One `/bin/sh -c` argument, in its own process group, with standard input at end of file. It does not inherit the environment of the `koto next` process: it runs in a cleared environment holding the live values of koto's default list and the template's `pass_env:` names, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. See [`pass_env:`](#pass_env--variables-a-command-reads). Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
+**Invocation.** One `/bin/sh -c` argument, in its own process group, with standard input at end of file. It does not inherit the environment of the `koto next` process: it runs in a cleared environment holding the live values of koto's default list and the template's `pass_env:` names, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the session was created, and `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER` and `KOTO_SESSIONS_BASE`. See [`pass_env:`](#pass_env--variables-a-command-reads). Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
 
 **When it runs.** Whenever the advance loop enters the state on a tick carrying no evidence for it. A tick that submits evidence skips the action -- which is how confirming doesn't re-run the command. Every other tick that reaches the state runs it again, gate-blocked retries and self-loops included, so the command must be safe to re-run (`mkdir -p`, not `mkdir`).
 
@@ -1264,7 +1264,7 @@ Gate and action commands don't see the caller's environment. Each runs in a clea
 
 1. the live value, on each tick, of each name on koto's default list and each name the template declares in `pass_env:`, minus the refused names below;
 2. `PATH`, `HOME` and `XDG_CONFIG_HOME` as recorded when the session was created (an unset recorded `PATH` becomes `/usr/bin:/bin`);
-3. `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, set by koto.
+3. `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER` and `KOTO_SESSIONS_BASE`, set by koto. `KOTO_TICK_DRIVER` is the ticking process's `CLAUDE_CODE_SESSION_ID` when it is id-shaped (the driver the run journal records), and unset otherwise.
 
 The default list is `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `LC_MONETARY`, `TZ`, `TMPDIR`, `TERM`, `NO_COLOR`, `CI`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`. Nothing else: not `GH_REPO`, no `GIT_*`, no `AWS_*`, no other `KOTO_*`.
 
@@ -1288,7 +1288,7 @@ Rules the compiler applies to each name:
 
 - It must match `^[A-Za-z_][A-Za-z0-9_]*$`. List names, not patterns or values.
 - A refused name is a compile error: `BASH_ENV`, `ENV`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR`, and any name starting `BASH_FUNC_` or `GIT_CONFIG`. These make the shell, `git` or `gh` run code or load configuration chosen by whoever ticks the session. koto also filters them at run time.
-- A name koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_SESSIONS_BASE`) compiles with warning **W7**, since koto's value wins and the declaration does nothing. Remove it.
+- A name koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER`, `KOTO_SESSIONS_BASE`) compiles with warning **W7**, since koto's value wins and the declaration does nothing. Remove it.
 
 Declared values are read live on each tick and never written to the session, so declaring a token's name is safe.
 
@@ -1769,7 +1769,7 @@ Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used
 | E | E-SKIP-AMBIGUOUS | Compile-time error on `skip_if` | `skip_if` values match zero or more than one conditional transition — ensure values satisfy exactly one `when` clause |
 | W | W1-W5 | Compile-time warnings on `materialize_children` / `failure` / `skipped_marker` | See [batch-authoring.md](batch-authoring.md) |
 | W | W6 | Compile-time warning on `present` matcher misuse | Fires when `"present"` appears outside `evidence.<field>` paths |
-| W | W7 | Compile-time warning on `pass_env:` | A declared name is one koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_SESSIONS_BASE`), so the declaration has no effect -- remove it |
+| W | W7 | Compile-time warning on `pass_env:` | A declared name is one koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER`, `KOTO_SESSIONS_BASE`), so the declaration has no effect -- remove it |
 | W | W-SKIP-GATE-ABSENT | Compile-time warning on `skip_if` | A `gates.NAME.*` key references a gate not declared on the state — add the gate or fix the key |
 | F | F5 | Compile-time warning on child template reachability | Child template has no reachable `skipped_marker: true` terminal. See [batch-authoring.md](batch-authoring.md) |
 | R | R0-R9 | Pre-append runtime rules on a submitted task list | Validated in `koto next`. See [batch-workflows.md](../../koto-user/references/batch-workflows.md) |

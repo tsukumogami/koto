@@ -552,6 +552,105 @@ fn nested_koto_in_a_gate_sees_the_tick_and_the_store() {
     assert_eq!(env.read_out("ctx.txt"), "from the store");
 }
 
+// ---------------------------------------------------------------------------
+// KOTO_TICK_DRIVER: the driver koto observed for the tick
+// ---------------------------------------------------------------------------
+
+/// A gate that records `KOTO_TICK_DRIVER`, or `<unset>` when it has none,
+/// and fails, so every tick runs it again. `extra` goes into the template's
+/// frontmatter after `initial_state`.
+fn driver_template(env: &Env, extra: &str) -> String {
+    env.template(
+        "driver.md",
+        &gate_template(
+            "driver",
+            r#"printf "%s" "${KOTO_TICK_DRIVER-<unset>}" > OUT/driver.txt; exit 1"#,
+        )
+        .replace(
+            "initial_state: check\n",
+            &format!("initial_state: check\n{extra}"),
+        ),
+    )
+}
+
+/// The driver the run journal last recorded for `session`.
+fn journal_driver(env: &Env, session: &str) -> Option<String> {
+    let journal = std::fs::read_to_string(env.sessions().join("_run_journal.jsonl")).ok()?;
+    journal
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|r| r["session"] == session)
+        .find_map(|r| r["koto.driver.session.id"].as_str().map(str::to_string))
+}
+
+const DRIVER_ID: &str = "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60718";
+
+#[test]
+fn a_gate_sees_an_id_shaped_driver_as_the_tick_driver() {
+    let env = Env::new();
+    let tpl = driver_template(&env, "");
+    env.init(&[], "wf", &tpl);
+
+    let r = env.next(&[("CLAUDE_CODE_SESSION_ID", DRIVER_ID)], "wf");
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(env.read_out("driver.txt"), DRIVER_ID);
+    // The same value the run journal records as the session's driver.
+    assert_eq!(journal_driver(&env, "wf").as_deref(), Some(DRIVER_ID));
+}
+
+#[test]
+fn a_gate_sees_no_tick_driver_without_an_id_shaped_driver() {
+    let env = Env::new();
+    let tpl = driver_template(&env, "");
+    env.init(&[], "wf", &tpl);
+
+    assert!(env.next(&[], "wf").success);
+    assert_eq!(env.read_out("driver.txt"), "<unset>");
+
+    for malformed in ["", "a/b", "has space", &"a".repeat(129)] {
+        std::fs::remove_file(env.out().join("driver.txt")).unwrap();
+        assert!(
+            env.next(&[("CLAUDE_CODE_SESSION_ID", malformed)], "wf")
+                .success
+        );
+        assert_eq!(env.read_out("driver.txt"), "<unset>", "{malformed:?}");
+    }
+    assert_eq!(journal_driver(&env, "wf"), None);
+}
+
+#[test]
+fn neither_pass_env_nor_the_ticking_process_replaces_the_tick_driver() {
+    let env = Env::new();
+    let tpl = driver_template(&env, "pass_env:\n  - KOTO_TICK_DRIVER\n");
+    env.init(&[], "wf", &tpl);
+
+    let spoofed = ("KOTO_TICK_DRIVER", "spoofed");
+    assert!(
+        env.next(&[spoofed, ("CLAUDE_CODE_SESSION_ID", DRIVER_ID)], "wf")
+            .success
+    );
+    assert_eq!(env.read_out("driver.txt"), DRIVER_ID);
+
+    assert!(env.next(&[spoofed], "wf").success);
+    assert_eq!(env.read_out("driver.txt"), "<unset>");
+
+    // A legacy session's commands inherit the caller's environment, which
+    // still can't supply the name.
+    let r = env.run(
+        &[],
+        &["init", "old", "--template", &tpl, "--legacy-environment"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(env.next(&[spoofed], "old").success);
+    assert_eq!(env.read_out("driver.txt"), "<unset>");
+    assert!(
+        env.next(&[spoofed, ("CLAUDE_CODE_SESSION_ID", DRIVER_ID)], "old")
+            .success
+    );
+    assert_eq!(env.read_out("driver.txt"), DRIVER_ID);
+}
+
 #[test]
 fn a_gate_reads_end_of_file_on_standard_input() {
     let env = Env::new();

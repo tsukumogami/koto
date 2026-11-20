@@ -239,10 +239,17 @@ command. Standard input is at end of file, so a command can't read whatever a ca
    are left out. A name the caller hasn't set is simply absent.
 2. `PATH`, `HOME` and `XDG_CONFIG_HOME` **as recorded when the session was created**. A value
    recorded unset stays unset, except `PATH`: an unset recorded `PATH` becomes `/usr/bin:/bin`.
-3. `KOTO_TICK_SESSION`, the session being ticked, and `KOTO_SESSIONS_BASE`, the directory that
-   holds the session directories, **set by koto**. When the koto running the tick has `KOTO_HOME`
-   set, koto also sets `KOTO_HOME` to the root it resolved, so a koto the command calls uses the
-   same root; otherwise `KOTO_HOME` is absent.
+3. `KOTO_TICK_SESSION`, the session being ticked, `KOTO_TICK_DRIVER`, the Claude Code session
+   driving the tick, and `KOTO_SESSIONS_BASE`, the directory that holds the session directories,
+   **set by koto**. When the koto running the tick has `KOTO_HOME` set, koto also sets
+   `KOTO_HOME` to the root it resolved, so a koto the command calls uses the same root; otherwise
+   `KOTO_HOME` is absent.
+
+`KOTO_TICK_DRIVER` holds the ticking process's `CLAUDE_CODE_SESSION_ID` when that value is
+id-shaped (1 to 128 characters from `A-Z a-z 0-9 . _ : -`), which is the value the
+[run journal](../reference/run-journal.md#drivers) records as the session's driver. When the variable is
+unset or isn't id-shaped, `KOTO_TICK_DRIVER` is unset in the command's environment, never empty.
+A gate can compare it with the driver it expects, to refuse a tick from some other session.
 
 The first step skips the recorded names and the ones koto sets, so neither a declared name nor
 the caller's own value can replace them. Nothing else reaches the command.
@@ -301,8 +308,8 @@ and the value is never recorded. The compiler checks each name:
 - It must match `^[A-Za-z_][A-Za-z0-9_]*$`. List names, not patterns or values.
 - A refused name (below) is a compile error.
 - A name koto supplies itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
-  `KOTO_SESSIONS_BASE`) compiles with warning W7, because koto's value wins and the declaration
-  does nothing.
+  `KOTO_TICK_DRIVER`, `KOTO_SESSIONS_BASE`) compiles with warning W7, because koto's value wins
+  and the declaration does nothing.
 
 A template that declares nothing compiles to the same form, and the same hash, as it did before
 `pass_env:` existed. An older koto ignores the key.
@@ -363,7 +370,9 @@ session: `koto cancel --cleanup <name>`, then `koto init` again.
 
 `koto init --legacy-environment` creates a session whose commands run with the ticking process's
 whole environment, plus `KOTO_TICK_SESSION`, as koto did before it recorded anything. `/bin/sh`
-and the empty standard input still apply.
+and the empty standard input still apply, and so does `KOTO_TICK_DRIVER`: koto sets it to the
+tick's driver, or removes it when there is none, so the caller's own value never reaches a
+command.
 
 The choice is made once, by whoever creates the session. It's stored in the record, children copy
 it, and no tick can set or clear it. With `--attach-live` on an existing session the flag has no

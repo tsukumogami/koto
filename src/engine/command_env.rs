@@ -25,10 +25,17 @@ pub const UNSET_PATH: &str = "/usr/bin:/bin";
 /// Variables recorded by value when a session is created.
 pub const FIXED_NAMES: [&str; 3] = ["PATH", "HOME", "XDG_CONFIG_HOME"];
 
+/// The driver koto observed for the tick: the ticking process's Claude Code
+/// session id (`CLAUDE_CODE_SESSION_ID`) when it is id-shaped, the same
+/// value the run journal records as the session's driver. Unset in a
+/// command's environment when the tick has no driver.
+pub const TICK_DRIVER_ENV: &str = "KOTO_TICK_DRIVER";
+
 /// Names koto sets itself on every command. A value from the ticking
 /// process or a template declaration never replaces them.
-pub const KOTO_SET_NAMES: [&str; 2] = [
+pub const KOTO_SET_NAMES: [&str; 3] = [
     crate::engine::reentrancy::TICK_SESSION_ENV,
+    TICK_DRIVER_ENV,
     "KOTO_SESSIONS_BASE",
 ];
 
@@ -537,13 +544,19 @@ where
 /// record.
 ///
 /// A legacy record gives this process's environment plus `KOTO_TICK_SESSION`,
-/// which is koto's behaviour before records existed. Otherwise the result is,
+/// which is koto's behaviour before records existed, with `KOTO_TICK_DRIVER`
+/// set to the tick's driver or, with none, removed. Otherwise the result is,
 /// in order: the live value of each name in the record's list and the
 /// template's `pass_env` that `lookup` finds, leaving out refused names and the
 /// names koto sets; the three fixed values, `PATH` becoming [`UNSET_PATH`] when
-/// the record has none; then `KOTO_TICK_SESSION` and, when given,
-/// `KOTO_SESSIONS_BASE`, and the `session_vars` (which carry `KOTO_HOME` when
-/// the tick has it set). Nothing else reaches a command.
+/// the record has none; then `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER` when the
+/// tick has a driver, `KOTO_SESSIONS_BASE` when given, and the `session_vars`
+/// (which carry `KOTO_HOME` when the tick has it set). Nothing else reaches a
+/// command.
+///
+/// The driver is read with the run journal's reader
+/// (`crate::run_journal::driver`), not through `lookup`, so the value a
+/// command sees is the one the journal records as the session's driver.
 ///
 /// The result always carries the tick's known set ([`known_credentials`]
 /// over `config_keys` and `lookup`), so every command run under it has its
@@ -565,10 +578,16 @@ where
         crate::engine::reentrancy::TICK_SESSION_ENV.to_string(),
         session.to_string(),
     );
+    // The run journal's own reader, so a command sees exactly the driver the
+    // journal records for this tick, or none.
+    let driver = crate::run_journal::driver().map(|id| (TICK_DRIVER_ENV.to_string(), id));
     if record.legacy {
         let mut vars = vec![tick];
+        vars.extend(driver);
         vars.extend(session_vars.iter().cloned());
-        return CommandEnv::inherited(vars, redactor);
+        // A legacy command inherits this process's environment, which may
+        // carry a value under the name; with no driver it must stay unset.
+        return CommandEnv::inherited(vars, redactor).unsetting(TICK_DRIVER_ENV);
     }
 
     let mut vars: Vec<(String, String)> = Vec::new();
@@ -592,6 +611,7 @@ where
         vars.push(("XDG_CONFIG_HOME".to_string(), xdg.clone()));
     }
     vars.push(tick);
+    vars.extend(driver);
     vars.extend(session_vars.iter().cloned());
     if let Some(base) = sessions_base {
         vars.push((
@@ -1135,5 +1155,73 @@ mod tests {
         let (built, _) = for_tick(Some(&legacy), &[], "wf", None, &[], &vars, env(&[])).unwrap();
         assert!(built.inherits());
         assert_eq!(built.get("KOTO_SESSION_BACKEND"), Some("cloud"));
+    }
+
+    /// Build a tick's environment with the hosting session's id set to
+    /// `driver` (or unset), through the seam the run journal reads.
+    fn ticked_under(
+        driver: Option<&str>,
+        rec: &CommandEnvironment,
+        pass_env: &[String],
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> (CommandEnv, Option<String>) {
+        use crate::host_env::{set_host_env_for_test, CLAUDE_SESSION_ID_ENV};
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, driver);
+        let built = for_tick(Some(rec), pass_env, "wf", None, &[], &[], lookup)
+            .unwrap()
+            .0;
+        let journal_driver = crate::run_journal::driver();
+        set_host_env_for_test(CLAUDE_SESSION_ID_ENV, None);
+        (built, journal_driver)
+    }
+
+    #[test]
+    fn an_id_shaped_driver_is_the_tick_driver_the_journal_records() {
+        let id = "3f1e2a9c-0b7d-4e55-a1b2-c3d4e5f60718";
+        let (built, journal) =
+            ticked_under(Some(id), &record(Some("/usr/bin"), &[]), &[], env(&[]));
+        assert_eq!(built.get(TICK_DRIVER_ENV), Some(id));
+        assert_eq!(built.get(TICK_DRIVER_ENV), journal.as_deref());
+
+        let mut legacy = record(Some("/usr/bin"), &[]);
+        legacy.legacy = true;
+        let (built, _) = ticked_under(Some(id), &legacy, &[], env(&[]));
+        assert!(built.inherits());
+        assert_eq!(built.get(TICK_DRIVER_ENV), Some(id));
+    }
+
+    #[test]
+    fn no_driver_or_a_malformed_one_leaves_the_tick_driver_unset() {
+        for driver in [None, Some(""), Some("a/b"), Some(" abc"), Some("abc\ndef")] {
+            let (built, journal) =
+                ticked_under(driver, &record(Some("/usr/bin"), &[]), &[], env(&[]));
+            assert_eq!(journal, None, "{driver:?}");
+            assert_eq!(built.get(TICK_DRIVER_ENV), None, "{driver:?}");
+
+            let mut legacy = record(Some("/usr/bin"), &[]);
+            legacy.legacy = true;
+            let (built, _) = ticked_under(driver, &legacy, &[], env(&[]));
+            assert_eq!(built.get(TICK_DRIVER_ENV), None, "{driver:?}");
+            // The caller's own value can't come through an inherited
+            // environment either.
+            assert!(built.unsets(TICK_DRIVER_ENV), "{driver:?}");
+        }
+    }
+
+    #[test]
+    fn neither_pass_env_nor_the_ticking_process_replaces_the_tick_driver() {
+        let id = "driver-1";
+        let pass_env = vec![TICK_DRIVER_ENV.to_string()];
+        let spoof = || env(&[(TICK_DRIVER_ENV, "spoofed")]);
+        // The record's list can't carry it either.
+        let rec = record(Some("/usr/bin"), &[TICK_DRIVER_ENV]);
+
+        let (built, _) = ticked_under(Some(id), &rec, &pass_env, spoof());
+        assert_eq!(built.get(TICK_DRIVER_ENV), Some(id));
+        let (built, _) = ticked_under(None, &rec, &pass_env, spoof());
+        assert_eq!(built.get(TICK_DRIVER_ENV), None);
+
+        assert!(is_koto_supplied(TICK_DRIVER_ENV));
+        assert!(validate_declared_name(TICK_DRIVER_ENV).is_ok());
     }
 }

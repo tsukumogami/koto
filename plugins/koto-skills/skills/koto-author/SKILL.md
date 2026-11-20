@@ -129,7 +129,7 @@ The category: **does the command's risk live in a bad success, or only in a bad 
 
 An action must also be safe to re-run -- it fires on every tick that enters the state without evidence, gate-blocked retries and self-loops included.
 
-Gates and actions run in a cleared environment, not the caller's: the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded at `koto init`, koto's default list of live names (locale, `TMPDIR`, `GH_TOKEN`, proxies and a few more), and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. If a command reads any other variable, declare its name in the template's top-level `pass_env:` list, or it's unset at run time. The exact lists and the compile rules are in the template format guide's `pass_env:` section.
+Gates and actions run in a cleared environment, not the caller's: the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded at `koto init`, koto's default list of live names (locale, `TMPDIR`, `GH_TOKEN`, proxies and a few more), and `KOTO_TICK_SESSION`, `KOTO_TICK_DRIVER` (the driving Claude Code session's id, unset when there is none) and `KOTO_SESSIONS_BASE`. If a command reads any other variable, declare its name in the template's top-level `pass_env:` list, or it's unset at run time. The exact lists and the compile rules are in the template format guide's `pass_env:` section.
 
 koto treats every declared `pass_env:` value as a credential and redacts it from command output, so don't declare a variable whose value a command needs to print back or capture; the rule is in the [`pass_env:` section](references/template-format.md#pass_env--variables-a-command-reads).
 
