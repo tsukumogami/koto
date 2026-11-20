@@ -18,7 +18,10 @@ default list and passes the gate without the checks this file names for them: ru
 Each JSON command runs through `scripts/without-session-env.sh`, which removes `KOTO_SESSIONS_BASE`,
 every `KOTO_SESSION_*` variable, `KOTO_ANCHOR`, `KOTO_DISPATCHER_ANCHOR` and `KOTO_AUTHORITY` and
 refuses to start the command while any is still set, since the koto driving the gate or the session
-around it can set them; the commands below are listed without it.
+around it can set them. Each `cargo` command in the JSON also runs as `env CARGO_INCREMENTAL=0 cargo ...`,
+right after that script, so the suite's build leaves no `target/debug/incremental/` behind; an exported
+variable would not reach the suite, since koto runs a session's commands with a fixed environment. The
+commands below are listed without either prefix.
 
 ## Verification map
 
@@ -27,7 +30,7 @@ around it can set them; the commands below are listed without it.
   -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
-  - `cargo test --test doc_names --test plugin_hooks_shape` (the two Rust tests that read `plugins/`)
+  - `cargo test --locked --test doc_names` and `cargo test --locked --test plugin_hooks_shape` (the two Rust tests that read `plugins/`, two map commands)
   - `bash scripts/check-evals-exist.sh`
   - `bash scripts/check-inline-evidence_test.sh` (`validate.yml`'s `inline-evidence` job)
   - `for d in $(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null); do test ! -f "$d/hooks.json" || exit 1; done`
@@ -39,7 +42,7 @@ around it can set them; the commands below are listed without it.
   - `bash plugins/koto-skills/hooks/test/session-start-workflows.test.sh` (needs `jq` on the PATH)
   - `bash plugins/koto-skills/hooks/test/pre-tool-use-agent.test.sh` (needs `jq` on the PATH; brings its own stub koto, so no build)
 - `docs/**` -> all of:
-  - `cargo test --test doc_names` and `cargo test --lib shipped_spec` (the only tests that read `docs/`)
+  - `cargo test --locked --test doc_names` and `cargo test --locked --lib shipped_spec` (the only tests that read `docs/`)
   - `B=$(git merge-base origin/main HEAD) && git diff --name-only --diff-filter=ACMR "$B" -- :/docs/ | grep -vE "(^|/)(evals|tests)/fixtures/" | xargs -r shirabe validate --visibility=public` (errors out when `origin/main` is missing: that is cannot-verify, not a failed change)
   - `shirabe validate --visibility=public --lifecycle . --mode=draft` (not `ready`: an in-flight `/execute` chain keeps its PLAN, which the ready posture rejects)
 - `scripts/run-evals.sh`, `scripts/run-evals_test.sh`, `scripts/classify-eval-session.py` ->
