@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   A koto pull request waits about 33 minutes for its test verdict, because the
   whole suite runs on one thread, twice per CI round, to keep tests that share
@@ -15,7 +15,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -112,13 +112,3 @@ cannot quietly break an unrelated test running at the same time.
 - Splitting the suite across several machines (sharding). It adds coordination
   the verdict then has to reassemble, and is a later option if one machine is
   still too slow.
-
-## Open Questions
-
-- Whether Coverage becomes part of what `validate` waits on once the test verdict
-  comes from the coverage-instrumented run, or stays a separate, non-required
-  signal.
-- How much of the remaining round time the PRD should target as "done", given
-  that an instrumented run is slower than a plain one.
-
-None of these questions block the brief.
