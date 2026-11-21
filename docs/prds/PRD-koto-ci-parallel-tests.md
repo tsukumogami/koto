@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   A koto pull request waits 34 to 41 minutes for its test verdict. CI runs the
   whole suite on one thread, twice per round (Unit Tests and Coverage), against
@@ -19,7 +19,7 @@ upstream: docs/briefs/BRIEF-koto-ci-parallel-tests.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
