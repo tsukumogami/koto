@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto runs every action inside one tick under a hard-coded 30-second limit
   and has no notion of a resource shared across sessions, so heavy steps from
@@ -32,7 +32,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
