@@ -91,7 +91,10 @@ for the second session.
 **Goal**: A `default_action` with `background: true` and `timeout_secs` starts
 its command through a detached `koto __run-action` runner and returns within 2
 seconds; the slot stays held for the command's real length, and the next tick
-after it ends delivers the result and moves on.
+after it ends delivers the result and moves on. Step 1 left `background`
+compiling but running as an ordinary action; this step gives it its runtime
+behind the same pool guard (the CLI action closure and the engine's
+`ActionResult::PoolBlocked` stop), unix-only like `src/pool/`.
 
 **Acceptance Criteria**:
 
@@ -119,7 +122,8 @@ the first run's `background_finished`.
 **Dependencies**: Step 1
 
 **Files**: `src/engine/background.rs`, `src/cli/run_action.rs`,
-`src/engine/advance.rs`, `src/pool/guard.rs`, `tests/pool_background.rs`
+`src/cli/mod.rs`, `src/engine/advance.rs`, `src/pool/guard.rs`,
+`src/pool/store.rs`, `tests/pool_background.rs`
 
 **Type**: code
 
