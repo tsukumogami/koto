@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   validate.yml runs the koto suite twice per round, each time on one libtest
   thread, because a few tests change HOME, the cache directory, the working
@@ -30,7 +30,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
