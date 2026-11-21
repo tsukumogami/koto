@@ -59,6 +59,8 @@ PR's evidence in line.
 
 **Goal**: A contributor can trust the `validate` check: a failing koto test, a failing stability test, or a test that only breaks under parallel runs turns it red, while a Codecov upload fault leaves it green. The stability-tests job runs on nextest the same way the `tests` job does (one process per test, no `--test-threads=1`, read-only job token), and the new job is shown to execute every test name the last `--all-features` Coverage run on `main` did.
 
+Step 1 landed the `tests` job (display name "Tests and Coverage") running `cargo llvm-cov nextest --locked --all-features --profile ci`, writing `target/**/nextest/ci/junit.xml` as the `junit` artifact, and `.config/nextest.toml` with the `ci` profile (`retries = 0`, `fail-fast = false`, no filter) and an empty `[test-groups]` table: locally all 5,449 tests passed in parallel with no test group needed. `stability-tests` still runs `cargo test -p koto-stability-tests -- --test-threads=1`; this step moves it onto nextest, reusing the `ci` profile or a profile beside it in the same file. The branch has not been pushed yet, so the PR's first hosted run is part of this step's evidence.
+
 **Acceptance Criteria**:
 
 - [ ] On a throwaway branch with one deliberately failing test in the `koto` package, the `tests` job result is `failure` and `validate` is red. The failing test is named in the `tests` job log.
@@ -76,7 +78,7 @@ PR's evidence in line.
 
 **Dependencies**: Step 1
 
-**Files**: `.github/workflows/validate.yml`
+**Files**: `.github/workflows/validate.yml`, `.config/nextest.toml`
 
 ### Step 3: Local verification runs tests with CI's isolation and falls back to the serial run with a notice
 
