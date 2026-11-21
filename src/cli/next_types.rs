@@ -1429,6 +1429,34 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::Error => "error",
                 GateOutcome::Pending => "pending",
             };
+            // The reserved `__pool__` condition: a pooled action held back by
+            // its host pool (DESIGN-host-resource-pools.md Decision 3). Its
+            // status is the guard's own word (`queued`, `invalid`,
+            // `unavailable`), carried in `output`. A queued session is a
+            // wait, so it is temporal; nothing the agent can do moves it.
+            if name == crate::template::types::POOL_CONDITION_NAME {
+                let pool_status = result
+                    .output
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(status)
+                    .to_string();
+                let category = if result.outcome == GateOutcome::Pending {
+                    "temporal"
+                } else {
+                    "corrective"
+                };
+                return Some(BlockingCondition {
+                    name: name.clone(),
+                    condition_type: "pool".to_string(),
+                    status: pool_status,
+                    category: category.to_string(),
+                    agent_actionable: false,
+                    output: result.output.clone(),
+                    failure: None,
+                    poll: None,
+                });
+            }
             if name == ACTION_CONDITION_NAME {
                 return Some(BlockingCondition {
                     name: name.clone(),

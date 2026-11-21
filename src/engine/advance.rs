@@ -149,6 +149,15 @@ pub enum ActionResult {
         /// attempt.
         spawned: bool,
     },
+    /// The action did not run, because its host pool held it back: the
+    /// session is queued for a slot (DESIGN-host-resource-pools.md
+    /// Decision 3), or the pool can't be used. The map holds the one
+    /// reserved `__pool__` condition the tick stops on.
+    ///
+    /// The loop stops here before the state's gates, as for a failed
+    /// action, and keeps the transitions the tick already made (PRD R17).
+    /// Nothing ran, so nothing is appended and no attempt is counted.
+    PoolBlocked(BTreeMap<String, StructuredGateResult>),
 }
 
 /// Build the synthetic condition map a failed action stops on.
@@ -1487,6 +1496,19 @@ where
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
+                }
+                ActionResult::PoolBlocked(conditions) => {
+                    // Queued for a slot, or the pool can't be used: stop at
+                    // this state before its gates, which judge work the
+                    // action has not done. `advanced` carries the
+                    // transitions this tick already made.
+                    return Ok(AdvanceResult {
+                        attempts: None,
+                        advisories: Advisories::default(),
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(conditions),
+                    });
                 }
                 ActionResult::Refused {
                     field,
@@ -5070,6 +5092,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         }
     }
 

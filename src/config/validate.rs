@@ -108,6 +108,20 @@ const KNOWN_KEYS: &[&str] = &[
 /// key under it is reported as the table, never by its own name.
 const RESERVED_TABLE: &str = "request_store.recursion";
 
+/// The keys a `[pools.<name>]` table may set (PRD-host-resource-pools.md R5).
+const POOL_KEYS: &[&str] = &["size", "claim_secs", "lapse_secs", "wait_secs"];
+
+/// Whether `path` is a pool setting, `pools.<name>.<key>`, with a valid pool
+/// name and a known key. Pools are user config only, so a project file's
+/// are dropped; one that passes this is named, since its pool name was
+/// checked against the pool-name grammar and holds no control characters.
+fn is_pool_key(path: &[String]) -> bool {
+    matches!(path, [table, name, key]
+        if table == "pools"
+            && crate::template::types::is_valid_pool_name(name)
+            && POOL_KEYS.contains(&key.as_str()))
+}
+
 /// What a trusted project config file contributes: its table reduced to
 /// the [`PROJECT_ALLOWLIST`] keys, and what was dropped.
 #[derive(Debug, Clone)]
@@ -143,7 +157,7 @@ pub fn filter_project_layer(raw: &toml::Value) -> ProjectLayer {
         let reserved = plain && key.starts_with(&format!("{RESERVED_TABLE}."));
         if allowed {
             insert_path(&mut kept, &path, value.clone());
-        } else if plain && KNOWN_KEYS.contains(&key.as_str()) {
+        } else if plain && (KNOWN_KEYS.contains(&key.as_str()) || is_pool_key(&path)) {
             dropped.push(key);
         } else if reserved {
             if !dropped.iter().any(|k| k == RESERVED_TABLE) {
@@ -438,6 +452,21 @@ mod tests {
         for key in crate::config::ALL_KEYS {
             assert!(KNOWN_KEYS.contains(key), "{key} is settable but not known");
         }
+    }
+
+    #[test]
+    fn a_project_file_s_pools_are_dropped_and_named() {
+        let l = layer("[pools.test-suite]\nsize = 4\nwait_secs = 0\n[pools.Bad]\nsize = 1\n");
+        assert!(l.kept.as_table().unwrap().is_empty());
+        let mut dropped = l.dropped.clone();
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            ["pools.test-suite.size", "pools.test-suite.wait_secs"]
+        );
+        // A pool name outside the grammar is text the author chose: counted,
+        // never printed.
+        assert_eq!(l.unknown, 1);
     }
 
     #[test]

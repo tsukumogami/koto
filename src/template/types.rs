@@ -866,6 +866,106 @@ pub struct ActionDecl {
     /// `capture_stdout_as`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub capture_allow_empty: bool,
+    /// The host pool this action takes a slot of before it runs
+    /// (DESIGN-host-resource-pools.md). The operator sizes the pool in the
+    /// user's koto config; a pool the config doesn't define imposes no limit.
+    ///
+    /// This and the two fields below are serialized only when set, so a
+    /// template that uses none of them compiles to the same output and
+    /// template hash as before they existed, and an older koto, which ignores
+    /// unknown keys here, runs the action unthrottled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Run the command through a detached runner that outlives the tick.
+    /// Requires `timeout_secs`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    /// A background action's time limit, 1 to 86400 seconds. Only with
+    /// `background: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u32>,
+}
+
+/// A pool name: lowercase letters, digits and hyphens, starting with a letter
+/// or digit, at most 63 characters (PRD-host-resource-pools.md R1). Checked
+/// before a name reaches a path.
+pub fn is_valid_pool_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// The most a background action's `timeout_secs` may be.
+pub const MAX_ACTION_TIMEOUT_SECS: u32 = 86_400;
+
+/// Refuse a `default_action`'s `pool`, `background` and `timeout_secs` when
+/// they break PRD-host-resource-pools.md R2, naming the state and the field.
+fn validate_action_pooling(state_name: &str, action: &ActionDecl) -> Result<(), String> {
+    if let Some(pool) = &action.pool {
+        // A variable would make the pool a value the template's caller
+        // picks, and the name reaches a path under the koto root.
+        if pool.contains("{{") {
+            return Err(format!(
+                "state {:?}: default_action pool {:?} holds a template variable; \
+                 a pool name must be written literally\n  \
+                 remedy: name the pool directly, as in `pool: test-suite`",
+                state_name, pool
+            ));
+        }
+        if !is_valid_pool_name(pool) {
+            return Err(format!(
+                "state {:?}: default_action pool {:?} is not a valid pool name; \
+                 use lowercase letters, digits and hyphens, starting with a letter \
+                 or digit, at most 63 characters",
+                state_name, pool
+            ));
+        }
+    }
+    match (action.background, action.timeout_secs) {
+        (false, Some(_)) => {
+            return Err(format!(
+                "state {:?}: default_action timeout_secs needs background: true\n  \
+                 remedy: add `background: true`, or remove timeout_secs; an ordinary \
+                 action runs under koto's 30-second limit",
+                state_name
+            ));
+        }
+        (true, None) => {
+            return Err(format!(
+                "state {:?}: default_action background: true needs timeout_secs\n  \
+                 remedy: add `timeout_secs` (1 to {})",
+                state_name, MAX_ACTION_TIMEOUT_SECS
+            ));
+        }
+        (true, Some(t)) if t == 0 || t > MAX_ACTION_TIMEOUT_SECS => {
+            return Err(format!(
+                "state {:?}: default_action timeout_secs {} is out of range; \
+                 it must be a whole number from 1 to {}",
+                state_name, t, MAX_ACTION_TIMEOUT_SECS
+            ));
+        }
+        _ => {}
+    }
+    if action.background {
+        if action.polling.is_some() {
+            return Err(format!(
+                "state {:?}: default_action background can't be combined with polling",
+                state_name
+            ));
+        }
+        if action.requires_confirmation {
+            return Err(format!(
+                "state {:?}: default_action background can't be combined with \
+                 requires_confirmation",
+                state_name
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ActionDecl {
@@ -897,6 +997,11 @@ impl ActionDecl {
             fallback: _,
             capture_stdout_as: _,
             capture_allow_empty: _,
+            // A pool name is never substituted; a reference in it is
+            // refused by `validate_action_pooling`.
+            pool: _,
+            background: _,
+            timeout_secs: _,
         } = self;
         vec![
             ("command", command.as_str()),
@@ -931,6 +1036,11 @@ impl ActionDecl {
             fallback,
             capture_stdout_as: _,
             capture_allow_empty: _,
+            // A pool name is never substituted; a reference in it is
+            // refused by `validate_action_pooling`.
+            pool: _,
+            background: _,
+            timeout_secs: _,
         } = self;
         let mut fields = Vec::new();
         if let Some(prose) = fallback {
@@ -1010,6 +1120,11 @@ pub const GATES_EVIDENCE_NAMESPACE: &str = "gates";
 /// otherwise an author's gate and the engine's synthetic result would collide
 /// in the same map.
 pub const ACTION_CONDITION_NAME: &str = "__action__";
+
+/// Condition name reserved for a pooled action waiting for a slot of its
+/// host pool (DESIGN-host-resource-pools.md Decision 3). Like
+/// [`ACTION_CONDITION_NAME`], the compiler refuses a gate of this name.
+pub const POOL_CONDITION_NAME: &str = "__pool__";
 
 /// Prefix used in when-clause keys to match on the presence of an agent-submitted
 /// evidence field. Paired with the sentinel value [`PRESENT_MATCHER_VALUE`] to form
@@ -1974,6 +2089,13 @@ impl CompiledTemplate {
                     state_name, ACTION_CONDITION_NAME
                 ));
             }
+            if state.gates.contains_key(POOL_CONDITION_NAME) {
+                return Err(format!(
+                    "state {:?}: gate name {:?} is reserved for a pooled action's wait\n  \
+                     remedy: rename the gate",
+                    state_name, POOL_CONDITION_NAME
+                ));
+            }
 
             // Validate variable references in every substitutable gate field.
             //
@@ -2102,6 +2224,7 @@ impl CompiledTemplate {
                         ));
                     }
                 }
+                validate_action_pooling(state_name, action)?;
             }
         }
 
@@ -3782,6 +3905,9 @@ mod tests {
             fallback: Some("look in {{V}}".to_string()),
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         };
         let named: Vec<&'static str> = probe.literal_fields().into_iter().map(|(f, _)| f).collect();
         assert!(
@@ -3799,6 +3925,9 @@ mod tests {
                 fallback: None,
                 capture_stdout_as: None,
                 capture_allow_empty: false,
+                pool: None,
+                background: false,
+                timeout_secs: None,
             };
             match field {
                 "fallback" => action.fallback = Some("look in {{V}}".to_string()),
@@ -3854,6 +3983,9 @@ mod tests {
             fallback: Some("plain prose with no reference in it".to_string()),
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         t.validate(false).unwrap();
     }
@@ -4813,6 +4945,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: Some(key.to_string()),
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         t
     }
@@ -4868,6 +5003,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: Some("BRANCH".to_string()),
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(err.contains("already delivered by state"), "got: {}", err);
@@ -4907,6 +5045,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -4992,6 +5133,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5174,6 +5318,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5196,6 +5343,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5218,6 +5368,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5239,6 +5392,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         t.validate(true).unwrap();
     }
@@ -5258,6 +5414,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         let err = t.validate(true).unwrap_err();
         assert!(
@@ -5288,6 +5447,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         t.validate(true).unwrap();
     }
@@ -5307,6 +5469,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         });
         t.validate(true).unwrap();
     }
@@ -5324,6 +5489,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         let restored: ActionDecl = serde_json::from_str(&json).unwrap();
@@ -5340,6 +5508,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         // Optional/empty fields should be omitted.

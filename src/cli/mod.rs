@@ -7633,6 +7633,45 @@ fn handle_next(
             }
         };
 
+        // The pool guard (DESIGN-host-resource-pools.md Decision 3): before
+        // the command and before any gate, take a slot of the action's host
+        // pool, wait for one, or stop queued. A pool the user config doesn't
+        // define returns `Unpooled` and touches nothing on disk, so the
+        // action runs exactly as it would without `pool`. The slot lives in
+        // `_pool_slot` until this closure returns, after the command; its
+        // descriptor is inherited by the command, so anything the command
+        // leaves running keeps the slot held too (PRD R10).
+        let _pool_slot = match (&action.pool, crate::koto_home::koto_home()) {
+            (Some(pool), Some(koto_root)) => {
+                let requester = crate::pool::guard::Requester {
+                    koto_root,
+                    session: name.clone(),
+                    workspace: execution_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    state: state_name.to_string(),
+                };
+                let outcome = crate::pool::guard::acquire(pool, &requester);
+                if let Some(conditions) = outcome.blocking_condition(pool) {
+                    return ActionResult::PoolBlocked(conditions);
+                }
+                match outcome {
+                    crate::pool::guard::GuardOutcome::Acquired(slot) => {
+                        if let Err(e) = slot.inherit_into_children() {
+                            eprintln!(
+                                "warning: the pool slot can't be passed to the command ({e}); \
+                                 it is held only while koto waits for the command"
+                            );
+                        }
+                        Some(slot)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
         // Execute: polling or one-shot. The run time covers the whole
         // polling loop for a polling action, as its timeout does.
         let started = std::time::Instant::now();
@@ -11612,6 +11651,9 @@ Done.
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
