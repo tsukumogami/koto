@@ -12,7 +12,7 @@ goals: |
   run, finishes in at most 15 minutes on the standard runner, the required
   `validate` check waits on it, and every test that runs today still runs and
   still checks what it checks.
-upstream: docs/briefs/BRIEF-koto-ci-parallel-tests.md
+absorbed: docs/briefs/BRIEF-koto-ci-parallel-tests.md
 ---
 
 # PRD: koto CI parallel tests
@@ -20,6 +20,35 @@ upstream: docs/briefs/BRIEF-koto-ci-parallel-tests.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF](docs/briefs/BRIEF-koto-ci-parallel-tests.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+**Why this exists.** Every push to a koto pull request waits more than half an
+hour for its test verdict, because the whole suite runs on one thread, twice
+per round, to keep a few tests that swap process-wide state (HOME, the cache
+directory, the working directory, environment variables) from racing. The
+guard was sized for a suite a tenth of today's, and whoever iterates on a PR,
+a contributor answering review or an agent working a red check, pays the wait
+on every fix-and-push round.
+
+**The outcome.** A contributor learns whether a push passed the whole suite in
+minutes, from a required check that keeps its name and its meaning, with
+coverage from the same run and every test still there and still checking what
+it checked. Agents running the verification steps locally get the isolation CI
+uses, and a new test that touches process state is isolated without its author
+knowing about a single-thread convention.
+
+**Who it serves.** A contributor waiting on a PR round; a maintainer reading
+coverage that matches the verdict; an agent running the verification map
+before pushing; a test author adding a state-touching test.
+
+**The boundary.** In: how CI runs the suite and produces coverage, what the
+required check waits on, the stability tests and local verification steps,
+and making the suite safe to run in parallel. Out: any engine or CLI behavior
+change, removing or weakening tests, the other CI jobs, larger runners or
+caching as the main lever, and sharding across machines.
 
 ## Problem Statement
 
