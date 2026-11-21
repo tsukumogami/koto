@@ -31,10 +31,17 @@ pub enum AnchorCommand {
     /// `resume` with no anchor of its own does the same through the
     /// transcript path. Every call appends an `anchor_started` event.
     ///
+    /// An open that creates an anchor records its origin on that event:
+    /// `dispatched` by the name `--dispatched-by` gave, `none` when it gave
+    /// none, or `unrecorded` with a fixed reason when the value is
+    /// malformed, names this anchor, or its link couldn't be written. The
+    /// dispatcher value never refuses the open.
+    ///
     /// Runs under the anchor's lock and never reads `KOTO_ANCHOR`. Prints
     /// `anchor=<name>`, `opened=new|continued|reopened|successor` and
-    /// `observed=yes|no`, and after a `clear` that found its predecessor
-    /// `previous=<name>` and `inherit_until=<rfc3339>`.
+    /// `observed=yes|no`, then `origin=dispatched|none|unrecorded` when the
+    /// open created the anchor, and after a `clear` that found its
+    /// predecessor `previous=<name>` and `inherit_until=<rfc3339>`.
     Open {
         /// The harness's session id: letters, digits, `_` and `-`, at most
         /// 128, not ending in `-closed` or `-s<n>`
@@ -50,8 +57,9 @@ pub enum AnchorCommand {
         #[arg(long, value_name = "TOKEN")]
         process: Option<String>,
 
-        /// The session that dispatched this agent session, recorded as a
-        /// dispatched-by link when the anchor is created
+        /// The session that dispatched this agent session, recorded as the
+        /// anchor's origin and a dispatched-by link when the anchor is
+        /// created; a malformed value is recorded as unrecorded, not refused
         #[arg(long = "dispatched-by", value_name = "NAME")]
         dispatched_by: Option<String>,
 
@@ -153,6 +161,9 @@ pub fn handle(backend: &Backend, command: AnchorCommand) -> Result<()> {
             println!("anchor={}", outcome.anchor);
             println!("opened={}", outcome.opened.as_str());
             println!("observed={}", yes_no(outcome.observed));
+            if let Some(origin) = &outcome.origin {
+                println!("origin={}", origin.state());
+            }
             if let Some(previous) = &outcome.previous {
                 println!("previous={previous}");
             }

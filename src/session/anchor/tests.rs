@@ -373,15 +373,14 @@ fn open_refuses_bad_ids_and_names_held_by_other_sessions() {
     let err = open(&b, &req("taken", Source::Startup)).unwrap_err();
     assert!(err.downcast_ref::<AnchorRefusal>().is_some(), "{err}");
     assert!(err.to_string().contains("isn't an anchor"), "{err}");
-    for (field, value) in [("key", "bad key"), ("dispatcher", "_x")] {
-        let mut r = req("s9", Source::Startup);
-        match field {
-            "key" => r.observed_key = Some(value.to_string()),
-            _ => r.dispatched_by = Some(value.to_string()),
-        }
-        let err = open(&b, &r).unwrap_err();
-        assert!(err.downcast_ref::<AnchorRefusal>().is_some(), "{err}");
-    }
+    // A malformed dispatcher is no longer refused: the anchor is created and
+    // records it as unrecorded (see the origin tests below).
+    let r = OpenRequest {
+        observed_key: Some("bad key".to_string()),
+        ..req("s9", Source::Startup)
+    };
+    let err = open(&b, &r).unwrap_err();
+    assert!(err.downcast_ref::<AnchorRefusal>().is_some(), "{err}");
     assert_eq!(hashes(tmp.path()), before);
 }
 
@@ -1474,4 +1473,417 @@ fn an_open_records_the_authority_it_was_handed_and_only_with_the_flag() {
     open(&b, &with(Some(""))).unwrap();
     assert!(matches!(read_authority(&dir), AuthorityRead::Record(r) if r.is_empty()));
     assert!(b.meta(&anchor, AUTHORITY_KEY).is_none());
+}
+
+// ===== Origin =====
+
+fn open_dispatched(b: &LocalBackend, harness: &str, value: &str) -> OpenOutcome {
+    open_with(
+        b,
+        OpenRequest {
+            dispatched_by: Some(value.to_string()),
+            ..req(harness, Source::Startup)
+        },
+    )
+}
+
+fn first_started(b: &LocalBackend, name: &str) -> AnchorStarted {
+    started_events(b, name).remove(0)
+}
+
+fn unrecorded(named: &str, reason: &str) -> AnchorOrigin {
+    AnchorOrigin::Unrecorded {
+        named: named.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+#[test]
+fn a_new_anchor_records_each_origin_state_and_never_refuses_the_dispatcher() {
+    let (_tmp, b) = backend();
+
+    let out = open_dispatched(&b, "d1", "anchor-parent");
+    let dispatched = AnchorOrigin::Dispatched {
+        dispatcher: "anchor-parent".to_string(),
+    };
+    assert_eq!(out.origin.as_ref(), Some(&dispatched));
+    let started = first_started(&b, "anchor-d1");
+    assert_eq!(started.origin.as_ref(), Some(&dispatched));
+    assert_eq!(started.dispatched_by.as_deref(), Some("anchor-parent"));
+    assert!(has_link(
+        &b,
+        "anchor-d1",
+        LinkKind::DispatchedBy,
+        "anchor-parent"
+    ));
+
+    for (harness, value) in [("n1", None), ("n2", Some(""))] {
+        let out = open_with(
+            &b,
+            OpenRequest {
+                dispatched_by: value.map(str::to_string),
+                ..req(harness, Source::Startup)
+            },
+        );
+        assert_eq!(out.origin, Some(AnchorOrigin::NoDispatcher), "{value:?}");
+        let started = first_started(&b, &out.anchor);
+        assert_eq!(started.origin, Some(AnchorOrigin::NoDispatcher));
+        assert_eq!(started.dispatched_by, None);
+        assert_eq!(link_count(&b, &out.anchor, LinkKind::DispatchedBy), 0);
+    }
+
+    let long_plain = "x".repeat(MAX_DISPATCHER_BYTES + 1);
+    for (harness, value, named) in [
+        ("m1", "_x".to_string(), "_x".to_string()),
+        ("m2", long_plain.clone(), "x".repeat(64)),
+        ("m3", "a b".to_string(), named_preview("a b")),
+        ("m4", "a/b".to_string(), named_preview("a/b")),
+    ] {
+        let out = open_dispatched(&b, harness, &value);
+        let want = unrecorded(&named, ORIGIN_MALFORMED);
+        assert_eq!(out.opened, Opened::New, "{value:?}");
+        assert_eq!(out.origin.as_ref(), Some(&want), "{value:?}");
+        let started = first_started(&b, &out.anchor);
+        assert_eq!(started.origin.as_ref(), Some(&want), "{value:?}");
+        assert_eq!(started.dispatched_by, None, "{value:?}");
+        assert_eq!(link_count(&b, &out.anchor, LinkKind::DispatchedBy), 0);
+    }
+
+    let out = open_dispatched(&b, "self1", "anchor-self1");
+    let want = unrecorded("anchor-self1", ORIGIN_SELF);
+    assert_eq!(out.origin.as_ref(), Some(&want));
+    let started = first_started(&b, "anchor-self1");
+    assert_eq!(started.origin.as_ref(), Some(&want));
+    assert_eq!(started.dispatched_by, None);
+    assert_eq!(link_count(&b, "anchor-self1", LinkKind::DispatchedBy), 0);
+}
+
+#[test]
+fn a_long_valid_name_is_dispatched_and_one_over_the_byte_bound_is_not() {
+    let (_tmp, b) = backend();
+    // The link key's own length rule caps a peer below the 256-byte bound,
+    // so the bound only ever adds to what validation already refuses; a
+    // long name the link rule accepts is still dispatched.
+    let longest = format!("a{}", "b".repeat(199));
+    assert!(links::validate_peer(LinkKind::DispatchedBy, &longest).is_ok());
+    let out = open_dispatched(&b, "l1", &longest);
+    assert_eq!(
+        out.origin,
+        Some(AnchorOrigin::Dispatched {
+            dispatcher: longest.clone()
+        })
+    );
+    let over = "a".repeat(MAX_DISPATCHER_BYTES + 1);
+    let out = open_dispatched(&b, "l2", &over);
+    assert_eq!(
+        out.origin.as_ref().map(AnchorOrigin::state),
+        Some("unrecorded")
+    );
+}
+
+#[test]
+fn the_named_preview_is_bounded_and_hashes_values_outside_the_plain_name_set() {
+    assert_eq!(named_preview("anchor-x.y_z"), "anchor-x.y_z");
+    assert_eq!(named_preview(&"q".repeat(300)), "q".repeat(64));
+    for hostile in [
+        "a\nanchor=anchor-forged",
+        "a\u{1b}[31mred",
+        "it's $(rm -rf x)",
+        "caf\u{e9}",
+    ] {
+        let named = named_preview(hostile);
+        assert!(named.starts_with("sha256:"), "{hostile:?}: {named}");
+        assert!(
+            named.ends_with(&format!("({} bytes)", hostile.len())),
+            "{named}"
+        );
+        assert!(!named.chars().any(char::is_control), "{named:?}");
+        assert!(!named.contains("anchor="), "{named}");
+        assert!(!named.contains("rm -rf"), "{named}");
+    }
+}
+
+#[test]
+fn origin_is_written_on_every_creating_event_and_never_on_a_continue() {
+    let (_tmp, b) = backend();
+    let dispatched = AnchorOrigin::Dispatched {
+        dispatcher: "anchor-parent".to_string(),
+    };
+
+    // New, then continued.
+    open_with(
+        &b,
+        OpenRequest {
+            dispatched_by: Some("anchor-parent".to_string()),
+            observed_key: Some("k1".to_string()),
+            ..req("s1", Source::Startup)
+        },
+    );
+    let out = open_dispatched(&b, "s1", "anchor-other");
+    assert_eq!(out.opened, Opened::Continued);
+    assert_eq!(out.origin, None);
+    let events = started_events(&b, "anchor-s1");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].origin.as_ref(), Some(&dispatched));
+    assert_eq!(events[1].origin, None);
+    // The continue still records the valid value it inherited, as before.
+    assert_eq!(events[1].dispatched_by.as_deref(), Some("anchor-other"));
+    // A malformed value on a continue is not put in the legacy field.
+    open_dispatched(&b, "s1", "bad value");
+    assert_eq!(last_started(&b, "anchor-s1").dispatched_by, None);
+    assert_eq!(last_started(&b, "anchor-s1").origin, None);
+
+    // A successor opened because its predecessor read closed.
+    close(&b, "k1", "s1").unwrap();
+    let out = open_dispatched(&b, "s1", "anchor-parent");
+    assert_eq!(
+        (out.anchor.as_str(), out.opened),
+        ("anchor-s1-s2", Opened::Successor)
+    );
+    assert_eq!(out.origin.as_ref(), Some(&dispatched));
+    assert_eq!(
+        first_started(&b, "anchor-s1-s2").origin.as_ref(),
+        Some(&dispatched)
+    );
+    // Naming the family's first anchor from its successor is naming itself.
+    let (_tmp2, b2) = backend();
+    open_keyed(&b2, "f1", "k1");
+    close(&b2, "k1", "f1").unwrap();
+    let out = open_dispatched(&b2, "f1", "anchor-f1");
+    assert_eq!(out.anchor, "anchor-f1-s2");
+    assert_eq!(out.origin, Some(unrecorded("anchor-f1", ORIGIN_SELF)));
+
+    // A successor after a `/clear`.
+    let tok = token(now_secs() - 60);
+    open_with(
+        &b,
+        OpenRequest {
+            process: Some(tok.clone()),
+            ..req("c1", Source::Startup)
+        },
+    );
+    let out = open_with(
+        &b,
+        OpenRequest {
+            process: Some(tok),
+            ..req("c2", Source::Clear)
+        },
+    );
+    assert_eq!(out.opened, Opened::Successor);
+    assert_eq!(out.origin, Some(AnchorOrigin::NoDispatcher));
+    assert_eq!(
+        first_started(&b, "anchor-c2").origin,
+        Some(AnchorOrigin::NoDispatcher)
+    );
+
+    // A reopened anchor: removed, then started again by a compaction.
+    open_with(&b, req("r1", Source::Startup));
+    b.cleanup("anchor-r1").unwrap();
+    let out = open_with(
+        &b,
+        OpenRequest {
+            dispatched_by: Some("anchor-parent".to_string()),
+            ..req("r1", Source::Compact)
+        },
+    );
+    assert_eq!(out.opened, Opened::Reopened);
+    assert_eq!(out.origin.as_ref(), Some(&dispatched));
+    assert_eq!(
+        first_started(&b, "anchor-r1").origin.as_ref(),
+        Some(&dispatched)
+    );
+}
+
+#[test]
+fn a_log_written_before_origin_existed_still_loads_and_replays() {
+    let (_tmp, b) = backend();
+    let name = "anchor-old1";
+    b.create(name).unwrap();
+    let text = format!(
+        "{}\n{}\n{}\n",
+        r#"{"schema_version":1,"workflow":"anchor-old1","template_hash":"h","created_at":"2026-01-01T00:00:00Z","kind":"anchor"}"#,
+        r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"anchor_started","payload":{"source":"startup","harness_session":"old1","opened":"new","dispatched_by":"anchor-parent"}}"#,
+        r#"{"seq":2,"timestamp":"2026-01-01T00:00:01Z","type":"anchor_started","payload":{"source":"resume","harness_session":"old1","opened":"continued"}}"#,
+    );
+    std::fs::write(state_path(&b, name), text).unwrap();
+    let (_, events) = b.read_events(name).unwrap();
+    assert_eq!(events.len(), 2);
+    let started = started_events(&b, name);
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[0].origin, None);
+    assert_eq!(started[0].dispatched_by.as_deref(), Some("anchor-parent"));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.payload, EventPayload::OriginUnrecorded(_))));
+}
+
+/// A local store whose dispatched-by link writes fail with an error
+/// carrying [`STORE_SECRET`], as a remote store's error text might carry an
+/// endpoint or a credential fragment.
+struct LinkFails {
+    inner: LocalBackend,
+}
+
+const STORE_SECRET: &str = "MARKER-endpoint-s3.example.internal-tok_7f3a9c";
+
+impl SessionBackend for LinkFails {
+    fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
+        self.inner.create(id)
+    }
+    fn session_dir(&self, id: &str) -> PathBuf {
+        self.inner.session_dir(id)
+    }
+    fn exists(&self, id: &str) -> bool {
+        self.inner.exists(id)
+    }
+    fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+        self.inner.cleanup(id)
+    }
+    fn list(&self) -> anyhow::Result<Vec<crate::session::SessionInfo>> {
+        self.inner.list()
+    }
+    fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
+        self.inner.append_header(id, header)
+    }
+    fn append_event(&self, id: &str, payload: &EventPayload, ts: &str) -> anyhow::Result<()> {
+        self.inner.append_event(id, payload, ts)
+    }
+    fn init_state_file(
+        &self,
+        id: &str,
+        header: StateFileHeader,
+        events: Vec<Event>,
+    ) -> Result<(), SessionError> {
+        self.inner.init_state_file(id, header, events)
+    }
+    fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        self.inner.read_events(id)
+    }
+    fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
+        self.inner.read_header(id)
+    }
+    fn ensure_pushed(&self, id: &str) -> Result<(), SessionError> {
+        self.inner.ensure_pushed(id)
+    }
+    fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.relocate(from, to)
+    }
+    fn lock_state_file(&self, id: &str) -> Result<crate::session::SessionLock, SessionError> {
+        self.inner.lock_state_file(id)
+    }
+}
+
+impl ContextStore for LinkFails {
+    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+        self.inner.add(session, key, content)
+    }
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        if key.starts_with(&format!("koto/links/{}/", LinkKind::DispatchedBy.as_str())) {
+            anyhow::bail!("PUT {key} failed: 403 from {STORE_SECRET}");
+        }
+        self.inner.add_with_writer(session, key, content, writer)
+    }
+    fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get(session, key)
+    }
+    fn ctx_exists(&self, session: &str, key: &str) -> bool {
+        self.inner.ctx_exists(session, key)
+    }
+    fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        self.inner.remove(session, key)
+    }
+    fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+        self.inner.list_keys(session, prefix)
+    }
+}
+
+#[test]
+fn a_failed_link_write_is_recorded_once_and_its_error_text_reaches_no_event() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = LinkFails {
+        inner: LocalBackend::with_base_dir(tmp.path().join("sessions")),
+    };
+    // The double's error really does carry the marker through the link
+    // writer, so its absence below is the open's doing.
+    make_session(&store.inner, "probe");
+    let err = links::write_link_via(
+        &store,
+        "probe",
+        LinkKind::DispatchedBy,
+        "anchor-parent",
+        &LinkHints::default(),
+        Some("anchor"),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains(STORE_SECRET), "{err:#}");
+
+    let out = open(
+        &store,
+        &OpenRequest {
+            dispatched_by: Some("anchor-parent".to_string()),
+            ..req("w1", Source::Startup)
+        },
+    )
+    .unwrap();
+    assert_eq!(out.anchor, "anchor-w1");
+    assert_eq!(out.opened, Opened::New);
+    assert_eq!(
+        out.origin,
+        Some(unrecorded("anchor-parent", ORIGIN_LINK_FAILED))
+    );
+    assert!(!store.ctx_exists(
+        "anchor-w1",
+        &links::link_key(LinkKind::DispatchedBy, "anchor-parent")
+    ));
+
+    let (_, events) = store.read_events("anchor-w1").unwrap();
+    let recorded: Vec<&OriginUnrecorded> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::OriginUnrecorded(o) => Some(o),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![&OriginUnrecorded {
+            named: "anchor-parent".to_string(),
+            reason: ORIGIN_LINK_FAILED.to_string(),
+        }]
+    );
+    // The creating event still says who was named.
+    let started = started_events(&store, "anchor-w1");
+    assert_eq!(
+        started[0].origin,
+        Some(AnchorOrigin::Dispatched {
+            dispatcher: "anchor-parent".to_string()
+        })
+    );
+    let log = std::fs::read_to_string(state_path(&store, "anchor-w1")).unwrap();
+    assert!(!log.contains("MARKER"), "{log}");
+    assert!(!log.contains("403"), "{log}");
+
+    // A continue writes no second one.
+    open(
+        &store,
+        &OpenRequest {
+            dispatched_by: Some("anchor-parent".to_string()),
+            ..req("w1", Source::Resume)
+        },
+    )
+    .unwrap();
+    let (_, events) = store.read_events("anchor-w1").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::OriginUnrecorded(_)))
+            .count(),
+        1
+    );
 }

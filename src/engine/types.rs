@@ -1162,9 +1162,60 @@ pub struct AnchorStarted {
     /// `clear`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The dispatcher the caller inherited, when it named one.
+    /// The dispatcher the caller inherited, when it named one that is a
+    /// valid anchor name other than this anchor's own. A malformed or
+    /// self-naming value is never put here, so older readers never see one;
+    /// it is kept, as a preview, in `origin` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_by: Option<String>,
+    /// Where the anchor came from, on the event that created it (a new
+    /// anchor, a reopened one or a successor). Absent on a continue, whose
+    /// creating event's origin stands, and on every event written before
+    /// koto recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AnchorOrigin>,
+}
+
+/// The event type `koto session anchor open` appends when the dispatched-by
+/// link it owes a new anchor could not be written.
+pub const ORIGIN_UNRECORDED: &str = "origin_unrecorded";
+
+/// An anchor's origin as its creating `anchor_started` records it: one of
+/// three states, told apart by `state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AnchorOrigin {
+    /// The starting environment named `dispatcher`. A claim, not a proof:
+    /// any process in that environment could have set it.
+    Dispatched { dispatcher: String },
+    /// The starting environment named no dispatcher.
+    #[serde(rename = "none")]
+    NoDispatcher,
+    /// A dispatcher was named and couldn't be recorded. `named` is a
+    /// bounded preview of the value, or a digest of it; `reason` is one of
+    /// a closed list of fixed texts, never an error's own text.
+    Unrecorded { named: String, reason: String },
+}
+
+impl AnchorOrigin {
+    /// The `state` value: `dispatched`, `none` or `unrecorded`.
+    pub fn state(&self) -> &'static str {
+        match self {
+            AnchorOrigin::Dispatched { .. } => "dispatched",
+            AnchorOrigin::NoDispatcher => "none",
+            AnchorOrigin::Unrecorded { .. } => "unrecorded",
+        }
+    }
+}
+
+/// The payload of an [`ORIGIN_UNRECORDED`] event: the anchor's creating
+/// event named a dispatcher, and its dispatched-by link wasn't written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginUnrecorded {
+    /// A bounded preview of the dispatcher named.
+    pub named: String,
+    /// A fixed text from a closed list, never the store's error.
+    pub reason: String,
 }
 
 /// The payload of an [`ANCHOR_ACTIVITY`] event.
@@ -1967,6 +2018,10 @@ pub enum EventPayload {
     /// build lands it in `Unknown`, and a payload this build can't parse
     /// does the same rather than failing the read.
     AnchorStarted(AnchorStarted),
+    /// The dispatched-by link a newly created anchor owed couldn't be
+    /// written; appended at most once, by the open that created it.
+    /// Additive, and degrades like `anchor_started`.
+    OriginUnrecorded(OriginUnrecorded),
     /// A `koto init` or `koto next` ran under this anchor (`KOTO_ANCHOR`),
     /// recorded at most once per tenth of the idle period. Additive, and
     /// degrades like `anchor_started`.
@@ -2350,6 +2405,7 @@ impl EventPayload {
             EventPayload::DocFixRecorded(_) => DOC_FIX_RECORDED,
             EventPayload::CodeReviewRoundRecorded(_) => CODE_REVIEW_ROUND_RECORDED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
+            EventPayload::OriginUnrecorded(_) => ORIGIN_UNRECORDED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
@@ -2972,6 +3028,15 @@ impl<'de> Deserialize<'de> for Event {
                     raw_payload: payload_val.clone(),
                 },
             },
+            ORIGIN_UNRECORDED => {
+                match serde_json::from_value::<OriginUnrecorded>(payload_val.clone()) {
+                    Ok(o) => EventPayload::OriginUnrecorded(o),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
             ANCHOR_ACTIVITY => {
                 match serde_json::from_value::<AnchorActivity>(payload_val.clone()) {
                     Ok(a) => EventPayload::AnchorActivity(a),

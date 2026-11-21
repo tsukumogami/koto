@@ -793,3 +793,90 @@ fn a_leftover_staging_entry_is_invisible_to_list_and_prune_and_is_swept() {
     );
     assert!(!staging.exists());
 }
+
+/// The open's `origin=` line and its exit, for each state, and a
+/// dispatcher value that would have been refused before is now recorded.
+#[test]
+fn an_open_prints_its_origin_and_never_fails_over_the_dispatcher() {
+    let tmp = setup();
+    let dir = tmp.path();
+
+    let out = open(dir, "o1", &["--dispatched-by=anchor-parent"]);
+    assert_eq!(out["anchor"], "anchor-o1");
+    assert_eq!(out["origin"], "dispatched");
+    assert!(link_exists(
+        dir,
+        "anchor-o1",
+        "dispatched-by",
+        "anchor-parent"
+    ));
+
+    let out = open(dir, "o2", &[]);
+    assert_eq!(out["origin"], "none");
+    let out = open(dir, "o3", &["--dispatched-by="]);
+    assert_eq!(out["origin"], "none");
+
+    for (harness, value) in [
+        ("o4", "--dispatched-by=_x"),
+        ("o5", "--dispatched-by=a b"),
+        ("o6", "--dispatched-by=-leading-dash"),
+    ] {
+        let out = open(dir, harness, &[value]);
+        assert_eq!(out["anchor"], format!("anchor-{harness}"), "{value}");
+        assert_eq!(out["origin"], "unrecorded", "{value}");
+        let started = events_of_type(dir, &format!("anchor-{harness}"), "anchor_started");
+        assert_eq!(started[0]["payload"]["origin"]["state"], "unrecorded");
+        assert_eq!(
+            started[0]["payload"]["origin"]["reason"],
+            "malformed: not an anchor name"
+        );
+        assert!(started[0]["payload"].get("dispatched_by").is_none());
+    }
+
+    let out = open(dir, "o7", &["--dispatched-by=anchor-o7"]);
+    assert_eq!(out["origin"], "unrecorded");
+
+    // A continue prints no origin; the creating event's stands.
+    let out = open(dir, "o1", &["--dispatched-by=anchor-other"]);
+    assert_eq!(out["opened"], "continued");
+    assert!(!out.contains_key("origin"), "{out:?}");
+}
+
+/// A dispatched-by link write that fails after the anchor exists: the open
+/// still prints its `anchor=` line and `origin=unrecorded` and exits 0, and
+/// records the failure once.
+#[test]
+fn an_open_whose_link_write_fails_still_succeeds() {
+    let tmp = setup();
+    let dir = tmp.path();
+    // A file where the dispatched-by links directory has to go makes that
+    // one write fail, and nothing else.
+    let blocker = sessions(dir).join("anchor-f1").join("ctx/koto/links");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("dispatched-by"), "not a directory").unwrap();
+
+    let out = run(
+        dir,
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "f1",
+            "--source",
+            "startup",
+            "--dispatched-by=anchor-parent",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let got = lines(&out.stdout);
+    assert_eq!(got["anchor"], "anchor-f1");
+    assert_eq!(got["origin"], "unrecorded");
+    let unrecorded = events_of_type(dir, "anchor-f1", "origin_unrecorded");
+    assert_eq!(unrecorded.len(), 1);
+    assert_eq!(unrecorded[0]["payload"]["named"], "anchor-parent");
+    assert_eq!(
+        unrecorded[0]["payload"]["reason"],
+        "link write failed: store error"
+    );
+}
