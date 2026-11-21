@@ -30,7 +30,8 @@ The single thread is a guard, not a preference. It came in when the suite had 52
 tests, to stop tests that swap process-wide state from tripping over each other:
 some tests in `src/` point HOME or XDG_CACHE_HOME at a scratch directory, change
 the working directory, or set an environment variable for the whole process, and
-their own comments say they rely on running alone. The suite has grown tenfold
+their own comments (for example the scratch-home guard in `src/cli/mod.rs`) say
+they rely on running alone. The suite has grown tenfold
 since. The guard's cost grew with it, while the reason for it stayed confined to
 a small number of tests.
 
@@ -89,15 +90,14 @@ cannot quietly break an unrelated test running at the same time.
 
 ### In scope
 
-- The Unit Tests and Coverage jobs in `.github/workflows/validate.yml`, including
-  whether the test verdict and the coverage report come from one run.
-- The `validate` aggregate job's needs list, kept under the same name as the one
-  required check.
-- The Stability Tests job and the verification map entries that use
-  `--test-threads=1`.
-- Test-harness changes needed for the suite to run in parallel safely: the tests
-  that swap HOME, XDG_CACHE_HOME, the working directory or process environment,
-  and the comments that tell readers those tests rely on a single thread.
+- How CI runs the full test suite and produces coverage, including whether the
+  test verdict and the coverage report come from one run.
+- What the one required CI check waits on, with that check keeping its name.
+- The stability tests and the local verification steps that also run the suite
+  one test at a time.
+- Making the suite safe to run in parallel: the tests that redirect the home or
+  cache directory, change the working directory or set process-wide environment,
+  and the notes in those tests that say they depend on running alone.
 
 ### Out of scope
 
