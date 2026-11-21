@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   Agents on one machine drive many koto sessions at once, often from separate
   workspaces. A few workflow steps, such as a full local test suite, use most
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-host-resource-pools](docs/briefs/BRIEF-host-resource-pools.md); carried in Absorbed Brief.
 
@@ -184,13 +184,12 @@ while the action runs would release it the moment the suite starts.
   whatever workspace, worktree or niwa instance they run from. At most `size`
   holders hold a pool's slots at any moment, including when several sessions
   try to take the last slot at the same instant.
-- **R10.** A slot is released when its holder exits for any reason, including
-  `kill -9`, within 5 seconds and without anyone removing a file by hand. The
-  slot follows the holder, not the command: when a runner, or the koto process
-  of an ordinary pooled action, is killed and its command's process group
-  survives, the slot is released and the run reads as lost (R21); the next
-  start in that session first kills the surviving process group (a known
-  limitation, below).
+- **R10.** A slot is held by every process of the work it was taken for: the
+  koto process or runner, the command, and the command's descendants. It is
+  released within 5 seconds after the last of them exits for any reason,
+  including `kill -9`, without anyone removing a file by hand. When a runner is
+  killed and processes of its command survive, the slot stays held until they
+  exit, and koto doesn't signal them (R20, R22).
 - **R11.** Waiters are served first come, first served. A session arriving at a
   pool queues behind existing waiters even when a slot is free. A freed slot is
   reserved for the head waiter for the claim period; if the head waiter doesn't
@@ -240,14 +239,20 @@ while the action runs would release it the moment the suite starts.
 - **R19.** A `default_action` may declare `background: true` with `timeout_secs`,
   with or without `pool`. koto starts the command through a runner in a new
   process group and returns from the tick within 2 seconds without waiting for
-  the command. A session never runs two copies of a visit's command at once. A background action that names a pool takes the slot
-  before its command starts, and the runner holds it until the command exits or
-  is killed.
+  the command. A session never runs two copies of a visit's command at once. A
+  background action that names a pool takes the slot before its command
+  starts. When the command ends or times out, the runner stops the command's
+  remaining descendants. The user's config can switch background actions off
+  (`[background] enabled = false`, refused at the tick with
+  `background_disabled`) and caps `timeout_secs` at `[background]
+  max_timeout_secs` (default 7200).
 - **R20.** While a background command runs, every tick in that visit returns exit
   0 with `action: "gate_blocked"` and one blocking condition: name `__action__`,
   type `action`, status `running`, category `temporal`,
   `agent_actionable: false`, with `run_id`, `elapsed_secs` and `timeout_secs`.
-  It starts no second copy and evaluates no gates.
+  It starts no second copy and evaluates no gates. When the runner has died but
+  processes of the run survive, the condition's status is `orphaned` instead,
+  and it stays so until they exit.
 - **R21.** The first tick after a background run ends records the result in the
   session log. An exit 0 delivers the action's `capture`, when declared, and
   runs the state's gates and transitions as an ordinary successful action
@@ -261,12 +266,12 @@ while the action runs would release it the moment the suite starts.
   `truncated: true` when either was cut. A failure doesn't transition as a
   pass.
 - **R22.** After a failed or lost run, the next tick in the same visit starts a new
-  run, as koto re-runs a failed ordinary action today. Entering the state again
-  always starts a new run, and first kills any earlier run of that session's
-  still alive.
-- **R23.** `koto cancel` on a session, and removing a session, kill its running
-  background command's process group and release its slot, and remove it from
-  any queue, before the command returns. `koto cancel` appends `pool_released`
+  run, as koto re-runs a failed ordinary action today; an orphaned run must end
+  first. Entering the state again starts a new run once any earlier run of that
+  session has stopped: a live runner is stopped first, as by `koto cancel`.
+- **R23.** `koto cancel` on a session, and removing a session, stop its live
+  background runner, which stops the command and its descendants, and remove it
+  from any queue, before the command returns. `koto cancel` appends `pool_released`
   with reason `cancelled`; a removed session has no log left to append to.
 - **R24.** Moving, relocating or rebinding a session to another machine while a
   background run is in flight is refused with error code
@@ -285,8 +290,8 @@ while the action runs would release it the moment the suite starts.
   where one is involved: `pool_queued` once when the session joins a queue (not
   on each queued tick); `pool_acquired` when it takes a slot;
   `pool_released`, with a reason of `done`, `failed`, `timed_out`, `lost`,
-  `cancelled`, `lapsed` or `left_state`, when it releases a slot or leaves a
-  queue; `background_started` and `background_finished` around each background
+  `cancelled`, `lapsed`, `left_state` or `pool_removed`, when it releases a
+  slot or leaves a queue; `background_started` and `background_finished` around each background
   run, carrying `run_id`. A koto release without the feature reads a log
   holding these events without error.
 
@@ -368,12 +373,20 @@ and cost, which say where they run.
   tick takes the slot.
 - [ ] `kill -9` of the koto process running an ordinary pooled action frees the
   slot within 5 seconds with no file removed by hand.
-- [ ] `kill -9` of a background runner, and separately of the runner's whole
-  process tree, frees the slot within 5 seconds with no file removed by hand,
-  and the head waiter's next tick takes it.
+- [ ] `kill -9` of a background runner's whole process tree frees the slot
+  within 5 seconds with no file removed by hand, and the head waiter's next
+  tick takes it.
 - [ ] After `kill -9` of a background runner whose command survives, the session's
-  next tick reports `failure_kind: "lost"` and the tick after starts a new run,
-  having killed the surviving command's process group first.
+  ticks report `__action__` status `orphaned` and the slot stays held, no
+  signal reaches the surviving command, and once it exits the next tick reports
+  `failure_kind: "lost"`, frees the slot and the tick after starts a new run.
+- [ ] A background command that starts a child in its own session (`setsid`)
+  and exits leaves no process of the run alive on Linux once the runner ends,
+  and the slot is free.
+- [ ] With `[background] enabled = false`, a background action stops with
+  `background_disabled`; with `max_timeout_secs = 10`, an action declaring
+  `timeout_secs: 60` is killed after 10 seconds and its `running` condition
+  shows `timeout_capped: true`.
 - [ ] With size 1 and waiters W1, W2 and W3 queued in that order, the slot goes to
   W1, then W2, then W3, even when W3 ticks every second and the others every
   10 seconds.
@@ -445,11 +458,12 @@ and cost, which say where they run.
 - [ ] A background command that outlives `timeout_secs: 5` has its process group
   killed within 7 seconds, its slot freed, and the next tick reports
   `failure_kind: "timed_out"` with `timeout_secs: 5`.
-- [ ] Re-entering the pool state while a previous visit's run is still alive kills
-  that run's process group before starting the new one.
-- [ ] `koto cancel` on a holder kills its background process group, frees the
-  slot and appends `pool_released` with reason `cancelled`; removing the
-  session kills the group and frees the slot; `koto cancel` on a waiter removes
+- [ ] Re-entering the pool state while a previous visit's runner is still alive
+  stops that runner, and its command's processes are gone, before the new run
+  starts.
+- [ ] `koto cancel` on a holder stops its background runner, whose command's
+  processes are then gone, frees the slot and appends `pool_released` with
+  reason `cancelled`; removing the session does the same and frees the slot; `koto cancel` on a waiter removes
   it from `koto pool status`; each is done before the command returns.
 - [ ] `koto session` moves, relocates and rebinds to another machine refuse with
   `background_run_in_flight` while a background run is in flight; a run whose
@@ -550,9 +564,9 @@ and cost, which say where they run.
   pools.
 - A pool counts steps, not load: a size-2 pool still lets two heavy suites run
   beside any amount of other work.
-- The slot follows its holder. If a runner or a tick's koto process is killed
-  with `kill -9` and the command's process group survives, the slot is free
-  while that command still runs, until the session's next start kills it.
+- A process that escapes a runner (on macOS, or a daemon left behind) keeps
+  its run's slot until it exits, and koto never kills it; `koto pool status`
+  shows the slot as held.
 - The nesting marker is cooperative: a process of the same user that copies it
   can run on another session's slot.
 - `docs/guides/cli-usage.md` states user config takes precedence over project
