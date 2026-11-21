@@ -2,15 +2,16 @@
 schema: prd/v1
 status: Draft
 problem: |
-  A koto pull request waits about 33 minutes for its test verdict. CI runs the
-  whole suite on one thread, twice per round (Unit Tests and Coverage, 34 to 41
-  minutes each in recent runs, against 3 to 4 for every other job), to keep a
-  small number of tests that swap process-wide state from racing. The guard came
-  in when the suite had 520 tests; it now has about 5,460.
+  A koto pull request waits 34 to 41 minutes for its test verdict. CI runs the
+  whole suite on one thread, twice per round (Unit Tests and Coverage), against
+  3 to 4 minutes for every other job, to keep a small number of tests that swap
+  process-wide state from racing. The guard came in when the suite had 520
+  tests; it now has about 5,460.
 goals: |
-  The required `validate` check reports the whole suite's result, with coverage
-  from the same run, in at most 15 minutes on the standard runner, with every
-  test that runs today still running and still checking what it checks.
+  The job that carries the whole suite's result, with coverage from the same
+  run, finishes in at most 15 minutes on the standard runner, the required
+  `validate` check waits on it, and every test that runs today still runs and
+  still checks what it checks.
 upstream: docs/briefs/BRIEF-koto-ci-parallel-tests.md
 ---
 
@@ -23,11 +24,12 @@ Draft
 ## Problem Statement
 
 Every push to a koto pull request starts a CI round whose test verdict arrives
-about 33 minutes later. Two jobs in `.github/workflows/validate.yml` set that
-time: Unit Tests runs `cargo test --locked -- --test-threads=1`, and Coverage
-runs the same suite again under `cargo llvm-cov --all-features ... --
---test-threads=1`. Recent runs put each at 34 to 41 minutes; the next-slowest
-job takes 3 to 4. The round waits on the same tests, run one at a time, twice.
+34 to 41 minutes later. Two jobs in `.github/workflows/validate.yml` set that
+time: Unit Tests runs `cargo test --locked -- --test-threads=1` with default
+features, and Coverage runs the same suite again under `cargo llvm-cov
+--all-features ... -- --test-threads=1`. In recent runs each took 34 to 41
+minutes; the next-slowest job took 3 to 4. The round waits on the same tests,
+run one at a time, twice.
 
 The single thread is a guard. It came in with #98, when the suite had 520
 tests, because some tests point HOME or XDG_CACHE_HOME at a scratch directory,
@@ -43,19 +45,19 @@ a round can go green while the coverage run is still going or has failed.
 
 ## Goals
 
-- A contributor learns whether a push passed the whole suite in minutes, not
-  half an hour.
+- The job carrying the whole suite's result finishes in at most 15 minutes, a
+  third of today's time or less.
 - Coverage comes from the same run as the verdict, so the two can't disagree.
 - The required check keeps its name and keeps meaning "the whole suite passed".
 - Local verification runs tests with the same isolation CI uses.
-- A new test that touches process-wide state is isolated without its author
-  having to know about a single-thread convention.
+- A new test that touches process-wide state is isolated from other tests by
+  the runner, without its author doing anything special.
 
 ## User Stories
 
 - As a contributor fixing a review comment on a koto PR, I want the required
-  check to report the whole suite's result within a few minutes of my push, so
-  that I can push the next fix without switching to other work.
+  check to report the whole suite's result within 15 minutes of my push, so that
+  I can push the next fix in the same sitting.
 - As a maintainer reviewing a PR, I want the Codecov report to come from the
   same run as the test verdict, so that the coverage number describes the tests
   that actually passed.
@@ -71,102 +73,122 @@ a round can go green while the coverage run is still going or has failed.
 ### Functional
 
 - **R1. Parallel, isolated test execution in CI.** The full suite of the `koto`
-  package runs in CI with more than one test executing at a time, and with each
-  test isolated from every other test's process-wide state (environment
-  variables, HOME, XDG_CACHE_HOME, working directory).
+  package runs in CI with each test in its own process and with the runner's
+  concurrency left at the runner's CPU count or higher (not pinned to 1).
 - **R2. One run for verdict and coverage.** A single CI job runs the full suite
-  once under coverage instrumentation and produces both the pass/fail result and
-  the lcov report uploaded to Codecov. No second full-suite run remains in
-  `validate.yml`.
-- **R3. Required check unchanged in name, complete in coverage.** The job named
-  `validate` remains the one aggregate check. It waits on the job that carries
-  the full-suite result, and it fails when that job fails. Every job it waits on
-  today, other than the replaced Unit Tests job, is still waited on.
+  once under coverage instrumentation, with `--locked` and `--all-features`, and
+  produces both the pass/fail result and the lcov report uploaded to Codecov. No
+  second full-suite run remains in `validate.yml`. Doctests, if any exist, run in
+  the same job as a separate step; today none are active, since every code fence
+  in doc comments is `json`, `text` or `ignore`.
+- **R3. Required check keeps its name and gates on the suite.** The job named
+  `validate` remains the one aggregate check. Its `needs` list and its result
+  check name the full-suite job, and `validate` fails when that job's result is
+  anything but `success` (failure, cancelled or skipped). Every other job it
+  waits on today is still waited on, with today's result handling. No workflow
+  file still refers to the removed Unit Tests or Coverage job ids.
 - **R4. Coverage upload stays non-blocking.** A failure to upload the report to
-  Codecov does not fail the suite job or `validate`. A failure of any test does.
-- **R5. Same test set.** The set of tests executed in CI after the change equals
-  the set executed before it: same feature set as today's coverage run
-  (`--all-features`), no test removed, newly ignored, filtered out, or skipped,
-  and no retry that lets a failing test pass on a later attempt. Tests that are
-  `#[ignore]` today stay ignored. Any doctest that `cargo test` would run is
-  still run.
-- **R6. Serialization only where needed.** A test that still cannot run
-  concurrently with some other test (for example one that writes a fixed path
-  outside its own temporary directory) is serialized with the tests it
-  conflicts with, by configuration that names it. It is never skipped, removed
-  or retried to make the suite pass.
+  Codecov does not fail the full-suite job or `validate`. A failure of any test
+  does.
+- **R5. Same test set.** The set of test names executed by the new full-suite
+  job equals the set executed by the last `--all-features` Coverage run on
+  `main` before the change (a superset of the old Unit Tests run, which used
+  default features). No test is removed, newly marked `#[ignore]`, filtered out
+  by runner configuration, or given a retry. Tests that are `#[ignore]` today
+  stay ignored.
+- **R6. Serialization only where needed.** A test that fails when run
+  concurrently with another, or that inspection shows writes a shared fixed
+  location outside its own temporary directory, is serialized with the tests it
+  conflicts with by runner configuration that names it. It is never skipped,
+  removed or retried to make the suite pass.
 - **R7. Tests that re-run their own binary keep working.** The tests that spawn
   their own test binary as a child process with `--test-threads=1` (for example
   in `tests/test_home_env.rs` and `tests/host_session_env.rs`) still pass and
-  still check what they check.
+  still pass that flag to the child.
 - **R8. Stability tests.** The `koto-stability-tests` package's tests still run
-  in CI and are still waited on by `validate`, with the same per-test isolation
-  as R1.
+  in CI, each in its own process, without `--test-threads=1`, and `validate`
+  still fails when they fail.
 - **R9. Local verification follows CI.** The `cargo-test` and `stability-tests`
   entries in `.claude/shirabe-extensions/verification-map.json` run the same
-  tests with the same isolation as CI when the parallel runner is installed.
-  When it isn't, the entry still runs the suite (serially, as today) and says
-  that it fell back. The entries keep their `scripts/without-session-env.sh`
-  prefix, which `tests/verification_map_env.rs` checks. Any other file in the
-  repo that copies the CI test command (such as
-  `.claude/shirabe-extensions/work-on.md`) is updated to match.
-- **R10. Single-thread notes corrected.** Comments in test code that say a test
-  relies on `--test-threads=1` are updated or removed so they describe how the
-  test is isolated after the change.
+  tests with the same per-test isolation as CI when the parallel runner is
+  installed. When it isn't, the entry runs the suite serially with `cargo test
+  -- --test-threads=1`, as today, after printing a fallback notice to stderr that
+  names the missing runner and says the run is serial. The entries keep their
+  `scripts/without-session-env.sh` prefix, which `tests/verification_map_env.rs`
+  checks. Every file under `.claude/` that contains the CI test command is
+  updated to match.
+- **R10. Single-thread notes corrected.** Comments under `src/` and `tests/`
+  that mention `--test-threads=1` or running single-threaded are updated so they
+  describe how the test is isolated after the change. The only remaining
+  mentions are in tests that pass the flag to a child process they start.
 
 ### Non-functional
 
-- **R11. Round time.** On the standard GitHub-hosted `ubuntu-latest` runner, the
-  job carrying the full-suite result finishes in at most 15 minutes of wall
-  time on a warm cache, measured on the PR that makes the change and on the next
-  run of `main`.
-- **R12. Tool install is fast and pinned.** The test runner and coverage tool
-  are installed from prebuilt, version-pinned releases, not compiled from
-  source on a cache miss.
-- **R13. No koto behavior change.** No file under `src/` changes outside
+- **R11. Suite job time.** On the GitHub-hosted `ubuntu-latest` runner this
+  public repository gets (4 vCPU), the full-suite job finishes in at most 15
+  minutes of wall time on a run whose dependency cache was restored (the cache
+  step reports a hit). Changes to cache configuration are allowed when they
+  serve this target.
+- **R12. Tool install is pinned and prebuilt.** The test runner and coverage
+  tool are installed from version-pinned prebuilt releases; no `cargo install`
+  step compiles them.
+- **R13. No koto behavior change.** No line under `src/` changes outside
   `#[cfg(test)]` code and comments, and no change alters what the koto binary or
   library does at runtime.
-- **R14. Shared-host safety.** Verification of this change on a shared
-  development host runs only targeted tests; the full suite runs only in CI.
 
 ## Acceptance Criteria
 
 - [ ] `validate.yml` contains exactly one job that runs the full `koto` package
-      suite, and that job runs it under coverage instrumentation (R2).
-- [ ] No step in `validate.yml` passes `--test-threads=1` to a full-suite or
-      stability-tests run (R1, R8).
-- [ ] The full-suite job's log shows more than one test running at a time and
-      each test in its own process, or the equivalent isolation the chosen
-      runner reports (R1).
-- [ ] The required check is still named `validate`; its `needs` list and its
-      failure check both name the full-suite job and the stability-tests job,
-      and every other job listed there before the change is still listed (R3, R8).
-- [ ] On a throwaway branch, a deliberately failing test makes the full-suite
-      job and `validate` fail (R3, R4).
-- [ ] With the Codecov step forced to fail, the full-suite job and `validate`
-      still pass (R4).
-- [ ] The Codecov report for the PR's run is produced from the full-suite job's
-      lcov output (R2).
-- [ ] The number of tests executed in the new full-suite job, plus any doctests
-      it runs, equals the number executed by the last `--all-features` coverage
-      run before the change, and the ignored count is unchanged; the PR
-      description states both numbers (R5).
-- [ ] No test is newly marked `#[ignore]`, deleted, filtered out by runner
-      configuration, or given a retry count (R5, R6).
-- [ ] Every test serialized by runner configuration is named in that
-      configuration with a comment saying what it conflicts with (R6).
-- [ ] The tests that re-run their own binary pass in the new job (R7).
-- [ ] The full-suite job finishes in 15 minutes or less on the change's PR run
-      and on the next `main` run (R11).
-- [ ] Tool installs use pinned versions of prebuilt binaries (R12).
+      suite, and its suite step runs under coverage instrumentation with
+      `--locked` and `--all-features` (R2).
+- [ ] The full-suite and stability-tests steps run each test in its own process
+      and pass no `--test-threads=1` (or a concurrency of 1) to the runner (R1,
+      R8).
+- [ ] The required check is still named `validate`; its `needs` list and result
+      check name the full-suite job and the stability-tests job; the result
+      check fails when the full-suite job's result is not `success`; every other
+      job listed before the change is still listed (R3, R8).
+- [ ] `git grep` over `.github/` finds no reference to the old Unit Tests or
+      Coverage job ids (R3).
+- [ ] A run on a throwaway branch with one deliberately failing test in the
+      `koto` package fails the full-suite job and `validate`, and a second run
+      with one failing stability test fails `validate`; both run links are in the
+      PR description (R3, R4, R8).
+- [ ] A run on a throwaway branch with the Codecov upload pointed at a missing
+      file still passes the full-suite job and `validate`; the run link is in the
+      PR description (R4).
+- [ ] The Codecov upload step uploads the lcov file the full-suite job's own
+      coverage step wrote (R2).
+- [ ] The PR description records the run id of the last `--all-features`
+      Coverage run on `main` before the change, its executed and ignored test
+      counts, and the same counts for the new full-suite job; the two sets of
+      executed test names, diffed, show no test missing (R5).
+- [ ] The diff adds no `#[ignore]`, removes no `#[test]` or `#[tokio::test]`,
+      and the runner configuration sets no retries and no filter that excludes
+      tests (R5, R6).
+- [ ] Every test the runner configuration serializes is named there with a
+      comment saying what it conflicts with (R6).
+- [ ] The tests that re-run their own binary pass in the new job and still pass
+      `--test-threads=1` to the child (R7).
+- [ ] On a throwaway branch, two added tests, one setting a process environment
+      variable and one asserting that variable is unset, both pass in the new job
+      (R1).
+- [ ] The full-suite job passes on three consecutive runs of the PR's final
+      commit, each with a dependency cache hit, and each finishes in 15 minutes
+      or less (R1, R6, R11).
+- [ ] No workflow step installs the test runner or coverage tool with `cargo
+      install`; the install step names a pinned version (R12).
 - [ ] The diff touches no non-test, non-comment line under `src/` (R13).
-- [ ] The verification map's `cargo-test` and `stability-tests` entries run with
-      the parallel runner when present, fall back to serial `cargo test` with a
-      printed notice when absent, keep the `scripts/without-session-env.sh`
-      prefix, and `cargo test --test verification_map_env` passes (R9).
-- [ ] No comment in the repo still says a test relies on `--test-threads=1`
-      unless that test passes the flag to a child process it starts itself
-      (R7, R10).
+- [ ] The verification map's `cargo-test` and `stability-tests` entries keep the
+      `scripts/without-session-env.sh` prefix and `cargo test --test
+      verification_map_env` passes; run with the parallel runner absent from
+      PATH, the `cargo-test` entry prints the fallback notice to stderr and runs
+      `cargo test -- --test-threads=1` (R9).
+- [ ] `git grep -- '--test-threads=1' .claude/` matches only fallback commands
+      (R9).
+- [ ] `git grep -n -e 'test-threads' -e 'single-thread' -e 'single thread' --
+      src tests` matches only tests that pass the flag to a child process they
+      start (R7, R10).
 
 ## Out of Scope
 
@@ -174,7 +196,7 @@ a round can go green while the coverage run is still going or has failed.
 - Removing, skipping, merging or weakening tests to save time.
 - Speeding up the other CI jobs (compat checks, clippy, MSRV, audit), which take
   three or four minutes and don't set the round time.
-- Build caching changes or larger runners as the main lever. They leave the
+- Larger runners, or build caching as the main lever. They leave the
   single-thread double run in place.
 - Splitting the suite across several machines. It's a later option if one
   runner still can't meet R11.
@@ -182,18 +204,21 @@ a round can go green while the coverage run is still going or has failed.
   `/bin/sh` reproduction job, which run single targeted tests and don't need
   parallelism.
 - The cloud integration job, which uses a real bucket and stays as it is.
+- Changing how `validate` treats a skipped or cancelled result for jobs other
+  than the full-suite job.
 
 ## Known Limitations
 
 - The suite has only ever run in one fixed order on one thread. A test that
   quietly depends on an earlier test's side effects will only show up on the
-  first parallel run; R6 says how such a test is handled, but finding them is
-  part of the work.
-- Coverage instrumentation slows the run. The 15-minute target assumes a 4-vCPU
-  runner and an instrumented build; a plain run would be faster, but R2 trades
-  that for one run instead of two.
+  first parallel runs; R6 says how such a test is handled, and the
+  three-consecutive-runs criterion is the check for it.
+- Coverage instrumentation slows the run. A plain parallel run would be faster,
+  but R2 trades that for one run instead of two.
 - Timing-sensitive tests may behave differently under more CPU contention.
   R5 rules out retries, so any such test has to be fixed or serialized.
+- The development host is shared, so the full suite is verified only in CI;
+  local checks of this change run named test targets only.
 
 ## Decisions and Trade-offs
 
@@ -204,15 +229,18 @@ a round can go green while the coverage run is still going or has failed.
   round, not the fastest single job.
 - **Verdict uses `--all-features`.** Today Unit Tests runs default features and
   Coverage runs all features. The coverage run is a superset and already passes
-  without cloud credentials, so the merged run keeps `--all-features` rather
-  than dropping coverage of the feature-gated tests.
-- **Fifteen-minute target, not "a few minutes".** Research on recent runs and a
-  4-vCPU runner put a realistic instrumented parallel run at 10 to 15 minutes.
-  A tighter target would push toward sharding or larger runners, which are out
-  of scope.
+  without cloud credentials, so the merged run keeps `--all-features` and the
+  baseline for R5 is the coverage run.
+- **Fifteen-minute target.** Recent runs and a 4-vCPU runner put a realistic
+  instrumented parallel run at 10 to 15 minutes. A tighter target would push
+  toward sharding or larger runners, which are out of scope.
+- **The suite job fails `validate` on cancelled or skipped too.** Today
+  `validate` fails only on `failure`. For the one job that carries the suite, a
+  skipped or cancelled run would otherwise read as a pass, which is the gap this
+  feature closes for coverage.
 - **Local fallback instead of a hard prerequisite.** Requiring the parallel
-  runner locally would break agents on hosts without it. Falling back to serial
-  `cargo test` with a notice keeps the map usable everywhere while giving CI's
+  runner locally would break agents on hosts without it. Falling back to the
+  serial run with a notice keeps the map usable everywhere while giving CI's
   isolation wherever the runner is installed.
 - **Serialize by configuration, never retry.** Retries would hide real
   order-dependence or flakiness, which is the same as weakening a test.
