@@ -14,7 +14,8 @@ goals: |
   session and workspace on the machine, holding a slot for as long as the
   work really runs and giving it back when the work ends or crashes. A
   machine with no pool defined behaves exactly as today.
-upstream: docs/briefs/BRIEF-host-resource-pools.md
+absorbed:
+  - docs/briefs/BRIEF-host-resource-pools.md
 ---
 
 # PRD: host resource pools
@@ -22,6 +23,38 @@ upstream: docs/briefs/BRIEF-host-resource-pools.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-host-resource-pools](docs/briefs/BRIEF-host-resource-pools.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
+The feature was framed before these requirements existed. koto can't tell that
+a step uses something scarce on the host, so when several sessions on one
+machine reach steps that run heavy test suites, all of them start, the machine
+overloads, suites fail on timing and the 30-second action limit cuts unrelated
+work, and people queue koto by hand because no one can predict which tick will
+start a suite. The framed outcome: a template author marks a step with a host
+pool's name, an operator sizes the pool once per machine, sessions from any
+workspace queue for it on their own and resume without failing, the slot is
+held for the work's real length and returns when it ends or crashes, and a
+machine with no pool defined, or an older koto, runs as before. The framing's
+five journeys (an author marking the heavy step, an operator sizing a pool on a
+shared machine, a session reaching the step while the pool is full, a holder
+crashing, and an operator checking who holds what) are among the User Stories
+and Acceptance Criteria below. Its boundary put in: naming a pool on a state's
+action, per-machine pool sizes in the user's config with an undefined pool
+meaning no limit, slots shared across sessions and workspaces and released on
+crash, heavy work holding its slot past the tick, queued rather than failed,
+fair ordering and visibility. It put out: pools across machines or users,
+sizes in templates or project config, CPU and memory limiting, the per-session
+write lock and the script-level suite lock; it also left the shirabe
+verification migration to follow, which Out of Scope below carries along with
+the rest. The brief's three open questions are closed under Decisions and
+Trade-offs.
 
 ## Problem Statement
 
