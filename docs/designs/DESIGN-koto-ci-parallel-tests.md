@@ -11,7 +11,8 @@ decision: |
   that runs `cargo llvm-cov nextest --locked --all-features --profile ci`,
   runs doctests, and uploads lcov to Codecov without letting the upload fail
   the job. `validate` gates on that job's success. A `ci` profile in
-  `.config/nextest.toml` forbids retries and names any serialized test, and
+  `.config/nextest.toml` forbids retries, the same file names any serialized
+  test, and
   `scripts/run-tests.sh` gives the verification map the same isolation with a
   serial fallback.
 rationale: |
@@ -21,6 +22,7 @@ rationale: |
   test and every reader. A second fast plain run was rejected because it runs
   the suite twice and lets coverage disagree with the verdict.
 upstream: docs/prds/PRD-koto-ci-parallel-tests.md
+user_visible_surface: false
 decision_provenance: inline-resolved
 ---
 
@@ -151,6 +153,11 @@ Key assumptions:
 
 - The `--all-features` run already passes without cloud credentials, since
   today's `coverage` job runs it on every PR.
+- `--all-features` is a strict superset of the default-feature run that
+  `unit-tests` does today: the only feature, `cloud-integration-tests`, gates
+  one file (`tests/cloud_integration_test.rs`, `#![cfg(feature = ...)]`), and
+  no code under `src/` or `tests/` has a `cfg(not(feature ...))` branch. So
+  dropping the separate default-feature run loses no test and no code path.
 - The repository has no active doctests: every code fence in a doc comment is
   `json`, `text` or `ignore`.
 
@@ -215,7 +222,11 @@ nextest reads `.config/nextest.toml` at the workspace root. The file defines:
 - `[test-groups]`, empty at first. A test is added to a group with
   `max-threads = 1` only when it fails under parallel runs or inspection shows
   it writes a shared fixed location, and each `[[profile.default.overrides]]`
-  entry naming it carries a comment saying what it conflicts with (R6).
+  entry naming it carries a comment saying what it conflicts with (R6). The
+  overrides sit under `default` on purpose: every nextest profile, `ci`
+  included, inherits them, so local and CI runs serialize the same tests;
+- a top-level `nextest-version` minimum, so an older local nextest is refused
+  clearly instead of misreading the file.
 
 No filter, `default-filter` or `retries` value other than 0 appears in the file.
 
@@ -235,11 +246,15 @@ nextest installed.
 #### Chosen: a `scripts/run-tests.sh` wrapper that falls back
 
 `scripts/run-tests.sh` takes cargo package arguments (for example `-p
-koto-stability-tests`). When `cargo nextest --version` succeeds, it runs `cargo
-nextest run --locked --profile ci "$@"`, then, for the `koto` package only,
+koto-stability-tests`). When `cargo nextest --version` succeeds and reports a
+version at or above the `nextest-version` minimum in `.config/nextest.toml`,
+it runs `cargo nextest run --locked --profile ci "$@"`, then, when it was
+called with no arguments (the `koto` package, the workspace default),
 `cargo test --locked --doc`. Otherwise it prints `run-tests: cargo-nextest not
 found; running cargo test serially (--test-threads=1)` to stderr and runs
-`cargo test --locked "$@" -- --test-threads=1`, which is today's command. The
+`cargo test --locked "$@" -- --test-threads=1`, which is today's command. Like today's map, it runs with default features; the
+isolation, not the feature set, is what it shares with CI, and the one
+feature-gated file needs cloud credentials anyway. The
 `cargo-test` and `stability-tests` map entries become `bash
 scripts/without-session-env.sh env CARGO_INCREMENTAL=0 bash
 scripts/run-tests.sh` (with `-p koto-stability-tests` for the second), keeping
@@ -276,7 +291,7 @@ without coverage.
 
 ### Overview
 
-Five files change: `.github/workflows/validate.yml`, a new
+Five files change, plus comments: `.github/workflows/validate.yml`, a new
 `.config/nextest.toml`, a new `scripts/run-tests.sh`,
 `.claude/shirabe-extensions/verification-map.json` and
 `.claude/shirabe-extensions/work-on.md`. Comments in `src/` and `tests/` that
@@ -290,8 +305,13 @@ mention `--test-threads=1` are updated. No Rust code changes outside comments.
   tests:
     name: Tests and Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -299,6 +319,7 @@ mention `--test-threads=1` are updated. No Rust code changes outside comments.
       - uses: taiki-e/install-action@<pinned-sha>  # vX.Y.Z
         with:
           tool: cargo-llvm-cov@<version>,cargo-nextest@<version>
+          fallback: none
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --locked --all-features --profile ci --lcov --output-path lcov.info
       - name: Run doctests
@@ -310,7 +331,7 @@ mention `--test-threads=1` are updated. No Rust code changes outside comments.
           name: junit
           path: target/**/nextest/ci/junit.xml
           retention-days: 7
-          if-no-files-found: error
+          if-no-files-found: warn
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
@@ -321,13 +342,14 @@ mention `--test-threads=1` are updated. No Rust code changes outside comments.
   The comment that today ties `unit-tests` to the `/work-on` verification map
   moves to this job.
 
-- **Workflow permissions**: a top-level `permissions: contents: read` block in
-  `validate.yml`.
+- **Job permissions**: `permissions: contents: read` on the `tests` and
+  `stability-tests` jobs only, so no other job's token changes.
 
 - **`stability-tests` job**: the same install step (nextest only), then `cargo
   nextest run --locked -p koto-stability-tests --profile ci`.
 
-- **`validate` job**: `needs` lists `tests` in place of `unit-tests`; the result
+- **`validate` job**: keeps `if: always()`, so it runs and reports even when a
+  need failed. `needs` lists `tests` in place of `unit-tests`; the result
   check's line for it is `[ "${{ needs.tests.result }}" != "success" ]`.
 
 - **`.config/nextest.toml`**:
@@ -395,13 +417,16 @@ Deliverables:
 - `.claude/shirabe-extensions/verification-map.json`
 - `.claude/shirabe-extensions/work-on.md`
 
-### Phase 2: CI jobs
+### Phase 2: CI jobs and gate proofs
 
 Replace `unit-tests` and `coverage` with `tests`, move `stability-tests` to
 nextest, update `validate`. Push and let CI run the full suite. Any test that
-fails only under parallel runs is investigated; if it conflicts through the
-filesystem it is added to a test group with a comment, never retried or
-skipped.
+fails only under parallel runs is investigated: if it conflicts through the
+filesystem it is added to a test group with a comment; if it has a real
+order dependence, its test code is fixed in this PR. It is never retried or
+skipped, and the PR doesn't merge while any such test is unresolved. Then run
+the gate proofs on throwaway branches: a failing test, a failing stability
+test, a broken Codecov input and the environment-variable pair.
 
 Deliverables:
 - `.github/workflows/validate.yml`
@@ -411,9 +436,8 @@ Deliverables:
 Update the comments that mention `--test-threads=1` (for example
 `src/workflows_surface/materialize.rs` near `HomeGuard` and `src/cli/mod.rs`
 near `ScratchHome`) to say the isolation comes from nextest's process per test.
-Collect the PR's evidence: the throwaway-branch runs (failing test, failing
-stability test, broken Codecov input, the environment-variable pair), the
-parity diff and three consecutive green runs with their times.
+Collect the PR's evidence: the gate-proof run links from Phase 2, the parity
+diff and three consecutive green runs with their times.
 
 Deliverables:
 - comment updates under `src/` and `tests/`
@@ -447,16 +471,38 @@ succeeded, so a cancelled or skipped suite can't pass the required check.
 The design adds install-action, two prebuilt tools and upload-artifact to the
 chain. install-action is pinned by SHA, which is stricter than the tag pins the
 other actions in `validate.yml` use; those tag pins are an existing, accepted
-risk this design doesn't change. Updating the pinned SHA and tool versions is a
-manual edit, reviewed like any other workflow change.
+risk this design doesn't change, and that includes `codecov/codecov-action@v4`,
+`actions/upload-artifact@v4` and `dtolnay/rust-toolchain@stable` in the new
+job. `fallback: none` makes install-action fail rather than build a tool from
+source when no verified prebuilt binary is available. Updating the pinned SHA
+and tool versions is a manual edit, reviewed like any other workflow change.
+
+### Runner use and checkout token
+
+nextest's slow-timeout only warns, so the job carries `timeout-minutes: 45`;
+a hung test, including one from a fork pull request, holds a runner for at
+most that long. Checkout runs with `persist-credentials: false`, so the token
+isn't left on disk for test code to read. The workflow triggers on
+`pull_request`, not `pull_request_target`, so fork code never runs with
+secrets; the rust cache is keyed per branch by `Swatinem/rust-cache`, as
+today.
+
+### Residual risk
+
+The no-retry, no-filter contract lives in files a pull request can edit
+(`.config/nextest.toml`, `scripts/run-tests.sh`, the workflow). Review is what
+keeps a later change from adding a retry or a filter, as it is today for the
+`--test-threads=1` flag; the parity record in this change's PR is a one-time
+check, not a standing one.
 
 ### Data exposure
 
 The lcov report goes to Codecov and holds coverage data for source that is
 already public. The JUnit file is uploaded as a workflow artifact with
 `retention-days: 7`. It lists test names and timings and may include output
-from failing tests, which is no more than the public job log already shows. The
-job holds no credentials a test could print.
+from failing tests. Artifacts aren't masked the way logs are, which is
+acceptable because the job receives no secrets and keeps no checkout token on
+disk.
 
 ## Consequences
 
@@ -484,8 +530,10 @@ job holds no credentials a test could print.
 - Process start-up is milliseconds against tests that mostly spawn the koto
   binary already; the 15-minute target and three-run criterion measure the net
   effect.
-- If instrumentation pushes the job past 15 minutes, the PRD's out-of-scope
-  list names sharding as the follow-up; the target is checked before merge.
+- If instrumentation pushes the job past 15 minutes, the first place to look
+  is the merge of per-process coverage data, which `cargo llvm-cov` does once
+  at the end and which the job's step timings show separately; sharding stays
+  the follow-up the PRD names. The target is checked before merge.
 - The install action is pinned by commit SHA and the tools by version.
 - Order-dependent tests are fixed or grouped per R6, with the reason written
   next to the group.
