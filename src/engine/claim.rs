@@ -830,4 +830,81 @@ mod tests {
         }
         .mutated());
     }
+
+    const RACE_HEADER: &str = r#"{"schema_version":1,"workflow":"wf","template_hash":"abc","created_at":"2025-01-01T00:00:00Z"}"#;
+
+    fn context_added(i: usize) -> crate::engine::types::EventPayload {
+        crate::engine::types::EventPayload::ContextAdded {
+            key: format!("k{i}"),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: None,
+        }
+    }
+
+    /// The `seq` and type of every event line in the log at `path`.
+    fn event_lines(path: &Path) -> Vec<(u64, String)> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let e: crate::engine::types::Event = serde_json::from_str(line).unwrap();
+                (e.seq, e.event_type)
+            })
+            .collect()
+    }
+
+    /// Header rewrites racing appends lose none of them (koto#239): the
+    /// rewrite reads the log, writes a temp file and renames it over the log,
+    /// so an append landing between the read and the rename must wait for it.
+    #[test]
+    fn header_rewrites_racing_appends_lose_no_append() {
+        const ROUNDS: usize = 20;
+        const PER_ROUND: usize = 40;
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("koto-wf.state.jsonl");
+            fs::write(&path, format!("{RACE_HEADER}\n")).unwrap();
+
+            let appender = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_ROUND {
+                        crate::engine::persistence::append_event(
+                            &path,
+                            &context_added(i),
+                            "2025-01-01T00:00:00Z",
+                        )
+                        .unwrap();
+                    }
+                })
+            };
+            let rewriter = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER_ROUND {
+                        rewrite_header_atomically(&path, |mut h| {
+                            h.dispatch_epoch += 1;
+                            h
+                        })
+                        .unwrap();
+                    }
+                })
+            };
+            appender.join().unwrap();
+            rewriter.join().unwrap();
+
+            let events = event_lines(&path);
+            let added = events.iter().filter(|(_, t)| t == "context_added").count();
+            let lost = PER_ROUND - added;
+            assert_eq!(
+                lost, 0,
+                "round {round}: concurrent appends vanished: {lost} of {PER_ROUND}"
+            );
+            let seqs: Vec<u64> = events.iter().map(|(s, _)| *s).collect();
+            let want: Vec<u64> = (1..=seqs.len() as u64).collect();
+            assert_eq!(seqs, want, "round {round}: seqs are not contiguous");
+        }
+    }
 }
