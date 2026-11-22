@@ -767,13 +767,15 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # The two suite jobs, tests and stability-tests, must be exactly
+      # `success`: a cancelled or skipped suite run would otherwise pass.
       - name: Check results
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.tests.result }}" != "success" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
              [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
-             [ "${{ needs.stability-tests.result }}" = "failure" ] || \
+             [ "${{ needs.stability-tests.result }}" != "success" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
