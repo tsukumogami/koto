@@ -1601,6 +1601,43 @@ fn a_stalled_own_prefix_probe_is_reported_as_no_answer() {
     assert!(!message.contains("couldn't be reached"), "{message}");
 }
 
+/// How long a command whose probe of a session with a local copy gets no
+/// answer may take: the probe's 10-second deadline, plus the process's
+/// start, its other requests and slack for a loaded test host.
+const PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// A probe of a session with a local copy that the bucket accepts but never
+/// answers is cut at the probe's deadline (koto#605). `koto status` from the
+/// session's own directory answers from the local copy within the bound,
+/// and its warning says the bucket gave no answer in time.
+#[test]
+fn a_stalled_probe_of_a_session_with_a_local_copy_is_cut_at_the_probe_deadline() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let dir = h.dir("ws");
+    h.init(&dir, &[]);
+    let listing = format!("{}/{WF}/", prefix_of(&dir));
+
+    s3.stall("LIST", &listing, std::time::Duration::from_secs(300));
+    let mut cmd = h.cmd(&dir, &["status", WF]);
+    // Past the bound and short of the sync bucket's own timeouts, so the
+    // check fails rather than waits.
+    cmd.timeout(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let out = h.run(cmd);
+    let took = started.elapsed();
+    assert!(
+        took < PROBE_BOUND,
+        "a stalled probe of {listing:?} held koto status for {took:?}, past the \
+         {PROBE_BOUND:?} bound: requests on the probe path need a request timeout: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(0), "{}", out.describe());
+    assert_eq!(out.json()["current_state"], "wait", "{}", out.describe());
+    assert!(out.stderr.contains("warning: cloud sync"), "{}", out.describe());
+    assert!(out.stderr.contains("no answer within"), "{}", out.describe());
+}
+
 /// A host that can't reach the bucket at all can't tell a never-used name
 /// from one another directory's prefix holds (koto#638): `koto status`
 /// and `context exists` of a name with no copy on this host refuse with
