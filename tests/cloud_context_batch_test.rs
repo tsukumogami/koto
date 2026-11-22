@@ -1521,3 +1521,59 @@ fn a_read_during_a_tick_sees_the_ticks_own_appends() {
     assert!(!h.session_dir().join("cloud-batch.jsonl").exists());
     assert!(s3.object(&h.key("batch-open.json")).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// A failed context upload (koto#646): a context write whose object upload
+// fails doesn't leave the key in the bucket manifest.
+// ---------------------------------------------------------------------------
+
+/// A `koto context add` whose object PUT fails on every attempt used to warn
+/// and exit 0, leaving the key in the local manifest, so the next push of
+/// any other key uploaded a bucket manifest naming an object the bucket
+/// never stored. The add now fails naming the key, and no bucket manifest
+/// names a key whose object the bucket lacks.
+#[test]
+fn a_failed_context_upload_stays_out_of_the_bucket_manifest() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    // Every PUT of a.md's object fails, so no retry can land it.
+    s3.fail("PUT", &h.key("ctx/a.md"), 500);
+    let failed = h.add("a.md", b"alpha");
+    s3.clear_faults();
+
+    let out = h.add("b.md", b"beta");
+    assert!(out.ok(), "add b.md: {}", out.describe());
+
+    // Checked first: on a build with the orphan, b.md's push uploads a
+    // manifest naming a.md, whose object never went up.
+    let manifest: serde_json::Value = s3
+        .object(&h.key("ctx/manifest.json"))
+        .map(|b| serde_json::from_slice(&b).expect("the bucket manifest parses"))
+        .unwrap_or_else(|| serde_json::json!({"keys": {}}));
+    let named = manifest["keys"].as_object().cloned().unwrap_or_default();
+    for key in named.keys() {
+        assert!(
+            s3.object(&h.key(&format!("ctx/{key}"))).is_some(),
+            "the bucket manifest names {key}, which the bucket lacks"
+        );
+    }
+    assert!(
+        named.contains_key("b.md"),
+        "the bucket manifest lacks b.md: {manifest}"
+    );
+
+    // The failed add said so, naming the key.
+    assert!(
+        !failed.ok(),
+        "the add whose upload failed exited 0: {}",
+        failed.describe()
+    );
+    assert!(
+        failed.stderr.contains("a.md") || failed.stdout.contains("a.md"),
+        "the failed add doesn't name a.md: {}",
+        failed.describe()
+    );
+    assert_remote_consistent(&s3, &h);
+}
