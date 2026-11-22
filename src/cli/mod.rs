@@ -932,6 +932,27 @@ pub enum SessionCommand {
         json: bool,
     },
 
+    /// Show which session dispatched a session, as JSON.
+    ///
+    /// Prints `{"session", "via", "origin"}`. `origin.state` is
+    /// `dispatched` (with `dispatcher` and `dispatcher_kind`, `anchor` or
+    /// `workflow`), `none` (nothing named a dispatcher) or `unrecorded`
+    /// (with `named`, a bounded preview of what was named, and `reason`).
+    /// `dispatched` is a claim the starting environment made, not a proof.
+    ///
+    /// For an anchor, reads the origin its creating `anchor_started` event
+    /// recorded, with its dispatched-by link and any `origin_unrecorded`
+    /// event; `via` is the anchor. For a workflow session, a dispatched-by
+    /// link of its own comes first (`dispatcher_kind: workflow`, `via:
+    /// null`); otherwise the anchor its first held-by link names is read
+    /// (`via` names it). Reads through the configured store backend and
+    /// writes nothing. Exits 0 for every state, and 2 for a malformed name
+    /// or a name with no session.
+    Origin {
+        /// The workflow session or anchor to report on
+        name: String,
+    },
+
     /// Open, observe and close agent-session anchors.
     ///
     /// An anchor is the session koto keeps for one agent session, so that
@@ -2640,6 +2661,7 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Hierarchy { name, json } => {
                     session::handle_hierarchy(&backend, &name, json)
                 }
+                SessionCommand::Origin { name } => session::handle_origin(&backend, &name),
                 SessionCommand::Rebind { name, to } => {
                     if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
                         refuse_if_lookup_failed(&e, "session rebind");

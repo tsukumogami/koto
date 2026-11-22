@@ -1002,6 +1002,37 @@ pub(super) fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config
     }
 }
 
+/// Handle `koto session origin <name>`: print where `name` came from as one
+/// JSON object ([`crate::session::origin::OriginReport`]).
+///
+/// Reads through `backend`, as `koto status` does, and writes nothing. Every
+/// one of the three states exits 0. A malformed name or one with no session
+/// exits 2; any other read that fails exits 3.
+pub fn handle_origin(backend: &Backend, name: &str) -> Result<()> {
+    use crate::session::origin::{origin_of, OriginRefusal};
+
+    match origin_of(backend, name) {
+        Ok(report) => {
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
+        Err(e) => {
+            let code = match e.downcast_ref::<OriginRefusal>() {
+                Some(_) => super::EXIT_CALLER_ERROR,
+                None => super::EXIT_INFRASTRUCTURE,
+            };
+            let error = match e.downcast_ref::<OriginRefusal>() {
+                Some(OriginRefusal::NoSuchSession) => format!("session '{name}' does not exist"),
+                _ => format!("{e:#}"),
+            };
+            super::exit_with_error_code(
+                serde_json::json!({ "error": error, "command": "session origin" }),
+                code,
+            )
+        }
+    }
+}
+
 /// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
 /// `name` belongs to and print the verdict, its members and the settings.
 ///

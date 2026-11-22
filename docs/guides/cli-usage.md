@@ -927,6 +927,33 @@ When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at",
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 
+#### session origin
+
+Shows which session dispatched a session: an anchor, or a workflow session.
+
+```bash
+koto session origin <name>
+```
+
+It prints one JSON object:
+
+```json
+{"session": "work-on-12", "via": "anchor-1f3c",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-9a07", "dispatcher_kind": "anchor"}}
+```
+
+`origin.state` is one of three values, and every one of them exits 0:
+
+- `dispatched` -- the starting environment named `dispatcher`, and the link that records it is there. `dispatcher_kind` says what the name is: `anchor` when the answer came through an anchor (the anchor of the agent session that dispatched it), `workflow` when it came from a dispatched-by link on the workflow session itself, as `koto init --dispatched-by` and `koto session link` write it. `dispatched` is a claim, not an authenticated fact: any process in the starting environment could have set the name.
+- `none` -- nothing named a dispatcher: the anchor was opened without `--dispatched-by` (or with an empty value), or the workflow session holds neither a dispatched-by nor a held-by link.
+- `unrecorded` -- a dispatcher may have been named and wasn't recorded. `named` is the bounded preview the record kept (empty when nothing was named) and `reason` a fixed text: the anchor's own `malformed: not an anchor name`, `self: names this anchor` or `link write failed: store error` (see [session anchor](#session-anchor)); `link not found` when the anchor's creating event names a dispatcher and holds no dispatched-by link to it; `anchor not found` when a workflow session's held-by link names an anchor the store no longer holds; and `recorded before koto tracked origin` for an anchor created by a koto that wrote no `origin` and whose creating event names no dispatcher, since its dispatcher may have been lost.
+
+For an anchor, `via` is the anchor itself, and the answer is the `origin` its creating `anchor_started` event recorded (the first one opened `new`, `reopened` or `successor`; a `continued` event never counts), read together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. Only the link to the named dispatcher counts, so a successor's link to its predecessor is never taken for its dispatcher's. An anchor with no `origin` reads as `dispatched` when its creating event's `dispatched_by` names a dispatcher with its link beside it.
+
+For a workflow session, a dispatched-by link of its own comes first, with `via` `null`. Otherwise the answer is the origin of the anchor its held-by link names, and `via` names that anchor. With several links of one kind, the one with the earliest `at` wins (for held-by, the link written when the session was opened), and links whose `at` is equal or unreadable fall back to the lowest name.
+
+The command reads through the configured store backend, as `koto status` does, and writes nothing. A malformed name or a name with no session exits 2; a read that fails otherwise exits 3.
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
