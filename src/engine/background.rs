@@ -642,8 +642,11 @@ fn read_started(req: &TickRequest<'_>, started: &BackgroundStarted) -> TickStep 
             run_lock_held,
         } => {
             let mut events = vec![finished(result.outcome())];
-            // While a process of the run survives, the slot is still held;
-            // its release is recorded when it frees.
+            // While a process of the run survives, the slot is still held,
+            // so no release is recorded here. Nothing records it later yet:
+            // once `background_finished` marks the run read, no tick reads
+            // it again. Recording the release when the survivors exit
+            // belongs with the orphan and survivor handling (PLAN step 4).
             if let (Some(pool), false) = (&record.pool, run_lock_held) {
                 events.push(released(pool, result.outcome()));
             }

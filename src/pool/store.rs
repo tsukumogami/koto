@@ -90,7 +90,7 @@ pub fn pool_dir(root: &Path, name: &str) -> Result<PathBuf, DirUnavailable> {
 }
 
 /// Open (creating 0600) a file in a pool directory, refusing a symlink.
-pub fn open_file(path: &Path) -> std::io::Result<File> {
+fn open_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
