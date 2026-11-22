@@ -446,7 +446,10 @@ fn open_records_digests_never_the_token_or_the_path() {
     );
     let text = std::fs::read_to_string(state_path(&b, "anchor-s1")).unwrap();
     assert!(!text.contains("host-a"));
-    assert!(!text.contains("4242"));
+    // Match the pid with the start time it travels with: a bare "4242" also
+    // turns up in timestamps, session ids and hashes the log legitimately
+    // carries.
+    assert!(!text.contains("4242:1700000000"));
     assert!(!text.contains("/secret/path"));
     let s = last_started(&b, "anchor-s1");
     assert_eq!(
