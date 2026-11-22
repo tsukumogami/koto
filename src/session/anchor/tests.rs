@@ -1867,7 +1867,10 @@ fn a_failed_link_write_is_recorded_once_and_its_error_text_reaches_no_event() {
     );
     let log = std::fs::read_to_string(state_path(&store, "anchor-w1")).unwrap();
     assert!(!log.contains("MARKER"), "{log}");
-    assert!(!log.contains("403"), "{log}");
+    // Match the status as the store's error phrases it: a bare "403" also
+    // turns up in timestamps, session ids and hashes the log legitimately
+    // carries, such as a created_at of "03:41:40.403Z".
+    assert!(!log.contains("failed: 403"), "{log}");
 
     // A continue writes no second one.
     open(
