@@ -156,10 +156,12 @@ where
         });
     };
     let anchor = link.peer.clone();
-    let is_anchor = store.exists(&anchor)
-        && store
-            .read_header(&anchor)
-            .is_ok_and(|h| h.session_kind() == SessionKind::Anchor);
+    // Only an anchor the store doesn't hold, or a session that isn't an
+    // anchor, reads as not found. A header that exists and can't be read is a
+    // failed read, returned as one, so an unreachable store is never shown
+    // as a lost dispatcher.
+    let is_anchor =
+        store.exists(&anchor) && store.read_header(&anchor)?.session_kind() == SessionKind::Anchor;
     let origin = if is_anchor {
         anchor_origin(store, &anchor)?
     } else {
@@ -232,7 +234,9 @@ where
         Some(AnchorOrigin::Dispatched { dispatcher }) => dispatcher.clone(),
         // Recorded before koto wrote `origin`: the legacy field is the only
         // record of who was named, and an event naming nobody can't be told
-        // apart from one whose dispatcher was lost.
+        // apart from one whose dispatcher was lost. A named one goes through
+        // the same link check below: the older koto wrote the link after the
+        // event too, so the event alone never proves the link landed.
         None => match creating.and_then(|s| s.dispatched_by.as_ref()) {
             Some(d) => d.clone(),
             None => return Ok(Origin::unrecorded("", REASON_LEGACY)),

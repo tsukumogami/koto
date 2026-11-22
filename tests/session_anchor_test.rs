@@ -1018,4 +1018,15 @@ fn session_origin_after_a_failed_link_and_its_refusals() {
         assert_eq!(out.code, 2, "{name}: {}\n{}", out.stdout, out.stderr);
         assert!(out.stdout.contains("\"session origin\""), "{}", out.stdout);
     }
+
+    // An anchor that is there and can't be read is a failed read (exit 3),
+    // never reported as a lost dispatcher.
+    std::fs::write(
+        sessions(dir).join("anchor-f1/koto-anchor-f1.state.jsonl"),
+        "not a header\n",
+    )
+    .unwrap();
+    let out = run(dir, &["session", "origin", "s1"]);
+    assert_eq!(out.code, 3, "{}\n{}", out.stdout, out.stderr);
+    assert!(!out.stdout.contains("unrecorded"), "{}", out.stdout);
 }

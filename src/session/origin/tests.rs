@@ -465,6 +465,20 @@ fn a_held_by_anchor_that_is_gone_reports_anchor_not_found() {
     assert_eq!(got.via.as_deref(), Some("anchor-gone"));
     assert_eq!(got.origin, unrecorded("", REASON_ANCHOR_NOT_FOUND));
 
+    // An anchor that is there but can't be read is a failed read, not a
+    // missing anchor.
+    anchor::open(&b, &req("garbled", None)).unwrap();
+    make_session(&b, "w3");
+    anchor::hold(&b, "w3", "anchor-garbled", "init").unwrap();
+    std::fs::write(
+        b.session_dir("anchor-garbled")
+            .join(crate::session::state_file_name("anchor-garbled")),
+        "not a header\n",
+    )
+    .unwrap();
+    let err = origin_of(&b, "w3").unwrap_err();
+    assert!(err.downcast_ref::<OriginRefusal>().is_none(), "{err:#}");
+
     // A held-by link to a session that isn't an anchor reads the same.
     make_session(&b, "not-an-anchor");
     make_session(&b, "w2");

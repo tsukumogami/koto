@@ -950,9 +950,9 @@ It prints one JSON object:
 
 For an anchor, `via` is the anchor itself, and the answer is the `origin` its creating `anchor_started` event recorded (the first one opened `new`, `reopened` or `successor`; a `continued` event never counts), read together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. Only the link to the named dispatcher counts, so a successor's link to its predecessor is never taken for its dispatcher's. An anchor with no `origin` reads as `dispatched` when its creating event's `dispatched_by` names a dispatcher with its link beside it.
 
-For a workflow session, a dispatched-by link of its own comes first, with `via` `null`. Otherwise the answer is the origin of the anchor its held-by link names, and `via` names that anchor. With several links of one kind, the one with the earliest `at` wins (for held-by, the link written when the session was opened), and links whose `at` is equal or unreadable fall back to the lowest name.
+For a workflow session, a dispatched-by link of its own comes first, with `via` `null`. Otherwise the answer is the origin of the anchor its held-by link names, and `via` names that anchor. With several links of one kind, the one with the earliest `at` wins (for held-by, the link written when the session was opened). A link whose `at` can be read comes before one whose `at` can't, so a body damaged later never displaces the link written first, and links whose `at` is equal, or both unreadable, fall back to the lowest name.
 
-The command reads through the configured store backend, as `koto status` does, and writes nothing. A malformed name or a name with no session exits 2; a read that fails otherwise exits 3.
+The command reads through the configured store backend, as `koto status` does, and writes nothing. A malformed name or a name with no session exits 2; a read that fails otherwise exits 3, a held-by anchor whose log is there but can't be read included, so a store that can't be read is never reported as a lost dispatcher.
 
 #### session cleanup
 
