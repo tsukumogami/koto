@@ -107,16 +107,17 @@ is its own group so the koto pull request does not wait on it.
 
 **Group**: core
 
-**Goal**: the start hook gives its shells `KOTO_ANCHOR` and `KOTO_DISPATCHER_ANCHOR` from the printed anchor, or from `anchor-<session id>` when the open was cut off, so a slow store no longer erases the dispatcher.
+**Goal**: the start hook gives its shells `KOTO_ANCHOR` and `KOTO_DISPATCHER_ANCHOR` from the printed anchor, or from `anchor-<session id>` when the open was cut off, so a slow store no longer erases the dispatcher. Issue 1's open no longer refuses over the dispatcher value, so the hook can pass any inherited value through and let koto record it.
 
 **Acceptance Criteria**:
 - [ ] The hook keeps `anchor` (printed) and `exported` (printed, else derived, else empty on a refusal) apart; only an empty `exported` writes the `unset` line; the watchers and the additionalContext fallback read `anchor` only.
 - [ ] With a koto test double whose open sleeps five seconds past `KOTO_LIMIT`, the hook returns within the limit, the env file exports the derived name, and a session whose hook runs with that environment passes it as `--dispatched-by` (AC2).
 - [ ] `KOTO_LIMIT` is unchanged and the slow case returns within it (AC9).
-- [ ] Any non-empty inherited value, cut to 256 bytes, is passed in `--flag=value` form; when the open exits 2 with no `anchor=` line and the value missed the anchor pattern, the hook opens again without it.
+- [ ] Any non-empty inherited value, cut to 256 bytes on a character boundary (koto's argument parser refuses invalid UTF-8 before the open runs, so a cut mid-character would fail the open), is passed in `--flag=value` form; when the open exits 2 with no `anchor=` line and the value missed the anchor pattern (an older koto that still refuses it), the hook opens again without it.
 - [ ] A hostile session id (quotes, `$(...)`, a newline) produces no export line.
 - [ ] `hooks/test/session-start.test.sh` passes, with the hook still exiting 0 and printing nothing on stderr.
-- [ ] Before the koto release carrying this group is installed on the reference host, three baseline runs of one worker task are taken there on the current koto, and each run's count of agent koto calls and the input plus output tokens those calls spent are kept for Issue 5's comparison (AC7).
+
+The three baseline worker runs for the cost check (AC7) are not this outline's work: they are taken on the reference host before the release is installed, and the `koto-release-installed` gate below holds them.
 
 **Dependencies**: Blocked by <<ISSUE:1>>
 
@@ -130,7 +131,7 @@ is its own group so the koto pull request does not wait on it.
 
 **Before**: Issue 4
 
-**Condition**: a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and the three baseline worker runs for the cost check (Issue 3's last criterion) were taken on the earlier koto before it was installed.
+**Condition**: a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and, before that install, three baseline runs of one worker task were taken there on the earlier koto, with each run's count of agent koto calls and the input plus output tokens those calls spent kept for Issue 5's comparison (AC7).
 
 ### Issue 4: feat(coordinate): drop the manual dispatcher link step from worker briefs
 
@@ -163,7 +164,7 @@ is its own group so the koto pull request does not wait on it.
 **Acceptance Criteria**:
 - [ ] Ten workers dispatched in a row from one coordinator through the launcher, with the cloud store in use and briefs carrying no link step, each report the coordinator's anchor from `koto session origin` on the workflow session and on the anchor (AC1).
 - [ ] On a machine with koto and shirabe and no launcher, a shirabe session started from a plain directory reports `none` on its workflow session and on its anchor, with no error, warning or install prompt in the hook output, command output or transcript (AC3).
-- [ ] Three runs of the same worker task after the change, against Issue 3's three baseline runs, show the same count of agent koto calls and a median cost inside the baseline range, and a case-insensitive search of each after transcript for `dispatched-by`, `link-dispatcher` and `dispatcher_session` finds nothing (AC7, AC8).
+- [ ] Three runs of the same worker task after the change, against the three baseline runs the `koto-release-installed` gate holds, show the same count of agent koto calls and a median cost inside the baseline range, and a case-insensitive search of each after transcript for `dispatched-by`, `link-dispatcher` and `dispatcher_session` finds nothing (AC7, AC8).
 
 **Dependencies**: Blocked by <<ISSUE:4>>
 
