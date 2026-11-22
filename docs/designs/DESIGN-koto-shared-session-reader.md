@@ -19,12 +19,13 @@ decision: |
   pointer read, the dashboard's local data layer, a read-only listing trait
   and a four-outcome context read. koto depends on it by path and re-exports
   each moved module at its old path, so koto::engine::types and every other
-  frozen name resolve unchanged. Every write, lock, fsync, hash, machine
-  identity function and template validator stays in koto. A per-crate clippy
-  ban list, forbid(unsafe_code), a dependency allowlist and a guard script
-  run in a CI job make the crate unable to write, and every read of the
-  store goes through one capped, non-blocking read that refuses symlinks
-  and non-regular files. docs/STABILITY.md gains a
+  frozen name resolve unchanged. Every write, lock, fsync, idempotency hash,
+  machine identity function and template validator stays in koto. A
+  per-crate clippy ban list, forbid(unsafe_code), a dependency allowlist and
+  a guard script run in a CI job make the crate unable to write, and every
+  read the dashboard scan and the read surface make goes through one
+  capped, non-blocking read that refuses symlinks inside the store and
+  non-regular files. docs/STABILITY.md gains a
   scoped, additive-only promise of exactly the store layout the reader reads,
   guarded by a layout marker that is absent today. Dependents pin a koto
   release tag, and the crate carries koto's version. A dashboard golden test
@@ -221,10 +222,12 @@ itself. The `derive_state_from_log` alias moves with the file, and
 `koto::error::Error` resolves through the re-exported `engine::errors`
 without an edit. A module that keeps koto items (`engine::persistence`,
 `engine::leg_pointer`, `engine::terminal_result`, `engine::context_assign`,
-`session::version`, `template::types`, `template::assignments`,
-`cli::dashboard_data`) becomes a mixed file: its koto items plus
-`pub use koto_session_reader::<same path>::*;`. One rule keeps it safe: a
-mixed module defines no name the crate exports.
+`session::version`, `template::types`, `cli::dashboard_data`) becomes a
+mixed file: its koto items plus `pub use koto_session_reader::<same
+path>::*;`. One rule keeps it safe: a mixed module defines no name the
+crate exports. `template::assignments` isn't mixed: it moves whole,
+including `validate_transition_assignments`, a pure helper with no I/O
+that koto's `ValidateSteps` calls through the re-export.
 
 Validation comes off `CompiledTemplate` by changing only `impl` headers. The
 public `validate` and `collect_pass_env_warnings` go under a koto trait,
@@ -316,7 +319,10 @@ Key assumptions:
    imports and method chains are caught. `disallowed-methods` lists the
    `std::fs` write, copy, rename, remove, create, link and `set_permissions`
    functions; `File::create`, `create_new`, `set_len`, `set_times`,
-   `set_modified`, `set_permissions`, `sync_*` and the `lock*` family; the `OpenOptions` modes `write`,
+   `set_modified`, `set_permissions`, `sync_*` and the `lock*` family,
+   whose entries carry `allow-invalid = true` because those methods are
+   newer than koto's MSRV of 1.88 and clippy would otherwise reject a ban
+   on a path it can't resolve; the `OpenOptions` modes `write`,
    `append`, `create`, `create_new` and `truncate`; `OpenOptionsExt::mode`
    and `custom_flags`; the unix `symlink` and `chown` family;
    `ToSocketAddrs::to_socket_addrs`; `std::env::set_var` and `remove_var`;
@@ -568,13 +574,16 @@ constructors call it with `Some`, so the rule has one owner. A dependent
 passes `None`, which is exact inside every tick and outside one except when
 the cloud backend is configured and someone exported `KOTO_SESSIONS_BASE` by
 hand, a variable koto documents as for testing. `koto session dir --json`
-gains a `sessions` field from the same function, for a caller that wants
+already exists and prints the koto root, the backend and where it came
+from; it gains a `sessions` field from the same function, for a caller that wants
 certainty and has koto on PATH. It still builds no backend and writes
 nothing.
 
 *Reading one context value.* `read_context(session_dir, key, events:
 Option<&[Event]>) -> ContextRead` takes no lock, records nothing, calls no
-backend and never fails the scan. It returns one of:
+backend and never fails the scan. It returns one of four variants,
+`Unusable`, `Absent`, `Unreadable` and `Present`; `Present` has two
+sources, the log and the store, so it is listed twice below:
 
 - `Unusable(reason)`: the key fails the grammar, or is `manifest.json` or
   `manifest.lock` directly under `ctx/`, which only ever hold koto's own
@@ -736,7 +745,9 @@ CI checks four things:
    unreadable-session note. The split PR passes it without touching the
    expected file or the builder.
 2. *Program equals dashboard.* On the same generated store, the program's
-   `once` output equals the dashboard's columns row for row; `list` lists
+   `once` output equals the dashboard's columns 1, 2, 4, 5, 6 and 8 row for
+   row, the same columns check 1 compares, since columns 3 and 7 tick with
+   the clock; `list` lists
    exactly the root and its descendants with the dashboard's states and
    liveness; and each value equals what `koto context get` prints, run after
    the comparisons because it records the read.
@@ -1019,7 +1030,10 @@ with its self-test, and the Reader Write Guard job. CI adds `-p
 koto-session-reader` test, clippy and coverage steps, because the root
 `cargo test` runs only the root package, and `koto-stability-tests` gains a
 glob-import test. The public-API snapshot taken before the move is diffed
-after.
+after. Because the crate and `[workspace.package]` exist from this phase,
+the release guards land here too: `set-version.sh` checks the crate's lock
+entry, and the version-equality and `cargo package` job runs, so no release
+cut after this phase is unguarded.
 
 Deliverables:
 - `koto-session-reader/` with its manifest, `clippy.toml` and moved sources,
@@ -1030,8 +1044,11 @@ Deliverables:
   64 KiB cap and the session's store root
 - the dashboard data layer's fixture-building unit tests moved to koto's
   `tests/`
-- `[workspace.package] version` and `version.workspace = true` on both
+- `[workspace.package] version` and `version.workspace = true` on koto and
+  `koto-session-reader` (the other two members keep their own versions)
 - the guard script and the validate.yml jobs
+- `set-version.sh`'s lock check extended to the crate's entry, and the
+  version-equality and `cargo package` CI job
 
 ### Phase 4: The read surface
 
@@ -1042,17 +1059,17 @@ files, leg pointers, context values and the marker through
 with `is_terminal_state`), and the guard script moves to its Phase 4
 row; koto's
 backends call `sessions_dir` and
-import the constants; `koto session dir --json` gains `sessions`.
+import the constants; `koto session dir --json`, whose `--json` output
+exists today, gains the `sessions` field.
 docs/STABILITY.md gains the "Session store read surface" section and the
 dependent's compatibility promise, `docs/workspace-layout.md` gains the
 descriptive entries, and `koto-stability-tests` gains the layout literal
-pins. `set-version.sh` checks the crate's lock entry and the version and
-packaging job lands.
+pins.
 
 Deliverables:
 - `LocalDirSource`, `check_layout`, `sessions_dir`, `read_session_events`
   and `read_context` in `koto-session-reader/src/source.rs`, the capped
-  scan in `src/dashboard.rs`, and `parse_header_bytes` beside
+  scan in `koto-session-reader/src/dashboard.rs`, and `parse_header_bytes` beside
   `parse_state_log`
 - tests in koto's `tests/` that build a store at run time with a FIFO, a
   symlink, an over-cap file and a planted marker, each marking one session
@@ -1063,7 +1080,6 @@ Deliverables:
 - protected `v*` tags on the koto repository, a repository setting the
   release owner turns on before the first dependent pins a tag
 - the STABILITY.md and workspace-layout.md sections
-- the version-equality and `cargo package` CI job
 
 ### Phase 5: Terminal projection
 
@@ -1120,8 +1136,10 @@ nothing a writer plants can hang the scan, and each file it reads is capped
 (the caps are per file, so a store of many large files still costs time in
 proportion, and parsing a log near its cap can take a few times its size in
 memory; the scan reads one session at a time, and that bound is an accepted
-residual). koto's commands reading their own session's log through
-`read_events` and `read_header` keep today's plain read. Those two stay
+residual). koto's commands reading their own session's log through the
+three log readers of Decision 2 (`read_header_only`, which `read_header`
+wraps; the full-log read behind `read_events` and `read_log`; and
+`read_fence`) keep today's plain read. Those readers stay
 public only because koto calls them across the crate boundary; they are
 `#[doc(hidden)]` and documented as koto's command-path readers, so a
 dependent that calls one on a path itself gets that unhardened behavior,
