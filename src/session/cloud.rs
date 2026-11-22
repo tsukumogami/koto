@@ -2513,49 +2513,61 @@ impl CloudBackend {
                 ));
             }
         }
-        refuse_cross_import_pull(id, &state_path, response.bytes())?;
-        // The fetched copy replaces the local log only when it holds every
-        // local event (koto#477). Another directory's copy, or one pushed
-        // before this host's last append went up, may lack some: the local
-        // log is kept then, stamped with the copy it extends so the next
-        // push goes up conditional on it, and a copy that holds events the
-        // local log lacks as well refuses rather than drop either side.
-        if let Ok(local) = std::fs::read(&state_path) {
-            let keep_local = match state_log::compare(&local, response.bytes()) {
-                state_log::LogOrder::Same
-                | state_log::LogOrder::RemoteExtends
-                | state_log::LogOrder::Unrelated => false,
-                // The same events under another header line: the bucket's
-                // header is newer only when the local file is still what this
-                // host last synced under this key.
-                state_log::LogOrder::HeaderOnly => {
-                    !self.stamp(id).is_some_and(|s| s.matches(&local))
+        // From reading the local log to replacing it, under the log's append
+        // lock: an append landing after the comparison read the log would
+        // otherwise be dropped by the replacement (koto#239). The copy goes
+        // in by temp file and rename, so no reader finds the log truncated.
+        crate::engine::persistence::with_log_replace_lock(
+            &state_path,
+            crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+            || {
+                refuse_cross_import_pull(id, &state_path, response.bytes())?;
+                // The fetched copy replaces the local log only when it holds
+                // every local event (koto#477). Another directory's copy, or
+                // one pushed before this host's last append went up, may lack
+                // some: the local log is kept then, stamped with the copy it
+                // extends so the next push goes up conditional on it, and a
+                // copy that holds events the local log lacks as well refuses
+                // rather than drop either side.
+                if let Ok(local) = std::fs::read(&state_path) {
+                    let keep_local = match state_log::compare(&local, response.bytes()) {
+                        state_log::LogOrder::Same
+                        | state_log::LogOrder::RemoteExtends
+                        | state_log::LogOrder::Unrelated => false,
+                        // The same events under another header line: the
+                        // bucket's header is newer only when the local file
+                        // is still what this host last synced under this key.
+                        state_log::LogOrder::HeaderOnly => {
+                            !self.stamp(id).is_some_and(|s| s.matches(&local))
+                        }
+                        state_log::LogOrder::LocalExtends => true,
+                        state_log::LogOrder::Diverged => {
+                            return Err(state_log::conflict(
+                                id,
+                                &key,
+                                "the pull was refused",
+                                &local,
+                                response.bytes(),
+                            ))
+                        }
+                    };
+                    if keep_local {
+                        self.record_synced(id, Some(&remote_etag), response.bytes(), false);
+                        return Ok(());
+                    }
                 }
-                state_log::LogOrder::LocalExtends => true,
-                state_log::LogOrder::Diverged => {
-                    return Err(state_log::conflict(
-                        id,
-                        &key,
-                        "the pull was refused",
-                        &local,
-                        response.bytes(),
-                    ))
-                }
-            };
-            if keep_local {
+                crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
+                    .with_context(|| {
+                        format!(
+                            "cloud sync: failed to write the pulled state of session '{}' to {}",
+                            id,
+                            state_path.display()
+                        )
+                    })?;
                 self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-                return Ok(());
-            }
-        }
-        std::fs::write(&state_path, response.bytes()).with_context(|| {
-            format!(
-                "cloud sync: failed to write the pulled state of session '{}' to {}",
-                id,
-                state_path.display()
-            )
-        })?;
-        self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-        Ok(())
+                Ok(())
+            },
+        )
     }
 
     /// What a delete of `id`'s bucket copy needs from its local copy, read
@@ -4397,8 +4409,16 @@ impl CloudBackend {
         if let Ok(response) = self.bucket.get_object(&state_key) {
             if response.status_code() == 200 {
                 let state_path = session_dir.join(state_file_name(id));
-                refuse_cross_import_pull(id, &state_path, response.bytes())?;
-                std::fs::write(&state_path, response.bytes())?;
+                // Under the log's append lock, replaced by temp file and
+                // rename, as `sync_pull_state` replaces it (koto#239).
+                crate::engine::persistence::with_log_replace_lock(
+                    &state_path,
+                    crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+                    || {
+                        refuse_cross_import_pull(id, &state_path, response.bytes())?;
+                        crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
+                    },
+                )?;
             }
         }
 
@@ -10510,6 +10530,52 @@ mod tests {
         write_log(tmp.path(), "wf", &log);
         let backend = cloud_backend_at(tmp.path(), endpoint);
         assert_eq!(ContextStore::get(&backend, "wf", "k").unwrap(), content);
+    }
+
+    /// A pull replaces the log under the append lock, so it waits for a
+    /// writer holding it instead of dropping that writer's append (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_waits_for_the_append_lock_before_it_replaces_the_log() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let hold = std::time::Duration::from_millis(400);
+        let holder = crate::engine::persistence::hold_append_lock_for(&state, hold);
+        let started = std::time::Instant::now();
+        backend.read_header("wf").unwrap();
+        assert!(started.elapsed() >= hold / 2, "the pull did not wait");
+        holder.join().unwrap();
+        assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `force_pull_session` replaces the log under the append lock too, so it
+    /// waits for a writer holding it (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn a_force_pull_waits_for_the_append_lock_before_it_replaces_the_log() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let hold = std::time::Duration::from_millis(400);
+        let holder = crate::engine::persistence::hold_append_lock_for(&state, hold);
+        let started = std::time::Instant::now();
+        backend.force_pull_session("wf").unwrap();
+        assert!(started.elapsed() >= hold / 2, "the force pull did not wait");
+        holder.join().unwrap();
+        assert_eq!(fs::read(&state).unwrap(), remote);
     }
 
     #[test]

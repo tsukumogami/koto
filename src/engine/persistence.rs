@@ -575,6 +575,204 @@ impl AppendLock {
     }
 }
 
+// ===== Whole-log replacement =====
+
+/// How long a writer that replaces a whole state log (a header rewrite, a
+/// cloud pull) waits for the log's append lock before it gives up with
+/// [`StateLogBusy`], having written nothing.
+pub const LOG_REPLACE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A writer that replaces a whole state log could not take the log's append
+/// lock within its wait: another process was writing the log. Nothing was
+/// written, and running the command again is safe.
+#[derive(Debug)]
+pub struct StateLogBusy {
+    path: std::path::PathBuf,
+    waited: std::time::Duration,
+}
+
+impl std::fmt::Display for StateLogBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "state log {} is busy: another koto process is writing it (waited {} ms); \
+             nothing was written, run the command again",
+            self.path.display(),
+            self.waited.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for StateLogBusy {}
+
+/// The [`StateLogBusy`] `e` failed with, whatever context was added to it.
+pub fn state_log_busy(e: &anyhow::Error) -> Option<&StateLogBusy> {
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<StateLogBusy>())
+}
+
+/// Run `f` holding the append lock of the log at `path`, the same sidecar
+/// lock every append takes, waiting for it at most `wait`.
+///
+/// For a writer that reads the log and then replaces it whole: with the lock
+/// held from the read to the replace, an append can't land in between and be
+/// dropped by the replacement. A lock still held elsewhere once `wait` has
+/// passed is [`StateLogBusy`], and `f` doesn't run. Where the lock can't be
+/// had at all, `f` runs unlocked, as an append does.
+///
+/// `f` must not append to this log or take this lock again: the lock belongs
+/// to the open file, so a second acquisition on this thread waits on the
+/// first until the wait runs out.
+pub fn with_log_replace_lock<T>(
+    path: &Path,
+    wait: std::time::Duration,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let started = std::time::Instant::now();
+    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
+        return Err(StateLogBusy {
+            path: path.to_path_buf(),
+            waited: started.elapsed(),
+        }
+        .into());
+    };
+    f()
+}
+
+/// Replace the log at `path` with `bytes`: written to a temp file beside it,
+/// synced, then renamed over it, so a reader never finds it truncated or
+/// half written. Call it under [`with_log_replace_lock`].
+pub fn replace_log_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state file path has no parent: {}", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
+        std::process::id()
+    ));
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("failed to open temp {}: {}", tmp.display(), e))?;
+        file.write_all(bytes)
+            .map_err(|e| anyhow::anyhow!("failed to write {}: {}", tmp.display(), e))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("failed to fsync {}: {}", tmp.display(), e))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to rename {} -> {}: {}",
+            tmp.display(),
+            path.display(),
+            e
+        )
+    })
+}
+
+/// Test support: take the append lock of the log at `log` on a file of its
+/// own, as another process would, held until the file is dropped.
+#[cfg(all(test, unix))]
+pub(crate) fn hold_append_lock(log: &Path) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(log.parent().unwrap().join(APPEND_LOCK_FILE))
+        .unwrap();
+    // SAFETY: `fd` is borrowed from `file`, which outlives the call.
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    file
+}
+
+/// Test support: hold the append lock of the log at `log` for `hold` from
+/// another thread, returning once it is held.
+#[cfg(all(test, unix))]
+pub(crate) fn hold_append_lock_for(
+    log: &Path,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let log = log.to_path_buf();
+    let handle = std::thread::spawn(move || {
+        let _lock = hold_append_lock(&log);
+        tx.send(()).unwrap();
+        std::thread::sleep(hold);
+    });
+    rx.recv().unwrap();
+    handle
+}
+
+#[cfg(all(test, unix))]
+mod log_replace_lock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const HEADER: &str = r#"{"schema_version":1,"workflow":"wf","template_hash":"abc","created_at":"2025-01-01T00:00:00Z"}"#;
+
+    /// A writer that replaces the log waits for the append lock, then
+    /// reports the log busy, retryably, without running (koto#239).
+    #[test]
+    fn a_held_append_lock_makes_a_log_replacement_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("koto-wf.state.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let held = hold_append_lock(&log);
+        let mut ran = false;
+        let err = with_log_replace_lock(&log, Duration::from_millis(200), || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!ran);
+        assert!(state_log_busy(&err).is_some(), "{err:#}");
+        assert!(err.to_string().contains("run the command again"), "{err}");
+        drop(held);
+        with_log_replace_lock(&log, Duration::from_millis(200), || Ok(())).unwrap();
+    }
+
+    /// An append waits for a replacement holding the lock, then lands in the
+    /// replaced log rather than in the file the replacement renamed away.
+    #[test]
+    fn an_append_waits_for_a_replacement_and_lands_in_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("koto-wf.state.jsonl");
+        std::fs::write(&log, format!("{HEADER}\n")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let replacer = {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                with_log_replace_lock(&log, Duration::from_secs(5), || {
+                    tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    replace_log_bytes(&log, format!("{HEADER}\n").as_bytes())
+                })
+                .unwrap();
+            })
+        };
+        rx.recv().unwrap();
+        let payload = EventPayload::ContextAdded {
+            key: "k".to_string(),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: None,
+        };
+        append_event(&log, &payload, "2025-01-01T00:00:00Z").unwrap();
+        replacer.join().unwrap();
+        let (_, events) = read_events(&log).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+}
+
 // ===== The supersede fence =====
 
 /// How long `koto init --supersede` waits for a predecessor's append lock

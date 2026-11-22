@@ -945,32 +945,45 @@ pub(crate) fn rename_state_file(dir: &Path, from: &str, to: &str) -> anyhow::Res
 /// sessions (`relocate`) treat that as fatal; callers that may be handed an
 /// already-corrupt state file (recovery) decide for themselves.
 pub(crate) fn rewrite_header_identity(dir: &Path, to: &str) -> anyhow::Result<()> {
+    rewrite_header_identity_within(dir, to, persistence::LOG_REPLACE_LOCK_WAIT)
+}
+
+/// [`rewrite_header_identity`] with the lock wait bounded by `wait`. The
+/// read and the replacement happen under the log's append lock, so an append
+/// can't land between them and be overwritten (koto#239); a lock still held
+/// once `wait` has passed is [`persistence::StateLogBusy`], with nothing
+/// written.
+pub(crate) fn rewrite_header_identity_within(
+    dir: &Path,
+    to: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
     let state = dir.join(state_file_name(to));
 
-    let mut header = persistence::read_header(&state)
-        .with_context(|| format!("failed to read header from {}", state.display()))?;
+    persistence::with_log_replace_lock(&state, wait, || {
+        let mut header = persistence::read_header(&state)
+            .with_context(|| format!("failed to read header from {}", state.display()))?;
 
-    header.workflow = to.to_string();
-    header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
+        header.workflow = to.to_string();
+        header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
 
-    // Read the entire file, replace the first line, write it back.
-    let content = fs::read_to_string(&state)
-        .with_context(|| format!("failed to read state file {}", state.display()))?;
-    let mut lines: Vec<&str> = content.lines().collect();
+        // Read the entire file, replace the first line, write it back.
+        let content = fs::read_to_string(&state)
+            .with_context(|| format!("failed to read state file {}", state.display()))?;
+        let mut lines: Vec<&str> = content.lines().collect();
 
-    let new_header_line =
-        serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+        let new_header_line =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
 
-    if lines.is_empty() {
-        anyhow::bail!("state file {} is empty", state.display());
-    }
-    lines[0] = &new_header_line;
+        if lines.is_empty() {
+            anyhow::bail!("state file {} is empty", state.display());
+        }
+        lines[0] = &new_header_line;
 
-    let new_content = lines.join("\n") + "\n";
-    fs::write(&state, new_content.as_bytes())
-        .with_context(|| format!("failed to write updated state file {}", state.display()))?;
-
-    Ok(())
+        let new_content = lines.join("\n") + "\n";
+        persistence::replace_log_bytes(&state, new_content.as_bytes())
+            .with_context(|| format!("failed to write updated state file {}", state.display()))
+    })
 }
 
 /// Directory that holds old-layout sessions whose name was already taken
@@ -1178,6 +1191,32 @@ pub(crate) fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// An identity rewrite meeting a held append lock reports the log busy
+    /// and leaves it as it was; once the lock is free it goes through
+    /// (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn an_identity_rewrite_under_a_held_append_lock_is_busy() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("b");
+        fs::create_dir_all(&dir).unwrap();
+        let state = dir.join(state_file_name("b"));
+        fs::write(
+            &state,
+            "{\"schema_version\":1,\"workflow\":\"a\",\"template_hash\":\"abc\",\"created_at\":\"2025-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        let before = fs::read(&state).unwrap();
+        let held = persistence::hold_append_lock(&state);
+        let err = rewrite_header_identity_within(&dir, "b", std::time::Duration::from_millis(200))
+            .unwrap_err();
+        assert!(persistence::state_log_busy(&err).is_some(), "{err:#}");
+        assert_eq!(fs::read(&state).unwrap(), before);
+        drop(held);
+        rewrite_header_identity_within(&dir, "b", std::time::Duration::from_millis(200)).unwrap();
+        assert_eq!(persistence::read_header(&state).unwrap().workflow, "b");
+    }
 
     /// Helper: create a LocalBackend using a temp directory as base.
     fn test_backend(dir: &Path) -> LocalBackend {
