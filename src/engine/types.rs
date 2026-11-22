@@ -1171,7 +1171,10 @@ pub struct AnchorStarted {
     /// Where the anchor came from, on the event that created it (a new
     /// anchor, a reopened one or a successor). Absent on a continue, whose
     /// creating event's origin stands, and on every event written before
-    /// koto recorded it.
+    /// koto recorded it. It is written before the dispatched-by link, so a
+    /// `dispatched` origin whose link then failed is followed by an
+    /// [`ORIGIN_UNRECORDED`] event; a reader takes the two together, or a
+    /// `dispatched` origin with no link beside it, as unrecorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<AnchorOrigin>,
 }

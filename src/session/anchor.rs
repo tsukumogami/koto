@@ -645,6 +645,10 @@ impl Source {
 // ---------------------------------------------------------------------
 
 /// The longest dispatcher value koto considers; a longer one is malformed.
+/// Today the link key's own length rule already refuses every value this
+/// long, so the bound changes no outcome; it is checked first so the
+/// contract the start hook relies on (it cuts at this size) doesn't hang on
+/// the link rule staying as it is.
 pub const MAX_DISPATCHER_BYTES: usize = 256;
 
 /// The most characters of a dispatcher value an `unrecorded` origin keeps.
@@ -1143,6 +1147,8 @@ fn open_locked<S: ContextStore + SessionBackend>(
 /// origin reads `unrecorded`. The error itself is dropped, never written,
 /// since a store's error text can carry endpoints or credentials. A failed
 /// predecessor link still fails the open, as before.
+// Each of the three creating paths calls this with its own name, predecessor
+// and marker; bundling them in a struct would only move the same fields.
 #[allow(clippy::too_many_arguments)]
 fn create_anchor<S: ContextStore + SessionBackend>(
     store: &S,
@@ -1179,7 +1185,8 @@ fn create_anchor<S: ContextStore + SessionBackend>(
             };
             // Best effort: if this append fails too, the creating event
             // still names the dispatcher with no link beside it, which a
-            // reader takes as unrecorded all the same.
+            // reader of the origin must take as unrecorded all the same
+            // (see `AnchorStarted::origin`).
             let _ = store.append_event(
                 name,
                 &EventPayload::OriginUnrecorded(unrecorded.clone()),
