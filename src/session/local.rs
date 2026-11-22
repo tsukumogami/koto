@@ -672,7 +672,7 @@ impl LocalBackend {
     /// Creates the lock file if it doesn't exist. Returns the open File
     /// handle; the lock is released when the file is dropped.
     #[cfg(unix)]
-    fn acquire_flock(path: &Path) -> anyhow::Result<fs::File> {
+    pub(crate) fn acquire_flock(path: &Path) -> anyhow::Result<fs::File> {
         use std::os::unix::io::AsRawFd;
 
         let file = fs::OpenOptions::new()

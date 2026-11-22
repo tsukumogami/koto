@@ -52,7 +52,11 @@ pub fn handle_add(
         }
     };
 
-    store.add_with_writer(session, key, &content, WRITER_AGENT)?;
+    // Confirmed: under the cloud backend an upload the bucket doesn't
+    // confirm fails the command, naming the key, and returns before the
+    // `context_added` below, so the bucket's log never names a key its
+    // manifest leaves out (koto#646).
+    store.add_confirmed(session, key, &content, WRITER_AGENT)?;
 
     let hash = sha256_hex(&content);
     let size = content.len() as u64;

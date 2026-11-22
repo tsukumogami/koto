@@ -124,14 +124,14 @@ pub fn fetch_remote_manifest(
 /// as they are, as every manifest did before: they name no key this could
 /// drop, and refusing would leave a batch open.
 ///
-/// Every manifest koto uploads from a local store goes through this, so no
-/// manifest koto pushes names a host-local key or a pin record.
-///
 /// `withheld` names keys the push leaves out besides: a continues relation
 /// whose back-reference beside its predecessor isn't confirmed yet
 /// ([`crate::session::continues_bucket::unpushable_keys`]), which reaches
 /// the bucket only once the pointer does.
-pub fn bucket_manifest_bytes(
+///
+/// Private: every upload builds its manifest through [`bucket_manifest_of`],
+/// which leaves out the owed keys too.
+fn bucket_manifest_bytes(
     path: &std::path::Path,
     withheld: &[String],
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -154,6 +154,187 @@ pub fn bucket_manifest_bytes(
     Ok(Some(
         serde_json::to_vec_pretty(&manifest).context("failed to serialize manifest")?,
     ))
+}
+
+/// The manifest of the session whose local directory is `session_dir`, as
+/// the bucket gets it ([`bucket_manifest_bytes`]), leaving out besides
+/// every key whose object the bucket hasn't confirmed
+/// ([`crate::session::sync_stamp::OwedKeys`]) (koto#646). An owed record
+/// that doesn't parse is an error, never read as empty.
+///
+/// Every manifest koto uploads from a local store goes through this, so no
+/// manifest koto pushes names a host-local key, a pin record, or an object
+/// the bucket may lack.
+pub fn bucket_manifest_of(
+    session_dir: &std::path::Path,
+    withheld: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let owed = crate::session::sync_stamp::OwedKeys::load(session_dir)?;
+    let mut left_out = withheld.to_vec();
+    left_out.extend(owed.keys.into_keys());
+    bucket_manifest_bytes(&session_dir.join("ctx").join("manifest.json"), &left_out)
+}
+
+/// How many times a context key's upload asks the bucket to store its
+/// object, the first included, before it reads the object back
+/// ([`put_confirmed`]). Each ask is a request plus rust-s3's own retry of
+/// it a second later, so two asks bound what an outage costs a write.
+pub(crate) const CONTEXT_UPLOAD_ATTEMPTS: u32 = 2;
+
+/// [`put_confirmed`]'s wait before its second ask, doubled before any ask
+/// after that.
+const CONTEXT_UPLOAD_BACKOFF: Duration = Duration::from_millis(250);
+
+/// PUT `data` under `s3_key`, asked up to [`CONTEXT_UPLOAD_ATTEMPTS`] times
+/// while the failure is [transient](crate::session::cloud::is_transient).
+/// A last failure the bucket may have stored anyway (a lost reply, a 500
+/// after the write) is checked by reading the object back
+/// ([`object_holds`]); a refusal such as a 403 is not.
+pub(crate) fn put_confirmed(
+    bucket: &Bucket,
+    s3_key: &str,
+    data: &[u8],
+) -> Result<(), s3::error::S3Error> {
+    use crate::session::cloud::is_transient;
+    let mut wait = CONTEXT_UPLOAD_BACKOFF;
+    let mut attempt = 1;
+    let failure = loop {
+        match bucket.put_object(s3_key, data) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < CONTEXT_UPLOAD_ATTEMPTS && is_transient(&e) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+                attempt += 1;
+            }
+            Err(e) => break e,
+        }
+    };
+    if is_transient(&failure) && object_holds(bucket, s3_key, data) {
+        return Ok(());
+    }
+    Err(failure)
+}
+
+/// Whether the bucket holds exactly `data` under `s3_key`: a listing of the
+/// key shows it at `data`'s size, and a GET of it returns `data`. A listing
+/// first, so an object that isn't there costs no 404 and none of rust-s3's
+/// retry sleep; the bytes, not the ETag, since an ETag needn't be a hash of
+/// the content (it isn't one under SSE-KMS). Any failure is a no.
+fn object_holds(bucket: &Bucket, s3_key: &str, data: &[u8]) -> bool {
+    let listed = bucket.list(s3_key.to_string(), None).is_ok_and(|pages| {
+        pages
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .any(|obj| obj.key == s3_key && obj.size == data.len() as u64)
+    });
+    listed
+        && bucket
+            .get_object(s3_key)
+            .is_ok_and(|reply| reply.status_code() == 200 && reply.bytes() == data)
+}
+
+/// Upload the objects of the session's owed keys
+/// ([`crate::session::sync_stamp::OwedKeys`]), each once, before a manifest
+/// goes up, and clear each the bucket took. A key gone from this host, or
+/// one no push sends (host-local, a pin record, not a valid key), is dropped from the
+/// record; a key in `withheld` stays owed and is not sent. The first
+/// transient failure stops the round, so an outage costs one request a
+/// command; the next push tries again.
+///
+/// Returns each key that stays owed with why, for the caller to warn about.
+pub fn push_owed(
+    local: &LocalBackend,
+    bucket: &Bucket,
+    prefix: &str,
+    session: &str,
+    withheld: &[String],
+) -> Vec<(String, String)> {
+    use crate::session::sync_stamp::{clear_owed, forget_owed, sha256_hex, OwedKeys};
+    let dir = local.session_dir(session);
+    let owed = match OwedKeys::load(&dir) {
+        Ok(owed) => owed,
+        Err(e) => {
+            return vec![(
+                crate::session::sync_stamp::OWED_FILE.to_string(),
+                format!("{e:#}"),
+            )]
+        }
+    };
+    let mut missed = Vec::new();
+    let mut keys = owed.keys.into_iter();
+    for (key, marked) in keys.by_ref() {
+        // An entry that isn't a key (a record edited by hand) names no file
+        // of the session's, and is never read.
+        if crate::session::validate::validate_context_key(&key).is_err()
+            || crate::session::context::is_host_local_key(&key)
+            || crate::session::context::is_pin_record_key(&key)
+        {
+            if let Err(e) = forget_owed(&dir, &key) {
+                missed.push((key, format!("{e:#}")));
+            }
+            continue;
+        }
+        if withheld.contains(&key) {
+            continue;
+        }
+        let data = match std::fs::read(dir.join("ctx").join(&key)) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = forget_owed(&dir, &key) {
+                    missed.push((key, format!("{e:#}")));
+                }
+                continue;
+            }
+            Err(e) => {
+                missed.push((key, format!("reading it failed: {e}")));
+                continue;
+            }
+        };
+        let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
+        match bucket.put_object(&s3_key, &data) {
+            // Cleared for the copy that went up, or for the mark as read
+            // above when nothing marked the key again since: a write that
+            // marked the key and then failed or stopped never wrote the
+            // marked bytes, and the copy this host holds is the one that
+            // counts. A mark made since, for another copy, stays.
+            Ok(_) => {
+                let cleared = clear_owed(&dir, &key, &sha256_hex(&data))
+                    .and_then(|()| clear_owed(&dir, &key, &marked));
+                if let Err(e) = cleared {
+                    missed.push((key, format!("{e:#}")));
+                }
+            }
+            Err(e) => {
+                let transient = crate::session::cloud::is_transient(&e);
+                missed.push((
+                    key,
+                    crate::session::cloud::without_url_userinfo(&e.to_string()),
+                ));
+                if transient {
+                    break;
+                }
+            }
+        }
+    }
+    missed.extend(keys.map(|(key, _)| (key, "an earlier owed upload failed first".to_string())));
+    missed
+}
+
+/// [`push_owed`], each key that stays owed a warning on stderr.
+pub fn push_owed_warning(
+    local: &LocalBackend,
+    bucket: &Bucket,
+    prefix: &str,
+    session: &str,
+    withheld: &[String],
+) {
+    for (key, why) in push_owed(local, bucket, prefix, session, withheld) {
+        eprintln!(
+            "warning: cloud sync: context key '{}' of session '{}' is still owed to the bucket, \
+             which leaves it out of the manifest until a later push uploads it: {}",
+            key, session, why
+        );
+    }
 }
 
 /// The keys a push of `session` leaves out of the bucket for now: its
@@ -187,6 +368,12 @@ pub fn push_context_key(
 /// the push leaves out (host-local, a pin record, or in `withheld`), or
 /// one with no content file, pushes nothing and succeeds. The caller
 /// invalidates the manifest cache.
+///
+/// The object goes up through [`put_confirmed`]. One the bucket doesn't
+/// confirm is recorded owed ([`crate::session::sync_stamp::mark_owed`]) and
+/// fails the push before any manifest goes up, so no manifest names it
+/// (koto#646); one it confirms is cleared. The other owed keys go up next
+/// ([`push_owed`]), then the manifest, which leaves out any still owed.
 pub fn try_push_context_key(
     local: &LocalBackend,
     bucket: &Bucket,
@@ -195,13 +382,15 @@ pub fn try_push_context_key(
     key: &str,
     withheld: &[String],
 ) -> anyhow::Result<()> {
+    use crate::session::sync_stamp::{clear_owed, mark_owed, sha256_hex};
     if crate::session::context::is_host_local_key(key)
         || crate::session::context::is_pin_record_key(key)
         || withheld.iter().any(|w| w == key)
     {
         return Ok(());
     }
-    let ctx_dir = local.session_dir(session).join("ctx");
+    let dir = local.session_dir(session);
+    let ctx_dir = dir.join("ctx");
 
     // Upload the content file.
     let content_path = ctx_dir.join(key);
@@ -210,17 +399,31 @@ pub fn try_push_context_key(
     }
     let data = std::fs::read(&content_path)
         .map_err(|e| anyhow::anyhow!("cloud sync: failed to read context key '{}': {}", key, e))?;
+    let hash = sha256_hex(&data);
     let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
-    bucket.put_object(&s3_key, &data).map_err(|e| {
-        anyhow::anyhow!(
+    if let Err(e) = put_confirmed(bucket, &s3_key, &data) {
+        let failed = format!(
             "cloud sync failed for context upload '{}': {}",
             key,
             crate::session::cloud::without_url_userinfo(&e.to_string())
+        );
+        if let Err(m) = mark_owed(&dir, key, &hash) {
+            anyhow::bail!("{failed}; recording the key as owed failed too: {m:#}");
+        }
+        anyhow::bail!("{failed}");
+    }
+    clear_owed(&dir, key, &hash).map_err(|e| {
+        anyhow::anyhow!(
+            "cloud sync: context key '{}' went up, but clearing it from the owed keys failed: \
+             {:#}",
+            key,
+            e
         )
     })?;
+    push_owed_warning(local, bucket, prefix, session, withheld);
 
     // Upload the manifest.
-    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json"), withheld)
+    let manifest_data = match bucket_manifest_of(&dir, withheld)
         .map_err(|e| anyhow::anyhow!("cloud sync: failed to read manifest: {:#}", e))?
     {
         Some(d) => d,
@@ -505,10 +708,11 @@ pub fn delete_context_key(
         );
     }
 
-    // Upload the updated manifest (the local remove already happened).
-    let manifest_path = local.session_dir(session).join("ctx").join("manifest.json");
+    // Upload the updated manifest (the local remove already happened),
+    // after the objects of any owed keys, which it leaves out while owed.
     let withheld = withheld_keys(local, prefix, session);
-    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path, &withheld) {
+    push_owed_warning(local, bucket, prefix, session, &withheld);
+    if let Ok(Some(data)) = bucket_manifest_of(&local.session_dir(session), &withheld) {
         let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
         if let Err(e) = bucket.put_object(&manifest_s3_key, &data) {
             eprintln!("warning: cloud sync failed for manifest upload: {}", e);
@@ -602,6 +806,46 @@ mod tests {
             pushed.keys.keys().collect::<Vec<_>>(),
             ["koto/links/held-by/a", "notes.md"]
         );
+    }
+
+    /// koto#646: an owed key stays out of the manifest the bucket gets, on
+    /// top of the host-local keys, the pin records and the withheld keys,
+    /// and goes back in once cleared. A record that doesn't parse fails the
+    /// build rather than read as empty.
+    #[test]
+    fn bucket_manifest_of_leaves_out_the_owed_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(bucket_manifest_of(dir.path(), &[]).unwrap().is_none());
+        std::fs::create_dir_all(dir.path().join("ctx")).unwrap();
+        let entry = r#"{"created_at":"t","size":1,"hash":"h"}"#;
+        std::fs::write(
+            dir.path().join("ctx").join("manifest.json"),
+            format!(
+                r#"{{"keys":{{"a.md":{entry},"b.md":{entry},"c.md":{entry},"koto/links/pin":{entry},"workflows/publish-location":{entry}}}}}"#
+            ),
+        )
+        .unwrap();
+        let pushed = |withheld: &[String]| -> Vec<String> {
+            let m: Manifest =
+                serde_json::from_slice(&bucket_manifest_of(dir.path(), withheld).unwrap().unwrap())
+                    .unwrap();
+            m.keys.into_keys().collect()
+        };
+        assert_eq!(pushed(&[]), ["a.md", "b.md", "c.md"]);
+
+        crate::session::sync_stamp::mark_owed(dir.path(), "a.md", "h").unwrap();
+        assert_eq!(pushed(&[]), ["b.md", "c.md"]);
+        assert_eq!(pushed(&["c.md".to_string()]), ["b.md"]);
+
+        crate::session::sync_stamp::clear_owed(dir.path(), "a.md", "h").unwrap();
+        assert_eq!(pushed(&[]), ["a.md", "b.md", "c.md"]);
+
+        std::fs::write(
+            dir.path().join(crate::session::sync_stamp::OWED_FILE),
+            b"not json",
+        )
+        .unwrap();
+        assert!(bucket_manifest_of(dir.path(), &[]).is_err());
     }
 
     /// A local copy counts as later only when both timestamps are in a form

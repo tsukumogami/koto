@@ -25,6 +25,12 @@
 //! - `cloud-summary-owed` ([`SUMMARY_OWED_FILE`]): left by a failed
 //!   `summary.json` PUT, so the next flush writes the summary for the
 //!   stamped bytes, and removed by a PUT that succeeds.
+//! - `cloud-ctx-owed.json` ([`OwedKeys`]): the context keys this host holds
+//!   whose object the bucket hasn't confirmed, so no manifest koto uploads
+//!   names them (koto#646), changed under `cloud-ctx-owed.lock`
+//!   ([`OWED_LOCK_FILE`]). Unlike the files above it is not best-effort:
+//!   a mark that can't be written fails the write, and a record that
+//!   doesn't parse fails the manifest built from it.
 //!
 //! A read probes the bucket once per session per process: one listing of
 //! the session's prefix says whether the migration marker is there and
@@ -65,6 +71,121 @@ pub const SYNCED_FILE: &str = "cloud-ctx-synced.json";
 /// writes the summary even when the state didn't change, and a PUT that
 /// succeeds removes the mark.
 pub const SUMMARY_OWED_FILE: &str = "cloud-summary-owed";
+
+/// File name of the context keys whose object the bucket hasn't confirmed
+/// ([`OwedKeys`]).
+pub const OWED_FILE: &str = "cloud-ctx-owed.json";
+
+/// File name of the lock every change of [`OWED_FILE`] is made under:
+/// several koto processes on one host can write one session at once.
+pub const OWED_LOCK_FILE: &str = "cloud-ctx-owed.lock";
+
+/// The context keys this host holds whose object the bucket hasn't
+/// confirmed, each with the SHA-256 of the bytes owed. A key is marked
+/// before its local write on a push that goes up at once, and cleared once
+/// the bucket confirms that very copy, so neither a push from another
+/// process between the write and the upload nor a process stopped during
+/// the upload can send a manifest naming an object the bucket lacks.
+///
+/// Not kept per home, as [`SyncedKeys`] is: an entry lives only until the
+/// next push that uploads it, and leaving a key out of a new home's
+/// manifest until then is the safe direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwedKeys {
+    /// Key to lowercase hex SHA-256 of the copy owed.
+    #[serde(default)]
+    pub keys: std::collections::BTreeMap<String, String>,
+}
+
+impl OwedKeys {
+    /// The record in `dir`: empty when there is none, an error when it
+    /// can't be read or doesn't parse, since reading it as empty would let
+    /// a manifest name an object the bucket lacks.
+    pub fn load(dir: &Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let path = dir.join(OWED_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "{} doesn't parse; it lists the context keys whose upload the bucket \
+                     hasn't confirmed",
+                    path.display()
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Whether `key` is owed.
+    pub fn owes(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+}
+
+/// Record that the bucket hasn't confirmed `key` of the session whose
+/// directory is `dir` at `hash`. An error when the record can't be
+/// written, or `dir` doesn't exist: the write it precedes must not go on.
+pub fn mark_owed(dir: &Path, key: &str, hash: &str) -> anyhow::Result<()> {
+    change_owed(dir, |owed| {
+        owed.keys.insert(key.to_string(), hash.to_string());
+    })
+}
+
+/// Clear `key` from the record in `dir` once the bucket confirmed the copy
+/// at `hash`. An entry for another hash (the key was written again since)
+/// stays. With no record there is nothing to clear, and no lock is taken:
+/// a mark made meanwhile is for a write still to be confirmed.
+pub fn clear_owed(dir: &Path, key: &str, hash: &str) -> anyhow::Result<()> {
+    if !dir.join(OWED_FILE).exists() {
+        return Ok(());
+    }
+    change_owed(dir, |owed| {
+        if owed.keys.get(key).is_some_and(|h| h == hash) {
+            owed.keys.remove(key);
+        }
+    })
+}
+
+/// Drop `key` from the record in `dir` whatever its hash: the key was
+/// removed here, or never goes up.
+pub fn forget_owed(dir: &Path, key: &str) -> anyhow::Result<()> {
+    if !dir.join(OWED_FILE).exists() {
+        return Ok(());
+    }
+    change_owed(dir, |owed| {
+        owed.keys.remove(key);
+    })
+}
+
+/// Read, change and write back the record in `dir` under its lock. An
+/// empty record is removed rather than written.
+fn change_owed(dir: &Path, change: impl FnOnce(&mut OwedKeys)) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if !dir.is_dir() {
+        anyhow::bail!("session directory {} does not exist", dir.display());
+    }
+    #[cfg(unix)]
+    let _lock = crate::session::local::LocalBackend::acquire_flock(&dir.join(OWED_LOCK_FILE))?;
+    let mut owed = OwedKeys::load(dir)?;
+    let before = owed.clone();
+    change(&mut owed);
+    if owed == before {
+        return Ok(());
+    }
+    let path = dir.join(OWED_FILE);
+    if owed.keys.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    let bytes = serde_json::to_vec(&owed).context("serializing the owed context keys")?;
+    write_replacing_strictly(dir, OWED_FILE, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
 
 /// The hash of each context key this host last knew the session's home to
 /// hold: the copy it pushed there, pulled from there, or found there equal
@@ -369,6 +490,15 @@ fn write_replacing(dir: &Path, name: &str, bytes: &[u8]) {
     }
 }
 
+/// [`write_replacing`] for a file whose write must not fail silently.
+fn write_replacing_strictly(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, dir.join(name)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +584,54 @@ mod tests {
         note_synced(dir.path(), "p2", [("j", "h3")]);
         assert_eq!(SyncedKeys::load(dir.path(), "p1").hash("j"), None);
         assert_eq!(SyncedKeys::load(dir.path(), "p2").hash("j"), Some("h3"));
+    }
+
+    #[test]
+    fn an_owed_record_round_trips_and_clears_only_the_confirmed_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(OwedKeys::load(dir.path()).unwrap(), OwedKeys::default());
+        mark_owed(dir.path(), "a.md", "h1").unwrap();
+        mark_owed(dir.path(), "b.md", "h2").unwrap();
+        let owed = OwedKeys::load(dir.path()).unwrap();
+        assert!(owed.owes("a.md") && owed.owes("b.md"));
+        assert_eq!(owed.keys["a.md"], "h1");
+
+        // The key was written again since: the older copy's confirmation
+        // leaves the newer one owed.
+        mark_owed(dir.path(), "a.md", "h3").unwrap();
+        clear_owed(dir.path(), "a.md", "h1").unwrap();
+        assert!(OwedKeys::load(dir.path()).unwrap().owes("a.md"));
+        clear_owed(dir.path(), "a.md", "h3").unwrap();
+        assert!(!OwedKeys::load(dir.path()).unwrap().owes("a.md"));
+
+        // Forgetting ignores the hash, and an empty record leaves no file.
+        forget_owed(dir.path(), "b.md").unwrap();
+        assert_eq!(OwedKeys::load(dir.path()).unwrap(), OwedKeys::default());
+        assert!(!dir.path().join(OWED_FILE).exists());
+        forget_owed(dir.path(), "b.md").unwrap();
+        clear_owed(dir.path(), "b.md", "h2").unwrap();
+    }
+
+    #[test]
+    fn an_owed_mark_into_a_missing_directory_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let gone = dir.path().join("gone");
+        assert!(mark_owed(&gone, "a.md", "h").is_err());
+        assert!(!gone.exists(), "no directory is made for the mark");
+    }
+
+    #[test]
+    fn an_owed_record_that_does_not_parse_is_an_error_not_an_empty_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(OWED_FILE), b"{not json").unwrap();
+        let e = OwedKeys::load(dir.path()).unwrap_err();
+        assert!(format!("{e:#}").contains(OWED_FILE), "{e:#}");
+        assert!(mark_owed(dir.path(), "a.md", "h").is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(OWED_FILE)).unwrap(),
+            b"{not json",
+            "a record that doesn't parse is left as it is"
+        );
     }
 
     #[test]

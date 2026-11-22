@@ -1577,3 +1577,218 @@ fn a_failed_context_upload_stays_out_of_the_bucket_manifest() {
     );
     assert_remote_consistent(&s3, &h);
 }
+
+/// The bucket manifest's keys, after checking that each has its object in
+/// the bucket: no manifest koto uploads names an object the bucket lacks.
+fn assert_bucket_manifest_names_only_present_objects(s3: &FakeS3, h: &Host) -> Vec<String> {
+    let manifest: serde_json::Value = s3
+        .object(&h.key("ctx/manifest.json"))
+        .map(|b| serde_json::from_slice(&b).expect("the bucket manifest parses"))
+        .unwrap_or_else(|| serde_json::json!({"keys": {}}));
+    let named: Vec<String> = manifest["keys"]
+        .as_object()
+        .map(|keys| keys.keys().cloned().collect())
+        .unwrap_or_default();
+    for key in &named {
+        assert!(
+            s3.object(&h.key(&format!("ctx/{key}"))).is_some(),
+            "the bucket manifest names {key}, but the bucket lacks its object (get-object \
+             would answer NoSuchKey)"
+        );
+    }
+    named
+}
+
+/// The keys this host's owed record lists for the session.
+fn owed_keys(h: &Host) -> Vec<String> {
+    match std::fs::read(h.session_dir().join("cloud-ctx-owed.json")) {
+        Ok(bytes) => {
+            let owed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            owed["keys"]
+                .as_object()
+                .map(|keys| keys.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The failed add names the key on its JSON error and exits 3, and a later
+/// push of another key uploads the owed object before the manifest names it.
+#[test]
+fn a_failed_context_upload_fails_the_add_and_goes_up_with_the_next_push() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    s3.fail("PUT", &h.key("ctx/a.md"), 500);
+    let failed = h.add("a.md", b"alpha");
+    assert_eq!(failed.code, Some(3), "{}", failed.describe());
+    let error = failed.json()["error"].as_str().unwrap_or("").to_string();
+    assert!(error.contains("a.md"), "{}", failed.describe());
+    assert_eq!(owed_keys(&h), ["a.md"]);
+
+    // A's object still can't go up: B's push leaves A out.
+    let out = h.add("b.md", b"beta");
+    assert!(out.ok(), "add b.md: {}", out.describe());
+    assert_eq!(
+        assert_bucket_manifest_names_only_present_objects(&s3, &h),
+        ["b.md"]
+    );
+    assert_remote_consistent(&s3, &h);
+    assert_eq!(owed_keys(&h), ["a.md"]);
+
+    s3.clear_faults();
+    let out = h.add("c.md", b"gamma");
+    assert!(out.ok(), "add c.md: {}", out.describe());
+    assert_eq!(assert_remote_consistent(&s3, &h), ["a.md", "b.md", "c.md"]);
+    assert_eq!(
+        s3.object(&h.key("ctx/a.md")).as_deref(),
+        Some(&b"alpha"[..])
+    );
+    assert!(owed_keys(&h).is_empty());
+    assert!(!h.session_dir().join("cloud-ctx-owed.json").exists());
+}
+
+/// An upload that fails on koto's first ask lands on its retry: the add
+/// exits 0 and owes nothing.
+#[test]
+fn a_context_upload_that_fails_once_lands_on_the_retry() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    // One koto ask is two requests: rust-s3 retries a failed one once.
+    s3.fail_times("PUT", &h.key("ctx/a.md"), 500, 2);
+    let out = h.add("a.md", b"alpha");
+    assert!(out.ok(), "add a.md: {}", out.describe());
+    assert_eq!(
+        s3.object(&h.key("ctx/a.md")).as_deref(),
+        Some(&b"alpha"[..])
+    );
+    assert_eq!(assert_remote_consistent(&s3, &h), ["a.md"]);
+    assert!(owed_keys(&h).is_empty());
+}
+
+/// An upload the bucket stored but answered with a failure is confirmed by
+/// reading the object back: the add exits 0 and the manifest names it.
+#[test]
+fn a_context_upload_whose_reply_was_lost_is_confirmed_by_reading_it_back() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    let object = h.key("ctx/a.md");
+    s3.fail_after_storing(&object, 500);
+    let mut out = None;
+    let requests = requests_during(&s3, || out = Some(h.add("a.md", b"alpha")));
+    let out = out.unwrap();
+    s3.clear_faults();
+    assert!(out.ok(), "add a.md: {}", out.describe());
+
+    let last_put = requests
+        .iter()
+        .rposition(|r| *r == format!("PUT {object}"))
+        .expect("the add PUT a.md's object");
+    let after: Vec<&String> = requests[last_put..].iter().collect();
+    assert!(
+        after.contains(&&format!("LIST {object}")) && after.contains(&&format!("GET {object}")),
+        "the add reads a.md back after its PUTs: {requests:?}"
+    );
+    assert_eq!(assert_remote_consistent(&s3, &h), ["a.md"]);
+    assert!(owed_keys(&h).is_empty());
+}
+
+/// A window's flush leaves a key owed from an earlier failed add out of the
+/// manifest it uploads while that key's object still can't go up, and the
+/// next push uploads it.
+#[test]
+fn a_window_flush_leaves_an_owed_key_out_of_the_bucket_manifest() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    s3.fail("PUT", &h.key("ctx/a.md"), 500);
+    let failed = h.add("a.md", b"alpha");
+    assert!(!failed.ok(), "{}", failed.describe());
+
+    let out = h.add_in_window("b.md", b"beta");
+    assert!(out.ok(), "add b.md in window: {}", out.describe());
+    let out = h.flush();
+    assert!(out.ok(), "flush: {}", out.describe());
+    assert_eq!(
+        assert_bucket_manifest_names_only_present_objects(&s3, &h),
+        ["b.md"]
+    );
+    assert_remote_consistent(&s3, &h);
+    assert_eq!(owed_keys(&h), ["a.md"]);
+
+    s3.clear_faults();
+    let out = h.add("c.md", b"gamma");
+    assert!(out.ok(), "add c.md: {}", out.describe());
+    assert_eq!(assert_remote_consistent(&s3, &h), ["a.md", "b.md", "c.md"]);
+    assert!(owed_keys(&h).is_empty());
+}
+
+/// A window key whose own upload fails fails the flush, and the bucket's
+/// manifest doesn't name it; the next flush pushes it.
+#[test]
+fn a_window_key_whose_upload_fails_fails_the_flush_and_stays_out_of_the_manifest() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    let out = h.add_in_window("d.md", b"delta");
+    assert!(out.ok(), "add d.md in window: {}", out.describe());
+    s3.fail("PUT", &h.key("ctx/d.md"), 500);
+    let out = h.flush();
+    assert!(!out.ok(), "the flush must fail: {}", out.describe());
+    assert!(
+        !assert_bucket_manifest_names_only_present_objects(&s3, &h).contains(&"d.md".to_string())
+    );
+
+    s3.clear_faults();
+    let out = h.flush();
+    assert!(out.ok(), "flush: {}", out.describe());
+    assert_eq!(assert_remote_consistent(&s3, &h), ["d.md"]);
+}
+
+/// `koto session resolve --keep local` fails naming a key whose object it
+/// couldn't put back, and the manifest it uploads leaves that key out; run
+/// again once the bucket answers, it puts the key back.
+#[test]
+fn resolve_keep_local_reports_a_key_that_does_not_go_up() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+
+    let out = h.add("a.md", b"alpha");
+    assert!(out.ok(), "add a.md: {}", out.describe());
+    let out = h.add("b.md", b"beta");
+    assert!(out.ok(), "add b.md: {}", out.describe());
+    s3.remove(&h.key("ctx/a.md"));
+    s3.fail("PUT", &h.key("ctx/a.md"), 500);
+
+    let out = h.koto(&["session", "resolve", NAME, "--keep", "local"]);
+    assert!(!out.ok(), "resolve must fail: {}", out.describe());
+    assert!(
+        out.stdout.contains("a.md") || out.stderr.contains("a.md"),
+        "the failure names a.md: {}",
+        out.describe()
+    );
+    assert_eq!(
+        assert_bucket_manifest_names_only_present_objects(&s3, &h),
+        ["b.md"]
+    );
+    assert_eq!(owed_keys(&h), ["a.md"]);
+
+    s3.clear_faults();
+    let out = h.koto(&["session", "resolve", NAME, "--keep", "local"]);
+    assert!(out.ok(), "resolve: {}", out.describe());
+    assert_eq!(assert_remote_consistent(&s3, &h), ["a.md", "b.md"]);
+    assert_eq!(
+        s3.object(&h.key("ctx/a.md")).as_deref(),
+        Some(&b"alpha"[..])
+    );
+    assert!(owed_keys(&h).is_empty());
+}
