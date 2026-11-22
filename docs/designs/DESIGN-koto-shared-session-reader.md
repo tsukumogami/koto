@@ -557,8 +557,9 @@ read, the header-only fallback it takes when a log won't parse whole, and
 `read_detail`'s re-read for the detail view all go through
 `read_store_file` and then `parse_state_log` or `parse_header_bytes`, a
 header-only parse of those bytes that shares `parse_header` with
-`read_header`, never through `read_events` or `read_header`, and the guard
-script fails if `dashboard.rs` or `source.rs` names either.
+`read_header`, never through `read_events`, `read_header`,
+`read_header_only` or `read_log`, and from Phase 4 the guard script fails
+if `dashboard.rs` or `source.rs` names any of the four.
 Listing skips a symlinked session directory, as `LocalBackend::list` already does.
 On every store koto itself writes, none of this changes a row; the
 reviewer run in Decision 5 records the largest state log in the reference

@@ -62,7 +62,7 @@ write nothing new, and their koto calls cost what they did.
 - [ ] The expected file holds no elapsed or idle duration (columns 3 and 7) and no calendar date, so nothing in it depends on when the test runs.
 - [ ] Running `cargo test --test dashboard_golden_test` five times in a row, with at least a minute between the first and last run, passes every time, and `git status --porcelain tests/` prints nothing afterwards, so the test never rewrites its expected file.
 - [ ] Changing the liveness token in one row of the expected file (for example `idle` to `active`) makes the test fail with a message that names that row's session id and shows the expected and actual values; swapping the order of two rows also fails; restoring the file makes it pass again.
-- [ ] `git diff --name-only main...HEAD` lists only paths under `tests/`: no file under `src/` changes and no dependency is added to `Cargo.toml`.
+- [ ] `git diff --name-only origin/main...HEAD` lists only paths under `tests/`: no file under `src/` changes and no dependency is added to `Cargo.toml`.
 
 **Check**: Run `cargo test --test dashboard_golden_test` and see `test result: ok.` with `0 failed`, covering both the `--once` and the `--once --all` comparison. Then change one liveness token in the expected file, rerun the same command, and see it fail naming that row's session id; restore the file with `git checkout -- tests/` and rerun to see it pass.
 
@@ -84,7 +84,7 @@ write nothing new, and their koto calls cost what they did.
 - [ ] Template validation reports the same errors and warnings: `cargo test --locked --lib template::` exits 0, and `git diff -w origin/main...HEAD -- src/template/types.rs src/template/variables.rs` shows changes only to lines that open or close an `impl` or `trait` block, declare a trait method signature, or add a `use` line, with no validator body or test body changed.
 - [ ] The dashboard scan runs against any `&dyn SessionSource`: a unit test builds a sessions directory in a temp dir, refreshes once through a `LocalBackend` passed as a `SessionSource` and once through the `refresh_with_overlay` path, and gets the same rows, tree roots and unreadable count from both.
 - [ ] The committed public-API snapshot of `koto::engine::types` and `koto::error` matches a fresh generation: re-running the snapshot command and then `git diff --exit-code` on the snapshot file exits 0. koto has no public-API tooling today (nothing in `Cargo.toml`, `scripts/` or `.github/workflows/` generates one), so the command is this step's to choose; it must run on the stable toolchain koto already uses, give byte-identical output on repeat runs, and be written down next to the snapshot so the crate step can run it unchanged.
-- [ ] No koto command opens, reads or writes a file it didn't before: `git diff --color-moved=plain --color-moved-ws=ignore-all-space origin/main...HEAD -- src/engine` shows the write-half functions as moved blocks rather than edited ones, with `prepare_append`'s call into `plan_append` the only changed function body there, and the integration suite passes with no existing test file modified, so agents' koto calls do the same work and write nothing new.
+- [ ] No koto command opens, reads or writes a file it didn't before: `git diff --color-moved=plain --color-moved-ws=ignore-all-space origin/main...HEAD -- src/engine` shows the write-half functions as moved blocks rather than edited ones; outside those blocks and `prepare_append`'s call into `plan_append`, the only changes there are paths, visibility and `use` lines, with no new file open, read or write in any function body; and the integration suite passes with no existing test file modified, so agents' koto calls do the same work and write nothing new.
 - [ ] `cargo clippy --all-targets -- -D warnings` exits 0 and `cargo test --locked -- --test-threads=1` exits 0.
 
 **Check**: From the worktree root, run `cargo test --locked --test dashboard_golden_test && cargo test --locked -p koto-stability-tests -- --test-threads=1 && cargo test --locked --test state_log_append_test a_merged_last_line_is_split_by_the_next_write && cargo clippy --all-targets -- -D warnings && cargo test --locked -- --test-threads=1`, then `git diff --diff-filter=MD --name-only origin/main...HEAD -- tests koto-stability-tests benches`, then the snapshot command followed by `git diff --exit-code` on the snapshot file. Look for `test result: ok.` with `0 failed` on every cargo test run, no output from the first `git diff`, and exit 0 from the second.
@@ -95,7 +95,7 @@ write nothing new, and their koto calls cost what they did.
 
 ### Step 3: the reader code builds as its own workspace crate that koto re-exports and CI proves cannot write
 
-koto-session-reader holds the moved files behind the Reader Write Guard job, with frozen paths, the golden test and the release version guards unchanged, and its release waits on the koto#668 fix (DESIGN Phase 3).
+koto-session-reader holds the moved files behind the Reader Write Guard job, with frozen paths and the golden test unchanged, the release version guards in place, and its release waiting on the koto#668 fix (DESIGN Phase 3).
 
 ### Step 4: a dependent finds the store and reads one context value through the hardened, capped read surface
 
