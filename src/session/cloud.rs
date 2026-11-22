@@ -5343,62 +5343,21 @@ enum KeyPush {
     Failed(anyhow::Error),
 }
 
-/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
-/// session imported elsewhere neither reads nor writes its keys here: the
-/// methods that return a `Result` refuse with `SessionMigrated`, while
-/// `ctx_exists` answers false and `meta` none, having no room for a
-/// reason. The answer is cached per session, so a command that touches
-/// many keys pays for it once.
-impl ContextStore for CloudBackend {
-    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
-        self.add_as(session, key, content, None)
+impl CloudBackend {
+    /// [`ContextStore::get`] that never writes to the bucket: a key whose
+    /// copy here is newer than the bucket's, or that the bucket lacks, is
+    /// read from here and left as it is, where `get` would push it.
+    /// `koto session origin` reads link bodies through this, since a read
+    /// verb that writes nothing must not repair the bucket as it reads. It
+    /// still pulls a newer remote copy into this host's mirror, as every
+    /// read does.
+    pub fn get_without_push(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_keyed(session, key, false)
     }
 
-    fn add_with_writer(
-        &self,
-        session: &str,
-        key: &str,
-        content: &[u8],
-        writer: &str,
-    ) -> anyhow::Result<()> {
-        self.add_as(session, key, content, Some(writer))
-    }
-
-    /// The local metadata, or for a key only the remote store has, the
-    /// remote manifest's.
-    ///
-    /// A migrated session has no metadata to give: `None`.
-    fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
-        if self.check_not_migrated(session).is_err() {
-            return None;
-        }
-        if let Some(meta) = self.local.meta(session, key) {
-            return Some(meta);
-        }
-        if !crate::session::context_log::loggable_key(key) || is_host_local_key(key) {
-            return None;
-        }
-        if self
-            .pending_keys(session)
-            .is_some_and(|pending| pending.touches(key))
-        {
-            return None;
-        }
-        // A session with no home has no manifest here to merge (koto#457).
-        if self.home_prefix(session).is_err() {
-            return None;
-        }
-        self.prime_manifest(session);
-        sync::remote_key_meta(
-            &self.bucket,
-            &self.home(session),
-            session,
-            key,
-            &self.manifest_cache,
-        )
-    }
-
-    fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+    /// The body of [`ContextStore::get`]; `push_kept` says whether a key
+    /// this host holds a newer copy of, or the bucket lacks, is pushed.
+    fn get_keyed(&self, session: &str, key: &str, push_kept: bool) -> anyhow::Result<Vec<u8>> {
         self.check_not_migrated(session)?;
         // A key an open batch wrote is read as the batch left it, and a
         // host-local key only ever lives here.
@@ -5463,11 +5422,71 @@ impl ContextStore for CloudBackend {
                     );
                 }
             }
-            sync::Pull::LocalNewer => self.push_kept_key(session, key, false)?,
-            sync::Pull::LocalOnly => self.push_kept_key(session, key, true)?,
-            sync::Pull::Unchanged => {}
+            sync::Pull::LocalNewer if push_kept => self.push_kept_key(session, key, false)?,
+            sync::Pull::LocalOnly if push_kept => self.push_kept_key(session, key, true)?,
+            sync::Pull::LocalNewer | sync::Pull::LocalOnly | sync::Pull::Unchanged => {}
         }
         self.local.get(session, key)
+    }
+}
+
+/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
+/// session imported elsewhere neither reads nor writes its keys here: the
+/// methods that return a `Result` refuse with `SessionMigrated`, while
+/// `ctx_exists` answers false and `meta` none, having no room for a
+/// reason. The answer is cached per session, so a command that touches
+/// many keys pays for it once.
+impl ContextStore for CloudBackend {
+    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+        self.add_as(session, key, content, None)
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_as(session, key, content, Some(writer))
+    }
+
+    /// The local metadata, or for a key only the remote store has, the
+    /// remote manifest's.
+    ///
+    /// A migrated session has no metadata to give: `None`.
+    fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
+        if self.check_not_migrated(session).is_err() {
+            return None;
+        }
+        if let Some(meta) = self.local.meta(session, key) {
+            return Some(meta);
+        }
+        if !crate::session::context_log::loggable_key(key) || is_host_local_key(key) {
+            return None;
+        }
+        if self
+            .pending_keys(session)
+            .is_some_and(|pending| pending.touches(key))
+        {
+            return None;
+        }
+        // A session with no home has no manifest here to merge (koto#457).
+        if self.home_prefix(session).is_err() {
+            return None;
+        }
+        self.prime_manifest(session);
+        sync::remote_key_meta(
+            &self.bucket,
+            &self.home(session),
+            session,
+            key,
+            &self.manifest_cache,
+        )
+    }
+
+    fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_keyed(session, key, true)
     }
 
     /// A migrated session holds no key here: `false`. Callers that must

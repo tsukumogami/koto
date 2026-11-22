@@ -29,6 +29,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg; or a session that carries on another's work, naming it with `--continues` |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
+| `koto session origin` | Operator and reviewer — which session dispatched a session or an anchor |
 | `koto session pin/unpin` | Runner and operator — keeping a finished session's record past every removal, and releasing it |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
@@ -969,7 +970,7 @@ koto session anchor close --key=<key> --harness-session=<id>
 
 An anchor is the session koto keeps for one agent session (`kind: "anchor"`), so that what the agent session opens or ticks under `KOTO_ANCHOR` can name it in a held-by link. You rarely run these by hand: the start hook runs `open` and `observe`, and a workspace's reap command runs `close`. All three print `key=value` lines; a refusal prints `{"error", "command"}` and exits 2, any other failure exits 3, and a failed `open` prints no `anchor=` line. Ids and keys must match `^[A-Za-z0-9_-]{1,128}$`.
 
-- **open** creates or continues `anchor-<id>` under its lock and never reads `KOTO_ANCHOR`. Prints `anchor=<name>`, `opened=new|continued|reopened|successor`, `observed=yes|no`, and after a `clear` that found the anchor its process ran before, `previous=<name>` and `inherit_until=<rfc3339>`. An anchor that reads closed (or was migrated) gets a successor `anchor-<id>-s2`, `-s3`, ... linked to it. A `resume` with no anchor of its own links to a predecessor found through the transcript path, without copying its marker. `--dispatched-by` becomes a link only when an anchor is created; `--observed-key` becomes the marker only when there is none. Each call appends an `anchor_started` event holding digests of the process token and transcript path, never the values.
+- **open** creates or continues `anchor-<id>` under its lock and never reads `KOTO_ANCHOR`. Prints `anchor=<name>`, `opened=new|continued|reopened|successor`, `observed=yes|no`, then `origin=dispatched|none|unrecorded` when the open created the anchor (the origin its `anchor_started` records, which `koto session origin` reads; the `--dispatched-by` value never refuses the open, and a malformed one, a self-naming one or a failed link write records `unrecorded`), and after a `clear` that found the anchor its process ran before, `previous=<name>` and `inherit_until=<rfc3339>`. An anchor that reads closed (or was migrated) gets a successor `anchor-<id>-s2`, `-s3`, ... linked to it. A `resume` with no anchor of its own links to a predecessor found through the transcript path, without copying its marker. `--dispatched-by` becomes a link only when an anchor is created; `--observed-key` becomes the marker only when there is none. Each call appends an `anchor_started` event holding digests of the process token and transcript path, never the values.
 - **observe** writes the observed marker into the named anchor only: `--key` the key given, `--inherit` the marker of the predecessor its `anchor_started` recorded. A marker already there is kept. Prints `anchor=<name>` and `observed=yes|no`.
 - **close** records `anchor-<id>`, and the anchors that succeeded it after a `/clear` or a resume, each only when its marker equals the key, in a separate close session `<anchor>-closed` (`kind: "anchor-close"`, already finished). It never writes an anchor. Prints `closed=<n>`; a repeat, or nothing matching, prints `closed=0` and exits 0. A child anchor dispatched by the session, or a successor opened because its predecessor was already closed, stays open.
 
@@ -990,7 +991,7 @@ KOTO_ANCHOR=anchor-demo-1 koto init demo-run --template ./demo.md
 koto session anchor close --key=demo-key --harness-session=demo-1    # closed=1
 ```
 
-**The plugin's start hook.** koto-skills registers `hooks/session-start.sh` for every start, resume, compaction and `/clear`. It opens `anchor-<session id>`, linked to the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`), with niwa's `NIWA_REAP_KEY` as the marker only when no `KOTO_ANCHOR` was inherited. It writes `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'` (both its own anchor), `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY` into its `# >>> koto-skills` block of `CLAUDE_ENV_FILE`, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the open fails. Without a usable env file it returns the `KOTO_ANCHOR` export line as `additionalContext`. A detached watcher picks up a reap key niwa writes later, or a `/clear` predecessor's marker. So in a session with the plugin `KOTO_ANCHOR` is already set: don't run the anchor verbs, and ask `koto session hierarchy` why a session is kept.
+**The plugin's start hook.** koto-skills registers `hooks/session-start.sh` for every start, resume, compaction and `/clear`. It opens `anchor-<session id>`, passing the dispatcher it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`) whatever it holds, cut to 256 bytes, so koto records the origin, with niwa's `NIWA_REAP_KEY` as the marker only when no `KOTO_ANCHOR` was inherited. It writes `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'` (both its own anchor), `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY` into its `# >>> koto-skills` block of `CLAUDE_ENV_FILE`. When the open is cut off after 5 seconds or fails without a refusal, both name `anchor-<session id>`, the family's first name, so a slow store doesn't erase the dispatcher; only a refused open writes `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR`. Without a usable env file it returns the `KOTO_ANCHOR` export line as `additionalContext`, only for an anchor the open printed. A detached watcher picks up a reap key niwa writes later, or a `/clear` predecessor's marker. So in a session with the plugin `KOTO_ANCHOR` is already set: don't run the anchor verbs, and ask `koto session hierarchy` why a session is kept.
 
 ---
 
@@ -1020,6 +1021,28 @@ Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: i
 | `relation_unreadable` | `[{holder, reason}]` for a relation that couldn't be judged (`unparseable`, `too_large`, `mismatch`, `cycle`, `unlistable`), which keeps the session |
 
 A stale anchor is a report and nothing more: koto never closes an observed anchor on its own. When the agent session behind it is truly gone, run the printed `close_command`. A malformed retention setting, or a name with no session, exits 2; a sessions directory that can't be listed exits 3.
+
+---
+
+## koto session origin
+
+```
+koto session origin <name>
+```
+
+Says which session dispatched `<name>`, a workflow session or an anchor. Read-only: it reads through the configured store backend, as `koto status` does, and writes nothing, never pushing to the cloud bucket. You rarely need it while driving a workflow; it answers "who started this?" afterwards.
+
+```json
+{"session": "work-on-12", "via": "anchor-1f3c",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-9a07", "dispatcher_kind": "anchor"}}
+```
+
+`origin.state` is `dispatched` (with `dispatcher` and `dispatcher_kind`), `none` (nothing named a dispatcher) or `unrecorded` (with `named`, a bounded preview of what was named, empty when nothing was, and `reason`, a fixed text). All three exit 0; a malformed name or a name with no session exits 2, and any other failed read exits 3.
+
+- **An anchor** is read directly (`via` is the anchor): the `origin` its creating `anchor_started` recorded, together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. A named dispatcher with no link reads `unrecorded` (`link not found`, or the event's reason). An anchor created before koto recorded origin reads `dispatched` when its creating event names a dispatcher and the link to it is there, else `unrecorded` (`link not found`, or `recorded before koto tracked origin` when it names none).
+- **A workflow session** reports its own dispatched-by link first (`dispatcher_kind: "workflow"`, `via: null`), else the origin of the anchor its first held-by link names (`via` names it; `unrecorded` with `anchor not found` when that anchor is gone or the link names a session that isn't an anchor), else `none`.
+
+`dispatched` is what the starting environment claimed, not an authenticated fact.
 
 ---
 

@@ -14,6 +14,7 @@ pub mod links;
 pub mod local;
 pub mod name_index;
 pub mod needed;
+pub mod origin;
 pub mod pin;
 pub mod read_spool;
 pub mod rebind_fence;
