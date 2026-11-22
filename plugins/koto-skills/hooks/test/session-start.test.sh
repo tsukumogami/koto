@@ -493,6 +493,78 @@ test_no_koto() {
   check "the stalled koto is gone" sh -c '! kill -0 "$(cat "$1")" 2>/dev/null' sh "$T/hang.pid"
 }
 
+# ===== A slow store =====
+
+# The hook's KOTO_LIMIT, as its source sets it.
+hook_limit() {
+  sed -n 's/^KOTO_LIMIT=\([0-9][0-9]*\)$/\1/p' "$HOOK"
+}
+
+# slow_koto: puts in $T/slow a koto whose `session anchor open` sleeps five
+# seconds past the hook's limit, as an open against a slow store does, and
+# which runs the real koto for every other call.
+slow_koto() {
+  mkdir -p "$T/slow"
+  printf '#!/bin/sh\nif [ "$1 $2 $3" = "session anchor open" ]; then\n  echo $$ >>"%s/slow.pids"\n  exec sleep %s\nfi\nexec %s "$@"\n' \
+    "$T" "$(($(hook_limit) + 5))" "$(command -v koto)" >"$T/slow/koto"
+  chmod +x "$T/slow/koto"
+}
+
+test_slow_open() {
+  local limit e p ms pid
+  limit="$(hook_limit)"
+  check "the hook's limit is still five seconds (${limit:-none})" [ "$limit" = 5 ]
+  [ -n "$limit" ] || limit=5
+  slow_koto
+
+  e="$(envfile W1)"
+  p="$(payload W1 startup)"
+  PATH="$T/slow:$PATH" hook "$p" "$e"
+  ms="$(cat "$p.ms")"
+  # The watchdog checks once a second, so it can outlast the limit by that.
+  check "a slow open returns within the limit (${ms} ms)" [ "$ms" -lt $(((limit + 2) * 1000)) ]
+  check "exit 0 when the open is slow" [ "$(rc_of "$p")" = 0 ]
+  check "nothing on stderr when the open is slow" [ ! -s "$p.err" ]
+  check "nothing on stdout with an env file" [ ! -s "$p.out" ]
+  check "the env file exports the derived name as KOTO_ANCHOR" [ "$(anchor_in "$e")" = anchor-W1 ]
+  check "the env file exports the derived name as KOTO_DISPATCHER_ANCHOR" \
+    grep -qx "export KOTO_DISPATCHER_ANCHOR='anchor-W1'" "$e"
+  check "a slow open writes no unset line" sh -c '! grep -q "^unset KOTO_ANCHOR" "$1"' sh "$e"
+  for pid in $(cat "$T/slow.pids" 2>/dev/null); do
+    check "the slow open is gone" sh -c '! kill -0 "$1" 2>/dev/null' sh "$pid"
+  done
+  check "no watcher runs for an anchor the open never printed" no_watchers_for anchor-W1
+
+  # With no env file, the fallback names only an anchor the open printed.
+  p="$(payload W2 startup)"
+  PATH="$T/slow:$PATH" hook "$p" -
+  check "with no env file a slow open writes no additionalContext" [ ! -s "$p.out" ]
+
+  # A worker started from W1's shell passes the derived name to its open.
+  local ew origin
+  ew="$(envfile W3)"
+  p="$(payload W3 startup)"
+  (. "$e" && hook "$p" "$ew")
+  check "the worker's shells name its own anchor" [ "$(anchor_in "$ew")" = anchor-W3 ]
+  check "the worker records the derived name as its dispatcher" \
+    has_key anchor-W3 koto/links/dispatched-by/anchor-W1
+  origin="$(koto session origin anchor-W3)"
+  check "koto session origin reports the derived dispatcher ($origin)" \
+    sh -c 'printf "%s" "$1" | jq -e ".origin.state == \"dispatched\" and .origin.dispatcher == \"anchor-W1\"" >/dev/null' sh "$origin"
+
+  # A hostile id gives no derived name, however long the open would take.
+  local id f
+  for id in "a'b" 'a"b' '$(touch pwned)' "$(printf 'a\nb')"; do
+    f="$(envfile "$id")"
+    p="$(payload "$id" startup)"
+    PATH="$T/slow:$PATH" hook "$p" "$f"
+    check "a hostile id exits 0 under a slow store" [ "$(rc_of "$p")" = 0 ]
+    check "a hostile id writes nothing to stdout" [ ! -s "$p.out" ]
+    check "a hostile id writes no export line" sh -c '! grep -q "^export " "$1"' sh "$f"
+  done
+  check "nothing in a hostile id ran" [ ! -e "$T/work/pwned" ]
+}
+
 # ===== The observed marker =====
 
 test_late_marker() {
@@ -834,7 +906,7 @@ test_timing() {
 }
 
 ALL="test_block test_env_file_cases test_one_anchor_per_session test_resume_cases
-test_no_koto test_late_marker test_inherited_key test_first_dispatch
+test_no_koto test_slow_open test_late_marker test_inherited_key test_first_dispatch
 test_idle_close test_bare_shell test_no_niwa_hierarchy test_injection test_authority test_timing"
 
 selected="${*:-$ALL}"
