@@ -21,6 +21,11 @@
 //! koto named the prefix whose candidates hold no copy, two, or one that
 //! is another session's.
 //!
+//! A read the bucket accepts but never answers is cut at a deadline: a
+//! missing name's lookup at its own, and a session's probe listing, a
+//! candidate listing and a HEAD of its state object at the probe's
+//! (koto#605).
+//!
 //! Every test drives the koto binary against the in-process endpoint in
 //! `tests/support/fake_s3.rs`; no real bucket is involved.
 
@@ -1634,8 +1639,85 @@ fn a_stalled_probe_of_a_session_with_a_local_copy_is_cut_at_the_probe_deadline()
     );
     assert_eq!(out.code, Some(0), "{}", out.describe());
     assert_eq!(out.json()["current_state"], "wait", "{}", out.describe());
-    assert!(out.stderr.contains("warning: cloud sync"), "{}", out.describe());
-    assert!(out.stderr.contains("no answer within"), "{}", out.describe());
+    assert!(
+        out.stderr.contains("warning: cloud sync"),
+        "{}",
+        out.describe()
+    );
+    assert!(
+        out.stderr.contains("no answer within"),
+        "{}",
+        out.describe()
+    );
+}
+
+/// A candidate listing of a session that records no prefix, which the
+/// bucket accepts but never answers, is cut at the probe's deadline
+/// (koto#605): the read from another directory refuses with
+/// `candidate_unreadable` within the bound, printing no value, and the
+/// message says the bucket gave no answer in time.
+#[test]
+fn a_stalled_candidate_listing_refuses_a_read_from_another_directory_within_the_bound() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    let listing = format!("{}/{WF}/", prefix_of(&a));
+
+    s3.stall("LIST", &listing, std::time::Duration::from_secs(300));
+    let mut cmd = h.cmd(&b, &["context", "get", WF, "k.md"]);
+    cmd.timeout(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let out = h.run(cmd);
+    let took = started.elapsed();
+    assert!(
+        took < PROBE_BOUND,
+        "a stalled candidate listing of {listing:?} held context get for {took:?}, \
+         past the {PROBE_BOUND:?} bound: {}",
+        out.describe()
+    );
+    assert_unlocated(&out, "context get", "candidate_unreadable");
+    assert!(!out.stdout.contains("value"), "{}", out.describe());
+    let message = out.json()["error"].as_str().unwrap().to_string();
+    assert!(message.contains("no answer within"), "{message}");
+}
+
+/// A HEAD of a session's state object that the bucket accepts but never
+/// answers is cut at the probe's deadline (koto#605): `koto init`'s check
+/// that the name is free reads it as absent within the bound, and the
+/// session is created.
+#[test]
+fn a_stalled_state_head_lets_init_go_on_within_the_bound() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let dir = h.dir("ws");
+    std::fs::write(dir.join("flow.md"), TEMPLATE).unwrap();
+    let key = state_key(&dir);
+
+    s3.stall("HEAD", &key, std::time::Duration::from_secs(300));
+    let mut cmd = h.cmd(&dir, &["init", WF, "--template", "flow.md"]);
+    cmd.timeout(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let out = h.run(cmd);
+    let took = started.elapsed();
+    assert!(
+        took < PROBE_BOUND,
+        "a stalled HEAD of {key:?} held koto init for {took:?}, past the \
+         {PROBE_BOUND:?} bound: {}",
+        out.describe()
+    );
+    assert_eq!(out.code, Some(0), "{}", out.describe());
+    assert!(
+        s3.requests()
+            .iter()
+            .any(|r| r.method == "HEAD" && r.key == key),
+        "init never asked for {key:?}"
+    );
+    assert!(state_path(&h).exists(), "no local copy: {}", out.describe());
 }
 
 /// A host that can't reach the bucket at all can't tell a never-used name
