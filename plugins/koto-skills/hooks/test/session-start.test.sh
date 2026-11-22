@@ -467,7 +467,8 @@ test_no_koto() {
   check "the guarded close form exits 0 with no koto" \
     env PATH=/usr/bin:/bin NIWA_REAP_KEY=k NIWA_SESSION_ID=K1 sh -c "$GUARDED_CLOSE"
 
-  # A koto that fails every call.
+  # A koto that fails every call, without a refusal: the shells get the
+  # derived name, never the dispatcher's.
   mkdir -p "$T/stub"
   printf '#!/bin/sh\nexit 1\n' >"$T/stub/koto"
   chmod +x "$T/stub/koto"
@@ -475,8 +476,23 @@ test_no_koto() {
   p="$(payload K2 startup)"
   PATH="$T/stub:$PATH" KOTO_ANCHOR=anchor-dispatcher KOTO_DISPATCHER_ANCHOR=anchor-dispatcher hook "$p" "$e"
   check "exit 0 when koto fails" [ "$(rc_of "$p")" = 0 ]
-  check "a failed open unsets both variables" grep -qx 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR' "$e"
+  check "a failed open exports the derived name" [ "$(anchor_in "$e")" = anchor-K2 ]
+  check "a failed open exports it as the dispatcher" grep -qx "export KOTO_DISPATCHER_ANCHOR='anchor-K2'" "$e"
   check "a failed open never leaves the dispatcher's anchor" sh -c '! grep -q anchor-dispatcher "$1"' sh "$e"
+
+  # A koto that refuses every call: the shells get no name at all.
+  mkdir -p "$T/refuse"
+  printf '#!/bin/sh\necho x >>"%s/refuse.calls"\nexit 2\n' "$T" >"$T/refuse/koto"
+  chmod +x "$T/refuse/koto"
+  e="$(envfile K4)"
+  p="$(payload K4 startup)"
+  PATH="$T/refuse:$PATH" KOTO_ANCHOR=anchor-dispatcher KOTO_DISPATCHER_ANCHOR=anchor-dispatcher hook "$p" "$e"
+  check "exit 0 when koto refuses" [ "$(rc_of "$p")" = 0 ]
+  check "nothing on stderr when koto refuses" [ ! -s "$p.err" ]
+  check "a refused open unsets both variables" grep -qx 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR' "$e"
+  check "a refused open exports nothing" sh -c '! grep -q "^export KOTO" "$1"' sh "$e"
+  check "a refusal with an anchor-name dispatcher is retried only without the authority flag" \
+    [ "$(wc -l <"$T/refuse.calls" | tr -d ' ')" = 2 ]
 
   # A koto that stalls is killed after the hook's limit.
   mkdir -p "$T/hang"
@@ -489,7 +505,8 @@ test_no_koto() {
   ms="$(cat "$p.ms")"
   check "a stalled koto is cut off within the limit (${ms} ms)" [ "$ms" -lt 10000 ]
   check "exit 0 when koto stalls" [ "$(rc_of "$p")" = 0 ]
-  check "a stalled open unsets both variables" grep -qx 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR' "$e"
+  check "a stalled open exports the derived name" [ "$(anchor_in "$e")" = anchor-K3 ]
+  check "a stalled open never leaves the dispatcher's anchor" sh -c '! grep -q anchor-dispatcher "$1"' sh "$e"
   check "the stalled koto is gone" sh -c '! kill -0 "$(cat "$1")" 2>/dev/null' sh "$T/hang.pid"
 }
 
@@ -530,9 +547,10 @@ test_slow_open() {
   check "the env file exports the derived name as KOTO_DISPATCHER_ANCHOR" \
     grep -qx "export KOTO_DISPATCHER_ANCHOR='anchor-W1'" "$e"
   check "a slow open writes no unset line" sh -c '! grep -q "^unset KOTO_ANCHOR" "$1"' sh "$e"
-  for pid in $(cat "$T/slow.pids" 2>/dev/null); do
+  check "the slow open ran" [ -s "$T/slow.pids" ]
+  while IFS= read -r pid; do
     check "the slow open is gone" sh -c '! kill -0 "$1" 2>/dev/null' sh "$pid"
-  done
+  done <"$T/slow.pids"
   check "no watcher runs for an anchor the open never printed" no_watchers_for anchor-W1
 
   # With no env file, the fallback names only an anchor the open printed.
@@ -563,6 +581,110 @@ test_slow_open() {
     check "a hostile id writes no export line" sh -c '! grep -q "^export " "$1"' sh "$f"
   done
   check "nothing in a hostile id ran" [ ! -e "$T/work/pwned" ]
+}
+
+# ===== The dispatcher value =====
+
+# record_koto: puts in $T/rec a koto that appends each `session anchor open`
+# call's arguments to $T/open.calls, one per line with a `--` line after the
+# call, and runs the real koto.
+record_koto() {
+  mkdir -p "$T/rec"
+  cat >"$T/rec/koto" <<EOF
+#!/bin/sh
+if [ "\$1 \$2 \$3" = "session anchor open" ]; then
+  for a in "\$@"; do printf '%s\n' "\$a"; done >>"$T/open.calls"
+  echo -- >>"$T/open.calls"
+fi
+exec "$(command -v koto)" "\$@"
+EOF
+  chmod +x "$T/rec/koto"
+}
+
+# old_koto: puts in $T/old a koto from before the origin record and before
+# --record-authority: it refuses that flag, and refuses the whole open over
+# a dispatcher that isn't an anchor name. It counts its calls in
+# $T/old.calls.
+old_koto() {
+  mkdir -p "$T/old"
+  cat >"$T/old/koto" <<EOF
+#!/bin/sh
+echo call >>"$T/old.calls"
+for a in "\$@"; do
+  case "\$a" in
+    --record-authority) exit 2 ;;
+    --dispatched-by=*)
+      printf '%s\n' "\${a#--dispatched-by=}" | grep -Eqx 'anchor-[A-Za-z0-9_-]+(-s[0-9]+)?' || exit 2 ;;
+  esac
+done
+exec "$(command -v koto)" "\$@"
+EOF
+  chmod +x "$T/old/koto"
+}
+
+# The value the recorded opens passed as --dispatched-by.
+passed_dispatcher() {
+  sed -n 's/^--dispatched-by=//p' "$T/open.calls"
+}
+
+opens_recorded() {
+  grep -cx -- -- "$T/open.calls"
+}
+
+test_dispatcher_value() {
+  local e p v origin
+  record_koto
+
+  # A value that isn't an anchor name reaches koto, which records it.
+  e="$(envfile D1)"
+  p="$(payload D1 startup)"
+  PATH="$T/rec:$PATH" KOTO_DISPATCHER_ANCHOR='not an anchor!' hook "$p" "$e"
+  check "exit 0 with a malformed dispatcher" [ "$(rc_of "$p")" = 0 ]
+  check "nothing on stderr with a malformed dispatcher" [ ! -s "$p.err" ]
+  check "the anchor opens with a malformed dispatcher" [ "$(anchor_in "$e")" = anchor-D1 ]
+  check "the value is passed in --flag=value form" [ "$(passed_dispatcher)" = 'not an anchor!' ]
+  origin="$(koto session origin anchor-D1)"
+  check "koto records it as malformed ($origin)" \
+    sh -c 'printf "%s" "$1" | jq -e ".origin.state == \"unrecorded\" and .origin.reason == \"malformed: not an anchor name\"" >/dev/null' sh "$origin"
+
+  # A value over 256 bytes is cut to its first 256.
+  : >"$T/open.calls"
+  v="anchor-$(printf 'a%.0s' $(seq 293))"
+  e="$(envfile D2)"
+  p="$(payload D2 startup)"
+  PATH="$T/rec:$PATH" KOTO_DISPATCHER_ANCHOR="$v" hook "$p" "$e"
+  check "a 300-byte value is cut to its first 256 bytes" [ "$(passed_dispatcher)" = "${v:0:256}" ]
+  check "the anchor opens with a long dispatcher" [ "$(anchor_in "$e")" = anchor-D2 ]
+
+  # A cut that would split a character drops the whole character, so koto's
+  # parser gets valid UTF-8 and the open runs once.
+  : >"$T/open.calls"
+  v="anchor-$(printf 'a%.0s' $(seq 248))"
+  e="$(envfile D3)"
+  p="$(payload D3 startup)"
+  PATH="$T/rec:$PATH" KOTO_DISPATCHER_ANCHOR="$v"$'\xc3\xa9' hook "$p" "$e"
+  check "a cut never splits a character" [ "$(passed_dispatcher)" = "$v" ]
+  check "the open runs once" [ "$(opens_recorded)" = 1 ]
+  check "the anchor opens when the cut drops a character" [ "$(anchor_in "$e")" = anchor-D3 ]
+
+  # KOTO_ANCHOR is the dispatcher when no KOTO_DISPATCHER_ANCHOR is set.
+  : >"$T/open.calls"
+  e="$(envfile D5)"
+  p="$(payload D5 startup)"
+  PATH="$T/rec:$PATH" KOTO_ANCHOR='also not an anchor' hook "$p" "$e"
+  check "KOTO_ANCHOR is passed when it is the only one set" [ "$(passed_dispatcher)" = 'also not an anchor' ]
+
+  # An older koto refuses the value: the hook opens again without it.
+  old_koto
+  e="$(envfile D4)"
+  p="$(payload D4 startup)"
+  PATH="$T/old:$PATH" KOTO_DISPATCHER_ANCHOR='not an anchor!' hook "$p" "$e"
+  check "exit 0 when an older koto refuses the value" [ "$(rc_of "$p")" = 0 ]
+  check "nothing on stderr when an older koto refuses the value" [ ! -s "$p.err" ]
+  check "an older koto still opens the anchor" [ "$(anchor_in "$e")" = anchor-D4 ]
+  check "without the value it refused" \
+    sh -c '[ -z "$(koto context list anchor-D4 --prefix koto/links/dispatched-by/ | jq -r ".[]")" ]'
+  check "after one refusal per flag combination" [ "$(wc -l <"$T/old.calls" | tr -d ' ')" = 4 ]
 }
 
 # ===== The observed marker =====
@@ -906,7 +1028,7 @@ test_timing() {
 }
 
 ALL="test_block test_env_file_cases test_one_anchor_per_session test_resume_cases
-test_no_koto test_slow_open test_late_marker test_inherited_key test_first_dispatch
+test_no_koto test_slow_open test_dispatcher_value test_late_marker test_inherited_key test_first_dispatch
 test_idle_close test_bare_shell test_no_niwa_hierarchy test_injection test_authority test_timing"
 
 selected="${*:-$ALL}"
