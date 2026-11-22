@@ -22,6 +22,8 @@ pub mod overrides;
 pub mod request;
 pub mod retry;
 pub mod review;
+#[cfg(unix)]
+pub mod run_action;
 pub mod session;
 pub mod session_anchor;
 pub mod session_index;
@@ -117,6 +119,11 @@ pub struct App {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// The runner of a background action. Only a tick starts it
+    /// (DESIGN-host-resource-pools.md, "The runner").
+    #[command(name = "__run-action", hide = true)]
+    RunAction { session: String, run_id: String },
+
     /// Print version information
     Version {
         /// Output as JSON
@@ -2067,6 +2074,15 @@ pub fn run(app: App) -> Result<()> {
         return workspace_read::run(workspace, app.command);
     }
     match app.command {
+        Command::RunAction { session, run_id } => {
+            #[cfg(unix)]
+            std::process::exit(run_action::run(&session, &run_id));
+            #[cfg(not(unix))]
+            {
+                let _ = (session, run_id);
+                std::process::exit(2);
+            }
+        }
         Command::Version { json } => {
             let info = buildinfo::build_info();
             if json {
@@ -5795,6 +5811,26 @@ fn handle_next(
         let json = serde_json::json!({"error": err});
         exit_with_error_code(json, err.code.exit_code());
     }
+    // A background action's command carries `KOTO_BACKGROUND_OF` instead of
+    // the tick marker (DESIGN-host-resource-pools.md, "Nesting"): it may tick
+    // another session, but not the one whose run it is, which would advance
+    // the session while the run's result is still to be delivered.
+    #[cfg(unix)]
+    if std::env::var(crate::engine::background::BACKGROUND_OF_ENV).as_deref() == Ok(name.as_str()) {
+        let err = crate::cli::next_types::NextError {
+            code: crate::cli::next_types::NextErrorCode::NestedInvocation,
+            message: format!(
+                "koto next cannot run on session '{name}' from inside its own background action: \
+                 this process inherited {}={name}. The tick after the action ends delivers its \
+                 result and advances the session; remove the `koto next {name}` call from the \
+                 command.",
+                crate::engine::background::BACKGROUND_OF_ENV
+            ),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
+    }
     reentrancy::mark_tick(&name);
 
     // An anchor or an anchor's close session is koto's own record of an
@@ -7633,6 +7669,68 @@ fn handle_next(
             }
         };
 
+        // A background action (DESIGN-host-resource-pools.md Decision 2)
+        // doesn't run here: a detached runner runs it, and this tick reports
+        // the run as in flight, or starts one, or reads one that ended. Its
+        // pool slot is taken inside, and only when a run starts, so a tick
+        // that finds its run still going touches no pool. A run that ended
+        // comes back as the command's output and goes through the same
+        // classification below as an ordinary action's; the events it
+        // carries (`background_finished`, `pool_released`) land first.
+        let workspace_name = || {
+            execution_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        #[cfg(unix)]
+        let mut background_events: Vec<EventPayload> = Vec::new();
+        #[cfg(unix)]
+        let background_output = if action.background {
+            // The log as it is now: a state entered earlier in this tick has
+            // no run yet, and this read can't mistake an older visit's for it.
+            let log = backend
+                .read_events(&name)
+                .map(|(_, events)| events)
+                .unwrap_or_else(|_| current_events.clone());
+            let pool = match (&action.pool, crate::koto_home::koto_home()) {
+                (Some(pool), Some(koto_root)) => Some((
+                    pool.as_str(),
+                    crate::pool::guard::Requester {
+                        koto_root,
+                        session: name.clone(),
+                        workspace: workspace_name(),
+                        state: state_name.to_string(),
+                    },
+                )),
+                _ => None,
+            };
+            let session_dir = backend.session_dir(&name);
+            let step = crate::engine::background::tick(crate::engine::background::TickRequest {
+                events: &log,
+                session_dir: &session_dir,
+                session: &name,
+                state: state_name,
+                command: &command,
+                working_dir: &wd,
+                timeout_secs: action.timeout_secs.unwrap_or(0),
+                env: tick_gates.command_env,
+                pool,
+            });
+            match step {
+                crate::engine::background::TickStep::Stop(result) => return result,
+                crate::engine::background::TickStep::Finished { output, events } => {
+                    background_events = events;
+                    Some(output)
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let background_output: Option<crate::action::CommandOutput> = None;
+        let is_background = background_output.is_some();
+
         // The pool guard (DESIGN-host-resource-pools.md Decision 3): before
         // the command and before any gate, take a slot of the action's host
         // pool, wait for one, or stop queued. A pool the user config doesn't
@@ -7642,14 +7740,12 @@ fn handle_next(
         // descriptor is inherited by the command, so anything the command
         // leaves running keeps the slot held too (PRD R10).
         let _pool_slot = match (&action.pool, crate::koto_home::koto_home()) {
+            _ if is_background => None,
             (Some(pool), Some(koto_root)) => {
                 let requester = crate::pool::guard::Requester {
                     koto_root,
                     session: name.clone(),
-                    workspace: execution_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
+                    workspace: workspace_name(),
                     state: state_name.to_string(),
                 };
                 let outcome = crate::pool::guard::acquire(pool, &requester);
@@ -7675,7 +7771,9 @@ fn handle_next(
         // Execute: polling or one-shot. The run time covers the whole
         // polling loop for a polling action, as its timeout does.
         let started = std::time::Instant::now();
-        let output = if let Some(polling) = &action.polling {
+        let output = if let Some(output) = background_output {
+            output
+        } else if let Some(polling) = &action.polling {
             // For polling, we need to evaluate gates inside the loop.
             // Look up the state's gates from the compiled template.
             let state_gates = match compiled
@@ -7765,7 +7863,12 @@ fn handle_next(
             output.stderr_truncated,
         );
 
-        let duration_ms = crate::action::elapsed_ms(started);
+        // A background run's time is the runner's measure of its command.
+        let duration_ms = if is_background {
+            output.duration_ms
+        } else {
+            crate::action::elapsed_ms(started)
+        };
 
         // The advance loop appends `DefaultActionExecuted` from what this
         // returns, once it knows the findings, counts and capture result.
@@ -7780,8 +7883,8 @@ fn handle_next(
         // now stops as a failure whether or not the flag is set, and the
         // confirm stop is reached only on success
         // (DESIGN-koto-runs-commands.md Decision 3).
-        if let Some(failure_kind) = output.failure_kind {
-            return ActionResult::Failed {
+        let result = if let Some(failure_kind) = output.failure_kind {
+            ActionResult::Failed {
                 command,
                 failure_kind,
                 exit_code: output.exit_code,
@@ -7791,10 +7894,8 @@ fn handle_next(
                 check,
                 duration_ms,
                 spawned: true,
-            };
-        }
-
-        if action.requires_confirmation {
+            }
+        } else if action.requires_confirmation {
             ActionResult::RequiresConfirmation {
                 command,
                 exit_code: output.exit_code,
@@ -7814,7 +7915,15 @@ fn handle_next(
                 check,
                 duration_ms,
             }
+        };
+        #[cfg(unix)]
+        if !background_events.is_empty() {
+            return ActionResult::WithEvents {
+                events: background_events,
+                result: Box::new(result),
+            };
         }
+        result
     };
 
     // The decider port. Built only when the user is opted in, and that is
@@ -7989,10 +8098,12 @@ fn handle_next(
                     // action succeeded and whose gates then failed must not
                     // be prefixed with prose about a failure that did not
                     // happen.
-                    if blocking
-                        .iter()
-                        .any(|c| c.name == crate::template::types::ACTION_CONDITION_NAME)
-                    {
+                    // A background run still in flight is a wait, not a
+                    // failure, so it gets no fallback either.
+                    if blocking.iter().any(|c| {
+                        c.name == crate::template::types::ACTION_CONDITION_NAME
+                            && c.category != "temporal"
+                    }) {
                         action_fallback = final_template_state
                             .default_action
                             .as_ref()

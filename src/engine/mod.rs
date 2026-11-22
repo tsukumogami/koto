@@ -3,6 +3,8 @@
 pub mod advance;
 pub mod atomic_fs;
 pub mod audit;
+#[cfg(unix)]
+pub mod background;
 pub mod batch_validation;
 pub mod caps;
 #[cfg(unix)]

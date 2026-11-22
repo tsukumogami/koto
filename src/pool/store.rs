@@ -47,7 +47,7 @@ impl std::fmt::Display for DirUnavailable {
 /// Create `dir` with mode 0700 if it is missing, then refuse it unless it is
 /// a real directory (not a symlink), owned by this user and writable by
 /// nobody else.
-fn ensure_private_dir(dir: &Path) -> Result<(), DirUnavailable> {
+pub fn ensure_private_dir(dir: &Path) -> Result<(), DirUnavailable> {
     let unavailable = |reason: String| DirUnavailable {
         path: dir.to_path_buf(),
         reason,
@@ -90,7 +90,7 @@ pub fn pool_dir(root: &Path, name: &str) -> Result<PathBuf, DirUnavailable> {
 }
 
 /// Open (creating 0600) a file in a pool directory, refusing a symlink.
-fn open_file(path: &Path) -> std::io::Result<File> {
+pub fn open_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -102,7 +102,7 @@ fn open_file(path: &Path) -> std::io::Result<File> {
 }
 
 /// Try to `flock` `file` exclusively without waiting.
-fn try_flock(file: &File) -> bool {
+pub fn try_flock(file: &File) -> bool {
     // SAFETY: flock on a descriptor `file` owns for the call.
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
@@ -128,6 +128,12 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// The slot file's descriptor, for handing it to a background action's
+    /// runner by number.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
     /// Let processes koto spawns from now on inherit this slot's descriptor,
     /// so the slot stays held while the command, or anything it leaves
     /// running, is alive (PRD R10). Call it just before spawning the command
@@ -171,7 +177,7 @@ fn slot_files(dir: &Path) -> Vec<(usize, PathBuf)> {
 /// Whether the slot file at `path` is held by anyone, this process
 /// included: a non-blocking try on a fresh descriptor, released at once. A
 /// try that collides with another process's probe reads as held.
-fn probe_held(path: &Path) -> bool {
+pub fn probe_held(path: &Path) -> bool {
     match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)

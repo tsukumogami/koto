@@ -144,6 +144,13 @@ impl CommandEnv {
         self.inherit
     }
 
+    /// The variables set on every command, in order. A background action's
+    /// runner is handed these so its command gets the environment a tick's
+    /// command gets (DESIGN-host-resource-pools.md, "The runner").
+    pub fn vars(&self) -> &[(String, String)] {
+        &self.vars
+    }
+
     /// The value set for `name`, if this value sets one.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.vars

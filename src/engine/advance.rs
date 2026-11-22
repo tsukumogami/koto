@@ -157,7 +157,22 @@ pub enum ActionResult {
     /// The loop stops here before the state's gates, as for a failed
     /// action, and keeps the transitions the tick already made (PRD R17).
     /// Nothing ran, so nothing is appended and no attempt is counted.
+    ///
+    /// A background action whose run is still going stops here too, with a
+    /// temporal `__action__` condition (status `running`): its gates judge
+    /// work that hasn't finished.
     PoolBlocked(BTreeMap<String, StructuredGateResult>),
+    /// `result`, with `events` to append before the loop handles it.
+    ///
+    /// A background action's tick records what it did to the pool and the
+    /// run (`pool_acquired`, `background_started`, `background_finished`,
+    /// `pool_released`) in the session log; the closure can't append, so it
+    /// hands them here, and the loop appends them in order before it acts
+    /// on `result`, so they land before the action's own record.
+    WithEvents {
+        events: Vec<EventPayload>,
+        result: Box<ActionResult>,
+    },
 }
 
 /// Build the synthetic condition map a failed action stops on.
@@ -1450,7 +1465,17 @@ where
         // 5. Action execution (if state has default_action)
         if let Some(action) = &template_state.default_action {
             let has_evidence = !current_evidence.is_empty();
-            let result = execute_action(&state, action, has_evidence);
+            let mut result = execute_action(&state, action, has_evidence);
+            while let ActionResult::WithEvents {
+                events,
+                result: inner,
+            } = result
+            {
+                for event in &events {
+                    append_event(event).map_err(AdvanceError::PersistenceError)?;
+                }
+                result = *inner;
+            }
             match result {
                 ActionResult::Executed {
                     command,
@@ -1497,6 +1522,8 @@ where
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
                 }
+                // Unwrapped by the loop above.
+                ActionResult::WithEvents { .. } => unreachable!("WithEvents is unwrapped first"),
                 ActionResult::PoolBlocked(conditions) => {
                     // Queued for a slot, or the pool can't be used: stop at
                     // this state before its gates, which judge work the

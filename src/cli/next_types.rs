@@ -1458,6 +1458,27 @@ pub fn blocking_conditions_from_gates(
                 });
             }
             if name == ACTION_CONDITION_NAME {
+                // A background action whose run is in flight
+                // (DESIGN-host-resource-pools.md, "Reading a run") is a
+                // wait: its status (`running`, `orphaned`, `lost`) is the
+                // run's own word, carried in `output`.
+                if result.outcome == GateOutcome::Pending {
+                    return Some(BlockingCondition {
+                        name: name.clone(),
+                        condition_type: "action".to_string(),
+                        status: result
+                            .output
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or(status)
+                            .to_string(),
+                        category: "temporal".to_string(),
+                        agent_actionable: false,
+                        output: result.output.clone(),
+                        failure: None,
+                        poll: None,
+                    });
+                }
                 return Some(BlockingCondition {
                     name: name.clone(),
                     condition_type: "action".to_string(),

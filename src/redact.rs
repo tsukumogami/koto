@@ -334,6 +334,24 @@ impl Redactor {
         &self.sources
     }
 
+    /// Every searched spelling with its source, in the order [`Redactor::new`]
+    /// takes them. Passing these back to [`Redactor::new`] builds a redactor
+    /// that replaces at least what this one does: it is how a background
+    /// action's runner, a separate process, gets the tick's known set without
+    /// it being written anywhere.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.values
+            .iter()
+            .zip(&self.pattern_source)
+            .map(|(value, &source)| {
+                (
+                    self.sources[source].clone(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )
+            })
+            .collect()
+    }
+
     /// How many bytes a capture reader must keep for a `limit`-byte bound so
     /// that a value starting before `limit` is seen whole:
     /// `limit + max(L, 1) - 1`, where L is the longest searched spelling.
