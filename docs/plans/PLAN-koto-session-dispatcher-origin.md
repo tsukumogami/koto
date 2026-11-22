@@ -84,14 +84,16 @@ is its own group so the koto pull request does not wait on it.
 
 **Group**: core
 
-**Goal**: one read-only call reports any session's origin as JSON, for an anchor directly or for a workflow session through its own link or its opening anchor.
+**Goal**: one read-only call reports any session's origin as JSON, for an anchor directly or for a workflow session through its own link or its opening anchor, reading the `origin` field and `origin_unrecorded` event Issue 1 added to the anchor log.
 
 **Acceptance Criteria**:
 - [ ] `koto session origin <name>` prints `{"session", "via", "origin": {...}}` with `state` one of `dispatched`, `none`, `unrecorded`, plus `dispatcher` and `dispatcher_kind` (`anchor` or `workflow`) when dispatched and `named` and `reason` when unrecorded; it exits 0 for all three (AC6).
-- [ ] A workflow session with a dispatched-by link of its own reports it with `dispatcher_kind: workflow`; otherwise the verb follows the held-by link written when the session was opened; a held-by anchor that doesn't exist reports `unrecorded` with `anchor not found`; neither link reports `none`.
-- [ ] A creating event that names a dispatcher with no dispatched-by link beside it reports `unrecorded` (`link not found` unless an `origin_unrecorded` event gives the reason) (AC4, on the anchor and on a workflow session it holds).
+- [ ] The anchor's creating event is the first `anchor_started` in its log (opened `new`, `reopened` or `successor`); a `continued` event never supplies the origin, for the `origin` field and for the legacy read alike.
+- [ ] A workflow session with a dispatched-by link of its own reports it with `dispatcher_kind: workflow`; otherwise the verb follows the held-by link written when the session was opened; a held-by anchor that doesn't exist (removed after the link was written) reports `unrecorded` with `anchor not found`; neither link reports `none`.
+- [ ] With several links of one kind, the one with the earliest `at` wins (for held-by, the link written when the session was opened), and equal or unreadable `at` values fall back to the lowest peer name; a test holds a session with two held-by links and checks the earlier one is followed.
+- [ ] A creating event that names a dispatcher with no dispatched-by link to that name beside it reports `unrecorded` (`link not found` unless an `origin_unrecorded` event gives the reason) (AC4, on the anchor and on a workflow session it holds). A successor's dispatched-by link to its predecessor is not taken for the dispatcher's.
 - [ ] After an open whose link write failed with a store error carrying a marker string, the verb's output for that anchor reports `unrecorded` and contains no part of the marker.
-- [ ] An anchor with no `origin` field reports `dispatched` when its event names a dispatcher, else `unrecorded` with `recorded before koto tracked origin`.
+- [ ] An anchor with no `origin` field reports `dispatched` when its creating event names a dispatcher, else `unrecorded` with `recorded before koto tracked origin`.
 - [ ] The verb reads through the configured store backend, as `koto status` does, and writes nothing; a test runs it against a non-local backend double.
 - [ ] Its reference documents the `origin` field and says `dispatched` is an unauthenticated claim; the koto-user skill gains the verb and the open's `origin=` line; `cargo test --test doc_names` passes.
 
