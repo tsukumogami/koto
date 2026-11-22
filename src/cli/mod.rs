@@ -946,8 +946,9 @@ pub enum SessionCommand {
     /// link of its own comes first (`dispatcher_kind: workflow`, `via:
     /// null`); otherwise the anchor its first held-by link names is read
     /// (`via` names it). Reads through the configured store backend and
-    /// writes nothing. Exits 0 for every state, and 2 for a malformed name
-    /// or a name with no session.
+    /// writes nothing, to the bucket included. Exits 0 for every state, 2
+    /// for a malformed name or a name with no session, and 3 for any other
+    /// read that fails.
     Origin {
         /// The workflow session or anchor to report on
         name: String,

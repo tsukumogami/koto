@@ -1030,7 +1030,7 @@ A stale anchor is a report and nothing more: koto never closes an observed ancho
 koto session origin <name>
 ```
 
-Says which session dispatched `<name>`, a workflow session or an anchor. Read-only: it reads through the configured store backend, as `koto status` does, and writes nothing. You rarely need it while driving a workflow; it answers "who started this?" afterwards.
+Says which session dispatched `<name>`, a workflow session or an anchor. Read-only: it reads through the configured store backend, as `koto status` does, and writes nothing, never pushing to the cloud bucket. You rarely need it while driving a workflow; it answers "who started this?" afterwards.
 
 ```json
 {"session": "work-on-12", "via": "anchor-1f3c",
@@ -1040,7 +1040,7 @@ Says which session dispatched `<name>`, a workflow session or an anchor. Read-on
 `origin.state` is `dispatched` (with `dispatcher` and `dispatcher_kind`), `none` (nothing named a dispatcher) or `unrecorded` (with `named`, a bounded preview of what was named, empty when nothing was, and `reason`, a fixed text). All three exit 0; a malformed name or a name with no session exits 2, and any other failed read exits 3.
 
 - **An anchor** is read directly (`via` is the anchor): the `origin` its creating `anchor_started` recorded, together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. A named dispatcher with no link reads `unrecorded` (`link not found`, or the event's reason). An anchor created before koto recorded origin reads `dispatched` when its creating event names a dispatcher and the link to it is there, else `unrecorded` (`link not found`, or `recorded before koto tracked origin` when it names none).
-- **A workflow session** reports its own dispatched-by link first (`dispatcher_kind: "workflow"`, `via: null`), else the origin of the anchor its first held-by link names (`via` names it; `unrecorded` with `anchor not found` when that anchor is gone), else `none`.
+- **A workflow session** reports its own dispatched-by link first (`dispatcher_kind: "workflow"`, `via: null`), else the origin of the anchor its first held-by link names (`via` names it; `unrecorded` with `anchor not found` when that anchor is gone or the link names a session that isn't an anchor), else `none`.
 
 `dispatched` is what the starting environment claimed, not an authenticated fact.
 

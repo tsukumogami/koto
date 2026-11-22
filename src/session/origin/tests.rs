@@ -123,7 +123,7 @@ fn unrecorded(named: &str, reason: &str) -> Origin {
     Origin::unrecorded(named, reason)
 }
 
-fn report<S: SessionBackend + ContextStore>(store: &S, name: &str) -> OriginReport {
+fn report<S: OriginStore>(store: &S, name: &str) -> OriginReport {
     origin_of(store, name).unwrap()
 }
 
@@ -665,6 +665,8 @@ impl SessionBackend for LinkFails {
     }
 }
 
+impl OriginStore for LinkFails {}
+
 impl ContextStore for LinkFails {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.inner.add(session, key, content)
@@ -839,6 +841,22 @@ impl SessionBackend for Remote {
     }
 }
 
+impl Remote {
+    fn peek(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.keys
+            .get(&(session.to_string(), key.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no key {key}"))
+    }
+}
+
+/// The read the origin verb uses instead of `get`, which writes nothing.
+impl OriginStore for Remote {
+    fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.peek(session, key)
+    }
+}
+
 impl ContextStore for Remote {
     fn add(&self, session: &str, key: &str, _content: &[u8]) -> anyhow::Result<()> {
         Err(self.refuse(format!("add {session} {key}")))
@@ -852,13 +870,22 @@ impl ContextStore for Remote {
     ) -> anyhow::Result<()> {
         Err(self.refuse(format!("add {session} {key}")))
     }
+    /// Counted as a write: the cloud backend's `get` may push this host's
+    /// copy of the key to the bucket, so the origin read must never use it.
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        self.keys
-            .get(&(session.to_string(), key.to_string()))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no key {key}"))
+        self.writes
+            .lock()
+            .unwrap()
+            .push(format!("get (may push) {session} {key}"));
+        self.peek(session, key)
     }
+    /// Counted as a write too: a read that answered from it couldn't tell a
+    /// failed read from a missing key.
     fn ctx_exists(&self, session: &str, key: &str) -> bool {
+        self.writes
+            .lock()
+            .unwrap()
+            .push(format!("ctx_exists {session} {key}"));
         self.keys
             .contains_key(&(session.to_string(), key.to_string()))
     }
@@ -905,10 +932,18 @@ fn the_read_goes_through_the_configured_store_and_not_the_local_files() {
             }),
         ],
     );
+    // The event recording the failed link wins over a link written there
+    // later: the pair still reads unrecorded.
+    remote.key("anchor-r2", LinkKind::DispatchedBy, "anchor-coord");
     remote.session("w1", None, Vec::new());
     remote.key("w1", LinkKind::HeldBy, "anchor-r1");
     remote.session("w2", None, Vec::new());
     remote.key("w2", LinkKind::HeldBy, "anchor-r2");
+    // Two held-by links, so their bodies are read to choose: equal `at`
+    // values, so the lowest name wins.
+    remote.session("w5", None, Vec::new());
+    remote.key("w5", LinkKind::HeldBy, "anchor-r2");
+    remote.key("w5", LinkKind::HeldBy, "anchor-r1");
     remote.session("w3", None, Vec::new());
     remote.key("w3", LinkKind::DispatchedBy, "coordinator");
     remote.session("w4", None, Vec::new());
@@ -937,6 +972,14 @@ fn the_read_goes_through_the_configured_store_and_not_the_local_files() {
         report(&remote, "w4").origin,
         unrecorded("", REASON_ANCHOR_NOT_FOUND)
     );
-    assert!(remote.writes.lock().unwrap().is_empty());
+    let w5 = report(&remote, "w5");
+    assert_eq!(w5.via.as_deref(), Some("anchor-r1"));
+    assert_eq!(
+        w5.origin,
+        dispatched("anchor-coord", DispatcherKind::Anchor)
+    );
+    // Nothing went through `get`, which may push, or `ctx_exists`, which
+    // can't report a failed read; and nothing was written.
+    assert_eq!(*remote.writes.lock().unwrap(), Vec::<String>::new());
     assert!(!Path::new("/nonexistent/koto-origin-remote-double").exists());
 }

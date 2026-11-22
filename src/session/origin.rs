@@ -9,20 +9,47 @@
 //! one (written by `koto init --dispatched-by` or `koto session link`), and
 //! otherwise from the anchor that held it when it was opened.
 //!
-//! Everything here reads through the store's own methods ([`SessionBackend`]
-//! and [`ContextStore`]), so under the cloud backend it reads what `koto
-//! status` reads, and none of it writes: no event, no key, no link.
+//! Everything here reads through the store's own methods ([`OriginStore`]),
+//! so under the cloud backend it reads what `koto status` reads, and none of
+//! it writes to the store: no event, no key, no link, and no push to the
+//! bucket. A context key's content is read with [`OriginStore::read_key`],
+//! never `ContextStore::get`, because the cloud backend's `get` pushes this
+//! host's copy of a key the bucket lacks or holds an older copy of.
 
 use serde::Serialize;
 
 use crate::engine::types::{AnchorOrigin, AnchorStarted, EventPayload, SessionKind};
 use crate::session::anchor::named_preview;
 use crate::session::context::ContextStore;
-use crate::session::links::{self, Link, LinkKind};
-use crate::session::SessionBackend;
+use crate::session::links::{self, Link, LinkBody, LinkKind};
+use crate::session::local::LocalBackend;
+use crate::session::{Backend, SessionBackend};
+
+/// The store the origin read goes through: its session and context reads,
+/// plus a read of a key's content that never writes to the store.
+pub trait OriginStore: SessionBackend + ContextStore {
+    /// `key`'s content in `session`, read without writing anything to the
+    /// store. The default is `get`, which writes nothing in a store that
+    /// keeps no copy elsewhere.
+    fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.get(session, key)
+    }
+}
+
+impl OriginStore for LocalBackend {}
+
+impl OriginStore for Backend {
+    fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Backend::Local(b) => b.get(session, key),
+            Backend::Cloud(b) => b.get_without_push(session, key),
+        }
+    }
+}
 
 /// A held-by link names an anchor the store doesn't hold (it was removed
-/// after the link was written), or a session that isn't an anchor.
+/// after the link was written), or a session that isn't an anchor. Both say
+/// the same thing to a reader: there is no anchor to take the origin from.
 pub const REASON_ANCHOR_NOT_FOUND: &str = "anchor not found";
 /// The creating event names a dispatcher, the anchor holds no dispatched-by
 /// link to it, and no `origin_unrecorded` event says why.
@@ -72,15 +99,6 @@ impl Origin {
             reason: reason.into(),
         }
     }
-
-    /// The `state` value: `dispatched`, `none` or `unrecorded`.
-    pub fn state(&self) -> &'static str {
-        match self {
-            Origin::Dispatched { .. } => "dispatched",
-            Origin::NoDispatcher => "none",
-            Origin::Unrecorded { .. } => "unrecorded",
-        }
-    }
 }
 
 /// The answer `koto session origin` prints.
@@ -120,10 +138,7 @@ impl std::error::Error for OriginRefusal {}
 /// Refuses with an [`OriginRefusal`] a name that fails the session-name rule
 /// and a name with no session. A read that fails for any other reason (an
 /// unreachable store, a log that can't be parsed) is returned as is.
-pub fn origin_of<S>(store: &S, name: &str) -> anyhow::Result<OriginReport>
-where
-    S: SessionBackend + ContextStore,
-{
+pub fn origin_of<S: OriginStore>(store: &S, name: &str) -> anyhow::Result<OriginReport> {
     crate::discover::validate_workflow_name(name).map_err(OriginRefusal::InvalidName)?;
     if !store.exists(name) {
         return Err(OriginRefusal::NoSuchSession.into());
@@ -137,8 +152,8 @@ where
         });
     }
 
-    let held = links::read_links(store, name)?;
-    if let Some(link) = earliest(&held, LinkKind::DispatchedBy) {
+    let dispatched_by = links_of(store, name, LinkKind::DispatchedBy)?;
+    if let Some(link) = earliest(&dispatched_by) {
         return Ok(OriginReport {
             session: name.to_string(),
             via: None,
@@ -148,7 +163,8 @@ where
             },
         });
     }
-    let Some(link) = earliest(&held, LinkKind::HeldBy) else {
+    let held_by = links_of(store, name, LinkKind::HeldBy)?;
+    let Some(link) = earliest(&held_by) else {
         return Ok(OriginReport {
             session: name.to_string(),
             via: None,
@@ -174,12 +190,53 @@ where
     })
 }
 
-/// The `kind` link `links` holds that was written first: the earliest `at`,
-/// and among links whose `at` is equal or can't be read, the lowest peer
-/// name. A link with a readable `at` comes before one without, so a body
-/// damaged later can't displace the link written when the session opened.
-fn earliest(links: &[Link], kind: LinkKind) -> Option<&Link> {
-    links.iter().filter(|l| l.kind == kind).min_by(|a, b| {
+/// The peers `session`'s `kind` links name, in key order, from the store's
+/// listing alone. A key whose shape isn't `<kind>/<peer>` is skipped, as
+/// [`links::read_links`] skips it.
+fn peers_of<S: OriginStore>(
+    store: &S,
+    session: &str,
+    kind: LinkKind,
+) -> anyhow::Result<Vec<String>> {
+    let prefix = format!("{}{}/", links::LINKS_PREFIX, kind.as_str());
+    Ok(store
+        .list_keys(session, Some(&prefix))?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+        .filter(|peer| !peer.is_empty() && !peer.contains('/'))
+        .collect())
+}
+
+/// `session`'s `kind` links. Their bodies are read only when there is more
+/// than one, since only [`earliest`] needs them, and through
+/// [`OriginStore::read_key`], so the read writes nothing. A body that can't
+/// be read fails the read; one that is too large or isn't a link body is
+/// kept as a link with no body, as [`links::read_links`] keeps it.
+fn links_of<S: OriginStore>(store: &S, session: &str, kind: LinkKind) -> anyhow::Result<Vec<Link>> {
+    let peers = peers_of(store, session, kind)?;
+    let with_bodies = peers.len() > 1;
+    peers
+        .into_iter()
+        .map(|peer| {
+            let body = if with_bodies {
+                let bytes = store.read_key(session, &links::link_key(kind, &peer))?;
+                (bytes.len() <= links::MAX_LINK_BODY_BYTES)
+                    .then(|| serde_json::from_slice::<LinkBody>(&bytes).ok())
+                    .flatten()
+            } else {
+                None
+            };
+            Ok(Link { kind, peer, body })
+        })
+        .collect()
+}
+
+/// The link of `links` written first: the earliest `at`, and among links
+/// whose `at` is equal or can't be read, the lowest peer name. A link with a
+/// readable `at` comes before one without, so a body damaged later can't
+/// displace the link written when the session opened.
+fn earliest(links: &[Link]) -> Option<&Link> {
+    links.iter().min_by(|a, b| {
         let at = |l: &Link| {
             l.body
                 .as_ref()
@@ -203,16 +260,17 @@ fn earliest(links: &[Link], kind: LinkKind) -> Option<&Link> {
 /// and its `dispatched_by` names whatever a later start inherited.
 ///
 /// A creating event that names a dispatcher counts as `dispatched` only when
-/// the anchor holds a dispatched-by link to that same name. Checking that one
-/// link, and no other, is what keeps a successor's dispatched-by link to its
-/// predecessor from being read as its dispatcher's. Without the link the
-/// answer is `unrecorded`, with the reason an `origin_unrecorded` event gives
-/// when there is one, and [`REASON_LINK_NOT_FOUND`] otherwise: the event is
-/// appended after the link write fails, best effort, so it can be missing.
-fn anchor_origin<S>(store: &S, anchor: &str) -> anyhow::Result<Origin>
-where
-    S: SessionBackend + ContextStore,
-{
+/// no `origin_unrecorded` event follows it and the anchor holds a
+/// dispatched-by link to that same name. The event is checked first and wins
+/// over a link: it is the open's own record that its link write failed, and
+/// `AnchorStarted::origin` tells a reader to take the two together as
+/// unrecorded, so a link written there later by any other path doesn't undo
+/// it. Without the event, a missing link reads as [`REASON_LINK_NOT_FOUND`],
+/// since the event is appended best effort and can be missing too.
+/// Checking the one link to the named dispatcher, and no other, is what
+/// keeps a successor's dispatched-by link to its predecessor from being read
+/// as its dispatcher's.
+fn anchor_origin<S: OriginStore>(store: &S, anchor: &str) -> anyhow::Result<Origin> {
     let (_, events) = store.read_events(anchor)?;
     let mut creating: Option<&AnchorStarted> = None;
     let mut unrecorded = None;
@@ -246,8 +304,9 @@ where
     if let Some(o) = unrecorded {
         return Ok(Origin::unrecorded(o.named.clone(), o.reason.clone()));
     }
-    let linked = links::validate_peer(LinkKind::DispatchedBy, &named).is_ok()
-        && store.ctx_exists(anchor, &links::link_key(LinkKind::DispatchedBy, &named));
+    // From the listing, not `ctx_exists`, so a listing that fails is a
+    // failed read rather than a missing link.
+    let linked = peers_of(store, anchor, LinkKind::DispatchedBy)?.contains(&named);
     if linked {
         Ok(Origin::Dispatched {
             dispatcher: named,
