@@ -5343,12 +5343,6 @@ enum KeyPush {
     Failed(anyhow::Error),
 }
 
-/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
-/// session imported elsewhere neither reads nor writes its keys here: the
-/// methods that return a `Result` refuse with `SessionMigrated`, while
-/// `ctx_exists` answers false and `meta` none, having no room for a
-/// reason. The answer is cached per session, so a command that touches
-/// many keys pays for it once.
 impl CloudBackend {
     /// [`ContextStore::get`] that never writes to the bucket: a key whose
     /// copy here is newer than the bucket's, or that the bucket lacks, is
@@ -5436,6 +5430,12 @@ impl CloudBackend {
     }
 }
 
+/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
+/// session imported elsewhere neither reads nor writes its keys here: the
+/// methods that return a `Result` refuse with `SessionMigrated`, while
+/// `ctx_exists` answers false and `meta` none, having no room for a
+/// reason. The answer is cached per session, so a command that touches
+/// many keys pays for it once.
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.add_as(session, key, content, None)
@@ -5488,6 +5488,7 @@ impl ContextStore for CloudBackend {
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         self.get_keyed(session, key, true)
     }
+
     /// A migrated session holds no key here: `false`. Callers that must
     /// tell the operator why ask [`CloudBackend::check_not_migrated`].
     fn ctx_exists(&self, session: &str, key: &str) -> bool {

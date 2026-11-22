@@ -621,7 +621,12 @@ mod context_carry {
         let got: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap();
         assert_eq!(got["origin"]["state"], "dispatched", "{}", run.describe());
         assert_eq!(got["origin"]["dispatcher_kind"], "workflow");
-        assert_eq!(s3.object(&format!("{ctx}{key}")), None, "{}", run.describe());
+        assert_eq!(
+            s3.object(&format!("{ctx}{key}")),
+            None,
+            "{}",
+            run.describe()
+        );
         assert!(
             bucket_manifest(&s3, &ctx)["keys"][key].is_null(),
             "the verb must not push the link: {}",

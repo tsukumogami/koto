@@ -29,14 +29,18 @@ use crate::session::{Backend, SessionBackend};
 /// plus a read of a key's content that never writes to the store.
 pub trait OriginStore: SessionBackend + ContextStore {
     /// `key`'s content in `session`, read without writing anything to the
-    /// store. The default is `get`, which writes nothing in a store that
-    /// keeps no copy elsewhere.
+    /// store. It has no default on purpose: a store whose `get` can write
+    /// (the cloud backend's pushes) must say how it reads without writing,
+    /// so a new implementor can't inherit a read that writes.
+    fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>>;
+}
+
+/// A local store keeps no copy elsewhere, so its `get` writes nothing.
+impl OriginStore for LocalBackend {
     fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         self.get(session, key)
     }
 }
-
-impl OriginStore for LocalBackend {}
 
 impl OriginStore for Backend {
     fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {

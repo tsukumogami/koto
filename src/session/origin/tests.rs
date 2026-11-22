@@ -665,7 +665,11 @@ impl SessionBackend for LinkFails {
     }
 }
 
-impl OriginStore for LinkFails {}
+impl OriginStore for LinkFails {
+    fn read_key(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get(session, key)
+    }
+}
 
 impl ContextStore for LinkFails {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
@@ -753,7 +757,7 @@ fn after_a_failed_link_write_the_answer_is_unrecorded_and_carries_no_part_of_the
 struct Remote {
     sessions: HashMap<String, (StateFileHeader, Vec<Event>)>,
     keys: HashMap<(String, String), Vec<u8>>,
-    writes: Mutex<Vec<String>>,
+    forbidden_calls: Mutex<Vec<String>>,
 }
 
 impl Remote {
@@ -786,7 +790,7 @@ impl Remote {
     }
 
     fn refuse(&self, what: String) -> anyhow::Error {
-        self.writes.lock().unwrap().push(what.clone());
+        self.forbidden_calls.lock().unwrap().push(what.clone());
         anyhow::anyhow!("write refused: {what}")
     }
 }
@@ -873,7 +877,7 @@ impl ContextStore for Remote {
     /// Counted as a write: the cloud backend's `get` may push this host's
     /// copy of the key to the bucket, so the origin read must never use it.
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        self.writes
+        self.forbidden_calls
             .lock()
             .unwrap()
             .push(format!("get (may push) {session} {key}"));
@@ -882,7 +886,7 @@ impl ContextStore for Remote {
     /// Counted as a write too: a read that answered from it couldn't tell a
     /// failed read from a missing key.
     fn ctx_exists(&self, session: &str, key: &str) -> bool {
-        self.writes
+        self.forbidden_calls
             .lock()
             .unwrap()
             .push(format!("ctx_exists {session} {key}"));
@@ -980,6 +984,9 @@ fn the_read_goes_through_the_configured_store_and_not_the_local_files() {
     );
     // Nothing went through `get`, which may push, or `ctx_exists`, which
     // can't report a failed read; and nothing was written.
-    assert_eq!(*remote.writes.lock().unwrap(), Vec::<String>::new());
+    assert_eq!(
+        *remote.forbidden_calls.lock().unwrap(),
+        Vec::<String>::new()
+    );
     assert!(!Path::new("/nonexistent/koto-origin-remote-double").exists());
 }
