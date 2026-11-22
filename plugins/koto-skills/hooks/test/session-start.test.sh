@@ -667,6 +667,21 @@ test_dispatcher_value() {
   check "the open runs once" [ "$(opens_recorded)" = 1 ]
   check "the anchor opens when the cut drops a character" [ "$(anchor_in "$e")" = anchor-D3 ]
 
+  # The same for a three-byte and a four-byte character the cut would split,
+  # and a three-byte character that ends exactly at the bound is kept.
+  local want n=0
+  for want in "anchor-$(printf 'a%.0s' $(seq 247))|"$'\xe2\x82\xac' \
+    "anchor-$(printf 'a%.0s' $(seq 246))|"$'\xf0\x9f\x98\x80' \
+    "anchor-$(printf 'a%.0s' $(seq 246))"$'\xe2\x82\xac'"|bbbb"; do
+    n=$((n + 1))
+    : >"$T/open.calls"
+    e="$(envfile "D6$n")"
+    p="$(payload "D6$n" startup)"
+    PATH="$T/rec:$PATH" KOTO_DISPATCHER_ANCHOR="${want%|*}${want#*|}" hook "$p" "$e"
+    check "the cut keeps whole characters up to 256 bytes (case $n)" \
+      [ "$(passed_dispatcher)" = "${want%|*}" ]
+  done
+
   # KOTO_ANCHOR is the dispatcher when no KOTO_DISPATCHER_ANCHOR is set.
   : >"$T/open.calls"
   e="$(envfile D5)"

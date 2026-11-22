@@ -317,6 +317,8 @@ args=(session anchor open "--harness-session=$session_id" "--source=$start_sourc
 
 # Whether the last open was refused: exit 2 with no anchor= line. A call
 # cut off by the watchdog exits otherwise, so it is never taken for one.
+# It reads the globals `out` and `status` that open_anchor sets; nothing
+# else assigns them, so the `exported` decision below can ask again.
 open_refused() {
   [ "$status" -eq 2 ] || return 1
   case "$out" in
