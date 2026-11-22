@@ -7689,6 +7689,9 @@ fn handle_next(
         let background_output = if action.background {
             // The log as it is now: a state entered earlier in this tick has
             // no run yet, and this read can't mistake an older visit's for it.
+            // A read that fails falls back to the log as the tick began,
+            // which holds every run an earlier tick started; only a visit
+            // begun in this same tick could be misread, and it has no run.
             let log = backend
                 .read_events(&name)
                 .map(|(_, events)| events)
