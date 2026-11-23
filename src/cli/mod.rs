@@ -3957,7 +3957,7 @@ fn handle_rewind(
 /// longer in, and record `pool_released` with reason `left_state` for each
 /// (PRD R12). A transition, a rewind or completion moves the session out of
 /// the state it queued in; this runs before the command that did it returns,
-/// so a `koto pool status` right after no longer lists it. The open waits
+/// so the pool's queue file no longer lists it once it has. The open waits
 /// come from the log, which names each one's pool and workspace, so nothing
 /// is created.
 ///
