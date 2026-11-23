@@ -4655,7 +4655,9 @@ impl CloudBackend {
                                 if let Some(parent) = local_path.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
-                                if crate::decisions::is_decision_area_key(file_name) {
+                                // Decisions and the supersede marker are
+                                // write-once: a pull never overwrites one.
+                                if crate::decisions::is_write_once_key(file_name) {
                                     pull_decision_copy(
                                         &session_dir,
                                         &local_path,

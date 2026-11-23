@@ -507,6 +507,25 @@ pub fn handle_show(backend: &Backend, name: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `koto decisions chain <name>`: print the chain read
+/// ([`chain::read`]), `{"v", "session", "marker", "links", "incomplete"}`,
+/// recording nothing. The read reaches only the sessions this host holds a
+/// copy of, as the walk standing uses does, so a session this host doesn't
+/// hold is refused as `show` refuses it.
+pub fn handle_chain(backend: &Backend, name: &str) -> Result<()> {
+    if !chain::session_present(backend, name) {
+        exit_with_error_code(
+            serde_json::json!({
+                "error": format!("no state file found for workflow '{}'", name),
+                "command": "decisions chain"
+            }),
+            EXIT_CALLER_ERROR,
+        );
+    }
+    println!("{}", serde_json::to_string(&chain::read(backend, name))?);
+    Ok(())
+}
+
 /// Whether the bucket holds `name` though this host has no copy: a read
 /// answers from the bucket's objects then.
 fn backend_holds_remote(backend: &Backend, name: &str) -> bool {

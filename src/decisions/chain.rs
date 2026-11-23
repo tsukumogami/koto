@@ -10,13 +10,22 @@
 //! The walk reads link files straight from each session's directory, with
 //! no lock, no pull and no write, so it changes no session it passes
 //! (R16). It reads no workspace-manager file (R13).
+//!
+//! [`read`] is the same walk with a forward step (R45): from each chain
+//! session it follows the supersede marker ([`super::marker`]) to the
+//! successor, confirms the successor's session id from its header, and
+//! keeps going while each hop holds. `koto decisions chain` prints it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::links::{LinkBody, LinkKind, LINKS_PREFIX, MAX_LINK_BODY_BYTES};
+use super::marker::{self, Successor, SupersedeMarker};
+use crate::engine::types::SupersedeActor;
+use crate::session::links::{
+    LinkBody, LinkKind, LINKS_PREFIX, MAX_LINK_BODY_BYTES, MAX_SUPERSEDE_HOPS,
+};
 use crate::session::SessionBackend;
 
 /// The most sessions a walk lists before it stops and marks the chain
@@ -245,4 +254,148 @@ fn walk<'a>(store: &'a dyn SessionBackend, session: &str) -> Walk<'a> {
         Err(()) => walk.snapshot.incomplete = true,
     }
     walk
+}
+
+// ===== The chain read: the walk with each supersede hop followed forward =====
+
+/// One supersede hop followed forward from a session: the successor its
+/// marker names, whether koto confirmed it, and the fence's actor and time
+/// as the marker records them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Hop {
+    /// The successor the marker names.
+    pub successor: Successor,
+    /// Whether the successor is in the store and its header's session id
+    /// is the one the marker names.
+    pub confirmed: bool,
+    /// Who ran the command that fenced the session.
+    pub actor: SupersedeActor,
+    /// When the fence was appended.
+    pub time: String,
+}
+
+/// One session on a chain read: how the link that reached it was written,
+/// and the supersede hops followed forward from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadLink {
+    /// The chain session.
+    pub session: String,
+    /// How the link that reached it was written.
+    pub via: String,
+    /// The supersede hops from it, in order; empty when it has no marker.
+    pub hops: Vec<Hop>,
+    /// Why the forward step stopped at a marker it couldn't read, naming
+    /// the session whose marker it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+/// A session's chain as koto would walk it now (PRD R45): each link and
+/// its kind, each supersede hop and whether it was confirmed, the
+/// session's own supersede marker, and whether the walk is incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChainRead {
+    /// The format version, [`crate::decisions::FORMAT_VERSION`].
+    pub v: u32,
+    /// The session read.
+    pub session: String,
+    /// The session's own supersede marker, or `None` (`null`) when it has
+    /// none or it can't be read.
+    pub marker: Option<SupersedeMarker>,
+    /// Why the session's own marker can't be read, when it can't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker_unreadable: Option<String>,
+    /// The chain sessions, in the walk's order.
+    pub links: Vec<ReadLink>,
+    /// Whether the walk, or a forward step, stopped short of what the
+    /// links and markers name.
+    pub incomplete: bool,
+}
+
+/// The session id in `name`'s header, read from the local state file with
+/// no lock and no pull: the cloud backend's own header read pulls first,
+/// and this read writes nothing.
+fn header_session_id(store: &dyn SessionBackend, name: &str) -> Option<String> {
+    let path = store
+        .session_dir(name)
+        .join(crate::session::state_file_name(name));
+    crate::engine::persistence::read_header(&path)
+        .ok()
+        .map(|h| h.session_id)
+}
+
+/// The hops followed forward from `start` through supersede markers, why
+/// the step stopped at a marker it couldn't read, and whether it stopped
+/// short. A missing marker ends the step; an unconfirmed hop is recorded
+/// and ends it; a successor already met on this step (or `start` itself),
+/// or more than [`MAX_SUPERSEDE_HOPS`] hops, end it and mark it short.
+fn forward(store: &dyn SessionBackend, start: &str) -> (Vec<Hop>, Option<String>, bool) {
+    let mut hops = Vec::new();
+    let mut seen = BTreeSet::from([start.to_string()]);
+    let mut at = start.to_string();
+    loop {
+        let marker = match marker::read(&store.session_dir(&at).join("ctx")) {
+            Ok(None) => return (hops, None, false),
+            Ok(Some(m)) => m,
+            Err(reason) => return (hops, Some(format!("'{at}': {reason}")), true),
+        };
+        if hops.len() >= MAX_SUPERSEDE_HOPS || seen.contains(&marker.successor.name) {
+            return (hops, None, true);
+        }
+        let name = marker.successor.name.clone();
+        let confirmed = session_present(store, &name)
+            && header_session_id(store, &name).as_deref() == Some(marker.successor.id.as_str());
+        hops.push(Hop {
+            successor: marker.successor,
+            confirmed,
+            actor: marker.actor,
+            time: marker.time,
+        });
+        if !confirmed {
+            return (hops, None, false);
+        }
+        seen.insert(name.clone());
+        at = name;
+    }
+}
+
+/// Read `session`'s chain as koto would walk it now: the walk
+/// [`snapshot`] takes, upward from the session and its anchors only, then
+/// from each chain session the supersede hops its marker leads to. The
+/// successors' own links aren't followed. Writes nothing, and fails
+/// closed: a marker that can't be read marks the read incomplete and is
+/// never guessed past.
+pub fn read(store: &dyn SessionBackend, session: &str) -> ChainRead {
+    let walk = walk(store, session);
+    let mut incomplete = walk.snapshot.incomplete;
+    let (marker, marker_unreadable) = match marker::read(&store.session_dir(session).join("ctx")) {
+        Ok(m) => (m, None),
+        Err(reason) => {
+            incomplete = true;
+            (None, Some(reason))
+        }
+    };
+    let links = walk
+        .snapshot
+        .links
+        .into_iter()
+        .map(|link| {
+            let (hops, unreadable, short) = forward(store, &link.session);
+            incomplete |= short;
+            ReadLink {
+                session: link.session,
+                via: link.via,
+                hops,
+                unreadable,
+            }
+        })
+        .collect();
+    ChainRead {
+        v: crate::decisions::FORMAT_VERSION,
+        session: session.to_string(),
+        marker,
+        marker_unreadable,
+        links,
+        incomplete,
+    }
 }
