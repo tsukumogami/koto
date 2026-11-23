@@ -3761,6 +3761,12 @@ impl CloudBackend {
     /// lock, which the caller took: the line goes in under it, and it is
     /// released before the push, so no network round trip of the push runs
     /// under it. The caller has run `local_guard`.
+    ///
+    /// The after-commit steps run with no lock held. They append a nested
+    /// `context_added`, which takes the append lock: run under the batch
+    /// lock, that is the batch lock then the append lock, the reverse of
+    /// every append's order, and two writers of one deferred session could
+    /// each wait on the other forever.
     fn append_logged_held(
         &self,
         id: &str,
@@ -3771,13 +3777,33 @@ impl CloudBackend {
         self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
         self.check_fence(id)?;
         if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.append_event_held(id, held, payload, timestamp);
+            if let Some((journal, lock)) = self.open_batch(id)? {
+                let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+                drop(lock);
+                self.local.after_commit(id, payload, &commit);
+                return self.push_unless_batched(id, &journal);
             }
         }
         // Releases `held` once the line is in, before the after-commit
         // steps and the push.
-        self.local.append_event_held(id, held, payload, timestamp)?;
+        let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+        self.local.after_commit(id, payload, &commit);
+        self.push_state_after_write(id)
+    }
+
+    /// After a deferred append's after-commit steps, which run with the
+    /// batch lock released: a flush that ran in that gap pushed the batch
+    /// without whatever those steps appended, so a batch found closed is
+    /// followed by a push at once, as an append outside a batch is. Its
+    /// lock is taken with no append lock held and released before the push.
+    fn push_unless_batched(&self, id: &str, journal: &Journal) -> anyhow::Result<()> {
+        let still_open = match journal.lock()? {
+            Some(_lock) => journal.is_open(),
+            None => false,
+        };
+        if still_open {
+            return Ok(());
+        }
         self.push_state_after_write(id)
     }
 
@@ -4972,6 +4998,12 @@ impl SessionBackend for CloudBackend {
     /// The rewrite is fenced like an append, and the epoch it leaves is the
     /// one this process has read from then on, so a rebind's own process
     /// isn't fenced off by the epoch it just bumped.
+    ///
+    /// A deferred rewrite takes the log's append lock before the batch lock,
+    /// the order every append takes them in, and rewrites under the lock it
+    /// holds. Waiting for the append lock while holding the batch lock would
+    /// stall behind an append that holds the append lock and waits for the
+    /// batch lock, until the bounded wait gave up.
     fn rewrite_header(
         &self,
         id: &str,
@@ -4979,16 +5011,24 @@ impl SessionBackend for CloudBackend {
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
         self.check_fence(id)?;
+        if self.defers(id) {
+            let path = self.local.state_path(id);
+            let held = crate::engine::persistence::hold_log_lock(
+                &path,
+                crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+            )?;
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                crate::engine::claim::rewrite_header_atomically_held(&held, &path, f)?;
+                drop(held);
+                self.note_epoch_read(id, &self.local.read_header(id)?);
+                return Ok(());
+            }
+        }
         let rewrite = || -> anyhow::Result<()> {
             self.local.rewrite_header(id, f)?;
             self.note_epoch_read(id, &self.local.read_header(id)?);
             Ok(())
         };
-        if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return rewrite();
-            }
-        }
         rewrite()?;
         self.push_state_after_write(id)
     }

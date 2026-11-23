@@ -93,7 +93,15 @@ impl LocalBackend {
 
     /// What runs after every committed append to `id`'s log, once the line
     /// is synced. Best-effort: neither step fails the commit.
-    fn after_commit(&self, id: &str, payload: &EventPayload, commit: &persistence::CommitInfo) {
+    ///
+    /// Run with no lock on `id` held: materializing the `/workflows` surface
+    /// appends a nested `context_added`, which takes the log's append lock.
+    pub(crate) fn after_commit(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        commit: &persistence::CommitInfo,
+    ) {
         // Journal the committed payload (best-effort, after the commit, so a
         // failed append never writes a record), with the seq it took and the
         // log it was appended to. See `crate::run_journal`.
@@ -105,21 +113,23 @@ impl LocalBackend {
         crate::workflows_surface::materialize_after_commit(self, self, id);
     }
 
-    /// [`SessionBackend::append_event`] for a caller holding `id`'s append
-    /// lock through `held`: the append goes in under it, without taking the
-    /// lock again, and runs the same after-commit steps.
+    /// The line of [`SessionBackend::append_event`] for a caller holding
+    /// `id`'s append lock through `held`: the append goes in under it,
+    /// without taking the lock again, and `held` is released once it is in.
     ///
-    /// `held` is taken by value and released once the line is in, before
-    /// the after-commit steps run: materializing the `/workflows` surface
-    /// appends a nested `context_added` through the commit funnel, which
-    /// takes the same lock and would wait forever on its own process.
-    pub(crate) fn append_event_held(
+    /// The after-commit steps don't run here. The caller runs
+    /// [`LocalBackend::after_commit`] with the returned commit once it has
+    /// released every lock of its own on `id`: they append a nested
+    /// `context_added`, which takes the append lock again and would wait
+    /// forever on its own process, or, under another lock the caller holds,
+    /// take the two in an order another writer reverses.
+    pub(crate) fn commit_event_held(
         &self,
         id: &str,
         held: persistence::HeldLogLock,
         payload: &EventPayload,
         timestamp: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<persistence::CommitInfo> {
         let commit = persistence::append_event_tracked_held(
             &held,
             &self.state_path(id),
@@ -127,8 +137,7 @@ impl LocalBackend {
             timestamp,
         )?;
         drop(held);
-        self.after_commit(id, payload, &commit);
-        Ok(())
+        Ok(commit)
     }
 
     /// [`SessionBackend::add_context_locked`] with the wait for `id`'s
