@@ -149,6 +149,30 @@ pub enum ActionResult {
         /// attempt.
         spawned: bool,
     },
+    /// The action did not run, because its host pool held it back: the
+    /// session is queued for a slot (DESIGN-host-resource-pools.md
+    /// Decision 3), or the pool can't be used. The map holds the one
+    /// reserved `__pool__` condition the tick stops on.
+    ///
+    /// The loop stops here before the state's gates, as for a failed
+    /// action, and keeps the transitions the tick already made (PRD R17).
+    /// Nothing ran, so nothing is appended and no attempt is counted.
+    ///
+    /// A background action whose run is still going stops here too, with a
+    /// temporal `__action__` condition (status `running`): its gates judge
+    /// work that hasn't finished.
+    PoolBlocked(BTreeMap<String, StructuredGateResult>),
+    /// `result`, with `events` to append before the loop handles it.
+    ///
+    /// A background action's tick records what it did to the pool and the
+    /// run (`pool_acquired`, `background_started`, `background_finished`,
+    /// `pool_released`) in the session log; the closure can't append, so it
+    /// hands them here, and the loop appends them in order before it acts
+    /// on `result`, so they land before the action's own record.
+    WithEvents {
+        events: Vec<EventPayload>,
+        result: Box<ActionResult>,
+    },
 }
 
 /// Build the synthetic condition map a failed action stops on.
@@ -176,7 +200,9 @@ fn action_failure_conditions(
     let outcome = match failure_kind {
         FailureKind::NonzeroExit => GateOutcome::Failed,
         FailureKind::TimedOut => GateOutcome::TimedOut,
-        FailureKind::SpawnFailed | FailureKind::WaitFailed => GateOutcome::Error,
+        FailureKind::SpawnFailed | FailureKind::WaitFailed | FailureKind::Lost => {
+            GateOutcome::Error
+        }
     };
     let markers = check.markers.clone();
     with_markers(
@@ -1441,7 +1467,17 @@ where
         // 5. Action execution (if state has default_action)
         if let Some(action) = &template_state.default_action {
             let has_evidence = !current_evidence.is_empty();
-            let result = execute_action(&state, action, has_evidence);
+            let mut result = execute_action(&state, action, has_evidence);
+            while let ActionResult::WithEvents {
+                events,
+                result: inner,
+            } = result
+            {
+                for event in &events {
+                    append_event(event).map_err(AdvanceError::PersistenceError)?;
+                }
+                result = *inner;
+            }
             match result {
                 ActionResult::Executed {
                     command,
@@ -1487,6 +1523,21 @@ where
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
+                }
+                // Unwrapped by the loop above.
+                ActionResult::WithEvents { .. } => unreachable!("WithEvents is unwrapped first"),
+                ActionResult::PoolBlocked(conditions) => {
+                    // Queued for a slot, or the pool can't be used: stop at
+                    // this state before its gates, which judge work the
+                    // action has not done. `advanced` carries the
+                    // transitions this tick already made.
+                    return Ok(AdvanceResult {
+                        attempts: None,
+                        advisories: Advisories::default(),
+                        final_state: state,
+                        advanced,
+                        stop_reason: StopReason::GateBlocked(conditions),
+                    });
                 }
                 ActionResult::Refused {
                     field,
@@ -5070,6 +5121,9 @@ mod tests {
             fallback: None,
             capture_stdout_as: None,
             capture_allow_empty: false,
+            pool: None,
+            background: false,
+            timeout_secs: None,
         }
     }
 

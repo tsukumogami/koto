@@ -1543,6 +1543,24 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         return Ok(());
     }
 
+    // A run in flight runs its command in the old anchor and keeps its
+    // locks in the session's directory; the move waits until it has ended
+    // (PRD R24).
+    #[cfg(unix)]
+    if let Some(run_id) = crate::engine::background::run_in_flight(&backend.session_dir(name)) {
+        super::exit_with_error_code(
+            serde_json::json!({
+                "error": {
+                    "code": "background_run_in_flight",
+                    "message": crate::engine::background::in_flight_refusal(name, &run_id),
+                    "run_id": run_id,
+                },
+                "command": "session rebind",
+            }),
+            2,
+        );
+    }
+
     // Under the cloud backend, the home before the move, when it has one:
     // a session that takes its home from its anchor moves home with it.
     let home_before = backend
@@ -1910,6 +1928,20 @@ pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     // and on a name koto already removed itself the record is the answer
     // `koto status` gives, so it must stay.
     let had_session = backend.session_dir(name).is_dir();
+    // A session about to be removed stops its live background runner and
+    // leaves any pool queue first (PRD R23); with no log left afterwards,
+    // the events that would record it are dropped. A pinned session is
+    // refused below and keeps both, so the pin is checked first.
+    #[cfg(unix)]
+    if had_session
+        && crate::session::pin::guard_removal(backend, name)
+            .refusal(name)
+            .is_none()
+    {
+        if let Ok((_, events)) = backend.read_events(name) {
+            let _ = super::stop_session_pool_work(backend, name, &events);
+        }
+    }
     // Through the pin guard: a pinned session is refused with exit 2 and
     // nothing removed, naming the pin and saying to unpin first.
     if let crate::session::pin::Removal::Kept(guard) =

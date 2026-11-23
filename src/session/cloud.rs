@@ -6050,6 +6050,9 @@ pub enum ImportErrorCode {
     /// A re-run found the copy already built, holding a continues relation
     /// that names another session than the source. Nothing was changed.
     RelationConflict,
+    /// The source's log records a background run no tick has settled: it
+    /// may still be running on the source's host, holding a pool slot.
+    BackgroundRunInFlight,
 }
 
 impl ImportErrorCode {
@@ -6067,6 +6070,7 @@ impl ImportErrorCode {
             ImportErrorCode::PushFailed => "import_push_failed",
             ImportErrorCode::Unmarked => "import_unmarked",
             ImportErrorCode::SourceRunning => "import_source_running",
+            ImportErrorCode::BackgroundRunInFlight => "background_run_in_flight",
             ImportErrorCode::SourceUnpushed => "import_source_unpushed",
             ImportErrorCode::SourceHasChildren => "import_source_has_children",
             ImportErrorCode::RelationConflict => "relation_conflict",
@@ -6087,7 +6091,8 @@ impl ImportErrorCode {
             | ImportErrorCode::SourceRunning
             | ImportErrorCode::SourceUnpushed
             | ImportErrorCode::SourceHasChildren
-            | ImportErrorCode::RelationConflict => 2,
+            | ImportErrorCode::RelationConflict
+            | ImportErrorCode::BackgroundRunInFlight => 2,
             ImportErrorCode::SourceUnreadable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
@@ -6274,6 +6279,18 @@ struct ImportSource {
 }
 
 impl ImportSource {
+    /// The id of a background run the source's log records as started and
+    /// never settled by `background_finished`.
+    fn unsettled_run(&self) -> Option<String> {
+        let events: Vec<crate::engine::types::Event> = self
+            .log
+            .event_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        crate::engine::types::unsettled_background_run(&events)
+    }
+
     /// The bucket key of `rest` under the source session.
     fn key(&self, rest: &str) -> String {
         format!("{}{}", self.session, rest)
@@ -6565,6 +6582,26 @@ impl CloudBackend {
                     ))
                 }
             };
+        }
+
+        // A new import of a session whose background run hasn't been
+        // settled would carry a log that says the run is going, to a host
+        // that can't read it (PRD R24). The source's own host settles it on
+        // its next tick, or `koto cancel` there stops it. The log decides,
+        // not the run's locks: those live on the source's host, which this
+        // one usually can't probe. A source whose host is gone for good
+        // stays refused until its log is settled there; no import guesses
+        // that a run it can't see has ended.
+        if let Some(run_id) = source.unsettled_run() {
+            return Err(ImportError::new(
+                ImportErrorCode::BackgroundRunInFlight,
+                format!(
+                    "session '{}' in workspace {} has background run '{}' in flight, by its \
+                     log; tick it on its own host once the run has ended (or cancel it there), \
+                     then import again",
+                    source.name, source.workspace, run_id
+                ),
+            ));
         }
 
         if self.is_takeover(req, &source) {
@@ -8888,6 +8925,56 @@ mod tests {
     use crate::session::SessionBackend;
     use std::fs;
     use tempfile::TempDir;
+
+    /// An import refuses a source whose log has a background run no tick
+    /// settled, and takes one whose every run was settled (PRD R24).
+    #[test]
+    fn an_unsettled_background_run_is_found_in_the_source_log() {
+        use crate::engine::types::{BackgroundFinished, BackgroundStarted, Event, EventPayload};
+        let event = |seq: u64, payload: EventPayload| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let started = |id: &str| {
+            EventPayload::BackgroundStarted(BackgroundStarted {
+                state: "test".into(),
+                run_id: id.into(),
+                machine: "alpha".into(),
+                boot_id: None,
+                pool: Some("test-suite".into()),
+            })
+        };
+        let finished = |id: &str| {
+            EventPayload::BackgroundFinished(BackgroundFinished {
+                state: "test".into(),
+                run_id: id.into(),
+                outcome: "done".into(),
+            })
+        };
+        let lines: Vec<String> = [
+            event(1, started("r1")),
+            event(2, finished("r1")),
+            event(3, started("r2")),
+        ]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+        let events: Vec<Event> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events).as_deref(),
+            Some("r2")
+        );
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events[..2]),
+            None
+        );
+    }
 
     /// Create a CloudBackend backed by a temp directory and a bucket pointing
     /// at a fake endpoint. S3 operations will fail, exercising the non-fatal

@@ -1233,6 +1233,21 @@ impl Backend {
     }
 }
 
+/// Refuse to move session `from` while a background run of it is in
+/// flight on this machine (PRD R24): its runner writes its result into the
+/// session's directory and its processes hold the run's locks there, so a
+/// move would leave the run behind. Undoing a failed move
+/// (`relocate_local_only`) is never refused.
+fn refuse_move_in_flight(backend: &Backend, from: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let Some(run_id) = crate::engine::background::run_in_flight(&backend.session_dir(from)) {
+        anyhow::bail!(crate::engine::background::in_flight_refusal(from, &run_id));
+    }
+    #[cfg(not(unix))]
+    let _ = (backend, from);
+    Ok(())
+}
+
 impl SessionBackend for Backend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         match self {
@@ -1372,6 +1387,7 @@ impl SessionBackend for Backend {
     }
 
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        refuse_move_in_flight(self, from)?;
         match self {
             Backend::Local(b) => b.relocate(from, to),
             Backend::Cloud(b) => b.relocate(from, to),
@@ -1386,6 +1402,7 @@ impl SessionBackend for Backend {
     }
 
     fn relocate_checked(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        refuse_move_in_flight(self, from)?;
         match self {
             Backend::Local(b) => b.relocate_checked(from, to),
             Backend::Cloud(b) => b.relocate_checked(from, to),
@@ -1556,6 +1573,36 @@ mod tests {
         // callers that pick an exit code by it.
         let wrapped = anyhow::Error::new(err.clone());
         assert_eq!(wrapped.downcast_ref::<SessionMigrated>(), Some(&err));
+    }
+
+    /// A move of a session whose run holds its locks is refused, naming the
+    /// run; once the locks are free it is not (PRD R24).
+    #[cfg(unix)]
+    #[test]
+    fn relocate_refuses_while_a_background_run_is_in_flight() {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Backend::Local(LocalBackend::with_base_dir(tmp.path().to_path_buf()));
+        let run_dir = backend.session_dir("s").join("runs").join("r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let lock = std::fs::File::create(run_dir.join("run.lock")).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        for result in [
+            backend.relocate("s", "t"),
+            backend.relocate_checked("s", "t"),
+        ] {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.starts_with("background_run_in_flight:") && message.contains("'r1'"),
+                "{message}"
+            );
+        }
+        drop(lock);
+        assert!(refuse_move_in_flight(&backend, "s").is_ok());
     }
 
     #[test]

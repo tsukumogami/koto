@@ -2569,7 +2569,7 @@ pub(crate) fn epoch_slice_for_test<'a>(events: &'a [Event], current_state: &str)
 /// keep the blocked badge on. Nothing in the repo exercises that predicate
 /// directly except the one unit test that asserts both boundaries against a
 /// single log.
-fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+pub(crate) fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::AnyEntry)
 }
 

@@ -14,6 +14,7 @@ pub mod findings;
 pub mod gate;
 pub(crate) mod host_env;
 pub(crate) mod koto_home;
+pub mod pool;
 pub mod redact;
 pub(crate) mod run_journal;
 pub mod session;

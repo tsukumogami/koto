@@ -136,6 +136,81 @@ struct SourceActionDecl {
     capture_stdout_as: Option<String>,
     #[serde(default)]
     capture_allow_empty: bool,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    background: bool,
+    /// Kept as a YAML value so a value that isn't a whole number is refused
+    /// with the state's name rather than serde's type error.
+    #[serde(default)]
+    timeout_secs: Option<serde_yaml_ng::Value>,
+}
+
+/// Pool settings that belong to the operator's config, never to a template
+/// (PRD-host-resource-pools.md R2): a template names a pool, the user's koto
+/// config sizes it.
+const POOL_CONFIG_KEYS: &[&str] = &["size", "claim_secs", "lapse_secs", "wait_secs"];
+
+/// Refuse a pool setting written under a state or its `default_action`,
+/// naming the state and the key. Run on the raw front-matter before the
+/// typed parse, because the typed parse ignores unknown `default_action`
+/// keys and reports an unknown state key without saying it is a pool
+/// setting.
+fn refuse_pool_settings_in_states(frontmatter: &str) -> anyhow::Result<()> {
+    let Ok(raw) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(frontmatter) else {
+        // The typed parse reports the syntax error.
+        return Ok(());
+    };
+    let Some(states) = raw.get("states").and_then(|s| s.as_mapping()) else {
+        return Ok(());
+    };
+    for (name, state) in states {
+        let name = name.as_str().unwrap_or("?");
+        let mut tables = vec![("", state)];
+        if let Some(action) = state.get("default_action") {
+            tables.push(("default_action ", action));
+        }
+        for (prefix, table) in tables {
+            let Some(map) = table.as_mapping() else {
+                continue;
+            };
+            for key in POOL_CONFIG_KEYS {
+                if map.contains_key(*key) {
+                    return Err(anyhow!(
+                        "state {:?}: {}{} is a pool setting and can't be set in a template\n  \
+                         remedy: remove it; the operator sizes a pool in the user's koto \
+                         config, as `[pools.<name>] {} = ...`",
+                        name,
+                        prefix,
+                        key,
+                        key
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A source `timeout_secs` as a whole number, or an error naming the state.
+fn compile_action_timeout(
+    state_name: &str,
+    value: &Option<serde_yaml_ng::Value>,
+) -> anyhow::Result<Option<u32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "state {:?}: default_action timeout_secs must be a whole number from 1 to {}",
+                state_name,
+                crate::template::types::MAX_ACTION_TIMEOUT_SECS
+            )
+        })
 }
 
 /// Polling configuration in source YAML.
@@ -602,6 +677,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
     // CLI prints the top-level message, and a key misspelled inside a strict
     // block (say `thresold:` in a decider answer, or `valuez:` in a variable
     // declaration) is only named down there.
+    refuse_pool_settings_in_states(frontmatter_str)?;
     let fm: SourceFrontmatter = serde_yaml_ng::from_str(frontmatter_str)
         .map_err(|e| anyhow!("invalid YAML: failed to parse front-matter: {}", e))?;
 
@@ -674,6 +750,10 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             };
 
         // Transform source default_action to compiled ActionDecl.
+        let timeout_secs = match &source_state.default_action {
+            Some(sa) => compile_action_timeout(state_name, &sa.timeout_secs)?,
+            None => None,
+        };
         let compiled_action = source_state.default_action.as_ref().map(|sa| ActionDecl {
             command: sa.command.clone(),
             working_dir: sa.working_dir.clone(),
@@ -685,6 +765,9 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             fallback: sa.fallback.clone(),
             capture_stdout_as: sa.capture_stdout_as.clone(),
             capture_allow_empty: sa.capture_allow_empty,
+            pool: sa.pool.clone(),
+            background: sa.background,
+            timeout_secs,
         });
 
         let compiled_materialize_children =
@@ -1820,6 +1903,56 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    // -----------------------------------------------------------------------
+    // background: true off Linux and macOS (PRD-host-resource-pools.md R27)
+    // -----------------------------------------------------------------------
+
+    mod background_platform {
+        use super::*;
+        use crate::pool::platform::force_for_test;
+
+        const SOURCE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
+            states:\n  a:\n    default_action:\n      command: \"true\"\n\
+            ACTION\
+            \x20   transitions:\n      - target: b\n  b:\n    terminal: true\n---\n\n\
+            ## a\n\nRun.\n\n## b\n\nDone.\n";
+
+        fn compile_action(extra: &str) -> anyhow::Result<CompiledTemplate> {
+            let f = write_temp(&SOURCE.replace("ACTION", extra));
+            compile(f.path(), true)
+        }
+
+        const BACKGROUND: &str = "      background: true\n      timeout_secs: 60\n";
+
+        #[test]
+        fn an_unsupported_platform_refuses_background_naming_the_state() {
+            let _forced = force_for_test(false);
+            let err = compile_action(BACKGROUND).unwrap_err().to_string();
+            assert!(err.contains("\"a\""), "names the state: {err}");
+            assert!(err.contains("background"), "names the field: {err}");
+            assert!(err.contains("Linux and macOS"), "says why: {err}");
+        }
+
+        #[test]
+        fn an_unsupported_platform_still_compiles_a_pooled_ordinary_action() {
+            let _forced = force_for_test(false);
+            compile_action("      pool: test-suite\n").unwrap();
+        }
+
+        #[test]
+        fn a_supported_platform_compiles_background() {
+            let _forced = force_for_test(true);
+            compile_action(BACKGROUND).unwrap();
+        }
+
+        #[test]
+        fn linux_and_macos_compile_background_unforced() {
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                compile_action(BACKGROUND).unwrap();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -1124,6 +1124,100 @@ pub struct CodeReviewRoundRecorded {
     pub entries: Vec<CodeReviewSeat>,
 }
 
+/// The event type a tick appends when its session joins a host pool's queue
+/// (DESIGN-host-resource-pools.md, "Interfaces"): once per join, not on each
+/// queued tick.
+pub const POOL_QUEUED: &str = "pool_queued";
+/// The event type a tick appends when it takes a slot of a host pool.
+pub const POOL_ACQUIRED: &str = "pool_acquired";
+/// The event type a tick appends when a slot it took is given back.
+pub const POOL_RELEASED: &str = "pool_released";
+/// The event type a tick appends when it starts a background action's runner.
+pub const BACKGROUND_STARTED: &str = "background_started";
+/// The event type a tick appends when it reads a background run's end.
+pub const BACKGROUND_FINISHED: &str = "background_finished";
+
+/// The payload of a [`POOL_QUEUED`] event. `workspace` is the workspace
+/// directory's name the queue entry is keyed by, so a command that takes the
+/// session out of `state` can find the entry to remove without the tick's
+/// execution directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolQueued {
+    pub state: String,
+    pub pool: String,
+    pub workspace: String,
+}
+
+/// The payload of a [`POOL_ACQUIRED`] event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolAcquired {
+    pub state: String,
+    pub pool: String,
+    pub slot: usize,
+    /// The background run the slot was taken for, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// The payload of a [`POOL_RELEASED`] event. `reason` is one of `done`,
+/// `failed`, `timed_out`, `lost`, `cancelled`, `lapsed`, `left_state` or
+/// `pool_removed`; a string, so a reason a later version adds can't break
+/// an older reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolReleased {
+    pub state: String,
+    pub pool: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// The payload of a [`BACKGROUND_STARTED`] event: the run this visit to
+/// `state` started, and the host it runs on, so a tick on another machine
+/// or after a reboot never acts on it as its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundStarted {
+    pub state: String,
+    pub run_id: String,
+    pub machine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// The pool whose slot the run holds, when it holds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+}
+
+/// The payload of a [`BACKGROUND_FINISHED`] event: the tick read the run's
+/// end. `outcome` is `done`, `failed`, `timed_out` or `lost`, or
+/// `cancelled` when `koto cancel`, a removal, leaving the state or a new
+/// visit's run stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundFinished {
+    pub state: String,
+    pub run_id: String,
+    pub outcome: String,
+}
+
+/// The id of the first background run `events` records as started with no
+/// `background_finished` for it: a run no tick has settled. Read on every
+/// platform, by a cloud import of another host's log as well as by koto's
+/// own ticks.
+pub fn unsettled_background_run(events: &[Event]) -> Option<String> {
+    let finished: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::BackgroundFinished(f) => Some(f.run_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    events.iter().find_map(|e| match &e.payload {
+        EventPayload::BackgroundStarted(b) if !finished.contains(b.run_id.as_str()) => {
+            Some(b.run_id.clone())
+        }
+        _ => None,
+    })
+}
+
 /// The event type every `koto session anchor open` appends to its anchor.
 pub const ANCHOR_STARTED: &str = "anchor_started";
 
@@ -2029,6 +2123,18 @@ pub enum EventPayload {
     /// recorded at most once per tenth of the idle period. Additive, and
     /// degrades like `anchor_started`.
     AnchorActivity(AnchorActivity),
+    /// A tick took a host pool slot (DESIGN-host-resource-pools.md). This
+    /// and the four below are additive: an older build lands them in
+    /// `Unknown`, and a payload this build can't parse does the same.
+    PoolAcquired(PoolAcquired),
+    /// A tick's session joined a host pool's queue.
+    PoolQueued(PoolQueued),
+    /// A slot a tick took was given back.
+    PoolReleased(PoolReleased),
+    /// A tick started a background action's runner.
+    BackgroundStarted(BackgroundStarted),
+    /// A tick read a background run's end.
+    BackgroundFinished(BackgroundFinished),
     /// A `koto next` response printed a non-terminal state's directive.
     /// Appended after the response prints, on every such response.
     InstructionsDelivered {
@@ -2410,6 +2516,11 @@ impl EventPayload {
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::OriginUnrecorded(_) => ORIGIN_UNRECORDED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
+            EventPayload::PoolAcquired(_) => POOL_ACQUIRED,
+            EventPayload::PoolQueued(_) => POOL_QUEUED,
+            EventPayload::PoolReleased(_) => POOL_RELEASED,
+            EventPayload::BackgroundStarted(_) => BACKGROUND_STARTED,
+            EventPayload::BackgroundFinished(_) => BACKGROUND_FINISHED,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -3043,6 +3154,45 @@ impl<'de> Deserialize<'de> for Event {
             ANCHOR_ACTIVITY => {
                 match serde_json::from_value::<AnchorActivity>(payload_val.clone()) {
                     Ok(a) => EventPayload::AnchorActivity(a),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            POOL_ACQUIRED => match serde_json::from_value::<PoolAcquired>(payload_val.clone()) {
+                Ok(p) => EventPayload::PoolAcquired(p),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            POOL_QUEUED => match serde_json::from_value::<PoolQueued>(payload_val.clone()) {
+                Ok(p) => EventPayload::PoolQueued(p),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            POOL_RELEASED => match serde_json::from_value::<PoolReleased>(payload_val.clone()) {
+                Ok(p) => EventPayload::PoolReleased(p),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            BACKGROUND_STARTED => {
+                match serde_json::from_value::<BackgroundStarted>(payload_val.clone()) {
+                    Ok(b) => EventPayload::BackgroundStarted(b),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            BACKGROUND_FINISHED => {
+                match serde_json::from_value::<BackgroundFinished>(payload_val.clone()) {
+                    Ok(b) => EventPayload::BackgroundFinished(b),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),

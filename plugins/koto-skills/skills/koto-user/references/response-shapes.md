@@ -726,7 +726,7 @@ response. The failure rides `blocking_conditions` under the reserved name `__act
 - `agent_actionable` is `false` and always will be. Do not call `koto overrides record`
   against `__action__`.
 - **Route on `output.failure_kind`**, one of `nonzero_exit`, `spawn_failed`, `timed_out`,
-  `wait_failed`, `capture_failed`. Don't route on `status`: `nonzero_exit` and
+  `wait_failed`, `capture_failed`, `lost` (a background run whose runner left no result). Don't route on `status`: `nonzero_exit` and
   `capture_failed` both report `failed`. The kinds are tabulated in
   `error-handling.md#command-failure-kinds`.
 - `output.exit_code` is present **only** for `nonzero_exit`. The three kinds that never

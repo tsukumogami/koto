@@ -504,6 +504,7 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
             // dashboard.
             "review",
             "config",
+            "pool",
             "decider",
             "workspace",
             "request",
