@@ -1198,6 +1198,26 @@ pub struct BackgroundFinished {
     pub outcome: String,
 }
 
+/// The id of the first background run `events` records as started with no
+/// `background_finished` for it: a run no tick has settled. Read on every
+/// platform, by a cloud import of another host's log as well as by koto's
+/// own ticks.
+pub fn unsettled_background_run(events: &[Event]) -> Option<String> {
+    let finished: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::BackgroundFinished(f) => Some(f.run_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    events.iter().find_map(|e| match &e.payload {
+        EventPayload::BackgroundStarted(b) if !finished.contains(b.run_id.as_str()) => {
+            Some(b.run_id.clone())
+        }
+        _ => None,
+    })
+}
+
 /// The event type every `koto session anchor open` appends to its anchor.
 pub const ANCHOR_STARTED: &str = "anchor_started";
 

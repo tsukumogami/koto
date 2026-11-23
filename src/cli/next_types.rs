@@ -1460,8 +1460,9 @@ pub fn blocking_conditions_from_gates(
             if name == ACTION_CONDITION_NAME {
                 // A background action whose run is in flight
                 // (DESIGN-host-resource-pools.md, "Reading a run") is a
-                // wait: its status (`running`, `orphaned`, `lost`) is the
-                // run's own word, carried in `output`.
+                // wait: its status (`running` or `orphaned`) is the run's
+                // own word, carried in `output`. A lost run is not a wait:
+                // it fails with `failure_kind: lost`.
                 if result.outcome == GateOutcome::Pending {
                     return Some(BlockingCondition {
                         name: name.clone(),

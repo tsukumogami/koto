@@ -3976,10 +3976,8 @@ fn release_left_pool_waits(
     name: &str,
     before: &[crate::engine::types::Event],
 ) {
-    #[cfg(unix)]
-    let unfinished_run = crate::engine::background::has_unfinished_run(before);
-    #[cfg(not(unix))]
-    let unfinished_run = false;
+    let unfinished_run =
+        cfg!(unix) && crate::engine::types::unsettled_background_run(before).is_some();
     if crate::pool::guard::open_waits(before).is_empty() && !unfinished_run {
         return;
     }

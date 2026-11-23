@@ -790,11 +790,6 @@ pub fn settle_unfinished(
     settled
 }
 
-/// Whether the log records a run no `background_finished` has settled.
-pub fn has_unfinished_run(events: &[Event]) -> bool {
-    crate::session::cloud::unsettled_run_in(events).is_some()
-}
-
 /// `pool_released` for every run whose result was delivered while
 /// processes of it survived and kept the slot, once they have all exited:
 /// `run.lock` is free or the run directory is gone. Only this machine's

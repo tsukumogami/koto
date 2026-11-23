@@ -5897,24 +5897,6 @@ struct ImportSource {
     own_marker: Option<Vec<u8>>,
 }
 
-/// The id of the first background run `events` records as started with no
-/// `background_finished` for it.
-pub(crate) fn unsettled_run_in(events: &[crate::engine::types::Event]) -> Option<String> {
-    use crate::engine::types::EventPayload;
-    events.iter().find_map(|e| {
-        match &e.payload {
-        EventPayload::BackgroundStarted(b)
-            if !events.iter().any(|f| {
-                matches!(&f.payload, EventPayload::BackgroundFinished(f) if f.run_id == b.run_id)
-            }) =>
-        {
-            Some(b.run_id.clone())
-        }
-        _ => None,
-    }
-    })
-}
-
 impl ImportSource {
     /// The id of a background run the source's log records as started and
     /// never settled by `background_finished`.
@@ -5925,7 +5907,7 @@ impl ImportSource {
             .iter()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        unsettled_run_in(&events)
+        crate::engine::types::unsettled_background_run(&events)
     }
 
     /// The bucket key of `rest` under the source session.
@@ -8565,8 +8547,14 @@ mod tests {
             .iter()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(unsettled_run_in(&events).as_deref(), Some("r2"));
-        assert_eq!(unsettled_run_in(&events[..2]), None);
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events).as_deref(),
+            Some("r2")
+        );
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events[..2]),
+            None
+        );
     }
 
     /// Create a CloudBackend backed by a temp directory and a bucket pointing
