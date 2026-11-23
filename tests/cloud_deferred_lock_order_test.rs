@@ -89,7 +89,7 @@ fn koto_cmd(
     args: &[&str],
 ) -> std::process::Command {
     let koto_dir = koto_command::koto_bin().parent().unwrap().to_path_buf();
-    let mut cmd = std::process::Command::new(koto_command::koto_bin());
+    let mut cmd = koto_command::koto_std();
     cmd.env_clear()
         .current_dir(ws)
         .env("PATH", format!("{}:{}", koto_dir.display(), SYSTEM_PATH))
