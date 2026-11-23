@@ -25,3 +25,13 @@ path = "junit.xml"
 # sit under `default` because every profile, `ci` included, inherits them, so
 # local and CI runs serialize the same tests.
 [test-groups]
+
+# The three wall-clock tests in cloud_read_cost_test time a run against the
+# cloud backend stand-in and compare it with a local run (koto#499). Beside
+# other test processes, and under coverage instrumentation, a busy runner
+# pushes them over their bound. `threads-required = "num-cpus"` makes each one
+# take every test slot, so it runs with nothing else beside it. It is still
+# never retried.
+[[profile.default.overrides]]
+filter = 'binary(=cloud_read_cost_test) & (test(=a_forty_read_action_on_the_cloud_backend_is_within_twice_local) | test(=a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing) | test(=a_hub_select_over_its_workers_checks_each_session_once))'
+threads-required = "num-cpus"
