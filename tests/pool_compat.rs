@@ -178,12 +178,19 @@ fn an_undefined_pool_adds_at_most_five_ms_to_a_tick() {
         ms(pooled) - ms(plain),
         BOUND.as_millis()
     );
-    assert!(
-        difference <= BOUND,
-        "an undefined pool costs {:.3} ms a tick over no pool, more than {} ms",
-        ms(difference),
-        BOUND.as_millis()
-    );
+    // The bound is judged on a release build only, as retention_cost does: a
+    // debug build, and the coverage-instrumented suite in CI, runs each tick
+    // several times slower, and on a loaded host the two medians drift apart
+    // by more than 5 ms with no change to koto. The release-mode
+    // `pool-tick-cost` CI job is the measurement of record.
+    if !cfg!(debug_assertions) {
+        assert!(
+            difference <= BOUND,
+            "an undefined pool costs {:.3} ms a tick over no pool, more than {} ms",
+            ms(difference),
+            BOUND.as_millis()
+        );
+    }
     assert!(
         !host.root.join("pools").exists(),
         "an undefined pool creates nothing under the koto root"

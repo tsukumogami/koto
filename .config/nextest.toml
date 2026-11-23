@@ -35,12 +35,3 @@ path = "junit.xml"
 [[profile.default.overrides]]
 filter = 'binary(=cloud_read_cost_test) & (test(=a_forty_read_action_on_the_cloud_backend_is_within_twice_local) | test(=a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing) | test(=a_hub_select_over_its_workers_checks_each_session_once))'
 threads-required = "num-cpus"
-
-# The pool tick-cost test (tests/pool_compat.rs) compares two 50-tick medians
-# against a 5 ms bound. Beside other test processes, and under coverage
-# instrumentation, a busy runner can push one median over the other by more
-# than that, so it takes every test slot and runs with nothing beside it. The
-# release-mode `pool-tick-cost` job is the measurement of record.
-[[profile.default.overrides]]
-filter = 'binary(=pool_compat) & test(=an_undefined_pool_adds_at_most_five_ms_to_a_tick)'
-threads-required = "num-cpus"
