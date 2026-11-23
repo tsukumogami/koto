@@ -102,6 +102,8 @@ const KNOWN_KEYS: &[&str] = &[
     "decider.endpoint",
     "decider.timeout_ms",
     "machine.name",
+    "background.enabled",
+    "background.max_timeout_secs",
 ];
 
 /// A reserved table koto knows by name but whose keys it doesn't read: a

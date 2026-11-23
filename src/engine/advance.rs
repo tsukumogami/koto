@@ -200,7 +200,9 @@ fn action_failure_conditions(
     let outcome = match failure_kind {
         FailureKind::NonzeroExit => GateOutcome::Failed,
         FailureKind::TimedOut => GateOutcome::TimedOut,
-        FailureKind::SpawnFailed | FailureKind::WaitFailed => GateOutcome::Error,
+        FailureKind::SpawnFailed | FailureKind::WaitFailed | FailureKind::Lost => {
+            GateOutcome::Error
+        }
     };
     let markers = check.markers.clone();
     with_markers(

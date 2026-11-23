@@ -7,14 +7,18 @@
 //! for its life and keeps it out of the command; the command and anything
 //! it starts inherit the slot and `run.lock`, so the slot frees only when
 //! every process of the run has gone. It runs the command with the tick's
-//! environment and redaction, cuts it at its timeout, writes the output and
+//! environment and redaction, cuts it at its timeout, and when the command
+//! ends, times out or the runner gets SIGTERM, stops every remaining process
+//! of the run (on Linux as a child subreaper, so descendants that left the
+//! command's group are found too). Then it writes the output and
 //! `result.json`, and exits. It never writes the session log.
 //!
 //! Hidden from help: nothing but a tick starts it.
 
 use std::io::Read;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::background::{self, RunResult, RunSpec, BACKGROUND_OF_ENV, MAX_SPEC_BYTES};
 
@@ -23,6 +27,12 @@ pub const EXIT_REFUSED: i32 = 2;
 
 /// Run the runner. Returns the process exit status.
 pub fn run(session: &str, run_id: &str) -> i32 {
+    // SIGTERM (from `koto cancel`, session removal or a re-entry) ends the
+    // run the way a timeout does: the command's processes are stopped and
+    // the result is written before the runner exits. Installed first, so a
+    // TERM that arrives while the runner starts still stops the command.
+    install_term_handler();
+
     let Some(spec) = accept(session, run_id) else {
         return EXIT_REFUSED;
     };
@@ -48,8 +58,26 @@ pub fn run(session: &str, run_id: &str) -> i32 {
         crate::action::CommandEnv::cleared(vars, redactor)
     };
 
-    let output =
-        crate::action::run_shell_command(&spec.command, &spec.working_dir, spec.timeout_secs, &env);
+    // The spec has been read; nothing more comes on standard input, and the
+    // command gets end of file from /dev/null as an ordinary action does.
+    redirect_stdin_to_null();
+
+    // On Linux, a descendant that leaves the command's process group (with
+    // `setsid`, say) and outlives its parent reparents to this runner
+    // instead of init, so the end-of-run sweep finds and stops it.
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_SET_CHILD_SUBREAPER only changes this process.
+    unsafe {
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    }
+
+    let output = crate::action::run_background_command(
+        &spec.command,
+        &spec.working_dir,
+        spec.timeout_secs,
+        &env,
+        &STOP,
+    );
 
     // The streams first, then the result that says they are complete.
     let dir = &spec.run_dir;
@@ -98,6 +126,38 @@ fn accept(session: &str, run_id: &str) -> Option<RunSpec> {
         .iter()
         .all(|(fd, path)| background::fd_is_file(*fd, path))
         .then_some(spec)
+}
+
+/// Set by the SIGTERM handler; the command's supervisor polls it.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    // An atomic store is async-signal-safe.
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// Turn SIGTERM into a stop request. The command doesn't inherit the
+/// handler: exec resets it to the default.
+fn install_term_handler() {
+    // SAFETY: an all-zero sigaction is valid before its fields are set.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_term as *const () as libc::sighandler_t;
+    // SAFETY: sigemptyset on a sigset we own; sigaction installs a handler
+    // that only stores to an atomic.
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+}
+
+/// Point standard input at /dev/null.
+fn redirect_stdin_to_null() {
+    if let Ok(null) = std::fs::File::open("/dev/null") {
+        // SAFETY: dup2 onto descriptor 0, which this process owns.
+        unsafe {
+            libc::dup2(null.as_raw_fd(), 0);
+        }
+    }
 }
 
 /// Mark `fd` close-on-exec.

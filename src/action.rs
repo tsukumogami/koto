@@ -47,6 +47,10 @@ pub enum FailureKind {
     TimedOut,
     /// Waiting for the child failed, so no exit status was ever obtained.
     WaitFailed,
+    /// A background run's runner is gone and left no result: it was killed,
+    /// or its machine went down (DESIGN-host-resource-pools.md, "Reading a
+    /// run"). There is no exit status.
+    Lost,
 }
 
 impl FailureKind {
@@ -57,6 +61,7 @@ impl FailureKind {
             FailureKind::SpawnFailed => "spawn_failed",
             FailureKind::TimedOut => "timed_out",
             FailureKind::WaitFailed => "wait_failed",
+            FailureKind::Lost => "lost",
         }
     }
 }
@@ -377,6 +382,48 @@ pub fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// `/bin/sh -c <command>` in `working_dir` with `env`'s environment, stdin
+/// at end of file, both streams piped, in a process group of its own so the
+/// whole group can be killed without touching the caller.
+fn shell_command(command: &str, working_dir: &Path, env: &CommandEnv) -> Command {
+    let mut cmd = Command::new(SHELL);
+    if !env.inherit {
+        cmd.env_clear();
+    }
+    cmd.envs(env.vars.iter().map(|(n, v)| (n, v)))
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // SAFETY: setpgid(0, 0) puts the child into its own process group so we
+    // can kill the entire group on timeout without affecting the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// The output of a command that could not be spawned.
+fn spawn_failure(e: &std::io::Error, started: std::time::Instant) -> CommandOutput {
+    CommandOutput {
+        exit_code: -1,
+        stdout: RedactedText::default(),
+        stderr: RedactedText::koto_note(format!("failed to spawn command: {}", e)),
+        failure_kind: Some(FailureKind::SpawnFailed),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        truncated: false,
+        stderr_ends_with_note: true,
+        duration_ms: elapsed_ms(started),
+    }
+}
+
 /// Run a shell command with process-group isolation, timeout, and output capture.
 ///
 /// The command runs via `/bin/sh -c` in its own process group, with the
@@ -404,43 +451,11 @@ pub fn run_shell_command(
         Duration::from_secs(u64::from(timeout_secs))
     };
 
-    let mut cmd = Command::new(SHELL);
-    if !env.inherit {
-        cmd.env_clear();
-    }
-    cmd.envs(env.vars.iter().map(|(n, v)| (n, v)))
-        .arg("-c")
-        .arg(command)
-        .current_dir(working_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // SAFETY: setpgid(0, 0) puts the child into its own process group so we
-    // can kill the entire group on timeout without affecting the parent.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
-    }
-
+    let mut cmd = shell_command(command, working_dir, env);
     let started = std::time::Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            return CommandOutput {
-                exit_code: -1,
-                stdout: RedactedText::default(),
-                stderr: RedactedText::koto_note(format!("failed to spawn command: {}", e)),
-                failure_kind: Some(FailureKind::SpawnFailed),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                truncated: false,
-                stderr_ends_with_note: true,
-                duration_ms: elapsed_ms(started),
-            };
-        }
+        Err(e) => return spawn_failure(&e, started),
     };
 
     // Start draining before waiting. A command that writes more than the
@@ -525,6 +540,274 @@ pub fn run_shell_command(
             stderr_ends_with_note: true,
             duration_ms,
         },
+    }
+}
+
+/// How long a background run's processes get between TERM and KILL
+/// (DESIGN-host-resource-pools.md, "The runner").
+pub const BACKGROUND_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the background runner waits for its output readers once every
+/// process of the run has been signalled. A process that escaped every
+/// signal (on macOS, one that left the command's group) can keep a pipe
+/// open; the runner then writes what it has rather than waiting forever.
+const BACKGROUND_READER_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the background runner looks at its command.
+const BACKGROUND_POLL: Duration = Duration::from_millis(20);
+
+/// Run a background action's command for the runner
+/// (DESIGN-host-resource-pools.md, "The runner").
+///
+/// Like [`run_shell_command`], but it ends the whole run rather than only a
+/// timed-out group. When the command exits, when `timeout_secs` passes, or
+/// when `stop` becomes true (the runner's SIGTERM handler sets it), every
+/// remaining process of the run gets TERM, then KILL after
+/// [`BACKGROUND_KILL_GRACE`]: the command's process group and, on Linux,
+/// every process that descends from this one. A runner that made itself a
+/// child subreaper sees a descendant that left the group with `setsid` as
+/// its own child once its parent exits, so the walk finds it too. Nothing
+/// is signalled but that group and this process's own descendants.
+///
+/// A stopped command reports [`FailureKind::WaitFailed`] with a note: no
+/// tick delivers that result, since the stop is `koto cancel`'s or a
+/// re-entry's, and they record the run as cancelled themselves.
+pub fn run_background_command(
+    command: &str,
+    working_dir: &Path,
+    timeout_secs: u32,
+    env: &CommandEnv,
+    stop: &std::sync::atomic::AtomicBool,
+) -> CommandOutput {
+    use std::sync::atomic::Ordering;
+
+    let timeout = Duration::from_secs(u64::from(timeout_secs.max(1)));
+    let mut cmd = shell_command(command, working_dir, env);
+    let started = std::time::Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return spawn_failure(&e, started),
+    };
+    let pgid = child.id() as i32;
+    let retain = env.redactor.retention(MAX_ACTION_OUTPUT_BYTES);
+    let stdout_reader = child.stdout.take().map(|pipe| spawn_reader(pipe, retain));
+    let stderr_reader = child.stderr.take().map(|pipe| spawn_reader(pipe, retain));
+
+    enum End {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        Stopped,
+        WaitFailed(String),
+    }
+    let deadline = started + timeout;
+    let end = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break End::Exited(status),
+            Ok(None) => {}
+            Err(e) => break End::WaitFailed(e.to_string()),
+        }
+        if stop.load(Ordering::SeqCst) {
+            break End::Stopped;
+        }
+        if std::time::Instant::now() >= deadline {
+            break End::TimedOut;
+        }
+        std::thread::sleep(BACKGROUND_POLL);
+    };
+    let reaped = matches!(end, End::Exited(_));
+    let gone = end_run(pgid, &mut child, reaped);
+    let duration_ms = elapsed_ms(started);
+
+    let note = match &end {
+        End::Exited(_) => None,
+        End::TimedOut => Some(format!(
+            "command timed out after {} seconds",
+            timeout.as_secs()
+        )),
+        End::Stopped => Some("the background run was stopped before its command ended".to_string()),
+        End::WaitFailed(e) => Some(format!("error waiting for command: {}", e)),
+    };
+    let note = note.map(|note| {
+        if gone {
+            note
+        } else {
+            format!("{note}; some of its processes were still present after the kill")
+        }
+    });
+
+    let killed = note.is_some();
+    let reader_deadline = std::time::Instant::now() + BACKGROUND_READER_WAIT;
+    let bounded = |handle: Option<JoinHandle<Capture>>| {
+        let handle = handle?;
+        while !handle.is_finished() && std::time::Instant::now() < reader_deadline {
+            std::thread::sleep(BACKGROUND_POLL);
+        }
+        // A reader still blocked is left behind: the runner exits after
+        // writing its result, which ends the thread with it.
+        handle.is_finished().then_some(handle)
+    };
+    let (stdout, stdout_truncated) = join_reader(bounded(stdout_reader), killed, &env.redactor);
+    let (stderr, stderr_truncated) = join_reader(bounded(stderr_reader), killed, &env.redactor);
+    let truncated = stdout_truncated || stderr_truncated;
+
+    match end {
+        End::Exited(status) => {
+            let exit_code = status.code().unwrap_or(1);
+            CommandOutput {
+                exit_code,
+                stdout,
+                stderr,
+                failure_kind: (exit_code != 0).then_some(FailureKind::NonzeroExit),
+                stdout_truncated,
+                stderr_truncated,
+                truncated,
+                stderr_ends_with_note: false,
+                duration_ms,
+            }
+        }
+        End::TimedOut | End::Stopped | End::WaitFailed(_) => CommandOutput {
+            exit_code: -1,
+            stdout,
+            stderr: append_note(stderr, note.unwrap_or_default()),
+            failure_kind: Some(if matches!(end, End::TimedOut) {
+                FailureKind::TimedOut
+            } else {
+                FailureKind::WaitFailed
+            }),
+            stdout_truncated,
+            stderr_truncated,
+            truncated,
+            stderr_ends_with_note: true,
+            duration_ms,
+        },
+    }
+}
+
+/// End every process of a background run: TERM to the command's group and
+/// to this process's descendants, KILL to whatever is left after
+/// [`BACKGROUND_KILL_GRACE`], reaping as it goes. `reaped` says whether the
+/// command itself has already been waited for. Returns whether nothing of
+/// the run was left when it stopped looking.
+fn end_run(pgid: i32, child: &mut std::process::Child, mut reaped: bool) -> bool {
+    let signal_all = |sig: i32| {
+        // SAFETY: a signal to the group the command was started in.
+        unsafe {
+            libc::killpg(pgid, sig);
+        }
+        for pid in descendants() {
+            // SAFETY: a signal to a process that descends from this one.
+            unsafe {
+                libc::kill(pid, sig);
+            }
+        }
+    };
+    let mut settled = |reaped: &mut bool| -> bool {
+        if !*reaped {
+            if let Ok(Some(_)) = child.try_wait() {
+                *reaped = true;
+            }
+        }
+        if *reaped {
+            reap_orphans();
+        }
+        *reaped && !group_present(pgid) && descendants().is_empty()
+    };
+
+    signal_all(libc::SIGTERM);
+    let grace = std::time::Instant::now() + BACKGROUND_KILL_GRACE;
+    while std::time::Instant::now() < grace {
+        if settled(&mut reaped) {
+            return true;
+        }
+        std::thread::sleep(BACKGROUND_POLL);
+    }
+    signal_all(libc::SIGKILL);
+    let limit = std::time::Instant::now() + GROUP_EXIT_WAIT;
+    loop {
+        if settled(&mut reaped) {
+            return true;
+        }
+        if std::time::Instant::now() >= limit {
+            return false;
+        }
+        // Something forked between the looks: it gets the KILL too.
+        signal_all(libc::SIGKILL);
+        std::thread::sleep(BACKGROUND_POLL);
+    }
+}
+
+/// Whether any process is left in the process group `pgid`, a zombie
+/// included.
+fn group_present(pgid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    let r = unsafe { libc::killpg(pgid, 0) };
+    !(r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Reap every child that has exited. Called only once the command spawned
+/// through a `Child` has been waited for, so no handle loses its status.
+fn reap_orphans() {
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid with WNOHANG on any child of this process.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            return;
+        }
+    }
+}
+
+/// The live (not zombie) processes descending from this one, found in
+/// `/proc` by parent links. Empty where there is no `/proc` (macOS), where
+/// the runner relies on the command's process group alone.
+pub fn descendants() -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id() as i32;
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut parent_of: Vec<(i32, i32)> = Vec::new();
+        for entry in dir.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // `pid (comm) state ppid ...`: comm may hold spaces and
+            // parentheses, so the fields are read after the last `)`.
+            let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("");
+            let Some(ppid) = fields.next().and_then(|p| p.parse::<i32>().ok()) else {
+                continue;
+            };
+            if state != "Z" && state != "X" {
+                parent_of.push((pid, ppid));
+            }
+        }
+        let mut found = Vec::new();
+        let mut frontier = vec![me];
+        while let Some(parent) = frontier.pop() {
+            for &(pid, ppid) in &parent_of {
+                if ppid == parent && pid != me && !found.contains(&pid) {
+                    found.push(pid);
+                    frontier.push(pid);
+                }
+            }
+        }
+        found
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
     }
 }
 

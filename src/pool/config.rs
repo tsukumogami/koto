@@ -109,9 +109,118 @@ pub fn lookup_in(text: &str, name: &str) -> PoolLookup {
     }
 }
 
+/// The default `[background] max_timeout_secs` (PRD R19).
+pub const DEFAULT_MAX_TIMEOUT_SECS: u32 = 7200;
+/// The most `[background] max_timeout_secs` may be: a template's own
+/// `timeout_secs` bound.
+pub const MAX_BACKGROUND_TIMEOUT_SECS: i64 = 86_400;
+
+/// The user config's `[background]` table: whether background actions may
+/// run on this machine, and the longest any of them may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundSpec {
+    pub enabled: bool,
+    pub max_timeout_secs: u32,
+}
+
+impl Default for BackgroundSpec {
+    fn default() -> Self {
+        BackgroundSpec {
+            enabled: true,
+            max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// A `[background]` value koto can't use: `key` is the dotted key at
+/// fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundInvalid {
+    pub key: String,
+    pub reason: String,
+}
+
+/// Read `[background]` from the user config file at `path`. Like a pool,
+/// it is user config only and judged where it is used, so a bad value
+/// stops background actions alone rather than every koto command. A file
+/// that never mentions `background` is answered without parsing it.
+pub fn background(path: &Path) -> Result<BackgroundSpec, BackgroundInvalid> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.contains("background") => background_in(&text),
+        _ => Ok(BackgroundSpec::default()),
+    }
+}
+
+/// [`background`] on the config file's text.
+pub fn background_in(text: &str) -> Result<BackgroundSpec, BackgroundInvalid> {
+    let invalid = |key: &str, reason: String| BackgroundInvalid {
+        key: key.to_string(),
+        reason,
+    };
+    let value: toml::Value = text
+        .parse()
+        .map_err(|e| invalid("background", format!("the config file does not parse: {e}")))?;
+    let Some(table) = value.get("background") else {
+        return Ok(BackgroundSpec::default());
+    };
+    let Some(table) = table.as_table() else {
+        return Err(invalid("background", "must be a table".to_string()));
+    };
+    let mut spec = BackgroundSpec::default();
+    match table.get("enabled") {
+        None => {}
+        Some(toml::Value::Boolean(b)) => spec.enabled = *b,
+        Some(_) => {
+            return Err(invalid(
+                "background.enabled",
+                "must be true or false".to_string(),
+            ))
+        }
+    }
+    match table.get("max_timeout_secs") {
+        None => {}
+        Some(toml::Value::Integer(n)) if (1..=MAX_BACKGROUND_TIMEOUT_SECS).contains(n) => {
+            spec.max_timeout_secs = *n as u32
+        }
+        Some(_) => {
+            return Err(invalid(
+                "background.max_timeout_secs",
+                format!("must be a whole number from 1 to {MAX_BACKGROUND_TIMEOUT_SECS}"),
+            ))
+        }
+    }
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_defaults_and_values() {
+        assert_eq!(background_in(""), Ok(BackgroundSpec::default()));
+        assert_eq!(
+            background_in("[background]\nenabled = false\nmax_timeout_secs = 10\n"),
+            Ok(BackgroundSpec {
+                enabled: false,
+                max_timeout_secs: 10,
+            })
+        );
+        for (text, key) in [
+            ("[background]\nenabled = \"no\"\n", "background.enabled"),
+            (
+                "[background]\nmax_timeout_secs = 0\n",
+                "background.max_timeout_secs",
+            ),
+            (
+                "[background]\nmax_timeout_secs = 86401\n",
+                "background.max_timeout_secs",
+            ),
+            ("background = 3\n", "background"),
+        ] {
+            assert_eq!(background_in(text).unwrap_err().key, key, "{text}");
+        }
+    }
 
     #[test]
     fn an_absent_table_is_undefined() {

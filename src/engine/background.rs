@@ -37,6 +37,7 @@ use crate::engine::types::{
     BackgroundFinished, BackgroundStarted, Event, EventPayload, PoolAcquired, PoolReleased,
 };
 use crate::gate::{GateOutcome, StructuredGateResult};
+use crate::pool::config::{BackgroundInvalid, BackgroundSpec};
 use crate::pool::guard::Requester;
 use crate::pool::store::{self, DirUnavailable, Slot};
 use crate::redact::Redactor;
@@ -107,6 +108,54 @@ pub struct RunRecord {
     /// Set once the runner has been spawned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_pid: Option<u32>,
+    /// The runner's start time as [`process_start_token`] read it right
+    /// after the spawn. koto signals the runner only while the process at
+    /// `runner_pid` still has this start time, so a reused pid is never
+    /// signalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_start: Option<u64>,
+    /// The template's `timeout_secs` was cut to `[background]
+    /// max_timeout_secs`; `timeout_secs` holds the cut value.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timeout_capped: bool,
+}
+
+/// A token for when process `pid` started, which changes if the pid is
+/// reused: on Linux the start time in clock ticks since boot from
+/// `/proc/<pid>/stat`, on macOS the start time in microseconds. `None` when
+/// the process is gone or the platform has no such reading, and koto then
+/// signals nothing.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 22, counted after the `)` that ends the command name: the
+        // state is the first field there, so the start time is the 20th.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: an all-zero proc_bsdinfo is a valid out-buffer.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// `result.json`, written by the runner when the command has ended.
@@ -269,6 +318,8 @@ pub struct StartRequest<'a> {
     pub command: &'a str,
     pub working_dir: &'a Path,
     pub timeout_secs: u32,
+    /// `timeout_secs` is the template's, cut to `max_timeout_secs`.
+    pub timeout_capped: bool,
     pub env: &'a crate::action::CommandEnv,
     /// The pool and the slot taken in it, when the action is pooled.
     pub slot: Option<(&'a str, Slot)>,
@@ -322,6 +373,8 @@ pub fn start(req: StartRequest<'_>) -> Result<RunRecord, String> {
         boot_id: boot_id(),
         started_at: store::now_secs(),
         runner_pid: None,
+        runner_start: None,
+        timeout_capped: req.timeout_capped,
     };
     let to_json = |r: &RunRecord| serde_json::to_vec(r).map_err(|e| e.to_string());
     write_atomic(&run_dir, "run.json", &to_json(&record)?)
@@ -384,6 +437,9 @@ pub fn start(req: StartRequest<'_>) -> Result<RunRecord, String> {
         .spawn()
         .map_err(|e| format!("can't start the runner: {e}"))?;
     record.runner_pid = Some(child.id());
+    // Read while the runner is this process's unreaped child, so the pid
+    // can't have been reused yet.
+    record.runner_start = process_start_token(child.id());
 
     let spec_bytes = serde_json::to_vec(&spec).map_err(|e| e.to_string())?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -487,7 +543,7 @@ pub fn load_output(
 }
 
 /// The temporal `__action__` condition a tick stops on while a run is in
-/// flight: `status` is `running`, `orphaned` or `lost`.
+/// flight: `status` is `running` or `orphaned`.
 pub fn in_flight_condition(
     state: &str,
     status: &str,
@@ -509,13 +565,15 @@ pub fn in_flight_condition(
         // Tick again around when the run could have ended, but at least
         // every 15 seconds.
         "running" => (u64::from(timeout).saturating_sub(elapsed)).clamp(1, MAX_RETRY_AFTER_SECS),
-        "lost" => 1,
         _ => MAX_RETRY_AFTER_SECS,
     };
     output["retry_after_secs"] = serde_json::json!(retry_after);
     if let Some(record) = record {
         if let Some(pool) = &record.pool {
             output["pool"] = serde_json::json!(pool);
+        }
+        if record.timeout_capped {
+            output["timeout_capped"] = serde_json::json!(true);
         }
         if status == "orphaned" {
             if let Some(pid) = record.runner_pid {
@@ -562,6 +620,238 @@ pub struct TickRequest<'a> {
     pub env: &'a crate::action::CommandEnv,
     /// The action's pool, and who is asking for its slot.
     pub pool: Option<(&'a str, Requester)>,
+    /// The user config's `[background]` table, and the file it was read
+    /// from, to name in a refusal.
+    pub settings: Result<BackgroundSpec, BackgroundInvalid>,
+    pub config_path: PathBuf,
+}
+
+/// `step` with `events` recorded before whatever it records itself.
+fn with_events(events: Vec<EventPayload>, step: TickStep) -> TickStep {
+    if events.is_empty() {
+        return step;
+    }
+    match step {
+        TickStep::Stop(ActionResult::WithEvents {
+            events: inner,
+            result,
+        }) => TickStep::Stop(ActionResult::WithEvents {
+            events: events.into_iter().chain(inner).collect(),
+            result,
+        }),
+        TickStep::Stop(result) => TickStep::Stop(ActionResult::WithEvents {
+            events,
+            result: Box::new(result),
+        }),
+        TickStep::Finished {
+            output,
+            events: inner,
+        } => TickStep::Finished {
+            output,
+            events: events.into_iter().chain(inner).collect(),
+        },
+    }
+}
+
+/// Whether a run recorded by `started` was started on this machine and
+/// boot. Only such a run is read, signalled or released here (PRD R24).
+fn is_local(started: &BackgroundStarted) -> bool {
+    started.machine == crate::session::version::machine_name()
+        && !matches!((&started.boot_id, boot_id()), (Some(a), Some(b)) if *a != b)
+}
+
+/// How long koto waits for a runner it signalled to be gone (PRD R23).
+pub const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send SIGTERM to the live runner of run `run_id` and wait up to
+/// [`STOP_WAIT`] for it, and then for the run's other processes, to be
+/// gone. Returns whether the runner was signalled and has exited.
+///
+/// koto signals only the runner, and only after checking that the process
+/// at the recorded pid has the recorded start time; the caller has already
+/// checked that the run is this machine's and reads as running. Survivors
+/// of an orphaned run are never signalled: they hold no `runner.lock`, so
+/// such a run never reaches here.
+pub fn stop_runner(session_dir: &Path, run_id: &str, record: &RunRecord) -> bool {
+    let (Some(pid), Some(start)) = (record.runner_pid, record.runner_start) else {
+        return false;
+    };
+    if pid == 0 || pid > i32::MAX as u32 || process_start_token(pid) != Some(start) {
+        return false;
+    }
+    let run_dir = session_dir.join(RUNS_DIR).join(run_id);
+    if !store::probe_held(&run_dir.join("runner.lock")) {
+        return false;
+    }
+    // SAFETY: SIGTERM to the verified runner pid.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    let mut runner_gone = false;
+    while std::time::Instant::now() < deadline {
+        runner_gone = runner_gone || !store::probe_held(&run_dir.join("runner.lock"));
+        if runner_gone && !store::probe_held(&run_dir.join("run.lock")) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    runner_gone
+}
+
+/// What [`settle_unfinished`] did to a session's runs that no tick has
+/// delivered.
+#[derive(Default)]
+pub struct Settled {
+    /// `background_finished` and `pool_released` for every run it settled.
+    pub events: Vec<EventPayload>,
+    /// A run it could not settle: orphaned (its survivors are never
+    /// signalled) or a runner that didn't stop. `(status, run_id, record)`.
+    pub in_flight: Option<(&'static str, String, RunRecord)>,
+}
+
+/// Settle every run of the session that `background_started` recorded and
+/// no `background_finished` has: stop a live runner (recorded as
+/// `cancelled`), and record a run that ended or was lost as such. `only`
+/// limits it to runs of the states it accepts. Used by `koto cancel`,
+/// session removal, leaving a state, and a tick about to start a new run,
+/// so an earlier run never keeps going beside the next one (PRD R22, R23).
+pub fn settle_unfinished(
+    events: &[Event],
+    session_dir: &Path,
+    only: &dyn Fn(&str) -> bool,
+) -> Settled {
+    let mut settled = Settled::default();
+    let finished: std::collections::BTreeSet<&str> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::BackgroundFinished(f) => Some(f.run_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for started in events.iter().filter_map(|e| match &e.payload {
+        EventPayload::BackgroundStarted(b) if !finished.contains(b.run_id.as_str()) => Some(b),
+        _ => None,
+    }) {
+        if !only(&started.state) {
+            continue;
+        }
+        let mut record = |outcome: &str, release: bool| {
+            settled
+                .events
+                .push(EventPayload::BackgroundFinished(BackgroundFinished {
+                    state: started.state.clone(),
+                    run_id: started.run_id.clone(),
+                    outcome: outcome.to_string(),
+                }));
+            if let (Some(pool), true) = (&started.pool, release) {
+                settled
+                    .events
+                    .push(EventPayload::PoolReleased(PoolReleased {
+                        state: started.state.clone(),
+                        pool: pool.clone(),
+                        reason: outcome.to_string(),
+                        run_id: Some(started.run_id.clone()),
+                    }));
+            }
+        };
+        let state = if is_local(started) {
+            read_run(session_dir, &started.run_id)
+        } else {
+            RunState::Lost
+        };
+        match state {
+            RunState::Running(rec) => {
+                if stop_runner(session_dir, &started.run_id, &rec) {
+                    record("cancelled", true);
+                } else if settled.in_flight.is_none() {
+                    settled.in_flight = Some(("running", started.run_id.clone(), rec));
+                }
+            }
+            RunState::Orphaned(rec) => {
+                if settled.in_flight.is_none() {
+                    settled.in_flight = Some(("orphaned", started.run_id.clone(), rec));
+                }
+            }
+            RunState::Finished {
+                result,
+                run_lock_held,
+                ..
+            } => record(result.outcome(), !run_lock_held),
+            RunState::Lost => record("lost", true),
+        }
+    }
+    settled
+}
+
+/// Whether the log records a run no `background_finished` has settled.
+pub fn has_unfinished_run(events: &[Event]) -> bool {
+    crate::session::cloud::unsettled_run_in(events).is_some()
+}
+
+/// `pool_released` for every run whose result was delivered while
+/// processes of it survived and kept the slot, once they have all exited:
+/// `run.lock` is free or the run directory is gone. Only this machine's
+/// runs are looked at.
+pub fn survivor_releases(events: &[Event], session_dir: &Path) -> Vec<EventPayload> {
+    let mut out = Vec::new();
+    for started in events.iter().filter_map(|e| match &e.payload {
+        EventPayload::BackgroundStarted(b) if b.pool.is_some() => Some(b),
+        _ => None,
+    }) {
+        let Some(outcome) = events.iter().find_map(|e| match &e.payload {
+            EventPayload::BackgroundFinished(f) if f.run_id == started.run_id => {
+                Some(f.outcome.clone())
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let released = events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::PoolReleased(r)
+                if r.run_id.as_deref() == Some(started.run_id.as_str()))
+        });
+        if released || !is_local(started) || !is_valid_run_id(&started.run_id) {
+            continue;
+        }
+        let run_lock = session_dir
+            .join(RUNS_DIR)
+            .join(&started.run_id)
+            .join("run.lock");
+        if !store::probe_held(&run_lock) {
+            out.push(EventPayload::PoolReleased(PoolReleased {
+                state: started.state.clone(),
+                pool: started.pool.clone().unwrap_or_default(),
+                reason: outcome,
+                run_id: Some(started.run_id.clone()),
+            }));
+        }
+    }
+    out
+}
+
+/// The run of this session whose `runner.lock` or `run.lock` is held, if
+/// any: a run in flight, which a move must not leave behind (PRD R24).
+pub fn run_in_flight(session_dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(session_dir.join(RUNS_DIR)).ok()?;
+    entries.flatten().find_map(|entry| {
+        let name = entry.file_name().to_str()?.to_string();
+        if !is_valid_run_id(&name) {
+            return None;
+        }
+        let dir = entry.path();
+        (store::probe_held(&dir.join("runner.lock")) || store::probe_held(&dir.join("run.lock")))
+            .then_some(name)
+    })
+}
+
+/// The message of a move refused while run `run_id` is in flight.
+pub fn in_flight_refusal(session: &str, run_id: &str) -> String {
+    format!(
+        "background_run_in_flight: session '{session}' has background run '{run_id}' in flight \
+         on this machine; wait for it to end (or `koto cancel {session}`) before moving the \
+         session"
+    )
 }
 
 /// One tick's handling of a background action ("Tick flow for a pooled
@@ -580,15 +870,36 @@ pub fn tick(req: TickRequest<'_>) -> TickStep {
         EventPayload::BackgroundStarted(b) if b.state == req.state => Some(b),
         _ => None,
     });
+    // Releases owed by earlier runs whose surviving processes have since
+    // exited.
+    let owed = survivor_releases(req.events, req.session_dir);
     if let Some(started) = latest {
         let read = visit.iter().any(|e| {
             matches!(&e.payload, EventPayload::BackgroundFinished(f) if f.run_id == started.run_id)
         });
         if !read {
-            return read_started(&req, started);
+            return with_events(owed, read_started(&req, started));
         }
     }
-    start_run(&req)
+    // A new run is about to start. Any earlier run nobody delivered, a
+    // previous visit's still running say, is settled first: a live runner
+    // is stopped, so the session never runs two copies (PRD R22).
+    let settled = settle_unfinished(req.events, req.session_dir, &|_| true);
+    let mut events = owed;
+    events.extend(settled.events);
+    if let Some((status, run_id, record)) = settled.in_flight {
+        return with_events(
+            events,
+            TickStep::Stop(ActionResult::PoolBlocked(in_flight_condition(
+                &record.state,
+                status,
+                &run_id,
+                Some(&record),
+                req.timeout_secs,
+            ))),
+        );
+    }
+    with_events(events, start_run(&req))
 }
 
 /// Read the visit's run `started`, which no tick has delivered yet.
@@ -610,12 +921,10 @@ fn read_started(req: &TickRequest<'_>, started: &BackgroundStarted) -> TickStep 
     };
     // A run started on another machine, or before this host's last boot,
     // isn't this host's to read: whatever its directory holds, it is lost.
-    let foreign = started.machine != crate::session::version::machine_name()
-        || matches!((&started.boot_id, boot_id()), (Some(a), Some(b)) if *a != b);
-    let state = if foreign {
-        RunState::Lost
-    } else {
+    let state = if is_local(started) {
         read_run(req.session_dir, &started.run_id)
+    } else {
+        RunState::Lost
     };
     match state {
         RunState::Running(record) => {
@@ -643,10 +952,8 @@ fn read_started(req: &TickRequest<'_>, started: &BackgroundStarted) -> TickStep 
         } => {
             let mut events = vec![finished(result.outcome())];
             // While a process of the run survives, the slot is still held,
-            // so no release is recorded here. Nothing records it later yet:
-            // once `background_finished` marks the run read, no tick reads
-            // it again. Recording the release when the survivors exit
-            // belongs with the orphan and survivor handling (PLAN step 4).
+            // so no release is recorded here: a later tick records it once
+            // they have exited (`survivor_releases`).
             if let (Some(pool), false) = (&record.pool, run_lock_held) {
                 events.push(released(pool, result.outcome()));
             }
@@ -665,22 +972,81 @@ fn read_started(req: &TickRequest<'_>, started: &BackgroundStarted) -> TickStep 
             if let Some(pool) = &started.pool {
                 events.push(released(pool, "lost"));
             }
-            TickStep::Stop(ActionResult::WithEvents {
+            // The runner is gone with no result, and nothing of the run
+            // holds the slot: the action failed as `lost`, with no exit
+            // status, and the visit's next tick starts a new run (PRD R21,
+            // R22).
+            TickStep::Finished {
+                output: CommandOutput {
+                    exit_code: -1,
+                    stdout: Default::default(),
+                    stderr: crate::redact::RedactedText::koto_note(format!(
+                        "background run {} was lost: its runner is gone and left no result",
+                        started.run_id
+                    )),
+                    failure_kind: Some(FailureKind::Lost),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    truncated: false,
+                    stderr_ends_with_note: true,
+                    duration_ms: 0,
+                },
                 events,
-                result: Box::new(ActionResult::PoolBlocked(in_flight_condition(
-                    req.state,
-                    "lost",
-                    &started.run_id,
-                    None,
-                    req.timeout_secs,
-                ))),
-            })
+            }
         }
     }
 }
 
+/// The `__action__` condition a background action stops on when the
+/// operator's `[background]` settings refuse it: an error naming its code,
+/// so the action runs nothing until the setting changes.
+fn settings_condition(output: serde_json::Value) -> BTreeMap<String, StructuredGateResult> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        crate::template::types::ACTION_CONDITION_NAME.to_string(),
+        StructuredGateResult {
+            outcome: GateOutcome::Error,
+            output,
+            ..Default::default()
+        },
+    );
+    map
+}
+
 /// Take the action's slot, if it is pooled, and start a run.
 fn start_run(req: &TickRequest<'_>) -> TickStep {
+    // The operator's switch and cap come before the pool, so a machine
+    // that has background actions off never queues for one.
+    let spec = match &req.settings {
+        Ok(spec) => *spec,
+        Err(invalid) => {
+            return TickStep::Stop(ActionResult::PoolBlocked(settings_condition(
+                serde_json::json!({
+                    "status": "invalid",
+                    "error_code": "pool_config_invalid",
+                    "state": req.state,
+                    "config_file": req.config_path.display().to_string(),
+                    "key": invalid.key,
+                    "reason": invalid.reason,
+                }),
+            )))
+        }
+    };
+    if !spec.enabled {
+        return TickStep::Stop(ActionResult::PoolBlocked(settings_condition(
+            serde_json::json!({
+                "status": "disabled",
+                "error_code": "background_disabled",
+                "state": req.state,
+                "config_file": req.config_path.display().to_string(),
+                "key": "background.enabled",
+                "reason": "background actions are switched off on this machine",
+            }),
+        )));
+    }
+    let timeout_capped = req.timeout_secs > spec.max_timeout_secs;
+    let timeout_secs = req.timeout_secs.min(spec.max_timeout_secs);
+
     let mut slot = None;
     // What the guard did to the session's place in the queue, recorded
     // before anything about the slot or the run.
@@ -713,7 +1079,8 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
         run_id: &run_id,
         command: req.command,
         working_dir: req.working_dir,
-        timeout_secs: req.timeout_secs,
+        timeout_secs,
+        timeout_capped,
         env: req.env,
         slot: slot.map(|(p, s, _)| (p, s)),
         koto_root: koto_root.as_deref(),
@@ -745,7 +1112,7 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
                     "running",
                     &run_id,
                     Some(&record),
-                    req.timeout_secs,
+                    timeout_secs,
                 ))),
             })
         }
@@ -837,6 +1204,8 @@ mod tests {
             boot_id: None,
             started_at: store::now_secs(),
             runner_pid: None,
+            runner_start: None,
+            timeout_capped: false,
         };
         write_atomic(&run_dir, "run.json", &serde_json::to_vec(&record).unwrap()).unwrap();
         let runner = create_new(&run_dir.join("runner.lock")).unwrap();

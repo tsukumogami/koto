@@ -3961,26 +3961,55 @@ fn handle_rewind(
 /// come from the log, which names each one's pool and workspace, so nothing
 /// is created.
 ///
+/// A background run still going in a state the session left is stopped the
+/// same way, as `koto cancel` stops one, and recorded `cancelled`: a run
+/// never keeps its slot for a state nobody is in (DESIGN-host-resource-pools.md,
+/// "Tick flow for a pooled action").
+///
 /// `before` is the log as the command found it. A wait is recorded only by
-/// a tick that stops queued, so a wait the command could have left is
-/// already there; when `before` holds none, the log isn't read again and a
-/// session that never queued pays nothing.
+/// a tick that stops queued, and a run only by the tick that started it, so
+/// either one the command could have left is already there; when `before`
+/// holds neither, the log isn't read again and a session that never queued
+/// or ran in the background pays nothing.
 fn release_left_pool_waits(
     backend: &dyn SessionBackend,
     name: &str,
     before: &[crate::engine::types::Event],
 ) {
-    if crate::pool::guard::open_waits(before).is_empty() {
+    #[cfg(unix)]
+    let unfinished_run = crate::engine::background::has_unfinished_run(before);
+    #[cfg(not(unix))]
+    let unfinished_run = false;
+    if crate::pool::guard::open_waits(before).is_empty() && !unfinished_run {
         return;
     }
     let Ok((_, events)) = backend.read_events(name) else {
         return;
     };
+    let current = derive_state_from_log(&events).unwrap_or_default();
+    #[cfg(unix)]
+    if unfinished_run {
+        let settled = crate::engine::background::settle_unfinished(
+            &events,
+            &backend.session_dir(name),
+            &|state| state != current,
+        );
+        if let Some((status, run_id, _)) = settled.in_flight {
+            eprintln!(
+                "warning: background run {run_id} of a state this session left is {status}; \
+                 its processes keep their slot until they exit"
+            );
+        }
+        for payload in settled.events {
+            if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
+                eprintln!("warning: could not record stopping a background run: {e}");
+            }
+        }
+    }
     let waits = crate::pool::guard::open_waits(&events);
     if waits.is_empty() {
         return;
     }
-    let current = derive_state_from_log(&events).unwrap_or_default();
     let koto_root = crate::koto_home::koto_home();
     for wait in waits.into_iter().filter(|w| w.state != current) {
         if let Some(root) = &koto_root {
@@ -4008,6 +4037,60 @@ fn release_left_pool_waits(
             eprintln!("warning: could not record leaving a pool queue: {e}");
         }
     }
+}
+
+/// Stop the session's live background runners and take it out of every
+/// pool queue it waits in, for `koto cancel` and session removal (PRD R23),
+/// before the command returns. Returns the events that record it: a stopped
+/// run's `background_finished` and `pool_released` with `cancelled` (or the
+/// outcome of a run that had already ended), and `pool_released` with
+/// `cancelled` for each queue left. A removal has no log left to append
+/// them to and drops them.
+///
+/// An orphaned run is left alone, since koto never signals its survivors;
+/// they keep their slot until they exit.
+#[cfg(unix)]
+fn stop_session_pool_work(
+    backend: &dyn SessionBackend,
+    name: &str,
+    events: &[crate::engine::types::Event],
+) -> Vec<EventPayload> {
+    let settled =
+        crate::engine::background::settle_unfinished(events, &backend.session_dir(name), &|_| true);
+    if let Some((status, run_id, _)) = &settled.in_flight {
+        eprintln!(
+            "warning: background run {run_id} is {status} and was not stopped; its processes \
+             keep their slot until they exit"
+        );
+    }
+    let mut out = settled.events;
+    let waits = crate::pool::guard::open_waits(events);
+    let koto_root = crate::koto_home::koto_home();
+    for wait in waits {
+        if let Some(root) = &koto_root {
+            match crate::pool::store::leave_queue(root, &wait.pool, name, &wait.workspace) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "warning: pool {:?}'s queue was busy; the entry stays until it lapses",
+                    wait.pool
+                ),
+                Err(e) => eprintln!(
+                    "warning: could not leave pool {:?}'s queue ({e}); the entry stays until \
+                     it lapses",
+                    wait.pool
+                ),
+            }
+        }
+        out.push(EventPayload::PoolReleased(
+            crate::engine::types::PoolReleased {
+                state: wait.state,
+                pool: wait.pool,
+                reason: "cancelled".to_string(),
+                run_id: None,
+            },
+        ));
+    }
+    out
 }
 
 /// Perform the clearing a rewind into `state` owes, warning on failure.
@@ -7799,7 +7882,19 @@ fn handle_next(
                 _ => None,
             };
             let session_dir = backend.session_dir(&name);
+            // `[background]` from the user config, read only here: a
+            // machine with no background actions never reads it.
+            let config_path = crate::koto_home::koto_home()
+                .map(|root| root.join("config.toml"))
+                .unwrap_or_default();
+            let settings = if config_path.as_os_str().is_empty() {
+                Ok(crate::pool::config::BackgroundSpec::default())
+            } else {
+                crate::pool::config::background(&config_path)
+            };
             let step = crate::engine::background::tick(crate::engine::background::TickRequest {
+                settings,
+                config_path,
                 events: &log,
                 session_dir: &session_dir,
                 session: &name,
@@ -10145,6 +10240,15 @@ fn handle_cancel(
                 }),
                 2,
             );
+        }
+    }
+
+    // A live background runner is stopped and any pool queue left first,
+    // and the log says so before it says the session was cancelled.
+    #[cfg(unix)]
+    for payload in stop_session_pool_work(backend, name, &events) {
+        if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
+            eprintln!("warning: could not record releasing the session's pool work: {e}");
         }
     }
 

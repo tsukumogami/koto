@@ -1188,7 +1188,9 @@ pub struct BackgroundStarted {
 }
 
 /// The payload of a [`BACKGROUND_FINISHED`] event: the tick read the run's
-/// end. `outcome` is `done`, `failed`, `timed_out` or `lost`.
+/// end. `outcome` is `done`, `failed`, `timed_out` or `lost`, or
+/// `cancelled` when `koto cancel`, a removal, leaving the state or a new
+/// visit's run stopped it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundFinished {
     pub state: String,
