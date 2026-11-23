@@ -488,8 +488,12 @@ pub const APPEND_LOCK_FILE: &str = "append.lock";
 /// released on drop.
 ///
 /// Every append path takes it, and only around reading the last seq, writing
-/// the line and syncing it: never while a command runs, so a gate's own
-/// `koto context get` can't wait on the tick that is running it. It is a
+/// the line and syncing it. A writer that replaces the log whole (a header
+/// rewrite, a cloud pull) takes it through [`with_log_replace_lock`] and holds
+/// it from reading the log to renaming the replacement over it, which is
+/// longer than an append but still only file I/O. Neither holds it while a
+/// command runs, so a gate's own `koto context get` can't wait on the tick
+/// that is running it; keep slow work out from under it. It is a
 /// dedicated file rather than the log itself, so it never contends with the
 /// state-file lock a batch tick holds for the whole tick.
 ///
@@ -622,7 +626,8 @@ pub fn state_log_busy(e: &anyhow::Error) -> Option<&StateLogBusy> {
 ///
 /// `f` must not append to this log or take this lock again: the lock belongs
 /// to the open file, so a second acquisition on this thread waits on the
-/// first until the wait runs out.
+/// first. An append's wait has no bound and never returns; a bounded wait
+/// runs out as [`StateLogBusy`].
 pub fn with_log_replace_lock<T>(
     path: &Path,
     wait: std::time::Duration,
