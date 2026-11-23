@@ -1174,4 +1174,77 @@ mod tests {
         assert!(history.is_empty());
         assert_eq!(serde_json::to_string(&history).unwrap(), "[]");
     }
+
+    /// A store that, as it is written, tries what a header rewrite does
+    /// first: take the session log's append lock, waiting a short while.
+    /// Whether it got the lock says whether a rewrite could have landed
+    /// between `context add`'s header check and its append.
+    struct WindowProbe {
+        inner: LocalBackend,
+        log: std::path::PathBuf,
+        replacer_got_lock: std::sync::Mutex<Option<bool>>,
+    }
+
+    impl crate::session::context::ContextStore for WindowProbe {
+        fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+            self.inner.add(session, key, content)
+        }
+        fn add_confirmed(
+            &self,
+            session: &str,
+            key: &str,
+            content: &[u8],
+            writer: &str,
+        ) -> anyhow::Result<()> {
+            let got = crate::engine::persistence::with_log_replace_lock(
+                &self.log,
+                std::time::Duration::from_millis(200),
+                || Ok(()),
+            )
+            .is_ok();
+            *self.replacer_got_lock.lock().unwrap() = Some(got);
+            self.inner.add_confirmed(session, key, content, writer)
+        }
+        fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(session, key)
+        }
+        fn ctx_exists(&self, session: &str, key: &str) -> bool {
+            self.inner.ctx_exists(session, key)
+        }
+        fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+            self.inner.remove(session, key)
+        }
+        fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+            self.inner.list_keys(session, prefix)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_replacement_cannot_land_between_the_header_check_and_the_append() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        let probe = WindowProbe {
+            inner: LocalBackend::with_base_dir(dir.path().to_path_buf()),
+            log: dir.path().join("s").join(state_file_name("s")),
+            replacer_got_lock: std::sync::Mutex::new(None),
+        };
+        let input = dir.path().join("in.txt");
+        std::fs::write(&input, b"content").unwrap();
+
+        handle_add(&probe, &backend, "s", "k", Some(input.to_str().unwrap())).unwrap();
+
+        let got = probe
+            .replacer_got_lock
+            .lock()
+            .unwrap()
+            .expect("the store was written");
+        assert!(
+            !got,
+            "context add runs its header check, store write and append with \
+             no lock held across them: a log replacement took the append lock \
+             between them"
+        );
+        assert_eq!(event_types(&backend), vec!["transitioned", "context_added"]);
+    }
 }
