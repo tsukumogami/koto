@@ -238,6 +238,9 @@ pub enum GuardOutcome {
     },
     /// The pool's directory can't be used (`pool_dir_unavailable`).
     DirUnavailable(DirUnavailable),
+    /// The pool is defined, but this platform doesn't run pools
+    /// (`pool_unsupported_platform`, PRD R27).
+    UnsupportedPlatform,
 }
 
 impl GuardOutcome {
@@ -281,6 +284,16 @@ impl GuardOutcome {
                     "pool": pool,
                     "path": e.path.display().to_string(),
                     "reason": e.reason,
+                }),
+            ),
+            GuardOutcome::UnsupportedPlatform => (
+                GateOutcome::Error,
+                serde_json::json!({
+                    "status": "unsupported",
+                    "error_code": "pool_unsupported_platform",
+                    "pool": pool,
+                    "platform": std::env::consts::OS,
+                    "reason": "host pools run on Linux and macOS only",
                 }),
             ),
         };
@@ -331,6 +344,12 @@ pub fn acquire(pool: &str, requester: &Requester) -> Guarded {
             key,
             reason,
         }),
+        // Checked only for a defined pool: an undefined one imposes nothing
+        // on any platform, so a template naming a pool still runs where
+        // pools don't (R6, R27).
+        PoolLookup::Defined(_) if !super::platform::supported() => {
+            unnoted(GuardOutcome::UnsupportedPlatform)
+        }
         PoolLookup::Defined(spec) => {
             if requester.may_nest {
                 if let Some(index) = inherited_slot(pool, &requester.koto_root) {
@@ -652,6 +671,45 @@ mod tests {
         // Once the slot is free the marker is stale and grants nothing.
         drop(held);
         assert_eq!(verify("p/0/tick-a", "p"), None);
+    }
+
+    #[test]
+    fn an_unsupported_platform_stops_a_defined_pool_and_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        config(root.path(), "[pools.p]\nsize = 1\n");
+        let _forced = super::super::platform::force_for_test(false);
+        let guarded = acquire("p", &requester(root.path(), "a"));
+        assert!(matches!(guarded.outcome, GuardOutcome::UnsupportedPlatform));
+        let conditions = guarded.outcome.blocking_condition("p").unwrap();
+        let condition = &conditions[crate::template::types::POOL_CONDITION_NAME];
+        assert_eq!(condition.outcome, crate::gate::GateOutcome::Error);
+        assert_eq!(
+            condition.output["error_code"],
+            serde_json::json!("pool_unsupported_platform")
+        );
+        assert_eq!(condition.output["pool"], serde_json::json!("p"));
+        assert!(
+            !root.path().join("pools").exists(),
+            "an unsupported platform touches no pool directory"
+        );
+        // An undefined pool still runs unthrottled there.
+        assert!(matches!(
+            acquire("other", &requester(root.path(), "a")).outcome,
+            GuardOutcome::Unpooled
+        ));
+    }
+
+    #[test]
+    fn a_supported_platform_takes_a_slot_of_a_defined_pool() {
+        let root = tempfile::tempdir().unwrap();
+        config(root.path(), "[pools.p]\nsize = 1\n");
+        let _forced = super::super::platform::force_for_test(true);
+        let guarded = acquire("p", &requester(root.path(), "a"));
+        assert!(
+            matches!(guarded.outcome, GuardOutcome::Acquired(_)),
+            "got {:?}",
+            guarded.outcome
+        );
     }
 
     #[test]

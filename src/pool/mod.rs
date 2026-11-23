@@ -10,7 +10,13 @@
 //!   queue.
 //! - [`guard`] is what a tick runs before a pooled action: take a slot, wait
 //!   for one, or report the session as queued.
+//! - [`platform`] says whether this platform runs pools at all. It is the
+//!   one part compiled everywhere, since the template compiler asks it.
 
+#[cfg(unix)]
 pub mod config;
+#[cfg(unix)]
 pub mod guard;
+pub mod platform;
+#[cfg(unix)]
 pub mod store;

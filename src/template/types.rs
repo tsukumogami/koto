@@ -951,6 +951,19 @@ fn validate_action_pooling(state_name: &str, action: &ActionDecl) -> Result<(), 
         _ => {}
     }
     if action.background {
+        // The runner needs primitives checked on Linux and macOS only, so
+        // elsewhere the template is refused here rather than failing at the
+        // first tick (PRD R27).
+        if !crate::pool::platform::supported() {
+            return Err(format!(
+                "state {:?}: default_action background: true runs on Linux and macOS only, \
+                 and this koto runs on {}\n  \
+                 remedy: remove background and timeout_secs to run the command as an \
+                 ordinary action",
+                state_name,
+                std::env::consts::OS
+            ));
+        }
         if action.polling.is_some() {
             return Err(format!(
                 "state {:?}: default_action background can't be combined with polling",

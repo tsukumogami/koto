@@ -1906,6 +1906,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // background: true off Linux and macOS (PRD-host-resource-pools.md R27)
+    // -----------------------------------------------------------------------
+
+    mod background_platform {
+        use super::*;
+        use crate::pool::platform::force_for_test;
+
+        const SOURCE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
+            states:\n  a:\n    default_action:\n      command: \"true\"\n\
+            ACTION\
+            \x20   transitions:\n      - target: b\n  b:\n    terminal: true\n---\n\n\
+            ## a\n\nRun.\n\n## b\n\nDone.\n";
+
+        fn compile_action(extra: &str) -> anyhow::Result<CompiledTemplate> {
+            let f = write_temp(&SOURCE.replace("ACTION", extra));
+            compile(f.path(), true)
+        }
+
+        const BACKGROUND: &str = "      background: true\n      timeout_secs: 60\n";
+
+        #[test]
+        fn an_unsupported_platform_refuses_background_naming_the_state() {
+            let _forced = force_for_test(false);
+            let err = compile_action(BACKGROUND).unwrap_err().to_string();
+            assert!(err.contains("\"a\""), "names the state: {err}");
+            assert!(err.contains("background"), "names the field: {err}");
+            assert!(err.contains("Linux and macOS"), "says why: {err}");
+        }
+
+        #[test]
+        fn an_unsupported_platform_still_compiles_a_pooled_ordinary_action() {
+            let _forced = force_for_test(false);
+            compile_action("      pool: test-suite\n").unwrap();
+        }
+
+        #[test]
+        fn a_supported_platform_compiles_background() {
+            let _forced = force_for_test(true);
+            compile_action(BACKGROUND).unwrap();
+        }
+
+        #[test]
+        fn linux_and_macos_compile_background_unforced() {
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                compile_action(BACKGROUND).unwrap();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // pass_env: (DESIGN-koto-fixed-environment.md)
     // -----------------------------------------------------------------------
 
