@@ -763,7 +763,13 @@ pub fn settle_unfinished(
         match state {
             RunState::Running(rec) => {
                 if stop_runner(session_dir, &started.run_id, &rec) {
-                    record("cancelled", true);
+                    // A process that outlived the runner's kill still holds
+                    // the slot: the release waits for `survivor_releases`.
+                    let run_lock = session_dir
+                        .join(RUNS_DIR)
+                        .join(&started.run_id)
+                        .join("run.lock");
+                    record("cancelled", !store::probe_held(&run_lock));
                 } else if settled.in_flight.is_none() {
                     settled.in_flight = Some(("running", started.run_id.clone(), rec));
                 }

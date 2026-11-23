@@ -6224,7 +6224,11 @@ impl CloudBackend {
         // A new import of a session whose background run hasn't been
         // settled would carry a log that says the run is going, to a host
         // that can't read it (PRD R24). The source's own host settles it on
-        // its next tick, or `koto cancel` there stops it.
+        // its next tick, or `koto cancel` there stops it. The log decides,
+        // not the run's locks: those live on the source's host, which this
+        // one usually can't probe. A source whose host is gone for good
+        // stays refused until its log is settled there; no import guesses
+        // that a run it can't see has ended.
         if let Some(run_id) = source.unsettled_run() {
             return Err(ImportError::new(
                 ImportErrorCode::BackgroundRunInFlight,
