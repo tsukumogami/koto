@@ -192,13 +192,62 @@ pub fn snapshot(store: &dyn SessionBackend, session: &str) -> ChainSnapshot {
     walk(store, session).snapshot
 }
 
+/// How a supersede hop is named in a standing path (PRD R41).
+pub const VIA_SUPERSEDE: &str = "supersede";
+
 /// One step of the path a reversal's standing came through: `to` is
 /// reached from `session` by a link written `via`.
+///
+/// A supersede hop (`via` is [`VIA_SUPERSEDE`]) goes from the fenced
+/// session to its successor, and also names the successor's session id
+/// and the fence's actor and time, as the fenced session's marker records
+/// them (R41). A link step carries none of the three, and a body written
+/// before hops were recorded still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathStep {
     pub session: String,
     pub via: String,
     pub to: String,
+    /// The successor's session id, for a supersede hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_id: Option<String>,
+    /// Who ran the command that fenced `session`, for a supersede hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<SupersedeActor>,
+    /// When the fence was appended, for a supersede hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+}
+
+impl PathStep {
+    /// A step reached by a link written `via`.
+    pub fn link(session: &str, via: &str, to: &str) -> Self {
+        PathStep {
+            session: session.to_string(),
+            via: via.to_string(),
+            to: to.to_string(),
+            successor_id: None,
+            actor: None,
+            time: None,
+        }
+    }
+
+    /// The supersede hop from `fenced` its marker records.
+    pub fn hop(fenced: &str, marker: &SupersedeMarker) -> Self {
+        PathStep {
+            session: fenced.to_string(),
+            via: VIA_SUPERSEDE.to_string(),
+            to: marker.successor.name.clone(),
+            successor_id: Some(marker.successor.id.clone()),
+            actor: Some(marker.actor.clone()),
+            time: Some(marker.time.clone()),
+        }
+    }
+
+    /// Whether this step is a supersede hop.
+    pub fn is_hop(&self) -> bool {
+        self.via == VIA_SUPERSEDE
+    }
 }
 
 /// The steps the chain walk from `from` takes to reach `to`, as the links
@@ -216,11 +265,7 @@ pub fn path(store: &dyn SessionBackend, from: &str, to: &str) -> Option<Vec<Path
     let mut current = to.to_string();
     while current != from {
         let parent = walk.reached_from.get(&current)?.clone();
-        steps.push(PathStep {
-            session: parent.clone(),
-            via: via_of(&current)?,
-            to: current,
-        });
+        steps.push(PathStep::link(&parent, &via_of(&current)?, &current));
         current = parent;
         if steps.len() > MAX_CHAIN {
             return None;
@@ -398,4 +443,89 @@ pub fn read(store: &dyn SessionBackend, session: &str) -> ChainRead {
         links,
         incomplete,
     }
+}
+
+// ===== Supersede hops for standing and reads (R39, R40) =====
+
+/// How the supersede hops followed forward from one session reach another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Reached with every hop confirmed: one [`PathStep::hop`] per hop, in
+    /// order.
+    Confirmed(Vec<PathStep>),
+    /// Reached only through a hop koto can't confirm (R40): a marker
+    /// naming a session id other than the successor's own, a fence with no
+    /// marker or with one that can't be read, or more than
+    /// [`MAX_SUPERSEDE_HOPS`] hops.
+    Unconfirmed,
+    /// The forward walk doesn't reach it.
+    No,
+}
+
+/// Follow supersede hops forward from `from` and say how they reach `to`.
+///
+/// Each hop is confirmed as [`read`] confirms it: the marker names a
+/// successor in the store whose header carries the marker's session id.
+/// Where a session has no marker, or one that can't be read, its log's
+/// fence still names the successor, so the walk goes on by that name, but
+/// nothing past it is confirmed. So does a walk past
+/// [`MAX_SUPERSEDE_HOPS`] hops, so a reach beyond the cap is refused as
+/// unconfirmed rather than read as off the chain. A name that isn't a
+/// session name, or one already met, ends the walk. Reads only; no lock,
+/// no pull, no write.
+pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
+    let mut steps = Vec::new();
+    let mut confirmed = true;
+    let mut seen = BTreeSet::from([from.to_string()]);
+    let mut at = from.to_string();
+    for n in 0..2 * MAX_SUPERSEDE_HOPS {
+        if n >= MAX_SUPERSEDE_HOPS {
+            confirmed = false;
+        }
+        let next = match marker::read(&store.session_dir(&at).join("ctx")) {
+            Ok(Some(m)) => {
+                let name = m.successor.name.clone();
+                let holds = session_present(store, &name)
+                    && header_session_id(store, &name).as_deref() == Some(m.successor.id.as_str());
+                confirmed &= holds;
+                if confirmed {
+                    steps.push(PathStep::hop(&at, &m));
+                }
+                name
+            }
+            Ok(None) | Err(_) => {
+                let Some(fence) = crate::session::links::supersede_fence(store, &at) else {
+                    return Reach::No;
+                };
+                confirmed = false;
+                fence.by
+            }
+        };
+        if crate::discover::validate_workflow_name(&next).is_err() || !seen.insert(next.clone()) {
+            return Reach::No;
+        }
+        if next == to {
+            return if confirmed {
+                Reach::Confirmed(steps)
+            } else {
+                Reach::Unconfirmed
+            };
+        }
+        at = next;
+    }
+    Reach::No
+}
+
+/// The sessions among `sessions` whose confirmed supersede hops reach
+/// `session`: the fenced predecessors it stands in for (R39). Only a
+/// session with a readable marker can be one, so a session with none
+/// costs one `stat`.
+pub fn predecessors(store: &dyn SessionBackend, sessions: &[String], session: &str) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|s| s.as_str() != session)
+        .filter(|s| matches!(marker::read(&store.session_dir(s).join("ctx")), Ok(Some(_))))
+        .filter(|s| matches!(hops_to(store, s, session), Reach::Confirmed(_)))
+        .cloned()
+        .collect()
 }
