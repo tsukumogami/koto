@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   Agents on one machine drive many koto sessions at once, often from separate
   workspaces. A few workflow steps, such as a full local test suite, use most
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-host-resource-pools](docs/briefs/BRIEF-host-resource-pools.md); carried in Absorbed Brief.
 
