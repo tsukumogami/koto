@@ -54,6 +54,8 @@ jobs:
           fallback: none
 
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh`: the same nextest `ci` profile, without coverage or
+      # --all-features, falling back to a serial `cargo test` where cargo-nextest isn't installed.
       # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
       # version bump that skips the lock file can't reach a tag.
       - name: Run tests with coverage
@@ -183,6 +185,8 @@ jobs:
           fallback: none
 
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh -p koto-stability-tests`, the same command where
+      # cargo-nextest is installed and a serial `cargo test` where it isn't.
       - name: Run external-consumer stability tests
         run: cargo nextest run --locked -p koto-stability-tests --profile ci
 
