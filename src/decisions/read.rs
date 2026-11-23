@@ -187,11 +187,20 @@ pub struct Filters {
     pub until: Option<String>,
     pub run_mode: Option<String>,
     pub defaulted: Option<bool>,
+    /// Only reversals whose standing path holds a supersede hop from this
+    /// fenced session (R41).
+    pub fenced: Option<String>,
 }
 
 impl Filters {
     pub fn matches(&self, body: &DecisionBody) -> bool {
-        self.kind.as_deref().is_none_or(|k| body.kind == k)
+        self.fenced.as_deref().is_none_or(|f| {
+            body.kind == "reverse"
+                && body
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| p.iter().any(|s| s.is_hop() && s.session == f))
+        }) && self.kind.as_deref().is_none_or(|k| body.kind == k)
             && self
                 .decider
                 .as_deref()
@@ -244,15 +253,22 @@ pub fn sort(entries: &mut [Entry]) {
 /// The sessions in the local store whose chain, walked now, includes
 /// `root`: every session below it, through any number of finished
 /// sessions in between. Sorted by name.
+///
+/// `root` stands in the position of each fenced session whose confirmed
+/// supersede hops reach it (R39), so the sessions below those are below
+/// `root` too. The successor's own links add nothing here beyond its own
+/// chain walk.
 pub fn sessions_below(backend: &Backend, root: &str) -> Vec<String> {
-    local_sessions(backend)
-        .into_iter()
+    let all = local_sessions(backend);
+    let mut roots = chain::predecessors(backend, &all, root);
+    roots.push(root.to_string());
+    all.into_iter()
         .filter(|n| n != root)
         .filter(|n| {
             chain::snapshot(backend, n)
                 .links
                 .iter()
-                .any(|l| l.session == root)
+                .any(|l| roots.contains(&l.session))
         })
         .collect()
 }
