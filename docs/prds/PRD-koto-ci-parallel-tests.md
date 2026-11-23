@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   A koto pull request waits 34 to 41 minutes for its test verdict. CI runs the
   whole suite on one thread, twice per round (Unit Tests and Coverage), against
@@ -19,7 +19,7 @@ absorbed: docs/briefs/BRIEF-koto-ci-parallel-tests.md
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF](docs/briefs/BRIEF-koto-ci-parallel-tests.md); carried in Absorbed Brief.
 
