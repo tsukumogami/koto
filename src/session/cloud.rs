@@ -2424,6 +2424,18 @@ impl CloudBackend {
     /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
     /// the only requests a pull adds, and only when such a batch is there.
     fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
+        self.sync_pull_state_held(id, None)
+    }
+
+    /// [`CloudBackend::sync_pull_state`], for a caller that may already hold
+    /// the local log's append lock: with `held`, the replacement runs under
+    /// that guard instead of taking the lock again, which would wait on the
+    /// guard itself and come back busy.
+    fn sync_pull_state_held(
+        &self,
+        id: &str,
+        held: Option<&crate::engine::persistence::HeldLogLock>,
+    ) -> anyhow::Result<()> {
         let own_tick = self.ticks(id);
         // The tick pulls its own session once. From then on the writes it
         // and its commands make wait in its batch, and the local copy is
@@ -2575,57 +2587,63 @@ impl CloudBackend {
         // lock: an append landing after the comparison read the log would
         // otherwise be dropped by the replacement (koto#239). The copy goes
         // in by temp file and rename, so no reader finds the log truncated.
-        crate::engine::persistence::with_log_replace_lock(
-            &state_path,
-            crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
-            || {
-                refuse_cross_import_pull(id, &state_path, response.bytes())?;
-                // The fetched copy replaces the local log only when it holds
-                // every local event (koto#477). Another directory's copy, or
-                // one pushed before this host's last append went up, may lack
-                // some: the local log is kept then, stamped with the copy it
-                // extends so the next push goes up conditional on it, and a
-                // copy that holds events the local log lacks as well refuses
-                // rather than drop either side.
-                if let Ok(local) = std::fs::read(&state_path) {
-                    let keep_local = match state_log::compare(&local, response.bytes()) {
-                        state_log::LogOrder::Same
-                        | state_log::LogOrder::RemoteExtends
-                        | state_log::LogOrder::Unrelated => false,
-                        // The same events under another header line: the
-                        // bucket's header is newer only when the local file
-                        // is still what this host last synced under this key.
-                        state_log::LogOrder::HeaderOnly => {
-                            !self.stamp(id).is_some_and(|s| s.matches(&local))
-                        }
-                        state_log::LogOrder::LocalExtends => true,
-                        state_log::LogOrder::Diverged => {
-                            return Err(state_log::conflict(
-                                id,
-                                &key,
-                                "the pull was refused",
-                                &local,
-                                response.bytes(),
-                            ))
-                        }
-                    };
-                    if keep_local {
-                        self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-                        return Ok(());
+        let replace = || {
+            refuse_cross_import_pull(id, &state_path, response.bytes())?;
+            // The fetched copy replaces the local log only when it holds
+            // every local event (koto#477). Another directory's copy, or
+            // one pushed before this host's last append went up, may lack
+            // some: the local log is kept then, stamped with the copy it
+            // extends so the next push goes up conditional on it, and a
+            // copy that holds events the local log lacks as well refuses
+            // rather than drop either side.
+            if let Ok(local) = std::fs::read(&state_path) {
+                let keep_local = match state_log::compare(&local, response.bytes()) {
+                    state_log::LogOrder::Same
+                    | state_log::LogOrder::RemoteExtends
+                    | state_log::LogOrder::Unrelated => false,
+                    // The same events under another header line: the
+                    // bucket's header is newer only when the local file
+                    // is still what this host last synced under this key.
+                    state_log::LogOrder::HeaderOnly => {
+                        !self.stamp(id).is_some_and(|s| s.matches(&local))
                     }
-                }
-                crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
-                    .with_context(|| {
-                        format!(
-                            "cloud sync: failed to write the pulled state of session '{}' to {}",
+                    state_log::LogOrder::LocalExtends => true,
+                    state_log::LogOrder::Diverged => {
+                        return Err(state_log::conflict(
                             id,
-                            state_path.display()
-                        )
-                    })?;
-                self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-                Ok(())
-            },
-        )
+                            &key,
+                            "the pull was refused",
+                            &local,
+                            response.bytes(),
+                        ))
+                    }
+                };
+                if keep_local {
+                    self.record_synced(id, Some(&remote_etag), response.bytes(), false);
+                    return Ok(());
+                }
+            }
+            crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
+                .with_context(|| {
+                    format!(
+                        "cloud sync: failed to write the pulled state of session '{}' to {}",
+                        id,
+                        state_path.display()
+                    )
+                })?;
+            self.record_synced(id, Some(&remote_etag), response.bytes(), false);
+            Ok(())
+        };
+        match held {
+            Some(held) => {
+                crate::engine::persistence::with_held_log_lock(held, &state_path, replace)
+            }
+            None => crate::engine::persistence::with_log_replace_lock(
+                &state_path,
+                crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+                replace,
+            ),
+        }
     }
 
     /// What a delete of `id`'s bucket copy needs from its local copy, read
@@ -3721,6 +3739,13 @@ impl CloudBackend {
     /// from the tick on `id` or a command it runs, or inside a write window
     /// on it, the append joins the batch instead and the tick, or `koto
     /// session flush`, pushes it. The caller has run `local_guard`.
+    ///
+    /// The log's append lock is taken first, waiting as a plain append
+    /// waits, and the batch lock after it, the order `koto context add`
+    /// takes them in ([`CloudBackend::add_context_locked`]). An append that
+    /// held the batch lock while it waited for the append lock could wait
+    /// forever on a `context add` that holds the append lock and waits for
+    /// the batch lock.
     fn append_logged(
         &self,
         id: &str,
@@ -3728,14 +3753,104 @@ impl CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
+        let held = crate::engine::persistence::hold_log_lock_blocking(&self.local.state_path(id));
+        self.append_logged_held(id, payload, timestamp, held)
+    }
+
+    /// [`CloudBackend::append_logged`] under `held`, the local log's append
+    /// lock, which the caller took: the line goes in under it, and it is
+    /// released before the push, so no network round trip of the push runs
+    /// under it. The caller has run `local_guard`.
+    ///
+    /// The after-commit steps run with no lock held. They append a nested
+    /// `context_added`, which takes the append lock: run under the batch
+    /// lock, that is the batch lock then the append lock, the reverse of
+    /// every append's order, and two writers of one deferred session could
+    /// each wait on the other forever.
+    fn append_logged_held(
+        &self,
+        id: &str,
+        payload: &crate::engine::types::EventPayload,
+        timestamp: &str,
+        held: crate::engine::persistence::HeldLogLock,
+    ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
         self.check_fence(id)?;
         if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.append_event(id, payload, timestamp);
+            if let Some((journal, lock)) = self.open_batch(id)? {
+                let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+                drop(lock);
+                self.local.after_commit(id, payload, &commit);
+                return self.push_unless_batched(id, &journal);
             }
         }
-        self.local.append_event(id, payload, timestamp)?;
+        // Releases `held` once the line is in, before the after-commit
+        // steps and the push.
+        let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+        self.local.after_commit(id, payload, &commit);
         self.push_state_after_write(id)
+    }
+
+    /// After a deferred append's after-commit steps, which run with the
+    /// batch lock released: a flush that ran in that gap pushed the batch
+    /// without whatever those steps appended, so a batch found closed is
+    /// followed by a push at once, as an append outside a batch is. Its
+    /// lock is taken with no append lock held and released before the push.
+    fn push_unless_batched(&self, id: &str, journal: &Journal) -> anyhow::Result<()> {
+        let still_open = match journal.lock()? {
+            Some(_lock) => journal.is_open(),
+            None => false,
+        };
+        if still_open {
+            return Ok(());
+        }
+        self.push_state_after_write(id)
+    }
+
+    /// [`SessionBackend::add_context_locked`] with the wait for the local
+    /// log's append lock bounded by `wait`.
+    ///
+    /// The lock is taken once, before the pull, and passed to the pull's
+    /// replacement of the local log and to the append, so neither takes it
+    /// again; it is released before the push. Everything between runs under
+    /// it, the pull's requests and the store's upload included: a header
+    /// rewrite or another process's pull waits for it, for at most its own
+    /// bounded wait, and comes back busy if the bucket is slow.
+    ///
+    /// The batch lock, where a step takes it (the pull's flush of an open
+    /// batch, the store write or the append inside a tick or write window),
+    /// is taken after the append lock, the order [`CloudBackend::append_logged`]
+    /// takes them in. A header rewrite inside a batch takes them in the same
+    /// order (see `rewrite_header`), so no path holds the batch lock while
+    /// it waits for the append lock.
+    pub(crate) fn add_context_locked_within(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &crate::engine::types::EventPayload,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        // Before the lock and the pull, as `read_header` checks it, so a
+        // migrated session's local directory gains nothing.
+        self.check_not_migrated(id)?;
+        let held = crate::engine::persistence::hold_log_lock(&self.local.state_path(id), wait)?;
+        self.sync_pull_state_held(id, Some(&held))?;
+        let header = self.local.read_header(id)?;
+        self.note_epoch_read(id, &header);
+        store_write()?;
+        self.local_guard(id)?;
+        // A `context_added` is never spooled; the check is the one
+        // `append_event` makes, kept so this path spools whatever it does.
+        if crate::session::read_spool::spooled(event) && !self.is_own_tick(id) {
+            drop(held);
+            return crate::session::read_spool::append(
+                &self.local.session_dir(id),
+                timestamp,
+                event,
+            );
+        }
+        self.append_logged_held(id, event, timestamp, held)
     }
 
     /// Push `id`'s state file after a write of its log, as
@@ -4794,6 +4909,22 @@ impl SessionBackend for CloudBackend {
         self.append_logged(id, payload, timestamp)
     }
 
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &crate::engine::types::EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.add_context_locked_within(
+            id,
+            store_write,
+            event,
+            timestamp,
+            crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+        )
+    }
+
     /// The read ran in `id`'s own tick, as its reader judged: into the log
     /// and pushed, like any event, with no spool backstop.
     fn append_own_read(
@@ -4867,6 +4998,12 @@ impl SessionBackend for CloudBackend {
     /// The rewrite is fenced like an append, and the epoch it leaves is the
     /// one this process has read from then on, so a rebind's own process
     /// isn't fenced off by the epoch it just bumped.
+    ///
+    /// A deferred rewrite takes the log's append lock before the batch lock,
+    /// the order every append takes them in, and rewrites under the lock it
+    /// holds. Waiting for the append lock while holding the batch lock would
+    /// stall behind an append that holds the append lock and waits for the
+    /// batch lock, until the bounded wait gave up.
     fn rewrite_header(
         &self,
         id: &str,
@@ -4874,16 +5011,24 @@ impl SessionBackend for CloudBackend {
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
         self.check_fence(id)?;
+        if self.defers(id) {
+            let path = self.local.state_path(id);
+            let held = crate::engine::persistence::hold_log_lock(
+                &path,
+                crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+            )?;
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                crate::engine::claim::rewrite_header_atomically_held(&held, &path, f)?;
+                drop(held);
+                self.note_epoch_read(id, &self.local.read_header(id)?);
+                return Ok(());
+            }
+        }
         let rewrite = || -> anyhow::Result<()> {
             self.local.rewrite_header(id, f)?;
             self.note_epoch_read(id, &self.local.read_header(id)?);
             Ok(())
         };
-        if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return rewrite();
-            }
-        }
         rewrite()?;
         self.push_state_after_write(id)
     }
@@ -11002,6 +11147,63 @@ mod tests {
         assert!(started.elapsed() >= hold / 2, "the force pull did not wait");
         holder.join().unwrap();
         assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `context add` takes the log's append lock once and passes it to its
+    /// pull and its append: the pull replaces the log under it rather than
+    /// waiting on it and coming back busy, a replacement from elsewhere is
+    /// kept out until the event is in, and the event lands in the pulled log
+    /// (koto#728).
+    #[cfg(unix)]
+    #[test]
+    fn a_cloud_context_add_pulls_and_appends_under_the_one_lock_it_holds() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let event = crate::engine::types::EventPayload::ContextAdded {
+            key: "k".to_string(),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: Some("agent".to_string()),
+        };
+        let wait = std::time::Duration::from_secs(5);
+        let mut replacement_busy = None;
+        let mut pulled_before_write = false;
+        let started = std::time::Instant::now();
+        backend
+            .add_context_locked_within(
+                "wf",
+                &mut || {
+                    pulled_before_write = fs::read(&state).unwrap() == remote;
+                    let replaced = crate::engine::persistence::with_log_replace_lock(
+                        &state,
+                        std::time::Duration::from_millis(100),
+                        || Ok(()),
+                    );
+                    replacement_busy =
+                        Some(replaced.is_err_and(|e| {
+                            crate::engine::persistence::state_log_busy(&e).is_some()
+                        }));
+                    Ok(())
+                },
+                &event,
+                "2026-01-01T00:00:09Z",
+                wait,
+            )
+            .unwrap();
+        assert!(started.elapsed() < wait, "the add waited on its own lock");
+        assert!(pulled_before_write, "the pull ran before the store write");
+        assert_eq!(replacement_busy, Some(true));
+        let after = fs::read(&state).unwrap();
+        assert!(after.starts_with(&remote), "the event is in the pulled log");
+        let (_, events) = backend.local.read_events("wf").unwrap();
+        assert_eq!(events.last().unwrap().event_type, "context_added");
     }
 
     #[test]

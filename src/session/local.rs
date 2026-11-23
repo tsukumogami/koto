@@ -86,6 +86,86 @@ impl LocalBackend {
         self.journal_root.as_deref()
     }
 
+    /// The path of `id`'s state log.
+    pub(crate) fn state_path(&self, id: &str) -> PathBuf {
+        self.base_dir.join(id).join(state_file_name(id))
+    }
+
+    /// What runs after every committed append to `id`'s log, once the line
+    /// is synced. Best-effort: neither step fails the commit.
+    ///
+    /// Run with no lock on `id` held: materializing the `/workflows` surface
+    /// appends a nested `context_added`, which takes the log's append lock.
+    pub(crate) fn after_commit(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        commit: &persistence::CommitInfo,
+    ) {
+        // Journal the committed payload (best-effort, after the commit, so a
+        // failed append never writes a record), with the seq it took and the
+        // log it was appended to. See `crate::run_journal`.
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload, commit);
+        // Materialize the native Claude Code `/workflows` artifact off the one
+        // commit funnel (opt-in, best-effort: never fails the commit). `self`
+        // is both the SessionBackend (header chain) and the ContextStore
+        // (published locations). See `crate::workflows_surface`.
+        crate::workflows_surface::materialize_after_commit(self, self, id);
+    }
+
+    /// The line of [`SessionBackend::append_event`] for a caller holding
+    /// `id`'s append lock through `held`: the append goes in under it,
+    /// without taking the lock again, and `held` is released once it is in.
+    ///
+    /// The after-commit steps don't run here. The caller runs
+    /// [`LocalBackend::after_commit`] with the returned commit once it has
+    /// released every lock of its own on `id`: they append a nested
+    /// `context_added`, which takes the append lock again and would wait
+    /// forever on its own process, or, under another lock the caller holds,
+    /// take the two in an order another writer reverses.
+    pub(crate) fn commit_event_held(
+        &self,
+        id: &str,
+        held: persistence::HeldLogLock,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<persistence::CommitInfo> {
+        let commit = persistence::append_event_tracked_held(
+            &held,
+            &self.state_path(id),
+            payload,
+            timestamp,
+        )?;
+        drop(held);
+        Ok(commit)
+    }
+
+    /// [`SessionBackend::add_context_locked`] with the wait for `id`'s
+    /// append lock bounded by `wait`.
+    ///
+    /// A session whose directory is missing gets no lock (the sidecar has
+    /// nowhere to go) and fails at the header read, as it did with no lock,
+    /// having created nothing.
+    pub(crate) fn add_context_locked_within(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let path = self.state_path(id);
+        let held = persistence::hold_log_lock(&path, wait)?;
+        persistence::read_header(&path)?;
+        store_write()?;
+        let commit = persistence::append_event_tracked_held(&held, &path, event, timestamp)?;
+        // The event is in: nothing that replaces the log from here on can
+        // drop it, so the after-commit steps run with the lock released.
+        drop(held);
+        self.after_commit(id, event, &commit);
+        Ok(())
+    }
+
     /// The directory sessions are stored under.
     ///
     /// Exposed so maintenance verbs that work on the store as a whole --
@@ -246,16 +326,24 @@ impl SessionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         let commit = persistence::append_event_tracked(&path, payload, timestamp)?;
-        // Journal the committed payload (best-effort, after the commit, so a
-        // failed append above never writes a record), with the seq it took
-        // and the log it was appended to. See `crate::run_journal`.
-        crate::run_journal::after_commit(self.journal_root(), self, id, payload, &commit);
-        // Materialize the native Claude Code `/workflows` artifact off the one
-        // commit funnel (opt-in, best-effort: never fails the commit). `self`
-        // is both the SessionBackend (header chain) and the ContextStore
-        // (published locations). See `crate::workflows_surface`.
-        crate::workflows_surface::materialize_after_commit(self, self, id);
+        self.after_commit(id, payload, &commit);
         Ok(())
+    }
+
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.add_context_locked_within(
+            id,
+            store_write,
+            event,
+            timestamp,
+            persistence::LOG_REPLACE_LOCK_WAIT,
+        )
     }
 
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
@@ -1289,6 +1377,90 @@ mod tests {
         drop(held);
         rewrite_header_identity_within(&dir, "b", std::time::Duration::from_millis(200)).unwrap();
         assert_eq!(persistence::read_header(&state).unwrap().workflow, "b");
+    }
+
+    fn context_added(key: &str, content: &[u8]) -> EventPayload {
+        EventPayload::ContextAdded {
+            key: key.to_string(),
+            hash: crate::cache::sha256_hex(content),
+            size: content.len() as u64,
+            writer: Some(crate::session::context_log::WRITER_AGENT.to_string()),
+        }
+    }
+
+    /// `context add` on a session whose log lock another process holds past
+    /// the wait is busy, retryably, and stores nothing: the store write runs
+    /// only once the lock is held (koto#728).
+    #[cfg(unix)]
+    #[test]
+    fn a_context_add_under_a_held_append_lock_is_busy_and_stores_nothing() {
+        use crate::session::context::ContextStore;
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "s", "2025-01-01T00:00:00Z");
+        let backend = test_backend(tmp.path());
+        let state = backend.state_path("s");
+        let before = fs::read(&state).unwrap();
+        let event = context_added("k", b"v");
+
+        let holder =
+            persistence::hold_append_lock_for(&state, std::time::Duration::from_millis(600));
+        let mut wrote = false;
+        let err = backend
+            .add_context_locked_within(
+                "s",
+                &mut || {
+                    wrote = true;
+                    backend.add_confirmed("s", "k", b"v", "agent")
+                },
+                &event,
+                "2025-01-01T00:00:01Z",
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap_err();
+        holder.join().unwrap();
+        assert!(persistence::state_log_busy(&err).is_some(), "{err:#}");
+        assert!(err.to_string().contains("run the command again"), "{err}");
+        assert!(!wrote);
+        assert!(!backend.ctx_exists("s", "k"));
+        assert_eq!(fs::read(&state).unwrap(), before);
+
+        // Once the lock is free, the same add stores the content and logs it.
+        backend
+            .add_context_locked_within(
+                "s",
+                &mut || backend.add_confirmed("s", "k", b"v", "agent"),
+                &event,
+                "2025-01-01T00:00:01Z",
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(backend.ctx_exists("s", "k"));
+        let (_, events) = backend.read_events("s").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "context_added");
+    }
+
+    /// A session with no directory fails at the header read with no lock to
+    /// take, and the add creates nothing: no directory, no sidecar, no
+    /// stored content.
+    #[test]
+    fn a_context_add_on_a_missing_session_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let mut wrote = false;
+        backend
+            .add_context_locked(
+                "gone",
+                &mut || {
+                    wrote = true;
+                    Ok(())
+                },
+                &context_added("k", b"v"),
+                "2025-01-01T00:00:01Z",
+            )
+            .unwrap_err();
+        assert!(!wrote);
+        assert!(!tmp.path().join("gone").exists());
     }
 
     /// Helper: create a LocalBackend using a temp directory as base.

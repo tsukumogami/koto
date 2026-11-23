@@ -396,25 +396,50 @@ where
     F: FnOnce(StateFileHeader) -> StateFileHeader,
 {
     crate::engine::persistence::with_log_replace_lock(path, wait, || {
-        let original = fs::read_to_string(path)
-            .with_context(|| format!("failed to read state file {}", path.display()))?;
-        let mut lines = original.lines();
-        let header_line = lines
-            .next()
-            .ok_or_else(|| anyhow!("state file {} is empty", path.display()))?;
-        let header: StateFileHeader = serde_json::from_str(header_line)
-            .with_context(|| format!("failed to parse header from {}", path.display()))?;
-        let new_header = mutate(header);
-        let mut content = serde_json::to_string(&new_header).context("serialize header")?;
-        content.push('\n');
-        // `.lines()` strips terminators; every line, the last included,
-        // goes back with its `\n`.
-        for tail in lines {
-            content.push_str(tail);
-            content.push('\n');
-        }
-        crate::engine::persistence::replace_log_bytes(path, content.as_bytes())
+        rewrite_header_under_lock(path, mutate)
     })
+}
+
+/// [`rewrite_header_atomically`] for a caller that already holds the log's
+/// append lock through `held`: the rewrite runs under it, with no second
+/// acquisition. Refused, writing nothing, when `held` locks another log.
+pub(crate) fn rewrite_header_atomically_held<F>(
+    held: &crate::engine::persistence::HeldLogLock,
+    path: &Path,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(StateFileHeader) -> StateFileHeader,
+{
+    crate::engine::persistence::with_held_log_lock(held, path, || {
+        rewrite_header_under_lock(path, mutate)
+    })
+}
+
+/// The body of every header rewrite, run with the log's append lock held by
+/// the caller.
+fn rewrite_header_under_lock<F>(path: &Path, mutate: F) -> Result<()>
+where
+    F: FnOnce(StateFileHeader) -> StateFileHeader,
+{
+    let original = fs::read_to_string(path)
+        .with_context(|| format!("failed to read state file {}", path.display()))?;
+    let mut lines = original.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("state file {} is empty", path.display()))?;
+    let header: StateFileHeader = serde_json::from_str(header_line)
+        .with_context(|| format!("failed to parse header from {}", path.display()))?;
+    let new_header = mutate(header);
+    let mut content = serde_json::to_string(&new_header).context("serialize header")?;
+    content.push('\n');
+    // `.lines()` strips terminators; every line, the last included,
+    // goes back with its `\n`.
+    for tail in lines {
+        content.push_str(tail);
+        content.push('\n');
+    }
+    crate::engine::persistence::replace_log_bytes(path, content.as_bytes())
 }
 
 /// Best-effort write of `assignment_claim` to the header. Failure is
