@@ -147,6 +147,10 @@ pub struct ListArgs {
     /// Only decisions whose decider was (true) or wasn't (false) defaulted
     #[arg(long)]
     pub defaulted: Option<bool>,
+    /// Only reversals whose standing path holds a supersede hop from this
+    /// fenced session: the reversals that one fence enabled
+    #[arg(long, value_name = "SESSION")]
+    pub fenced: Option<String>,
 }
 
 impl ListArgs {
@@ -162,6 +166,7 @@ impl ListArgs {
             || self.until.is_some()
             || self.run_mode.is_some()
             || self.defaulted.is_some()
+            || self.fenced.is_some()
     }
 }
 
@@ -445,6 +450,14 @@ pub fn handle_list(backend: &Backend, name: &str, args: &ListArgs) -> Result<()>
             );
         }
     }
+    if let Some(f) = &args.fenced {
+        if crate::discover::validate_workflow_name(f).is_err() {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid("fenced", "--fenced takes a session name"),
+            );
+        }
+    }
     if !chain::session_present(backend, name) && !backend_holds_remote(backend, name) {
         exit_with_error_code(
             serde_json::json!({
@@ -462,6 +475,7 @@ pub fn handle_list(backend: &Backend, name: &str, args: &ListArgs) -> Result<()>
         until: args.until.clone(),
         run_mode: args.run_mode.clone(),
         defaulted: args.defaulted,
+        fenced: args.fenced.clone(),
     };
     println!(
         "{}",
@@ -840,6 +854,15 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
 
     let placement = match standing::judge(backend, &original, &reverser, &decider, anchor) {
         Ok(p) => p,
+        Err(reason) if reason == reasons::SUPERSEDE_UNCONFIRMED => refuse_recorded(
+            reason,
+            format!(
+                "'{reverser}' would have standing to reverse decision {id} in '{name}' only \
+                 through a supersede hop koto can't confirm ({reason})"
+            ),
+            Some(target),
+            None,
+        ),
         Err(reason) => refuse_recorded(
             reason,
             format!("'{reverser}' has no standing to reverse decision {id} in '{name}' ({reason})"),
