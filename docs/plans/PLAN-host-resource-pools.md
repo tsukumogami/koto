@@ -287,4 +287,54 @@ nesting case shows one `pool_acquired` across the outer and nested sessions.
 
 ### Step 6: an undefined pool costs under 5 ms, older koto runs pooled templates, and the guide explains pools
 
-The cost benchmark (R28), previous-release compatibility (R3, R4), the unsupported-platform path (R27), the authoring guide and the config-precedence correction land together.
+**Goal**: The feature costs nothing measurable when no pool is defined, a
+template that uses it still runs on the previous koto release, an unsupported
+platform fails clearly, and an author or operator can learn pools and
+background actions from the docs and skills alone. Steps 1 to 5 built and
+tested the behaviour; this step adds the cost and compatibility evidence, the
+platform path, the authoring guide, the skill updates and the config-precedence
+correction.
+
+**Acceptance Criteria**:
+
+- [ ] A tick-cost check reports the median of 50 ticks on a state whose action
+  names an undefined pool at most 5 ms above the median of 50 ticks on the same
+  state with no `pool` field, measured in one run, and runs in a job the Linux
+  CI runner executes.
+- [ ] Every template under the repository's compiled-snapshot fixtures still
+  compiles to byte-identical output and the same template hash, and a template
+  that uses none of `pool`, `background` or `timeout_secs` is added to them.
+- [ ] A compat script in `test/compat/` shows the previous released koto
+  compiling and running a template with `pool: test-suite` unthrottled, and
+  `koto status` on that release reading a session log that holds all five new
+  event types without error.
+- [ ] A unit test that forces the platform check to report an unsupported
+  platform sees a pooled action on a defined pool stop with
+  `pool_unsupported_platform` and `background: true` refused at compile time;
+  on Linux and macOS neither happens.
+- [ ] An authoring guide in `docs/guides/` explains `pool`, `background` and
+  `timeout_secs`, the `[pools.<name>]` and `[background]` settings with their
+  defaults and ranges, that an undefined pool is no limit, the queued
+  condition, `koto pool status`, the nesting marker, the `orphaned` and `lost`
+  outcomes and `timeout_capped`; every `koto` verb and repo path it names
+  resolves under `cargo test --test doc_names`.
+- [ ] The koto-user, koto-author and koto-adhoc skills describe what each
+  needs of the new surface (the `__pool__` condition and background run
+  statuses for running workflows, the template fields and compile errors for
+  authoring), and `docs/guides/cli-usage.md` states the config precedence the
+  code applies and lists the pool keys as user-only.
+
+**Check**: Run `cargo test --test pool_compat` and `cargo test --test doc_names`
+and see both pass; the tick-cost check prints both medians and their
+difference.
+
+**Dependencies**: Step 5
+
+**Files**: `benches/` or `tests/pool_compat.rs`, `.github/workflows/`,
+`test/compat/`, `tests/fixtures/compiled-snapshots/`, `src/pool/`,
+`src/template/compile.rs`, `docs/guides/`, `docs/guides/cli-usage.md`,
+`plugins/koto-skills/skills/`
+
+**Type**: code
+
+**Complexity**: testable
