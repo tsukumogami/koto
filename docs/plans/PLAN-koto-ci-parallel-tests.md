@@ -106,7 +106,23 @@ What steps 1 and 2 left: `.config/nextest.toml` has the `ci` profile (`retries =
 
 ### Step 4: The suite's notes and the PR's evidence match the new isolation
 
-Comments that claim a single thread describe process-per-test isolation, and three consecutive timed green runs are recorded in the PR.
+**Goal**: Nothing under `src/` or `tests/` still tells a reader the suite depends on running single-threaded, and the PR carries the timing evidence that the new `tests` job meets the 15-minute target on three consecutive runs. Two test-support comments still give `--test-threads=1` as the reason a `$HOME` swap is safe: `ScratchHome` in `src/cli/mod.rs` (around line 11880) and `HomeGuard` in `src/workflows_surface/materialize.rs` (around line 1176). Both are rewritten to say nextest runs each test in its own process, so the swap can't race another test; the serial fallback in `scripts/run-tests.sh` keeps that true locally too. These mentions stay as they are, because they are accurate: `src/cli/mod.rs` line 70 and `src/session/sync.rs` line 85 describe the koto CLI's own single-threaded runtime, not the tests; `tests/cloud_integration_test.rs` line 8 documents how to run that credentialed suite, which the `cloud-integration` job still runs serially against a shared bucket; and the five tests that re-run their own binary (`tests/decider_client.rs`, `tests/host_session_env.rs`, `tests/koto_command_env.rs`, `tests/session_store_env.rs`, `tests/test_home_env.rs`) pass `--test-threads=1` to that child on purpose.
+
+What steps 1 to 3 left: the `tests` job ("Tests and Coverage") runs `cargo llvm-cov nextest --locked --all-features --profile ci`, and `stability-tests` runs on nextest; `validate` fails unless both succeed; the verification map's two test commands run `scripts/run-tests.sh`, which uses nextest when it is on PATH and the serial run with a notice otherwise. The first hosted run of `tests` took 14 minutes. This step's own verification still reads main's serial map, because verification reads the map from the merge base.
+
+**Acceptance Criteria**:
+
+- [ ] The `ScratchHome` comment in `src/cli/mod.rs` and the `HomeGuard` comment in `src/workflows_surface/materialize.rs` describe process-per-test isolation under nextest, with the serial fallback named for local runs, and no longer cite `--test-threads=1` or `.github/workflows/validate.yml` as what makes them safe
+- [ ] `git grep -n -e 'test-threads' -e 'single-thread' -e 'single thread' -- src tests` matches only the five child-process invocations, the cloud-integration run instruction, and the two CLI-runtime comments named above
+- [ ] The diff touches no non-comment line under `src/`, and adds no `#[ignore]` and removes no `#[test]` or `#[tokio::test]`
+- [ ] The PR's `validate` workflow passes on three consecutive runs at this step's pushed head, and in each run the "Tests and Coverage" job is green, its cache step reports a hit, and it finishes in 15 minutes or less
+- [ ] The step's `summary.md` lists the three runs (run id, "Tests and Coverage" duration, cache hit yes/no), the step 1 run id and duration, and step 2's evidence: the four probe run ids with their job and `validate` results, the parity baseline run id, and the executed and ignored counts for the baseline and the new job. The owning session copies it into the PR description
+
+**Check**: Edit the two comments, then run `git grep -n -e 'test-threads' -e 'single-thread' -e 'single thread' -- src tests` and confirm only the listed lines match. Run `git diff main... -- src | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '^[+-]\s*(//|$)'` and confirm it prints nothing. Push the head, then start the `validate` workflow on it three times in a row with `gh run rerun` (rerun the whole run, not only failed jobs), waiting for each to finish. For each, read the "Tests and Coverage" job's duration and its cache step's hit line. If a run fails on a test this change doesn't touch (the known flakes koto#499 and koto#724), record it, rerun, and count only an unbroken series of three green runs. Write the evidence list into `summary.md`.
+
+**Dependencies**: Step 3
+
+**Files**: `src/cli/mod.rs`, `src/workflows_surface/materialize.rs`
 
 ## Implementation Sequence
 
