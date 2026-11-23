@@ -230,7 +230,60 @@ death and no signal recorded against it.
 
 ### Step 5: koto pool status shows holders and waiters, and bad config fails only where used
 
-`koto pool status` and pool events report holders and waiters, and invalid config, project keys, an unsafe pools directory and nested requests behave as R5, R7, R13, R14, R25 and R26 require.
+**Goal**: An operator can see who holds and who waits on each pool on the
+host, and a pooled command that runs koto again runs on the slot it already
+holds. Steps 1 to 4 already reject an invalid pool at the tick that reaches it,
+drop a project config's pool keys, refuse an unwritable pools directory and
+append the pool and background events; this step adds `koto pool status`, the
+nesting marker that keeps a nested same-pool request on the outer slot, and
+end-to-end checks that the config, directory and event rules hold together.
+
+**Acceptance Criteria**:
+
+- [ ] `koto pool status --json` lists each configured pool with `size`, `held`,
+  `free` (never below 0), `waiting`, each holder (session, workspace, state,
+  held time) and each waiter in queue order (session, workspace, waited time);
+  the plain form prints one block per pool with the same values.
+- [ ] Neither form changes any file's modification time under the koto root,
+  and both complete while another process holds a session's state lock and
+  while a holder is mid-run; with no pools configured it says so and exits 0.
+- [ ] A template naming `pool: other` while only `[pools.test-suite]` is
+  defined runs its action as without `pool`, and `koto pool status` doesn't
+  list `other`.
+- [ ] For each of `size = "two"`, `0`, `-1`, `1.5`, `1025`, a missing `size`,
+  `claim_secs = 0`, `lapse_secs = 86401` and `wait_secs = 61`: `koto status`,
+  `koto config list` and a tick that doesn't reach the pool succeed; a tick
+  reaching the pooled action stops with `pool_config_invalid` naming the
+  config file and the key and runs nothing; `koto pool status` reports the
+  pool with that code and exits 1. `size = 1024`, `claim_secs = 1`,
+  `lapse_secs = 86400` and `wait_secs = 0` are accepted.
+- [ ] A project config setting `pools.test-suite.size = 1` changes nothing, and
+  `koto config list` lists the key among dropped keys.
+- [ ] A background command under a size-1 pool that runs a nested koto session
+  reaching a pooled action on the same pool, and separately runs a pooled
+  action directly, finishes without waiting and without a second
+  `pool_acquired`; a nested action on a different defined pool, and a nested
+  koto run with the same pool but another `KOTO_HOME`, queue normally.
+- [ ] With the pools directory made unwritable, a tick reaching a pooled action
+  stops with `pool_dir_unavailable` naming the path and runs nothing.
+- [ ] A queued, acquired, then released background run appends `pool_queued`,
+  `pool_acquired`, `background_started`, `background_finished` and
+  `pool_released` (reason `done`) in that order, each pool event naming the
+  pool and both background events carrying the same `run_id`; five
+  consecutive queued ticks append one `pool_queued`.
+
+**Check**: Run `cargo test --test pool_status` and see every case pass; the
+nesting case shows one `pool_acquired` across the outer and nested sessions.
+
+**Dependencies**: Step 4
+
+**Files**: `src/cli/pool.rs`, `src/cli/mod.rs`, `src/pool/store.rs`,
+`src/pool/guard.rs`, `src/engine/command_env.rs`, `src/engine/background.rs`,
+`tests/pool_status.rs`
+
+**Type**: code
+
+**Complexity**: testable
 
 ### Step 6: an undefined pool costs under 5 ms, older koto runs pooled templates, and the guide explains pools
 
