@@ -682,12 +682,23 @@ fn read_started(req: &TickRequest<'_>, started: &BackgroundStarted) -> TickStep 
 /// Take the action's slot, if it is pooled, and start a run.
 fn start_run(req: &TickRequest<'_>) -> TickStep {
     let mut slot = None;
+    // What the guard did to the session's place in the queue, recorded
+    // before anything about the slot or the run.
+    let mut events = Vec::new();
     if let Some((pool, requester)) = &req.pool {
-        let outcome = crate::pool::guard::acquire(pool, requester);
-        if let Some(conditions) = outcome.blocking_condition(pool) {
-            return TickStep::Stop(ActionResult::PoolBlocked(conditions));
+        let guarded = crate::pool::guard::acquire(pool, requester);
+        events = guarded.queue_events(pool, requester);
+        if let Some(conditions) = guarded.outcome.blocking_condition(pool) {
+            let blocked = ActionResult::PoolBlocked(conditions);
+            if events.is_empty() {
+                return TickStep::Stop(blocked);
+            }
+            return TickStep::Stop(ActionResult::WithEvents {
+                events,
+                result: Box::new(blocked),
+            });
         }
-        if let crate::pool::guard::GuardOutcome::Acquired(s) = outcome {
+        if let crate::pool::guard::GuardOutcome::Acquired(s) = guarded.outcome {
             slot = Some((*pool, s, requester.koto_root.clone()));
         }
     }
@@ -707,16 +718,18 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
         slot: slot.map(|(p, s, _)| (p, s)),
         koto_root: koto_root.as_deref(),
     });
+    let acquired = |pool: &str, index: usize| {
+        EventPayload::PoolAcquired(PoolAcquired {
+            state: req.state.to_string(),
+            pool: pool.to_string(),
+            slot: index,
+            run_id: Some(run_id.clone()),
+        })
+    };
     match started {
         Ok(record) => {
-            let mut events = Vec::new();
             if let (Some(pool), Some(index)) = (&pool, slot_index) {
-                events.push(EventPayload::PoolAcquired(PoolAcquired {
-                    state: req.state.to_string(),
-                    pool: pool.clone(),
-                    slot: index,
-                    run_id: Some(run_id.clone()),
-                }));
+                events.push(acquired(pool, index));
             }
             events.push(EventPayload::BackgroundStarted(BackgroundStarted {
                 state: req.state.to_string(),
@@ -737,23 +750,36 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
             })
         }
         // Nothing was started, so this is the action's spawn failure, and
-        // the slot went back when `start` dropped it.
-        Err(message) => TickStep::Finished {
-            output: CommandOutput {
-                exit_code: -1,
-                stdout: Default::default(),
-                stderr: crate::redact::RedactedText::koto_note(format!(
-                    "failed to start the background runner: {message}"
-                )),
-                failure_kind: Some(FailureKind::SpawnFailed),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                truncated: false,
-                stderr_ends_with_note: true,
-                duration_ms: 0,
-            },
-            events: Vec::new(),
-        },
+        // the slot went back when `start` dropped it. Taking it left the
+        // queue, so the log says so: a later tick must not read the
+        // session as still waiting.
+        Err(message) => {
+            if let (Some(pool), Some(index)) = (&pool, slot_index) {
+                events.push(acquired(pool, index));
+                events.push(EventPayload::PoolReleased(PoolReleased {
+                    state: req.state.to_string(),
+                    pool: pool.clone(),
+                    reason: "failed".to_string(),
+                    run_id: Some(run_id.clone()),
+                }));
+            }
+            TickStep::Finished {
+                output: CommandOutput {
+                    exit_code: -1,
+                    stdout: Default::default(),
+                    stderr: crate::redact::RedactedText::koto_note(format!(
+                        "failed to start the background runner: {message}"
+                    )),
+                    failure_kind: Some(FailureKind::SpawnFailed),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    truncated: false,
+                    stderr_ends_with_note: true,
+                    duration_ms: 0,
+                },
+                events,
+            }
+        }
     }
 }
 

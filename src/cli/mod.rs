@@ -3916,6 +3916,9 @@ fn handle_rewind(
     // state's next tick clears them before anything reads context.
     clear_after_rewind(backend, context_store, name, &header, &events, &prev_state);
 
+    // A waiter rewound out of its pool state leaves the queue now.
+    release_left_pool_waits(backend, name, &events);
+
     // Re-read events to include the Rewound event we just appended.
     let (_, events_after) = match backend.read_events(name) {
         Ok(result) => result,
@@ -3948,6 +3951,63 @@ fn handle_rewind(
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Take the session out of every pool queue it waits in for a state it is no
+/// longer in, and record `pool_released` with reason `left_state` for each
+/// (PRD R12). A transition, a rewind or completion moves the session out of
+/// the state it queued in; this runs before the command that did it returns,
+/// so a `koto pool status` right after no longer lists it. The open waits
+/// come from the log, which names each one's pool and workspace, so nothing
+/// is created.
+///
+/// `before` is the log as the command found it. A wait is recorded only by
+/// a tick that stops queued, so a wait the command could have left is
+/// already there; when `before` holds none, the log isn't read again and a
+/// session that never queued pays nothing.
+fn release_left_pool_waits(
+    backend: &dyn SessionBackend,
+    name: &str,
+    before: &[crate::engine::types::Event],
+) {
+    if crate::pool::guard::open_waits(before).is_empty() {
+        return;
+    }
+    let Ok((_, events)) = backend.read_events(name) else {
+        return;
+    };
+    let waits = crate::pool::guard::open_waits(&events);
+    if waits.is_empty() {
+        return;
+    }
+    let current = derive_state_from_log(&events).unwrap_or_default();
+    let koto_root = crate::koto_home::koto_home();
+    for wait in waits.into_iter().filter(|w| w.state != current) {
+        if let Some(root) = &koto_root {
+            match crate::pool::store::leave_queue(root, &wait.pool, name, &wait.workspace) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "warning: pool {:?}'s queue was busy; the entry of state {:?} \
+                     stays until it lapses",
+                    wait.pool, wait.state
+                ),
+                Err(e) => eprintln!(
+                    "warning: could not leave pool {:?}'s queue ({e}); the entry \
+                     of state {:?} stays until it lapses",
+                    wait.pool, wait.state
+                ),
+            }
+        }
+        let released = EventPayload::PoolReleased(crate::engine::types::PoolReleased {
+            state: wait.state,
+            pool: wait.pool,
+            reason: "left_state".to_string(),
+            run_id: None,
+        });
+        if let Err(e) = backend.append_event(name, &released, &now_iso8601()) {
+            eprintln!("warning: could not record leaving a pool queue: {e}");
+        }
+    }
 }
 
 /// Perform the clearing a rewind into `state` owes, warning on failure.
@@ -7706,29 +7766,36 @@ fn handle_next(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
+        // The log as it is now, read only for a pooled or background action:
+        // a state entered earlier in this tick has no run or queue entry yet,
+        // and this read can't mistake an older visit's for it. A read that
+        // fails falls back to the log as the tick began, which holds every
+        // run and wait an earlier tick recorded; only a visit begun in this
+        // same tick could be misread, and it has neither.
+        let log = if action.background || action.pool.is_some() {
+            backend
+                .read_events(&name)
+                .map(|(_, events)| events)
+                .unwrap_or_else(|_| current_events.clone())
+        } else {
+            Vec::new()
+        };
+        // Who asks the pool for a slot. `was_waiting` is the log's word that
+        // this visit already queued, which is how a waiter whose entry was
+        // swept learns it lapsed (PRD R12, R26).
+        let requester = |pool: &str, koto_root: std::path::PathBuf| crate::pool::guard::Requester {
+            koto_root,
+            session: name.clone(),
+            workspace: workspace_name(),
+            state: state_name.to_string(),
+            was_waiting: crate::pool::guard::waiting_in_visit(&log, state_name, pool),
+        };
         #[cfg(unix)]
         let mut background_events: Vec<EventPayload> = Vec::new();
         #[cfg(unix)]
         let background_output = if action.background {
-            // The log as it is now: a state entered earlier in this tick has
-            // no run yet, and this read can't mistake an older visit's for it.
-            // A read that fails falls back to the log as the tick began,
-            // which holds every run an earlier tick started; only a visit
-            // begun in this same tick could be misread, and it has no run.
-            let log = backend
-                .read_events(&name)
-                .map(|(_, events)| events)
-                .unwrap_or_else(|_| current_events.clone());
             let pool = match (&action.pool, crate::koto_home::koto_home()) {
-                (Some(pool), Some(koto_root)) => Some((
-                    pool.as_str(),
-                    crate::pool::guard::Requester {
-                        koto_root,
-                        session: name.clone(),
-                        workspace: workspace_name(),
-                        state: state_name.to_string(),
-                    },
-                )),
+                (Some(pool), Some(koto_root)) => Some((pool.as_str(), requester(pool, koto_root))),
                 _ => None,
             };
             let session_dir = backend.session_dir(&name);
@@ -7765,20 +7832,32 @@ fn handle_next(
         // `_pool_slot` until this closure returns, after the command; its
         // descriptor is inherited by the command, so anything the command
         // leaves running keeps the slot held too (PRD R10).
+        //
+        // What the guard did is recorded (R26): `pool_queued` once on
+        // joining, `pool_released` for a wait that lapsed or whose pool
+        // went away, and `pool_acquired` then, once the command returns,
+        // `pool_released` for a slot. They are appended before the action's
+        // own record. The pool whose slot this tick holds goes in
+        // `pool_held`, for the release.
+        let mut pool_events: Vec<EventPayload> = Vec::new();
+        let mut pool_held: Option<String> = None;
         let _pool_slot = match (&action.pool, crate::koto_home::koto_home()) {
             _ if is_background => None,
             (Some(pool), Some(koto_root)) => {
-                let requester = crate::pool::guard::Requester {
-                    koto_root,
-                    session: name.clone(),
-                    workspace: workspace_name(),
-                    state: state_name.to_string(),
-                };
-                let outcome = crate::pool::guard::acquire(pool, &requester);
-                if let Some(conditions) = outcome.blocking_condition(pool) {
-                    return ActionResult::PoolBlocked(conditions);
+                let requester = requester(pool, koto_root);
+                let guarded = crate::pool::guard::acquire(pool, &requester);
+                pool_events = guarded.queue_events(pool, &requester);
+                if let Some(conditions) = guarded.outcome.blocking_condition(pool) {
+                    let blocked = ActionResult::PoolBlocked(conditions);
+                    if pool_events.is_empty() {
+                        return blocked;
+                    }
+                    return ActionResult::WithEvents {
+                        events: pool_events,
+                        result: Box::new(blocked),
+                    };
                 }
-                match outcome {
+                match guarded.outcome {
                     crate::pool::guard::GuardOutcome::Acquired(slot) => {
                         if let Err(e) = slot.inherit_into_children() {
                             eprintln!(
@@ -7786,6 +7865,15 @@ fn handle_next(
                                  it is held only while koto waits for the command"
                             );
                         }
+                        pool_events.push(EventPayload::PoolAcquired(
+                            crate::engine::types::PoolAcquired {
+                                state: state_name.to_string(),
+                                pool: pool.clone(),
+                                slot: slot.index,
+                                run_id: None,
+                            },
+                        ));
+                        pool_held = Some(pool.clone());
                         Some(slot)
                     }
                     _ => None,
@@ -7942,10 +8030,28 @@ fn handle_next(
                 duration_ms,
             }
         };
+        // The slot goes back as this closure returns; the release is
+        // recorded with the outcome of the command it was taken for.
+        if let Some(pool) = pool_held {
+            let reason = match output.failure_kind {
+                None => "done",
+                Some(crate::action::FailureKind::TimedOut) => "timed_out",
+                Some(_) => "failed",
+            };
+            pool_events.push(EventPayload::PoolReleased(
+                crate::engine::types::PoolReleased {
+                    state: state_name.to_string(),
+                    pool,
+                    reason: reason.to_string(),
+                    run_id: None,
+                },
+            ));
+        }
         #[cfg(unix)]
-        if !background_events.is_empty() {
+        pool_events.append(&mut background_events);
+        if !pool_events.is_empty() {
             return ActionResult::WithEvents {
-                events: background_events,
+                events: pool_events,
                 result: Box::new(result),
             };
         }
@@ -7995,6 +8101,11 @@ fn handle_next(
         crate::engine::advance::AdvanceOptions { evidence_recorded },
     );
     drop(decider_port);
+
+    // A waiter this tick moved out of its pool state (a transition, or
+    // reaching a terminal state) leaves the queue before the response goes
+    // out (PRD R12).
+    release_left_pool_waits(backend, &name, &current_events);
 
     // Issue #263: a tick that leaves a batching state records the batch it
     // leaves, if that batch is complete. This is decided here, against the

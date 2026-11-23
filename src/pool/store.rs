@@ -210,17 +210,24 @@ pub fn holders(dir: &Path) -> Vec<(usize, Option<Holder>)> {
         .collect()
 }
 
+/// How many of a pool of `size`'s slots are free: `size` minus the slot
+/// files held, of any index, never below 0. A pool shrunk below its holders
+/// has none free until fewer than `size` are held (PRD R8).
+pub fn free_slots(dir: &Path, size: u32) -> usize {
+    let held = slot_files(dir)
+        .iter()
+        .filter(|(_, path)| probe_held(path))
+        .count();
+    (size as usize).saturating_sub(held)
+}
+
 /// Take a free slot of a pool of `size`, writing `holder` into it.
 ///
 /// Every slot file present is probed first, whatever its index, so a pool
 /// shrunk below its holders admits nobody until fewer than `size` are held
 /// (PRD R8). Returns `None` when no slot is free.
 pub fn try_acquire(dir: &Path, size: u32, holder: &Holder) -> std::io::Result<Option<Slot>> {
-    let held = slot_files(dir)
-        .iter()
-        .filter(|(_, path)| probe_held(path))
-        .count();
-    if held >= size as usize {
+    if free_slots(dir, size) == 0 {
         return Ok(None);
     }
     for index in 0..size as usize {
@@ -251,6 +258,14 @@ pub struct QueueEntry {
     pub last_seen: u64,
 }
 
+/// A free slot reserved for one waiter until `deadline` (PRD R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub ticket: u64,
+    /// Unix seconds after which the claim passes to the next waiter.
+    pub deadline: u64,
+}
+
 /// `queue.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queue {
@@ -258,6 +273,10 @@ pub struct Queue {
     pub next_ticket: u64,
     #[serde(default)]
     pub entries: Vec<QueueEntry>,
+    /// The waiter a free slot is reserved for, if any. A file written before
+    /// claims existed reads as none.
+    #[serde(default)]
+    pub claim: Option<Claim>,
 }
 
 impl Queue {
@@ -266,6 +285,90 @@ impl Queue {
         self.entries
             .iter()
             .position(|e| e.session == session && e.workspace == workspace)
+    }
+
+    /// Drop every waiter that hasn't ticked for more than `lapse_secs`
+    /// (PRD R12). The waiters behind one move up. Returns whether any went.
+    pub fn sweep_lapsed(&mut self, now: u64, lapse_secs: u32) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| now.saturating_sub(e.last_seen) <= u64::from(lapse_secs));
+        self.entries.len() != before
+    }
+
+    /// Find this session's entry and mark it seen now, or add one at the
+    /// back. Returns the entry's index and whether it was added.
+    pub fn join_or_refresh(&mut self, session: &str, workspace: &str, now: u64) -> (usize, bool) {
+        if let Some(i) = self.position_of(session, workspace) {
+            self.entries[i].last_seen = now;
+            return (i, false);
+        }
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.entries.push(QueueEntry {
+            ticket,
+            session: session.to_string(),
+            workspace: workspace.to_string(),
+            joined_at: now,
+            last_seen: now,
+        });
+        (self.entries.len() - 1, true)
+    }
+
+    /// Bring the claim up to date for `free` slots (PRD R11, DESIGN "Taking
+    /// a slot", step 4).
+    ///
+    /// With no free slot there is nothing to reserve, so the claim goes; the
+    /// next slot that frees starts a new one on the head waiter, which is
+    /// how a waiter that was skipped keeps first place. With a free slot,
+    /// a claim whose waiter has left goes, a claim whose deadline passed
+    /// moves to the waiter after it with a fresh deadline (the skipped one
+    /// keeps its place), and with none the head waiter gets one. A claim
+    /// starts at the first edit that sees the slot free, whether its holder
+    /// exited cleanly or was killed: nothing depends on the holder saying
+    /// it left.
+    pub fn settle_claim(&mut self, free: usize, claim_secs: u32, now: u64) {
+        if free == 0 || self.entries.is_empty() {
+            self.claim = None;
+            return;
+        }
+        let fresh = |ticket| Claim {
+            ticket,
+            deadline: now.saturating_add(u64::from(claim_secs)),
+        };
+        let claimed = self
+            .claim
+            .and_then(|c| self.entries.iter().position(|e| e.ticket == c.ticket));
+        self.claim = match (self.claim, claimed) {
+            (Some(c), Some(_)) if now <= c.deadline => Some(c),
+            (Some(_), Some(i)) => Some(fresh(self.entries[(i + 1) % self.entries.len()].ticket)),
+            _ => Some(fresh(self.entries[0].ticket)),
+        };
+    }
+
+    /// Whether the entry at `index` may take one of `free` slots: the
+    /// claimed waiter and the `free - 1` after it, in queue order (wrapping
+    /// to the front), so a pool with several free slots admits that many
+    /// waiters at once. Call after [`Queue::settle_claim`].
+    pub fn may_take(&self, index: usize, free: usize) -> bool {
+        let len = self.entries.len();
+        if free == 0 || index >= len {
+            return false;
+        }
+        let start = self
+            .claim
+            .and_then(|c| self.entries.iter().position(|e| e.ticket == c.ticket))
+            .unwrap_or(0);
+        (index + len - start) % len < free
+    }
+
+    /// Remove the entry at `index`, and the claim with it when it was that
+    /// entry's.
+    pub fn remove_at(&mut self, index: usize) {
+        let entry = self.entries.remove(index);
+        if self.claim.is_some_and(|c| c.ticket == entry.ticket) {
+            self.claim = None;
+        }
     }
 }
 
@@ -344,6 +447,35 @@ pub fn edit_queue<T>(
         write_queue(dir, &queue)?;
     }
     Ok(Some(out))
+}
+
+/// Remove `session`'s entry from `workspace` in the queue of pool `name`
+/// under `root`, if the pool's directory exists; nothing is created.
+/// `Ok(true)` when the queue no longer holds the entry (it was removed or
+/// was never there), `Ok(false)` when `queue.lock` stayed busy, so the
+/// entry may remain until it lapses.
+pub fn leave_queue(
+    root: &Path,
+    name: &str,
+    session: &str,
+    workspace: &str,
+) -> std::io::Result<bool> {
+    if !crate::template::types::is_valid_pool_name(name) {
+        return Ok(true);
+    }
+    let dir = root.join("pools").join(name);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return Ok(true),
+    }
+    let left = edit_queue(&dir, |queue| match queue.position_of(session, workspace) {
+        Some(i) => {
+            queue.remove_at(i);
+            ((), true)
+        }
+        None => ((), false),
+    })?;
+    Ok(left.is_some())
 }
 
 /// `s` with control characters removed and cut to [`MAX_SHOWN_CHARS`], for a
@@ -434,6 +566,108 @@ mod tests {
         let q = read_queue(&dir);
         assert_eq!(q.position_of("s", "w"), Some(0));
         assert_eq!(q.position_of("s", "other"), None);
+    }
+
+    fn waiters(names: &[&str], now: u64) -> Queue {
+        let mut q = Queue::default();
+        for name in names {
+            q.join_or_refresh(name, "w", now);
+        }
+        q
+    }
+
+    fn claimed(q: &Queue) -> Option<&str> {
+        let c = q.claim?;
+        q.entries
+            .iter()
+            .find(|e| e.ticket == c.ticket)
+            .map(|e| e.session.as_str())
+    }
+
+    #[test]
+    fn a_free_slot_is_claimed_for_the_head_waiter_only() {
+        let mut q = waiters(&["w1", "w2", "w3"], 100);
+        q.settle_claim(1, 5, 100);
+        assert_eq!(claimed(&q), Some("w1"));
+        assert_eq!(q.claim.unwrap().deadline, 105);
+        assert!(q.may_take(0, 1));
+        assert!(!q.may_take(1, 1));
+        assert!(!q.may_take(2, 1));
+        // Two free slots admit the two at the front.
+        assert!(q.may_take(1, 2));
+        assert!(!q.may_take(2, 2));
+    }
+
+    #[test]
+    fn an_expired_claim_passes_on_and_the_skipped_waiter_keeps_first_place() {
+        let mut q = waiters(&["w1", "w2"], 100);
+        q.settle_claim(1, 5, 100);
+        // Within the period the claim stays.
+        q.settle_claim(1, 5, 105);
+        assert_eq!(claimed(&q), Some("w1"));
+        q.settle_claim(1, 5, 106);
+        assert_eq!(claimed(&q), Some("w2"));
+        assert_eq!(q.claim.unwrap().deadline, 111);
+        assert!(q.may_take(1, 1));
+        assert!(!q.may_take(0, 1));
+        // w2 takes the slot and leaves; w1 is still first.
+        q.remove_at(1);
+        assert!(q.claim.is_none());
+        assert_eq!(q.entries[0].session, "w1");
+        q.settle_claim(1, 5, 120);
+        assert_eq!(claimed(&q), Some("w1"));
+    }
+
+    #[test]
+    fn no_free_slot_means_no_claim() {
+        let mut q = waiters(&["w1"], 100);
+        q.settle_claim(1, 5, 100);
+        q.settle_claim(0, 5, 101);
+        assert!(q.claim.is_none());
+        assert!(!q.may_take(0, 0));
+    }
+
+    #[test]
+    fn a_claim_whose_waiter_left_goes_to_the_head() {
+        let mut q = waiters(&["w1", "w2"], 100);
+        q.settle_claim(1, 5, 100);
+        q.entries.remove(0);
+        q.settle_claim(1, 5, 101);
+        assert_eq!(claimed(&q), Some("w2"));
+    }
+
+    #[test]
+    fn lapsed_waiters_are_swept_and_those_behind_move_up() {
+        let mut q = waiters(&["w1", "w2"], 100);
+        q.entries[1].last_seen = 104;
+        assert!(q.sweep_lapsed(106, 5));
+        assert_eq!(q.entries.len(), 1);
+        assert_eq!(q.position_of("w2", "w"), Some(0));
+        // Joining again goes to the back with a new ticket.
+        let (i, added) = q.join_or_refresh("w1", "w", 106);
+        assert!(added);
+        assert_eq!(i, 1);
+    }
+
+    #[test]
+    fn a_queue_file_without_a_claim_reads_as_none() {
+        let q: Queue = serde_json::from_str(r#"{"next_ticket":1,"entries":[]}"#).unwrap();
+        assert!(q.claim.is_none());
+    }
+
+    #[test]
+    fn leaving_a_missing_pool_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(leave_queue(root.path(), "p", "s", "w").unwrap());
+        assert!(!root.path().join("pools").exists());
+        let dir = pool_dir(root.path(), "p").unwrap();
+        edit_queue(&dir, |q| {
+            q.join_or_refresh("s", "w", 1);
+            ((), true)
+        })
+        .unwrap();
+        assert!(leave_queue(root.path(), "p", "s", "w").unwrap());
+        assert!(read_queue(&dir).entries.is_empty());
     }
 
     #[test]

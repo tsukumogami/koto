@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::config::{self, PoolLookup, PoolSpec};
-use super::store::{self, DirUnavailable, Holder, QueueEntry, Slot};
+use super::store::{self, DirUnavailable, Holder, Slot};
+use crate::engine::types::{Event, EventPayload, PoolQueued, PoolReleased};
 
 /// How long the in-tick wait sleeps between attempts.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -29,6 +30,106 @@ pub struct Requester {
     /// The workspace directory's name.
     pub workspace: String,
     pub state: String,
+    /// The session's log says it is waiting in this pool's queue on this
+    /// visit to `state` ([`waiting_in_visit`]). The queue can't say so
+    /// itself once a sweep has dropped the entry, and the log is how a
+    /// lapsed waiter learns it lost its place.
+    pub was_waiting: bool,
+}
+
+/// What the guard's queue edits found, beyond its outcome, so the tick can
+/// record it (PRD R26).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueNote {
+    /// The session was waiting but its entry was gone: it lapsed (R12).
+    pub lapsed: bool,
+    /// The session's entry is in the queue as the guard returns.
+    pub queued: bool,
+    /// The session was waiting on a pool the config no longer defines (R8).
+    pub pool_removed: bool,
+}
+
+/// The guard's decision and what it found in the queue.
+#[derive(Debug)]
+pub struct Guarded {
+    pub outcome: GuardOutcome,
+    pub note: QueueNote,
+}
+
+impl Guarded {
+    /// The events the tick appends for what happened to the session's place
+    /// in the queue, before anything about a slot: `pool_released` with
+    /// `pool_removed` or `lapsed` for a wait that ended without a slot, and
+    /// `pool_queued` when the session is waiting now and wasn't before (a
+    /// lapsed waiter queued again at the back counts as joining).
+    pub fn queue_events(&self, pool: &str, requester: &Requester) -> Vec<EventPayload> {
+        let released = |reason: &str| {
+            EventPayload::PoolReleased(PoolReleased {
+                state: requester.state.clone(),
+                pool: pool.to_string(),
+                reason: reason.to_string(),
+                run_id: None,
+            })
+        };
+        let mut events = Vec::new();
+        if self.note.pool_removed {
+            events.push(released("pool_removed"));
+        }
+        if self.note.lapsed {
+            events.push(released("lapsed"));
+        }
+        if self.note.queued && (!requester.was_waiting || self.note.lapsed) {
+            events.push(EventPayload::PoolQueued(PoolQueued {
+                state: requester.state.clone(),
+                pool: pool.to_string(),
+                workspace: requester.workspace.clone(),
+            }));
+        }
+        events
+    }
+}
+
+/// The latest of `pool_queued`, `pool_acquired` and `pool_released` naming
+/// `pool` in `events`.
+fn latest_pool_event<'a>(events: &'a [Event], pool: &str) -> Option<&'a EventPayload> {
+    events.iter().rev().map(|e| &e.payload).find(|p| match p {
+        EventPayload::PoolQueued(q) => q.pool == pool,
+        EventPayload::PoolAcquired(a) => a.pool == pool,
+        EventPayload::PoolReleased(r) => r.pool == pool,
+        _ => false,
+    })
+}
+
+/// Whether the log leaves the session waiting on `pool` in its current
+/// visit to `state`: the visit's latest event naming the pool is
+/// `pool_queued`.
+pub fn waiting_in_visit(events: &[Event], state: &str, pool: &str) -> bool {
+    let visit = crate::engine::persistence::epoch_slice(events, state);
+    matches!(
+        latest_pool_event(visit, pool),
+        Some(EventPayload::PoolQueued(q)) if q.state == state
+    )
+}
+
+/// Every wait the log leaves open: for each pool, its latest event, when
+/// that is `pool_queued`. A session that leaves the state such a wait was
+/// recorded in leaves the queue (R12).
+pub fn open_waits(events: &[Event]) -> Vec<PoolQueued> {
+    let mut pools: Vec<&str> = Vec::new();
+    for e in events {
+        if let EventPayload::PoolQueued(q) = &e.payload {
+            if !pools.contains(&q.pool.as_str()) {
+                pools.push(&q.pool);
+            }
+        }
+    }
+    pools
+        .into_iter()
+        .filter_map(|pool| match latest_pool_event(events, pool) {
+            Some(EventPayload::PoolQueued(q)) => Some(q.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// What the guard decided.
@@ -108,51 +209,116 @@ impl GuardOutcome {
 
 /// Resolve `pool` from the user config under `requester.koto_root` and take
 /// a slot, wait for one, or report the requester queued.
-pub fn acquire(pool: &str, requester: &Requester) -> GuardOutcome {
+pub fn acquire(pool: &str, requester: &Requester) -> Guarded {
     let config_path = requester.koto_root.join("config.toml");
+    let unnoted = |outcome| Guarded {
+        outcome,
+        note: QueueNote::default(),
+    };
     match config::lookup(&config_path, pool) {
-        PoolLookup::Undefined => GuardOutcome::Unpooled,
-        PoolLookup::Invalid { key, reason } => GuardOutcome::ConfigInvalid {
+        PoolLookup::Undefined => {
+            // A pool removed while this session waited: it runs unthrottled
+            // and leaves the queue it was in (R8). The directory is left
+            // alone if it is already gone, so an undefined pool still
+            // creates nothing (R6).
+            let mut note = QueueNote::default();
+            if requester.was_waiting {
+                note.pool_removed = true;
+                let _ = store::leave_queue(
+                    &requester.koto_root,
+                    pool,
+                    &requester.session,
+                    &requester.workspace,
+                );
+            }
+            Guarded {
+                outcome: GuardOutcome::Unpooled,
+                note,
+            }
+        }
+        PoolLookup::Invalid { key, reason } => unnoted(GuardOutcome::ConfigInvalid {
             config_path,
             key,
             reason,
-        },
+        }),
         PoolLookup::Defined(spec) => acquire_defined(pool, &spec, requester),
     }
 }
 
 /// [`acquire`] for a pool the config defines as `spec`.
-pub fn acquire_defined(pool: &str, spec: &PoolSpec, requester: &Requester) -> GuardOutcome {
+pub fn acquire_defined(pool: &str, spec: &PoolSpec, requester: &Requester) -> Guarded {
+    let mut note = QueueNote::default();
     let dir = match store::pool_dir(&requester.koto_root, pool) {
         Ok(dir) => dir,
-        Err(e) => return GuardOutcome::DirUnavailable(e),
-    };
-    let unavailable = |e: std::io::Error| {
-        GuardOutcome::DirUnavailable(DirUnavailable {
-            path: dir.clone(),
-            reason: e.to_string(),
-        })
+        Err(e) => {
+            return Guarded {
+                outcome: GuardOutcome::DirUnavailable(e),
+                note,
+            }
+        }
     };
     let started = Instant::now();
     let wait = Duration::from_secs(spec.wait_secs as u64);
+    // Whether the session is in the queue as far as this call knows: the
+    // log's answer until the first edit, then what the edits did.
+    let mut waiting = requester.was_waiting;
     loop {
-        match attempt(&dir, spec, requester) {
-            Ok(Some(slot)) => return GuardOutcome::Acquired(slot),
+        match attempt(&dir, spec, requester, waiting) {
+            Ok(Some(turn)) => {
+                note.lapsed |= turn.lapsed;
+                note.queued = turn.slot.is_none();
+                if let Some(slot) = turn.slot {
+                    return Guarded {
+                        outcome: GuardOutcome::Acquired(slot),
+                        note,
+                    };
+                }
+                waiting = true;
+            }
+            // `queue.lock` stayed busy: not yet.
             Ok(None) => {}
-            Err(e) => return unavailable(e),
+            Err(e) => {
+                return Guarded {
+                    outcome: GuardOutcome::DirUnavailable(DirUnavailable {
+                        path: dir.clone(),
+                        reason: e.to_string(),
+                    }),
+                    note,
+                }
+            }
         }
         if started.elapsed() + POLL_INTERVAL > wait {
-            return GuardOutcome::Queued(queued_output(&dir, pool, spec, requester));
+            return Guarded {
+                outcome: GuardOutcome::Queued(queued_output(&dir, pool, spec, requester)),
+                note,
+            };
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// One attempt under `queue.lock`: drop lapsed waiters, take a free slot and
-/// leave the queue, or join it (or refresh this session's place in it).
-/// `Ok(None)` when no slot is free, or when `queue.lock` stayed busy, which
-/// counts as "not yet".
-fn attempt(dir: &Path, spec: &PoolSpec, requester: &Requester) -> std::io::Result<Option<Slot>> {
+/// What one queue edit did for the requester.
+struct Turn {
+    /// The slot taken, or `None` when the requester is left waiting.
+    slot: Option<Slot>,
+    /// The requester was waiting but found its entry gone.
+    lapsed: bool,
+}
+
+/// One attempt under `queue.lock` (DESIGN "Taking a slot: the queue and the
+/// claim"): drop lapsed waiters, find or add this session's entry and mark
+/// it seen, bring the claim up to date, and take a free slot only when the
+/// queue says it is this session's turn. A session arriving while others
+/// wait joins behind them even when a slot is free (R11), and a slot is
+/// only ever taken here, under the lock, so a race for the last slot
+/// produces one holder (R9). `Ok(None)` when `queue.lock` stayed busy,
+/// which counts as "not yet".
+fn attempt(
+    dir: &Path,
+    spec: &PoolSpec,
+    requester: &Requester,
+    waiting: bool,
+) -> std::io::Result<Option<Turn>> {
     let now = store::now_secs();
     let holder = Holder {
         session: requester.session.clone(),
@@ -161,42 +327,27 @@ fn attempt(dir: &Path, spec: &PoolSpec, requester: &Requester) -> std::io::Resul
         pid: std::process::id(),
         since: now,
     };
-    let outcome = store::edit_queue(dir, |queue| {
-        let before = queue.entries.len();
-        queue
-            .entries
-            .retain(|e| now.saturating_sub(e.last_seen) <= spec.lapse_secs as u64);
-        let mut changed = queue.entries.len() != before;
-        let mine = queue.position_of(&requester.session, &requester.workspace);
-        match store::try_acquire(dir, spec.size, &holder) {
-            Ok(Some(slot)) => {
-                if let Some(i) = mine {
-                    queue.entries.remove(i);
-                    changed = true;
-                }
-                (Ok(Some(slot)), changed)
+    let edited = store::edit_queue(dir, |queue| {
+        queue.sweep_lapsed(now, spec.lapse_secs);
+        let lapsed = waiting
+            && queue
+                .position_of(&requester.session, &requester.workspace)
+                .is_none();
+        let (mine, _) = queue.join_or_refresh(&requester.session, &requester.workspace, now);
+        let free = store::free_slots(dir, spec.size);
+        queue.settle_claim(free, spec.claim_secs, now);
+        let mut slot = Ok(None);
+        if queue.may_take(mine, free) {
+            slot = store::try_acquire(dir, spec.size, &holder);
+            if matches!(slot, Ok(Some(_))) {
+                queue.remove_at(mine);
             }
-            Ok(None) => {
-                match mine {
-                    Some(i) => queue.entries[i].last_seen = now,
-                    None => {
-                        let ticket = queue.next_ticket;
-                        queue.next_ticket += 1;
-                        queue.entries.push(QueueEntry {
-                            ticket,
-                            session: requester.session.clone(),
-                            workspace: requester.workspace.clone(),
-                            joined_at: now,
-                            last_seen: now,
-                        });
-                    }
-                }
-                (Ok(None), true)
-            }
-            Err(e) => (Err(e), changed),
         }
+        // Marking the entry seen always changes the queue, so it is always
+        // written back.
+        (slot.map(|slot| Turn { slot, lapsed }), true)
     })?;
-    outcome.unwrap_or(Ok(None))
+    edited.transpose()
 }
 
 /// The `__pool__` condition's output for a requester left waiting (PRD R16).
@@ -256,55 +407,119 @@ mod tests {
             session: session.to_string(),
             workspace: format!("ws-{session}"),
             state: "test".to_string(),
+            was_waiting: false,
         }
+    }
+
+    fn waiting(root: &Path, session: &str) -> Requester {
+        Requester {
+            was_waiting: true,
+            ..requester(root, session)
+        }
+    }
+
+    fn config(root: &Path, text: &str) {
+        std::fs::write(root.join("config.toml"), text).unwrap();
+    }
+
+    fn slot(guarded: Guarded) -> Slot {
+        match guarded.outcome {
+            GuardOutcome::Acquired(slot) => slot,
+            other => panic!("expected a slot, got {other:?}"),
+        }
+    }
+
+    fn queued(guarded: &Guarded) -> &serde_json::Value {
+        match &guarded.outcome {
+            GuardOutcome::Queued(output) => output,
+            other => panic!("expected queued, got {other:?}"),
+        }
+    }
+
+    fn event_types(events: &[EventPayload]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                EventPayload::PoolReleased(r) => format!("released:{}", r.reason),
+                other => other.type_name().to_string(),
+            })
+            .collect()
     }
 
     #[test]
     fn an_undefined_pool_creates_nothing() {
         let root = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            acquire("test-suite", &requester(root.path(), "a")),
-            GuardOutcome::Unpooled
-        ));
+        let guarded = acquire("test-suite", &requester(root.path(), "a"));
+        assert!(matches!(guarded.outcome, GuardOutcome::Unpooled));
+        assert_eq!(guarded.note, QueueNote::default());
+        // A waiter whose pool went away creates nothing either.
+        let guarded = acquire("test-suite", &waiting(root.path(), "a"));
+        assert!(guarded.note.pool_removed);
         assert!(!root.path().join("pools").exists());
     }
 
     #[test]
     fn a_second_requester_is_queued_behind_the_holder() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("config.toml"),
-            "[pools.test-suite]\nsize = 1\nwait_secs = 0\n",
-        )
-        .unwrap();
-        let held = match acquire("test-suite", &requester(root.path(), "a")) {
-            GuardOutcome::Acquired(slot) => slot,
-            other => panic!("expected a slot, got {other:?}"),
-        };
-        let output = match acquire("test-suite", &requester(root.path(), "b")) {
-            GuardOutcome::Queued(output) => output,
-            other => panic!("expected queued, got {other:?}"),
-        };
+        config(root.path(), "[pools.test-suite]\nsize = 1\nwait_secs = 0\n");
+        let held = slot(acquire("test-suite", &requester(root.path(), "a")));
+        let b = requester(root.path(), "b");
+        let guarded = acquire("test-suite", &b);
+        let output = queued(&guarded);
         assert_eq!(output["position"], 1);
         assert_eq!(output["waiting"], 1);
         assert_eq!(output["size"], 1);
         assert_eq!(output["retry_after_secs"], 15);
         assert_eq!(output["holders"][0]["session"], "a");
+        assert_eq!(
+            event_types(&guarded.queue_events("test-suite", &b)),
+            ["pool_queued"]
+        );
         drop(held);
-        assert!(matches!(
-            acquire("test-suite", &requester(root.path(), "b")),
-            GuardOutcome::Acquired(_)
-        ));
+        let b = waiting(root.path(), "b");
+        let guarded = acquire("test-suite", &b);
+        assert!(guarded.queue_events("test-suite", &b).is_empty());
+        let _slot = slot(guarded);
         // Taking the slot left the queue.
         let dir = root.path().join("pools").join("test-suite");
         assert!(store::read_queue(&dir).entries.is_empty());
     }
 
     #[test]
+    fn an_arrival_queues_behind_a_waiter_even_with_a_free_slot() {
+        let root = tempfile::tempdir().unwrap();
+        config(root.path(), "[pools.p]\nsize = 1\nwait_secs = 0\n");
+        let held = slot(acquire("p", &requester(root.path(), "h")));
+        let _ = queued(&acquire("p", &requester(root.path(), "w1")));
+        drop(held);
+        let c = acquire("p", &requester(root.path(), "c"));
+        assert_eq!(queued(&c)["position"], 2);
+        // The slot is the head waiter's.
+        let _w1 = slot(acquire("p", &waiting(root.path(), "w1")));
+    }
+
+    #[test]
+    fn a_waiter_whose_entry_is_gone_is_told_it_lapsed_and_queues_again() {
+        let root = tempfile::tempdir().unwrap();
+        config(root.path(), "[pools.p]\nsize = 1\nwait_secs = 0\n");
+        let _held = slot(acquire("p", &requester(root.path(), "h")));
+        let _ = queued(&acquire("p", &requester(root.path(), "w2")));
+        // `w1`'s log says it waits, but the queue has no entry for it.
+        let w1 = waiting(root.path(), "w1");
+        let guarded = acquire("p", &w1);
+        assert_eq!(queued(&guarded)["position"], 2);
+        assert!(guarded.note.lapsed);
+        assert_eq!(
+            event_types(&guarded.queue_events("p", &w1)),
+            ["released:lapsed", "pool_queued"]
+        );
+    }
+
+    #[test]
     fn an_invalid_pool_names_its_key() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("config.toml"), "[pools.p]\nsize = 0\n").unwrap();
-        match acquire("p", &requester(root.path(), "a")) {
+        config(root.path(), "[pools.p]\nsize = 0\n");
+        match acquire("p", &requester(root.path(), "a")).outcome {
             GuardOutcome::ConfigInvalid { key, .. } => assert_eq!(key, "pools.p.size"),
             other => panic!("expected invalid, got {other:?}"),
         }
@@ -313,25 +528,55 @@ mod tests {
     #[test]
     fn the_in_tick_wait_takes_a_slot_that_frees() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("config.toml"),
-            "[pools.p]\nsize = 1\nwait_secs = 5\n",
-        )
-        .unwrap();
-        let held = match acquire("p", &requester(root.path(), "a")) {
-            GuardOutcome::Acquired(slot) => slot,
-            other => panic!("expected a slot, got {other:?}"),
-        };
+        config(root.path(), "[pools.p]\nsize = 1\nwait_secs = 5\n");
+        let held = slot(acquire("p", &requester(root.path(), "a")));
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(600));
             drop(held);
         });
         let started = Instant::now();
-        assert!(matches!(
-            acquire("p", &requester(root.path(), "b")),
-            GuardOutcome::Acquired(_)
-        ));
+        let b = requester(root.path(), "b");
+        let guarded = acquire("p", &b);
+        // Joined and left within the tick: nothing to record but the slot.
+        assert!(guarded.queue_events("p", &b).is_empty());
+        let _slot = slot(guarded);
         assert!(started.elapsed() < Duration::from_secs(4));
         releaser.join().unwrap();
+    }
+
+    fn event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: String::new(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn queued_event(state: &str, pool: &str) -> EventPayload {
+        EventPayload::PoolQueued(PoolQueued {
+            state: state.to_string(),
+            pool: pool.to_string(),
+            workspace: "ws".to_string(),
+        })
+    }
+
+    #[test]
+    fn open_waits_are_pools_whose_latest_event_is_a_join() {
+        let released = EventPayload::PoolReleased(PoolReleased {
+            state: "a".to_string(),
+            pool: "p".to_string(),
+            reason: "lapsed".to_string(),
+            run_id: None,
+        });
+        let events = vec![
+            event(1, queued_event("a", "p")),
+            event(2, queued_event("a", "q")),
+            event(3, released),
+        ];
+        let open = open_waits(&events);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].pool, "q");
     }
 }

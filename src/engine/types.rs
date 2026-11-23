@@ -1124,8 +1124,11 @@ pub struct CodeReviewRoundRecorded {
     pub entries: Vec<CodeReviewSeat>,
 }
 
-/// The event type a tick appends when it takes a slot of a host pool
-/// (DESIGN-host-resource-pools.md, "Interfaces").
+/// The event type a tick appends when its session joins a host pool's queue
+/// (DESIGN-host-resource-pools.md, "Interfaces"): once per join, not on each
+/// queued tick.
+pub const POOL_QUEUED: &str = "pool_queued";
+/// The event type a tick appends when it takes a slot of a host pool.
 pub const POOL_ACQUIRED: &str = "pool_acquired";
 /// The event type a tick appends when a slot it took is given back.
 pub const POOL_RELEASED: &str = "pool_released";
@@ -1133,6 +1136,17 @@ pub const POOL_RELEASED: &str = "pool_released";
 pub const BACKGROUND_STARTED: &str = "background_started";
 /// The event type a tick appends when it reads a background run's end.
 pub const BACKGROUND_FINISHED: &str = "background_finished";
+
+/// The payload of a [`POOL_QUEUED`] event. `workspace` is the workspace
+/// directory's name the queue entry is keyed by, so a command that takes the
+/// session out of `state` can find the entry to remove without the tick's
+/// execution directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolQueued {
+    pub state: String,
+    pub pool: String,
+    pub workspace: String,
+}
 
 /// The payload of a [`POOL_ACQUIRED`] event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2088,9 +2102,11 @@ pub enum EventPayload {
     /// degrades like `anchor_started`.
     AnchorActivity(AnchorActivity),
     /// A tick took a host pool slot (DESIGN-host-resource-pools.md). This
-    /// and the three below are additive: an older build lands them in
+    /// and the four below are additive: an older build lands them in
     /// `Unknown`, and a payload this build can't parse does the same.
     PoolAcquired(PoolAcquired),
+    /// A tick's session joined a host pool's queue.
+    PoolQueued(PoolQueued),
     /// A slot a tick took was given back.
     PoolReleased(PoolReleased),
     /// A tick started a background action's runner.
@@ -2479,6 +2495,7 @@ impl EventPayload {
             EventPayload::OriginUnrecorded(_) => ORIGIN_UNRECORDED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::PoolAcquired(_) => POOL_ACQUIRED,
+            EventPayload::PoolQueued(_) => POOL_QUEUED,
             EventPayload::PoolReleased(_) => POOL_RELEASED,
             EventPayload::BackgroundStarted(_) => BACKGROUND_STARTED,
             EventPayload::BackgroundFinished(_) => BACKGROUND_FINISHED,
@@ -3123,6 +3140,13 @@ impl<'de> Deserialize<'de> for Event {
             }
             POOL_ACQUIRED => match serde_json::from_value::<PoolAcquired>(payload_val.clone()) {
                 Ok(p) => EventPayload::PoolAcquired(p),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            POOL_QUEUED => match serde_json::from_value::<PoolQueued>(payload_val.clone()) {
+                Ok(p) => EventPayload::PoolQueued(p),
                 Err(_) => EventPayload::Unknown {
                     type_name: event_type.clone(),
                     raw_payload: payload_val.clone(),
