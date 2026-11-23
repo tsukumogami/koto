@@ -26,8 +26,8 @@ commands below are listed without either prefix.
 ## Verification map
 
 - `src/**`, `tests/**`, `test/functional/fixtures/**`, `benches/**`, `koto-stability-tests/**`,
-  `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`
-  -> every default command below
+  `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
+  `scripts/run-tests.sh`, `.config/nextest.toml` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
   - `cargo test --locked --test doc_names` and `cargo test --locked --test plugin_hooks_shape` (the two Rust tests that read `plugins/`, two map commands)
@@ -80,7 +80,7 @@ commands below are listed without either prefix.
   in the next entry until someone checks its `on:` block against this rule and adds it here. The
   check script itself is under `scripts/**`, so a change to it stays with a person too.
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
-  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, `scripts/without-session-env.sh`, the two
+  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, `scripts/without-session-env.sh`, `scripts/run-tests.sh`, the two
   inline-evidence files and the three run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
   `plugins/koto-skills/hooks/*.sh` (except `session-start.sh`, `session-start-workflows.sh` and `pre-tool-use-agent.sh`, which the session-start and agent-hook suites in the `plugins/**` entry run); `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
@@ -91,10 +91,15 @@ commands below are listed without either prefix.
 ### Default verification command (when no map entry matches; all must pass)
 
 Four of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
-change both together. Its other jobs (audit, coverage, the tsuku install, cloud integration,
-leftover-artifact checks) are left out on purpose.
+change both together. Its other jobs (audit, the tsuku install, cloud integration,
+leftover-artifact checks) are left out on purpose. The two test commands run through
+`scripts/run-tests.sh`, which uses cargo-nextest's `ci` profile from `.config/nextest.toml` (one
+process per test, as the `tests` and `stability-tests` jobs do) when a cargo-nextest at or above
+that file's `nextest-version` is installed, and otherwise says so on stderr and falls back to
+`cargo test --locked ... -- --test-threads=1`. CI's `tests` job also adds coverage and
+`--all-features`; locally the suite runs without either.
 
-- `cargo test --locked -- --test-threads=1`
-- `cargo test -p koto-stability-tests -- --test-threads=1`
+- `bash scripts/run-tests.sh` (the suite, then the doctests under nextest)
+- `bash scripts/run-tests.sh -p koto-stability-tests`
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
