@@ -212,13 +212,39 @@ fn append_event_reading<H: LogHeader>(
     payload: &EventPayload,
     timestamp: &str,
 ) -> anyhow::Result<(u64, String)> {
+    // Held from reading the last seq until the line is synced, so two
+    // processes appending at once can't both take the same seq.
+    let _append_lock = AppendLock::acquire(path);
+    append_under_lock::<H>(path, payload, timestamp)
+}
+
+/// [`append_event_tracked`] for a caller that already holds the log's append
+/// lock through `held`, from [`hold_log_lock`]: the append runs under that
+/// lock rather than taking it again, which would wait on `held` itself (see
+/// [`HeldLogLock`]). Refused, writing nothing, when `held` is the lock of a
+/// log other than `path`.
+pub(crate) fn append_event_tracked_held(
+    held: &HeldLogLock,
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+) -> anyhow::Result<CommitInfo> {
+    held.check(path)?;
+    let (seq, prior_log) = append_under_lock::<StateFileHeader>(path, payload, timestamp)?;
+    Ok(CommitInfo { seq, prior_log })
+}
+
+/// The body of every append, run with the log's append lock held by the
+/// caller.
+fn append_under_lock<H: LogHeader>(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+) -> anyhow::Result<(u64, String)> {
     debug_assert!(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event"
     );
-    // Held from reading the last seq until the line is synced, so two
-    // processes appending at once can't both take the same seq.
-    let _append_lock = AppendLock::acquire(path);
     let tail = prepare_append::<H>(path)?;
     // Checked on the bytes read under the lock, so no write slips in after
     // a fence another process just appended.
@@ -491,9 +517,13 @@ pub const APPEND_LOCK_FILE: &str = "append.lock";
 /// the line and syncing it. A writer that replaces the log whole (a header
 /// rewrite, a cloud pull) takes it through [`with_log_replace_lock`] and holds
 /// it from reading the log to renaming the replacement over it, which is
-/// longer than an append but still only file I/O. Neither holds it while a
-/// command runs, so a gate's own `koto context get` can't wait on the tick
-/// that is running it; keep slow work out from under it. It is a
+/// longer than an append but still only file I/O. `koto context add` holds it
+/// through [`hold_log_lock`] from its header check, across its store write,
+/// to its append, so no replacement lands between them; on the cloud backend
+/// that span includes the pull's requests and the content's upload, which is
+/// why every replacement's wait is bounded. None holds it while a command
+/// runs, so a gate's own `koto context get` can't wait on the tick that is
+/// running it; keep slow work out from under it. It is a
 /// dedicated file rather than the log itself, so it never contends with the
 /// state-file lock a batch tick holds for the whole tick.
 ///
@@ -624,24 +654,94 @@ pub fn state_log_busy(e: &anyhow::Error) -> Option<&StateLogBusy> {
 /// passed is [`StateLogBusy`], and `f` doesn't run. Where the lock can't be
 /// had at all, `f` runs unlocked, as an append does.
 ///
-/// `f` must not append to this log or take this lock again: the lock belongs
-/// to the open file, so a second acquisition on this thread waits on the
-/// first. An append's wait has no bound and never returns; a bounded wait
-/// runs out as [`StateLogBusy`].
+/// `f` must not append to this log or take this lock again (see
+/// [`HeldLogLock`]). A caller that already holds the lock runs its
+/// replacement through [`with_held_log_lock`] instead.
 pub fn with_log_replace_lock<T>(
     path: &Path,
     wait: std::time::Duration,
     f: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let _held = hold_log_lock(path, wait)?;
+    f()
+}
+
+/// [`with_log_replace_lock`] for a caller that already holds the lock of the
+/// log at `path` through `held`: `f` runs under it, with no second
+/// acquisition. Refused, running nothing, when `held` locks another log.
+pub fn with_held_log_lock<T>(
+    held: &HeldLogLock,
+    path: &Path,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    held.check(path)?;
+    f()
+}
+
+/// The append lock of one log, held by this process until the guard is
+/// dropped, for a caller that runs several steps on the log (a check, a
+/// write elsewhere, an append) and must keep every other writer of it out
+/// until the last one.
+///
+/// The steps take the guard rather than the lock. The lock belongs to the
+/// open file, so a second acquisition in this process, on a file of its own,
+/// waits on this one: an append's wait has no bound and never returns, and a
+/// bounded wait runs out as [`StateLogBusy`]. Steps under the guard append
+/// through [`append_event_tracked_held`] and replace the log through
+/// [`with_held_log_lock`].
+pub struct HeldLogLock {
+    path: std::path::PathBuf,
+    _lock: AppendLock,
+}
+
+impl HeldLogLock {
+    /// The log whose lock this is.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Refuse a step on a log other than the one this guard locks: it would
+    /// run unlocked while looking locked.
+    fn check(&self, path: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.path == path,
+            "internal error: the append lock held is that of {}, not of {}",
+            self.path.display(),
+            path.display()
+        );
+        Ok(())
+    }
+}
+
+/// Take the append lock of the log at `path`, the same sidecar lock every
+/// append takes, waiting for it at most `wait`, and hold it until the guard
+/// is dropped. A lock still held elsewhere once `wait` has passed is
+/// [`StateLogBusy`], with nothing done. Where the lock can't be had at all
+/// (no `flock`, or no directory to put the sidecar in), the guard holds
+/// nothing and the steps under it run unlocked, as an append does.
+pub fn hold_log_lock(path: &Path, wait: std::time::Duration) -> anyhow::Result<HeldLogLock> {
     let started = std::time::Instant::now();
-    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
+    let Some(lock) = AppendLock::acquire_within(path, wait) else {
         return Err(StateLogBusy {
             path: path.to_path_buf(),
             waited: started.elapsed(),
         }
         .into());
     };
-    f()
+    Ok(HeldLogLock {
+        path: path.to_path_buf(),
+        _lock: lock,
+    })
+}
+
+/// [`hold_log_lock`] waiting as long as it takes, as a plain append waits:
+/// for an append path with other work to do under the lock before the line
+/// goes in.
+pub(crate) fn hold_log_lock_blocking(path: &Path) -> HeldLogLock {
+    HeldLogLock {
+        path: path.to_path_buf(),
+        _lock: AppendLock::acquire(path),
+    }
 }
 
 /// Replace the log at `path` with `bytes`: written to a temp file beside it,
@@ -775,6 +875,96 @@ mod log_replace_lock_tests {
         replacer.join().unwrap();
         let (_, events) = read_events(&log).unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    fn context_added(key: &str) -> EventPayload {
+        EventPayload::ContextAdded {
+            key: key.to_string(),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: None,
+        }
+    }
+
+    /// Holding a log's lock waits for another holder, then reports the log
+    /// busy, retryably, as a replacement does (koto#728).
+    #[test]
+    fn hold_log_lock_is_busy_while_another_process_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("koto-wf.state.jsonl");
+        std::fs::write(&log, format!("{HEADER}\n")).unwrap();
+        let holder = hold_append_lock_for(&log, Duration::from_millis(600));
+        let err = hold_log_lock(&log, Duration::from_millis(100))
+            .err()
+            .expect("the lock is held elsewhere");
+        assert!(state_log_busy(&err).is_some(), "{err:#}");
+        assert!(err.to_string().contains("is busy"), "{err}");
+        holder.join().unwrap();
+        let held = hold_log_lock(&log, Duration::from_millis(100)).unwrap();
+        assert_eq!(held.path(), log.as_path());
+    }
+
+    /// An append through a held guard writes one line with the next seq,
+    /// without waiting on the guard, and the lock stays held until the
+    /// guard is dropped.
+    #[test]
+    fn an_append_through_a_held_guard_takes_the_next_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("koto-wf.state.jsonl");
+        std::fs::write(&log, format!("{HEADER}\n")).unwrap();
+        append_event(&log, &context_added("a"), "2025-01-01T00:00:00Z").unwrap();
+
+        let held = hold_log_lock(&log, Duration::from_millis(200)).unwrap();
+        let commit =
+            append_event_tracked_held(&held, &log, &context_added("b"), "2025-01-01T00:00:01Z")
+                .unwrap();
+        assert_eq!(commit.seq, 2);
+        let replaced = with_log_replace_lock(&log, Duration::from_millis(100), || Ok(()));
+        assert!(
+            replaced
+                .as_ref()
+                .is_err_and(|e| state_log_busy(e).is_some()),
+            "the guard still holds the lock: {replaced:?}"
+        );
+        drop(held);
+
+        let content = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(content.lines().count(), 3, "{content}");
+        assert!(content.ends_with('\n'));
+        let (_, events) = read_events(&log).unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        with_log_replace_lock(&log, Duration::from_millis(100), || Ok(())).unwrap();
+    }
+
+    /// A guard is the lock of one log: an append or a replacement of another
+    /// log through it is refused, with nothing written or run.
+    #[test]
+    fn a_held_guard_for_another_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("koto-wf.state.jsonl");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = other_dir.join("koto-other.state.jsonl");
+        std::fs::write(&log, format!("{HEADER}\n")).unwrap();
+        std::fs::write(&other, format!("{HEADER}\n")).unwrap();
+
+        let held = hold_log_lock(&log, Duration::from_millis(200)).unwrap();
+        let err =
+            append_event_tracked_held(&held, &other, &context_added("k"), "2025-01-01T00:00:00Z")
+                .unwrap_err();
+        assert!(err.to_string().contains("not of"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            format!("{HEADER}\n")
+        );
+        let mut ran = false;
+        with_held_log_lock(&held, &other, || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!ran);
     }
 }
 

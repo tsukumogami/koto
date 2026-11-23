@@ -16,6 +16,17 @@ use crate::session::SessionBackend;
 /// session log. A failed append fails the command, as it always has.
 ///
 /// When `from_file` is provided, reads from that path instead of stdin.
+///
+/// The header check, the store write and the append run under the session
+/// log's append lock, held across all three (see
+/// [`SessionBackend::add_context_locked`]): a header rewrite (a rebind, an
+/// anchor adoption) or a pull that replaced the log between them could leave
+/// the stored content with no `context_added` naming it (koto#728). A lock
+/// another process still holds after
+/// [`LOG_REPLACE_LOCK_WAIT`](crate::engine::persistence::LOG_REPLACE_LOCK_WAIT)
+/// fails the command as
+/// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), with nothing
+/// stored, and running it again is safe.
 pub fn handle_add(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,
@@ -23,22 +34,11 @@ pub fn handle_add(
     key: &str,
     from_file: Option<&str>,
 ) -> Result<()> {
-    // The append below refuses a log that has no header, but by then the
-    // store would already hold the content. Check the header first so a
-    // refused write stores nothing.
-    //
-    // This read is load-bearing on the cloud backend for a second reason: it
-    // pulls the remote copy over the local one, so an append that follows
-    // sees what S3 has. A session whose directory is missing locally still
-    // fails here, because the pull writes no directory of its own. (Inside a
-    // tick on this session there is no pull: the tick pulled, and the local
-    // copy holds writes the bucket doesn't have yet.)
-    backend.read_header(session)?;
-
     // A reserved key is refused by the store itself; checking here as well
     // refuses it before stdin is read, rather than after.
     crate::session::links::check_writer_key(key, WRITER_AGENT)?;
 
+    // Read before the lock is taken, so a slow or idle stdin never holds it.
     let content = match from_file {
         Some(path) => {
             fs::read(path).map_err(|e| anyhow::anyhow!("failed to read file '{}': {}", path, e))?
@@ -52,23 +52,34 @@ pub fn handle_add(
         }
     };
 
-    // Confirmed: under the cloud backend an upload the bucket doesn't
-    // confirm fails the command, naming the key, and returns before the
-    // `context_added` below, so the bucket's log never names a key its
-    // manifest leaves out (koto#646).
-    store.add_confirmed(session, key, &content, WRITER_AGENT)?;
-
-    let hash = sha256_hex(&content);
-    let size = content.len() as u64;
     let event = EventPayload::ContextAdded {
         key: key.to_string(),
-        hash,
-        size,
+        hash: sha256_hex(&content),
+        size: content.len() as u64,
         writer: Some(WRITER_AGENT.to_string()),
     };
-    backend.append_event(session, &event, &now_iso8601())?;
 
-    Ok(())
+    // The backend reads the header first: the append refuses a log that has
+    // no header, but by then the store would already hold the content, so a
+    // refused write stores nothing this way.
+    //
+    // That read is load-bearing on the cloud backend for a second reason: it
+    // pulls the remote copy over the local one, so the append that follows
+    // sees what S3 has. A session whose directory is missing locally still
+    // fails there, because the pull writes no directory of its own. (Inside
+    // a tick on this session there is no pull: the tick pulled, and the
+    // local copy holds writes the bucket doesn't have yet.)
+    //
+    // The store write is confirmed: under the cloud backend an upload the
+    // bucket doesn't confirm fails the command, naming the key, and returns
+    // before the `context_added`, so the bucket's log never names a key its
+    // manifest leaves out (koto#646).
+    backend.add_context_locked(
+        session,
+        &mut || store.add_confirmed(session, key, &content, WRITER_AGENT),
+        &event,
+        &now_iso8601(),
+    )
 }
 
 /// The log of `session`, read for a `koto context get` or `exists` of `key`

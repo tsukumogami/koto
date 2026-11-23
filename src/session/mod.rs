@@ -675,6 +675,37 @@ pub trait SessionBackend: Send + Sync {
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
 
+    /// # Stability: additive-only
+    ///
+    /// `koto context add`'s three steps on `id`: read its header (as
+    /// [`read_header`](Self::read_header) does, pull included), run
+    /// `store_write`, then append `event` (as
+    /// [`append_event`](Self::append_event) does). Each step runs only when
+    /// the one before it succeeded, so a session with no header stores
+    /// nothing.
+    ///
+    /// A backend with a state log on disk holds the log's append lock from
+    /// before the header read to after the append, taking it once and
+    /// passing it to each step, so no header rewrite or pull replaces the
+    /// log in between and leaves the stored content with no event naming
+    /// it. Its wait for the lock is bounded by
+    /// [`LOG_REPLACE_LOCK_WAIT`](crate::engine::persistence::LOG_REPLACE_LOCK_WAIT)
+    /// and runs out as
+    /// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), with
+    /// nothing stored. The default runs the three steps in order with no
+    /// lock across them.
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.read_header(id)?;
+        store_write()?;
+        self.append_event(id, event, timestamp)
+    }
+
     /// Append a `context_read` that its reader already judged to be `id`'s
     /// own (the CLI's `read_log_target` answered `Session`: the read ran in
     /// `id`'s own tick) to `id`'s log.
@@ -1280,6 +1311,19 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.append_own_read(id, payload, timestamp),
             Backend::Cloud(b) => b.append_own_read(id, payload, timestamp),
+        }
+    }
+
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_context_locked(id, store_write, event, timestamp),
+            Backend::Cloud(b) => b.add_context_locked(id, store_write, event, timestamp),
         }
     }
 
