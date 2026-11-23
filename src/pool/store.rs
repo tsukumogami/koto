@@ -117,6 +117,12 @@ pub struct Holder {
     pub pid: u32,
     /// Unix seconds when the slot was taken.
     pub since: u64,
+    /// What the slot is held for: the background run's id, or a tick's own
+    /// id for an ordinary action. A nested pooled action checks it against
+    /// the nesting marker it inherited (DESIGN "Nesting"). A record written
+    /// before it existed has none, and no marker matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// A held slot. Dropping it closes koto's descriptor; the slot frees once
@@ -199,6 +205,23 @@ fn read_holder(path: &Path) -> Option<Holder> {
     let mut text = String::new();
     file.take(MAX_HOLDER_BYTES).read_to_string(&mut text).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// The holder of slot `index` of pool `name` under `root`, when the slot is
+/// held. Nothing is created: a pool directory or slot file that isn't there
+/// is a slot nobody holds.
+pub fn held_slot(root: &Path, name: &str, index: usize) -> Option<Holder> {
+    if !crate::template::types::is_valid_pool_name(name) {
+        return None;
+    }
+    let path = root
+        .join("pools")
+        .join(name)
+        .join(format!("slot-{index}.lock"));
+    if !probe_held(&path) {
+        return None;
+    }
+    read_holder(&path)
 }
 
 /// The holders of every held slot in `dir`, of any index, with the index.
@@ -506,6 +529,7 @@ mod tests {
             state: "test".to_string(),
             pid: std::process::id(),
             since: now_secs(),
+            run_id: Some(format!("run-{session}")),
         }
     }
 

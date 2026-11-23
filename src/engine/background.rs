@@ -233,6 +233,31 @@ pub struct RunSpec {
     pub slot: Option<(RawFd, PathBuf)>,
 }
 
+/// The runner's command environment: the tick's, plus the nesting marker
+/// for the slot the run holds, so a pooled action of the same pool that the
+/// command reaches through a nested koto runs on this slot (PRD R13).
+fn run_vars(
+    tick: &[(String, String)],
+    pool: &Option<String>,
+    slot: &Option<Slot>,
+    run_id: &str,
+    koto_root: Option<&Path>,
+) -> Vec<(String, String)> {
+    let marker = match (pool, slot, koto_root) {
+        (Some(pool), Some(slot), Some(root)) => {
+            crate::pool::guard::marker_vars(pool, slot.index, run_id, root)
+        }
+        _ => return tick.to_vec(),
+    };
+    let mut vars: Vec<(String, String)> = tick
+        .iter()
+        .filter(|(name, _)| !marker.iter().any(|(m, _)| m == name))
+        .cloned()
+        .collect();
+    vars.extend(marker);
+    vars
+}
+
 /// `<session dir>/runs/`, created private when missing.
 pub fn runs_dir(session_dir: &Path) -> Result<PathBuf, DirUnavailable> {
     let dir = session_dir.join(RUNS_DIR);
@@ -396,7 +421,7 @@ pub fn start(req: StartRequest<'_>) -> Result<RunRecord, String> {
         command: req.command.to_string(),
         working_dir: req.working_dir.to_path_buf(),
         timeout_secs: req.timeout_secs,
-        vars: req.env.vars().to_vec(),
+        vars: run_vars(req.env.vars(), &pool, &slot, &run_id, req.koto_root),
         inherit: req.env.inherits(),
         redact: req.env.redactor().entries(),
         runner_lock_fd: runner_lock.as_raw_fd(),
@@ -1049,10 +1074,21 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
     let timeout_secs = req.timeout_secs.min(spec.max_timeout_secs);
 
     let mut slot = None;
+    // The run's id is known before its slot is taken, so the slot's holder
+    // record names the run, which is what a nested pooled action checks
+    // its marker against.
+    let run_id = new_run_id();
     // What the guard did to the session's place in the queue, recorded
     // before anything about the slot or the run.
     let mut events = Vec::new();
     if let Some((pool, requester)) = &req.pool {
+        // A background action never runs on an inherited slot: its runner
+        // would outlive the slot it borrowed (DESIGN "Nesting").
+        let requester = &Requester {
+            holder_id: run_id.clone(),
+            may_nest: false,
+            ..requester.clone()
+        };
         let guarded = crate::pool::guard::acquire(pool, requester);
         events = guarded.queue_events(pool, requester);
         if let Some(conditions) = guarded.outcome.blocking_condition(pool) {
@@ -1069,7 +1105,6 @@ fn start_run(req: &TickRequest<'_>) -> TickStep {
             slot = Some((*pool, s, requester.koto_root.clone()));
         }
     }
-    let run_id = new_run_id();
     let slot_index = slot.as_ref().map(|(_, s, _)| s.index);
     let pool = slot.as_ref().map(|(p, _, _)| p.to_string());
     let koto_root = slot.as_ref().map(|(_, _, root)| root.clone());

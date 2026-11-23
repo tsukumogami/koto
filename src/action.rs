@@ -156,6 +156,25 @@ impl CommandEnv {
         &self.vars
     }
 
+    /// This environment with `extra` set on top, replacing any value it
+    /// already sets for those names, and the same redaction: for one
+    /// command that needs a variable the tick's others don't, such as a
+    /// pooled action's nesting marker. Outcomes are still recorded on the
+    /// tick's own environment.
+    pub fn with_vars(&self, extra: Vec<(String, String)>) -> Self {
+        let mut vars: Vec<(String, String)> = self
+            .vars
+            .iter()
+            .filter(|(name, _)| !extra.iter().any(|(n, _)| n == name))
+            .cloned()
+            .collect();
+        vars.extend(extra);
+        Self {
+            inherit: self.inherit,
+            ..Self::cleared(vars, Redactor::new(self.redactor.entries()))
+        }
+    }
+
     /// The value set for `name`, if this value sets one.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.vars

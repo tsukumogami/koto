@@ -19,6 +19,8 @@ pub(crate) mod move_aside;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
+#[cfg(unix)]
+pub mod pool;
 pub mod request;
 pub mod retry;
 pub mod review;
@@ -425,6 +427,12 @@ pub enum Command {
         subcommand: ConfigCommand,
     },
 
+    /// Host resource pools: who holds and who waits on each
+    Pool {
+        #[command(subcommand)]
+        subcommand: PoolCommand,
+    },
+
     /// Decider ledger report and promotion eligibility
     Decider {
         #[command(subcommand)]
@@ -451,6 +459,19 @@ pub enum Command {
 
     /// Live terminal dashboard showing session hierarchy and state
     Dashboard(DashboardArgs),
+}
+
+/// Subverbs under `koto pool`.
+#[derive(Subcommand)]
+pub enum PoolCommand {
+    /// List each pool the user config defines, with its holders and its
+    /// waiters in queue order. Reads only: it takes no lock and changes no
+    /// file. Exits 1 when a pool's config entry is invalid.
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subverbs under `koto workspace`.
@@ -2105,6 +2126,23 @@ pub fn run(app: App) -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Command::Pool { subcommand } => match subcommand {
+            PoolCommand::Status { json } => {
+                #[cfg(unix)]
+                {
+                    let code = pool::status(json)?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = json;
+                    anyhow::bail!("koto pool status is available on Linux and macOS only")
+                }
+            }
+        },
         Command::Version { json } => {
             let info = buildinfo::build_info();
             if json {
@@ -7864,12 +7902,17 @@ fn handle_next(
         // Who asks the pool for a slot. `was_waiting` is the log's word that
         // this visit already queued, which is how a waiter whose entry was
         // swept learns it lapsed (PRD R12, R26).
+        // `holder_id` names this tick in the slot's holder record and the
+        // nesting marker; a background start replaces it with its run's id.
+        let holder_id = crate::engine::background::new_run_id();
         let requester = |pool: &str, koto_root: std::path::PathBuf| crate::pool::guard::Requester {
             koto_root,
             session: name.clone(),
             workspace: workspace_name(),
             state: state_name.to_string(),
             was_waiting: crate::pool::guard::waiting_in_visit(&log, state_name, pool),
+            holder_id: holder_id.clone(),
+            may_nest: true,
         };
         #[cfg(unix)]
         let mut background_events: Vec<EventPayload> = Vec::new();
@@ -7932,12 +7975,19 @@ fn handle_next(
         // `pool_released` for a slot. They are appended before the action's
         // own record. The pool whose slot this tick holds goes in
         // `pool_held`, for the release.
+        //
+        // The command also gets the nesting marker for the slot it runs on,
+        // so a koto it runs that reaches a pooled action of the same pool
+        // runs on this slot instead of queueing behind it (PRD R13). A
+        // marker that verified here means this tick is such a nested one:
+        // it runs on the outer slot, takes none and records nothing.
         let mut pool_events: Vec<EventPayload> = Vec::new();
         let mut pool_held: Option<String> = None;
+        let mut pool_marker: Vec<(String, String)> = Vec::new();
         let _pool_slot = match (&action.pool, crate::koto_home::koto_home()) {
             _ if is_background => None,
             (Some(pool), Some(koto_root)) => {
-                let requester = requester(pool, koto_root);
+                let requester = requester(pool, koto_root.clone());
                 let guarded = crate::pool::guard::acquire(pool, &requester);
                 pool_events = guarded.queue_events(pool, &requester);
                 if let Some(conditions) = guarded.outcome.blocking_condition(pool) {
@@ -7951,7 +8001,17 @@ fn handle_next(
                     };
                 }
                 match guarded.outcome {
+                    crate::pool::guard::GuardOutcome::Nested { marker, .. } => {
+                        pool_marker = marker;
+                        None
+                    }
                     crate::pool::guard::GuardOutcome::Acquired(slot) => {
+                        pool_marker = crate::pool::guard::marker_vars(
+                            pool,
+                            slot.index,
+                            &requester.holder_id,
+                            &koto_root,
+                        );
                         if let Err(e) = slot.inherit_into_children() {
                             eprintln!(
                                 "warning: the pool slot can't be passed to the command ({e}); \
@@ -7973,6 +8033,16 @@ fn handle_next(
                 }
             }
             _ => None,
+        };
+
+        // The environment this action's command runs with: the tick's,
+        // plus the nesting marker when it runs on a pool slot.
+        let marked_env;
+        let action_env: &crate::action::CommandEnv = if pool_marker.is_empty() {
+            tick_gates.command_env
+        } else {
+            marked_env = tick_gates.command_env.with_vars(pool_marker);
+            &marked_env
         };
 
         // Execute: polling or one-shot. The run time covers the whole
@@ -8030,7 +8100,7 @@ fn handle_next(
             execute_with_polling(
                 &command,
                 &wd,
-                tick_gates.command_env,
+                action_env,
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
@@ -8052,7 +8122,7 @@ fn handle_next(
                 &shutdown,
             )
         } else {
-            crate::action::run_shell_command(&command, &wd, 30, tick_gates.command_env)
+            crate::action::run_shell_command(&command, &wd, 30, action_env)
         };
         tick_gates.command_env.record(
             &format!("the default action of state '{}'", state_name),

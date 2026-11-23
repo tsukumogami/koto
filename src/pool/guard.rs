@@ -35,6 +35,86 @@ pub struct Requester {
     /// itself once a sweep has dropped the entry, and the log is how a
     /// lapsed waiter learns it lost its place.
     pub was_waiting: bool,
+    /// What a slot taken now is held for, written into its holder record
+    /// and carried by the nesting marker: the background run's id, or a
+    /// fresh id for an ordinary action's tick.
+    pub holder_id: String,
+    /// Whether a nesting marker that verifies lets this action run on the
+    /// outer slot. A background action never does: its runner would outlive
+    /// the slot it borrowed, so it queues as its own session.
+    pub may_nest: bool,
+}
+
+/// The nesting marker: `<pool>/<slot index>/<holder id>` of the slot the
+/// enclosing action holds (DESIGN-host-resource-pools.md, "Nesting").
+pub const POOL_HELD_ENV: &str = "KOTO_POOL_HELD";
+/// The koto root the marker's pool lives under, on its own so a root path
+/// with any character is unambiguous.
+pub const POOL_ROOT_ENV: &str = "KOTO_POOL_ROOT";
+
+/// The marker for slot `index` of `pool` under `root`, held for
+/// `holder_id`, as the variables a command run on that slot gets.
+pub fn marker_vars(
+    pool: &str,
+    index: usize,
+    holder_id: &str,
+    root: &Path,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            POOL_HELD_ENV.to_string(),
+            format!("{pool}/{index}/{holder_id}"),
+        ),
+        (
+            POOL_ROOT_ENV.to_string(),
+            root.to_string_lossy().into_owned(),
+        ),
+    ]
+}
+
+/// Whether two koto roots are the same directory.
+fn same_root(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The slot index this process may run `pool`'s action on because an
+/// enclosing action holds it: the marker (`held`, `root`) names `pool`
+/// under `koto_root`, and the named slot is held by a record naming the
+/// marker's holder id. A marker that doesn't verify (another pool or root,
+/// a free slot, a different holder, a malformed value) grants nothing, so a
+/// stale marker left in a daemon's environment is ignored once its run has
+/// ended.
+pub fn verify_marker(
+    held: Option<&str>,
+    root: Option<&str>,
+    pool: &str,
+    koto_root: &Path,
+) -> Option<usize> {
+    let (held, root) = (held?, root?);
+    let mut parts = held.splitn(3, '/');
+    let (name, index, id) = (parts.next()?, parts.next()?, parts.next()?);
+    if name != pool || id.is_empty() || root.is_empty() {
+        return None;
+    }
+    let index: usize = index.parse().ok()?;
+    if !same_root(Path::new(root), koto_root) {
+        return None;
+    }
+    let holder = store::held_slot(koto_root, pool, index)?;
+    (holder.run_id.as_deref() == Some(id)).then_some(index)
+}
+
+/// [`verify_marker`] on this process's environment.
+fn inherited_slot(pool: &str, koto_root: &Path) -> Option<usize> {
+    let held = std::env::var(POOL_HELD_ENV).ok();
+    let root = std::env::var(POOL_ROOT_ENV).ok();
+    verify_marker(held.as_deref(), root.as_deref(), pool, koto_root)
 }
 
 /// What the guard's queue edits found, beyond its outcome, so the tick can
@@ -139,6 +219,14 @@ pub enum GuardOutcome {
     Unpooled,
     /// A slot was taken; hold it while the action runs.
     Acquired(Slot),
+    /// An enclosing action already holds slot `index` of this pool, and its
+    /// marker verified: run on that slot, taking none and recording no
+    /// `pool_acquired` (PRD R13). `marker` is the variables to pass on, so
+    /// an action nested deeper verifies the same way.
+    Nested {
+        index: usize,
+        marker: Vec<(String, String)>,
+    },
     /// No slot came free within `wait_secs`. The value is the `__pool__`
     /// condition's `output`.
     Queued(serde_json::Value),
@@ -166,7 +254,9 @@ impl GuardOutcome {
     ) -> Option<std::collections::BTreeMap<String, crate::gate::StructuredGateResult>> {
         use crate::gate::{GateOutcome, StructuredGateResult};
         let (outcome, output) = match self {
-            GuardOutcome::Unpooled | GuardOutcome::Acquired(_) => return None,
+            GuardOutcome::Unpooled | GuardOutcome::Acquired(_) | GuardOutcome::Nested { .. } => {
+                return None
+            }
             GuardOutcome::Queued(output) => (GateOutcome::Pending, output.clone()),
             GuardOutcome::ConfigInvalid {
                 config_path,
@@ -241,7 +331,22 @@ pub fn acquire(pool: &str, requester: &Requester) -> Guarded {
             key,
             reason,
         }),
-        PoolLookup::Defined(spec) => acquire_defined(pool, &spec, requester),
+        PoolLookup::Defined(spec) => {
+            if requester.may_nest {
+                if let Some(index) = inherited_slot(pool, &requester.koto_root) {
+                    let held = std::env::var(POOL_HELD_ENV).unwrap_or_default();
+                    let root = std::env::var(POOL_ROOT_ENV).unwrap_or_default();
+                    return unnoted(GuardOutcome::Nested {
+                        index,
+                        marker: vec![
+                            (POOL_HELD_ENV.to_string(), held),
+                            (POOL_ROOT_ENV.to_string(), root),
+                        ],
+                    });
+                }
+            }
+            acquire_defined(pool, &spec, requester)
+        }
     }
 }
 
@@ -326,6 +431,7 @@ fn attempt(
         state: requester.state.clone(),
         pid: std::process::id(),
         since: now,
+        run_id: Some(requester.holder_id.clone()),
     };
     let edited = store::edit_queue(dir, |queue| {
         queue.sweep_lapsed(now, spec.lapse_secs);
@@ -408,6 +514,8 @@ mod tests {
             workspace: format!("ws-{session}"),
             state: "test".to_string(),
             was_waiting: false,
+            holder_id: format!("tick-{session}"),
+            may_nest: true,
         }
     }
 
@@ -513,6 +621,37 @@ mod tests {
             event_types(&guarded.queue_events("p", &w1)),
             ["released:lapsed", "pool_queued"]
         );
+    }
+
+    #[test]
+    fn a_marker_verifies_only_against_its_own_held_slot() {
+        let root = tempfile::tempdir().unwrap();
+        config(
+            root.path(),
+            "[pools.p]\nsize = 1\nwait_secs = 0\n[pools.q]\nsize = 1\n",
+        );
+        let r = root.path().to_str().unwrap();
+        let held = slot(acquire("p", &requester(root.path(), "a")));
+        let verify = |held: &str, pool: &str| verify_marker(Some(held), Some(r), pool, root.path());
+        assert_eq!(verify("p/0/tick-a", "p"), Some(0));
+        // Another pool, another holder, another slot, another root, junk.
+        assert_eq!(verify("p/0/tick-a", "q"), None);
+        assert_eq!(verify("p/0/tick-b", "p"), None);
+        assert_eq!(verify("p/1/tick-a", "p"), None);
+        assert_eq!(verify("p/x/tick-a", "p"), None);
+        assert_eq!(verify("p/0/", "p"), None);
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(
+            verify_marker(Some("p/0/tick-a"), Some(r), "p", other.path()),
+            None
+        );
+        assert_eq!(
+            verify_marker(Some("p/0/tick-a"), None, "p", root.path()),
+            None
+        );
+        // Once the slot is free the marker is stale and grants nothing.
+        drop(held);
+        assert_eq!(verify("p/0/tick-a", "p"), None);
     }
 
     #[test]
