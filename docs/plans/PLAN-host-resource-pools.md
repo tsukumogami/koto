@@ -131,7 +131,49 @@ the first run's `background_finished`.
 
 ### Step 3: waiters are served in order, with a claim period and a lapse
 
-Waiters are served first come first served with the claim period, lapse, in-tick wait and resize or removal rules (R8, R9 race, R11, R12, R15, R16), and leaving the state drops a waiter.
+**Goal**: Sessions waiting on a full pool take freed slots first come first
+served, through the queue file and its claim. Steps 1 and 2 admit any session
+that finds a free slot and only sweep waiters whose tickets expired; this step
+makes the queue decide who goes next, holds a freed slot for the head waiter
+for `claim_secs`, drops a waiter that stops ticking for `lapse_secs`, and
+applies the resize and removal rules.
+
+**Acceptance Criteria**:
+
+- [ ] With size 1 and waiters W1, W2 and W3 queued in that order, the slot goes
+  to W1, then W2, then W3, even when W3 ticks every second and the others
+  every 10 seconds.
+- [ ] A session that arrives while a slot is free but W1 is waiting queues
+  behind W1 and reports `position: 2`.
+- [ ] With `claim_secs = 5`, when a slot frees and W1 doesn't tick for 6
+  seconds, W2's next tick takes the slot, and W1 takes the following free
+  slot; the claim starts whether the holder exited cleanly or was killed.
+- [ ] With `lapse_secs = 5`, a waiter that doesn't tick for 6 seconds loses its
+  place and the waiters behind it move up; its next tick queues it at the back
+  and its log holds `pool_released` with reason `lapsed`.
+- [ ] A queued tick reports `retry_after_secs` equal to `min(15, claim_secs)`,
+  and two queued ticks 3 seconds apart report `waited_secs` larger by at least
+  2 on the second; with `wait_secs = 5` and a holder finishing 2 seconds into
+  the waiter's tick, that tick takes the slot without returning queued.
+- [ ] Twenty sessions racing for the last free slot of a size-1 pool produce
+  exactly one holder.
+- [ ] Lowering `size` from 2 to 1 while two sessions hold slots keeps both and
+  admits a third only after both release; removing the pool lets a waiter's
+  next tick run unthrottled with `pool_released` reason `pool_removed`.
+- [ ] A waiter whose session is rewound out of the pool state, or completes,
+  leaves the queue at once with `pool_released` reason `left_state`.
+
+**Check**: Run `cargo test --test pool_queue` and see every case pass; the
+ordering case prints the three acquisition times in W1, W2, W3 order.
+
+**Dependencies**: Step 2
+
+**Files**: `src/pool/store.rs`, `src/pool/guard.rs`, `src/cli/mod.rs`,
+`tests/pool_queue.rs`
+
+**Type**: code
+
+**Complexity**: critical
 
 ### Step 4: crashes, cancels and moves never leak a slot or signal a stranger
 
