@@ -82,7 +82,27 @@ Step 1 landed the `tests` job (display name "Tests and Coverage") running `cargo
 
 ### Step 3: Local verification runs tests with CI's isolation and falls back to the serial run with a notice
 
-The verification map's test entries go through a wrapper that uses nextest when it is installed and prints a fallback notice and runs serial cargo test when it is not.
+**Goal**: An agent running koto's verification map gets the same one-process-per-test isolation CI uses when cargo-nextest is installed, and today's serial run, with a notice saying so, when it isn't. A new `scripts/run-tests.sh` (`set -euo pipefail`) takes cargo package arguments. When `cargo nextest --version` succeeds and reports a version at or above the `nextest-version` minimum in `.config/nextest.toml` (0.9.100), it runs `cargo nextest run --locked --profile ci "$@"`, then, only when called with no arguments, `cargo test --locked --doc`. Otherwise it prints `run-tests: cargo-nextest not found; running cargo test serially (--test-threads=1)` to stderr and runs `cargo test --locked "$@" -- --test-threads=1`. The map's `cargo-test` and `stability-tests` commands become `bash scripts/without-session-env.sh env CARGO_INCREMENTAL=0 bash scripts/run-tests.sh` (plus `-p koto-stability-tests` for the second). They keep the `"timeout_secs": 3600` and `"max_procs": 2048` main now gives them (koto#722). The map entry whose paths trigger those commands gains `scripts/run-tests.sh` and `.config/nextest.toml`.
+
+What steps 1 and 2 left: `.config/nextest.toml` has the `ci` profile (`retries = 0`, `fail-fast = false`, no filter, JUnit to `junit.xml`) and an empty `[test-groups]` table. CI's `tests` job ("Tests and Coverage") and `stability-tests` job both run nextest under that profile, and `validate` fails unless both succeed. The comment above the stability-tests job in `.github/workflows/validate.yml` says it is one of the four default checks in `.claude/shirabe-extensions/work-on.md` to "change both together". That stays untrue until this step: this step makes it true and keeps `work-on.md`'s default-check list in step with the map. Environment variables set in the caller's shell don't reach the commands the verification supervisor starts, so the wrapper sets anything it needs itself. Verification reads the map from the merge base, so this step's own verification run still uses the serial map; the wrapper is checked directly below.
+
+**Acceptance Criteria**:
+
+- [ ] `scripts/run-tests.sh` exists, is executable, starts with `set -euo pipefail`, and passes `bash -n` and `shellcheck` with no findings
+- [ ] With a cargo-nextest at or above 0.9.100 on PATH, `bash scripts/run-tests.sh -p koto-stability-tests` runs nextest with the `ci` profile, lists the 12 stability tests each with its own result line, and runs no doctest step
+- [ ] With no cargo-nextest on PATH, `bash scripts/run-tests.sh -p koto-stability-tests` prints exactly `run-tests: cargo-nextest not found; running cargo test serially (--test-threads=1)` to stderr and then runs `cargo test --locked -p koto-stability-tests -- --test-threads=1`, which passes
+- [ ] A cargo-nextest older than 0.9.100 is treated the same as a missing one (fallback notice, serial run), shown by a stub `cargo-nextest` on PATH that reports an older version
+- [ ] The map's `cargo-test` and `stability-tests` commands both start `bash scripts/without-session-env.sh`, call `scripts/run-tests.sh`, and keep `timeout_secs` 3600 and `max_procs` 2048; `cargo test --locked --test verification_map_env` passes
+- [ ] `git grep -n -- '--test-threads=1' .claude/` matches only fallback text, and no map command passes `--test-threads=1` itself
+- [ ] The map entry that triggers `cargo-test` and `stability-tests` lists `scripts/run-tests.sh` and `.config/nextest.toml` among its paths
+- [ ] `.claude/shirabe-extensions/work-on.md`'s default-check list names the same commands the map's `default` runs, and the validate.yml comments that tie a CI job to it describe the pairing truthfully
+- [ ] No test is removed, ignored or retried, and no file under `src/` changes
+
+**Check**: Run `bash -n scripts/run-tests.sh` and `shellcheck scripts/run-tests.sh`. Run `cargo test --locked --test verification_map_env`. For the nextest path, put a cargo-nextest of 0.9.100 or later on PATH and run `bash scripts/run-tests.sh -p koto-stability-tests`; confirm the `ci` profile and 12 separately reported passes. For the fallback, run the same command with PATH stripped of any cargo-nextest; confirm the exact stderr notice and a passing serial run. For the old-version case, put a stub `cargo-nextest` that prints `cargo-nextest 0.9.50` first on PATH and confirm the fallback notice. Run `git grep -n -- '--test-threads=1' .claude/` and confirm only fallback text matches. Don't run the full suite by hand: verification runs it, and the PR's hosted CI runs it under nextest.
+
+**Dependencies**: Step 2
+
+**Files**: `scripts/run-tests.sh`, `.claude/shirabe-extensions/verification-map.json`, `.claude/shirabe-extensions/work-on.md`, `.github/workflows/validate.yml`
 
 ### Step 4: The suite's notes and the PR's evidence match the new isolation
 
