@@ -6,10 +6,11 @@
 //!   config doesn't define is timed against a tick on the same state with no
 //!   `pool` field: the median of 50 each, taken in one run with the two
 //!   interleaved, may differ by at most 5 ms. The test prints both medians
-//!   and the difference. It runs in the debug suite and, in release mode, in
-//!   CI's `Pool Tick Cost (release)` job on the Linux runner.
+//!   and the difference. The debug suite measures and prints them; the bound
+//!   is judged in release mode, in CI's `Pool Tick Cost (release)` job on the
+//!   Linux runner.
 //! - **The compiled hash of a template that uses none of the new fields.**
-//!   `tests/fixtures/template-hash/no-pool.md` compiles to the hash the
+//!   `tests/fixtures/pool/no-pool.md` compiles to the hash the
 //!   released koto v0.38.0 gave it. `compat_baseline_test` holds its
 //!   compiled bytes with every other fixture; this pins the hash itself.
 //!
@@ -198,15 +199,14 @@ fn an_undefined_pool_adds_at_most_five_ms_to_a_tick() {
 }
 
 /// The hash koto v0.38.0, the release before pools shipped, gave
-/// `tests/fixtures/template-hash/no-pool.md` (the name of the file
+/// `tests/fixtures/pool/no-pool.md` (the name of the file
 /// `koto template compile` wrote to its cache).
 const NO_POOL_RELEASED_HASH: &str =
     "c5fa2de21fea83384ba35153edbae50549b1779f1a44de2e5a71712b1c71e0b8";
 
 #[test]
 fn a_template_using_none_of_the_new_fields_keeps_its_released_hash() {
-    let source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/template-hash/no-pool.md");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pool/no-pool.md");
     // The fixture's gate has a `poll.timeout_secs` of its own, so the
     // action fields are checked on the compiled template, not the text.
     let compiled = koto::template::compile::compile(&source, false).unwrap();
