@@ -177,7 +177,56 @@ ordering case prints the three acquisition times in W1, W2, W3 order.
 
 ### Step 4: crashes, cancels and moves never leak a slot or signal a stranger
 
-Crash release, orphaned and lost runs, cancel and removal, moves refused in flight, the background switch and timeout cap, and output truncation behave as R10, R19 to R24 require.
+**Goal**: A background run holds its slot until every process of it has
+exited, the runner stops the command's descendants when the command ends or
+times out, and koto signals only a live runner it has verified. Step 2 left no
+descendant kill, no SIGTERM or cancel handling, and no record when a surviving
+process finally frees a slot; step 3 left `koto cancel` and session removal
+without leaving the queue. This step closes those, adds the `[background]`
+switch and timeout cap, and refuses moves while a run is in flight.
+
+**Acceptance Criteria**:
+
+- [ ] `kill -9` of a background runner's whole process tree frees the slot
+  within 5 seconds with no file removed by hand, and the head waiter's next
+  tick takes it.
+- [ ] After `kill -9` of a runner whose command survives, the session's ticks
+  report `__action__` status `orphaned` and the slot stays held, no signal
+  reaches the surviving command, and once it exits the next tick reports
+  `failure_kind: "lost"` with `pool_released` reason `lost`, and the tick after
+  starts a new run.
+- [ ] On Linux, a background command that starts a child with `setsid` and
+  exits leaves no process of the run alive once the runner ends, and the slot
+  is free.
+- [ ] `koto cancel` on a holder stops its runner, the command's processes are
+  gone and the slot is free within 5 seconds, with `pool_released` reason
+  `cancelled`; `koto cancel` on a waiter, and removing a waiting session,
+  remove it from the queue before the command returns.
+- [ ] Re-entering the pool state while a previous visit's runner is alive stops
+  that runner before the new run starts.
+- [ ] With `[background] enabled = false`, a background action stops with
+  `background_disabled`; with `max_timeout_secs = 10`, an action declaring
+  `timeout_secs: 60` is killed after 10 seconds and its `running` condition
+  shows `timeout_capped: true`.
+- [ ] A background command printing 100 KiB to stdout and exiting 1 yields a
+  failure whose stdout is its first 64 KiB with `truncated: true`.
+- [ ] Relocate, rebind and cross-host import of a session refuse with
+  `background_run_in_flight` while its run is in flight, and a run whose
+  `background_started` event names another machine reads as `lost`.
+
+**Check**: Run `cargo test --test pool_crash` and see every case pass; the
+orphaned case shows the surviving command's pid still alive after the runner's
+death and no signal recorded against it.
+
+**Dependencies**: Step 3
+
+**Files**: `src/engine/background.rs`, `src/cli/run_action.rs`,
+`src/cli/mod.rs`, `src/pool/store.rs`, `src/pool/config.rs`,
+`src/session/`, `tests/pool_crash.rs`
+
+**Type**: code
+
+**Complexity**: critical
 
 ### Step 5: koto pool status shows holders and waiters, and bad config fails only where used
 
