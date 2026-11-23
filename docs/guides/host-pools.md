@@ -38,8 +38,8 @@ state or its `default_action` are compile errors.
 
 **A pool nobody defined is no limit.** On a machine whose config has no `[pools.test-suite]`, the
 action above runs exactly as it would without the `pool` line: nothing is created on disk, nothing
-is recorded, and the tick costs well under a millisecond more (the repository's tick-cost check
-holds it to 5 ms). So naming a pool in a shared template is safe: it only takes effect where an
+is recorded, and the tick costs at most 5 ms more, which the repository's tick-cost check
+enforces (in practice the two medians are within a millisecond of each other). So naming a pool in a shared template is safe: it only takes effect where an
 operator defined it.
 
 ## Sizing a pool
@@ -246,10 +246,12 @@ A background run adds `background_started` and `background_finished`, each with 
 
 ## Platforms
 
-Pools and background actions run on Linux and macOS. On another platform a pooled action on a
-defined pool stops with an error `__pool__` condition, `error_code: "pool_unsupported_platform"`,
+Pools and background actions run on Linux and macOS. On another Unix platform (a BSD, say) a
+pooled action on a defined pool stops with an error `__pool__` condition, `error_code: "pool_unsupported_platform"`,
 and runs nothing, and the compiler refuses `background: true`. An undefined pool imposes nothing
-there either, so a template that names a pool still runs where pools don't.
+there either, so a template that names a pool still runs where pools don't. (koto doesn't run
+actions at all on non-Unix platforms, so the compile-time refusal is the only part that applies
+there.)
 
 On macOS there is no child subreaper, so a process that escapes the runner (a daemon a command
 leaves behind) is not killed when the run ends. It keeps the run's slot until it exits, and
