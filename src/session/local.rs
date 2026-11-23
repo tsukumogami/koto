@@ -662,6 +662,79 @@ impl LocalBackend {
         out
     }
 
+    /// [`with_manifest_lock`](Self::with_manifest_lock) with the wait for
+    /// the lock bounded by `wait`: `Ok(None)`, with `f` never run, when
+    /// another process still holds the lock once `wait` has passed.
+    ///
+    /// `koto init --supersede` takes the predecessor's manifest lock this
+    /// way and its append lock inside it, so it never waits without limit
+    /// on either. A decision writer takes the same two locks in the same
+    /// order (the manifest lock in [`crate::decisions::store`], then the
+    /// append lock for a gate-passing event), so the two can't deadlock.
+    pub(crate) fn with_manifest_lock_within<T>(
+        &self,
+        session: &str,
+        wait: std::time::Duration,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let ctx_dir = self.ctx_dir(session);
+        fs::create_dir_all(&ctx_dir)
+            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
+        #[cfg(unix)]
+        let Some(manifest_lock) =
+            Self::acquire_flock_within(&self.manifest_lock_path(session), wait)?
+        else {
+            return Ok(None);
+        };
+        #[cfg(not(unix))]
+        let _ = wait;
+        let out = f();
+        #[cfg(unix)]
+        Self::release_flock(&manifest_lock);
+        out.map(Some)
+    }
+
+    /// [`acquire_flock`](Self::acquire_flock) with the wait bounded by
+    /// `wait`: `Ok(None)` when the lock is still held elsewhere once `wait`
+    /// has passed. The same import-swap check applies once it is held.
+    #[cfg(unix)]
+    fn acquire_flock_within(
+        path: &Path,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<Option<fs::File>> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("failed to open lock file: {}", path.display()))?;
+        match crate::engine::jsonl_append::lock_exclusive(
+            file.as_raw_fd(),
+            Some(wait),
+            std::time::Instant::now(),
+        ) {
+            Ok(()) => {}
+            Err(e) if crate::engine::jsonl_append::lock_timeout(&e).is_some() => return Ok(None),
+            Err(e) => {
+                return Err(e.context(format!("failed to acquire flock on {}", path.display())))
+            }
+        }
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+            let now = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+            if held.is_none() || held != now {
+                return Err(anyhow::anyhow!(
+                    "{} was replaced while waiting for its lock; run the command again",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Some(file))
+    }
+
     /// The `ctx/` directory of `session`.
     pub(crate) fn ctx_path(&self, session: &str) -> PathBuf {
         self.ctx_dir(session)

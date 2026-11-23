@@ -1310,6 +1310,13 @@ pub enum DecisionsSubcommand {
         /// Decision id
         id: String,
     },
+    /// Print a session's chain as koto would walk it now: each link and its
+    /// kind, each supersede hop and whether it was confirmed, and the
+    /// session's own supersede marker. Records nothing
+    Chain {
+        /// Session name
+        name: String,
+    },
     /// Reverse a decision, by session name and id, recording the reversal
     /// in the session named by `--in` or its anchor
     Reverse {
@@ -3112,6 +3119,17 @@ pub fn run(app: App) -> Result<()> {
                         }
                     }
                     decisions::handle_show(&backend, &name, &id)
+                }
+                DecisionsSubcommand::Chain { name } => {
+                    // The chain read walks this host's copies only, so a
+                    // session imported away isn't served from the bucket's
+                    // copy as `show` is: it is refused, naming where it
+                    // went. No back-reference is written, since the read
+                    // records nothing.
+                    if let Err(e) = backend.check_located(&name) {
+                        refuse_unlocated(&e, "decisions chain");
+                    }
+                    decisions::handle_chain(&backend, &name)
                 }
                 DecisionsSubcommand::Reverse { name, id, reversal } => {
                     let reverser = reversal.in_session.clone();

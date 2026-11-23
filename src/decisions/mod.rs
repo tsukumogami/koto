@@ -17,7 +17,10 @@
 //!   size caps.
 //! - [`decider`]: the decider, agent, run mode and authority, from koto's
 //!   own variables and keys.
-//! - [`chain`]: the chain snapshot over dispatched-by and held-by links.
+//! - [`chain`]: the chain snapshot over dispatched-by and held-by links,
+//!   and the chain read that follows supersede markers forward.
+//! - [`marker`]: the supersede marker `koto init --supersede` writes in
+//!   the session it fences.
 //! - [`store`]: the allocator, the create-only writer and the listing of a
 //!   session's areas with their integrity checks.
 //! - [`gate_pass`]: the decisions koto's own commands record with the
@@ -30,6 +33,7 @@ pub mod body;
 pub mod chain;
 pub mod decider;
 pub mod gate_pass;
+pub mod marker;
 pub mod read;
 pub mod standing;
 pub mod store;
@@ -72,6 +76,14 @@ pub fn is_decision_area_key(key: &str) -> bool {
         && ["decisions", "aimed", "packs"]
             .iter()
             .any(|area| second.eq_ignore_ascii_case(area))
+}
+
+/// Whether `key` is one no writer may change or remove through a context
+/// store, koto's own included: a key in a decision area
+/// ([`is_decision_area_key`]) or the supersede marker
+/// ([`marker::is_marker_key`]), each compared case-insensitively.
+pub fn is_write_once_key(key: &str) -> bool {
+    is_decision_area_key(key) || marker::is_marker_key(key)
 }
 
 /// Whether `id` is a decision id: exactly [`ID_WIDTH`] ASCII digits.
@@ -151,6 +163,16 @@ mod tests {
         assert!(!is_decision_area_key("koto/links/held-by/a"));
         assert!(!is_decision_area_key("decisions/000000000001"));
         assert!(!is_decision_area_key("koto/decisionsx/1"));
+    }
+
+    #[test]
+    fn the_marker_is_write_once_and_not_a_decision_area() {
+        assert!(is_write_once_key("koto/superseded-by"));
+        assert!(is_write_once_key("Koto/SUPERSEDED-BY"));
+        assert!(is_write_once_key("koto/decisions/000000000001"));
+        assert!(!is_decision_area_key("koto/superseded-by"));
+        assert!(!is_write_once_key("koto/superseded-carry-complete"));
+        assert!(!is_write_once_key("koto/links/held-by/a"));
     }
 
     #[test]
