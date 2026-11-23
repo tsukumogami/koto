@@ -574,6 +574,66 @@ mod context_carry {
         );
     }
 
+    /// `koto session origin` reads link bodies without the push `context
+    /// get` makes: a dispatched-by link the home's manifest lacks stays out
+    /// of the bucket after the verb read it.
+    #[test]
+    fn session_origin_never_pushes_a_link_the_home_lacks() {
+        let s3 = FakeS3::start(BUCKET);
+        let root = tempfile::TempDir::new().unwrap();
+        let (host, _) = host_and_sibling(&s3, root.path());
+        let ws = host.ws.clone();
+        let template = root.path().join("marker.md");
+        std::fs::write(&template, MARKER_TEMPLATE).unwrap();
+        let name = "wf";
+        let run = koto_in(
+            &host,
+            &ws,
+            &["init", name, "--template", template.to_str().unwrap()],
+        );
+        assert!(run.ok(), "init: {}", run.describe());
+        let run = koto_in(
+            &host,
+            &ws,
+            &["session", "link", name, "--dispatched-by", "zeta"],
+        );
+        assert!(run.ok(), "link zeta: {}", run.describe());
+
+        // Two links, so the verb reads their bodies to choose; the second's
+        // push fails, so only this host holds it.
+        let ctx = format!("{}/{name}/ctx/", prefix_of(&ws));
+        let key = "koto/links/dispatched-by/alpha";
+        s3.fail("PUT", &format!("{ctx}{key}"), 500);
+        let _ = koto_in(
+            &host,
+            &ws,
+            &["session", "link", name, "--dispatched-by", "alpha"],
+        );
+        s3.clear_faults();
+        assert!(
+            bucket_manifest(&s3, &ctx)["keys"][key].is_null(),
+            "the failed push must leave the link out of the home's manifest"
+        );
+        assert!(host.manifest(name)["keys"][key].is_object());
+
+        let run = koto_in(&host, &ws, &["session", "origin", name]);
+        assert!(run.ok(), "session origin: {}", run.describe());
+        let got: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap();
+        assert_eq!(got["origin"]["state"], "dispatched", "{}", run.describe());
+        assert_eq!(got["origin"]["dispatcher_kind"], "workflow");
+        assert_eq!(
+            s3.object(&format!("{ctx}{key}")),
+            None,
+            "{}",
+            run.describe()
+        );
+        assert!(
+            bucket_manifest(&s3, &ctx)["keys"][key].is_null(),
+            "the verb must not push the link: {}",
+            run.describe()
+        );
+    }
+
     /// A key removed from the home after this host last synced it isn't pushed
     /// back by a read: the home lacks it because another host removed it.
     #[test]

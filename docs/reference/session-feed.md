@@ -971,6 +971,19 @@ events:
       dispatched_by:
         type: string
         required: false
+      origin:
+        type: object
+        required: false
+
+  origin_unrecorded:
+    tier: 3
+    fields:
+      named:
+        type: string
+        required: true
+      reason:
+        type: string
+        required: true
 
   anchor_activity:
     tier: 3
@@ -2750,7 +2763,42 @@ it. A created anchor carries it among its initial events.
 | `transcript` | string | No | A SHA-256 prefix of the harness's transcript path, never the path. |
 | `predecessor` | string | No | For a successor, the anchor it succeeds. |
 | `reason` | string | No | Why a successor was opened: `closed` (its predecessor read closed), `migrated`, `resume` (a resume under a new id, matched through a hint) or `clear`. |
-| `dispatched_by` | string | No | The dispatcher the caller inherited, when it named one. Recorded on every call; the dispatched-by link itself is written only when the anchor is created. |
+| `dispatched_by` | string | No | The dispatcher the caller inherited, when it named a valid anchor name other than this anchor's own. Recorded on every call; the dispatched-by link itself is written only when the anchor is created. A malformed or self-naming value is never put here. |
+| `origin` | object | No | Where the anchor came from, on the event that created it (`opened` of `new`, `reopened` or `successor`); absent on a continue and on events written before koto recorded it. `state` is `dispatched` (with `dispatcher`, the name the starting environment gave), `none` (it gave none, or an empty value), or `unrecorded` (with `named` and `reason`). `named` is the value's first 64 characters when it holds only letters, digits, `.`, `_` and `-`, and otherwise `sha256:<prefix> (<n> bytes)`. `reason` is `malformed: not an anchor name` (over 256 bytes, or not a valid session name) or `self: names this anchor` (it names this anchor or its family's first anchor). `dispatched` is what the starting environment claimed, not an authenticated fact. `koto session origin` reports it, read together with the dispatched-by link and any `origin_unrecorded` event. |
+
+```json
+{"source": "startup", "harness_session": "h2", "opened": "new",
+ "dispatched_by": "anchor-h1",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-h1"}}
+```
+
+---
+
+#### `origin_unrecorded`
+
+Appended to an anchor by the `koto session anchor open` that created it,
+when the dispatched-by link its creating `anchor_started` called for couldn't
+be written. At most one per anchor. The open still succeeds and prints
+`origin=unrecorded`. The store's error is never recorded.
+`koto session origin` reads the anchor as `unrecorded` with this event's
+`named` and `reason`, and as `unrecorded` with `link not found` when the
+creating event names a dispatcher with no link beside it and this event is
+missing too.
+
+```json
+{
+  "type": "origin_unrecorded",
+  "payload": {
+    "named": "anchor-h1",
+    "reason": "link write failed: store error"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `named` | string | Yes | The dispatcher the creating event named, as a preview. |
+| `reason` | string | Yes | `link write failed: store error`. |
 
 ---
 

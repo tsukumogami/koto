@@ -12,35 +12,45 @@
 #      walking up from its parent past shells, so koto can link a /clear to
 #      the anchor the same process ran before;
 #   3. keeps the dispatcher it inherited (`KOTO_DISPATCHER_ANCHOR`, else
-#      `KOTO_ANCHOR`) and, only when no `KOTO_ANCHOR` was inherited, niwa's
-#      reap key (`NIWA_REAP_KEY`): a process launched from another agent
-#      session's shell carries that session's `KOTO_ANCHOR`, and its parent's
-#      key must not mark it;
+#      `KOTO_ANCHOR`), whatever it holds, cut to 256 bytes, and, only when no
+#      `KOTO_ANCHOR` was inherited, niwa's reap key (`NIWA_REAP_KEY`): a
+#      process launched from another agent session's shell carries that
+#      session's `KOTO_ANCHOR`, and its parent's key must not mark it;
 #   4. runs `koto session anchor open` with those and `--record-authority`
 #      against the store the agent session's shells use: the one the
 #      `KOTO_SESSION_*` configuration names, or koto's config files when
 #      none is set (see koto_clean). The watchers of step 6 inherit the same
-#      environment, so they write to the store the open used. The open
-#      records the authority
+#      environment, so they write to the store the open used. koto decides
+#      whether the dispatcher names an anchor and records the anchor's
+#      origin either way. The open records the authority
 #      the start was handed in `KOTO_AUTHORITY` in the anchor, or clears an
 #      earlier start's; the variable stays in that one call's environment,
 #      never on a command line. A koto from before the flag refuses it, and
-#      the open runs again without it, recording nothing;
+#      the open runs again without it, recording nothing. A koto from before
+#      the origin record refuses a dispatcher that isn't an anchor name, and
+#      the open runs again without the dispatcher;
 #   5. replaces its block of `CLAUDE_ENV_FILE`, which Claude Code sources
 #      before every shell command, when that file can be written safely:
 #      `export KOTO_ANCHOR` and `export KOTO_DISPATCHER_ANCHOR`, both naming
-#      its own anchor, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the
-#      open failed, so the shells never keep the dispatcher's anchor; then
+#      its own anchor. That is the anchor the open printed or, when the open
+#      printed none because the watchdog cut it off or it failed without a
+#      refusal, the family's first name, `anchor-<session id>`, so a slow
+#      store doesn't erase the dispatcher a worker launched from these
+#      shells records. Only a refused open writes
+#      `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR`, so the shells never keep
+#      the dispatcher's anchor; then
 #      `unset NIWA_REAP_KEY`, since the key is this hook's to record and must
 #      not reach a child, `unset KOTO_AUTHORITY`, so no shell of the session
 #      and no worker or `claude -p` it launches carries the start's
 #      authority, and `:`, because each env file is one link of an
 #      `&&` chain and must end with status 0. When the file can't be written
 #      safely it returns the `KOTO_ANCHOR` export line as additionalContext
-#      instead; a failure writing it leaves the file as it was;
-#   6. detaches a watcher, unless it inherited a `KOTO_ANCHOR` or already
-#      has a key: on a startup or a resume that opened a successor, with an
-#      env file directory to read, one that waits for niwa's key; after a
+#      instead, only for an anchor the open printed; a failure writing it
+#      leaves the file as it was;
+#   6. detaches a watcher for an anchor the open printed, unless it
+#      inherited a `KOTO_ANCHOR` or already has a key: on a startup or a
+#      resume that opened a successor, with an env file directory to read,
+#      one that waits for niwa's key; after a
 #      /clear that found a predecessor with no marker yet, one that copies
 #      the marker.
 #
@@ -247,8 +257,49 @@ for _ in 1 2 3 4 5 6 7 8; do
   break
 done
 
-dispatcher="${KOTO_DISPATCHER_ANCHOR:-${KOTO_ANCHOR:-}}"
-[[ "$dispatcher" =~ $ANCHOR_RE ]] || dispatcher=""
+# The anchor family's first name, which the shells get when the open prints
+# no anchor of its own (see step 5). The id passed the plain-name check, so
+# the name holds only plain-name characters and is safe inside the env
+# file's single quotes.
+derived="anchor-$session_id"
+
+# cut_bytes <value> <n>: sets CUT to the value's first n bytes, less the
+# bytes of a UTF-8 character the cut would split. koto's argument parser
+# refuses invalid UTF-8 before the open runs, so a cut mid-character would
+# fail the open. The work is byte by byte, under an LC_ALL=C local to the
+# function, and the result is set, not printed, so no trailing newline of
+# the value is lost to a command substitution.
+cut_bytes() {
+  local LC_ALL=C
+  local v="$1" n="$2" i k need=0
+  if [ "${#v}" -gt "$n" ]; then
+    v="${v:0:n}"
+    # Back from the end over continuation bytes to the last character's
+    # lead byte, which says how many continuation bytes it needs.
+    i=$((${#v} - 1))
+    k=0
+    while [ "$i" -gt 0 ] && [[ "${v:i:1}" == [$'\x80'-$'\xbf'] ]]; do
+      i=$((i - 1))
+      k=$((k + 1))
+    done
+    if [[ "${v:i:1}" == [$'\xc0'-$'\xdf'] ]]; then
+      need=1
+    elif [[ "${v:i:1}" == [$'\xe0'-$'\xef'] ]]; then
+      need=2
+    elif [[ "${v:i:1}" == [$'\xf0'-$'\xf7'] ]]; then
+      need=3
+    fi
+    [ "$k" -lt "$need" ] && v="${v:0:i}"
+  fi
+  CUT="$v"
+}
+
+# The dispatcher goes to the open whatever it holds: koto, not the hook,
+# decides whether it names an anchor, and records one that doesn't as an
+# unrecorded origin. The cut is to 256 bytes, koto's bound on the value,
+# so an oversized environment value never reaches the command line whole.
+cut_bytes "${KOTO_DISPATCHER_ANCHOR:-${KOTO_ANCHOR:-}}" 256
+dispatcher="$CUT"
 inherited_anchor="${KOTO_ANCHOR:-}"
 key=""
 if [ -z "$inherited_anchor" ]; then
@@ -260,22 +311,45 @@ fi
 # never read as a flag.
 args=(session anchor open "--harness-session=$session_id" "--source=$start_source")
 [ -n "$token" ] && args+=("--process=$token")
-[ -n "$dispatcher" ] && args+=("--dispatched-by=$dispatcher")
 [ -n "$key" ] && args+=("--observed-key=$key")
 [ -n "$transcript_path" ] && args+=("--transcript-path=$transcript_path")
 [ -n "$payload_cwd" ] && [ -d "$payload_cwd" ] && args+=("--workspace=$payload_cwd")
 
-out="$(koto_clean "${args[@]}" --record-authority)"
-status=$?
-# Exit 2 with no anchor is a refusal, or a koto from before
-# --record-authority that doesn't know the flag: open again without it, so
-# such a koto still opens the anchor (recording no authority). A call cut
-# off by the watchdog exits otherwise and isn't run twice.
-if [ "$status" -eq 2 ]; then
+# Whether the last open was refused: exit 2 with no anchor= line. A call
+# cut off by the watchdog exits otherwise, so it is never taken for one.
+# It reads the globals `out` and `status` that open_anchor sets; nothing
+# else assigns them, so the `exported` decision below can ask again.
+open_refused() {
+  [ "$status" -eq 2 ] || return 1
   case "$out" in
-    anchor=* | *$'\n'anchor=*) ;;
-    *) out="$(koto_clean "${args[@]}")" ;;
+    anchor=* | *$'\n'anchor=*) return 1 ;;
   esac
+  return 0
+}
+
+# open_anchor <arg...>: runs the open with --record-authority, and when that
+# is refused, which a koto from before the flag does, again without it, so
+# such a koto still opens the anchor (recording no authority). Sets out and
+# status.
+open_anchor() {
+  out="$(koto_clean "$@" --record-authority)"
+  status=$?
+  if open_refused; then
+    out="$(koto_clean "$@")"
+    status=$?
+  fi
+}
+
+if [ -n "$dispatcher" ]; then
+  open_anchor "${args[@]}" "--dispatched-by=$dispatcher"
+  # A koto from before the origin record refuses the whole open over a
+  # dispatcher that isn't an anchor name: open again without it. A refusal
+  # with an anchor name is koto's answer to something else and stands.
+  if open_refused && ! [[ "$dispatcher" =~ $ANCHOR_RE ]]; then
+    open_anchor "${args[@]}"
+  fi
+else
+  open_anchor "${args[@]}"
 fi
 
 anchor=""
@@ -293,6 +367,22 @@ while IFS= read -r line; do
   esac
 done <<<"$out"
 [[ "$anchor" =~ $ANCHOR_RE ]] || anchor=""
+
+# Two names, kept apart. `anchor` is the one the open printed, and only it
+# is acted on: the watchers and the additionalContext fallback read it, so
+# nothing runs against an anchor the open didn't confirm. `exported` is the
+# one the shells get: the printed anchor, else the derived name when the
+# watchdog cut the open off or it failed without a refusal, so a dispatcher
+# behind a slow store still has a name for its workers to record. A refused
+# open, such as a session id koto won't name an anchor after, exports
+# nothing.
+if [ -n "$anchor" ]; then
+  exported="$anchor"
+elif open_refused; then
+  exported=""
+else
+  exported="$derived"
+fi
 
 # The env file is written only when it is a regular file, or not there yet,
 # in a directory of this session's own that isn't a symlink.
@@ -323,9 +413,9 @@ if [ -n "$env_dir" ]; then
       done <"$CLAUDE_ENV_FILE"
     fi
     printf '%s\n' "$BLOCK_BEGIN"
-    if [ -n "$anchor" ]; then
-      printf "export KOTO_ANCHOR='%s'\n" "$anchor"
-      printf "export KOTO_DISPATCHER_ANCHOR='%s'\n" "$anchor"
+    if [ -n "$exported" ]; then
+      printf "export KOTO_ANCHOR='%s'\n" "$exported"
+      printf "export KOTO_DISPATCHER_ANCHOR='%s'\n" "$exported"
     else
       printf 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR\n'
     fi
