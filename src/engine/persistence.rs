@@ -273,6 +273,23 @@ fn append_under_lock<H: LogHeader>(
 /// fix: the buffer then starts with the missing `\n`, so this event still gets
 /// a line of its own.
 fn write_event_line(path: &Path, event: &Event, unterminated: bool) -> anyhow::Result<()> {
+    // No `create`: if the log disappeared since it was read, the open fails
+    // rather than starting a new, headerless one.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    write_event_to(&mut file, event, unterminated)
+        .map_err(|e| anyhow::anyhow!("failed to write event to {}: {:#}", path.display(), e))?;
+    file.sync_data()
+        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// The body of [`write_event_line`] past the open: `event` serialized and
+/// written to `w` as one line, in one `write_all` of one buffer. Separate
+/// from the open so a test can count the writes.
+fn write_event_to(w: &mut impl Write, event: &Event, unterminated: bool) -> anyhow::Result<()> {
     let line = serde_json::to_string(event)
         .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
     let mut buf = String::with_capacity(line.len() + 2);
@@ -281,18 +298,67 @@ fn write_event_line(path: &Path, event: &Event, unterminated: bool) -> anyhow::R
     }
     buf.push_str(&line);
     buf.push('\n');
-
-    // No `create`: if the log disappeared since it was read, the open fails
-    // rather than starting a new, headerless one.
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-    file.write_all(buf.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write event to {}: {}", path.display(), e))?;
-    file.sync_data()
-        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+    w.write_all(buf.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod single_write_tests {
+    use super::*;
+    use crate::engine::types::{Event, EventPayload};
+
+    /// Accepts every write whole and keeps each call's bytes apart.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl Write for Writes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn event() -> Event {
+        let payload = EventPayload::ContextAdded {
+            key: "k".to_string(),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: None,
+        };
+        Event {
+            seq: 7,
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    /// One state-log event goes out in exactly one write: the whole line
+    /// and its newline, never the line in pieces or the newline on its own
+    /// (koto#419, koto#728).
+    #[test]
+    fn an_event_line_goes_out_in_one_write() {
+        let event = event();
+        let line = serde_json::to_string(&event).unwrap();
+        for (unterminated, want) in [(false, format!("{line}\n")), (true, format!("\n{line}\n"))] {
+            let mut w = Writes::default();
+            write_event_to(&mut w, &event, unterminated).unwrap();
+            assert_eq!(
+                w.0.len(),
+                1,
+                "unterminated={unterminated}: {} writes: {:?}",
+                w.0.len(),
+                w.0.iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(String::from_utf8_lossy(&w.0[0]), want);
+        }
+    }
 }
 
 /// Outcome of an idempotent append.
