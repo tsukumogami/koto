@@ -1172,8 +1172,10 @@ mod tests {
 
     /// RAII guard that overrides `$HOME` for the duration of a test and restores
     /// it on drop, so the config load and env self-discovery resolve against a
-    /// controlled directory. Env mutation is process-global; CI runs
-    /// `--test-threads=1` (see `.github/workflows/validate.yml`).
+    /// controlled directory. Env mutation is process-global, but nextest runs
+    /// each test in its own process, so the override can't race another test.
+    /// Locally, `scripts/run-tests.sh` falls back to a serial `cargo test`
+    /// when nextest isn't installed, which keeps that true.
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
     }

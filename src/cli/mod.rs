@@ -11876,10 +11876,11 @@ Done.
 
     /// Points `$HOME` at a scratch directory for one test and restores it,
     /// so the terminal tick's writes under `$HOME/.koto` (the terminal index)
-    /// land there. Env mutation is process-global; CI runs
-    /// `--test-threads=1` (a parallel local run can race another test that
-    /// reads `$HOME`), as the workflows surface tests that do the same
-    /// rely on.
+    /// land there. Env mutation is process-global, but nextest runs each
+    /// test in its own process, so the swap can't race another test that
+    /// reads `$HOME`. Locally, `scripts/run-tests.sh` falls back to a serial
+    /// `cargo test` when nextest isn't installed, which keeps that true. The
+    /// workflows surface tests that do the same rely on it too.
     #[cfg(unix)]
     struct ScratchHome {
         prev: Option<std::ffi::OsString>,
