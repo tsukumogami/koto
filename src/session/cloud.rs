@@ -3772,12 +3772,12 @@ impl CloudBackend {
         self.check_fence(id)?;
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.append_event_held(id, &held, payload, timestamp);
+                return self.local.append_event_held(id, held, payload, timestamp);
             }
         }
-        self.local
-            .append_event_held(id, &held, payload, timestamp)?;
-        drop(held);
+        // Releases `held` once the line is in, before the after-commit
+        // steps and the push.
+        self.local.append_event_held(id, held, payload, timestamp)?;
         self.push_state_after_write(id)
     }
 

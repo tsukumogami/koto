@@ -86,11 +86,6 @@ impl LocalBackend {
         self.journal_root.as_deref()
     }
 
-    /// The directory sessions are stored under.
-    ///
-    /// Exposed so maintenance verbs that work on the store as a whole --
-    /// `koto session recover` walking the migration quarantine, for one --
-    /// can address it without duplicating the home-directory lookup.
     /// The path of `id`'s state log.
     pub(crate) fn state_path(&self, id: &str) -> PathBuf {
         self.base_dir.join(id).join(state_file_name(id))
@@ -113,15 +108,25 @@ impl LocalBackend {
     /// [`SessionBackend::append_event`] for a caller holding `id`'s append
     /// lock through `held`: the append goes in under it, without taking the
     /// lock again, and runs the same after-commit steps.
+    ///
+    /// `held` is taken by value and released once the line is in, before
+    /// the after-commit steps run: materializing the `/workflows` surface
+    /// appends a nested `context_added` through the commit funnel, which
+    /// takes the same lock and would wait forever on its own process.
     pub(crate) fn append_event_held(
         &self,
         id: &str,
-        held: &persistence::HeldLogLock,
+        held: persistence::HeldLogLock,
         payload: &EventPayload,
         timestamp: &str,
     ) -> anyhow::Result<()> {
-        let commit =
-            persistence::append_event_tracked_held(held, &self.state_path(id), payload, timestamp)?;
+        let commit = persistence::append_event_tracked_held(
+            &held,
+            &self.state_path(id),
+            payload,
+            timestamp,
+        )?;
+        drop(held);
         self.after_commit(id, payload, &commit);
         Ok(())
     }
@@ -152,6 +157,11 @@ impl LocalBackend {
         Ok(())
     }
 
+    /// The directory sessions are stored under.
+    ///
+    /// Exposed so maintenance verbs that work on the store as a whole --
+    /// `koto session recover` walking the migration quarantine, for one --
+    /// can address it without duplicating the home-directory lookup.
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
