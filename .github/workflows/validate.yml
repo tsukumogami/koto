@@ -59,6 +59,24 @@ jobs:
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
 
+  pool-tick-cost:
+    # Host resource pools' cost bound (PRD-host-resource-pools.md R28): the
+    # median of 50 ticks on a state whose action names an undefined pool is
+    # at most 5 ms above the median of 50 on the same state without `pool`.
+    # The debug suite runs the same test; this job times a release build
+    # and prints both medians.
+    name: Pool Tick Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the tick-cost check in release mode
+        run: cargo test --locked --release --test pool_compat -- --nocapture
+
   pin-compat-v0-23:
     # Proves koto v0.23.0, the last release before pins, keeps a session the
     # PR's koto pinned through its prunes, its terminal tick and its replace.
@@ -620,6 +638,69 @@ jobs:
       - name: Check that log mutations make it fail
         run: test/compat/check-lifecycle-v0_14_1.sh --self-test
 
+  pool-compat-v0-38-0:
+    # Proves koto v0.38.0, the release before host resource pools, compiles
+    # and runs a template with `pool: test-suite` unthrottled while the
+    # PR's koto holds that pool's only slot, and reads with `koto status` a
+    # session log holding all five pool and background event types. Same
+    # pinned installer as the jobs above (install.sh is unchanged between
+    # the two tags); no secret is needed.
+    name: Pool Compat (koto v0.38.0)
+    runs-on: ubuntu-latest
+    env:
+      KOTO_FLOOR_VERSION: v0.38.0
+      # Commit the v0.38.0 tag points to, and the SHA-256 of its install.sh.
+      KOTO_INSTALLER_COMMIT: 556f26dd27d54d2103ae676126663ef51164a9c4
+      KOTO_INSTALLER_SHA256: 5f8c62f618f8181fa4b48e0e600e1208dddd1f0dab668a73e1b52ae7b52ba319
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require sha256sum
+        run: |
+          if ! command -v sha256sum >/dev/null 2>&1; then
+            echo "::error::sha256sum is not on PATH; the koto installer can't be verified"
+            exit 1
+          fi
+
+      - name: Install koto v0.38.0 through the pinned installer
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/koto-install.sh"
+          curl -fsSL -o "$installer" \
+            "https://raw.githubusercontent.com/tsukumogami/koto/${KOTO_INSTALLER_COMMIT}/install.sh"
+          if ! echo "${KOTO_INSTALLER_SHA256}  ${installer}" | sha256sum -c -; then
+            echo "::error::install.sh at ${KOTO_INSTALLER_COMMIT} does not match the recorded SHA-256"
+            exit 1
+          fi
+          install_dir="$RUNNER_TEMP/koto-floor"
+          KOTO_INSTALL_DIR="$install_dir" bash "$installer" --version="$KOTO_FLOOR_VERSION" --no-modify-path
+          KOTO_FLOOR_BIN="$install_dir/bin/koto"
+          reported="$("$KOTO_FLOOR_BIN" version)"
+          echo "$reported"
+          case "$reported" in
+            "koto ${KOTO_FLOOR_VERSION#v} "*|"koto ${KOTO_FLOOR_VERSION#v}") ;;
+            *)
+              echo "::error::$KOTO_FLOOR_BIN reports '$reported', expected koto ${KOTO_FLOOR_VERSION#v}"
+              exit 1
+              ;;
+          esac
+          echo "KOTO_FLOOR_BIN=$KOTO_FLOOR_BIN" >> "$GITHUB_ENV"
+
+      - name: Build the PR's koto
+        run: |
+          cargo build --release
+          echo "KOTO_NEW_BIN=$GITHUB_WORKSPACE/target/release/koto" >> "$GITHUB_ENV"
+
+      - name: Run the v0.38.0 compatibility check
+        run: test/compat/pool-v0_38_0.sh
+
+      - name: Check that log and pool mutations make it fail
+        run: test/compat/pool-v0_38_0.sh --self-test
+
   poll-forge-neutral:
     # The polling gate and clear-on-entry code stay free of any forge and of
     # credentials: koto runs the command a template names and nothing else.
@@ -738,7 +819,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, retention-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, retention-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -747,6 +828,7 @@ jobs:
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
+             [ "${{ needs.pool-tick-cost.result }}" = "failure" ] || \
              [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
              [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
@@ -759,6 +841,7 @@ jobs:
              [ "${{ needs.decider-checks-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.value-routing-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.check-lifecycle-compat-v0-14-1.result }}" = "failure" ] || \
+             [ "${{ needs.pool-compat-v0-38-0.result }}" = "failure" ] || \
              [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
              [ "${{ needs.inline-evidence.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
