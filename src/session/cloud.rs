@@ -3820,9 +3820,9 @@ impl CloudBackend {
     /// The batch lock, where a step takes it (the pull's flush of an open
     /// batch, the store write or the append inside a tick or write window),
     /// is taken after the append lock, the order [`CloudBackend::append_logged`]
-    /// takes them in. A header rewrite inside a batch takes them the other
-    /// way round, but waits for the append lock for a bounded time, so the
-    /// two can't wait on each other for good.
+    /// takes them in. A header rewrite inside a batch takes them in the same
+    /// order (see `rewrite_header`), so no path holds the batch lock while
+    /// it waits for the append lock.
     pub(crate) fn add_context_locked_within(
         &self,
         id: &str,
