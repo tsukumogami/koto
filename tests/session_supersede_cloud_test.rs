@@ -1137,3 +1137,82 @@ fn a_manifest_key_the_carry_refuses_never_reaches_the_refusal() {
     }
     assert!(!h.has_marker());
 }
+
+/// A cloud pull never replaces a supersede marker already in the local
+/// copy, even when the bucket's marker has other bytes, and brings the
+/// bucket's marker down when the local copy has none.
+#[test]
+fn a_cloud_pull_never_replaces_a_present_local_marker_and_fills_a_missing_one() {
+    let h = Hosts::new();
+    h.predecessor();
+    let out = h.supersede(1, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+
+    let local = h.sessions(1).join("p/ctx/koto/superseded-by");
+    let kept = std::fs::read(&local).expect("the supersede left a local marker");
+    let marker_key = h.pred_ctx("koto/superseded-by");
+    let bucket_marker = h.s3.object(&marker_key).unwrap();
+    let other = b"{\"v\":1,\"other\":\"bytes\"}".to_vec();
+    assert_ne!(kept, other);
+    h.s3.put(&marker_key, &other);
+    // Force the pull to fetch the context again: the local sync record
+    // is gone, so every bucket key reads as new to this host.
+    let _ = std::fs::remove_file(h.sessions(1).join("p").join("cloud-ctx-synced.json"));
+    h.s3.clear_requests();
+
+    let out = h.run(1, &h.w1, &["session", "resolve", "p", "--keep", "remote"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(&local).unwrap(), kept);
+    let gets =
+        h.s3.requests()
+            .into_iter()
+            .filter(|r| r.method == "GET" && r.key == marker_key)
+            .count();
+    assert!(gets >= 1, "the pull never fetched the bucket's marker");
+
+    // With no local marker, a pull brings the bucket's down.
+    h.s3.put(&marker_key, &bucket_marker);
+    std::fs::remove_file(&local).unwrap();
+    let out = h.run(1, &h.w1, &["session", "resolve", "p", "--keep", "remote"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(&local).unwrap(), bucket_marker);
+}
+
+/// The fence is pushed first, then the marker, then the successor's first
+/// key; a marker write the bucket refuses exits 3 `persistence_error`
+/// with the predecessor fenced and no successor anywhere.
+#[test]
+fn the_fence_comes_before_the_marker_and_the_marker_before_the_successor() {
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.clear_requests();
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(0), "{out:?}");
+
+    let marker_key = h.pred_ctx("koto/superseded-by");
+    let succ_prefix = format!("{}/s/", prefix_of(&h.w2));
+    let reqs = h.s3.requests();
+    let first_put = |pred: &dyn Fn(&fake_s3::Request) -> bool| {
+        reqs.iter()
+            .position(|r| r.method == "PUT" && pred(r))
+            .expect("expected a PUT")
+    };
+    let fence = first_put(&|r| r.key == h.pred_state_key());
+    let marker = first_put(&|r| r.key == marker_key);
+    let succ = first_put(&|r| r.key.starts_with(&succ_prefix));
+    assert!(fence < marker, "fence {fence} after marker {marker}");
+    assert!(marker < succ, "marker {marker} after successor {succ}");
+
+    // A refused marker write leaves p fenced and s uncreated.
+    let h = Hosts::new();
+    h.predecessor();
+    h.s3.fail("PUT", &h.pred_ctx("koto/superseded-by"), 500);
+    let out = h.supersede(2, "s");
+    assert_eq!(exit_of(&out), Some(3), "{out:?}");
+    let body = printed_json(&out.stdout);
+    assert_eq!(body["code"], "persistence_error", "{body}");
+    assert_eq!(h.fences().len(), 1);
+    let succ_prefix = format!("{}/s/", prefix_of(&h.w2));
+    assert!(h.s3.keys_under(&succ_prefix).is_empty());
+    assert!(!h.sessions(2).join("s").exists());
+}
