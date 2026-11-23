@@ -257,7 +257,8 @@ const UNDECLARED_LOOKUP_REMEDY: &str = ". This bucket's name index isn't declare
      requests";
 
 /// The request timeout of every request koto makes to the bucket, except a
-/// lookup's, which uses [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
+/// lookup's and the probe path's reads ([`PROBE_DEADLINE`]), which use
+/// [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
 /// default, set here so a crate upgrade can't move it under
 /// [`list_retrying`]'s retry policy.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -311,6 +312,33 @@ const LOOKUP_LIVE_REQUESTS: usize = 2 * HELD_ELSEWHERE_FANOUT;
 /// The process-wide count of live lookup request threads, capped at
 /// [`LOOKUP_LIVE_REQUESTS`].
 static LOOKUP_SLOTS: RequestSlots = RequestSlots::new(LOOKUP_LIVE_REQUESTS);
+
+/// How long one of the probe path's reads may take, counted from its first
+/// request (koto#605): the listing of a session's prefix
+/// ([`CloudBackend::probe`]), the listings that locate a session recording
+/// no prefix ([`CloudBackend::locate`]) and the HEAD of a session's state
+/// object ([`CloudBackend::s3_session_exists`]).
+///
+/// Each is one ask ([`bounded_ask`]) of at most [`LOOKUP_REQUEST_TIMEOUT`],
+/// with no koto retry, so the deadline is one full ask. On the sync bucket
+/// a reply that never came held the command for about a minute: rust-s3's
+/// retry a second later, after two 30 s read timeouts. Here a stalled
+/// bucket costs a command about 10 s per session it probes; a failed
+/// listing isn't asked again in the process.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most probe request threads alive at once in this process, in flight
+/// and abandoned together ([`bounded_ask`]). Probes run one at a time, and
+/// one koto stopped waiting for ends within about 21 s (two 10 s transport
+/// timeouts and rust-s3's retry between them), so a command probing
+/// session after session on a stalled bucket holds a few. Kept apart from
+/// [`LOOKUP_SLOTS`], so a sweep's abandoned requests never starve a probe,
+/// nor a probe a sweep.
+const PROBE_LIVE_REQUESTS: usize = 16;
+
+/// The process-wide count of live probe request threads, capped at
+/// [`PROBE_LIVE_REQUESTS`].
+static PROBE_SLOTS: RequestSlots = RequestSlots::new(PROBE_LIVE_REQUESTS);
 
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
@@ -474,6 +502,10 @@ struct Probes {
     /// the declaration is read once and the refusal's retry sleep is paid
     /// once. Kept here, in the box, for the same reason.
     entries_refused: Mutex<HashSet<String>>,
+    /// The limits the probe path's reads ask under
+    /// ([`LookupLimits::probe`]); short ones in tests. Kept here, in the
+    /// box, for the same reason.
+    limits: LookupLimits,
 }
 
 impl CloudBackend {
@@ -532,6 +564,7 @@ impl CloudBackend {
                 located: Mutex::default(),
                 deferred_to: Mutex::default(),
                 entries_refused: Mutex::default(),
+                limits: LookupLimits::probe(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -1387,7 +1420,10 @@ impl CloudBackend {
     /// no prefix twice) whose listing shows the session's state object.
     ///
     /// Each candidate is listed once per process, with a delimiter, so the
-    /// listing reads only the session's top level. No candidate holding the
+    /// listing reads only the session's top level. Every listing is one
+    /// bounded ask ([`probe_ask`]), and all of them together end within
+    /// [`PROBE_DEADLINE`]; one with no answer by then is a listing that
+    /// failed (koto#605). No candidate holding the
     /// state object, both holding one, and a listing that fails are
     /// [`Unlocated`], naming every candidate concerned. A listing alone
     /// can't say whose copy it found: the copy is the session's own only
@@ -1418,10 +1454,13 @@ impl CloudBackend {
         };
         let mut held = Vec::new();
         let mut failed = None;
+        // One deadline for every candidate: a later one gets the time left.
+        let run = LookupRun::new(self.probes.limits);
         for candidate in &candidates {
             let session = format!("{candidate}/{id}/");
             let state = format!("{session}{}", state_file_name(id));
-            match self.bucket.list(session, Some("/".to_string())) {
+            let bucket = self.probe_bucket();
+            match probe_ask(run, move || bucket.list(session, Some("/".to_string()))) {
                 Ok(pages) => {
                     if pages
                         .iter()
@@ -1581,13 +1620,32 @@ impl CloudBackend {
     /// process's listing, reused for the check window (koto#439). Only a
     /// read takes a shared answer (`allow_shared`); a write's probe is a
     /// listing this process made, as it always was.
+    ///
+    /// The listing is one bounded ask ([`probe_ask`]) that ends within
+    /// [`PROBE_DEADLINE`], counted from when it starts, so a bucket that
+    /// accepts the request and never answers fails the probe in about 10 s
+    /// rather than holding the command for a minute (koto#605).
     fn probe_for(&self, id: &str, allow_shared: bool) -> anyhow::Result<ProbeAnswer> {
-        self.probe_with(id, allow_shared, |prefix| self.bucket.list(prefix, None))
+        self.probe_with(id, allow_shared, |prefix| {
+            let run = LookupRun::new(self.probes.limits);
+            let bucket = self.probe_bucket();
+            probe_ask(run, move || bucket.list(prefix, None))
+        })
+    }
+
+    /// The bucket the probe path's reads ask on: a copy of the sync bucket
+    /// with [`LOOKUP_REQUEST_TIMEOUT`] as its request timeout
+    /// ([`lookup_bucket`]), so a read koto stopped waiting for ends by
+    /// itself sooner. The sync bucket itself if the copy can't be made;
+    /// [`bounded_ask`] is the bound either way.
+    fn probe_bucket(&self) -> Box<Bucket> {
+        lookup_bucket(&self.bucket).unwrap_or_else(|_| self.bucket.clone())
     }
 
     /// [`CloudBackend::probe_for`], with the listing of `id`'s prefix made
-    /// by `list` when no answer is kept: the sync bucket's own listing, or
-    /// a lookup's bounded one ([`CloudBackend::located_probe`]).
+    /// by `list` when no answer is kept: one bounded ask
+    /// ([`CloudBackend::probe_for`]), or a lookup's bounded listing
+    /// ([`CloudBackend::located_probe`]).
     fn probe_with(
         &self,
         id: &str,
@@ -3437,9 +3495,15 @@ impl CloudBackend {
     }
 
     /// Check if a session exists in S3 by looking for its state file.
+    ///
+    /// The HEAD is one bounded ask ([`probe_ask`]) that ends within
+    /// [`PROBE_DEADLINE`] (koto#605). Any failure, no answer in time
+    /// included, reads as absent.
     fn s3_session_exists(&self, id: &str) -> bool {
         let key = self.state_key(id);
-        self.bucket.head_object(&key).is_ok()
+        let bucket = self.probe_bucket();
+        let run = LookupRun::new(self.probes.limits);
+        probe_ask(run, move || bucket.head_object(key).map(|_| ())).is_ok()
     }
 
     /// DELETE `key`. Every delete this backend makes itself goes through
@@ -7226,7 +7290,8 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
 }
 
 /// A copy of `bucket` whose requests time out after
-/// [`LOOKUP_REQUEST_TIMEOUT`], for a lookup's small reads. It keeps the
+/// [`LOOKUP_REQUEST_TIMEOUT`], for a lookup's or a probe's small reads
+/// ([`CloudBackend::probe_bucket`]). It keeps the
 /// bucket's name, endpoint, credentials and addressing.
 ///
 /// That timeout starts only once the connection is up, so it isn't the
@@ -7403,7 +7468,8 @@ impl Drop for RequestSlot {
 }
 
 /// The limits a lookup's asks run under: [`LookupLimits::lookup`] for a
-/// command, and short ones in tests, each with request slots of its own.
+/// command, [`LookupLimits::probe`] for the probe path's reads, and short
+/// ones in tests, each with request slots of its own.
 #[derive(Clone, Copy)]
 struct LookupLimits {
     /// The longest koto waits for one ask ([`bounded_ask`]).
@@ -7428,12 +7494,25 @@ impl LookupLimits {
             slots: &LOOKUP_SLOTS,
         }
     }
+
+    /// The probe path's limits: one ask of [`LOOKUP_REQUEST_TIMEOUT`]
+    /// within [`PROBE_DEADLINE`], on slots of its own ([`PROBE_SLOTS`]).
+    /// Its reads make one listing or HEAD at a time, so the fanout is 1.
+    fn probe() -> Self {
+        LookupLimits {
+            ask_deadline: LOOKUP_REQUEST_TIMEOUT,
+            deadline: PROBE_DEADLINE,
+            fanout: 1,
+            slots: &PROBE_SLOTS,
+        }
+    }
 }
 
 /// One lookup ([`CloudBackend::check_located`]'s, for a name with no local
 /// copy): its limits, and when it began, which is where its deadline counts
 /// from. Every read of the lookup asks within it: the own-prefix probe, the
 /// index, declaration and top-level reads, and every [`any_holds`] listing.
+/// One of the probe path's reads ([`probe_ask`]) runs within one too.
 #[derive(Clone, Copy)]
 struct LookupRun {
     limits: LookupLimits,
@@ -7537,6 +7616,9 @@ fn whole_ms(d: std::time::Duration) -> std::time::Duration {
 /// read deadline, and usually less ([`LookupRun::wait`]). When both are
 /// 10 s either can fire first; both failures are transient and are asked
 /// again alike, so the tie needs no breaking.
+///
+/// A lookup's reads ask through here, and so do the probe path's
+/// ([`probe_ask`]), which ask once.
 fn bounded_ask<T: Send + 'static>(
     run: LookupRun,
     wait: std::time::Duration,
@@ -7576,6 +7658,26 @@ fn bounded_ask<T: Send + 'static>(
             Err(S3Error::Io(std::io::Error::other(ended)))
         }
     }
+}
+
+/// One of the probe path's reads (koto#605): `request` asked once
+/// ([`bounded_ask`]), waiting at most [`LookupRun::wait`]. A read whose
+/// `run` has no time left isn't asked and fails as a [`timed_out`] one.
+/// No retry of koto's own: rust-s3's single retry still runs inside the
+/// ask, so a failure costs the requests it always did, only bounded.
+///
+/// For reads only, as [`bounded_ask`] is.
+fn probe_ask<T: Send + 'static>(
+    run: LookupRun,
+    request: impl FnOnce() -> Result<T, S3Error> + Send + 'static,
+) -> Result<T, S3Error> {
+    let Some(wait) = run.wait() else {
+        return Err(timed_out(format!(
+            "not asked: koto stopped waiting at the probe's {:?} deadline",
+            whole_ms(run.limits.deadline)
+        )));
+    };
+    bounded_ask(run, wait, request)
 }
 
 /// [`asked_retrying`]'s policy for one of a lookup's reads, where `ask`
@@ -8486,7 +8588,11 @@ mod tests {
         let credentials =
             Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
         let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
-        CloudBackend::with_parts(local, bucket, "test-prefix".to_string())
+        let mut backend = CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+        // Every probe-path read fails here; a short deadline keeps a host
+        // whose connects to it hang from waiting the full one.
+        backend.probes.limits = test_limits(ms(500), ms(500), 1);
+        backend
     }
 
     /// Helper: write a minimal state file header into a session directory.
@@ -9842,6 +9948,174 @@ mod tests {
             "{} connection(s) accepted",
             accepted.load(Ordering::SeqCst)
         );
+    }
+
+    // -- the probe path's reads (koto#605) --
+
+    #[test]
+    fn probe_limits_wait_one_full_ask_and_keep_slots_of_their_own() {
+        let probe = LookupLimits::probe();
+        assert_eq!(probe.ask_deadline, LOOKUP_REQUEST_TIMEOUT);
+        assert_eq!(probe.ask_deadline, std::time::Duration::from_secs(10));
+        assert_eq!(probe.deadline, PROBE_DEADLINE);
+        assert_eq!(probe.deadline, std::time::Duration::from_secs(10));
+        assert!(
+            probe.deadline >= probe.ask_deadline,
+            "the deadline cuts the probe's one ask short"
+        );
+        assert!(std::ptr::eq(probe.slots, &PROBE_SLOTS));
+        assert!(!std::ptr::eq(probe.slots, &LOOKUP_SLOTS));
+        assert_eq!(probe.slots.limit, PROBE_LIVE_REQUESTS);
+
+        // A backend asks its probes under them, until a test sets others.
+        let tmp = TempDir::new().unwrap();
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: "http://192.0.2.1:19000".to_string(),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let backend = CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+        assert_eq!(backend.probes.limits.deadline, PROBE_DEADLINE);
+        assert!(std::ptr::eq(backend.probes.limits.slots, &PROBE_SLOTS));
+    }
+
+    /// A backend against a loopback stub that accepts every connection and
+    /// never answers, keeping each one open with its request unread, with
+    /// probe limits of `ask` per ask within `deadline`; and how many
+    /// connections the stub accepted.
+    fn never_answering_backend(
+        base: &Path,
+        ask: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> (CloudBackend, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                kept.push(stream);
+            }
+        });
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: format!("http://{addr}"),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials)
+            .unwrap()
+            .with_path_style();
+        let local = LocalBackend::with_base_dir(base.to_path_buf());
+        let mut backend = CloudBackend::with_parts(local, bucket, "0000000000000005".to_string());
+        backend.probes.limits = test_limits(ask, deadline, 1);
+        (backend, accepted)
+    }
+
+    #[test]
+    fn a_stalled_probe_fails_within_its_deadline_and_names_the_timeout() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = TempDir::new().unwrap();
+        let (backend, accepted) = never_answering_backend(tmp.path(), ms(300), ms(300));
+
+        let started = std::time::Instant::now();
+        let err = backend.probe("wf").expect_err("the stub never answers");
+        let took = started.elapsed();
+        assert!(took < ms(1500), "took {took:?}");
+        assert!(is_timed_out(&err), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("listing 0000000000000005/wf/ failed"),
+            "{text}"
+        );
+        assert!(text.contains("no answer within"), "{text}");
+
+        // The failure stands for the process: no second listing.
+        let waited = std::time::Instant::now();
+        while accepted.load(Ordering::SeqCst) == 0 && waited.elapsed() < ms(1000) {
+            std::thread::sleep(ms(10));
+        }
+        let before = accepted.load(Ordering::SeqCst);
+        assert!(before >= 1, "the listing never connected");
+        let started = std::time::Instant::now();
+        let again = backend
+            .probe("wf")
+            .expect_err("a failed probe stays failed");
+        assert!(started.elapsed() < ms(100), "asked again");
+        assert!(again.to_string().contains("failed earlier"), "{again:#}");
+        std::thread::sleep(ms(50));
+        assert_eq!(accepted.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn a_stalled_candidate_listing_leaves_the_session_unlocated_within_the_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let (backend, _) = never_answering_backend(tmp.path(), ms(300), ms(500));
+        let (first, second) = ("000000000000000a", "000000000000000b");
+
+        let started = std::time::Instant::now();
+        let got = backend.locate(
+            "wf",
+            Some("/the/anchor".to_string()),
+            vec![first.to_string(), second.to_string()],
+        );
+        let took = started.elapsed();
+        assert!(took < ms(1500), "took {took:?}");
+        let unlocated = got.expect_err("the stub never answers");
+        match unlocated.reason {
+            UnlocatedReason::NoRecordedPrefix {
+                anchor,
+                fallback: Fallback::Unreadable { prefix, error },
+            } => {
+                assert_eq!(anchor.as_deref(), Some("/the/anchor"));
+                assert_eq!(prefix, first);
+                assert!(error.contains("no answer within"), "{error}");
+            }
+            other => panic!("not an unreadable candidate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stalled_head_reads_as_absent_within_the_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let (backend, _) = never_answering_backend(tmp.path(), ms(300), ms(300));
+
+        let started = std::time::Instant::now();
+        assert!(!backend.s3_session_exists("wf"));
+        assert!(!backend.exists("wf"));
+        assert!(!backend.remote_state_exists("wf"));
+        let took = started.elapsed();
+        assert!(took < ms(2500), "took {took:?}");
+    }
+
+    #[test]
+    fn a_probe_ask_with_no_time_left_is_not_asked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let run = LookupRun::new(test_limits(ms(200), ms(0), 1));
+        let asked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&asked);
+        let got: Result<(), S3Error> = probe_ask(run, move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let err = got.unwrap_err();
+        assert!(
+            matches!(&err, S3Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut),
+            "{err:?}"
+        );
+        assert!(!asked.load(Ordering::SeqCst), "asked past the deadline");
     }
 
     // -- the migration marker on state reads --
