@@ -585,6 +585,23 @@ enum PublishError {
     Io(anyhow::Error),
 }
 
+/// [`publish`] for another write-once key koto keeps beside the decision
+/// areas, the supersede marker ([`super::marker`]): `Ok(true)` when this
+/// call published `bytes` at `key`, `Ok(false)` when something already sat
+/// there, which is left as it is.
+pub(crate) fn publish_create_only(
+    session_dir: &Path,
+    ctx_dir: &Path,
+    key: &str,
+    bytes: &[u8],
+) -> anyhow::Result<bool> {
+    match publish(session_dir, ctx_dir, key, bytes) {
+        Ok(()) => Ok(true),
+        Err(PublishError::Exists) => Ok(false),
+        Err(PublishError::Io(e)) => Err(e),
+    }
+}
+
 /// Write `bytes` to a synced temporary file in `session_dir` (outside
 /// `ctx/koto/`) and publish it at `key` under `ctx_dir` with a create-only
 /// rename, then sync the area directory.

@@ -1143,6 +1143,8 @@ koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
 
+`--keep local` uploads every context key the bucket doesn't hold as this host has it, then the manifest, the state file and `version.json`. A key whose upload the bucket doesn't confirm stays out of the manifest, and the command exits non-zero naming it after the rest went up. Run it again once the bucket answers.
+
 `--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
 
 | Value | Behavior |
@@ -1216,6 +1218,8 @@ Keys are hierarchical path strings (e.g., `scope.md`, `research/r1/lead.md`). Ke
 **Keys under `koto/` are reserved.** koto writes its own records there (the dispatched-by links of `koto session link`, the held-by links `KOTO_ANCHOR` records, and an anchor's observed marker). `context add` and `context remove` refuse any key whose first component is `koto`, in any case (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. `context get`, `exists` and `list` read them like any other key.
 
 No stdout on success. Exit 2 with `workflow '<session>' not found` if the session has no state log, and nothing is stored. That covers a name that was never initialized, a session that finished and was cleaned up, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. To give a batch child input before it starts, put it in the task entry's `vars`, or store it on the parent and read it from the child with `koto context get <parent> <key>`. Exit 3 on infrastructure errors, including a state log that exists but has no header.
+
+Under the cloud backend, an add made outside a tick or write window uploads the key's object before the manifest. koto asks the bucket up to twice and, when the last failure could still have stored it, reads the object back. When the bucket doesn't confirm it, the add exits 3 with an error naming the key. The content stays on this host, the add logs no `context_added` event, and the bucket's manifest leaves the key out until a later push of the session uploads it. Run the add again once the bucket answers.
 
 ---
 

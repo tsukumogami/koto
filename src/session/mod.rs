@@ -1460,6 +1460,19 @@ impl ContextStore for Backend {
         }
     }
 
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_confirmed(session, key, content, writer),
+            Backend::Cloud(b) => b.add_confirmed(session, key, content, writer),
+        }
+    }
+
     fn meta(&self, session: &str, key: &str) -> Option<context::KeyMeta> {
         match self {
             Backend::Local(b) => b.meta(session, key),

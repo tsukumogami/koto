@@ -11,7 +11,7 @@ This file covers exit codes, error shapes, and how to respond to each category o
 | 0 | Success | Parse and act on the JSON output |
 | 1 | Transient — retry when the condition resolves | Wait, then retry; or report to user if externally blocked |
 | 2 | Caller error — the agent must change behavior | Fix the request; do not retry without changing input |
-| 3 | Infrastructure error — corrupted or misconfigured, or the session bucket couldn't be read | Report to user; do not retry automatically. `session_lookup_failed` is the one to run again once the bucket answers |
+| 3 | Infrastructure error — corrupted or misconfigured, or the session bucket couldn't be read | Report to user; do not retry automatically. `session_lookup_failed` is the one to run again once the bucket answers, and so is a `koto context add` whose error says its upload to the bucket failed (the content is stored on this host only) |
 
 Some subcommands also return sysexits values (64, 65, 66, 75) — see the `NextErrorCode` table below. The `koto request` group never does: it uses 0, 1, 2, and 3 and nothing else, so a wrapper can treat any status above 3 from a request command as coming from somewhere other than koto.
 
