@@ -551,7 +551,11 @@ mod context_carry {
         let ctx = format!("{}/{name}/ctx/", prefix_of(&ws));
         s3.fail("PUT", &format!("{ctx}{key}"), 500);
         let run = add_in(&host, &ws, name, key, "mine");
-        assert!(run.ok(), "add: {}", run.describe());
+        assert!(
+            run.code == Some(3) && run.stdout.contains(key),
+            "add: {}",
+            run.describe()
+        );
         assert!(
             bucket_manifest(&s3, &ctx)["keys"][key].is_null(),
             "the failed push must leave the key out of the home's manifest"
@@ -692,7 +696,11 @@ mod context_carry {
         std::thread::sleep(std::time::Duration::from_millis(20));
         s3.fail("PUT", &format!("{ctx}{key}"), 500);
         let run = add_in(host, &ws, name, key, "local");
-        assert!(run.ok(), "add local: {}", run.describe());
+        assert!(
+            run.code == Some(3) && run.stdout.contains(key),
+            "add local: {}",
+            run.describe()
+        );
         s3.clear_faults();
         assert_eq!(
             s3.object(&format!("{ctx}{key}")).as_deref(),

@@ -3971,18 +3971,24 @@ impl CloudBackend {
             .iter()
             .filter(|key| !is_host_local_key(key) && !withheld.contains(key))
             .partition(|key| manifest.keys.contains_key(key.as_str()));
-        let ctx_dir = self.local.session_dir(id).join("ctx");
+        let session_dir = self.local.session_dir(id);
+        let ctx_dir = session_dir.join("ctx");
         let ctx_key = |key: &str| format!("{}/{}/ctx/{}", self.home(id), id, key);
+        // A window key a plain write left owed before is owed no more once
+        // its object went up here.
         in_parallel(&present, |key| {
             let path = ctx_dir.join(key.as_str());
             let data =
                 std::fs::read(&path).with_context(|| format!("reading context key '{}'", key))?;
-            self.put_object(&ctx_key(key), &data)
+            self.put_object(&ctx_key(key), &data)?;
+            sync_stamp::clear_owed(&session_dir, key, &sync_stamp::sha256_hex(&data))
         })?;
         if !pending.keys.is_empty() {
-            if let Some(data) =
-                sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
-            {
+            // The objects of keys owed from earlier pushes go first, and the
+            // manifest leaves out any still owed (koto#646); those are
+            // warnings, since this window's own keys all went up.
+            sync::push_owed_warning(&self.local, &self.bucket, &self.home(id), id, &withheld);
+            if let Some(data) = sync::bucket_manifest_of(&session_dir, &withheld)? {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
                 crate::session::sync_stamp::note_synced(
                     &self.local.session_dir(id),
@@ -4380,8 +4386,10 @@ impl CloudBackend {
         // batch flush uses. Host-local keys stay on this host, and files in
         // `ctx/` the manifest doesn't name (its lock) are not context. A key
         // the manifest names with no content file here refuses the push
-        // rather than send a manifest naming it; a failed upload is a
-        // warning, as every push here always was. When the listing or the
+        // rather than send a manifest naming it. A key whose upload the
+        // bucket doesn't confirm is recorded owed, so the manifest leaves
+        // it out, and the push fails naming it once the state file and
+        // `version.json` went up (koto#646). When the listing or the
         // manifest can't be read, every key goes up.
         // A fresh probe and manifest, not this process's cached ones: the
         // comparison below decides what is skipped.
@@ -4411,23 +4419,49 @@ impl CloudBackend {
             // A pin record this copy indexes goes up as its own object,
             // below, and leaves the index. A continues relation whose
             // pointer isn't confirmed stays here until it is.
-            if is_host_local_key(key) || is_pin_record_key(key) || withheld.contains(key) || held {
+            if is_host_local_key(key) || is_pin_record_key(key) || withheld.contains(key) {
+                continue;
+            }
+            // The bucket holds this very copy: owed no more.
+            if held {
+                sync_stamp::clear_owed(&session_dir, key, &meta.hash)?;
                 continue;
             }
             let data = std::fs::read(ctx_dir.join(key))
                 .with_context(|| format!("reading context key '{}'", key))?;
             uploads.push((key.clone(), data));
         }
+        // The uploads take the bucket directly, past `put_object`'s check.
+        if !uploads.is_empty() {
+            self.refuse_if_read_only(&format!("S3 PUT of the context of {}", id))?;
+        }
+        let failed: Mutex<Vec<(String, String)>> = Mutex::default();
         let _ = in_parallel(&uploads, |(name, data)| {
             let s3_key = format!("{}/{}/ctx/{}", self.home(id), id, name);
-            if let Err(e) = self.put_object(&s3_key, data) {
-                eprintln!("warning: cloud sync: failed to upload ctx/{}: {}", name, e);
+            let hash = sync_stamp::sha256_hex(data);
+            let sent = match sync::put_confirmed(&self.bucket, &s3_key, data) {
+                Ok(()) => sync_stamp::clear_owed(&session_dir, name, &hash),
+                Err(e) => {
+                    let why = without_url_userinfo(&e.to_string());
+                    Err(match sync_stamp::mark_owed(&session_dir, name, &hash) {
+                        Ok(()) => anyhow::anyhow!("{why}"),
+                        Err(m) => {
+                            anyhow::anyhow!("{why}; recording the key as owed failed too: {m:#}")
+                        }
+                    })
+                }
+            };
+            if let Err(e) = sent {
+                failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((name.clone(), format!("{:#}", e)));
             }
             Ok(())
         });
+        let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
         self.carry_pin_records(id);
-        if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
-        {
+        if let Some(data) = sync::bucket_manifest_of(&session_dir, &withheld)? {
             let s3_key = format!("{}/{}/ctx/manifest.json", self.home(id), id);
             if let Err(e) = self.put_object(&s3_key, &data) {
                 eprintln!(
@@ -4448,6 +4482,23 @@ impl CloudBackend {
 
         self.push_version(id)?;
 
+        if !failed.is_empty() {
+            let keys: Vec<String> = failed
+                .iter()
+                .map(|(key, why)| format!("'{}' ({})", key, why))
+                .collect();
+            let (noun, them) = if failed.len() == 1 {
+                ("key", "it")
+            } else {
+                ("keys", "them")
+            };
+            anyhow::bail!(
+                "cloud sync: the upload of context {noun} {} of session '{id}' to the bucket \
+                 failed; the bucket's manifest leaves {them} out until a later push uploads \
+                 {them}, so run the command again once the bucket answers",
+                keys.join(", "),
+            );
+        }
         Ok(())
     }
 
@@ -5135,6 +5186,66 @@ impl CloudBackend {
         Ok(())
     }
 
+    /// [`CloudBackend::add_as`] for `koto context add`: an upload the
+    /// bucket doesn't confirm is the error, naming the key, rather than a
+    /// warning (koto#646). The content stays on this host, owed, out of
+    /// the bucket's manifest until a later push uploads it.
+    fn add_confirmed_as(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self.store_key(session, key, Some((content, Some(writer))))? {
+            KeyPush::Failed(e) => Err(anyhow::anyhow!(
+                "cloud sync: context key '{}' of session '{}' is stored on this host, but its \
+                 upload to the bucket failed and the bucket's manifest leaves it out until a \
+                 later push uploads it; run the command again once the bucket answers: {:#}",
+                key,
+                session,
+                e
+            )),
+            KeyPush::Pushed | KeyPush::Batched | KeyPush::Withheld => Ok(()),
+        }
+    }
+
+    /// Mark `key` of `session` owed before a write that pushes at once
+    /// ([`CloudBackend::store_key`]): at the hash of `content`, or, for a
+    /// push of the copy this host holds (`None`), of that copy. A key with
+    /// no copy here has nothing to push and is not marked.
+    fn mark_owed_before_write(
+        &self,
+        session: &str,
+        key: &str,
+        content: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        // Refused here as the write would refuse it, so no key that isn't
+        // one is ever recorded, nor read back by a later push.
+        crate::session::validate::validate_context_key(key)?;
+        let dir = self.local.session_dir(session);
+        let hash = match content {
+            // The write that follows makes the session's directory when it
+            // isn't there yet; the mark goes in it first.
+            Some(content) => {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                sync_stamp::sha256_hex(content)
+            }
+            None => match std::fs::read(dir.join("ctx").join(key)) {
+                Ok(held) => sync_stamp::sha256_hex(&held),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e).with_context(|| format!("reading context key '{}'", key)),
+            },
+        };
+        sync_stamp::mark_owed(&dir, key, &hash).with_context(|| {
+            format!(
+                "recording context key '{}' as owed to the bucket before writing it",
+                key
+            )
+        })
+    }
+
     /// [`CloudBackend::add_as`], saying how the key went up. With `write`
     /// the key is written locally first; without it the copy this host
     /// holds goes up as it is, as a read's push of a kept copy does. A
@@ -5152,6 +5263,7 @@ impl CloudBackend {
             crate::session::links::check_writer_key(key, writer)?;
         }
         self.check_not_migrated_to_write(session)?;
+        let content = write.map(|(content, _)| content);
         let write = || match write {
             Some((content, Some(w))) => self.local.add_with_writer(session, key, content, w),
             Some((content, None)) => self.local.add(session, key, content),
@@ -5183,6 +5295,15 @@ impl CloudBackend {
             }
         }
         self.settle_batch(session)?;
+        // Owed before it is written (koto#646): until the bucket confirms
+        // the object, no manifest koto uploads names the key, whether this
+        // process uploads it or another one pushes between this write and
+        // the upload, and a process stopped during the upload leaves it
+        // owed. The push clears it once the object is confirmed; a mark
+        // that can't be written refuses the write.
+        if !is_pin_record_key(key) {
+            self.mark_owed_before_write(session, key, content)?;
+        }
         write()?;
 
         // Check version before pushing. Conflicts are hard errors;
@@ -5192,6 +5313,9 @@ impl CloudBackend {
         let home = self.home(session);
         let withheld = sync::withheld_keys(&self.local, &home, session);
         let pushed = if is_pin_record_key(key) || withheld.iter().any(|w| w == key) {
+            // A withheld key stays owed: once it may go up, the push that
+            // sends it, or the next push of any key, uploads its object
+            // before a manifest names it.
             KeyPush::Withheld
         } else {
             match sync::try_push_context_key(
@@ -5348,9 +5472,14 @@ impl CloudBackend {
         let ctx_dir = dir.join("ctx");
         let failed: Mutex<Vec<(String, String)>> = Mutex::default();
         let _ = in_parallel(&held, |key| {
+            // A key this host owed the bucket is owed no more once its
+            // object is up.
             let sent = std::fs::read(ctx_dir.join(key))
                 .with_context(|| format!("reading context key '{}'", key))
-                .and_then(|data| self.put_object(&format!("{}/{}/ctx/{}", home, id, key), &data));
+                .and_then(|data| {
+                    self.put_object(&format!("{}/{}/ctx/{}", home, id, key), &data)?;
+                    sync_stamp::clear_owed(&dir, key, &sync_stamp::sha256_hex(&data))
+                });
             if let Err(e) = sent {
                 failed
                     .lock()
@@ -5515,6 +5644,16 @@ impl ContextStore for CloudBackend {
         self.add_as(session, key, content, Some(writer))
     }
 
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_confirmed_as(session, key, content, writer)
+    }
+
     /// The local metadata, or for a key only the remote store has, the
     /// remote manifest's.
     ///
@@ -5594,6 +5733,14 @@ impl ContextStore for CloudBackend {
         self.check_fence(session)?;
         // A copy this host writes again later is one the home never had.
         crate::session::sync_stamp::forget_synced(&self.local.session_dir(session), key);
+        // A removed key owes the bucket nothing, once it is gone here. Kept
+        // owed when the record can't be changed, a later push drops it,
+        // finding no copy here.
+        let forget_owed = || {
+            if let Err(e) = sync_stamp::forget_owed(&self.local.session_dir(session), key) {
+                eprintln!("warning: cloud sync: {:#}", e);
+            }
+        };
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
                 journal.record(
@@ -5602,12 +5749,15 @@ impl ContextStore for CloudBackend {
                         key: key.to_string(),
                     },
                 )?;
-                return self.local.remove(session, key);
+                self.local.remove(session, key)?;
+                forget_owed();
+                return Ok(());
             }
         }
         self.settle_batch(session)?;
         let held_locally = self.local.ctx_exists(session, key);
         self.local.remove(session, key)?;
+        forget_owed();
 
         // A key neither copy has leaves nothing to delete or to drop from
         // the manifest: the removal is a no-op, as it is locally, and costs
@@ -7326,7 +7476,7 @@ fn is_answered_failure(e: &S3Error) -> bool {
 /// with a [throttle or a failure on its side](is_answered_failure), or the
 /// connection failed. A refusal such as a 403, or an answer koto can't
 /// parse, would only fail again.
-fn is_transient(e: &S3Error) -> bool {
+pub(crate) fn is_transient(e: &S3Error) -> bool {
     is_answered_failure(e) || matches!(e, S3Error::Atto(_) | S3Error::Io(_))
 }
 

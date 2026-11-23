@@ -119,6 +119,22 @@ pub trait ContextStore: Send + Sync {
         self.add(session, key, content)
     }
 
+    /// [`add_with_writer`](Self::add_with_writer) for a caller that must
+    /// know the key reached every copy the store keeps, as `koto context
+    /// add` must: a store that keeps a remote copy fails, naming the key,
+    /// when the remote copy isn't confirmed, where `add_with_writer` only
+    /// warns (koto#646). The local write stands either way. The default
+    /// is `add_with_writer`, for a store that keeps one copy.
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_with_writer(session, key, content, writer)
+    }
+
     /// The stored metadata for `key`, or `None` when the key is absent, fails
     /// the key grammar, or the store keeps no metadata (the default).
     fn meta(&self, session: &str, key: &str) -> Option<KeyMeta> {

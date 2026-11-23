@@ -659,19 +659,20 @@ impl CloudBackend {
         let dir = self.local.session_dir(session);
         continues_bucket::clear_mark(&dir);
         if written {
-            if let Err(e) = self.local.remove(session, &owed.relation_key) {
-                eprintln!(
+            match self.local.remove(session, &owed.relation_key) {
+                // The key is gone here, so it owes the bucket nothing.
+                Ok(()) => {
+                    let _ = crate::session::sync_stamp::forget_owed(&dir, &owed.relation_key);
+                }
+                Err(e) => eprintln!(
                     "warning: the relation of '{session}' couldn't be taken back from this host: \
                      {e:#}"
-                );
+                ),
             }
             let object = format!("{}ctx/{}", self.session_prefix(session), owed.relation_key);
             let _ = self.bucket.delete_object(&object);
             // The manifest the failed push may have left names the key.
-            if let Ok(Some(data)) = crate::session::sync::bucket_manifest_bytes(
-                &dir.join("ctx").join("manifest.json"),
-                &[],
-            ) {
+            if let Ok(Some(data)) = crate::session::sync::bucket_manifest_of(&dir, &[]) {
                 let manifest = format!("{}ctx/manifest.json", self.session_prefix(session));
                 let _ = self.bucket.put_object(manifest, &data);
             }
