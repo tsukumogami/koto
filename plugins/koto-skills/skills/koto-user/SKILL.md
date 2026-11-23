@@ -216,6 +216,22 @@ Three things to know:
 
 If the template's author wrote a `fallback`, its text opens the `directive`, ahead of the state's own instructions. That's the author telling you how to do the step by hand. Do that, and carry on.
 
+## When a pool or a background run holds the tick
+
+A `default_action` can name a host pool (`pool: test-suite`), which caps how many sessions on this machine run that kind of command at once, and can run as `background: true`, detached from the tick. Neither changes what you do when the command finishes; both add waits you mustn't mistake for failures. Each arrives as `action: "gate_blocked"`, exit 0, with exactly one reserved condition:
+
+| Condition | `status` | `category` | What you do |
+|---|---|---|---|
+| `__pool__` (`type: "pool"`) | `queued` | `temporal` | Another session holds the pool's slots. `output` carries `position`, `waiting`, `retry_after_secs` and the `holders` (session, workspace, state, `held_secs`). Tick again after about `retry_after_secs`; waiters are served in queue order, and a waiter that stops ticking for the pool's lapse period loses its place. Don't work around it by running the command yourself. |
+| `__pool__` | `invalid` (`pool_config_invalid`), `unavailable` (`pool_dir_unavailable`), `unsupported` (`pool_unsupported_platform`) | `corrective` | The machine's pool setup is broken or this platform doesn't run pools. The command didn't run. `output` names the config file and key, the path, or the platform. You can't fix it from the workflow: report it to the user. |
+| `__action__` (`type: "action"`) | `running` | `temporal` | The background run is in flight. `output` carries `run_id`, `elapsed_secs`, `timeout_secs`, `retry_after_secs`, `pool` when it holds a slot, and `timeout_capped: true` when the machine's cap cut the template's `timeout_secs`, so the run will be stopped sooner than the template says. Tick again later; no second copy starts. |
+| `__action__` | `orphaned` | `temporal` | The runner died but processes of the run live on and keep the slot; koto never signals them. Wait. Once they exit the next tick reports `failure_kind: "lost"` and the tick after starts a new run. |
+| `__action__` | `error` with `error_code: "background_disabled"` or `pool_config_invalid` | `corrective` | The machine has background actions switched off, or its `[background]` settings are invalid. Report it. |
+
+The first tick after a background command ends delivers its result as an ordinary action's: `capture_stdout_as`, gates, the transition, or a failure with `failure_kind` `nonzero_exit`, `timed_out` (it outlived `timeout_secs`) or `lost`.
+
+`koto pool status` (`--json` for the structured form) shows each pool the machine defines, its holders and its waiters in order; it reads only. `koto cancel` on a session with a run in flight stops the run and frees its slot. While a run is in flight the session can't be moved: `koto session rebind` and `koto session import` refuse with `background_run_in_flight`. The [host pools guide](../../../../docs/guides/host-pools.md) has the full picture.
+
 ## Reading why a check failed
 
 A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object beside `output` on their blocking condition, and the response carries a top-level `attempts` object. Use them to fix the problem the check reported: `failure.findings` says what's wrong and where, and `attempts.rules` counts how many times each rule has failed, so a climbing count means your fixes aren't reaching it and it's time to change approach or escalate. `output` is unchanged, so routing and overrides work as before.

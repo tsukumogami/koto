@@ -1361,8 +1361,10 @@ Unlike other template subcommands, export errors go to stderr as plain text (not
 
 The `config` subcommand group reads and writes koto's configuration. koto looks for config in two places, merged in this order (later wins):
 
-1. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
-2. **User config** -- `~/.koto/config.toml` (`$KOTO_HOME/config.toml` when `KOTO_HOME` is set). Machine-specific settings and credentials.
+1. **User config** -- `~/.koto/config.toml` (`$KOTO_HOME/config.toml` when `KOTO_HOME` is set). Machine-specific settings and credentials.
+2. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
+
+A key a trusted project file sets therefore replaces the user's value for it, and environment variables (`KOTO_SESSION_*`, `KOTO_RETENTION_*`, `KOTO_DECIDER*` and the others named below) replace both. Two exceptions: a project `decider.mode` can only lower the user's mode (see below), and keys outside the project allowlist, among them every `pools.*` and `background.*` key, are read from the user config alone, so a project can't change them at all.
 
 Project config applies only once you trust it. A `.koto/config.toml` koto hasn't been told to trust is ignored and not even read, and every command that loads config says so in one note on stderr. Run `koto config trust` in the directory to apply it. koto records the trust in `~/.koto/trust.toml` (`$KOTO_HOME/trust.toml` when `KOTO_HOME` is an absolute path), outside the repository, bound to that directory and to the file's exact contents. Any later change to the file, including one a `git pull` brings in, needs `koto config trust` again, and running it again shows what changed since the last time. A file you create or edit with `koto config set` or `koto config unset` is trusted as written, so you only trust a file yourself when someone else wrote it or you edited it by hand.
 
@@ -1469,6 +1471,14 @@ The output says whether the directory's project config applied. With `--json` th
 | `decider.endpoint` | `https` URL of the decision call (plain `http` only for loopback) | `"https://api.typesafe.ai/v1/systemone"` | no |
 | `decider.timeout_ms` | Integer, 1 to 10000 | `2000` | no |
 | `machine.name` | Machine name, 1 to 64 characters of `[A-Za-z0-9._-]`, not `unknown` | short hostname | no (user config only) |
+| `pools.<name>.size` | Slots in host pool `<name>`, 1 to 1024 | -- (required to define the pool) | no (user config only) |
+| `pools.<name>.claim_secs` | Seconds a freed slot is kept for the first waiter, 1 to 86400 | `120` | no (user config only) |
+| `pools.<name>.lapse_secs` | Seconds a waiter may go without ticking before it loses its place, 1 to 86400 | `600` | no (user config only) |
+| `pools.<name>.wait_secs` | Seconds a tick waits for a slot before it reports the session queued, 0 to 60 | `10` | no (user config only) |
+| `background.enabled` | `true`, `false` | `true` | no (user config only) |
+| `background.max_timeout_secs` | Longest a background action may run, 1 to 86400 | `7200` | no (user config only) |
+
+The `pools` and `background` keys size host resource pools and switch background actions on this machine; a project file that sets them is ignored for those keys, and `koto config list` lists them among its dropped keys. A pool's values are judged only when a tick reaches an action on that pool, never when config loads. The [host pools guide](host-pools.md) covers both tables.
 
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
 
@@ -1535,6 +1545,16 @@ and, after checking that the endpoint and bucket are the team's, trusts the file
 ```bash
 koto config trust
 ```
+
+### pool
+
+#### pool status
+
+```
+koto pool status [--json]
+```
+
+Lists every pool the user config defines, with its size, how many slots are held and free, how many sessions wait, each holder (session, workspace, state, seconds held) and each waiter in queue order (session, workspace, seconds waited). It reads only: it takes no lock, creates nothing and changes no file under the koto root, so it answers while a holder runs. With no pools configured it says so and exits 0. A pool whose config entry is invalid is reported with `pool_config_invalid`, naming the config file and key, and the command exits 1. A pool that templates name but the config doesn't define isn't listed: it imposes no limit. The [host pools guide](host-pools.md) has the output and what the queue means.
 
 ### Cloud sync
 
