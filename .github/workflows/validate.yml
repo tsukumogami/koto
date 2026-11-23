@@ -26,21 +26,59 @@ jobs:
           done
           exit $failed
 
-  unit-tests:
-    name: Unit Tests
+  # The suite runs once, under coverage instrumentation, with nextest giving
+  # each test its own process. The nextest `ci` profile in .config/nextest.toml
+  # forbids retries and filters; `validate` fails unless this job succeeded.
+  tests:
+    name: Tests and Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
+      # Prebuilt, checksum-verified binaries at pinned versions; fallback: none
+      # fails the step rather than build a tool from source.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.150
+          fallback: none
+
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh`: the same nextest `ci` profile, without coverage or
+      # --all-features, falling back to a serial `cargo test` where cargo-nextest isn't installed.
       # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
       # version bump that skips the lock file can't reach a tag.
-      - name: Run tests
-        run: cargo test --locked -- --test-threads=1
+      - name: Run tests with coverage
+        run: cargo llvm-cov nextest --locked --all-features --profile ci --lcov --output-path lcov.info
+
+      # nextest doesn't run doctests; this runs any that are added.
+      - name: Run doctests
+        run: cargo test --locked --all-features --doc
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: target/**/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   retention-cost:
     # The retention engine's cost bound: on a generated store of 2,000
@@ -124,18 +162,35 @@ jobs:
     # a release.
     #
     # See docs/STABILITY.md for the bump protocol.
+    #
+    # Runs under nextest's `ci` profile like the `tests` job: one process per
+    # test, no retries, no filter.
     name: Stability Tests
     runs-on: ubuntu-latest
+    # nextest's slow-timeout only warns, so this bounds a hung test.
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      # Same pinned install as the `tests` job.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-nextest@0.9.150
+          fallback: none
+
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh -p koto-stability-tests`, the same command where
+      # cargo-nextest is installed and a serial `cargo test` where it isn't.
       - name: Run external-consumer stability tests
-        run: cargo test -p koto-stability-tests -- --test-threads=1
+        run: cargo nextest run --locked -p koto-stability-tests --profile ci
 
   msrv:
     # Builds koto on exactly the toolchain Cargo.toml's rust-version declares,
@@ -662,30 +717,6 @@ jobs:
       - name: Run audit
         run: cargo audit
 
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --test-threads=1
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-
   tsuku-distributed-install:
     name: Distributed Install (tsuku)
     runs-on: ubuntu-latest
@@ -738,17 +769,19 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, retention-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, tests, retention-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # The two suite jobs, tests and stability-tests, must be exactly
+      # `success`: a cancelled or skipped suite run would otherwise pass.
       - name: Check results
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
-             [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.tests.result }}" != "success" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
              [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
-             [ "${{ needs.stability-tests.result }}" = "failure" ] || \
+             [ "${{ needs.stability-tests.result }}" != "success" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
