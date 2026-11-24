@@ -62,6 +62,7 @@ use crate::session::context::ContextStore;
 use crate::session::local::LocalBackend;
 use crate::session::{Backend, SessionBackend, SessionError};
 use crate::template::types::CompiledTemplate;
+use crate::template::types::ValidateTemplate;
 
 /// Maximum payload size for --with-data (1 MB).
 pub(super) const MAX_WITH_DATA_BYTES: usize = 1_048_576;

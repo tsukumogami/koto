@@ -536,8 +536,10 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
         // timeout. The pass below reads the bucket.
         let mut tree = SessionTree::new();
         match &backend {
-            Backend::Cloud(cloud) => dashboard_data::refresh(&mut tree, cloud.local())?,
-            Backend::Local(store) => dashboard_data::refresh(&mut tree, store)?,
+            Backend::Cloud(cloud) => {
+                dashboard_data::refresh_with_overlay(&mut tree, cloud.local())?
+            }
+            Backend::Local(store) => dashboard_data::refresh_with_overlay(&mut tree, store)?,
         }
         let remote = match &backend {
             Backend::Cloud(cloud) => once_remote_rows(cloud, &mut tree),
@@ -558,8 +560,8 @@ pub fn run(args: DashboardArgs, backend: crate::session::Backend) -> Result<()> 
     // never makes. Sessions found only in the bucket come from the feed.
     let local = Arc::clone(&backend);
     let mut refresh_local: LocalRefresh = Box::new(move |tree| match &*local {
-        Backend::Cloud(cloud) => dashboard_data::refresh(tree, cloud.local()),
-        Backend::Local(store) => dashboard_data::refresh(tree, store),
+        Backend::Cloud(cloud) => dashboard_data::refresh_with_overlay(tree, cloud.local()),
+        Backend::Local(store) => dashboard_data::refresh_with_overlay(tree, store),
     });
 
     // The first local read comes before the feed starts, so its first scan

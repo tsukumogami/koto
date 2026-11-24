@@ -19,6 +19,7 @@ use crate::engine::substitute::{bindings_from_events, validate_value, VALUE_PATT
 use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, VariableDecl};
+use crate::template::variables::VariableDeclExt;
 
 /// The `constraint` reported when a value fails the global allowlist rather
 /// than a declared `values:` or `pattern:`.

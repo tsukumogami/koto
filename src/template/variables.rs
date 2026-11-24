@@ -13,6 +13,7 @@
 use regex::Regex;
 
 use super::types::VariableDecl;
+pub use super::validate::VariableDeclExt;
 use crate::engine::substitute::validate_value;
 
 /// Compile a declared `pattern:` so it matches only a whole value.
@@ -25,10 +26,10 @@ pub fn compile_whole_value_pattern(pattern: &str) -> Result<Regex, regex::Error>
     Regex::new(&format!("^(?:{})$", pattern))
 }
 
-impl VariableDecl {
+impl VariableDeclExt for VariableDecl {
     /// The declared constraint as a caller sees it in an error body:
     /// `values:[a,b]`, `pattern:<re>`, or `None` when nothing is declared.
-    pub fn constraint_label(&self) -> Option<String> {
+    fn constraint_label(&self) -> Option<String> {
         if !self.values.is_empty() {
             Some(format!("values:[{}]", self.values.join(",")))
         } else if !self.pattern.is_empty() {
@@ -44,7 +45,7 @@ impl VariableDecl {
     /// checked separately). A pattern that fails to compile accepts nothing;
     /// compilation refuses such a template, so this only matters for a
     /// hand-edited compiled artifact.
-    pub fn satisfies_constraint(&self, value: &str) -> bool {
+    fn satisfies_constraint(&self, value: &str) -> bool {
         if !self.values.is_empty() {
             return self.values.iter().any(|v| v == value);
         }
@@ -58,7 +59,7 @@ impl VariableDecl {
 
     /// Check that the declaration named `name` is coherent. Called by the
     /// compiler; the error names the variable and what is wrong with it.
-    pub fn validate_declaration(&self, name: &str) -> Result<(), String> {
+    fn validate_declaration(&self, name: &str) -> Result<(), String> {
         if !self.values.is_empty() && !self.pattern.is_empty() {
             return Err(format!(
                 "variable {:?}: declares both values: and pattern:; declare at most one",

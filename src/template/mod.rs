@@ -6,6 +6,7 @@ pub mod decider;
 pub mod decider_check;
 pub mod result_map;
 pub mod types;
+mod validate;
 pub mod variables;
 
 pub(crate) use compile::split_frontmatter;
