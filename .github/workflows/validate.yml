@@ -53,9 +53,10 @@ jobs:
           tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.150
           fallback: none
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
-      # Locally it is `bash scripts/run-tests.sh`: the same nextest `ci` profile, without coverage or
-      # --all-features, falling back to a serial `cargo test` where cargo-nextest isn't installed.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh -p koto -p koto-session-reader`: the same nextest `ci`
+      # profile, without coverage or --all-features, falling back to a serial `cargo test` where
+      # cargo-nextest isn't installed.
       # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
       # version bump that skips the lock file can't reach a tag.
       # Without -p, cargo runs only the root package, so koto-session-reader
@@ -64,6 +65,8 @@ jobs:
         run: cargo llvm-cov nextest --locked --all-features --profile ci -p koto -p koto-session-reader --lcov --output-path lcov.info
 
       # nextest doesn't run doctests; this runs any that are added.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is the same command, without --all-features.
       - name: Run doctests
         run: cargo test --locked --all-features --doc -p koto -p koto-session-reader
 
@@ -206,7 +209,7 @@ jobs:
           tool: cargo-nextest@0.9.150
           fallback: none
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       # Locally it is `bash scripts/run-tests.sh -p koto-stability-tests`, the same command where
       # cargo-nextest is installed and a serial `cargo test` where it isn't.
       - name: Run external-consumer stability tests
@@ -267,7 +270,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Check formatting
         run: cargo fmt --check
 
@@ -283,7 +286,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       # Each package is linted under its own clippy.toml, so koto-session-reader
       # gets its write ban here as well as in the Reader Write Guard job.
       - name: Run clippy
