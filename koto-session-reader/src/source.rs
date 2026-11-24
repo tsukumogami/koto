@@ -1,11 +1,15 @@
 //! Where the dashboard reads sessions from: the listing trait a session
-//! store implements, and how a program finds the sessions directory koto
-//! uses.
+//! store implements, how a program finds the sessions directory koto uses,
+//! the store's layout marker, and the hardened listing a
+//! [`LocalDirSource`] reads a sessions directory with.
 
 use std::path::{Path, PathBuf};
 
+use crate::engine::persistence::parse_header_bytes;
+use crate::engine::types::StateFileHeader;
+use crate::fs_read::{read_store_file, read_store_first_line, ReadMode};
 use crate::koto_root::{koto_root, KOTO_ROOT_UNRESOLVED};
-use crate::session::SessionInfo;
+use crate::session::{state_file_name, SessionInfo};
 
 /// A store of session directories the dashboard lists and reads, and
 /// never writes.
@@ -201,6 +205,259 @@ pub fn sessions_dir(backend: Option<BackendKind>) -> anyhow::Result<PathBuf> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The layout marker
+// ---------------------------------------------------------------------------
+
+/// Why [`check_layout`] refused a store. Neither variant holds any of the
+/// marker's bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    /// The marker names a layout newer than this reader reads.
+    #[error(
+        "session store layout marker {} says layout {found}; this reader supports layout {supported}",
+        path.display()
+    )]
+    Newer {
+        /// The marker's path.
+        path: PathBuf,
+        /// The layout the marker names.
+        found: u64,
+        /// The layout this reader reads, [`STORE_LAYOUT_VERSION`].
+        supported: u32,
+    },
+    /// The marker can't be read as a layout number. `category` is one of
+    /// "not a regular file", "a symlink", "larger than 64 bytes", "not a
+    /// layout number" and "unreadable".
+    #[error("session store layout marker {} is unusable: {category}", path.display())]
+    Unusable {
+        /// The marker's path.
+        path: PathBuf,
+        /// What is wrong with it, a fixed string.
+        category: &'static str,
+    },
+}
+
+/// The layout number a marker's bytes name: UTF-8 digits, surrounding
+/// whitespace allowed. The error is a fixed category string.
+fn parse_layout_marker(bytes: &[u8]) -> Result<u64, &'static str> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .ok_or("not a layout number")
+}
+
+/// The category a refused marker read falls in.
+fn marker_read_category(err: &std::io::Error) -> &'static str {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return "a symlink";
+    }
+    match err.kind() {
+        std::io::ErrorKind::InvalidInput => "not a regular file",
+        std::io::ErrorKind::InvalidData => "larger than 64 bytes",
+        _ => "unreadable",
+    }
+}
+
+/// Check that this reader reads the store's layout.
+///
+/// Reads `<sessions_dir>/.koto-store-layout` through the hardened read,
+/// capped at [`LAYOUT_MARKER_READ_CAP`] bytes. A missing marker is layout 1
+/// (nothing writes one yet). A marker naming a layout up to
+/// [`STORE_LAYOUT_VERSION`] passes; a higher one, or a marker that is a
+/// symlink, not a regular file, over the cap or not a number, refuses the
+/// store. Never blocks: a FIFO at the marker's path opens without waiting
+/// and is refused.
+pub fn check_layout(sessions_dir: &Path) -> Result<(), LayoutError> {
+    let path = sessions_dir.join(STORE_LAYOUT_MARKER);
+    let bytes = match read_store_file(
+        &path,
+        LAYOUT_MARKER_READ_CAP,
+        ReadMode::InStore { root: sessions_dir },
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(LayoutError::Unusable {
+                category: marker_read_category(&e),
+                path,
+            })
+        }
+    };
+    let found = parse_layout_marker(&bytes).map_err(|category| LayoutError::Unusable {
+        path: path.clone(),
+        category,
+    })?;
+    if found > u64::from(STORE_LAYOUT_VERSION) {
+        return Err(LayoutError::Newer {
+            path,
+            found,
+            supported: STORE_LAYOUT_VERSION,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The hardened listing
+// ---------------------------------------------------------------------------
+
+/// What reading one session directory's state-file header found.
+enum ListedHeader {
+    /// No state file: the directory isn't a session.
+    Missing,
+    /// A state file that was refused or whose header doesn't parse.
+    Unreadable,
+    /// The header.
+    Read(Box<StateFileHeader>),
+}
+
+/// Read the first line of `<sessions_dir>/<name>/koto-<name>.state.jsonl`
+/// through the hardened read and parse it as a header.
+fn listed_header(sessions_dir: &Path, name: &str) -> ListedHeader {
+    let path = sessions_dir.join(name).join(state_file_name(name));
+    match read_store_first_line(
+        &path,
+        STATE_LOG_READ_CAP,
+        ReadMode::InStore { root: sessions_dir },
+    ) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ListedHeader::Missing,
+        Err(_) => ListedHeader::Unreadable,
+        Ok(line) => match parse_header_bytes(&line) {
+            Ok(header) => ListedHeader::Read(Box::new(header)),
+            Err(_) => ListedHeader::Unreadable,
+        },
+    }
+}
+
+/// Every session under `sessions_dir` whose state-file header reads,
+/// sorted by id.
+///
+/// The filters are koto's own listing's: a missing `sessions_dir` lists
+/// nothing; only real directories count (a symlinked session directory is
+/// passed by); names that aren't UTF-8 and names starting with
+/// [`STAGING_PREFIX`] are passed by; a directory with no state file isn't a
+/// session. Each header is read through the hardened first-line read, so a
+/// FIFO, a symlink or a file over [`STATE_LOG_READ_CAP`] at a state file's
+/// path never blocks the listing: that session is left out, and
+/// [`count_unreadable_sessions`] counts it, as it counts a header that
+/// doesn't parse or names a newer `schema_version`. Names holding `~` are
+/// listed; the dashboard scan drops them.
+///
+/// `template_source_status` is always `None`: the listing reads nothing
+/// beyond the header.
+pub fn list_sessions(sessions_dir: &Path) -> anyhow::Result<Vec<SessionInfo>> {
+    let mut results = Vec::new();
+    let entries = match std::fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(results),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read directory {}: {}",
+                sessions_dir.display(),
+                e
+            ))
+        }
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with(STAGING_PREFIX) {
+            continue;
+        }
+        if let ListedHeader::Read(header) = listed_header(sessions_dir, &name) {
+            let header = *header;
+            let session_id = (!header.session_id.is_empty()).then_some(header.session_id);
+            results.push(SessionInfo {
+                id: name,
+                created_at: header.created_at,
+                template_hash: header.template_hash,
+                parent_workflow: header.parent_workflow,
+                template_source_status: None,
+                execution_dir: header.execution_dir,
+                session_id,
+                kind: header.kind,
+            });
+        }
+    }
+
+    results.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(results)
+}
+
+/// How many session directories under `sessions_dir` hold a state file
+/// [`list_sessions`] leaves out: one the hardened read refuses, or whose
+/// header doesn't parse.
+///
+/// Walks with [`list_sessions`]'s filters and also passes by names holding
+/// `~`, as the dashboard scan does. A directory with no state file isn't
+/// counted, and a `sessions_dir` that can't be read counts 0.
+pub fn count_unreadable_sessions(sessions_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with(STAGING_PREFIX) || name.contains('~') {
+            continue;
+        }
+        if let ListedHeader::Unreadable = listed_header(sessions_dir, &name) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// A sessions directory read as a [`SessionSource`], for a program other
+/// than koto: the hardened listing over one directory, opened only once its
+/// layout marker passes [`check_layout`].
+#[derive(Debug, Clone)]
+pub struct LocalDirSource {
+    sessions_dir: PathBuf,
+}
+
+impl LocalDirSource {
+    /// Open `sessions_dir`, refusing a store whose layout marker this
+    /// reader doesn't read. The directory need not exist (it lists
+    /// nothing).
+    pub fn new(sessions_dir: impl Into<PathBuf>) -> Result<Self, LayoutError> {
+        let sessions_dir = sessions_dir.into();
+        check_layout(&sessions_dir)?;
+        Ok(Self { sessions_dir })
+    }
+}
+
+impl SessionSource for LocalDirSource {
+    fn sessions_dir(&self) -> &Path {
+        &self.sessions_dir
+    }
+
+    fn list(&self) -> anyhow::Result<Vec<SessionInfo>> {
+        list_sessions(&self.sessions_dir)
+    }
+
+    fn session_dir(&self, id: &str) -> PathBuf {
+        self.sessions_dir.join(id)
+    }
+
+    fn count_unreadable(&self) -> usize {
+        count_unreadable_sessions(&self.sessions_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +636,74 @@ mod tests {
         ));
         assert_eq!(events[1].payload.type_name(), "evidence_submitted");
         assert_eq!(outstanding_assignments(&events), before);
+    }
+
+    #[test]
+    fn parse_layout_marker_reads_a_number_with_surrounding_whitespace() {
+        assert_eq!(parse_layout_marker(b"1"), Ok(1));
+        assert_eq!(parse_layout_marker(b"1\n"), Ok(1));
+        assert_eq!(parse_layout_marker(b" 2 \r\n"), Ok(2));
+        assert_eq!(parse_layout_marker(b"0"), Ok(0));
+        assert_eq!(parse_layout_marker(b"18446744073709551615"), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn parse_layout_marker_refuses_anything_else() {
+        for bytes in [
+            &b""[..],
+            b"\n",
+            b"abc",
+            b"-1",
+            b"+",
+            b"1.0",
+            b"1 2",
+            b"0x1",
+            b"18446744073709551616",
+            &[b'1', 0xff],
+        ] {
+            assert_eq!(
+                parse_layout_marker(bytes),
+                Err("not a layout number"),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_marker_read_falls_in_a_fixed_category() {
+        use std::io::{Error, ErrorKind};
+        #[cfg(unix)]
+        assert_eq!(
+            marker_read_category(&Error::from_raw_os_error(libc::ELOOP)),
+            "a symlink"
+        );
+        let category = |kind| marker_read_category(&Error::new(kind, "ZQX-PLANTED"));
+        assert_eq!(category(ErrorKind::InvalidInput), "not a regular file");
+        assert_eq!(category(ErrorKind::InvalidData), "larger than 64 bytes");
+        assert_eq!(category(ErrorKind::PermissionDenied), "unreadable");
+        assert_eq!(category(ErrorKind::Other), "unreadable");
+    }
+
+    #[test]
+    fn layout_error_display_names_the_path_and_the_numbers() {
+        let path = PathBuf::from("/s/.koto-store-layout");
+        let newer = LayoutError::Newer {
+            path: path.clone(),
+            found: 2,
+            supported: STORE_LAYOUT_VERSION,
+        };
+        assert_eq!(
+            newer.to_string(),
+            "session store layout marker /s/.koto-store-layout says layout 2; \
+             this reader supports layout 1"
+        );
+        let unusable = LayoutError::Unusable {
+            path,
+            category: "a symlink",
+        };
+        assert_eq!(
+            unusable.to_string(),
+            "session store layout marker /s/.koto-store-layout is unusable: a symlink"
+        );
     }
 }

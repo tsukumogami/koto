@@ -498,6 +498,45 @@ pub fn parse_state_log(bytes: &[u8]) -> anyhow::Result<(StateFileHeader, Vec<Eve
     parse_log_content(content, "the state log", TailReport::Quiet)
 }
 
+/// Parse a state file's header from bytes that start at the file's first
+/// byte, as [`read_header`] parses the file: only the first line counts,
+/// and it must be UTF-8, not blank, and a header no newer than this
+/// reader. Whatever follows the first newline is not looked at, so the
+/// bytes may be the first line alone or the whole log.
+pub fn parse_header_bytes(bytes: &[u8]) -> anyhow::Result<StateFileHeader> {
+    if bytes.is_empty() {
+        return Err(EngineError::StateFileCorrupted("state file is empty".to_string()).into());
+    }
+    let first = match bytes.iter().position(|&b| b == b'\n') {
+        Some(end) => &bytes[..end],
+        None => bytes,
+    };
+    let first_line = std::str::from_utf8(first)
+        .map_err(|e| anyhow::anyhow!("failed to read first line: {}", e))?;
+    let trimmed = first_line.trim();
+    if trimmed.is_empty() {
+        return Err(
+            EngineError::StateFileCorrupted("state file has empty first line".to_string()).into(),
+        );
+    }
+    parse_header(trimmed)
+}
+
+/// [`parse_state_log`] with the truncated-final-line warning on stderr
+/// naming `path`, exactly as [`read_events`] reads the file at `path`: for
+/// the dashboard scan, which reads the bytes through the hardened read and
+/// keeps `--once`'s stderr what it was.
+#[doc(hidden)]
+pub fn parse_state_log_at(
+    bytes: &[u8],
+    path: &Path,
+) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+    let content = std::str::from_utf8(bytes).map_err(|e| {
+        EngineError::StateFileCorrupted(format!("state log {} is not UTF-8: {}", path.display(), e))
+    })?;
+    parse_log_content(content, &path.display().to_string(), TailReport::Warn)
+}
+
 /// The one parse of a log's text, shared by the file and in-memory readers.
 /// `source` names the log in a warning.
 fn parse_log_content<H: LogHeader>(
@@ -2823,5 +2862,102 @@ mod tests {
         assert!(split_concatenated(&format!("{a}{}", &b[..5])).is_none());
         assert!(split_concatenated(&format!("{a}{{\"x\":1}}")).is_none());
         assert!(split_concatenated("").is_none());
+    }
+
+    fn header_json() -> String {
+        serde_json::to_string(&make_header()).unwrap()
+    }
+
+    #[test]
+    fn parse_header_bytes_reads_the_first_line() {
+        let alone = header_json();
+        assert_eq!(
+            parse_header_bytes(alone.as_bytes()).unwrap().workflow,
+            "test-wf"
+        );
+        let with_newline = format!("{alone}\n");
+        assert_eq!(
+            parse_header_bytes(with_newline.as_bytes())
+                .unwrap()
+                .workflow,
+            "test-wf"
+        );
+    }
+
+    #[test]
+    fn parse_header_bytes_ignores_what_follows_the_first_line() {
+        let mut bytes = format!("{}\n{{not an event\n", header_json()).into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        assert_eq!(parse_header_bytes(&bytes).unwrap().workflow, "test-wf");
+    }
+
+    fn corrupted(result: anyhow::Result<StateFileHeader>) -> String {
+        match result.unwrap_err().downcast::<EngineError>() {
+            Ok(EngineError::StateFileCorrupted(msg)) => msg,
+            other => panic!("expected StateFileCorrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_bytes_refuses_an_empty_file() {
+        assert_eq!(corrupted(parse_header_bytes(b"")), "state file is empty");
+    }
+
+    #[test]
+    fn parse_header_bytes_refuses_a_blank_first_line() {
+        for bytes in [&b"\n"[..], b"   \n", b"  \t", b"\n{\"seq\":1}\n"] {
+            assert_eq!(
+                corrupted(parse_header_bytes(bytes)),
+                "state file has empty first line",
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_header_bytes_refuses_a_first_line_that_is_not_utf8() {
+        let err = parse_header_bytes(&[b'{', 0xff, b'}', b'\n']).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to read first line"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_header_bytes_refuses_a_newer_schema() {
+        let mut header = make_header();
+        header.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        let line = serde_json::to_string(&header).unwrap();
+        match parse_header_bytes(line.as_bytes())
+            .unwrap_err()
+            .downcast::<EngineError>()
+        {
+            Ok(EngineError::IncompatibleSchemaVersion {
+                found,
+                max_supported,
+            }) => {
+                assert_eq!(found, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(max_supported, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_bytes_refuses_a_first_line_that_is_not_a_header() {
+        let msg = corrupted(parse_header_bytes(b"{\"workflow\": 3}\n"));
+        assert!(msg.starts_with("failed to parse header"), "{msg}");
+    }
+
+    #[test]
+    fn parse_state_log_at_parses_as_parse_state_log_does() {
+        let log = format!("{}\n{}\n", header_json(), line(&intent(1, "a")));
+        let (header, events) =
+            parse_state_log_at(log.as_bytes(), Path::new("/s/koto-x.state.jsonl")).unwrap();
+        let (quiet_header, quiet_events) = parse_state_log(log.as_bytes()).unwrap();
+        assert_eq!(header.workflow, quiet_header.workflow);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), quiet_events.len());
+        assert!(parse_state_log_at(&[0xff], Path::new("/s/x")).is_err());
     }
 }

@@ -24,7 +24,8 @@
 #  7. Every normal and build dependency of the crate, direct or not, comes
 #     from the crates.io registry according to cargo metadata.
 #  8. open_plain is defined once in fs_read.rs, which offers no other public
-#     function besides read_store_file, and is called only as
+#     function besides read_store_file and read_store_first_line (the two
+#     hardened reads, which share one private open), and is called only as
 #     crate::fs_read::open_plain(...) from the functions OPEN_PLAIN_CALLERS
 #     lists; dashboard.rs and source.rs name nothing in SCAN_FORBIDDEN.
 #  9. `cargo tree --depth 1 -e normal,build` lists no direct dependency
@@ -433,9 +434,9 @@ check() {
   local pubs
   pubs="$(strip_comments "$src/fs_read.rs" \
     | sed -nE 's/^[[:space:]]*pub(\([^)]*\))?[[:space:]]+fn[[:space:]]+([A-Za-z0-9_]+).*/\2/p' \
-    | grep -vxE 'open_plain|read_store_file' || true)"
+    | grep -vxE 'open_plain|read_store_file|read_store_first_line' || true)"
   if [ -n "$pubs" ]; then
-    fail "fs_read.rs offers public functions besides open_plain and read_store_file: $(echo "$pubs" | tr '\n' ' ')"
+    fail "fs_read.rs offers public functions besides open_plain, read_store_file and read_store_first_line: $(echo "$pubs" | tr '\n' ' ')"
     bad=1
   fi
   local site lineno fname text
@@ -662,7 +663,7 @@ self_test() {
     append "$S/dashboard.rs" 'use crate::fs_read::open_plain as planted;'
   expect_fail "a wrapper around open_plain in fs_read.rs" "fs_read.rs must name open_plain only in its definition" \
     append "$S/fs_read.rs" $'fn planted(p: &Path) -> io::Result<File> {\n    open_plain(p)\n}'
-  expect_fail "a third public read in fs_read.rs" "fs_read.rs offers public functions besides" \
+  expect_fail "a fourth public read in fs_read.rs" "fs_read.rs offers public functions besides" \
     append "$S/fs_read.rs" 'pub fn planted() {}'
 
   if [ "$missed" -ne 0 ]; then
