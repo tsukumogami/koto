@@ -15,14 +15,66 @@ use crate::engine::persistence::{
 };
 use crate::engine::types::parse_timestamp_to_systemtime;
 use crate::engine::types::StateFileHeader;
+use crate::session::local::LocalBackend;
 use crate::session::remote_feed::{
     sanitize_bucket_text, ImportedSource, LocalView, ReadFailure, RemoteRow, RemoteSnapshot,
     RowStatus,
 };
 use crate::session::row::{derive_row, latest_import};
-use crate::session::{state_file_name, SessionBackend};
+use crate::session::{state_file_name, SessionBackend, SessionInfo};
 
 pub use liveness::{attention_key, classify_liveness, Liveness};
+
+/// Where the dashboard reads sessions from.
+///
+/// Kept in a module of its own and not re-exported, so code that has
+/// [`SessionBackend`] in scope never has [`source::SessionSource`] there
+/// too: both traits name `list`, `session_dir` and `count_unreadable`, and
+/// a method call on a [`LocalBackend`] with both in scope is ambiguous.
+pub mod source {
+    use std::path::{Path, PathBuf};
+
+    use crate::session::SessionInfo;
+
+    /// A store of session directories the dashboard lists and reads, and
+    /// never writes.
+    ///
+    /// The listing half of
+    /// [`SessionBackend`](crate::session::SessionBackend), which
+    /// [`LocalBackend`](crate::session::local::LocalBackend) implements, so
+    /// koto passes its local store (or the cloud backend's local mirror)
+    /// wherever a `&dyn SessionSource` is asked for.
+    pub trait SessionSource {
+        /// The directory the sessions live under, one subdirectory each.
+        fn sessions_dir(&self) -> &Path;
+        /// Every session whose state file header reads, with the metadata
+        /// that header carries.
+        fn list(&self) -> anyhow::Result<Vec<SessionInfo>>;
+        /// The directory of session `id` (no I/O, just path computation).
+        fn session_dir(&self, id: &str) -> PathBuf;
+        /// How many session directories hold a state file whose header
+        /// fails to parse: the sessions [`list`](Self::list) leaves out.
+        fn count_unreadable(&self) -> usize;
+    }
+}
+
+impl source::SessionSource for LocalBackend {
+    fn sessions_dir(&self) -> &Path {
+        self.base_dir()
+    }
+
+    fn list(&self) -> Result<Vec<SessionInfo>> {
+        SessionBackend::list(self)
+    }
+
+    fn session_dir(&self, id: &str) -> PathBuf {
+        SessionBackend::session_dir(self, id)
+    }
+
+    fn count_unreadable(&self) -> usize {
+        SessionBackend::count_unreadable(self)
+    }
+}
 
 /// Read-time liveness classification for dashboard sessions.
 ///
@@ -367,12 +419,12 @@ pub struct DetailData {
     pub remaining: Vec<String>,
 }
 
-/// Enumerate sessions from the backend, filtering epoch-branched names.
+/// Enumerate sessions from `source`, filtering epoch-branched names.
 ///
 /// Returns a list of `(session_name, state_file_path)` pairs for sessions
 /// whose names do not contain `~` (epoch-branched session indicator).
-pub fn scan_sessions(backend: &dyn SessionBackend) -> Result<Vec<(String, PathBuf)>> {
-    let session_list = backend.list()?;
+pub fn scan_sessions(source: &dyn source::SessionSource) -> Result<Vec<(String, PathBuf)>> {
+    let session_list = source.list()?;
     let mut result = Vec::new();
     for info in session_list {
         // Filter out epoch-branched sessions (those containing `~`).
@@ -383,7 +435,7 @@ pub fn scan_sessions(backend: &dyn SessionBackend) -> Result<Vec<(String, PathBu
         if info.session_kind().is_koto_owned() {
             continue;
         }
-        let dir = backend.session_dir(&info.id);
+        let dir = source.session_dir(&info.id);
         let state_path = dir.join(state_file_name(&info.id));
         result.push((info.id, state_path));
     }
@@ -913,12 +965,34 @@ fn cyclic_keys(sessions: &HashMap<String, CachedSession>) -> HashSet<String> {
     cyclic
 }
 
-/// Refresh the session tree by scanning the backend and re-reading changed sessions.
+/// Refresh the session tree with the bucket overlay applied: the same as
+/// [`refresh_with_overlay`].
+pub fn refresh(tree: &mut SessionTree, source: &dyn source::SessionSource) -> Result<()> {
+    refresh_with_overlay(tree, source)
+}
+
+/// [`refresh_scan`], then the bucket overlay: a remote row whose session
+/// this machine now holds a copy of leaves the tree, so the session shows
+/// once, as its local row, and roots are rebuilt if any row went.
+pub fn refresh_with_overlay(
+    tree: &mut SessionTree,
+    source: &dyn source::SessionSource,
+) -> Result<()> {
+    refresh_scan(tree, source)?;
+    if drop_shadowed_remote(tree) {
+        tree.rebuild_roots();
+    }
+    Ok(())
+}
+
+/// Refresh the session tree from `source` alone, by scanning it and
+/// re-reading changed sessions. Remote rows are left as they are; see
+/// [`refresh_with_overlay`].
 ///
 /// Orchestrates `scan_sessions`, `stat_and_diff`, and `read_session` to keep the
 /// tree up to date with minimal I/O. Rebuilds `roots` whenever the session set changes.
-pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<()> {
-    let session_paths = scan_sessions(backend)?;
+pub fn refresh_scan(tree: &mut SessionTree, source: &dyn source::SessionSource) -> Result<()> {
+    let session_paths = scan_sessions(source)?;
     let diff = stat_and_diff(tree, &session_paths);
 
     let session_set_changed = !diff.adds.is_empty() || !diff.removes.is_empty();
@@ -940,20 +1014,17 @@ pub fn refresh(tree: &mut SessionTree, backend: &dyn SessionBackend) -> Result<(
         tree.sessions.insert(name.clone(), cached);
     }
 
-    // A session that now has a local copy leaves its remote row.
-    let shadowed = drop_shadowed_remote(tree);
-
     // Rebuild roots whenever the session set changed (adds or removes).
     // Also rebuild if any mtime-changed session could have had its parent change.
-    if session_set_changed || shadowed || !diff.changed.is_empty() {
+    if session_set_changed || !diff.changed.is_empty() {
         tree.rebuild_roots();
     }
 
-    // Recompute the unreadable tally directly from the backend: sessions whose
-    // header fails to parse are excluded from `backend.list()` (and thus from
+    // Recompute the unreadable tally directly from the source: sessions whose
+    // header fails to parse are excluded from `source.list()` (and thus from
     // the tree), so they must be counted at the directory level to be surfaced
     // rather than silently dropped.
-    tree.unreadable = backend.count_unreadable();
+    tree.unreadable = source.count_unreadable();
 
     Ok(())
 }
@@ -1883,6 +1954,92 @@ mod tests {
             !tree.sessions.contains_key("corrupt"),
             "the corrupt session is not in the readable tree (its header does not parse)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionSource: the scan runs against any `&dyn SessionSource`
+    // -----------------------------------------------------------------------
+
+    /// What a row shows, for comparing two trees row by row.
+    type RowView = (
+        Option<String>,
+        bool,
+        bool,
+        bool,
+        Option<String>,
+        Option<SystemTime>,
+        SystemTime,
+        PathBuf,
+    );
+
+    fn row_views(tree: &SessionTree) -> std::collections::BTreeMap<String, RowView> {
+        tree.sessions
+            .iter()
+            .map(|(key, s)| {
+                let view = (
+                    s.current_state.clone(),
+                    s.is_terminal,
+                    s.is_blocked,
+                    s.is_unreadable,
+                    parent_key(s),
+                    s.last_event_at,
+                    s.mtime,
+                    s.state_path.clone(),
+                );
+                (key.clone(), view)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refresh_through_a_session_source_matches_the_overlay_path() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+
+        backend.create("good").unwrap();
+        write_state_file_with_transition(&dir.path().join("good"), "good", "working");
+
+        backend.create("parent").unwrap();
+        write_minimal_state_file(&dir.path().join("parent"), "parent");
+        backend.create("child").unwrap();
+        let child_path = dir.path().join("child").join(state_file_name("child"));
+        append_header(&child_path, &make_header("child", Some("parent"))).unwrap();
+        append_event(
+            &child_path,
+            &EventPayload::WorkflowInitialized {
+                template_path: "/cache/test.json".to_string(),
+                variables: HashMap::new(),
+                spawn_entry: None,
+                machine: None,
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        backend.create("corrupt").unwrap();
+        let corrupt_path = dir.path().join("corrupt").join(state_file_name("corrupt"));
+        std::fs::write(&corrupt_path, "this is not valid jsonl header\n").unwrap();
+
+        let as_source: &dyn source::SessionSource = &backend;
+        assert_eq!(as_source.sessions_dir(), dir.path());
+        let mut through_source = SessionTree::new();
+        refresh_scan(&mut through_source, as_source).unwrap();
+
+        let mut through_overlay = SessionTree::new();
+        refresh_with_overlay(&mut through_overlay, &backend).unwrap();
+
+        let rows = row_views(&through_source);
+        assert_eq!(
+            rows.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["child", "good", "parent"]
+        );
+        assert_eq!(rows["good"].0.as_deref(), Some("working"));
+        assert_eq!(rows["child"].4.as_deref(), Some("parent"));
+        assert_eq!(rows, row_views(&through_overlay));
+        assert_eq!(through_source.roots, vec!["good", "parent"]);
+        assert_eq!(through_source.roots, through_overlay.roots);
+        assert_eq!(through_source.unreadable, 1);
+        assert_eq!(through_source.unreadable, through_overlay.unreadable);
     }
 
     // -----------------------------------------------------------------------

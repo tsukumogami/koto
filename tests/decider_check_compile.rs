@@ -13,6 +13,7 @@ use std::io::Write as _;
 
 use koto::template::compile::compile;
 use koto::template::decider_check::{CheckMode, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES};
+use koto::template::types::ValidateTemplate;
 use koto::template::types::{CompiledTemplate, GATE_TYPE_DECIDER_CHECK};
 
 #[test]

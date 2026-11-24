@@ -8,6 +8,7 @@ use super::decider::{
     DeciderAnswer, DeciderEscape, DeciderInput, DeciderInputSource, DeciderMode, FieldDecider,
     DEFAULT_MAX_BYTES, DEFAULT_THRESHOLD,
 };
+use super::types::ValidateTemplate;
 use super::types::{
     default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
     MaterializeChildrenSpec, PollSpec, PollingConfig, TemplateState, Transition, VariableDecl,
@@ -15,6 +16,7 @@ use super::types::{
     GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_DECIDER_CHECK,
     GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
 };
+use super::variables::VariableDeclExt;
 
 /// YAML front-matter structure of a template source file.
 #[derive(Debug, Deserialize)]
@@ -1961,6 +1963,7 @@ mod tests {
 
     mod pass_env {
         use super::*;
+        use crate::template::types::PassEnvWarnings;
 
         const BASE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
             PASS_ENV\

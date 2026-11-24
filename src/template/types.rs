@@ -8,6 +8,8 @@ use super::decider::{
     DeciderInputSource, DeciderMode, FieldDecider, FloorViolation, FloorViolationKind,
     MAX_THRESHOLD, MIN_THRESHOLD,
 };
+pub use super::validate::{PassEnvWarnings, ValidateTemplate, ValidateVocabulary};
+use super::validate::{ValidateRouting, ValidateSteps};
 
 /// Regex for variable references in template strings: `{{KEY}}` where KEY is
 /// uppercase letters, digits, and underscores.
@@ -112,12 +114,14 @@ impl ReviewVocabulary {
     pub fn is_empty(&self) -> bool {
         self.seats.is_empty() && self.sections.is_empty()
     }
+}
 
+impl ValidateVocabulary for ReviewVocabulary {
     /// Refuse a list longer than [`REVIEW_VOCABULARY_MAX`], a name outside
     /// the run journal's name shape (1 to 128 characters from
     /// `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`), and a name
     /// declared twice.
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
         for (list, names) in [("seats", &self.seats), ("sections", &self.sections)] {
             if names.len() > REVIEW_VOCABULARY_MAX {
                 return Err(format!(
@@ -1671,7 +1675,9 @@ impl CompiledTemplate {
         }
         Ok(captures)
     }
+}
 
+impl ValidateTemplate for CompiledTemplate {
     /// Validate the compiled template against all schema rules.
     ///
     /// When `strict` is `true`, a state that has gates but no `gates.*`
@@ -1680,7 +1686,7 @@ impl CompiledTemplate {
     /// D4 (gate reachability / unreferenced-field warnings) is suppressed when
     /// `strict` is `false` — those warnings are aimed at template authors, not
     /// at agents running workflows.
-    pub fn validate(&self, strict: bool) -> Result<(), String> {
+    fn validate(&self, strict: bool) -> Result<(), String> {
         if self.format_version != 1 {
             return Err(format!(
                 "unsupported format version: {}",
@@ -2317,7 +2323,9 @@ impl CompiledTemplate {
 
         Ok(())
     }
+}
 
+impl CompiledTemplate {
     /// Every transition out of `state` that an `auto` answer `answer` for
     /// `field` is forbidden to take, with the reason.
     ///
@@ -2394,7 +2402,9 @@ impl CompiledTemplate {
         }
         out
     }
+}
 
+impl ValidateSteps for CompiledTemplate {
     /// Validate one state's `directive_rules` against what the compiled form
     /// can hold but the record must not: a `rule_id` outside koto's rule-id
     /// bounds (non-blank, at most [`RULE_ID_MAX_BYTES`] bytes), a `check`
@@ -3043,12 +3053,14 @@ impl CompiledTemplate {
 
         Ok(())
     }
+}
 
+impl PassEnvWarnings for CompiledTemplate {
     /// Collect warning W7: a `pass_env:` name that koto supplies itself
     /// (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
     /// `KOTO_SESSIONS_BASE`). koto's value always wins, so the declaration
     /// does nothing.
-    pub fn collect_pass_env_warnings(&self) -> Vec<String> {
+    fn collect_pass_env_warnings(&self) -> Vec<String> {
         self.pass_env
             .iter()
             .filter(|n| crate::engine::command_env::is_koto_supplied(n))
@@ -3061,7 +3073,9 @@ impl CompiledTemplate {
             })
             .collect()
     }
+}
 
+impl CompiledTemplate {
     /// Collect non-fatal warnings W1-W5 tied to `materialize_children`,
     /// `failure`, and `skipped_marker` usage.
     ///
@@ -3299,7 +3313,9 @@ impl CompiledTemplate {
 
         warnings
     }
+}
 
+impl ValidateRouting for CompiledTemplate {
     /// Validate that every state with pure-gate-only transitions can fire at least
     /// one transition when all gates use their declared (or builtin) override defaults.
     ///
