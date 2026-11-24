@@ -1073,6 +1073,7 @@ dependencies = [
  "filetime",
  "hex",
  "http",
+ "koto-session-reader",
  "libc",
  "opener",
  "predicates",
@@ -1089,6 +1090,22 @@ dependencies = [
  "toml",
  "url",
  "wait-timeout",
+]
+
+[[package]]
+name = "koto-session-reader"
+version = "0.39.1-dev"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "hex",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "toml",
 ]
 
 [[package]]
