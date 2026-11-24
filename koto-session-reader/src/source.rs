@@ -315,4 +315,69 @@ mod tests {
             Some(PathBuf::from("/w/k/sessions"))
         );
     }
+
+    /// One log line of type `event_type` with `payload`, parsed as the
+    /// reader parses a state log.
+    fn event(seq: u64, event_type: &str, payload: &str) -> crate::engine::types::Event {
+        let line = format!(
+            r#"{{"seq":{seq},"timestamp":"2026-05-24T00:00:00Z","type":"{event_type}","payload":{payload}}}"#
+        );
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// An event of a listed type, with the payload it carries in a state log;
+    /// each touches key `k`.
+    fn listed_event(seq: u64, event_type: &str) -> crate::engine::types::Event {
+        let payload = match event_type {
+            "transitioned" => {
+                r#"{"from":"a","to":"b","condition_type":"auto","context_assignments":{"k":"v2"}}"#
+            }
+            "context_added" => r#"{"key":"k","hash":"00","size":0}"#,
+            "context_removed" => r#"{"key":"k"}"#,
+            "context_cleared" => r#"{"state":"b","keys":["k"],"entry_seq":1}"#,
+            other => panic!("CONTEXT_KEY_EVENTS lists {other}, which this test can't build"),
+        };
+        event(seq, event_type, payload)
+    }
+
+    #[test]
+    fn each_context_key_event_changes_the_outstanding_assignments() {
+        use crate::engine::context_assign::outstanding_assignments;
+
+        // A transition that assigned `k = v1`: the outstanding set holds it.
+        let base = vec![event(
+            1,
+            "transitioned",
+            r#"{"from":null,"to":"a","condition_type":"auto","context_assignments":{"k":"v1"}}"#,
+        )];
+        let before = outstanding_assignments(&base);
+        assert_eq!(before.get("k").map(String::as_str), Some("v1"));
+
+        for event_type in CONTEXT_KEY_EVENTS {
+            let listed = listed_event(2, event_type);
+            assert_eq!(
+                listed.payload.type_name(),
+                event_type,
+                "CONTEXT_KEY_EVENTS names {event_type}, which must be the payload's type name"
+            );
+            let mut events = base.clone();
+            events.push(listed);
+            assert_ne!(
+                outstanding_assignments(&events),
+                before,
+                "a {event_type} event must change the outstanding assignments"
+            );
+        }
+
+        // A type the list doesn't name leaves the set as it was.
+        assert!(!CONTEXT_KEY_EVENTS.contains(&"evidence_submitted"));
+        let mut events = base.clone();
+        events.push(event(
+            2,
+            "evidence_submitted",
+            r#"{"state":"a","fields":{"k":"v3"}}"#,
+        ));
+        assert_eq!(events[1].payload.type_name(), "evidence_submitted");
+        assert_eq!(outstanding_assignments(&events), before);
+    }
 }

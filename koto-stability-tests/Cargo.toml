@@ -16,6 +16,9 @@ publish = false
 # crate is actually published; path-dep is the right call for an
 # internal compile-check fixture.
 koto = { path = ".." }
+# The session store read surface is pinned through the crate a dependent
+# names (tests/store_layout_literals.rs).
+koto-session-reader = { path = "../koto-session-reader" }
 
 [dev-dependencies]
 # tempfile is the only runtime dep the smoke test needs — it gives
