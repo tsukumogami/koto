@@ -26,7 +26,7 @@ commands below are listed without either prefix.
 ## Verification map
 
 - `src/**`, `tests/**`, `test/functional/fixtures/**`, `benches/**`, `koto-stability-tests/**`,
-  `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
+  `koto-session-reader/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
   `scripts/run-tests.sh`, `.config/nextest.toml` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
@@ -90,16 +90,19 @@ commands below are listed without either prefix.
 
 ### Default verification command (when no map entry matches; all must pass)
 
-Four of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
+Five of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
 change both together. Its other jobs (audit, the tsuku install, cloud integration,
 leftover-artifact checks) are left out on purpose. The two test commands run through
 `scripts/run-tests.sh`, which uses cargo-nextest's `ci` profile from `.config/nextest.toml` (one
 process per test, as the `tests` and `stability-tests` jobs do) when a cargo-nextest at or above
 that file's `nextest-version` is installed, and otherwise says so on stderr and falls back to
 `cargo test --locked ... -- --test-threads=1`. CI's `tests` job also adds coverage and
-`--all-features`; locally the suite runs without either.
+`--all-features`; locally the suite runs without either. Like CI, the test, doctest and clippy
+commands name `koto` and `koto-session-reader`, since cargo without `-p` runs only the root
+package; `run-tests.sh` given arguments skips the doctests, which have their own command.
 
-- `bash scripts/run-tests.sh` (the suite, then the doctests under nextest)
+- `bash scripts/run-tests.sh -p koto -p koto-session-reader`
+- `cargo test --locked --doc -p koto -p koto-session-reader`
 - `bash scripts/run-tests.sh -p koto-stability-tests`
 - `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy -p koto -p koto-session-reader --all-targets -- -D warnings`

@@ -31,11 +31,7 @@ use crate::session::context_log::{
 };
 use crate::session::SessionBackend;
 
-/// The reserved area of a session's context. Only koto writes keys here.
-pub const RESERVED_PREFIX: &str = "koto/";
-
-/// The first component of every reserved key, compared case-insensitively.
-const RESERVED_COMPONENT: &str = "koto";
+pub use koto_session_reader::session::links::{is_reserved_key, RESERVED_PREFIX};
 
 /// Where a session's links live: `koto/links/<kind>/<peer>`.
 pub const LINKS_PREFIX: &str = "koto/links/";
@@ -101,15 +97,6 @@ impl std::fmt::Display for LinkKind {
 /// The context key of a `kind` link to `peer`.
 pub fn link_key(kind: LinkKind, peer: &str) -> String {
     format!("{LINKS_PREFIX}{}/{peer}", kind.as_str())
-}
-
-/// Whether `key` lies in the reserved area: its first component is `koto`,
-/// compared case-insensitively so `KOTO/links/...` can't reach the same
-/// directory on a case-insensitive filesystem. The bare key `koto` counts
-/// too, since a file of that name would block the reserved directory.
-pub fn is_reserved_key(key: &str) -> bool {
-    let first = key.split('/').next().unwrap_or("");
-    first.eq_ignore_ascii_case(RESERVED_COMPONENT)
 }
 
 /// A write or removal of a reserved key by a writer that may not touch it.

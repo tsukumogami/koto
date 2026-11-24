@@ -3617,7 +3617,7 @@ pub fn generate_session_id() -> String {
     use std::io::Read;
 
     let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
+    crate::fs_read::open_plain("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .unwrap_or_default();
 
@@ -3664,7 +3664,8 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
-pub(crate) fn is_leap(y: u64) -> bool {
+#[doc(hidden)]
+pub fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
@@ -3681,7 +3682,8 @@ const MAX_YEAR: u64 = 9999;
 /// come from another machine's summary, so no input can make this loop
 /// without end, overflow or slice inside a character. The dashboard's rows
 /// and the remote feed's reader both read times through it.
-pub(crate) fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<std::time::SystemTime> {
+#[doc(hidden)]
+pub fn parse_timestamp_to_systemtime(timestamp: &str) -> Option<std::time::SystemTime> {
     use std::time::{Duration, SystemTime};
 
     let t = timestamp.trim_end_matches('Z');
