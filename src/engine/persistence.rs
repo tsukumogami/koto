@@ -3,7 +3,7 @@
 //! Durability discipline: `sync_data()` (fdatasync) is called after
 //! every header and event append. The first header write of a brand-new
 //! state file ALSO fsyncs the parent directory via
-//! [`append::fsync_parent_dir`] so the file's directory entry is durable across
+//! `append::fsync_parent_dir` so the file's directory entry is durable across
 //! a crash. Subsequent appends do NOT re-fsync the parent because the
 //! directory entry is already committed; only the file's data + size
 //! need durability, which `sync_data()` provides. See Fix 3 in the
