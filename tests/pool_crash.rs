@@ -338,16 +338,17 @@ fn read_pid(path: &Path) -> i32 {
 /// Whether `pid` is a live process (not a zombie).
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only asks whether the process exists.
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        return false;
-    }
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    // On Linux a zombie still answers signal 0, so read its state too.
     #[cfg(target_os = "linux")]
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) {
-            return rest.split_whitespace().next() != Some("Z");
+    if exists {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) {
+                return rest.split_whitespace().next() != Some("Z");
+            }
         }
     }
-    true
+    exists
 }
 
 fn kill9(pid: i32) {
