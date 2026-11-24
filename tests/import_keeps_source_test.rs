@@ -1581,6 +1581,29 @@ fn a_context_object_missing_from_the_bucket_is_still_unreadable() {
     assert_eq!(import_dirs(&w.b), Vec::<String>::new());
 }
 
+#[test]
+fn an_import_reads_its_context_keys_in_parallel() {
+    let w = World::new();
+    let keys = w.long_source();
+    // Every context read takes HELD before it answers. One at a time the
+    // reads alone would take LONG_KEYS * HELD; side by side they take a
+    // couple of HELDs.
+    const HELD: Duration = Duration::from_millis(500);
+    for key in &keys {
+        w.s3.stall("GET", key, HELD);
+    }
+    let started = std::time::Instant::now();
+    let r = w.import(&w.b, "v2", &w.a, &[]);
+    let took = started.elapsed();
+    assert!(r.ok(), "{}", r.describe());
+    let serial = HELD * LONG_KEYS as u32;
+    assert!(
+        took < serial / 2,
+        "the import took {took:?}, as long as reading {} context keys one at a time ({serial:?})",
+        LONG_KEYS
+    );
+}
+
 /// The `.import-*` entries in a host's session store: staging directories
 /// and keys kept for a re-run.
 fn import_dirs(host: &Host) -> Vec<String> {
