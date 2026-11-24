@@ -1472,3 +1472,151 @@ fn every_write_verb_refuses_a_migrated_source_owing_its_back_reference_before_wr
     assert_writes_refused(&w, &w.a, &w.b);
     w.assert_still_owed(&owed, "a refused write");
 }
+
+/// How many context keys the long-session tests give the source.
+const LONG_KEYS: usize = 12;
+
+impl World {
+    /// v2 in W1 on host 1 with [`LONG_KEYS`] context keys, finished and
+    /// the retention waited out; host 2 has the template compiled. Returns
+    /// the bucket keys of the source's context objects.
+    fn long_source(&self) -> Vec<String> {
+        self.init(&self.a, "v2", &[]);
+        let scratch = self.root.join("long-keys");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut keys = Vec::new();
+        for i in 0..LONG_KEYS {
+            let key = format!("record/k{i:02}");
+            let file = scratch.join(format!("k{i:02}"));
+            std::fs::write(&file, format!("value {i}\n")).unwrap();
+            ok(
+                &self.a,
+                &[
+                    "context",
+                    "add",
+                    "v2",
+                    &key,
+                    "--from-file",
+                    file.to_str().unwrap(),
+                ],
+            );
+            keys.push(format!("{}/v2/ctx/{key}", self.a.prefix()));
+        }
+        self.done(&self.a, "v2");
+        self.compile(&self.b);
+        settle();
+        keys
+    }
+
+    /// The source context keys the bucket was asked for with a GET.
+    fn context_gets(&self, keys: &[String]) -> Vec<String> {
+        self.s3
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "GET" && keys.contains(&r.key))
+            .map(|r| r.key)
+            .collect()
+    }
+}
+
+#[test]
+fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
+    let w = World::new();
+    let keys = w.long_source();
+    // A key in the last batch of reads, so the first run asks for every
+    // other key before it stops.
+    let failing = keys[LONG_KEYS - 3].clone();
+    w.s3.fail("GET", &failing, 500);
+    let first = w.import(&w.b, "v2", &w.a, &[]);
+    assert_eq!(first.code, Some(1), "{}", first.describe());
+    assert!(!w.b.session_dir("v2").exists());
+    assert_eq!(import_dirs(&w.b), vec![".import-fetched-v2".to_string()]);
+
+    // Once the bucket answers again, the re-run reads only what the first
+    // run couldn't, not every key from the first one.
+    w.s3.clear_faults();
+    w.s3.clear_requests();
+    let second = w.import(&w.b, "v2", &w.a, &[]);
+    assert!(second.ok(), "{}", second.describe());
+    let fetched = w.context_gets(&keys);
+    assert_eq!(
+        fetched,
+        std::slice::from_ref(&failing),
+        "a re-run starts from the first key again: it read {} of {} context keys",
+        fetched.len(),
+        LONG_KEYS
+    );
+    for (i, key) in keys.iter().enumerate() {
+        let name = key.rsplit_once("/ctx/").unwrap().1;
+        let local = std::fs::read(w.b.session_dir("v2").join("ctx").join(name)).unwrap();
+        assert_eq!(local, format!("value {i}\n").into_bytes(), "{name}");
+    }
+    assert_eq!(import_dirs(&w.b), Vec::<String>::new());
+
+    // The first run's refusal says the bucket couldn't be reached, which a
+    // retry can clear, apart from a missing or corrupt object.
+    assert_eq!(
+        first.json["error"]["code"],
+        "import_source_unreachable",
+        "{}",
+        first.describe()
+    );
+}
+
+#[test]
+fn a_context_object_missing_from_the_bucket_is_still_unreadable() {
+    let w = World::new();
+    let keys = w.long_source();
+    w.s3.remove(&keys[3]);
+    let r = w.import(&w.b, "v2", &w.a, &[]);
+    assert_eq!(r.code, Some(1), "{}", r.describe());
+    assert_eq!(
+        r.json["error"]["code"],
+        "import_source_unreadable",
+        "{}",
+        r.describe()
+    );
+    assert!(!w.b.session_dir("v2").exists());
+    // A re-run can't finish this import either, so nothing is kept for one.
+    assert_eq!(import_dirs(&w.b), Vec::<String>::new());
+}
+
+#[test]
+fn an_import_reads_its_context_keys_in_parallel() {
+    let w = World::new();
+    let keys = w.long_source();
+    // Every context read takes HELD before it answers. One at a time the
+    // reads alone would take LONG_KEYS * HELD; side by side they take a
+    // couple of HELDs.
+    const HELD: Duration = Duration::from_millis(500);
+    for key in &keys {
+        w.s3.stall("GET", key, HELD);
+    }
+    let started = std::time::Instant::now();
+    let r = w.import(&w.b, "v2", &w.a, &[]);
+    let took = started.elapsed();
+    assert!(r.ok(), "{}", r.describe());
+    let serial = HELD * LONG_KEYS as u32;
+    assert!(
+        took < serial / 2,
+        "the import took {took:?}, as long as reading {} context keys one at a time ({serial:?})",
+        LONG_KEYS
+    );
+}
+
+/// The `.import-*` entries in a host's session store: staging directories
+/// and keys kept for a re-run.
+fn import_dirs(host: &Host) -> Vec<String> {
+    let store = host.home.join(".koto").join("sessions");
+    let mut names: Vec<String> = std::fs::read_dir(&store)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".import-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}

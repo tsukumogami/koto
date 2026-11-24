@@ -13,7 +13,7 @@ members = ["koto-stability-tests", "koto-session-reader"]
 # koto and koto-session-reader release together under one version. The
 # release hook stamps this line; koto-stability-tests keeps its own version.
 [workspace.package]
-version = "0.39.1-dev"
+version = "0.40.1-dev"
 
 [package]
 name = "koto"
