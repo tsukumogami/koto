@@ -29,6 +29,66 @@ pub trait SessionSource {
 }
 
 // ---------------------------------------------------------------------------
+// The store's layout names
+// ---------------------------------------------------------------------------
+//
+// Each name is defined once, here, and koto's writer imports it, so the
+// reader and the writer can't drift apart. docs/STABILITY.md's "Session store
+// read surface" section promises them, and koto-stability-tests pins each as
+// a literal, so a rename fails there rather than orphaning older readers.
+// The state file's name is `crate::session::state_file_name`, the leg
+// pointer's `crate::engine::leg_pointer::POINTER_FILENAME`.
+
+/// Reserved prefix of a close session being staged in the sessions
+/// directory. No session name can start with a dot, so a directory with this
+/// prefix is never a session; every walk of the store passes it by.
+pub const STAGING_PREFIX: &str = ".koto-staging-";
+
+/// The directory under a session's directory that holds its context values,
+/// one file per key, hierarchical keys as subdirectories.
+pub const CTX_DIR: &str = "ctx";
+
+/// koto's own index of a session's context values, directly under
+/// [`CTX_DIR`]. Its shape is not promised; no context key can name it.
+pub const MANIFEST_FILE: &str = "manifest.json";
+
+/// The lock koto takes on a session's context writes, directly under
+/// [`CTX_DIR`]. No context key can name it, and the reader never takes it.
+pub const MANIFEST_LOCK_FILE: &str = "manifest.lock";
+
+/// The layout marker's name, directly under the sessions directory. A
+/// missing marker means layout 1; nothing writes one yet.
+pub const STORE_LAYOUT_MARKER: &str = ".koto-store-layout";
+
+/// The store layout this reader reads. A marker naming a higher number
+/// makes the reader refuse the store.
+pub const STORE_LAYOUT_VERSION: u32 = 1;
+
+/// The koto release this crate was built with: the crate and koto share one
+/// version.
+pub const KOTO_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The event types that set or supersede a context key: a `transitioned`
+/// event's `context_assignments` set keys, and `context_added`,
+/// `context_removed` and `context_cleared` supersede them. A fifth would be
+/// a breaking change to the read surface.
+pub const CONTEXT_KEY_EVENTS: [&str; 4] = [
+    "transitioned",
+    "context_added",
+    "context_removed",
+    "context_cleared",
+];
+
+/// The most a state log may hold before a hardened read refuses it.
+pub const STATE_LOG_READ_CAP: u64 = 512 * 1024 * 1024;
+
+/// The most a context value may hold before `read_context` refuses it.
+pub const CONTEXT_VALUE_READ_CAP: u64 = 16 * 1024 * 1024;
+
+/// The most the layout marker may hold before `check_layout` refuses it.
+pub const LAYOUT_MARKER_READ_CAP: u64 = 64;
+
+// ---------------------------------------------------------------------------
 // Finding the store
 // ---------------------------------------------------------------------------
 
