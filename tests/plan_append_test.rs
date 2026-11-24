@@ -4,6 +4,9 @@
 //! held in memory; nothing here opens a file, except the one test that
 //! checks a truncated last line fails a real append with the same error.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::path::Path;
 
 use koto::engine::persistence::{append_event, plan_append};
