@@ -2232,6 +2232,45 @@ impl CloudBackend {
         }
     }
 
+    /// GET an object expected to exist, asked again while it fails with a
+    /// [transient](is_transient) error, as [`asked_retrying`] asks a
+    /// listing. `Ok(None)` is a 404; a response other than a 200 is a
+    /// failure of its status, so a 5xx the bucket answered is asked again.
+    fn fetch_object_retrying(&self, key: &str) -> Result<Option<Vec<u8>>, S3Error> {
+        let fetched = asked_retrying(
+            || {
+                let started = std::time::Instant::now();
+                match self.bucket.get_object(key) {
+                    Ok(response) if response.status_code() == 200 => Ok(response),
+                    Ok(response) => Err((
+                        S3Error::HttpFailWithBody(
+                            response.status_code(),
+                            String::from_utf8_lossy(response.bytes()).into_owned(),
+                        ),
+                        started.elapsed(),
+                    )),
+                    Err(e) => Err((e, started.elapsed())),
+                }
+            },
+            is_transient,
+        );
+        match fetched {
+            Ok(response) => Ok(Some(response.bytes().to_vec())),
+            Err((e, _)) if is_not_found(&e) => Ok(None),
+            Err((e, _)) => Err(e),
+        }
+    }
+
+    /// Where an import into `target` keeps the source's context keys it
+    /// has fetched and checked, so a run the bucket stopped partway leaves
+    /// them for the next. Like a staging directory, no session is named
+    /// like it.
+    fn fetched_dir(&self, target: &str) -> PathBuf {
+        self.local
+            .base_dir()
+            .join(format!(".import-fetched-{}", target))
+    }
+
     /// Fetch an object that may well be absent: list for it, and GET it
     /// only when the listing shows it.
     fn get_object_if_present(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -6026,6 +6065,11 @@ pub enum ImportErrorCode {
     TemplateUnavailable,
     /// A source object couldn't be read, or failed validation.
     SourceUnreadable,
+    /// A source context key couldn't be fetched because the bucket didn't
+    /// answer: a dropped connection, a timeout, a throttle or a 5xx, still
+    /// failing after retries. A retry after a backoff can clear it, and
+    /// the keys fetched before it are kept for the re-run.
+    SourceUnreachable,
     /// Building the imported session here, pushing it under this
     /// workspace's prefix or moving it into place failed, or something the
     /// import needs on this side couldn't be read: this machine's id, the
@@ -6067,6 +6111,7 @@ impl ImportErrorCode {
             ImportErrorCode::NameTaken => "import_name_taken",
             ImportErrorCode::TemplateUnavailable => "import_template_unavailable",
             ImportErrorCode::SourceUnreadable => "import_source_unreadable",
+            ImportErrorCode::SourceUnreachable => "import_source_unreachable",
             ImportErrorCode::PushFailed => "import_push_failed",
             ImportErrorCode::Unmarked => "import_unmarked",
             ImportErrorCode::SourceRunning => "import_source_running",
@@ -6094,6 +6139,7 @@ impl ImportErrorCode {
             | ImportErrorCode::RelationConflict
             | ImportErrorCode::BackgroundRunInFlight => 2,
             ImportErrorCode::SourceUnreadable
+            | ImportErrorCode::SourceUnreachable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
         }
@@ -6452,6 +6498,24 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.moved {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// The context keys an import has fetched and checked, kept in
+/// `.import-fetched-<target>` while it runs. Removed when dropped unless
+/// `for_rerun` says the bucket couldn't be reached, so a refusal a re-run
+/// can't finish leaves nothing behind. A failure to remove them costs only
+/// disk: a later run checks every kept key against its manifest first.
+struct KeptFetches {
+    dir: PathBuf,
+    for_rerun: bool,
+}
+
+impl Drop for KeptFetches {
+    fn drop(&mut self) {
+        if !self.for_rerun {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -7206,29 +7270,94 @@ impl CloudBackend {
         let staging = Staging { dir, moved: false };
         let dir = staging.dir.as_path();
 
-        // Context keys, one fetched and written at a time. The manifest says
-        // each exists, so each is one GET with no listing first.
+        // Context keys. The manifest says each exists, so each is one GET
+        // with no listing first, asked again while the bucket fails
+        // transiently and sent FLUSH_PARALLELISM at a time. Each key whose
+        // size and hash match the manifest is kept in
+        // `.import-fetched-<target>` as it lands, and a run reuses every
+        // kept key that still matches, so a re-run after a failed read
+        // fetches only what's left.
         let ctx_dir = dir.join("ctx");
         std::fs::create_dir_all(&ctx_dir).map_err(|e| write_failed(&ctx_dir, &e))?;
-        for (key, meta) in &manifest.keys {
-            let what = format!("context key {:?}", key);
-            let bytes = self
-                .fetch_object(&source.key(&format!("ctx/{}", key)))
-                .map_err(|e| source.unreadable(&what, &e))?
-                .ok_or_else(|| {
-                    source.unreadable(&what, &"the manifest lists it but the object is missing")
-                })?;
-            if bytes.len() as u64 != meta.size || crate::cache::sha256_hex(&bytes) != meta.hash {
-                return Err(
-                    source.unreadable(&what, &"its size or SHA-256 doesn't match the manifest")
-                );
-            }
-            let path = ctx_dir.join(key);
+        let fetched_dir = self.fetched_dir(target);
+        if !fetched_dir.is_dir() {
+            create_private_dir(&fetched_dir).map_err(|e| write_failed(&fetched_dir, &e))?;
+        }
+        // The kept keys outlive this call only when the bucket couldn't be
+        // reached, the one refusal a re-run can finish. Any other way out
+        // removes them: a missing or corrupt object refuses the re-run too,
+        // and once every key is copied into staging they aren't needed.
+        let mut kept = KeptFetches {
+            dir: fetched_dir.clone(),
+            for_rerun: false,
+        };
+        let matches = |bytes: &[u8], size: u64, hash: &str| {
+            bytes.len() as u64 == size && crate::cache::sha256_hex(bytes) == hash
+        };
+        let missing: Vec<(&String, u64, &str)> = manifest
+            .keys
+            .iter()
+            .map(|(key, meta)| (key, meta.size, meta.hash.as_str()))
+            .filter(|(key, size, hash)| {
+                !std::fs::read(fetched_dir.join(key))
+                    .is_ok_and(|bytes| matches(&bytes, *size, hash))
+            })
+            .collect();
+        let keep = |path: &Path, bytes: &[u8]| -> Result<(), ImportError> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
             }
-            std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
+            std::fs::write(path, bytes).map_err(|e| write_failed(path, &e))
+        };
+        let total = manifest.keys.len();
+        let mut held = total - missing.len();
+        for chunk in missing.chunks(FLUSH_PARALLELISM) {
+            let results = each_in_parallel(chunk, |(key, _, _)| {
+                Ok(self.fetch_object_retrying(&source.key(&format!("ctx/{}", key))))
+            });
+            let mut failure = None;
+            for ((key, size, hash), result) in chunk.iter().zip(results) {
+                let what = format!("context key {:?}", key);
+                let err =
+                    match result {
+                        Ok(Ok(Some(bytes))) if matches(&bytes, *size, hash) => {
+                            keep(&fetched_dir.join(key), &bytes)?;
+                            held += 1;
+                            continue;
+                        }
+                        Ok(Ok(Some(_))) => source
+                            .unreadable(&what, &"its size or SHA-256 doesn't match the manifest"),
+                        Ok(Ok(None)) => source
+                            .unreadable(&what, &"the manifest lists it but the object is missing"),
+                        Ok(Err(e)) if is_transient(&e) => ImportError::new(
+                            SourceUnreachable,
+                            format!(
+                                "could not reach the bucket for {} of session '{}': {}",
+                                what, source.name, e
+                            ),
+                        ),
+                        Ok(Err(e)) => source.unreadable(&what, &e),
+                        Err(e) => source.unreadable(&what, &e),
+                    };
+                failure.get_or_insert(err);
+            }
+            if let Some(mut err) = failure {
+                if err.code == SourceUnreachable {
+                    kept.for_rerun = true;
+                    err.message.push_str(&format!(
+                        "; {} of {} context keys are kept for a re-run, which fetches only the rest",
+                        held, total
+                    ));
+                }
+                return Err(err);
+            }
         }
+        for key in manifest.keys.keys() {
+            let from = fetched_dir.join(key);
+            let bytes = std::fs::read(&from).map_err(|e| write_failed(&from, &e))?;
+            keep(&ctx_dir.join(key), &bytes)?;
+        }
+        drop(kept);
         // The source's pin and release record, as the bucket holds them,
         // carried verbatim, an unreadable pin included (R25). They stay out
         // of the copy's manifest, as on every cloud copy (R20a), and
@@ -10920,6 +11049,7 @@ mod tests {
             (NameTaken, "import_name_taken", 2),
             (TemplateUnavailable, "import_template_unavailable", 2),
             (SourceUnreadable, "import_source_unreadable", 1),
+            (SourceUnreachable, "import_source_unreachable", 1),
             (PushFailed, "import_push_failed", 1),
             (Unmarked, "import_unmarked", 1),
             (SourceRunning, "import_source_running", 2),
