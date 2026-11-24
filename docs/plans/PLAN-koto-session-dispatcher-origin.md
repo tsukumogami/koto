@@ -139,17 +139,21 @@ It is met. Issues 1 to 3 merged in #715 and ship in koto v0.38.0, which is insta
 
 **Goal**: the brief the coordinator renders for a dispatched worker no longer tells the agent to record its dispatcher. This outline waited on the `koto-release-installed` gate above even though it depends on no other outline, so it would not merge before a koto release carrying Issues 1 to 3 was installed on the reference host; dispatched workers would otherwise get no link while the old koto was still there. That gate is met.
 
+The link step is the `link` row of the opener table: for a message-path worker whose entry point is `/scope`, `/deliver`, `/execute` or `/work-on`, the Goal carries a dispatcher block ("Your dispatcher is the coordinator run that sent you this brief", the `dispatcher_session:` line, the instruction to record it, the `link-dispatcher.sh <session> --dispatched-by <run>` command, and the paragraph after it about `${CLAUDE_PLUGIN_ROOT}` and `warning=link-failed`). `dc_opener` in `skills/coordinate/scripts/dispatch-common.sh` builds that row, `skills/coordinate/scripts/render-brief.sh` renders the block, and `skills/coordinate/references/brief-template.md` ("The Dispatcher on the Message Path") documents it. That block goes. The `open` rows stay: `/coordinate`'s `coordinate-open.sh --dispatched-by` and `/explore`, `/decision` and `/release`'s `skill-session.sh open --dispatched-by` are those entry points' own open command, not a separate step. So do a leg worker's brief, which has no dispatcher block, and the Reporting section's `resolve-coordinator.sh` and `render-result.sh --dispatcher` lines.
+
 **Acceptance Criteria**:
-- [ ] The brief template and its renderer emit no link step, and the golden briefs drop it (AC8, golden half).
-- [ ] A brief rendered with a dispatcher name supplied, and one rendered with that input empty or absent, both carry no link step and no mention of `link-dispatcher.sh`; neither render fails.
-- [ ] Each golden brief differs from its pre-change version only by the removed link step: a diff of old against new golden shows no other added or removed line.
+- [ ] The brief template and its renderer emit no link step for `/scope`, `/deliver`, `/execute` and `/work-on`, and the golden briefs `base.txt` and `min.txt` under `skills/coordinate/scripts/testdata/brief-golden/` drop it (AC8, golden half). A brief for `/coordinate`, `/explore`, `/decision` or `/release` renders its opener row as before, and `leg.txt` doesn't change.
+- [ ] For those four entry points, a brief rendered with a dispatcher name supplied and one rendered with that input empty or absent both carry no link step, no mention of `link-dispatcher.sh` and no `dispatcher_session:` line, and neither render fails.
+- [ ] Each golden brief differs from its pre-change version only by the removed link step: a diff of old against new golden shows only removed lines, all of them the dispatcher block's.
 - [ ] `link-dispatcher.sh` stays callable so briefs already in flight keep working: with valid arguments it writes the link as before, and with a missing or malformed session or dispatcher argument it exits with the same code and prints the same message as it did before the change.
 - [ ] A search of koto, the koto-skills plugin and shirabe finds no read of a launcher-defined variable used to learn the dispatcher (AC5).
-- [ ] The renderer's and dispatch scripts' tests pass.
+- [ ] The renderer's and dispatch scripts' tests pass (`render-brief_test.sh`, `dispatch-worker_test.sh`, and any other test under `skills/coordinate/scripts/` that asserts the link row).
 
 **Dependencies**: None
 
 **Type**: code
+
+**Files**: `skills/coordinate/scripts/dispatch-common.sh`, `skills/coordinate/scripts/render-brief.sh`, `skills/coordinate/references/brief-template.md`, `skills/coordinate/scripts/testdata/brief-golden/base.txt`, `skills/coordinate/scripts/testdata/brief-golden/min.txt`, and the tests that assert the link row
 
 ### Issue 5: chore: verify dispatcher origin on the reference host
 
