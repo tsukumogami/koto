@@ -1523,7 +1523,9 @@ impl World {
 fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
     let w = World::new();
     let keys = w.long_source();
-    let failing = keys[LONG_KEYS / 2].clone();
+    // A key in the last batch of reads, so the first run asks for every
+    // other key before it stops.
+    let failing = keys[LONG_KEYS - 3].clone();
     w.s3.fail("GET", &failing, 500);
     let first = w.import(&w.b, "v2", &w.a, &[]);
     assert_eq!(first.code, Some(1), "{}", first.describe());
@@ -1538,7 +1540,7 @@ fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
     let fetched = w.context_gets(&keys);
     assert_eq!(
         fetched,
-        [failing.clone()],
+        std::slice::from_ref(&failing),
         "a re-run starts from the first key again: it read {} of {} context keys",
         fetched.len(),
         LONG_KEYS
@@ -1552,7 +1554,8 @@ fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
     // The first run's refusal says the bucket couldn't be reached, which a
     // retry can clear, apart from a missing or corrupt object.
     assert_eq!(
-        first.json["error"]["code"], "import_source_unreachable",
+        first.json["error"]["code"],
+        "import_source_unreachable",
         "{}",
         first.describe()
     );
@@ -1566,7 +1569,8 @@ fn a_context_object_missing_from_the_bucket_is_still_unreadable() {
     let r = w.import(&w.b, "v2", &w.a, &[]);
     assert_eq!(r.code, Some(1), "{}", r.describe());
     assert_eq!(
-        r.json["error"]["code"], "import_source_unreadable",
+        r.json["error"]["code"],
+        "import_source_unreadable",
         "{}",
         r.describe()
     );
