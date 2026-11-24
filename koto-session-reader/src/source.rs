@@ -1,14 +1,19 @@
 //! Where the dashboard reads sessions from: the listing trait a session
 //! store implements, how a program finds the sessions directory koto uses,
-//! the store's layout marker, and the hardened listing a
-//! [`LocalDirSource`] reads a sessions directory with.
+//! the store's layout marker, the hardened listing a [`LocalDirSource`]
+//! reads a sessions directory with, and the hardened reads of one session's
+//! log ([`read_session_events`]) and one context value ([`read_context`]).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::engine::persistence::parse_header_bytes;
-use crate::engine::types::StateFileHeader;
+use crate::engine::context_assign::outstanding_assignments;
+use crate::engine::errors::EngineError;
+use crate::engine::persistence::{parse_header_bytes, parse_state_log};
+use crate::engine::types::{Event, StateFileHeader};
 use crate::fs_read::{read_store_file, read_store_first_line, ReadMode};
 use crate::koto_root::{koto_root, KOTO_ROOT_UNRESOLVED};
+use crate::session::validate::{validate_context_key, validate_session_id};
 use crate::session::{state_file_name, SessionInfo};
 
 /// A store of session directories the dashboard lists and reads, and
@@ -458,6 +463,312 @@ impl SessionSource for LocalDirSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// One session's log
+// ---------------------------------------------------------------------------
+
+/// Why [`read_session_events`] couldn't read a session's log: a fixed
+/// category and the log's path. It holds none of the log's bytes, and its
+/// `Display` never carries a parser's or the OS's error text, which can
+/// quote them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{category}: {}", path.display())]
+pub struct SessionReadError {
+    /// What went wrong.
+    pub category: SessionReadCategory,
+    /// The state log's path.
+    pub path: PathBuf,
+}
+
+/// The fixed categories a [`SessionReadError`] falls in. Each displays as
+/// a fixed string; [`NewerSchema`](Self::NewerSchema) adds its two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionReadCategory {
+    /// The id isn't a session name, so no path inside the store is built
+    /// from it.
+    InvalidId,
+    /// No state log at the path.
+    NotFound,
+    /// The state log is a symlink.
+    Symlink,
+    /// The state log isn't a regular file (a FIFO, a device, a directory).
+    NotRegular,
+    /// The state log is larger than [`STATE_LOG_READ_CAP`].
+    TooLarge,
+    /// The state log's path resolves outside the sessions directory.
+    OutsideStore,
+    /// The state log couldn't be read for another reason.
+    Unreadable,
+    /// The state log doesn't parse.
+    Malformed,
+    /// The state log was written with a newer `schema_version` than this
+    /// reader reads.
+    NewerSchema {
+        /// The log's `schema_version`.
+        found: u32,
+        /// The newest `schema_version` this reader reads.
+        supported: u32,
+    },
+}
+
+impl fmt::Display for SessionReadCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidId => f.write_str("session id is not a session name"),
+            Self::NotFound => f.write_str("state log not found"),
+            Self::Symlink => f.write_str("state log is a symlink"),
+            Self::NotRegular => f.write_str("state log is not a regular file"),
+            Self::TooLarge => f.write_str("state log is larger than 512 MiB"),
+            Self::OutsideStore => f.write_str("state log resolves outside the sessions directory"),
+            Self::Unreadable => f.write_str("state log is unreadable"),
+            Self::Malformed => f.write_str("state log is malformed"),
+            Self::NewerSchema { found, supported } => write!(
+                f,
+                "state log has schema_version {found}; this reader supports up to {supported}"
+            ),
+        }
+    }
+}
+
+/// The category a refused state-log read falls in.
+fn log_read_category(err: &std::io::Error) -> SessionReadCategory {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return SessionReadCategory::Symlink;
+    }
+    match err.kind() {
+        std::io::ErrorKind::NotFound => SessionReadCategory::NotFound,
+        std::io::ErrorKind::InvalidInput => SessionReadCategory::NotRegular,
+        std::io::ErrorKind::InvalidData => SessionReadCategory::TooLarge,
+        std::io::ErrorKind::PermissionDenied => SessionReadCategory::OutsideStore,
+        _ => SessionReadCategory::Unreadable,
+    }
+}
+
+/// The category a state log that won't parse falls in.
+fn log_parse_category(err: &anyhow::Error) -> SessionReadCategory {
+    match err.downcast_ref::<EngineError>() {
+        Some(EngineError::IncompatibleSchemaVersion {
+            found,
+            max_supported,
+        }) => SessionReadCategory::NewerSchema {
+            found: *found,
+            supported: *max_supported,
+        },
+        _ => SessionReadCategory::Malformed,
+    }
+}
+
+/// Read and parse session `id`'s state log from `source`.
+///
+/// `id` is checked against the session-name grammar first. The log is
+/// `<source.session_dir(id)>/koto-<id>.state.jsonl`, read through the
+/// hardened read inside `source.sessions_dir()` and capped at
+/// [`STATE_LOG_READ_CAP`], so a FIFO, a symlink or an over-cap file at the
+/// path is refused without blocking. The bytes are parsed as koto's own
+/// commands parse a log, a torn final line recovered quietly. Takes no lock
+/// and writes nothing.
+pub fn read_session_events(
+    source: &dyn SessionSource,
+    id: &str,
+) -> Result<(StateFileHeader, Vec<Event>), SessionReadError> {
+    let path = source.session_dir(id).join(state_file_name(id));
+    let refuse = |category| SessionReadError {
+        category,
+        path: path.clone(),
+    };
+    validate_session_id(id).map_err(|_| refuse(SessionReadCategory::InvalidId))?;
+    let bytes = read_store_file(
+        &path,
+        STATE_LOG_READ_CAP,
+        ReadMode::InStore {
+            root: source.sessions_dir(),
+        },
+    )
+    .map_err(|e| refuse(log_read_category(&e)))?;
+    parse_state_log(&bytes).map_err(|e| refuse(log_parse_category(&e)))
+}
+
+// ---------------------------------------------------------------------------
+// One context value
+// ---------------------------------------------------------------------------
+
+/// What [`read_context`] found for one key.
+///
+/// A reason is a fixed category string and a path (or, for
+/// [`Unusable`](Self::Unusable), the key asked for), never bytes from the
+/// store. `Debug` prints a [`Present`](Self::Present) value's length and
+/// source, never its bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ContextRead {
+    /// The key can't name a context value: it fails the key grammar, or is
+    /// one of koto's own files directly under `ctx/`.
+    Unusable(String),
+    /// No value: `ctx/`, an intermediate directory or the value's file
+    /// doesn't exist.
+    Absent,
+    /// A value is there but this reader won't read it: a symlink at any
+    /// component, a leaf that isn't a regular file, a value over
+    /// [`CONTEXT_VALUE_READ_CAP`], or an I/O error.
+    Unreadable(String),
+    /// The value, whole.
+    Present {
+        /// The value's bytes, unredacted.
+        bytes: Vec<u8>,
+        /// Where they came from.
+        from: ContextSource,
+    },
+}
+
+impl fmt::Debug for ContextRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unusable(reason) => f.debug_tuple("Unusable").field(reason).finish(),
+            Self::Absent => f.write_str("Absent"),
+            Self::Unreadable(reason) => f.debug_tuple("Unreadable").field(reason).finish(),
+            Self::Present { bytes, from } => f
+                .debug_struct("Present")
+                .field("len", &bytes.len())
+                .field("from", from)
+                .finish(),
+        }
+    }
+}
+
+/// Where a [`ContextRead::Present`] value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// A transition assigned the key and nothing in the log has superseded
+    /// it since, so the value is what the log says, whatever `ctx/` holds.
+    Log,
+    /// The value's file under `ctx/`.
+    Store,
+}
+
+/// `Unreadable` with a fixed category and the path it applies to.
+fn unreadable(category: &str, path: &Path) -> ContextRead {
+    ContextRead::Unreadable(format!("{category}: {}", path.display()))
+}
+
+/// What a directory on the way to a context value says, `None` when it is
+/// a real directory the walk can go into.
+fn check_context_dir(dir: &Path) -> Option<ContextRead> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(ContextRead::Absent),
+        Err(_) => Some(unreadable("context value path is unreadable", dir)),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Some(unreadable("context value path holds a symlink", dir))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            Some(unreadable("context value path holds a non-directory", dir))
+        }
+        Ok(_) => None,
+    }
+}
+
+/// The category a refused context-value read falls in.
+fn context_read_category(err: &std::io::Error) -> &'static str {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return "context value path holds a symlink";
+    }
+    match err.kind() {
+        std::io::ErrorKind::InvalidInput => "context value is not a regular file",
+        std::io::ErrorKind::InvalidData => "context value is larger than 16 MiB",
+        std::io::ErrorKind::PermissionDenied => {
+            "context value resolves outside the session's context directory"
+        }
+        _ => "context value is unreadable",
+    }
+}
+
+/// Read context key `key` of the session in `session_dir`, as `koto
+/// context get` answers it, taking no lock, recording no read and writing
+/// nothing.
+///
+/// In order:
+///
+/// 1. A key that fails the context-key grammar, or is `manifest.json` or
+///    `manifest.lock` (koto's own files directly under `ctx/`), is
+///    [`ContextRead::Unusable`].
+/// 2. Given the session's `events` (from [`read_session_events`]), a key
+///    whose latest writer in the log is a transition's assignment is
+///    [`ContextRead::Present`] from [`ContextSource::Log`], the assigned
+///    value, whatever `ctx/` holds.
+/// 3. `ctx/` and each directory down to the value's file are checked with
+///    `symlink_metadata`: a missing one is [`ContextRead::Absent`]; a
+///    symlink at any component, an intermediate that isn't a directory, or
+///    a directory where the value's file belongs is
+///    [`ContextRead::Unreadable`].
+/// 4. The file is read through the hardened read, capped at
+///    [`CONTEXT_VALUE_READ_CAP`] and contained in the session's `ctx/`: a
+///    FIFO or device is refused without blocking.
+///
+/// Refusing symlinks is a deliberate difference from `koto context get`,
+/// which follows them; koto never writes one. Two limits: a read racing
+/// koto's unlocked content write can see a torn value, as `koto context
+/// get` can, and under the cloud backend the value is this host's mirror.
+pub fn read_context(session_dir: &Path, key: &str, events: Option<&[Event]>) -> ContextRead {
+    if validate_context_key(key).is_err() {
+        return ContextRead::Unusable(format!("context key fails the key grammar: {key:?}"));
+    }
+    if key == MANIFEST_FILE || key == MANIFEST_LOCK_FILE {
+        return ContextRead::Unusable(format!(
+            "context key names one of koto's own files: {key:?}"
+        ));
+    }
+
+    if let Some(value) = events.and_then(|events| outstanding_assignments(events).remove(key)) {
+        return ContextRead::Present {
+            bytes: value.into_bytes(),
+            from: ContextSource::Log,
+        };
+    }
+
+    let ctx = session_dir.join(CTX_DIR);
+    let mut components: Vec<&str> = key.split('/').collect();
+    let Some(leaf_name) = components.pop() else {
+        return ContextRead::Unusable(format!("context key fails the key grammar: {key:?}"));
+    };
+
+    // `ctx/` and each intermediate directory must exist as a directory, not
+    // a symlink to one.
+    let mut dir = ctx.clone();
+    if let Some(refused) = check_context_dir(&dir) {
+        return refused;
+    }
+    for name in components {
+        dir.push(name);
+        if let Some(refused) = check_context_dir(&dir) {
+            return refused;
+        }
+    }
+
+    let leaf = dir.join(leaf_name);
+    match std::fs::symlink_metadata(&leaf) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ContextRead::Absent,
+        Err(_) => return unreadable("context value is unreadable", &leaf),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return unreadable("context value path holds a symlink", &leaf)
+        }
+        Ok(meta) if meta.is_dir() => return unreadable("context value is a directory", &leaf),
+        Ok(_) => {}
+    }
+
+    match read_store_file(
+        &leaf,
+        CONTEXT_VALUE_READ_CAP,
+        ReadMode::InStore { root: &ctx },
+    ) {
+        Ok(bytes) => ContextRead::Present {
+            bytes,
+            from: ContextSource::Store,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ContextRead::Absent,
+        Err(e) => unreadable(context_read_category(&e), &leaf),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +993,148 @@ mod tests {
         assert_eq!(category(ErrorKind::InvalidData), "larger than 64 bytes");
         assert_eq!(category(ErrorKind::PermissionDenied), "unreadable");
         assert_eq!(category(ErrorKind::Other), "unreadable");
+    }
+
+    #[test]
+    fn context_read_debug_shows_a_present_value_length_and_source_only() {
+        let read = ContextRead::Present {
+            bytes: b"ZQX-PLANTED-7F3A".to_vec(),
+            from: ContextSource::Store,
+        };
+        let debug = format!("{read:?}");
+        assert_eq!(debug, "Present { len: 16, from: Store }");
+        let from_log = ContextRead::Present {
+            bytes: b"ZQX".to_vec(),
+            from: ContextSource::Log,
+        };
+        assert_eq!(format!("{from_log:?}"), "Present { len: 3, from: Log }");
+        assert_eq!(format!("{:?}", ContextRead::Absent), "Absent");
+        assert_eq!(
+            format!("{:?}", ContextRead::Unreadable("r".into())),
+            r#"Unreadable("r")"#
+        );
+        assert_eq!(
+            format!("{:?}", ContextRead::Unusable("u".into())),
+            r#"Unusable("u")"#
+        );
+    }
+
+    #[test]
+    fn read_context_refuses_keys_that_name_no_value_before_any_io() {
+        // A session directory that doesn't exist: an unusable key is
+        // refused without looking at it.
+        let dir = Path::new("/nonexistent-koto-session-dir");
+        for key in [
+            "",
+            "../x",
+            "a//b",
+            "/a",
+            "a/",
+            "a/./b",
+            MANIFEST_FILE,
+            MANIFEST_LOCK_FILE,
+        ] {
+            assert!(
+                matches!(read_context(dir, key, None), ContextRead::Unusable(_)),
+                "{key:?}"
+            );
+        }
+        // A nested manifest.json is an ordinary key.
+        assert_eq!(
+            read_context(dir, "a/manifest.json", None),
+            ContextRead::Absent
+        );
+        assert_eq!(read_context(dir, "k", None), ContextRead::Absent);
+    }
+
+    #[test]
+    fn read_context_answers_from_the_log_before_the_store() {
+        let events = vec![event(
+            1,
+            "transitioned",
+            r#"{"from":null,"to":"a","condition_type":"auto","context_assignments":{"k":"v1"}}"#,
+        )];
+        let dir = Path::new("/nonexistent-koto-session-dir");
+        assert_eq!(
+            read_context(dir, "k", Some(&events)),
+            ContextRead::Present {
+                bytes: b"v1".to_vec(),
+                from: ContextSource::Log,
+            }
+        );
+        assert_eq!(
+            read_context(dir, "other", Some(&events)),
+            ContextRead::Absent
+        );
+        // A later add supersedes the assignment: the store answers.
+        let mut events = events;
+        events.push(listed_event(2, "context_added"));
+        assert_eq!(read_context(dir, "k", Some(&events)), ContextRead::Absent);
+    }
+
+    #[test]
+    fn a_refused_log_read_falls_in_a_fixed_category() {
+        use std::io::{Error, ErrorKind};
+        #[cfg(unix)]
+        assert_eq!(
+            log_read_category(&Error::from_raw_os_error(libc::ELOOP)),
+            SessionReadCategory::Symlink
+        );
+        let category = |kind| log_read_category(&Error::new(kind, "ZQX-PLANTED"));
+        assert_eq!(category(ErrorKind::NotFound), SessionReadCategory::NotFound);
+        assert_eq!(
+            category(ErrorKind::InvalidInput),
+            SessionReadCategory::NotRegular
+        );
+        assert_eq!(
+            category(ErrorKind::InvalidData),
+            SessionReadCategory::TooLarge
+        );
+        assert_eq!(
+            category(ErrorKind::PermissionDenied),
+            SessionReadCategory::OutsideStore
+        );
+        assert_eq!(category(ErrorKind::Other), SessionReadCategory::Unreadable);
+    }
+
+    #[test]
+    fn a_log_that_will_not_parse_falls_in_a_fixed_category() {
+        let newer = parse_state_log(
+            br#"{"schema_version":99,"workflow":"w","template_hash":"h","created_at":"2026-05-24T00:00:00Z"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            log_parse_category(&newer),
+            SessionReadCategory::NewerSchema {
+                found: 99,
+                supported: crate::engine::types::CURRENT_SCHEMA_VERSION,
+            }
+        );
+        let garbled = parse_state_log(b"{\"ZQX-PLANTED\n").unwrap_err();
+        assert_eq!(log_parse_category(&garbled), SessionReadCategory::Malformed);
+    }
+
+    #[test]
+    fn session_read_error_display_is_the_category_and_the_path() {
+        let err = SessionReadError {
+            category: SessionReadCategory::Malformed,
+            path: PathBuf::from("/s/w/koto-w.state.jsonl"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "state log is malformed: /s/w/koto-w.state.jsonl"
+        );
+        let newer = SessionReadError {
+            category: SessionReadCategory::NewerSchema {
+                found: 4,
+                supported: 3,
+            },
+            path: PathBuf::from("/p"),
+        };
+        assert_eq!(
+            newer.to_string(),
+            "state log has schema_version 4; this reader supports up to 3: /p"
+        );
     }
 
     #[test]
