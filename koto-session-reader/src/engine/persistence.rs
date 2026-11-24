@@ -5,7 +5,7 @@
 //! `engine::persistence`, which re-exports this module.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -122,7 +122,11 @@ pub fn superseded_by_in_log(content: &str) -> Option<SupersedeFence> {
 /// The fence in the log at `path`, read without a lock. A log that doesn't
 /// exist has none.
 pub fn read_fence(path: &Path) -> anyhow::Result<Option<SupersedeFence>> {
-    match std::fs::read_to_string(path) {
+    let read = crate::fs_read::open_plain(path).and_then(|mut file| {
+        let mut content = String::new();
+        file.read_to_string(&mut content).map(|_| content)
+    });
+    match read {
         Ok(content) => Ok(superseded_by_in_log(&content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!(
@@ -361,7 +365,7 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
 /// Used by the request store's listing walk, which must not pay for a
 /// full replay of every request just to answer an identity filter.
 pub fn read_header_only<H: LogHeader>(path: &Path) -> anyhow::Result<H> {
-    let file = std::fs::File::open(path)
+    let file = crate::fs_read::open_plain(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
     let reader = BufReader::new(file);
@@ -474,7 +478,11 @@ fn read_log_inner<H: LogHeader>(
     path: &Path,
     report: TailReport,
 ) -> anyhow::Result<(H, Vec<Event>)> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::fs_read::open_plain(path)
+        .and_then(|mut file| {
+            let mut content = String::new();
+            file.read_to_string(&mut content).map(|_| content)
+        })
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
     parse_log_content(&content, &path.display().to_string(), report)
 }
@@ -866,7 +874,11 @@ pub fn derive_machine_state(
 /// the single implementation shared by the dashboard read seam and the
 /// `/workflows` projection writer.
 pub fn is_terminal_state(template_path: &str, state_name: &str) -> bool {
-    let bytes = match std::fs::read(template_path) {
+    let read = crate::fs_read::open_plain(template_path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let bytes = match read {
         Ok(b) => b,
         Err(_) => return false,
     };

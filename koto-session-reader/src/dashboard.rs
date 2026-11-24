@@ -837,9 +837,16 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
     // resolution base for a session-relative template_path.
     let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let compiled = derive_machine_state(&header, &events, session_dir).and_then(|ms| {
-        std::fs::read(&ms.template_path).ok().and_then(|bytes| {
-            serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
-        })
+        crate::fs_read::open_plain(&ms.template_path)
+            .and_then(|mut file| {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map(|_| bytes)
+            })
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
+            })
     });
 
     // Find the most recent GateEvaluated event (optional).

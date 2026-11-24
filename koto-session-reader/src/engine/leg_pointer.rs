@@ -46,6 +46,8 @@ use std::time::SystemTime;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::fs_read::{read_store_file, ReadMode};
+
 /// Filename for the leg pointer inside a session directory.
 ///
 /// Sits beside `claim.lock` and the state file. Named for what it points
@@ -85,8 +87,19 @@ pub fn pointer_path(session_dir: &Path) -> PathBuf {
     session_dir.join(POINTER_FILENAME)
 }
 
-/// Read the pointer at `<session_dir>/request-leg.toml` using
-/// `O_NOFOLLOW`.
+/// The most a leg pointer may hold. A real pointer is three short TOML
+/// lines; anything larger isn't one.
+pub const POINTER_READ_CAP: u64 = 64 * 1024;
+
+/// Read the pointer at `<session_dir>/request-leg.toml` through
+/// [`read_store_file`] in store mode.
+///
+/// The read refuses a symlink at the pointer path, so a foothold attacker
+/// cannot point a delegate at a file outside its own session directory; a
+/// FIFO or device, which it refuses without blocking; a pointer larger than
+/// [`POINTER_READ_CAP`]; and a path that resolves outside the session
+/// directory. The session directory is the containment root, so a session
+/// reached through a symlinked path still reads its own pointer.
 ///
 /// Returns `Ok(None)` when the session carries no pointer, which is the
 /// overwhelmingly common case — every session that is not a bound
@@ -94,19 +107,9 @@ pub fn pointer_path(session_dir: &Path) -> PathBuf {
 /// `None`, so a bind cannot silently overwrite one it failed to parse.
 pub fn read_pointer(session_dir: &Path) -> Result<Option<LegPointer>> {
     let path = pointer_path(session_dir);
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Refuse the open when the final component is a symlink, so a
-        // foothold attacker cannot point a delegate at a file outside
-        // its own session directory.
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-
-    let file = match opts.open(&path) {
-        Ok(f) => f,
+    let mode = ReadMode::InStore { root: session_dir };
+    let bytes = match read_store_file(&path, POINTER_READ_CAP, mode) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(anyhow!(
@@ -117,11 +120,7 @@ pub fn read_pointer(session_dir: &Path) -> Result<Option<LegPointer>> {
         }
     };
 
-    let mut buf = String::new();
-    let mut reader = std::io::BufReader::new(file);
-    use std::io::Read;
-    reader
-        .read_to_string(&mut buf)
+    let buf = String::from_utf8(bytes)
         .with_context(|| format!("failed to read leg pointer {}", path.display()))?;
     let parsed: LegPointer = toml::from_str(&buf)
         .with_context(|| format!("failed to parse leg pointer {}", path.display()))?;

@@ -3617,7 +3617,7 @@ pub fn generate_session_id() -> String {
     use std::io::Read;
 
     let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
+    crate::fs_read::open_plain("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .unwrap_or_default();
 
