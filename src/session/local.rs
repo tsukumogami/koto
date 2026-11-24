@@ -1056,25 +1056,8 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
 }
 
 /// Derive the remote prefix of a workspace that may not exist on this
-/// machine.
-///
-/// `koto session import --from <path>` names the workspace a session was
-/// created in, usually a path on another host. When the path resolves here
-/// this is exactly [`repo_id`]; when it doesn't, the literal path is hashed
-/// the same way, which matches the creating host's `repo_id` whenever the
-/// caller passes the canonical path that host recorded. The path is only
-/// hashed, never opened beyond the canonicalization attempt.
-///
-/// A relative path is refused: it would be resolved against whatever
-/// directory the import happens to run from, not the source host's.
-pub(crate) fn prefix_for_workspace(path: &Path) -> anyhow::Result<String> {
-    if !path.is_absolute() {
-        anyhow::bail!("workspace path must be absolute, got '{}'", path.display());
-    }
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let hash = sha256_hex(resolved.to_string_lossy().as_bytes());
-    Ok(hash[..16].to_string())
-}
+/// machine; defined beside the dashboard's read of a session's import record.
+pub(crate) use koto_session_reader::session::local::prefix_for_workspace;
 
 /// Rename a session's state file inside `dir` from the `from` identity to
 /// the `to` identity.

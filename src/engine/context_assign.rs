@@ -17,9 +17,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::engine::types::{Event, EventPayload};
+use crate::engine::types::Event;
 use crate::session::context::ContextStore;
 use crate::session::context_log::WRITER_TRANSITION;
+
+pub use koto_session_reader::engine::context_assign::*;
 
 /// Write resolved assignments to the store, each with writer `transition`.
 /// Stops at the first failure; the caller reports it, and [`reconcile`]
@@ -36,39 +38,6 @@ pub fn write_assignments(
         store.add_with_writer(session, key, value.as_bytes(), WRITER_TRANSITION)?;
     }
     Ok(())
-}
-
-/// The assignments the store should reflect: every key whose latest writer in
-/// `events` is a `Transitioned` event's assignment, mapped to that value.
-pub fn outstanding_assignments(events: &[Event]) -> BTreeMap<String, String> {
-    let mut latest: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for event in events {
-        match &event.payload {
-            EventPayload::Transitioned {
-                context_assignments: Some(assignments),
-                ..
-            } => {
-                for (key, value) in assignments {
-                    latest.insert(key.clone(), Some(value.clone()));
-                }
-            }
-            EventPayload::ContextAdded { key, .. } | EventPayload::ContextRemoved { key, .. } => {
-                latest.insert(key.clone(), None);
-            }
-            // A `clear_on_entry` clearing removed these keys; it supersedes
-            // an earlier assignment exactly as a `koto context remove` does.
-            EventPayload::ContextCleared { keys, .. } => {
-                for key in keys {
-                    latest.insert(key.clone(), None);
-                }
-            }
-            _ => {}
-        }
-    }
-    latest
-        .into_iter()
-        .filter_map(|(key, value)| value.map(|v| (key, v)))
-        .collect()
 }
 
 /// Bring the store in line with the assignments recorded in `events`,
@@ -100,6 +69,7 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::types::EventPayload;
     use std::collections::HashMap;
     use std::sync::Mutex;
 

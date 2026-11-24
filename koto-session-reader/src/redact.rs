@@ -160,12 +160,14 @@ pub struct RedactedText(String);
 impl RedactedText {
     /// Text koto composed itself -- a timeout, polling or `working_dir` note --
     /// that holds no captured output.
-    pub(crate) fn koto_note(text: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn koto_note(text: impl Into<String>) -> Self {
         RedactedText(text.into())
     }
 
     /// Append koto-written `note` exactly as given.
-    pub(crate) fn push_koto_note(&mut self, note: &str) {
+    #[doc(hidden)]
+    pub fn push_koto_note(&mut self, note: &str) {
         self.0.push_str(note);
     }
 

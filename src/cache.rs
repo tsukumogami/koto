@@ -2,8 +2,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use hex::encode as hex_encode;
-use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
 use crate::template::compile::compile;
@@ -28,12 +26,7 @@ pub(crate) fn cache_dir() -> PathBuf {
         .join("koto")
 }
 
-/// Compute the SHA256 hex digest of a byte slice.
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex_encode(hasher.finalize())
-}
+pub use koto_session_reader::cache::sha256_hex;
 
 /// Core cache logic with an explicit output directory.
 ///

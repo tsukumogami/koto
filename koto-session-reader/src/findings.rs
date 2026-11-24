@@ -609,7 +609,8 @@ pub fn fallback_finding(check: &str, output: Option<&CheckOutput>, sentence: &st
 
 /// Where a level sorts when a list is over its cap: `error`, then
 /// `warning`, then `info`, then any level this koto doesn't know.
-pub(crate) fn level_rank(level: &FindingLevel) -> u8 {
+#[doc(hidden)]
+pub fn level_rank(level: &FindingLevel) -> u8 {
     match level {
         FindingLevel::Error => 0,
         FindingLevel::Warning => 1,
