@@ -187,9 +187,6 @@ impl CloudBackend {
         // the marker may have landed, and `.takeover-<name>` is what keeps
         // the source's copy refusing until a re-run settles it.
         staging.moved = true;
-        // The staged copy holds every context key, so the keys kept for a
-        // re-run of the fetch are no longer needed.
-        self.forget_fetched(req.target);
         if reuse_session_id.is_none() {
             if let Err(e) = self.mark_source(req, source, &session_id, &machine_id) {
                 if let Some(stop) = self.after_failed_mark(e, source, &session_id, &pushed, &owed) {

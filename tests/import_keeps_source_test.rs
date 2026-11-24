@@ -1530,6 +1530,7 @@ fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
     let first = w.import(&w.b, "v2", &w.a, &[]);
     assert_eq!(first.code, Some(1), "{}", first.describe());
     assert!(!w.b.session_dir("v2").exists());
+    assert_eq!(import_dirs(&w.b), vec![".import-fetched-v2".to_string()]);
 
     // Once the bucket answers again, the re-run reads only what the first
     // run couldn't, not every key from the first one.
@@ -1550,6 +1551,7 @@ fn a_failed_context_read_keeps_the_keys_already_fetched_for_a_rerun() {
         let local = std::fs::read(w.b.session_dir("v2").join("ctx").join(name)).unwrap();
         assert_eq!(local, format!("value {i}\n").into_bytes(), "{name}");
     }
+    assert_eq!(import_dirs(&w.b), Vec::<String>::new());
 
     // The first run's refusal says the bucket couldn't be reached, which a
     // retry can clear, apart from a missing or corrupt object.
@@ -1575,4 +1577,23 @@ fn a_context_object_missing_from_the_bucket_is_still_unreadable() {
         r.describe()
     );
     assert!(!w.b.session_dir("v2").exists());
+    // A re-run can't finish this import either, so nothing is kept for one.
+    assert_eq!(import_dirs(&w.b), Vec::<String>::new());
+}
+
+/// The `.import-*` entries in a host's session store: staging directories
+/// and keys kept for a re-run.
+fn import_dirs(host: &Host) -> Vec<String> {
+    let store = host.home.join(".koto").join("sessions");
+    let mut names: Vec<String> = std::fs::read_dir(&store)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".import-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }

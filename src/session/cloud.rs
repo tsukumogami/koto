@@ -2262,20 +2262,13 @@ impl CloudBackend {
     }
 
     /// Where an import into `target` keeps the source's context keys it
-    /// has fetched and checked, so a run that stops partway leaves them
-    /// for the next. Removed once an import into `target` is in place.
-    /// Like a staging directory, no session is named like it.
+    /// has fetched and checked, so a run the bucket stopped partway leaves
+    /// them for the next. Like a staging directory, no session is named
+    /// like it.
     fn fetched_dir(&self, target: &str) -> PathBuf {
         self.local
             .base_dir()
             .join(format!(".import-fetched-{}", target))
-    }
-
-    /// Remove [`CloudBackend::fetched_dir`] once the import it served is
-    /// in place. A failure to remove it costs only disk: a later run checks
-    /// every kept key against its manifest before reusing it.
-    pub(crate) fn forget_fetched(&self, target: &str) {
-        let _ = std::fs::remove_dir_all(self.fetched_dir(target));
     }
 
     /// Fetch an object that may well be absent: list for it, and GET it
@@ -6510,6 +6503,24 @@ impl Drop for Staging {
     }
 }
 
+/// The context keys an import has fetched and checked, kept in
+/// `.import-fetched-<target>` while it runs. Removed when dropped unless
+/// `for_rerun` says the bucket couldn't be reached, so a refusal a re-run
+/// can't finish leaves nothing behind. A failure to remove them costs only
+/// disk: a later run checks every kept key against its manifest first.
+struct KeptFetches {
+    dir: PathBuf,
+    for_rerun: bool,
+}
+
+impl Drop for KeptFetches {
+    fn drop(&mut self) {
+        if !self.for_rerun {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 /// Create the directory `path`, mode 0700, failing when anything is
 /// already there: not recursive, so the directory is the caller's alone.
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -6692,7 +6703,6 @@ impl CloudBackend {
                         .inspect_err(|_| self.take_back_backref(&owed))?;
                     self.move_into_place(req.target, &mut staging, &pushed)
                         .inspect_err(|_| self.take_back_backref(&owed))?;
-                    self.forget_fetched(req.target);
                     // The session is in place: journal it as a new run, with
                     // the state its carried log leaves it in. This comes
                     // before the marker, since a marker failure leaves the
@@ -7273,6 +7283,14 @@ impl CloudBackend {
         if !fetched_dir.is_dir() {
             create_private_dir(&fetched_dir).map_err(|e| write_failed(&fetched_dir, &e))?;
         }
+        // The kept keys outlive this call only when the bucket couldn't be
+        // reached, the one refusal a re-run can finish. Any other way out
+        // removes them: a missing or corrupt object refuses the re-run too,
+        // and once every key is copied into staging they aren't needed.
+        let mut kept = KeptFetches {
+            dir: fetched_dir.clone(),
+            for_rerun: false,
+        };
         let matches = |bytes: &[u8], size: u64, hash: &str| {
             bytes.len() as u64 == size && crate::cache::sha256_hex(bytes) == hash
         };
@@ -7325,6 +7343,7 @@ impl CloudBackend {
             }
             if let Some(mut err) = failure {
                 if err.code == SourceUnreachable {
+                    kept.for_rerun = true;
                     err.message.push_str(&format!(
                         "; {} of {} context keys are kept for a re-run, which fetches only the rest",
                         held, total
@@ -7338,6 +7357,7 @@ impl CloudBackend {
             let bytes = std::fs::read(&from).map_err(|e| write_failed(&from, &e))?;
             keep(&ctx_dir.join(key), &bytes)?;
         }
+        drop(kept);
         // The source's pin and release record, as the bucket holds them,
         // carried verbatim, an unreadable pin included (R25). They stay out
         // of the copy's manifest, as on every cloud copy (R20a), and
