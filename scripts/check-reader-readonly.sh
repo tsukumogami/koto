@@ -110,9 +110,10 @@ OPEN_PLAIN_CALLERS=(
   engine/types.rs:generate_session_id
   dashboard.rs:read_detail
 )
-# Names dashboard.rs and source.rs may not use. Empty in the first phase;
-# the log readers join it once the scan reads through read_store_file.
-SCAN_FORBIDDEN=()
+# Names dashboard.rs and source.rs may not use. Phase 4: the scan reads
+# every state log through read_store_file and lists through the hardened
+# first-line read, so koto's plain log readers are out of both files.
+SCAN_FORBIDDEN=(read_events read_header read_header_only read_log)
 
 # --locked for a real run; the self-test swaps in --offline so a planted
 # dependency can update the copy's lock file from the local cache.
@@ -665,6 +666,8 @@ self_test() {
     append "$S/fs_read.rs" $'fn planted(p: &Path) -> io::Result<File> {\n    open_plain(p)\n}'
   expect_fail "a fourth public read in fs_read.rs" "fs_read.rs offers public functions besides" \
     append "$S/fs_read.rs" 'pub fn planted() {}'
+  expect_fail "a plain log reader in the dashboard scan" "which the dashboard scan may not use in this phase" \
+    append "$S/dashboard.rs" $'fn planted(p: &Path) {\n    let _ = crate::engine::persistence::read_events(p);\n}'
 
   if [ "$missed" -ne 0 ]; then
     echo "FAIL: self-test: a planted violation was not caught"
