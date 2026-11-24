@@ -125,13 +125,11 @@ The three baseline worker runs for the cost check (AC7) are not this outline's w
 
 **Files**: `plugins/koto-skills/hooks/session-start.sh`
 
-### Gate: koto-release-installed
+**Release gate `koto-release-installed` (met)**
 
-**After**: Issue 1, Issue 2, Issue 3
+The gate sat after Issues 1 to 3 and before Issue 4. Its condition was that a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and that, before that install, three baseline runs of one worker task were taken there on the earlier koto, with each run's count of agent koto calls and the input plus output tokens those calls spent kept for Issue 5's comparison (AC7).
 
-**Before**: Issue 4
-
-**Condition**: a koto release carrying Issues 1 to 3 is installed on the reference host with its koto-skills plugin, and, before that install, three baseline runs of one worker task were taken there on the earlier koto, with each run's count of agent koto calls and the input plus output tokens those calls spent kept for Issue 5's comparison (AC7).
+It is met. Issues 1 to 3 merged in #715 and ship in koto v0.38.0, which is installed on both hosts with its koto-skills plugin. The three baseline runs were taken on koto 0.37.2 and are recorded on #716. The gate stays here as a record rather than as a node, so Issue 4 no longer waits on it.
 
 ### Issue 4: feat(coordinate): drop the manual dispatcher link step from worker briefs
 
@@ -139,7 +137,7 @@ The three baseline worker runs for the cost check (AC7) are not this outline's w
 
 **Group**: brief
 
-**Goal**: the brief the coordinator renders for a dispatched worker no longer tells the agent to record its dispatcher. This outline waits on the `koto-release-installed` gate above even though it depends on no other outline: it does not merge until a koto release carrying Issues 1 to 3 is installed on the reference host, or dispatched workers would get no link while the old koto is still there.
+**Goal**: the brief the coordinator renders for a dispatched worker no longer tells the agent to record its dispatcher. This outline waited on the `koto-release-installed` gate above even though it depends on no other outline, so it would not merge before a koto release carrying Issues 1 to 3 was installed on the reference host; dispatched workers would otherwise get no link while the old koto was still there. That gate is met.
 
 **Acceptance Criteria**:
 - [ ] The brief template and its renderer emit no link step, and the golden briefs drop it (AC8, golden half).
