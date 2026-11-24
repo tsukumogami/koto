@@ -1,6 +1,7 @@
 # Every path koto keeps for itself is built from the koto root, which
-# `KOTO_HOME` can move. `src/koto_home.rs` is the one place allowed to ask
-# for the home directory; a path built from it anywhere else would ignore
+# `KOTO_HOME` can move. `koto-session-reader/src/koto_root.rs` is the one
+# place allowed to ask for the home directory (`src/koto_home.rs` calls it);
+# a path built from it anywhere else would ignore
 # `KOTO_HOME` and reach the real `~/.koto`. The lint can't see a read of the
 # `HOME` variable itself (`std::env::var_os("HOME")`): don't build a koto
 # path that way either.

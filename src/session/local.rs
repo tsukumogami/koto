@@ -48,8 +48,16 @@ impl LocalBackend {
     /// Sessions from the old per-repo layout (`~/.koto/sessions/<repo-id>/`)
     /// are migrated to the flat layout on first use.
     pub fn new() -> anyhow::Result<Self> {
-        let koto_home = crate::koto_home::koto_home_or_err()?;
-        let base_dir = koto_home.join("sessions");
+        use koto_session_reader::source::{locate_sessions_dir, BackendKind, SessionsDir};
+        // The root's own sessions directory, which the cloud backend's local
+        // mirror also uses, so `KOTO_SESSIONS_BASE` doesn't move it.
+        let SessionsDir::UnderRoot {
+            root: koto_home,
+            dir: base_dir,
+        } = locate_sessions_dir(Some(BackendKind::Cloud))?
+        else {
+            anyhow::bail!("the cloud backend's sessions directory is always under the koto root");
+        };
         migrate_if_needed(&base_dir);
         Ok(Self {
             base_dir,

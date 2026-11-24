@@ -1098,6 +1098,7 @@ version = "0.40.1-dev"
 dependencies = [
  "aho-corasick",
  "anyhow",
+ "dirs",
  "hex",
  "libc",
  "regex",
