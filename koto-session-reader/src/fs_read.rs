@@ -19,6 +19,22 @@
 //! The two hardened reads share one open, so the open flags, the regular
 //! file check, the length check and the containment recheck are written
 //! once.
+//!
+//! # How a hardened read refuses
+//!
+//! Every refusal is an `io::Error`, and callers sort them into categories
+//! by these rules alone:
+//!
+//! - A final-component symlink in [`ReadMode::InStore`] is the OS's own
+//!   `O_NOFOLLOW` error, `raw_os_error() == Some(ELOOP)`.
+//! - A FIFO, device or directory is `ErrorKind::InvalidInput`, built here.
+//! - A file over the cap, at the `fstat` or after the read, is
+//!   `ErrorKind::InvalidData`, built here.
+//! - A path that resolves outside the store is `ErrorKind::PermissionDenied`
+//!   built here, so it has no raw OS error. That is what tells it from the
+//!   OS refusing the open (`EACCES`, `EPERM`), which is also
+//!   `PermissionDenied` but always carries its `raw_os_error()`.
+//! - Anything else is the OS's error as it came, `NotFound` included.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -73,7 +89,8 @@ pub fn open_plain<P: AsRef<Path>>(path: P) -> io::Result<File> {
 /// the canonicalized `root`.
 ///
 /// Every refusal is an `io::Error`; a missing file keeps its `NotFound`
-/// kind so a caller can treat it as absent.
+/// kind so a caller can treat it as absent. The module docs list the kind
+/// each refusal uses.
 pub fn read_store_file(path: &Path, cap: u64, mode: ReadMode<'_>) -> io::Result<Vec<u8>> {
     let file = open_store_file(path, cap, mode)?;
     let mut buf = Vec::new();
@@ -127,6 +144,8 @@ fn open_store_file(path: &Path, cap: u64, mode: ReadMode<'_>) -> io::Result<File
         let resolved = std::fs::canonicalize(path)?;
         let root = std::fs::canonicalize(root)?;
         if !resolved.starts_with(&root) {
+            // Built, not from the OS: no raw OS error, which is how a
+            // caller tells this from an OS permission error.
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(

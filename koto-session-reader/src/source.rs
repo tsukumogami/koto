@@ -252,15 +252,27 @@ fn parse_layout_marker(bytes: &[u8]) -> Result<u64, &'static str> {
         .ok_or("not a layout number")
 }
 
+/// Whether a hardened read's error is its own refusal of a path that
+/// resolves outside the store. `fs_read` builds that refusal as
+/// `PermissionDenied` with no raw OS error; the OS refusing the open
+/// (`EACCES`, `EPERM`) is `PermissionDenied` too, but carries its code.
+fn is_outside_store(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied && err.raw_os_error().is_none()
+}
+
 /// The category a refused marker read falls in.
 fn marker_read_category(err: &std::io::Error) -> &'static str {
     #[cfg(unix)]
     if err.raw_os_error() == Some(libc::ELOOP) {
         return "a symlink";
     }
+    if is_outside_store(err) {
+        return "resolves outside the sessions directory";
+    }
     match err.kind() {
         std::io::ErrorKind::InvalidInput => "not a regular file",
         std::io::ErrorKind::InvalidData => "larger than 64 bytes",
+        std::io::ErrorKind::PermissionDenied => "not readable: permission denied",
         _ => "unreadable",
     }
 }
@@ -497,6 +509,9 @@ pub enum SessionReadCategory {
     TooLarge,
     /// The state log's path resolves outside the sessions directory.
     OutsideStore,
+    /// The OS refused to open the state log: its mode, or a directory's on
+    /// the way to it, doesn't let this process read it.
+    PermissionDenied,
     /// The state log couldn't be read for another reason.
     Unreadable,
     /// The state log doesn't parse.
@@ -520,6 +535,7 @@ impl fmt::Display for SessionReadCategory {
             Self::NotRegular => f.write_str("state log is not a regular file"),
             Self::TooLarge => f.write_str("state log is larger than 512 MiB"),
             Self::OutsideStore => f.write_str("state log resolves outside the sessions directory"),
+            Self::PermissionDenied => f.write_str("state log is not readable: permission denied"),
             Self::Unreadable => f.write_str("state log is unreadable"),
             Self::Malformed => f.write_str("state log is malformed"),
             Self::NewerSchema { found, supported } => write!(
@@ -536,11 +552,14 @@ fn log_read_category(err: &std::io::Error) -> SessionReadCategory {
     if err.raw_os_error() == Some(libc::ELOOP) {
         return SessionReadCategory::Symlink;
     }
+    if is_outside_store(err) {
+        return SessionReadCategory::OutsideStore;
+    }
     match err.kind() {
         std::io::ErrorKind::NotFound => SessionReadCategory::NotFound,
         std::io::ErrorKind::InvalidInput => SessionReadCategory::NotRegular,
         std::io::ErrorKind::InvalidData => SessionReadCategory::TooLarge,
-        std::io::ErrorKind::PermissionDenied => SessionReadCategory::OutsideStore,
+        std::io::ErrorKind::PermissionDenied => SessionReadCategory::PermissionDenied,
         _ => SessionReadCategory::Unreadable,
     }
 }
@@ -672,12 +691,13 @@ fn context_read_category(err: &std::io::Error) -> &'static str {
     if err.raw_os_error() == Some(libc::ELOOP) {
         return "context value path holds a symlink";
     }
+    if is_outside_store(err) {
+        return "context value resolves outside the session's context directory";
+    }
     match err.kind() {
         std::io::ErrorKind::InvalidInput => "context value is not a regular file",
         std::io::ErrorKind::InvalidData => "context value is larger than 16 MiB",
-        std::io::ErrorKind::PermissionDenied => {
-            "context value resolves outside the session's context directory"
-        }
+        std::io::ErrorKind::PermissionDenied => "context value is not readable: permission denied",
         _ => "context value is unreadable",
     }
 }
@@ -991,8 +1011,80 @@ mod tests {
         let category = |kind| marker_read_category(&Error::new(kind, "ZQX-PLANTED"));
         assert_eq!(category(ErrorKind::InvalidInput), "not a regular file");
         assert_eq!(category(ErrorKind::InvalidData), "larger than 64 bytes");
-        assert_eq!(category(ErrorKind::PermissionDenied), "unreadable");
+        assert_eq!(
+            category(ErrorKind::PermissionDenied),
+            "resolves outside the sessions directory"
+        );
         assert_eq!(category(ErrorKind::Other), "unreadable");
+        #[cfg(unix)]
+        for code in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                marker_read_category(&Error::from_raw_os_error(code)),
+                "not readable: permission denied"
+            );
+        }
+    }
+
+    #[test]
+    fn a_permission_error_is_told_from_a_containment_refusal() {
+        use std::io::{Error, ErrorKind};
+        // fs_read's containment refusal: built, so no raw OS error.
+        let outside = Error::new(ErrorKind::PermissionDenied, "ZQX-PLANTED outside");
+        assert!(is_outside_store(&outside));
+        assert!(!is_outside_store(&Error::other("x")));
+        // The refusal read_store_file really gives: the crate's manifest
+        // read with its src/ directory as the store.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let refused = read_store_file(
+            &crate_dir.join("Cargo.toml"),
+            1 << 20,
+            ReadMode::InStore {
+                root: &crate_dir.join("src"),
+            },
+        )
+        .unwrap_err();
+        assert!(is_outside_store(&refused), "{refused:?}");
+        assert_eq!(
+            log_read_category(&refused),
+            SessionReadCategory::OutsideStore
+        );
+        #[cfg(unix)]
+        for code in [libc::EACCES, libc::EPERM] {
+            let os = Error::from_raw_os_error(code);
+            assert_eq!(os.kind(), ErrorKind::PermissionDenied);
+            assert!(!is_outside_store(&os), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_refused_context_read_falls_in_a_fixed_category() {
+        use std::io::{Error, ErrorKind};
+        #[cfg(unix)]
+        assert_eq!(
+            context_read_category(&Error::from_raw_os_error(libc::ELOOP)),
+            "context value path holds a symlink"
+        );
+        let category = |kind| context_read_category(&Error::new(kind, "ZQX-PLANTED"));
+        assert_eq!(
+            category(ErrorKind::InvalidInput),
+            "context value is not a regular file"
+        );
+        assert_eq!(
+            category(ErrorKind::InvalidData),
+            "context value is larger than 16 MiB"
+        );
+        assert_eq!(
+            category(ErrorKind::PermissionDenied),
+            "context value resolves outside the session's context directory"
+        );
+        assert_eq!(category(ErrorKind::Other), "context value is unreadable");
+        #[cfg(unix)]
+        for code in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                context_read_category(&Error::from_raw_os_error(code)),
+                "context value is not readable: permission denied"
+            );
+        }
     }
 
     #[test]
@@ -1095,6 +1187,17 @@ mod tests {
             SessionReadCategory::OutsideStore
         );
         assert_eq!(category(ErrorKind::Other), SessionReadCategory::Unreadable);
+        #[cfg(unix)]
+        for code in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                log_read_category(&Error::from_raw_os_error(code)),
+                SessionReadCategory::PermissionDenied
+            );
+        }
+        assert_eq!(
+            SessionReadCategory::PermissionDenied.to_string(),
+            "state log is not readable: permission denied"
+        );
     }
 
     #[test]

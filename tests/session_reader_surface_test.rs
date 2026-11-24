@@ -461,6 +461,46 @@ fn read_session_events_refuses_what_is_not_a_regular_log_inside_the_store() {
     );
 }
 
+/// A file whose mode lets nobody but root read it: a refusal from the OS,
+/// which must read as permission denied, never as a path outside the store.
+#[test]
+fn an_unreadable_mode_reads_as_permission_denied_not_outside_the_store() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root reads a file whatever its mode");
+        return;
+    }
+    let store = KotoStore::build();
+    let events = store.events();
+    let chmod = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+
+    let value = store.ctx().join(PLAIN_KEY);
+    chmod(&value, 0o000);
+    let read = store.read(PLAIN_KEY, Some(&events));
+    chmod(&value, 0o600);
+    assert_unreadable(
+        &read,
+        "context value is not readable: permission denied",
+        &value,
+    );
+
+    let log = store.log();
+    chmod(&log, 0o000);
+    let err = read_session_events(&store.source(), SESSION).unwrap_err();
+    chmod(&log, 0o600);
+    assert_eq!(err.category, SessionReadCategory::PermissionDenied);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "state log is not readable: permission denied: {}",
+            log.display()
+        )
+    );
+}
+
 #[test]
 fn unusable_keys_are_refused() {
     let store = KotoStore::build();
