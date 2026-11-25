@@ -21,6 +21,8 @@ aho-corasick = "1.1"
 toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
+# The home directory, for the koto root rule in src/koto_root.rs.
+dirs = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

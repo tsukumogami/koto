@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 
 use crate::engine::persistence::{
-    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, read_events,
-    read_header,
+    derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, parse_header_bytes,
+    parse_state_log_at,
 };
 use crate::engine::types::parse_timestamp_to_systemtime;
 use crate::engine::types::StateFileHeader;
+use crate::fs_read::{read_store_file, ReadMode};
 use crate::session::row::{derive_row, latest_import};
 use crate::session::state_file_name;
 use crate::source;
@@ -385,7 +386,11 @@ pub struct DetailData {
 ///
 /// Returns a list of `(session_name, state_file_path)` pairs for sessions
 /// whose names do not contain `~` (epoch-branched session indicator).
+///
+/// Fails first with the store's [`source::LayoutError`], as the outer
+/// error, when its layout marker names a layout this reader doesn't read.
 pub fn scan_sessions(source: &dyn source::SessionSource) -> Result<Vec<(String, PathBuf)>> {
+    source::check_layout(source.sessions_dir())?;
     let session_list = source.list()?;
     let mut result = Vec::new();
     for info in session_list {
@@ -460,6 +465,32 @@ pub fn stat_and_diff<F>(tree: &SessionTree<F>, session_paths: &[(String, PathBuf
     }
 }
 
+/// The store root a state file at `path` must stay inside: by the layout
+/// rule a state file is `<sessions dir>/<id>/koto-<id>.state.jsonl`, so the
+/// root is its directory's parent. Every path the scan passes is built that
+/// way under the source's sessions directory, so this is the source's own
+/// root; a symlinked session directory still resolves outside it.
+fn store_root(path: &Path) -> &Path {
+    path.parent()
+        .and_then(Path::parent)
+        .filter(|root| !root.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// The state log at `path`, read whole through the hardened read: capped at
+/// [`source::STATE_LOG_READ_CAP`], never blocking on a FIFO, refusing a
+/// symlink and a path outside the store. `None` when refused.
+fn read_state_log(path: &Path) -> Option<Vec<u8>> {
+    read_store_file(
+        path,
+        source::STATE_LOG_READ_CAP,
+        ReadMode::InStore {
+            root: store_root(path),
+        },
+    )
+    .ok()
+}
+
 /// Read a session from disk and return a `CachedSession`.
 ///
 /// On any parse error, returns a `CachedSession` with `current_state = None`
@@ -481,8 +512,12 @@ pub fn read_session(path: &Path) -> CachedSession {
         .flatten()
         .is_some();
 
+    // Read the log once, through the hardened read. A refused read leaves
+    // no bytes, which no header parses: the unreadable row below.
+    let log = read_state_log(path).unwrap_or_default();
+
     // Try to read the header alone for the fallback case.
-    let fallback_header = match read_header(path) {
+    let fallback_header = match parse_header_bytes(&log) {
         Ok(h) => h,
         Err(_) => {
             return CachedSession {
@@ -508,7 +543,7 @@ pub fn read_session(path: &Path) -> CachedSession {
     };
 
     // Try to read events.
-    let (header, events) = match read_events(path) {
+    let (header, events) = match parse_state_log_at(&log, path) {
         Ok(pair) => pair,
         Err(_) => {
             let intent = fallback_header.intent.clone();
@@ -803,7 +838,7 @@ pub fn refresh_scan<F>(
 /// gate evaluation in the current epoch, returns `Some(DetailData)` with
 /// `gate_name` and `result` set to `None` and `elapsed` set to `Duration::ZERO`.
 pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
-    let (header, events) = read_events(path).ok()?;
+    let (header, events) = parse_state_log_at(&read_state_log(path)?, path).ok()?;
 
     // Find the current state (optional — no short-circuit).
     let current_state = derive_state_from_log(&events);

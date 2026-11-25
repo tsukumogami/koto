@@ -987,17 +987,15 @@ pub fn handle_needed(path: &str) -> Result<()> {
 /// `build_backend` resolves it, without building the backend, and the
 /// cloud configuration when the backend is the cloud one.
 pub(super) fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
+    use koto_session_reader::source::{sessions_dir, BackendKind};
     let config = crate::config::resolve::load_config()?;
     crate::config::session_env::check(&config)?;
-    let koto_sessions = || -> Result<std::path::PathBuf> {
-        Ok(crate::koto_home::koto_home_or_err()?.join("sessions"))
-    };
     match config.session.backend.as_str() {
-        "cloud" => Ok((koto_sessions()?, Some(config.session.cloud.clone()))),
-        "local" => match std::env::var("KOTO_SESSIONS_BASE") {
-            Ok(base) => Ok((std::path::PathBuf::from(base), None)),
-            Err(_) => Ok((koto_sessions()?, None)),
-        },
+        "cloud" => Ok((
+            sessions_dir(Some(BackendKind::Cloud))?,
+            Some(config.session.cloud.clone()),
+        )),
+        "local" => Ok((sessions_dir(Some(BackendKind::Local))?, None)),
         other => anyhow::bail!("unknown backend: {other}"),
     }
 }

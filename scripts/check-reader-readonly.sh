@@ -7,7 +7,11 @@
 #  2. No file under the crate's src/ carries an allow, expect or cfg_attr
 #     attribute naming those two lints (or their old singular names),
 #     clippy::all, clippy::style or warnings, and none carries
-#     cfg(not(clippy)), outside the sanctioned site: src/fs_read.rs.
+#     cfg(not(clippy)), outside the two sanctioned sites: src/fs_read.rs and
+#     src/koto_root.rs. koto_root.rs holds exactly one such attribute,
+#     #[allow(clippy::disallowed_methods)], on the line before its one
+#     home-directory lookup, `let home = dirs::home_dir();`, and names
+#     home_dir nowhere else.
 #  3. custom_flags appears exactly once, in fs_read.rs, passed
 #     mode_flags(&mode), whose arms return only IN_STORE_OPEN_FLAGS and
 #     TEMPLATE_OPEN_FLAGS, defined once each as exactly
@@ -20,7 +24,8 @@
 #  7. Every normal and build dependency of the crate, direct or not, comes
 #     from the crates.io registry according to cargo metadata.
 #  8. open_plain is defined once in fs_read.rs, which offers no other public
-#     function besides read_store_file, and is called only as
+#     function besides read_store_file and read_store_first_line (the two
+#     hardened reads, which share one private open), and is called only as
 #     crate::fs_read::open_plain(...) from the functions OPEN_PLAIN_CALLERS
 #     lists; dashboard.rs and source.rs name nothing in SCAN_FORBIDDEN.
 #  9. `cargo tree --depth 1 -e normal,build` lists no direct dependency
@@ -49,7 +54,11 @@ FORBID_ATTR='#![forbid(unsafe_code)]'
 DENY_ATTR='#![deny(clippy::disallowed_methods, clippy::disallowed_types)]'
 
 # Files under the crate's src/ allowed to carry the lint allows.
-SANCTIONED_ALLOW_FILES=("fs_read.rs")
+SANCTIONED_ALLOW_FILES=("fs_read.rs" "koto_root.rs")
+
+# The one allow koto_root.rs may carry, and the one call it covers.
+ROOT_ALLOW_ATTR='#[allow(clippy::disallowed_methods)]'
+ROOT_HOME_CALL='let home = dirs::home_dir();'
 
 # The flag constants' definitions and the one custom_flags call.
 IN_STORE_DEF='pub const IN_STORE_OPEN_FLAGS: libc::c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK;'
@@ -101,9 +110,10 @@ OPEN_PLAIN_CALLERS=(
   engine/types.rs:generate_session_id
   dashboard.rs:read_detail
 )
-# Names dashboard.rs and source.rs may not use. Empty in the first phase;
-# the log readers join it once the scan reads through read_store_file.
-SCAN_FORBIDDEN=()
+# Names dashboard.rs and source.rs may not use. Phase 4: the scan reads
+# every state log through read_store_file and lists through the hardened
+# first-line read, so koto's plain log readers are out of both files.
+SCAN_FORBIDDEN=(read_events read_header read_header_only read_log)
 
 # --locked for a real run; the self-test swaps in --offline so a planted
 # dependency can update the copy's lock file from the local cache.
@@ -253,7 +263,38 @@ check() {
       bad=1
     fi
   done < <(find "$src" -name '*.rs' -type f | sort)
-  [ "$bad" -eq 0 ] && pass "no lint allow, expect, cfg_attr or cfg(not(clippy)) outside fs_read.rs"
+  [ "$bad" -eq 0 ] && pass "no lint allow, expect, cfg_attr or cfg(not(clippy)) outside fs_read.rs and koto_root.rs"
+
+  # koto_root.rs: one allow, on the one home-directory lookup.
+  bad=0
+  local root_file="$src/koto_root.rs" root_attrs n_attrs home_lines n_home home_text
+  if [ ! -f "$root_file" ]; then
+    fail "src/koto_root.rs is missing"
+    bad=1
+  else
+    root_attrs="$(
+      attributes "$root_file" | grep -E '^[0-9]+: #!?\[(allow|expect|cfg_attr)\('
+      attributes "$root_file" | grep -F 'not(clippy)'
+    )" || true
+    n_attrs="$(printf '%s\n' "$root_attrs" | grep -c . || true)"
+    home_lines="$(strip_comments "$root_file" | grep -nE '(^|[^A-Za-z0-9_])home_dir([^A-Za-z0-9_]|$)' || true)"
+    n_home="$(printf '%s\n' "$home_lines" | grep -c . || true)"
+    home_text="$(printf '%s\n' "${home_lines#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    if [ "$n_attrs" -ne 1 ] || [ "${root_attrs#*: }" != "$ROOT_ALLOW_ATTR" ]; then
+      fail "src/koto_root.rs must hold exactly one lint attribute, $ROOT_ALLOW_ATTR, found $n_attrs:"
+      [ -n "$root_attrs" ] && printf '%s\n' "$root_attrs"
+      bad=1
+    elif [ "$n_home" -ne 1 ] || [ "$home_text" != "$ROOT_HOME_CALL" ]; then
+      fail "src/koto_root.rs must make one home-directory lookup, exactly '$ROOT_HOME_CALL', found $n_home:"
+      [ -n "$home_lines" ] && printf '%s\n' "$home_lines"
+      bad=1
+    elif [ "${home_lines%%:*}" -ne $((${root_attrs%%:*} + 1)) ] \
+      || [ "$(strip_comments "$root_file" | sed -n "${root_attrs%%:*}p" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')" != "$ROOT_ALLOW_ATTR" ]; then
+      fail "src/koto_root.rs's allow (line ${root_attrs%%:*}) is not on the line before its home-directory lookup (line ${home_lines%%:*})"
+      bad=1
+    fi
+  fi
+  [ "$bad" -eq 0 ] && pass "koto_root.rs carries one allow, on its one home-directory lookup"
 
   # --- 3. the one custom_flags call and its constants ---------------------
   bad=0
@@ -394,9 +435,9 @@ check() {
   local pubs
   pubs="$(strip_comments "$src/fs_read.rs" \
     | sed -nE 's/^[[:space:]]*pub(\([^)]*\))?[[:space:]]+fn[[:space:]]+([A-Za-z0-9_]+).*/\2/p' \
-    | grep -vxE 'open_plain|read_store_file' || true)"
+    | grep -vxE 'open_plain|read_store_file|read_store_first_line' || true)"
   if [ -n "$pubs" ]; then
-    fail "fs_read.rs offers public functions besides open_plain and read_store_file: $(echo "$pubs" | tr '\n' ' ')"
+    fail "fs_read.rs offers public functions besides open_plain, read_store_file and read_store_first_line: $(echo "$pubs" | tr '\n' ' ')"
     bad=1
   fi
   local site lineno fname text
@@ -557,6 +598,22 @@ self_test() {
     append "$S/source.rs" $'#[allow(clippy::disallowed_method)]\nfn planted() {}'
   expect_fail "a cfg(not(clippy)) item" "lowers or hides the write ban" \
     append "$S/source.rs" $'#[cfg(not(clippy))]\nfn planted() {}'
+  expect_fail "an allow in a nested file named koto_root.rs" "src/session/koto_root.rs:1 lowers or hides the write ban" \
+    append "$S/session/koto_root.rs" $'#[allow(clippy::disallowed_methods)]\nfn planted() {}'
+  expect_fail "a second allow in koto_root.rs" "src/koto_root.rs must hold exactly one lint attribute" \
+    append "$S/koto_root.rs" $'#[allow(clippy::disallowed_methods)]\nfn planted() {\n    let _ = std::fs::write("x", "");\n}'
+  expect_fail "a cfg(not(clippy)) item in koto_root.rs" "src/koto_root.rs must hold exactly one lint attribute" \
+    append "$S/koto_root.rs" $'#[cfg(not(clippy))]\nfn planted() {}'
+  expect_fail "a second home-directory lookup in koto_root.rs" "src/koto_root.rs must make one home-directory lookup" \
+    append "$S/koto_root.rs" $'fn planted() -> Option<PathBuf> {\n    dirs::home_dir()\n}'
+
+  # shellcheck disable=SC2329 # invoked through expect_fail
+  plant_fn_wide_root_allow() {
+    edit "$S/koto_root.rs" '/^[[:space:]]+#\[allow\(clippy::disallowed_methods\)\]$/d'
+    edit "$S/koto_root.rs" 's/^pub fn koto_root\(\)/#[allow(clippy::disallowed_methods)] pub fn koto_root()/'
+  }
+  expect_fail "koto_root.rs's allow moved onto the whole function" "is not on the line before its home-directory lookup" \
+    plant_fn_wide_root_allow
   expect_fail "a second custom_flags call" "custom_flags appears 2 times" \
     append "$S/source.rs" $'fn planted(o: &mut std::fs::OpenOptions) {\n    std::os::unix::fs::OpenOptionsExt::custom_flags(o, 0);\n}'
   expect_fail "custom_flags passed a raw flag" "the custom_flags call reads" \
@@ -607,8 +664,10 @@ self_test() {
     append "$S/dashboard.rs" 'use crate::fs_read::open_plain as planted;'
   expect_fail "a wrapper around open_plain in fs_read.rs" "fs_read.rs must name open_plain only in its definition" \
     append "$S/fs_read.rs" $'fn planted(p: &Path) -> io::Result<File> {\n    open_plain(p)\n}'
-  expect_fail "a third public read in fs_read.rs" "fs_read.rs offers public functions besides" \
+  expect_fail "a fourth public read in fs_read.rs" "fs_read.rs offers public functions besides" \
     append "$S/fs_read.rs" 'pub fn planted() {}'
+  expect_fail "a plain log reader in the dashboard scan" "which the dashboard scan may not use in this phase" \
+    append "$S/dashboard.rs" $'fn planted(p: &Path) {\n    let _ = crate::engine::persistence::read_events(p);\n}'
 
   if [ "$missed" -ne 0 ]; then
     echo "FAIL: self-test: a planted violation was not caught"

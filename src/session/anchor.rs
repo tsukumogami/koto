@@ -71,7 +71,7 @@ pub const CLOSED_SUFFIX: &str = "-closed";
 /// directory. No session name can start with a dot, so listing, prune and
 /// every other walk of the store already pass these by; [`sweep_staging`]
 /// removes a leftover one once it is older than [`STAGING_SWEEP_AGE`].
-pub const STAGING_PREFIX: &str = ".koto-staging-";
+pub use koto_session_reader::source::STAGING_PREFIX;
 
 /// How old a staging entry must be before a close sweeps it. A fresher one
 /// may be a close still in progress.

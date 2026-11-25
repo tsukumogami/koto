@@ -135,6 +135,42 @@ have no cleanup verb at all, and so is the decider ledger. The four
 derived files described further down are safe to delete; nothing else
 here is.
 
+### What programs outside koto may read
+
+Programs other than koto read the sessions directory through the
+`koto-session-reader` crate. The "Session store read surface" section of
+`docs/STABILITY.md` promises what that reader reads: each session's
+directory and state log, its `ctx/<key>` values, its `request-leg.toml`
+pointer, the template its log names, the four events that set a context
+key, and the layout marker. Nothing else in the sessions directory is
+promised.
+
+The layout marker is `<sessions dir>/.koto-store-layout`. It names the
+store's layout as a number, in at most 64 bytes of ASCII digits. A
+missing marker means layout 1, and nothing writes one yet: the first koto
+to write it will be the migration of a breaking layout change, released
+after a crate release that reads both layouts. A reader, `koto dashboard`
+included, refuses a store whose marker names a layout above its own, or
+a marker it can't read as a number, with an error naming the marker's
+path. Don't create the file by hand, since any number above 1 makes every
+current reader refuse the store. Don't delete one a future koto wrote
+either: an older reader would then read the newer layout as layout 1.
+
+These files sit beside the promised ones, and their names and shapes can
+change in any release:
+
+- the context manifest, `<session dir>/ctx/manifest.json`, koto's own
+  index of a session's values;
+- lock files: `<session dir>/ctx/manifest.lock`,
+  `<session dir>/claim.lock` and any other lock koto takes;
+- the run journal: `<session dir>/run-journal.json` and the root's
+  `_run_journal.jsonl`, whose own reader rules are in
+  `docs/reference/run-journal.md`;
+- the read spool, `<session dir>/context-reads.jsonl`, one line per
+  `koto context get` or `koto context exists` read made outside the
+  session's own tick, kept on this host;
+- finished records, `<sessions dir>/.finished/<name>.json`.
+
 ## Authoritative state: `~/.koto/requests/`
 
 `koto request create` mints an opaque lowercase identifier and writes

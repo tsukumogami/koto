@@ -1681,9 +1681,10 @@ fn build_backend() -> Result<Backend> {
 }
 
 /// What `koto session dir --json` prints: the koto root, the backend the
-/// config resolved and where that came from, the bucket for the cloud
-/// backend, and the setting `KOTO_HOME` ignored, if any. Built from the
-/// loaded config alone: no backend, no request, nothing written.
+/// config resolved and where that came from, the sessions directory that
+/// backend keeps on this host, the bucket for the cloud backend, and the
+/// setting `KOTO_HOME` ignored, if any. Built from the loaded config and the
+/// environment alone: no backend, no request, nothing opened or written.
 fn session_dir_report(
     root: &std::path::Path,
     config: &crate::config::KotoConfig,
@@ -1700,6 +1701,15 @@ fn session_dir_report(
         "backend": config.session.backend,
         "backend_source": source,
     });
+    // The same rule koto's backends and a program reading the store use.
+    let kind = if config.session.backend == "cloud" {
+        koto_session_reader::source::BackendKind::Cloud
+    } else {
+        koto_session_reader::source::BackendKind::Local
+    };
+    if let Ok(sessions) = koto_session_reader::source::sessions_dir(Some(kind)) {
+        out["sessions"] = serde_json::json!(sessions.display().to_string());
+    }
     if config.session.backend == "cloud" {
         out["bucket"] = serde_json::json!(config.session.cloud.bucket);
     }
@@ -1751,10 +1761,10 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 /// `KOTO_SESSIONS_BASE` redirected journals inside that base, so it never
 /// writes the real home's journal (see `crate::run_journal`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
-    if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
-        Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
-    } else {
-        LocalBackend::new()
+    use koto_session_reader::source::{locate_sessions_dir, BackendKind, SessionsDir};
+    match locate_sessions_dir(Some(BackendKind::Local))? {
+        SessionsDir::SessionsBase(base) => Ok(LocalBackend::with_base_dir(base)),
+        SessionsDir::UnderRoot { .. } => LocalBackend::new(),
     }
 }
 

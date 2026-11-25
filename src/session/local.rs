@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use koto_session_reader::source::{CTX_DIR, MANIFEST_FILE, MANIFEST_LOCK_FILE};
 
 use crate::cache::sha256_hex;
 use crate::engine::persistence;
@@ -48,8 +49,16 @@ impl LocalBackend {
     /// Sessions from the old per-repo layout (`~/.koto/sessions/<repo-id>/`)
     /// are migrated to the flat layout on first use.
     pub fn new() -> anyhow::Result<Self> {
-        let koto_home = crate::koto_home::koto_home_or_err()?;
-        let base_dir = koto_home.join("sessions");
+        use koto_session_reader::source::{locate_sessions_dir, BackendKind, SessionsDir};
+        // The root's own sessions directory, which the cloud backend's local
+        // mirror also uses, so `KOTO_SESSIONS_BASE` doesn't move it.
+        let SessionsDir::UnderRoot {
+            root: koto_home,
+            dir: base_dir,
+        } = locate_sessions_dir(Some(BackendKind::Cloud))?
+        else {
+            anyhow::bail!("the cloud backend's sessions directory is always under the koto root");
+        };
         migrate_if_needed(&base_dir);
         Ok(Self {
             base_dir,
@@ -569,17 +578,17 @@ impl SessionBackend for LocalBackend {
 impl LocalBackend {
     /// Return the `ctx/` directory path for a session.
     fn ctx_dir(&self, session: &str) -> PathBuf {
-        self.base_dir.join(session).join("ctx")
+        self.base_dir.join(session).join(CTX_DIR)
     }
 
     /// Return the manifest path for a session's context store.
     fn manifest_path(&self, session: &str) -> PathBuf {
-        self.ctx_dir(session).join("manifest.json")
+        self.ctx_dir(session).join(MANIFEST_FILE)
     }
 
     /// Return the manifest lock file path.
     fn manifest_lock_path(&self, session: &str) -> PathBuf {
-        self.ctx_dir(session).join("manifest.lock")
+        self.ctx_dir(session).join(MANIFEST_LOCK_FILE)
     }
 
     /// Return the content file path for a given key.

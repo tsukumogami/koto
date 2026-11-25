@@ -31,13 +31,23 @@ pub mod source {
     pub use koto_session_reader::source::SessionSource;
 }
 
+/// The dashboard scan's view of a local store (or the cloud backend's local
+/// mirror).
+///
+/// `list` and `count_unreadable` use the crate's hardened listing, not
+/// [`SessionBackend::list`] and [`SessionBackend::count_unreadable`]: the
+/// scan reads every session directory on each refresh, so a FIFO, symlink
+/// or over-cap file planted at a state file's path must not block it or be
+/// read without bound. The backend's own listing keeps its plain header
+/// reads, since `koto session list` and every other caller are koto's
+/// command path over sessions koto wrote.
 impl source::SessionSource for LocalBackend {
     fn sessions_dir(&self) -> &Path {
         self.base_dir()
     }
 
     fn list(&self) -> Result<Vec<SessionInfo>> {
-        SessionBackend::list(self)
+        koto_session_reader::source::list_sessions(self.base_dir())
     }
 
     fn session_dir(&self, id: &str) -> PathBuf {
@@ -45,7 +55,7 @@ impl source::SessionSource for LocalBackend {
     }
 
     fn count_unreadable(&self) -> usize {
-        SessionBackend::count_unreadable(self)
+        koto_session_reader::source::count_unreadable_sessions(self.base_dir())
     }
 }
 

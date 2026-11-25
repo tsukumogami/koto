@@ -1,14 +1,15 @@
 # koto-session-reader reads the session store and never writes it. Clippy
 # reads the first clippy.toml walking up from the crate's manifest, so this
 # file replaces the root one for this crate and carries its two home_dir
-# entries too. lib.rs denies both lints, and src/fs_read.rs holds the only
-# #[allow]s: every file open in the crate goes through it.
+# entries too. lib.rs denies both lints, and two files hold the only
+# #[allow]s: src/fs_read.rs, through which every file open in the crate goes,
+# and src/koto_root.rs, whose one home-directory lookup is the koto root rule.
 # scripts/check-reader-readonly.sh checks that every entry below is still
 # here.
 #
 # allow-invalid = true marks a path clippy can't resolve on every toolchain
-# the crate builds with: the File::lock family is newer than the MSRV (1.88),
-# and dirs isn't a dependency of this crate.
+# the crate builds with: the File::lock family is newer than the MSRV (1.88).
+# The dirs entry keeps it too, as it had before dirs became a dependency.
 disallowed-methods = [
     # Writes, copies, renames, removals, creations and links through std::fs.
     { path = "std::fs::write", reason = "the reader never writes" },

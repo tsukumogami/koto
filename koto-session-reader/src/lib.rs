@@ -17,6 +17,7 @@ pub mod decider;
 pub mod engine;
 pub mod findings;
 pub mod fs_read;
+pub mod koto_root;
 pub mod redact;
 pub mod session;
 pub mod source;
