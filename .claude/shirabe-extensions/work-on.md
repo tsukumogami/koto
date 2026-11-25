@@ -106,3 +106,10 @@ package; `run-tests.sh` given arguments skips the doctests, which have their own
 - `bash scripts/run-tests.sh -p koto-stability-tests`
 - `cargo fmt --check`
 - `cargo clippy -p koto -p koto-session-reader --all-targets -- -D warnings`
+
+### Build output
+
+The JSON's top-level `build_output` lists `target/`, the tree the cargo commands above build into. Verification
+never reads it. shirabe removes the listed paths from a finished run's worktree only on a workspace that
+turns the cleanup on in an untracked `CLAUDE.local.md`, and reads the list at the merge base, so a branch
+can't change what its own run removes.

@@ -33,5 +33,6 @@
       "commands": ["run-evals-test"]
     }
   ],
-  "default": ["cargo-test", "doctests", "stability-tests", "fmt", "clippy"]
+  "default": ["cargo-test", "doctests", "stability-tests", "fmt", "clippy"],
+  "build_output": ["target/"]
 }
