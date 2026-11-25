@@ -21,7 +21,7 @@ It keeps that session only. The rest of its hierarchy is kept or released by
 the rule as before, so a pinned child doesn't keep its parent and a pinned
 parent doesn't keep its children.
 
-A session `koto session import` moved is kept too, by the copy. The import
+A session that `koto session import` moved is kept too, by the copy. The import
 leaves the source in place as a read-only predecessor, and the source stays
 while the copy, or any session that continues it, is alive, pinned, or within
 `retention.keep` (see [Import keeps its source](#import-keeps-its-source)).
