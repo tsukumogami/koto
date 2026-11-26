@@ -10,7 +10,7 @@
 //!
 //! `koto decisions attempts --at top` and `koto decisions attempts --in` a
 //! worker each answer within five seconds on a release build, which CI
-//! runs in its own job (`cargo test --release --test precedent_cost`). A
+//! runs in its own job (`cargo test --release --test attempts_cost`). A
 //! debug build runs the same code on a store a tenth the size and checks
 //! only the counts, so the default suite stays fast.
 //!
@@ -468,7 +468,7 @@ fn check(store: &Store, units: usize) -> Times {
         .iter()
         .all(|e| e["session"] == probe.as_str()));
     eprintln!(
-        "precedent_cost: {sessions} sessions; attempts --at top {at:?}; \
+        "attempts_cost: {sessions} sessions; attempts --at top {at:?}; \
          --awaiting-review {awaiting:?}; --in {within:?} (release: {RELEASE})"
     );
     Times {

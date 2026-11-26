@@ -864,7 +864,7 @@ to an id-shaped value, and both say so.
   identity) and `question` (the first of them or null, or the one `--question` named). The
   response lists under `unreadable` every entry at the position the read couldn't use, including
   a `judgment` or `escalate` whose stored `state` or `result` the write would refuse, which is not
-  an attempt. `--result`, `--state` and `--question <identity>` narrow to exact matches
+  an attempt, ties to no question or attempt and ends no wait. `--result`, `--state` and `--question <identity>` narrow to exact matches
   and combine. Elements are ordered by time, then session name, then identifier. Both or neither
   of `--in` and `--at`, a position naming nothing, a `--result` outside the three or a
   `--question` that isn't an identity exits 2.
@@ -877,7 +877,7 @@ to an id-shaped value, and both say so.
   answer, a settle, a withdrawal, an entry that doesn't count, a verified answer another
   outranks, a withdrawn question, a person answer that doesn't read `verified` on this host, or
   a decision citing the judgment. `--awaiting-review` returns only provisional judgments awaiting
-  review, and `show` prints the same `review`, read from the same local store. A review is matched by identity, so a review
+  review, and `show` prints the same `review`, read from the same local store, except that it reads `reversed` whenever the `status` in its response does. A review is matched by identity, so a review
   question naming a removed session's judgment doesn't review a new judgment that reuses its name
   and identifier.
 - **R85.** The attempts read uses only this machine's store. It takes no lock, pulls nothing,

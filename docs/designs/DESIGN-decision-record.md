@@ -1207,10 +1207,11 @@ session's run (the session and those it continues through a confirmed supersede,
 it, as `open --at` does, and adds `relation`. Elements are ordered by time, session name and
 identifier, and a provisional element carries `review`. `koto decisions show` adds the same
 `review` beside a provisional judgment, computed from the same local reading even under the cloud
-backend, so the two never disagree; `list` is unchanged apart from the stored fields. A judgment
+backend, except that it reads `reversed` whenever the `status` in the same response does, so one
+response never contradicts itself; `list` is unchanged apart from the stored fields. A judgment
 or `escalate` whose stored `state` or `result` the write would refuse (a body edited by hand) is
-not an attempt: the read lists it, with every other unreadable entry at the position, under
-`unreadable`, as `{"session", "id", "status": "unreadable", "reason"}`, so a caller can tell the
+not an attempt, ties to no question or attempt and ends no wait: the read lists it, with every
+other unreadable entry at the position, under `unreadable`, as `{"session", "id", "status": "unreadable", "reason"}`, so a caller can tell the
 listing is incomplete.
 
 ```json
@@ -1233,12 +1234,13 @@ new fields as it reads any other: `show` and `list` print the stored subject, ne
 Its `repair`, which publishes a decision whose key a stopped writer never wrote, checks bodies
 against its own subject table and skips such a body with a warning.
 
-**Measured cost.** On a release build on a Linux development host, over 1,001 sessions in
-dispatcher chains four deep holding 200 open questions, 100 questions closed by a verified
-person answer, 600 closed by a session's answer, 1,700 attempts and 800 provisional judgments,
-`attempts --at` the top coordinator took 258 ms, the same read with `--awaiting-review` 242 ms,
-and `attempts --in` one worker 160 ms. `tests/precedent_cost.rs` asserts each under five seconds
-on a release build.
+**Cost.** Each read is one scan of this host's store plus a walk of the confirmed links of the
+sessions it touches, so its cost grows with the number of sessions held locally, not with what
+the bucket holds. `tests/attempts_cost.rs` bounds it: on a generated store of 1,001 sessions in
+dispatcher chains four deep, holding 200 open questions, 100 closed by a verified person answer,
+600 closed by a session's answer, 1,700 attempts and 800 provisional judgments, `attempts --at`
+the top coordinator, the same read with `--awaiting-review`, and `attempts --in` one worker each
+finish under five seconds on a release build.
 
 ## Implementation Approach
 

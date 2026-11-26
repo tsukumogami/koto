@@ -1805,9 +1805,9 @@ A provisional judgment's element adds `review`, and `decisions show` prints the 
 
 A session's answer, a raiser's settle or withdrawal, an entry that doesn't count, a verified answer that another outranks, a withdrawn (reversed) question, a person's answer that doesn't read `verified` on this host, or a decision citing the judgment doesn't end the wait. `--awaiting-review` keeps only provisional judgments whose review is `awaiting`.
 
-`unreadable` lists every entry at the position the read couldn't use, each as `{"session","id","status":"unreadable","reason"}`: an entry no decision read can parse, and a `judgment` or `escalate` whose stored `state` or `result` the write would have refused (a body edited by hand), which isn't treated as an attempt. A non-empty `unreadable` means the listing may be incomplete.
+`unreadable` lists every entry at the position the read couldn't use, each as `{"session","id","status":"unreadable","reason"}`: an entry no decision read can parse, and a `judgment` or `escalate` whose stored `state` or `result` the write would have refused (a body edited by hand), which isn't treated as an attempt, ties to no question or attempt and ends no wait. A non-empty `unreadable` means the listing may be incomplete.
 
-The read uses only this host's store: it takes no lock, pulls nothing, makes no bucket request under the cloud backend and writes nothing. `decisions show` takes a provisional judgment's `review` from the same local reading, so under the cloud backend the two agree even when the bucket holds a decision this host hasn't pulled. It is refused under `--workspace`.
+The read uses only this host's store: it takes no lock, pulls nothing, makes no bucket request under the cloud backend and writes nothing. `decisions show` takes a provisional judgment's `review` from the same local reading, so the two agree under the cloud backend. The one exception is a reversal: `show` prints the `status` it reads with the bucket, and its `review` reads `reversed` whenever that `status` does, even when the reversal is only in the bucket and the attempts read still shows `awaiting`. It is refused under `--workspace`.
 
 ### decider answer
 

@@ -555,7 +555,8 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
     if let Entry::Decision(body) = entry {
         if super::attempts::is_provisional(body) {
             // The review comes from the local store, as `decisions
-            // attempts` reads it, so the two never disagree.
+            // attempts` reads it, so the two never disagree; whether it is
+            // reversed follows the `status` this response prints.
             let local;
             let reading = if matches!(backend, Backend::Cloud(_)) {
                 local = Index::scan(backend, false);
@@ -563,7 +564,7 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
             } else {
                 &index
             };
-            out["review"] = super::attempts::review(backend, reading, body);
+            out["review"] = super::attempts::review(backend, &index, reading, body);
         }
     }
     Some(out)

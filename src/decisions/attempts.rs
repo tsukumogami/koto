@@ -168,10 +168,19 @@ impl<'i> Ties<'i> {
         let mut preds = BTreeMap::new();
         let all = decisions(index);
         for d in &all {
+            // A hand-edited `state` or `result` makes a decision unreadable
+            // to these reads on either side of a tie: it ties to nothing and
+            // ends no wait.
+            if malformed(d).is_some() {
+                continue;
+            }
             for c in &d.basis {
                 let Some(target) = cited(index, &c.session, &c.id) else {
                     continue;
                 };
+                if malformed(target).is_some() {
+                    continue;
+                }
                 if target.time > d.time {
                     // A later decision under a reused name and id is never
                     // the one that was cited.
@@ -226,30 +235,33 @@ impl<'i> Ties<'i> {
 }
 
 /// The answer that governs `question` (koto's answer in effect), when it
-/// is a person's `answered` answer that reads `verified` on this host.
-/// An earlier verified answer the governing one outranks, a settle, a
-/// withdrawal and an entry that doesn't count never qualify.
+/// is a person's answer this host verified. An earlier verified answer the
+/// governing one outranks, a settle, a withdrawal and an entry that doesn't
+/// count never qualify.
 fn governing_person_answer<'i>(
     backend: &Backend,
     index: &'i Index,
     runs: &questions::Runs<'_>,
     question: &DecisionBody,
 ) -> Option<&'i DecisionBody> {
-    let a = questions::answer_in_effect(index, runs, question)?;
-    let verified = a.outcome == "answered"
-        && a.prompt.is_some()
-        && index
-            .holders(a)
-            .iter()
-            .any(|h| standing::verified_in(backend, h, a));
-    verified.then_some(a)
+    questions::answer_in_effect(index, runs, question)
+        .filter(|a| questions::verified_person(index, backend, a))
 }
 
-fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &DecisionBody) -> Value {
+/// `reversals` is the index whose `status` the response prints beside the
+/// review, so the two always agree; `index` is the local reading the rest
+/// of the review comes from.
+fn review_with(
+    backend: &Backend,
+    reversals: &Index,
+    index: &Index,
+    ties: &Ties<'_>,
+    body: &DecisionBody,
+) -> Value {
     // `status` reads reversed only once the reversal wins; the winner is
     // what `reversed_by` reports.
-    if let Some(w) = index.winner_of(&body.session.id, &body.id) {
-        if index.status(body) == "reversed" {
+    if let Some(w) = reversals.winner_of(&body.session.id, &body.id) {
+        if reversals.status(body) == "reversed" {
             return json!({
                 "state": "reversed",
                 "reversed_by": standing::reversal_json(w),
@@ -298,8 +310,18 @@ fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &Decisio
 /// `reviewed`, with that question and the verified person answer that
 /// ended the wait; or `reversed`, with the winning reversal as `show`
 /// reports it.
-pub fn review(backend: &Backend, index: &Index, body: &DecisionBody) -> Value {
-    review_with(backend, index, &Ties::build(backend, index), body)
+///
+/// `reversals` decides whether it is reversed and must be the index whose
+/// `status` the caller prints with it; `reading` is the local store the
+/// rest of the review is read from.
+pub fn review(backend: &Backend, reversals: &Index, reading: &Index, body: &DecisionBody) -> Value {
+    review_with(
+        backend,
+        reversals,
+        reading,
+        &Ties::build(backend, reading),
+        body,
+    )
 }
 
 /// Where an attempts read looks.
@@ -403,7 +425,7 @@ pub fn attempts(backend: &Backend, position: &Position<'_>, filters: &Filters) -
                 continue;
             }
         }
-        let review = is_provisional(b).then(|| review_with(backend, &index, &ties, b));
+        let review = is_provisional(b).then(|| review_with(backend, &index, &index, &ties, b));
         if filters.awaiting_review
             && review
                 .as_ref()

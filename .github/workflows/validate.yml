@@ -118,7 +118,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run the cost test in release mode
-        run: cargo test --locked --release --test precedent_cost -- --nocapture
+        run: cargo test --locked --release --test attempts_cost -- --nocapture
 
   pool-tick-cost:
     # Host resource pools' cost bound (PRD-host-resource-pools.md R28): the

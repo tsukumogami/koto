@@ -1232,6 +1232,58 @@ fn a_hand_edited_field_reads_as_unreadable_not_as_an_attempt() {
 }
 
 #[test]
+fn a_hand_edited_question_ties_to_nothing_and_ends_no_wait() {
+    let env = Env::new();
+    tree(&env);
+    let p1 = env.judgment(
+        "worker2",
+        &["what=name the table cache_entries", "result=provisional"],
+        &[],
+    );
+    let q = env.question("director", "person:owner", &["state=review:1"], &[&p1]);
+    let a = env.judgment("director", &["what=a", "result=undecided"], &[&q]);
+    let v = env.attempts(&["--at", "director", "--result", "provisional"]);
+    assert_eq!(list(&v)[0]["review"]["question"], q.identity.as_str());
+
+    let path = env
+        .sessions()
+        .join("director/ctx/koto/decisions")
+        .join(&q.id);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"state\":\"review:1\""), "{text}");
+    std::fs::write(
+        &path,
+        text.replace("\"state\":\"review:1\"", "\"state\":\"review\""),
+    )
+    .unwrap();
+
+    let v = env.attempts(&["--at", "director"]);
+    let unreadable: Vec<&str> = v["unreadable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(unreadable, vec![q.id.as_str()], "{v}");
+    let of = |identity: &str| {
+        list(&v)
+            .iter()
+            .find(|e| e["identity"] == identity)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(of(&a.identity)["questions"], serde_json::json!([]), "{v}");
+    assert_eq!(of(&a.identity)["question"], Value::Null, "{v}");
+    assert_eq!(of(&p1.identity)["review"]["question"], Value::Null, "{v}");
+
+    // A person's answer on it doesn't end the wait.
+    env.owner_answers(&q, "manager");
+    assert_eq!(awaiting_at(&env, "director"), vec![p1.identity.clone()]);
+    let shown = env.ok(&["decisions", "show", "worker2", &p1.id]).json();
+    assert_eq!(shown["review"]["state"], "awaiting", "{shown}");
+}
+
+#[test]
 fn a_judgment_without_the_fields_prints_what_main_printed() {
     fn copy(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
