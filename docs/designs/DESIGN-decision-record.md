@@ -778,7 +778,7 @@ winner), plus the existing `session_migrated`.
 
 ### Questions and answers
 
-This covers questions and answers (R49 to R61, R72 to R86). It carries a question from its
+This covers questions and answers (R49 to R61, R72 to R79, R87 to R93). It carries a question from its
 `escalate`, through any pass-ups, to an answer, a settle or a withdrawal, and back to the asker,
 and keeps the sessions an open question depends on while it needs them.
 
@@ -1033,7 +1033,7 @@ retention engine and the cleanup refusal all decide open through `is_open` in
 and has no entry in effect. Retention adds no test of its own. Each reaches it through a helper
 over the same store index (`raised_open`, `raised_open_in`, `holds_of`, `orphans`,
 `open_by_session`), so the five can't disagree about a question, and none can disagree with the
-resolution about which entries count or which one is in effect (R80).
+resolution about which entries count or which one is in effect (R87).
 
 **Which sessions are kept.** Three kinds of session hold something a question depends on, and
 retention keeps each for as long as the question needs it (the session retention design states the
@@ -1045,12 +1045,12 @@ time, so it changes when the entries do.
   is closed by an entry that counts, reversed or fenced. Its terminal tick reports
   `{"retained": true, "reason": "open_question", "open_questions": ["<identity>"]}`. A question its
   raiser withdrew or settled holds nothing, so the raiser is removed at its terminal tick as one
-  holding no question is (R80).
+  holding no question is (R87).
 - *The holder of an answer or a pass-up.* Each lives only in the session that recorded it, under
   `koto/aimed/<raiser id>/`. Retention reads that directory as an edge between the holder and the
   session whose header id it names, by id and never by name, so the holder is in the raiser's
   hierarchy and is kept while that hierarchy is: while the raiser's question is open, at least. A
-  reversal there, or a body that can't be read, is no edge (R81). An answer is the same edge
+  reversal there, or a body that can't be read, is no edge (R88). An answer is the same edge
   whether a session or a person gave it. It holds the question only while it is the entry in
   effect (`governs` true): when a person's verified answer outranks a session's, the person's
   answer holds and the session's is released. A pass-up holds only while it counts and an open
@@ -1066,7 +1066,7 @@ time, so it changes when the entries do.
   what the reads then compute: the answer in effect gone leaves the resolution to pick the next
   counted entry, or reopens the question when none counts, a pass-up gone returns it to the
   addressee before, and the raiser gone drops it from every open read while its aimed entries
-  still list in their holders (R82, R83). The same refusal covers a session whose own decisions,
+  still list in their holders (R89, R90). The same refusal covers a session whose own decisions,
   or a question its aimed entries point at, can't be read, and `koto init --replace-terminal`
   refuses such a predecessor rather than moving it aside. The prunes that can take part of a
   component keep an answer or pass-up holder unless its question's raiser goes in the same run.
@@ -1089,7 +1089,7 @@ refuses, a `readdress`
 and `koto decisions record` ring nothing. A person's answer rings exactly as a session's does,
 once the answer and its verified-answer note (`koto-verified-here`) are written. Ringing never fails the answer, which is already written:
 with no koto root, an unwritable wakes directory, or a symbolic link, directory or FIFO at the path,
-the command warns once on stderr, leaves the path as it was and exits 0 (R84, R85). Nothing is
+the command warns once on stderr, leaves the path as it was and exits 0 (R91, R92). Nothing is
 written in the asker's session, so R51 still holds.
 
 **What the reads cost.** `cargo test --release --test questions_cost` builds, under a temporary
@@ -1099,7 +1099,7 @@ that `open --person`, `open --at` a top coordinator and `koto next`'s `questions
 under five seconds and return the intended counts, locally and under the in-process cloud test
 endpoint. The endpoint sees no request from either open read. A cloud `koto next` syncs its
 session as every tick does, and the test asserts that a session holding an answered question makes
-exactly the requests a session holding none makes, so the `questions` read adds none (R86). On
+exactly the requests a session holding none makes, so the `questions` read adds none (R93). On
 the same store the test bounds, also at five seconds, a terminal tick of a session holding an open
 question and a refused cleanup of it. Each cost grows with the store's decisions, not with the
 open questions: the reads scan each session's decisions once, and a session that recorded no
@@ -1244,6 +1244,88 @@ and the check. No record text is echoed, since the record holds the person's who
   another's prompt, and its cost grows with the whole history.
 - **Trust the caller's `--text`.** Rejected: the answer text comes from the result, so a caller
   can't put words in the person's mouth.
+
+### Attempts and provisional decisions
+
+A caller one layer up needs two answers from the record: whether a session tried to decide a
+question itself before passing it up, and which decisions an unattended run made on its own that
+nobody has looked at yet. Both ride on two optional subject fields and one read over the local
+scan the open reads use (`src/decisions/attempts.rs`).
+
+**The fields.** A `judgment` may carry `state` and `result`, and an `escalate` may carry `state`.
+`result` is `decided`, `undecided` or `provisional`. `state` is `<state name>:<visit>`: the name
+takes a session name's shape and the visit is a whole number of 1 or more, with no sign and no
+leading zero. It's the caller's value, stored as handed and never compared with the workflow
+state R3 already records in the body's own `state`. `record` checks both fields alongside the
+rest of the subject, so a refusal writes nothing. A judgment carrying `result` is an attempt; one
+carrying neither field is not, prints exactly as it did, and no attempts read returns it. Open
+elements add `state` only when the `escalate` carries one.
+
+**The tie between an attempt and a question.** An attempt is tied to a question through `basis`,
+in either direction: the attempt names the question's `escalate`, or the `escalate` names an
+attempt recorded in the raiser's own run (the raiser, the sessions it continues and those that
+continue it). A raiser naming another session's attempt doesn't tie it, so no session can make
+another appear to have attempted a question. A basis entry names its session by name, which a later session can reuse, so a
+citation counts only when the decision it names, read now, is of the right kind and recorded no
+later than the citing decision. That's the check the `questions` report on `koto next` makes. An
+attempt carries every tied question in `questions`, ordered by time, session name and
+identifier, and `question` is the first of them, or the one `--question` named.
+
+**The end of a provisional judgment's wait.** A provisional judgment's `review` is `reversed`,
+with the winning reversal as `show` prints it, once a reversal aimed at it is in effect. Failing
+that, it's `reviewed` once a question whose `escalate` is in effect and names the judgment in its
+`basis` is governed by a person's answer that reads `verified` on this host: the question's answer
+in effect, so an earlier verified answer the governing one outranks doesn't count. Otherwise it's
+`awaiting`, naming the earliest such question still open, else the earliest such question, or null.
+The question may be raised in any session: putting a judgment before a person ties nothing, and
+only the person's governing verified answer ends the wait. A session's answer, a raiser's settle
+or withdrawal, an answer that doesn't count, a withdrawn (reversed) question, a remote person
+answer and a decision that merely cites the judgment leave it awaiting. Review is matched by
+session id and identifier, so a recreated session reusing a name and identifier inherits no
+review.
+
+**The command surface.** `koto decisions attempts` takes exactly one of `--in <session>` and
+`--at <session or anchor>`, plus `--result`, `--state`, `--question <identity>` and
+`--awaiting-review`, which keeps provisional judgments still awaiting review. `--in` covers the
+session's run (the session and those it continues through a confirmed supersede, as
+`chain::run_predecessors` finds them); `--at` covers the position's run and every session below
+it, as `open --at` does, and adds `relation`. Elements are ordered by time, session name and
+identifier, and a provisional element carries `review`. `koto decisions show` adds the same
+`review` beside a provisional judgment, computed from the same local reading even under the cloud
+backend, except that it reads `reversed` whenever the `status` in the same response does, so one
+response never contradicts itself; `list` is unchanged apart from the stored fields. A judgment
+or `escalate` whose stored `state` or `result` the write would refuse (a body edited by hand) is
+not an attempt, ties to no question or attempt and ends no wait: the read lists it, with every
+other unreadable entry at the position, under `unreadable`, as `{"session", "id", "status": "unreadable", "reason"}`, so a caller can tell the
+listing is incomplete.
+
+```json
+{"v": 1, "in": "worker", "attempts": [{"identity": "<session id>/000000000001",
+  "session": "worker", "id": "000000000001", "what": "Postgres or SQLite for the cache",
+  "state": "implement:1", "result": "undecided", "decider": {"kind": "session", "...": "..."},
+  "run_mode": {"source": "observed", "value": "unknown"}, "time": "...",
+  "status": "in-effect", "question": null, "questions": []}], "unreadable": []}
+```
+
+**Enforcement is the caller's.** koto refuses nothing for want of an attempt. An `escalate` or a
+`readdress` with no attempt behind it is recorded as before; a caller that wants an attempt
+before a pass-up asks `attempts --in <session> --question <identity>` and decides.
+
+**Local only.** The read builds on `Index::scan` with `remote` unset: no lock, no pull, no bucket
+request under the cloud backend, and no write.
+
+**Older binaries.** A binary older than this change reads a `judgment` or `escalate` carrying the
+new fields as it reads any other: `show` and `list` print the stored subject, new keys included.
+Its `repair`, which publishes a decision whose key a stopped writer never wrote, checks bodies
+against its own subject table and skips such a body with a warning.
+
+**Cost.** Each read is one scan of this host's store plus a walk of the confirmed links of the
+sessions it touches, so its cost grows with the number of sessions held locally, not with what
+the bucket holds. `tests/attempts_cost.rs` bounds it: on a generated store of 1,001 sessions in
+dispatcher chains four deep, holding 200 open questions, 100 closed by a verified person answer,
+600 closed by a session's answer, 1,700 attempts and 800 provisional judgments, `attempts --at`
+the top coordinator, the same read with `--awaiting-review`, and `attempts --in` one worker each
+finish under five seconds on a release build.
 
 ## Implementation Approach
 

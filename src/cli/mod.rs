@@ -1410,6 +1410,16 @@ pub enum DecisionsSubcommand {
         #[arg(long, value_name = "SESSION_OR_ANCHOR")]
         at: Option<String>,
     },
+    /// List attempts to decide: judgments carrying a `result` subject, in
+    /// one session's run (`--in`) or at and below a session or anchor
+    /// (`--at`), each with the questions it is tied to and, for a
+    /// provisional one, its review. Takes exactly one of `--in` and
+    /// `--at`. Reads this machine's store only and records nothing
+    #[command(group(clap::ArgGroup::new("attempts_by").required(true).args(["in_session", "at"])))]
+    Attempts {
+        #[command(flatten)]
+        args: decisions::AttemptsArgs,
+    },
     /// Write or read a question's content: the write-once bytes a person is
     /// shown, in the raiser's `koto/packets/`
     Content {
@@ -3319,6 +3329,9 @@ pub fn run(app: App) -> Result<()> {
                     (None, Some(at)) => decisions::handle_open_at(&backend, &at),
                     (None, None) => unreachable!("clap requires --person or --at"),
                 },
+                DecisionsSubcommand::Attempts { args } => {
+                    decisions::handle_attempts(&backend, &args)
+                }
                 DecisionsSubcommand::Content { action } => match action {
                     decisions::ContentAction::Write { name, id, file } => {
                         refuse_if_unlocated(&backend, &name, "decisions content write");
