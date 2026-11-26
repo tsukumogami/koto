@@ -1099,16 +1099,11 @@ that `open --person`, `open --at` a top coordinator and `koto next`'s `questions
 under five seconds and return the intended counts, locally and under the in-process cloud test
 endpoint. The endpoint sees no request from either open read. A cloud `koto next` syncs its
 session as every tick does, and the test asserts that a session holding an answered question makes
-exactly the requests a session holding none makes, so the `questions` read adds none (R86).
-Measured on a release build on a 32-core Linux host:
-
-| Operation | Local | Cloud test backend |
-|-----------|-------|--------------------|
-| `koto decisions open --person owner` | 72 ms | 105 ms |
-| `koto decisions open --at <top coordinator>` | 108 ms | 115 ms |
-| `koto next` with an answered, uncited question | 139 ms | 155 ms |
-| terminal tick of a session holding an open question | 233 ms | not measured |
-| refused `koto session cleanup` of that session | 67 ms | not measured |
+exactly the requests a session holding none makes, so the `questions` read adds none (R86). On
+the same store the test bounds, also at five seconds, a terminal tick of a session holding an open
+question and a refused cleanup of it. Each cost grows with the store's decisions, not with the
+open questions: the reads scan each session's decisions once, and a session that recorded no
+question costs the tick only a read of its own decisions.
 
 **Older binaries.** A binary older than this change doesn't know the `answer` kind, so it reads an
 answer entry as unreadable; it reads a typed recipient as the plain string it is stored as. A
