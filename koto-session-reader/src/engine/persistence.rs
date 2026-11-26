@@ -909,27 +909,122 @@ pub fn derive_machine_state(
 /// Check whether `state_name` is a terminal state in the compiled template at
 /// `template_path`.
 ///
-/// Returns `false` on any I/O or parse error (graceful degradation). This is
+/// This is [`read_terminal_state`] with every refusal taken as `false`
+/// (graceful degradation): a template that can't be read, isn't JSON, has no
+/// `states` object, or doesn't declare `state_name` is not terminal. It is
 /// the single implementation shared by the dashboard read seam and the
 /// `/workflows` projection writer.
 pub fn is_terminal_state(template_path: &str, state_name: &str) -> bool {
-    let read = crate::fs_read::open_plain(template_path).and_then(|mut file| {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let bytes = match read {
-        Ok(b) => b,
-        Err(_) => return false,
+    read_terminal_state(template_path, state_name).unwrap_or(false)
+}
+
+/// Read whether `state_name` is a terminal state in the compiled template at
+/// `template_path`, with the reason when the template can't answer.
+///
+/// The read is the hardened template read, [`ReadMode::Template`]: it
+/// follows a symlink and checks no containment, never blocks on a FIFO, and
+/// refuses a file over [`TEMPLATE_READ_CAP`]. It parses only
+/// `states.<name>.terminal` and ignores every other field, so a template
+/// written by a newer koto, with fields or gate types this reader doesn't
+/// know, still answers. A state the template doesn't declare is `Ok(false)`.
+///
+/// [`ReadMode::Template`]: crate::fs_read::ReadMode::Template
+/// [`TEMPLATE_READ_CAP`]: crate::source::TEMPLATE_READ_CAP
+pub fn read_terminal_state(
+    template_path: &str,
+    state_name: &str,
+) -> Result<bool, TemplateReadError> {
+    let path = Path::new(template_path);
+    let refused = |category| TemplateReadError {
+        category,
+        path: path.to_path_buf(),
     };
-    let compiled: crate::template::types::CompiledTemplate = match serde_json::from_slice(&bytes) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    compiled
+    let bytes = crate::fs_read::read_store_file(
+        path,
+        crate::source::TEMPLATE_READ_CAP,
+        crate::fs_read::ReadMode::Template,
+    )
+    .map_err(|e| refused(template_read_category(&e)))?;
+    let projection: TerminalProjection =
+        serde_json::from_slice(&bytes).map_err(|_| refused(TemplateReadCategory::Malformed))?;
+    Ok(projection
         .states
         .get(state_name)
-        .map(|s| s.terminal)
-        .unwrap_or(false)
+        .is_some_and(|s| s.terminal))
+}
+
+/// The part of a compiled template [`read_terminal_state`] reads: each
+/// state's `terminal` flag. Unknown fields are ignored at every level, and a
+/// state without `terminal` is not terminal, since the compiler leaves it out
+/// when it is false.
+#[derive(serde::Deserialize)]
+struct TerminalProjection {
+    states: HashMap<String, StateTerminal>,
+}
+
+/// One state of a [`TerminalProjection`].
+#[derive(serde::Deserialize)]
+struct StateTerminal {
+    #[serde(default)]
+    terminal: bool,
+}
+
+/// Why [`read_terminal_state`] couldn't answer: a fixed category and the
+/// template's path. It holds none of the template's bytes, and its `Display`
+/// never carries a parser's or the OS's error text, which can quote them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{category}: {}", path.display())]
+pub struct TemplateReadError {
+    /// What went wrong.
+    pub category: TemplateReadCategory,
+    /// The compiled template's path.
+    pub path: std::path::PathBuf,
+}
+
+/// The fixed categories a [`TemplateReadError`] falls in, each displayed as
+/// a fixed string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateReadCategory {
+    /// No file at the path.
+    NotFound,
+    /// The path isn't a regular file (a FIFO, a device, a directory).
+    NotRegular,
+    /// The template is larger than
+    /// [`TEMPLATE_READ_CAP`](crate::source::TEMPLATE_READ_CAP).
+    TooLarge,
+    /// The OS refused to open the template.
+    PermissionDenied,
+    /// The template couldn't be read for another reason.
+    Unreadable,
+    /// The template isn't JSON, has no `states` object, or a state's
+    /// `terminal` isn't a boolean.
+    Malformed,
+}
+
+impl std::fmt::Display for TemplateReadCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "template not found",
+            Self::NotRegular => "template is not a regular file",
+            Self::TooLarge => "template is larger than 32 MiB",
+            Self::PermissionDenied => "template is not readable: permission denied",
+            Self::Unreadable => "template is unreadable",
+            Self::Malformed => "template is malformed",
+        })
+    }
+}
+
+/// Sort a hardened template read's refusal into its category, by the rules
+/// in [`crate::fs_read`]'s module docs. A template read checks no symlink
+/// and no containment, so neither of those refusals comes back.
+fn template_read_category(err: &std::io::Error) -> TemplateReadCategory {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => TemplateReadCategory::NotFound,
+        std::io::ErrorKind::InvalidInput => TemplateReadCategory::NotRegular,
+        std::io::ErrorKind::InvalidData => TemplateReadCategory::TooLarge,
+        std::io::ErrorKind::PermissionDenied => TemplateReadCategory::PermissionDenied,
+        _ => TemplateReadCategory::Unreadable,
+    }
 }
 
 /// Return true if `state` names a failure terminal, matching the dashboard's

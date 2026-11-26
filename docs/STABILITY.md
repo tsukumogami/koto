@@ -359,7 +359,13 @@ A reader built from a given crate release:
   its type name and raw payload, and goes on;
 - ignores header fields it doesn't know;
 - marks a session whose log has a higher `schema_version` unreadable,
-  that one session only, while every other session still reads.
+  that one session only, while every other session still reads;
+- reads only `states.<name>.terminal` from a compiled template and
+  ignores every other field, known to it or not, so a newer koto's
+  additive template change, such as a new top-level field, state field or
+  gate type, leaves terminal detection correct;
+- reads a state as not terminal when its template can't be read, isn't
+  JSON, has no `states` object or doesn't declare the state.
 
 The scan, `read_session_events` and `read_context` read state logs, leg
 pointers, context values and the marker through one hardened read: it
@@ -368,9 +374,11 @@ path that resolves outside the store, and is capped at 512 MiB for a
 state log, 64 KiB for a leg pointer, 16 MiB for a context value and 64
 bytes for the marker. A refused state log or context value marks that
 one session or value unreadable, and a refused leg pointer reads as no
-pointer; the scan goes on. Where the reader gives a reason, it is a
-fixed category and the file's path, never the file's bytes or a parser's
-message, which can quote them.
+pointer; the scan goes on. A compiled template goes through the same
+hardened read, capped at 32 MiB, except that it follows a symlink and
+has no containment check, since `--template` may name a file anywhere.
+Where the reader gives a reason, it is a fixed category and the file's
+path, never the file's bytes or a parser's message, which can quote them.
 
 ### Reading a context value
 
