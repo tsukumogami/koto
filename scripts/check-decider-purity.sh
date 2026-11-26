@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Check the structural rules of src/decider/ that the compiler can't.
+# Check the structural rules of the decider modules that the compiler can't.
+# The decider lives in two places: koto's src/decider/ (the provider, the
+# ledger and build_decider) and koto-session-reader/src/decider/ (the
+# provider-neutral types, request, evaluate, record and check files, which
+# koto re-exports). "The decider directories" below means both.
 #
 #  1. The provider-neutral files (types.rs, request.rs, evaluate.rs,
-#     record.rs) do no I/O: they import nothing from std::net, std::fs, std::thread,
+#     record.rs, under koto-session-reader/src/decider/) do no I/O: they import nothing from std::net, std::fs, std::thread,
 #     std::time::Instant or SystemTime, or attohttpc. They also never
 #     mention Jev's wire vocabulary (the strings noul, criteria, "choice").
 #  2. build_decider gates on DeciderSettings::opted_in() and nothing else:
 #     its body has no mode comparison, key-presence check, or origin check.
 #  3. build_decider is the only production code that constructs a
 #     JevDecider.
-#  4. No function named effective_mode exists under src/decider/, and no
-#     file there orders configured modes against template modes: evaluate.rs
+#  4. No function named effective_mode exists in the decider directories,
+#     and no file there orders configured modes against template modes: evaluate.rs
 #     never names GlobalMode, DeciderSettings, or an ordering, and no file
 #     names both GlobalMode and DeciderMode.
 #
@@ -24,6 +28,7 @@ set -u
 
 ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 DIR="$ROOT/src/decider"
+READER_DIR="$ROOT/koto-session-reader/src/decider"
 failed=0
 
 fail() {
@@ -35,10 +40,12 @@ pass() {
     echo "PASS: $*"
 }
 
-if [ ! -d "$DIR" ]; then
-    fail "src/decider/ not found under $ROOT"
-    exit 1
-fi
+for d in "$DIR" "$READER_DIR"; do
+    if [ ! -d "$d" ]; then
+        fail "${d#"$ROOT"/}/ not found under $ROOT"
+        exit 1
+    fi
+done
 
 # Print a file without its top-level test modules (from a `#[cfg(test)]`
 # line followed by `mod tests` through the module's closing `}` in column 0).
@@ -55,25 +62,26 @@ strip_tests() {
 # --- Rule 1: purity of the provider-neutral files --------------------------
 
 for name in types.rs request.rs evaluate.rs record.rs; do
-    f="$DIR/$name"
+    f="$READER_DIR/$name"
+    rel="koto-session-reader/src/decider/$name"
     if [ ! -f "$f" ]; then
-        fail "src/decider/$name is missing"
+        fail "$rel is missing"
         continue
     fi
     bad=0
     if grep -nE 'std::(net|fs|thread)\b|\battohttpc\b|\bInstant\b|\bSystemTime\b' "$f"; then
-        fail "src/decider/$name imports I/O (std::net, std::fs, std::thread, Instant, SystemTime, or attohttpc)"
+        fail "$rel imports I/O (std::net, std::fs, std::thread, Instant, SystemTime, or attohttpc)"
         bad=1
     fi
     if grep -nE 'use std::\{[^}]*\b(net|fs|thread)\b' "$f"; then
-        fail "src/decider/$name imports std::net, std::fs, or std::thread in a grouped use"
+        fail "$rel imports std::net, std::fs, or std::thread in a grouped use"
         bad=1
     fi
     if grep -nE 'noul|criteria|"choice"' "$f"; then
-        fail "src/decider/$name names provider wire vocabulary (noul, criteria, \"choice\")"
+        fail "$rel names provider wire vocabulary (noul, criteria, \"choice\")"
         bad=1
     fi
-    [ "$bad" -eq 0 ] && pass "src/decider/$name is pure and provider-neutral"
+    [ "$bad" -eq 0 ] && pass "$rel is pure and provider-neutral"
 done
 
 # --- Rule 2: build_decider gates only on opted_in() -----------------------
@@ -103,12 +111,12 @@ fi
 
 ctor_calls=0
 ctor_outside=0
-for f in "$DIR"/*.rs; do
+for f in "$DIR"/*.rs "$READER_DIR"/*.rs; do
     n=$(strip_tests "$f" | grep -cE 'JevDecider::new\(' || true)
     ctor_calls=$((ctor_calls + n))
     if [ "$n" -gt 0 ] && [ "$f" != "$MOD" ]; then
         ctor_outside=1
-        fail "$(basename "$f") calls JevDecider::new outside tests"
+        fail "${f#"$ROOT"/} calls JevDecider::new outside tests"
     fi
 done
 if [ "$ctor_calls" -ne 1 ]; then
@@ -129,21 +137,21 @@ fi
 # --- Rule 4: no effective_mode, no ordering of modes ----------------------
 
 bad=0
-if grep -rnE '\bfn[[:space:]]+effective_mode\b' "$DIR"; then
-    fail "a function named effective_mode exists under src/decider/"
+if grep -rnE '\bfn[[:space:]]+effective_mode\b' "$DIR" "$READER_DIR"; then
+    fail "a function named effective_mode exists in the decider directories"
     bad=1
 fi
-if strip_tests "$DIR/evaluate.rs" | grep -nE 'GlobalMode|DeciderSettings|config::|\.min\(|\bcmp\(|PartialOrd|\bOrd\b'; then
+if strip_tests "$READER_DIR/evaluate.rs" | grep -nE 'GlobalMode|DeciderSettings|config::|\.min\(|\bcmp\(|PartialOrd|\bOrd\b'; then
     fail "evaluate.rs reads settings or orders modes"
     bad=1
 fi
-for f in "$DIR"/*.rs; do
+for f in "$DIR"/*.rs "$READER_DIR"/*.rs; do
     src="$(strip_tests "$f")"
     if printf '%s\n' "$src" | grep -q 'GlobalMode' && printf '%s\n' "$src" | grep -q 'DeciderMode'; then
-        fail "$(basename "$f") names both GlobalMode and DeciderMode (configured vs template mode ordering belongs to the engine)"
+        fail "${f#"$ROOT"/} names both GlobalMode and DeciderMode (configured vs template mode ordering belongs to the engine)"
         bad=1
     fi
 done
-[ "$bad" -eq 0 ] && pass "no effective_mode and no mode ordering under src/decider/"
+[ "$bad" -eq 0 ] && pass "no effective_mode and no mode ordering in the decider directories"
 
 exit $failed

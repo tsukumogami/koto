@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use koto_session_reader::source::{CTX_DIR, MANIFEST_FILE, MANIFEST_LOCK_FILE};
 
 use crate::cache::sha256_hex;
 use crate::engine::persistence;
@@ -48,8 +49,16 @@ impl LocalBackend {
     /// Sessions from the old per-repo layout (`~/.koto/sessions/<repo-id>/`)
     /// are migrated to the flat layout on first use.
     pub fn new() -> anyhow::Result<Self> {
-        let koto_home = crate::koto_home::koto_home_or_err()?;
-        let base_dir = koto_home.join("sessions");
+        use koto_session_reader::source::{locate_sessions_dir, BackendKind, SessionsDir};
+        // The root's own sessions directory, which the cloud backend's local
+        // mirror also uses, so `KOTO_SESSIONS_BASE` doesn't move it.
+        let SessionsDir::UnderRoot {
+            root: koto_home,
+            dir: base_dir,
+        } = locate_sessions_dir(Some(BackendKind::Cloud))?
+        else {
+            anyhow::bail!("the cloud backend's sessions directory is always under the koto root");
+        };
         migrate_if_needed(&base_dir);
         Ok(Self {
             base_dir,
@@ -84,6 +93,86 @@ impl LocalBackend {
     /// The directory this store's run journal is written in.
     pub(crate) fn journal_root(&self) -> Option<&Path> {
         self.journal_root.as_deref()
+    }
+
+    /// The path of `id`'s state log.
+    pub(crate) fn state_path(&self, id: &str) -> PathBuf {
+        self.base_dir.join(id).join(state_file_name(id))
+    }
+
+    /// What runs after every committed append to `id`'s log, once the line
+    /// is synced. Best-effort: neither step fails the commit.
+    ///
+    /// Run with no lock on `id` held: materializing the `/workflows` surface
+    /// appends a nested `context_added`, which takes the log's append lock.
+    pub(crate) fn after_commit(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        commit: &persistence::CommitInfo,
+    ) {
+        // Journal the committed payload (best-effort, after the commit, so a
+        // failed append never writes a record), with the seq it took and the
+        // log it was appended to. See `crate::run_journal`.
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload, commit);
+        // Materialize the native Claude Code `/workflows` artifact off the one
+        // commit funnel (opt-in, best-effort: never fails the commit). `self`
+        // is both the SessionBackend (header chain) and the ContextStore
+        // (published locations). See `crate::workflows_surface`.
+        crate::workflows_surface::materialize_after_commit(self, self, id);
+    }
+
+    /// The line of [`SessionBackend::append_event`] for a caller holding
+    /// `id`'s append lock through `held`: the append goes in under it,
+    /// without taking the lock again, and `held` is released once it is in.
+    ///
+    /// The after-commit steps don't run here. The caller runs
+    /// [`LocalBackend::after_commit`] with the returned commit once it has
+    /// released every lock of its own on `id`: they append a nested
+    /// `context_added`, which takes the append lock again and would wait
+    /// forever on its own process, or, under another lock the caller holds,
+    /// take the two in an order another writer reverses.
+    pub(crate) fn commit_event_held(
+        &self,
+        id: &str,
+        held: persistence::HeldLogLock,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<persistence::CommitInfo> {
+        let commit = persistence::append_event_tracked_held(
+            &held,
+            &self.state_path(id),
+            payload,
+            timestamp,
+        )?;
+        drop(held);
+        Ok(commit)
+    }
+
+    /// [`SessionBackend::add_context_locked`] with the wait for `id`'s
+    /// append lock bounded by `wait`.
+    ///
+    /// A session whose directory is missing gets no lock (the sidecar has
+    /// nowhere to go) and fails at the header read, as it did with no lock,
+    /// having created nothing.
+    pub(crate) fn add_context_locked_within(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let path = self.state_path(id);
+        let held = persistence::hold_log_lock(&path, wait)?;
+        persistence::read_header(&path)?;
+        store_write()?;
+        let commit = persistence::append_event_tracked_held(&held, &path, event, timestamp)?;
+        // The event is in: nothing that replaces the log from here on can
+        // drop it, so the after-commit steps run with the lock released.
+        drop(held);
+        self.after_commit(id, event, &commit);
+        Ok(())
     }
 
     /// The directory sessions are stored under.
@@ -246,16 +335,24 @@ impl SessionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         let commit = persistence::append_event_tracked(&path, payload, timestamp)?;
-        // Journal the committed payload (best-effort, after the commit, so a
-        // failed append above never writes a record), with the seq it took
-        // and the log it was appended to. See `crate::run_journal`.
-        crate::run_journal::after_commit(self.journal_root(), self, id, payload, &commit);
-        // Materialize the native Claude Code `/workflows` artifact off the one
-        // commit funnel (opt-in, best-effort: never fails the commit). `self`
-        // is both the SessionBackend (header chain) and the ContextStore
-        // (published locations). See `crate::workflows_surface`.
-        crate::workflows_surface::materialize_after_commit(self, self, id);
+        self.after_commit(id, payload, &commit);
         Ok(())
+    }
+
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.add_context_locked_within(
+            id,
+            store_write,
+            event,
+            timestamp,
+            persistence::LOG_REPLACE_LOCK_WAIT,
+        )
     }
 
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
@@ -481,17 +578,17 @@ impl SessionBackend for LocalBackend {
 impl LocalBackend {
     /// Return the `ctx/` directory path for a session.
     fn ctx_dir(&self, session: &str) -> PathBuf {
-        self.base_dir.join(session).join("ctx")
+        self.base_dir.join(session).join(CTX_DIR)
     }
 
     /// Return the manifest path for a session's context store.
     fn manifest_path(&self, session: &str) -> PathBuf {
-        self.ctx_dir(session).join("manifest.json")
+        self.ctx_dir(session).join(MANIFEST_FILE)
     }
 
     /// Return the manifest lock file path.
     fn manifest_lock_path(&self, session: &str) -> PathBuf {
-        self.ctx_dir(session).join("manifest.lock")
+        self.ctx_dir(session).join(MANIFEST_LOCK_FILE)
     }
 
     /// Return the content file path for a given key.
@@ -662,6 +759,79 @@ impl LocalBackend {
         out
     }
 
+    /// [`with_manifest_lock`](Self::with_manifest_lock) with the wait for
+    /// the lock bounded by `wait`: `Ok(None)`, with `f` never run, when
+    /// another process still holds the lock once `wait` has passed.
+    ///
+    /// `koto init --supersede` takes the predecessor's manifest lock this
+    /// way and its append lock inside it, so it never waits without limit
+    /// on either. A decision writer takes the same two locks in the same
+    /// order (the manifest lock in [`crate::decisions::store`], then the
+    /// append lock for a gate-passing event), so the two can't deadlock.
+    pub(crate) fn with_manifest_lock_within<T>(
+        &self,
+        session: &str,
+        wait: std::time::Duration,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let ctx_dir = self.ctx_dir(session);
+        fs::create_dir_all(&ctx_dir)
+            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
+        #[cfg(unix)]
+        let Some(manifest_lock) =
+            Self::acquire_flock_within(&self.manifest_lock_path(session), wait)?
+        else {
+            return Ok(None);
+        };
+        #[cfg(not(unix))]
+        let _ = wait;
+        let out = f();
+        #[cfg(unix)]
+        Self::release_flock(&manifest_lock);
+        out.map(Some)
+    }
+
+    /// [`acquire_flock`](Self::acquire_flock) with the wait bounded by
+    /// `wait`: `Ok(None)` when the lock is still held elsewhere once `wait`
+    /// has passed. The same import-swap check applies once it is held.
+    #[cfg(unix)]
+    fn acquire_flock_within(
+        path: &Path,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<Option<fs::File>> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("failed to open lock file: {}", path.display()))?;
+        match crate::engine::jsonl_append::lock_exclusive(
+            file.as_raw_fd(),
+            Some(wait),
+            std::time::Instant::now(),
+        ) {
+            Ok(()) => {}
+            Err(e) if crate::engine::jsonl_append::lock_timeout(&e).is_some() => return Ok(None),
+            Err(e) => {
+                return Err(e.context(format!("failed to acquire flock on {}", path.display())))
+            }
+        }
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+            let now = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+            if held.is_none() || held != now {
+                return Err(anyhow::anyhow!(
+                    "{} was replaced while waiting for its lock; run the command again",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Some(file))
+    }
+
     /// The `ctx/` directory of `session`.
     pub(crate) fn ctx_path(&self, session: &str) -> PathBuf {
         self.ctx_dir(session)
@@ -672,7 +842,7 @@ impl LocalBackend {
     /// Creates the lock file if it doesn't exist. Returns the open File
     /// handle; the lock is released when the file is dropped.
     #[cfg(unix)]
-    fn acquire_flock(path: &Path) -> anyhow::Result<fs::File> {
+    pub(crate) fn acquire_flock(path: &Path) -> anyhow::Result<fs::File> {
         use std::os::unix::io::AsRawFd;
 
         let file = fs::OpenOptions::new()
@@ -895,25 +1065,8 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
 }
 
 /// Derive the remote prefix of a workspace that may not exist on this
-/// machine.
-///
-/// `koto session import --from <path>` names the workspace a session was
-/// created in, usually a path on another host. When the path resolves here
-/// this is exactly [`repo_id`]; when it doesn't, the literal path is hashed
-/// the same way, which matches the creating host's `repo_id` whenever the
-/// caller passes the canonical path that host recorded. The path is only
-/// hashed, never opened beyond the canonicalization attempt.
-///
-/// A relative path is refused: it would be resolved against whatever
-/// directory the import happens to run from, not the source host's.
-pub(crate) fn prefix_for_workspace(path: &Path) -> anyhow::Result<String> {
-    if !path.is_absolute() {
-        anyhow::bail!("workspace path must be absolute, got '{}'", path.display());
-    }
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let hash = sha256_hex(resolved.to_string_lossy().as_bytes());
-    Ok(hash[..16].to_string())
-}
+/// machine; defined beside the dashboard's read of a session's import record.
+pub(crate) use koto_session_reader::session::local::prefix_for_workspace;
 
 /// Rename a session's state file inside `dir` from the `from` identity to
 /// the `to` identity.
@@ -945,32 +1098,45 @@ pub(crate) fn rename_state_file(dir: &Path, from: &str, to: &str) -> anyhow::Res
 /// sessions (`relocate`) treat that as fatal; callers that may be handed an
 /// already-corrupt state file (recovery) decide for themselves.
 pub(crate) fn rewrite_header_identity(dir: &Path, to: &str) -> anyhow::Result<()> {
+    rewrite_header_identity_within(dir, to, persistence::LOG_REPLACE_LOCK_WAIT)
+}
+
+/// [`rewrite_header_identity`] with the lock wait bounded by `wait`. The
+/// read and the replacement happen under the log's append lock, so an append
+/// can't land between them and be overwritten (koto#239); a lock still held
+/// once `wait` has passed is [`persistence::StateLogBusy`], with nothing
+/// written.
+pub(crate) fn rewrite_header_identity_within(
+    dir: &Path,
+    to: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
     let state = dir.join(state_file_name(to));
 
-    let mut header = persistence::read_header(&state)
-        .with_context(|| format!("failed to read header from {}", state.display()))?;
+    persistence::with_log_replace_lock(&state, wait, || {
+        let mut header = persistence::read_header(&state)
+            .with_context(|| format!("failed to read header from {}", state.display()))?;
 
-    header.workflow = to.to_string();
-    header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
+        header.workflow = to.to_string();
+        header.parent_workflow = to.rsplit_once('.').map(|(parent, _)| parent.to_string());
 
-    // Read the entire file, replace the first line, write it back.
-    let content = fs::read_to_string(&state)
-        .with_context(|| format!("failed to read state file {}", state.display()))?;
-    let mut lines: Vec<&str> = content.lines().collect();
+        // Read the entire file, replace the first line, write it back.
+        let content = fs::read_to_string(&state)
+            .with_context(|| format!("failed to read state file {}", state.display()))?;
+        let mut lines: Vec<&str> = content.lines().collect();
 
-    let new_header_line =
-        serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+        let new_header_line =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
 
-    if lines.is_empty() {
-        anyhow::bail!("state file {} is empty", state.display());
-    }
-    lines[0] = &new_header_line;
+        if lines.is_empty() {
+            anyhow::bail!("state file {} is empty", state.display());
+        }
+        lines[0] = &new_header_line;
 
-    let new_content = lines.join("\n") + "\n";
-    fs::write(&state, new_content.as_bytes())
-        .with_context(|| format!("failed to write updated state file {}", state.display()))?;
-
-    Ok(())
+        let new_content = lines.join("\n") + "\n";
+        persistence::replace_log_bytes(&state, new_content.as_bytes())
+            .with_context(|| format!("failed to write updated state file {}", state.display()))
+    })
 }
 
 /// Directory that holds old-layout sessions whose name was already taken
@@ -1178,6 +1344,116 @@ pub(crate) fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// An identity rewrite meeting a held append lock reports the log busy
+    /// and leaves it as it was; once the lock is free it goes through
+    /// (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn an_identity_rewrite_under_a_held_append_lock_is_busy() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("b");
+        fs::create_dir_all(&dir).unwrap();
+        let state = dir.join(state_file_name("b"));
+        fs::write(
+            &state,
+            "{\"schema_version\":1,\"workflow\":\"a\",\"template_hash\":\"abc\",\"created_at\":\"2025-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        let before = fs::read(&state).unwrap();
+        let held = persistence::hold_append_lock(&state);
+        let err = rewrite_header_identity_within(&dir, "b", std::time::Duration::from_millis(200))
+            .unwrap_err();
+        assert!(persistence::state_log_busy(&err).is_some(), "{err:#}");
+        assert_eq!(fs::read(&state).unwrap(), before);
+        drop(held);
+        rewrite_header_identity_within(&dir, "b", std::time::Duration::from_millis(200)).unwrap();
+        assert_eq!(persistence::read_header(&state).unwrap().workflow, "b");
+    }
+
+    fn context_added(key: &str, content: &[u8]) -> EventPayload {
+        EventPayload::ContextAdded {
+            key: key.to_string(),
+            hash: crate::cache::sha256_hex(content),
+            size: content.len() as u64,
+            writer: Some(crate::session::context_log::WRITER_AGENT.to_string()),
+        }
+    }
+
+    /// `context add` on a session whose log lock another process holds past
+    /// the wait is busy, retryably, and stores nothing: the store write runs
+    /// only once the lock is held (koto#728).
+    #[cfg(unix)]
+    #[test]
+    fn a_context_add_under_a_held_append_lock_is_busy_and_stores_nothing() {
+        use crate::session::context::ContextStore;
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "s", "2025-01-01T00:00:00Z");
+        let backend = test_backend(tmp.path());
+        let state = backend.state_path("s");
+        let before = fs::read(&state).unwrap();
+        let event = context_added("k", b"v");
+
+        let holder =
+            persistence::hold_append_lock_for(&state, std::time::Duration::from_millis(600));
+        let mut wrote = false;
+        let err = backend
+            .add_context_locked_within(
+                "s",
+                &mut || {
+                    wrote = true;
+                    backend.add_confirmed("s", "k", b"v", "agent")
+                },
+                &event,
+                "2025-01-01T00:00:01Z",
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap_err();
+        holder.join().unwrap();
+        assert!(persistence::state_log_busy(&err).is_some(), "{err:#}");
+        assert!(err.to_string().contains("run the command again"), "{err}");
+        assert!(!wrote);
+        assert!(!backend.ctx_exists("s", "k"));
+        assert_eq!(fs::read(&state).unwrap(), before);
+
+        // Once the lock is free, the same add stores the content and logs it.
+        backend
+            .add_context_locked_within(
+                "s",
+                &mut || backend.add_confirmed("s", "k", b"v", "agent"),
+                &event,
+                "2025-01-01T00:00:01Z",
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(backend.ctx_exists("s", "k"));
+        let (_, events) = backend.read_events("s").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "context_added");
+    }
+
+    /// A session with no directory fails at the header read with no lock to
+    /// take, and the add creates nothing: no directory, no sidecar, no
+    /// stored content.
+    #[test]
+    fn a_context_add_on_a_missing_session_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let mut wrote = false;
+        backend
+            .add_context_locked(
+                "gone",
+                &mut || {
+                    wrote = true;
+                    Ok(())
+                },
+                &context_added("k", b"v"),
+                "2025-01-01T00:00:01Z",
+            )
+            .unwrap_err();
+        assert!(!wrote);
+        assert!(!tmp.path().join("gone").exists());
+    }
 
     /// Helper: create a LocalBackend using a temp directory as base.
     fn test_backend(dir: &Path) -> LocalBackend {

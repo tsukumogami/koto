@@ -257,7 +257,8 @@ const UNDECLARED_LOOKUP_REMEDY: &str = ". This bucket's name index isn't declare
      requests";
 
 /// The request timeout of every request koto makes to the bucket, except a
-/// lookup's, which uses [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
+/// lookup's and the probe path's reads ([`PROBE_DEADLINE`]), which use
+/// [`LOOKUP_REQUEST_TIMEOUT`]. It is rust-s3's own
 /// default, set here so a crate upgrade can't move it under
 /// [`list_retrying`]'s retry policy.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -311,6 +312,33 @@ const LOOKUP_LIVE_REQUESTS: usize = 2 * HELD_ELSEWHERE_FANOUT;
 /// The process-wide count of live lookup request threads, capped at
 /// [`LOOKUP_LIVE_REQUESTS`].
 static LOOKUP_SLOTS: RequestSlots = RequestSlots::new(LOOKUP_LIVE_REQUESTS);
+
+/// How long one of the probe path's reads may take, counted from its first
+/// request (koto#605): the listing of a session's prefix
+/// ([`CloudBackend::probe`]), the listings that locate a session recording
+/// no prefix ([`CloudBackend::locate`]) and the HEAD of a session's state
+/// object ([`CloudBackend::s3_session_exists`]).
+///
+/// Each is one ask ([`bounded_ask`]) of at most [`LOOKUP_REQUEST_TIMEOUT`],
+/// with no koto retry, so the deadline is one full ask. On the sync bucket
+/// a reply that never came held the command for about a minute: rust-s3's
+/// retry a second later, after two 30 s read timeouts. Here a stalled
+/// bucket costs a command about 10 s per session it probes; a failed
+/// listing isn't asked again in the process.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most probe request threads alive at once in this process, in flight
+/// and abandoned together ([`bounded_ask`]). Probes run one at a time, and
+/// one koto stopped waiting for ends within about 21 s (two 10 s transport
+/// timeouts and rust-s3's retry between them), so a command probing
+/// session after session on a stalled bucket holds a few. Kept apart from
+/// [`LOOKUP_SLOTS`], so a sweep's abandoned requests never starve a probe,
+/// nor a probe a sweep.
+const PROBE_LIVE_REQUESTS: usize = 16;
+
+/// The process-wide count of live probe request threads, capped at
+/// [`PROBE_LIVE_REQUESTS`].
+static PROBE_SLOTS: RequestSlots = RequestSlots::new(PROBE_LIVE_REQUESTS);
 
 /// How much of a state object a delete reads to compare its header's
 /// `session_id`: a header line is far shorter.
@@ -474,6 +502,10 @@ struct Probes {
     /// the declaration is read once and the refusal's retry sleep is paid
     /// once. Kept here, in the box, for the same reason.
     entries_refused: Mutex<HashSet<String>>,
+    /// The limits the probe path's reads ask under
+    /// ([`LookupLimits::probe`]); short ones in tests. Kept here, in the
+    /// box, for the same reason.
+    limits: LookupLimits,
 }
 
 impl CloudBackend {
@@ -532,6 +564,7 @@ impl CloudBackend {
                 located: Mutex::default(),
                 deferred_to: Mutex::default(),
                 entries_refused: Mutex::default(),
+                limits: LookupLimits::probe(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -1387,7 +1420,10 @@ impl CloudBackend {
     /// no prefix twice) whose listing shows the session's state object.
     ///
     /// Each candidate is listed once per process, with a delimiter, so the
-    /// listing reads only the session's top level. No candidate holding the
+    /// listing reads only the session's top level. Every listing is one
+    /// bounded ask ([`probe_ask`]), and all of them together end within
+    /// [`PROBE_DEADLINE`]; one with no answer by then is a listing that
+    /// failed (koto#605). No candidate holding the
     /// state object, both holding one, and a listing that fails are
     /// [`Unlocated`], naming every candidate concerned. A listing alone
     /// can't say whose copy it found: the copy is the session's own only
@@ -1418,10 +1454,13 @@ impl CloudBackend {
         };
         let mut held = Vec::new();
         let mut failed = None;
+        // One deadline for every candidate: a later one gets the time left.
+        let run = LookupRun::new(self.probes.limits);
         for candidate in &candidates {
             let session = format!("{candidate}/{id}/");
             let state = format!("{session}{}", state_file_name(id));
-            match self.bucket.list(session, Some("/".to_string())) {
+            let bucket = self.probe_bucket();
+            match probe_ask(run, move || bucket.list(session, Some("/".to_string()))) {
                 Ok(pages) => {
                     if pages
                         .iter()
@@ -1581,13 +1620,32 @@ impl CloudBackend {
     /// process's listing, reused for the check window (koto#439). Only a
     /// read takes a shared answer (`allow_shared`); a write's probe is a
     /// listing this process made, as it always was.
+    ///
+    /// The listing is one bounded ask ([`probe_ask`]) that ends within
+    /// [`PROBE_DEADLINE`], counted from when it starts, so a bucket that
+    /// accepts the request and never answers fails the probe in about 10 s
+    /// rather than holding the command for a minute (koto#605).
     fn probe_for(&self, id: &str, allow_shared: bool) -> anyhow::Result<ProbeAnswer> {
-        self.probe_with(id, allow_shared, |prefix| self.bucket.list(prefix, None))
+        self.probe_with(id, allow_shared, |prefix| {
+            let run = LookupRun::new(self.probes.limits);
+            let bucket = self.probe_bucket();
+            probe_ask(run, move || bucket.list(prefix, None))
+        })
+    }
+
+    /// The bucket the probe path's reads ask on: a copy of the sync bucket
+    /// with [`LOOKUP_REQUEST_TIMEOUT`] as its request timeout
+    /// ([`lookup_bucket`]), so a read koto stopped waiting for ends by
+    /// itself sooner. The sync bucket itself if the copy can't be made;
+    /// [`bounded_ask`] is the bound either way.
+    fn probe_bucket(&self) -> Box<Bucket> {
+        lookup_bucket(&self.bucket).unwrap_or_else(|_| self.bucket.clone())
     }
 
     /// [`CloudBackend::probe_for`], with the listing of `id`'s prefix made
-    /// by `list` when no answer is kept: the sync bucket's own listing, or
-    /// a lookup's bounded one ([`CloudBackend::located_probe`]).
+    /// by `list` when no answer is kept: one bounded ask
+    /// ([`CloudBackend::probe_for`]), or a lookup's bounded listing
+    /// ([`CloudBackend::located_probe`]).
     fn probe_with(
         &self,
         id: &str,
@@ -2174,6 +2232,45 @@ impl CloudBackend {
         }
     }
 
+    /// GET an object expected to exist, asked again while it fails with a
+    /// [transient](is_transient) error, as [`asked_retrying`] asks a
+    /// listing. `Ok(None)` is a 404; a response other than a 200 is a
+    /// failure of its status, so a 5xx the bucket answered is asked again.
+    fn fetch_object_retrying(&self, key: &str) -> Result<Option<Vec<u8>>, S3Error> {
+        let fetched = asked_retrying(
+            || {
+                let started = std::time::Instant::now();
+                match self.bucket.get_object(key) {
+                    Ok(response) if response.status_code() == 200 => Ok(response),
+                    Ok(response) => Err((
+                        S3Error::HttpFailWithBody(
+                            response.status_code(),
+                            String::from_utf8_lossy(response.bytes()).into_owned(),
+                        ),
+                        started.elapsed(),
+                    )),
+                    Err(e) => Err((e, started.elapsed())),
+                }
+            },
+            is_transient,
+        );
+        match fetched {
+            Ok(response) => Ok(Some(response.bytes().to_vec())),
+            Err((e, _)) if is_not_found(&e) => Ok(None),
+            Err((e, _)) => Err(e),
+        }
+    }
+
+    /// Where an import into `target` keeps the source's context keys it
+    /// has fetched and checked, so a run the bucket stopped partway leaves
+    /// them for the next. Like a staging directory, no session is named
+    /// like it.
+    fn fetched_dir(&self, target: &str) -> PathBuf {
+        self.local
+            .base_dir()
+            .join(format!(".import-fetched-{}", target))
+    }
+
     /// Fetch an object that may well be absent: list for it, and GET it
     /// only when the listing shows it.
     fn get_object_if_present(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -2366,6 +2463,18 @@ impl CloudBackend {
     /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
     /// the only requests a pull adds, and only when such a batch is there.
     fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
+        self.sync_pull_state_held(id, None)
+    }
+
+    /// [`CloudBackend::sync_pull_state`], for a caller that may already hold
+    /// the local log's append lock: with `held`, the replacement runs under
+    /// that guard instead of taking the lock again, which would wait on the
+    /// guard itself and come back busy.
+    fn sync_pull_state_held(
+        &self,
+        id: &str,
+        held: Option<&crate::engine::persistence::HeldLogLock>,
+    ) -> anyhow::Result<()> {
         let own_tick = self.ticks(id);
         // The tick pulls its own session once. From then on the writes it
         // and its commands make wait in its batch, and the local copy is
@@ -2513,49 +2622,67 @@ impl CloudBackend {
                 ));
             }
         }
-        refuse_cross_import_pull(id, &state_path, response.bytes())?;
-        // The fetched copy replaces the local log only when it holds every
-        // local event (koto#477). Another directory's copy, or one pushed
-        // before this host's last append went up, may lack some: the local
-        // log is kept then, stamped with the copy it extends so the next
-        // push goes up conditional on it, and a copy that holds events the
-        // local log lacks as well refuses rather than drop either side.
-        if let Ok(local) = std::fs::read(&state_path) {
-            let keep_local = match state_log::compare(&local, response.bytes()) {
-                state_log::LogOrder::Same
-                | state_log::LogOrder::RemoteExtends
-                | state_log::LogOrder::Unrelated => false,
-                // The same events under another header line: the bucket's
-                // header is newer only when the local file is still what this
-                // host last synced under this key.
-                state_log::LogOrder::HeaderOnly => {
-                    !self.stamp(id).is_some_and(|s| s.matches(&local))
+        // From reading the local log to replacing it, under the log's append
+        // lock: an append landing after the comparison read the log would
+        // otherwise be dropped by the replacement (koto#239). The copy goes
+        // in by temp file and rename, so no reader finds the log truncated.
+        let replace = || {
+            refuse_cross_import_pull(id, &state_path, response.bytes())?;
+            // The fetched copy replaces the local log only when it holds
+            // every local event (koto#477). Another directory's copy, or
+            // one pushed before this host's last append went up, may lack
+            // some: the local log is kept then, stamped with the copy it
+            // extends so the next push goes up conditional on it, and a
+            // copy that holds events the local log lacks as well refuses
+            // rather than drop either side.
+            if let Ok(local) = std::fs::read(&state_path) {
+                let keep_local = match state_log::compare(&local, response.bytes()) {
+                    state_log::LogOrder::Same
+                    | state_log::LogOrder::RemoteExtends
+                    | state_log::LogOrder::Unrelated => false,
+                    // The same events under another header line: the
+                    // bucket's header is newer only when the local file
+                    // is still what this host last synced under this key.
+                    state_log::LogOrder::HeaderOnly => {
+                        !self.stamp(id).is_some_and(|s| s.matches(&local))
+                    }
+                    state_log::LogOrder::LocalExtends => true,
+                    state_log::LogOrder::Diverged => {
+                        return Err(state_log::conflict(
+                            id,
+                            &key,
+                            "the pull was refused",
+                            &local,
+                            response.bytes(),
+                        ))
+                    }
+                };
+                if keep_local {
+                    self.record_synced(id, Some(&remote_etag), response.bytes(), false);
+                    return Ok(());
                 }
-                state_log::LogOrder::LocalExtends => true,
-                state_log::LogOrder::Diverged => {
-                    return Err(state_log::conflict(
-                        id,
-                        &key,
-                        "the pull was refused",
-                        &local,
-                        response.bytes(),
-                    ))
-                }
-            };
-            if keep_local {
-                self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-                return Ok(());
             }
+            crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
+                .with_context(|| {
+                    format!(
+                        "cloud sync: failed to write the pulled state of session '{}' to {}",
+                        id,
+                        state_path.display()
+                    )
+                })?;
+            self.record_synced(id, Some(&remote_etag), response.bytes(), false);
+            Ok(())
+        };
+        match held {
+            Some(held) => {
+                crate::engine::persistence::with_held_log_lock(held, &state_path, replace)
+            }
+            None => crate::engine::persistence::with_log_replace_lock(
+                &state_path,
+                crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+                replace,
+            ),
         }
-        std::fs::write(&state_path, response.bytes()).with_context(|| {
-            format!(
-                "cloud sync: failed to write the pulled state of session '{}' to {}",
-                id,
-                state_path.display()
-            )
-        })?;
-        self.record_synced(id, Some(&remote_etag), response.bytes(), false);
-        Ok(())
     }
 
     /// What a delete of `id`'s bucket copy needs from its local copy, read
@@ -3437,9 +3564,15 @@ impl CloudBackend {
     }
 
     /// Check if a session exists in S3 by looking for its state file.
+    ///
+    /// The HEAD is one bounded ask ([`probe_ask`]) that ends within
+    /// [`PROBE_DEADLINE`] (koto#605). Any failure, no answer in time
+    /// included, reads as absent.
     fn s3_session_exists(&self, id: &str) -> bool {
         let key = self.state_key(id);
-        self.bucket.head_object(&key).is_ok()
+        let bucket = self.probe_bucket();
+        let run = LookupRun::new(self.probes.limits);
+        probe_ask(run, move || bucket.head_object(key).map(|_| ())).is_ok()
     }
 
     /// DELETE `key`. Every delete this backend makes itself goes through
@@ -3645,6 +3778,13 @@ impl CloudBackend {
     /// from the tick on `id` or a command it runs, or inside a write window
     /// on it, the append joins the batch instead and the tick, or `koto
     /// session flush`, pushes it. The caller has run `local_guard`.
+    ///
+    /// The log's append lock is taken first, waiting as a plain append
+    /// waits, and the batch lock after it, the order `koto context add`
+    /// takes them in ([`CloudBackend::add_context_locked`]). An append that
+    /// held the batch lock while it waited for the append lock could wait
+    /// forever on a `context add` that holds the append lock and waits for
+    /// the batch lock.
     fn append_logged(
         &self,
         id: &str,
@@ -3652,14 +3792,104 @@ impl CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
+        let held = crate::engine::persistence::hold_log_lock_blocking(&self.local.state_path(id));
+        self.append_logged_held(id, payload, timestamp, held)
+    }
+
+    /// [`CloudBackend::append_logged`] under `held`, the local log's append
+    /// lock, which the caller took: the line goes in under it, and it is
+    /// released before the push, so no network round trip of the push runs
+    /// under it. The caller has run `local_guard`.
+    ///
+    /// The after-commit steps run with no lock held. They append a nested
+    /// `context_added`, which takes the append lock: run under the batch
+    /// lock, that is the batch lock then the append lock, the reverse of
+    /// every append's order, and two writers of one deferred session could
+    /// each wait on the other forever.
+    fn append_logged_held(
+        &self,
+        id: &str,
+        payload: &crate::engine::types::EventPayload,
+        timestamp: &str,
+        held: crate::engine::persistence::HeldLogLock,
+    ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
         self.check_fence(id)?;
         if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.append_event(id, payload, timestamp);
+            if let Some((journal, lock)) = self.open_batch(id)? {
+                let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+                drop(lock);
+                self.local.after_commit(id, payload, &commit);
+                return self.push_unless_batched(id, &journal);
             }
         }
-        self.local.append_event(id, payload, timestamp)?;
+        // Releases `held` once the line is in, before the after-commit
+        // steps and the push.
+        let commit = self.local.commit_event_held(id, held, payload, timestamp)?;
+        self.local.after_commit(id, payload, &commit);
         self.push_state_after_write(id)
+    }
+
+    /// After a deferred append's after-commit steps, which run with the
+    /// batch lock released: a flush that ran in that gap pushed the batch
+    /// without whatever those steps appended, so a batch found closed is
+    /// followed by a push at once, as an append outside a batch is. Its
+    /// lock is taken with no append lock held and released before the push.
+    fn push_unless_batched(&self, id: &str, journal: &Journal) -> anyhow::Result<()> {
+        let still_open = match journal.lock()? {
+            Some(_lock) => journal.is_open(),
+            None => false,
+        };
+        if still_open {
+            return Ok(());
+        }
+        self.push_state_after_write(id)
+    }
+
+    /// [`SessionBackend::add_context_locked`] with the wait for the local
+    /// log's append lock bounded by `wait`.
+    ///
+    /// The lock is taken once, before the pull, and passed to the pull's
+    /// replacement of the local log and to the append, so neither takes it
+    /// again; it is released before the push. Everything between runs under
+    /// it, the pull's requests and the store's upload included: a header
+    /// rewrite or another process's pull waits for it, for at most its own
+    /// bounded wait, and comes back busy if the bucket is slow.
+    ///
+    /// The batch lock, where a step takes it (the pull's flush of an open
+    /// batch, the store write or the append inside a tick or write window),
+    /// is taken after the append lock, the order [`CloudBackend::append_logged`]
+    /// takes them in. A header rewrite inside a batch takes them in the same
+    /// order (see `rewrite_header`), so no path holds the batch lock while
+    /// it waits for the append lock.
+    pub(crate) fn add_context_locked_within(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &crate::engine::types::EventPayload,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        // Before the lock and the pull, as `read_header` checks it, so a
+        // migrated session's local directory gains nothing.
+        self.check_not_migrated(id)?;
+        let held = crate::engine::persistence::hold_log_lock(&self.local.state_path(id), wait)?;
+        self.sync_pull_state_held(id, Some(&held))?;
+        let header = self.local.read_header(id)?;
+        self.note_epoch_read(id, &header);
+        store_write()?;
+        self.local_guard(id)?;
+        // A `context_added` is never spooled; the check is the one
+        // `append_event` makes, kept so this path spools whatever it does.
+        if crate::session::read_spool::spooled(event) && !self.is_own_tick(id) {
+            drop(held);
+            return crate::session::read_spool::append(
+                &self.local.session_dir(id),
+                timestamp,
+                event,
+            );
+        }
+        self.append_logged_held(id, event, timestamp, held)
     }
 
     /// Push `id`'s state file after a write of its log, as
@@ -3907,18 +4137,24 @@ impl CloudBackend {
             .iter()
             .filter(|key| !is_host_local_key(key) && !withheld.contains(key))
             .partition(|key| manifest.keys.contains_key(key.as_str()));
-        let ctx_dir = self.local.session_dir(id).join("ctx");
+        let session_dir = self.local.session_dir(id);
+        let ctx_dir = session_dir.join("ctx");
         let ctx_key = |key: &str| format!("{}/{}/ctx/{}", self.home(id), id, key);
+        // A window key a plain write left owed before is owed no more once
+        // its object went up here.
         in_parallel(&present, |key| {
             let path = ctx_dir.join(key.as_str());
             let data =
                 std::fs::read(&path).with_context(|| format!("reading context key '{}'", key))?;
-            self.put_object(&ctx_key(key), &data)
+            self.put_object(&ctx_key(key), &data)?;
+            sync_stamp::clear_owed(&session_dir, key, &sync_stamp::sha256_hex(&data))
         })?;
         if !pending.keys.is_empty() {
-            if let Some(data) =
-                sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
-            {
+            // The objects of keys owed from earlier pushes go first, and the
+            // manifest leaves out any still owed (koto#646); those are
+            // warnings, since this window's own keys all went up.
+            sync::push_owed_warning(&self.local, &self.bucket, &self.home(id), id, &withheld);
+            if let Some(data) = sync::bucket_manifest_of(&session_dir, &withheld)? {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
                 crate::session::sync_stamp::note_synced(
                     &self.local.session_dir(id),
@@ -4316,8 +4552,10 @@ impl CloudBackend {
         // batch flush uses. Host-local keys stay on this host, and files in
         // `ctx/` the manifest doesn't name (its lock) are not context. A key
         // the manifest names with no content file here refuses the push
-        // rather than send a manifest naming it; a failed upload is a
-        // warning, as every push here always was. When the listing or the
+        // rather than send a manifest naming it. A key whose upload the
+        // bucket doesn't confirm is recorded owed, so the manifest leaves
+        // it out, and the push fails naming it once the state file and
+        // `version.json` went up (koto#646). When the listing or the
         // manifest can't be read, every key goes up.
         // A fresh probe and manifest, not this process's cached ones: the
         // comparison below decides what is skipped.
@@ -4347,23 +4585,49 @@ impl CloudBackend {
             // A pin record this copy indexes goes up as its own object,
             // below, and leaves the index. A continues relation whose
             // pointer isn't confirmed stays here until it is.
-            if is_host_local_key(key) || is_pin_record_key(key) || withheld.contains(key) || held {
+            if is_host_local_key(key) || is_pin_record_key(key) || withheld.contains(key) {
+                continue;
+            }
+            // The bucket holds this very copy: owed no more.
+            if held {
+                sync_stamp::clear_owed(&session_dir, key, &meta.hash)?;
                 continue;
             }
             let data = std::fs::read(ctx_dir.join(key))
                 .with_context(|| format!("reading context key '{}'", key))?;
             uploads.push((key.clone(), data));
         }
+        // The uploads take the bucket directly, past `put_object`'s check.
+        if !uploads.is_empty() {
+            self.refuse_if_read_only(&format!("S3 PUT of the context of {}", id))?;
+        }
+        let failed: Mutex<Vec<(String, String)>> = Mutex::default();
         let _ = in_parallel(&uploads, |(name, data)| {
             let s3_key = format!("{}/{}/ctx/{}", self.home(id), id, name);
-            if let Err(e) = self.put_object(&s3_key, data) {
-                eprintln!("warning: cloud sync: failed to upload ctx/{}: {}", name, e);
+            let hash = sync_stamp::sha256_hex(data);
+            let sent = match sync::put_confirmed(&self.bucket, &s3_key, data) {
+                Ok(()) => sync_stamp::clear_owed(&session_dir, name, &hash),
+                Err(e) => {
+                    let why = without_url_userinfo(&e.to_string());
+                    Err(match sync_stamp::mark_owed(&session_dir, name, &hash) {
+                        Ok(()) => anyhow::anyhow!("{why}"),
+                        Err(m) => {
+                            anyhow::anyhow!("{why}; recording the key as owed failed too: {m:#}")
+                        }
+                    })
+                }
+            };
+            if let Err(e) = sent {
+                failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((name.clone(), format!("{:#}", e)));
             }
             Ok(())
         });
+        let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
         self.carry_pin_records(id);
-        if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
-        {
+        if let Some(data) = sync::bucket_manifest_of(&session_dir, &withheld)? {
             let s3_key = format!("{}/{}/ctx/manifest.json", self.home(id), id);
             if let Err(e) = self.put_object(&s3_key, &data) {
                 eprintln!(
@@ -4384,6 +4648,23 @@ impl CloudBackend {
 
         self.push_version(id)?;
 
+        if !failed.is_empty() {
+            let keys: Vec<String> = failed
+                .iter()
+                .map(|(key, why)| format!("'{}' ({})", key, why))
+                .collect();
+            let (noun, them) = if failed.len() == 1 {
+                ("key", "it")
+            } else {
+                ("keys", "them")
+            };
+            anyhow::bail!(
+                "cloud sync: the upload of context {noun} {} of session '{id}' to the bucket \
+                 failed; the bucket's manifest leaves {them} out until a later push uploads \
+                 {them}, so run the command again once the bucket answers",
+                keys.join(", "),
+            );
+        }
         Ok(())
     }
 
@@ -4397,8 +4678,16 @@ impl CloudBackend {
         if let Ok(response) = self.bucket.get_object(&state_key) {
             if response.status_code() == 200 {
                 let state_path = session_dir.join(state_file_name(id));
-                refuse_cross_import_pull(id, &state_path, response.bytes())?;
-                std::fs::write(&state_path, response.bytes())?;
+                // Under the log's append lock, replaced by temp file and
+                // rename, as `sync_pull_state` replaces it (koto#239).
+                crate::engine::persistence::with_log_replace_lock(
+                    &state_path,
+                    crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+                    || {
+                        refuse_cross_import_pull(id, &state_path, response.bytes())?;
+                        crate::engine::persistence::replace_log_bytes(&state_path, response.bytes())
+                    },
+                )?;
             }
         }
 
@@ -4431,7 +4720,9 @@ impl CloudBackend {
                                 if let Some(parent) = local_path.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
-                                if crate::decisions::is_decision_area_key(file_name) {
+                                // Decisions and the supersede marker are
+                                // write-once: a pull never overwrites one.
+                                if crate::decisions::is_write_once_key(file_name) {
                                     pull_decision_copy(
                                         &session_dir,
                                         &local_path,
@@ -4657,6 +4948,22 @@ impl SessionBackend for CloudBackend {
         self.append_logged(id, payload, timestamp)
     }
 
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &crate::engine::types::EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.add_context_locked_within(
+            id,
+            store_write,
+            event,
+            timestamp,
+            crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+        )
+    }
+
     /// The read ran in `id`'s own tick, as its reader judged: into the log
     /// and pushed, like any event, with no spool backstop.
     fn append_own_read(
@@ -4730,6 +5037,12 @@ impl SessionBackend for CloudBackend {
     /// The rewrite is fenced like an append, and the epoch it leaves is the
     /// one this process has read from then on, so a rebind's own process
     /// isn't fenced off by the epoch it just bumped.
+    ///
+    /// A deferred rewrite takes the log's append lock before the batch lock,
+    /// the order every append takes them in, and rewrites under the lock it
+    /// holds. Waiting for the append lock while holding the batch lock would
+    /// stall behind an append that holds the append lock and waits for the
+    /// batch lock, until the bounded wait gave up.
     fn rewrite_header(
         &self,
         id: &str,
@@ -4737,16 +5050,24 @@ impl SessionBackend for CloudBackend {
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
         self.check_fence(id)?;
+        if self.defers(id) {
+            let path = self.local.state_path(id);
+            let held = crate::engine::persistence::hold_log_lock(
+                &path,
+                crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+            )?;
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                crate::engine::claim::rewrite_header_atomically_held(&held, &path, f)?;
+                drop(held);
+                self.note_epoch_read(id, &self.local.read_header(id)?);
+                return Ok(());
+            }
+        }
         let rewrite = || -> anyhow::Result<()> {
             self.local.rewrite_header(id, f)?;
             self.note_epoch_read(id, &self.local.read_header(id)?);
             Ok(())
         };
-        if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return rewrite();
-            }
-        }
         rewrite()?;
         self.push_state_after_write(id)
     }
@@ -5071,6 +5392,66 @@ impl CloudBackend {
         Ok(())
     }
 
+    /// [`CloudBackend::add_as`] for `koto context add`: an upload the
+    /// bucket doesn't confirm is the error, naming the key, rather than a
+    /// warning (koto#646). The content stays on this host, owed, out of
+    /// the bucket's manifest until a later push uploads it.
+    fn add_confirmed_as(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self.store_key(session, key, Some((content, Some(writer))))? {
+            KeyPush::Failed(e) => Err(anyhow::anyhow!(
+                "cloud sync: context key '{}' of session '{}' is stored on this host, but its \
+                 upload to the bucket failed and the bucket's manifest leaves it out until a \
+                 later push uploads it; run the command again once the bucket answers: {:#}",
+                key,
+                session,
+                e
+            )),
+            KeyPush::Pushed | KeyPush::Batched | KeyPush::Withheld => Ok(()),
+        }
+    }
+
+    /// Mark `key` of `session` owed before a write that pushes at once
+    /// ([`CloudBackend::store_key`]): at the hash of `content`, or, for a
+    /// push of the copy this host holds (`None`), of that copy. A key with
+    /// no copy here has nothing to push and is not marked.
+    fn mark_owed_before_write(
+        &self,
+        session: &str,
+        key: &str,
+        content: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        // Refused here as the write would refuse it, so no key that isn't
+        // one is ever recorded, nor read back by a later push.
+        crate::session::validate::validate_context_key(key)?;
+        let dir = self.local.session_dir(session);
+        let hash = match content {
+            // The write that follows makes the session's directory when it
+            // isn't there yet; the mark goes in it first.
+            Some(content) => {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                sync_stamp::sha256_hex(content)
+            }
+            None => match std::fs::read(dir.join("ctx").join(key)) {
+                Ok(held) => sync_stamp::sha256_hex(&held),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e).with_context(|| format!("reading context key '{}'", key)),
+            },
+        };
+        sync_stamp::mark_owed(&dir, key, &hash).with_context(|| {
+            format!(
+                "recording context key '{}' as owed to the bucket before writing it",
+                key
+            )
+        })
+    }
+
     /// [`CloudBackend::add_as`], saying how the key went up. With `write`
     /// the key is written locally first; without it the copy this host
     /// holds goes up as it is, as a read's push of a kept copy does. A
@@ -5088,6 +5469,7 @@ impl CloudBackend {
             crate::session::links::check_writer_key(key, writer)?;
         }
         self.check_not_migrated_to_write(session)?;
+        let content = write.map(|(content, _)| content);
         let write = || match write {
             Some((content, Some(w))) => self.local.add_with_writer(session, key, content, w),
             Some((content, None)) => self.local.add(session, key, content),
@@ -5119,6 +5501,15 @@ impl CloudBackend {
             }
         }
         self.settle_batch(session)?;
+        // Owed before it is written (koto#646): until the bucket confirms
+        // the object, no manifest koto uploads names the key, whether this
+        // process uploads it or another one pushes between this write and
+        // the upload, and a process stopped during the upload leaves it
+        // owed. The push clears it once the object is confirmed; a mark
+        // that can't be written refuses the write.
+        if !is_pin_record_key(key) {
+            self.mark_owed_before_write(session, key, content)?;
+        }
         write()?;
 
         // Check version before pushing. Conflicts are hard errors;
@@ -5128,6 +5519,9 @@ impl CloudBackend {
         let home = self.home(session);
         let withheld = sync::withheld_keys(&self.local, &home, session);
         let pushed = if is_pin_record_key(key) || withheld.iter().any(|w| w == key) {
+            // A withheld key stays owed: once it may go up, the push that
+            // sends it, or the next push of any key, uploads its object
+            // before a manifest names it.
             KeyPush::Withheld
         } else {
             match sync::try_push_context_key(
@@ -5284,9 +5678,14 @@ impl CloudBackend {
         let ctx_dir = dir.join("ctx");
         let failed: Mutex<Vec<(String, String)>> = Mutex::default();
         let _ = in_parallel(&held, |key| {
+            // A key this host owed the bucket is owed no more once its
+            // object is up.
             let sent = std::fs::read(ctx_dir.join(key))
                 .with_context(|| format!("reading context key '{}'", key))
-                .and_then(|data| self.put_object(&format!("{}/{}/ctx/{}", home, id, key), &data));
+                .and_then(|data| {
+                    self.put_object(&format!("{}/{}/ctx/{}", home, id, key), &data)?;
+                    sync_stamp::clear_owed(&dir, key, &sync_stamp::sha256_hex(&data))
+                });
             if let Err(e) = sent {
                 failed
                     .lock()
@@ -5343,62 +5742,21 @@ enum KeyPush {
     Failed(anyhow::Error),
 }
 
-/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
-/// session imported elsewhere neither reads nor writes its keys here: the
-/// methods that return a `Result` refuse with `SessionMigrated`, while
-/// `ctx_exists` answers false and `meta` none, having no room for a
-/// reason. The answer is cached per session, so a command that touches
-/// many keys pays for it once.
-impl ContextStore for CloudBackend {
-    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
-        self.add_as(session, key, content, None)
+impl CloudBackend {
+    /// [`ContextStore::get`] that never writes to the bucket: a key whose
+    /// copy here is newer than the bucket's, or that the bucket lacks, is
+    /// read from here and left as it is, where `get` would push it.
+    /// `koto session origin` reads link bodies through this, since a read
+    /// verb that writes nothing must not repair the bucket as it reads. It
+    /// still pulls a newer remote copy into this host's mirror, as every
+    /// read does.
+    pub fn get_without_push(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_keyed(session, key, false)
     }
 
-    fn add_with_writer(
-        &self,
-        session: &str,
-        key: &str,
-        content: &[u8],
-        writer: &str,
-    ) -> anyhow::Result<()> {
-        self.add_as(session, key, content, Some(writer))
-    }
-
-    /// The local metadata, or for a key only the remote store has, the
-    /// remote manifest's.
-    ///
-    /// A migrated session has no metadata to give: `None`.
-    fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
-        if self.check_not_migrated(session).is_err() {
-            return None;
-        }
-        if let Some(meta) = self.local.meta(session, key) {
-            return Some(meta);
-        }
-        if !crate::session::context_log::loggable_key(key) || is_host_local_key(key) {
-            return None;
-        }
-        if self
-            .pending_keys(session)
-            .is_some_and(|pending| pending.touches(key))
-        {
-            return None;
-        }
-        // A session with no home has no manifest here to merge (koto#457).
-        if self.home_prefix(session).is_err() {
-            return None;
-        }
-        self.prime_manifest(session);
-        sync::remote_key_meta(
-            &self.bucket,
-            &self.home(session),
-            session,
-            key,
-            &self.manifest_cache,
-        )
-    }
-
-    fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+    /// The body of [`ContextStore::get`]; `push_kept` says whether a key
+    /// this host holds a newer copy of, or the bucket lacks, is pushed.
+    fn get_keyed(&self, session: &str, key: &str, push_kept: bool) -> anyhow::Result<Vec<u8>> {
         self.check_not_migrated(session)?;
         // A key an open batch wrote is read as the batch left it, and a
         // host-local key only ever lives here.
@@ -5463,11 +5821,81 @@ impl ContextStore for CloudBackend {
                     );
                 }
             }
-            sync::Pull::LocalNewer => self.push_kept_key(session, key, false)?,
-            sync::Pull::LocalOnly => self.push_kept_key(session, key, true)?,
-            sync::Pull::Unchanged => {}
+            sync::Pull::LocalNewer if push_kept => self.push_kept_key(session, key, false)?,
+            sync::Pull::LocalOnly if push_kept => self.push_kept_key(session, key, true)?,
+            sync::Pull::LocalNewer | sync::Pull::LocalOnly | sync::Pull::Unchanged => {}
         }
         self.local.get(session, key)
+    }
+}
+
+/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
+/// session imported elsewhere neither reads nor writes its keys here: the
+/// methods that return a `Result` refuse with `SessionMigrated`, while
+/// `ctx_exists` answers false and `meta` none, having no room for a
+/// reason. The answer is cached per session, so a command that touches
+/// many keys pays for it once.
+impl ContextStore for CloudBackend {
+    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+        self.add_as(session, key, content, None)
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_as(session, key, content, Some(writer))
+    }
+
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_confirmed_as(session, key, content, writer)
+    }
+
+    /// The local metadata, or for a key only the remote store has, the
+    /// remote manifest's.
+    ///
+    /// A migrated session has no metadata to give: `None`.
+    fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
+        if self.check_not_migrated(session).is_err() {
+            return None;
+        }
+        if let Some(meta) = self.local.meta(session, key) {
+            return Some(meta);
+        }
+        if !crate::session::context_log::loggable_key(key) || is_host_local_key(key) {
+            return None;
+        }
+        if self
+            .pending_keys(session)
+            .is_some_and(|pending| pending.touches(key))
+        {
+            return None;
+        }
+        // A session with no home has no manifest here to merge (koto#457).
+        if self.home_prefix(session).is_err() {
+            return None;
+        }
+        self.prime_manifest(session);
+        sync::remote_key_meta(
+            &self.bucket,
+            &self.home(session),
+            session,
+            key,
+            &self.manifest_cache,
+        )
+    }
+
+    fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_keyed(session, key, true)
     }
 
     /// A migrated session holds no key here: `false`. Callers that must
@@ -5511,6 +5939,14 @@ impl ContextStore for CloudBackend {
         self.check_fence(session)?;
         // A copy this host writes again later is one the home never had.
         crate::session::sync_stamp::forget_synced(&self.local.session_dir(session), key);
+        // A removed key owes the bucket nothing, once it is gone here. Kept
+        // owed when the record can't be changed, a later push drops it,
+        // finding no copy here.
+        let forget_owed = || {
+            if let Err(e) = sync_stamp::forget_owed(&self.local.session_dir(session), key) {
+                eprintln!("warning: cloud sync: {:#}", e);
+            }
+        };
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
                 journal.record(
@@ -5519,12 +5955,15 @@ impl ContextStore for CloudBackend {
                         key: key.to_string(),
                     },
                 )?;
-                return self.local.remove(session, key);
+                self.local.remove(session, key)?;
+                forget_owed();
+                return Ok(());
             }
         }
         self.settle_batch(session)?;
         let held_locally = self.local.ctx_exists(session, key);
         self.local.remove(session, key)?;
+        forget_owed();
 
         // A key neither copy has leaves nothing to delete or to drop from
         // the manifest: the removal is a no-op, as it is locally, and costs
@@ -5626,6 +6065,11 @@ pub enum ImportErrorCode {
     TemplateUnavailable,
     /// A source object couldn't be read, or failed validation.
     SourceUnreadable,
+    /// A source context key couldn't be fetched because the bucket didn't
+    /// answer: a dropped connection, a timeout, a throttle or a 5xx, still
+    /// failing after retries. A retry after a backoff can clear it, and
+    /// the keys fetched before it are kept for the re-run.
+    SourceUnreachable,
     /// Building the imported session here, pushing it under this
     /// workspace's prefix or moving it into place failed, or something the
     /// import needs on this side couldn't be read: this machine's id, the
@@ -5650,6 +6094,9 @@ pub enum ImportErrorCode {
     /// A re-run found the copy already built, holding a continues relation
     /// that names another session than the source. Nothing was changed.
     RelationConflict,
+    /// The source's log records a background run no tick has settled: it
+    /// may still be running on the source's host, holding a pool slot.
+    BackgroundRunInFlight,
 }
 
 impl ImportErrorCode {
@@ -5664,9 +6111,11 @@ impl ImportErrorCode {
             ImportErrorCode::NameTaken => "import_name_taken",
             ImportErrorCode::TemplateUnavailable => "import_template_unavailable",
             ImportErrorCode::SourceUnreadable => "import_source_unreadable",
+            ImportErrorCode::SourceUnreachable => "import_source_unreachable",
             ImportErrorCode::PushFailed => "import_push_failed",
             ImportErrorCode::Unmarked => "import_unmarked",
             ImportErrorCode::SourceRunning => "import_source_running",
+            ImportErrorCode::BackgroundRunInFlight => "background_run_in_flight",
             ImportErrorCode::SourceUnpushed => "import_source_unpushed",
             ImportErrorCode::SourceHasChildren => "import_source_has_children",
             ImportErrorCode::RelationConflict => "relation_conflict",
@@ -5687,8 +6136,10 @@ impl ImportErrorCode {
             | ImportErrorCode::SourceRunning
             | ImportErrorCode::SourceUnpushed
             | ImportErrorCode::SourceHasChildren
-            | ImportErrorCode::RelationConflict => 2,
+            | ImportErrorCode::RelationConflict
+            | ImportErrorCode::BackgroundRunInFlight => 2,
             ImportErrorCode::SourceUnreadable
+            | ImportErrorCode::SourceUnreachable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
         }
@@ -5874,6 +6325,18 @@ struct ImportSource {
 }
 
 impl ImportSource {
+    /// The id of a background run the source's log records as started and
+    /// never settled by `background_finished`.
+    fn unsettled_run(&self) -> Option<String> {
+        let events: Vec<crate::engine::types::Event> = self
+            .log
+            .event_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        crate::engine::types::unsettled_background_run(&events)
+    }
+
     /// The bucket key of `rest` under the source session.
     fn key(&self, rest: &str) -> String {
         format!("{}{}", self.session, rest)
@@ -6040,6 +6503,24 @@ impl Drop for Staging {
     }
 }
 
+/// The context keys an import has fetched and checked, kept in
+/// `.import-fetched-<target>` while it runs. Removed when dropped unless
+/// `for_rerun` says the bucket couldn't be reached, so a refusal a re-run
+/// can't finish leaves nothing behind. A failure to remove them costs only
+/// disk: a later run checks every kept key against its manifest first.
+struct KeptFetches {
+    dir: PathBuf,
+    for_rerun: bool,
+}
+
+impl Drop for KeptFetches {
+    fn drop(&mut self) {
+        if !self.for_rerun {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 /// Create the directory `path`, mode 0700, failing when anything is
 /// already there: not recursive, so the directory is the caller's alone.
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -6165,6 +6646,26 @@ impl CloudBackend {
                     ))
                 }
             };
+        }
+
+        // A new import of a session whose background run hasn't been
+        // settled would carry a log that says the run is going, to a host
+        // that can't read it (PRD R24). The source's own host settles it on
+        // its next tick, or `koto cancel` there stops it. The log decides,
+        // not the run's locks: those live on the source's host, which this
+        // one usually can't probe. A source whose host is gone for good
+        // stays refused until its log is settled there; no import guesses
+        // that a run it can't see has ended.
+        if let Some(run_id) = source.unsettled_run() {
+            return Err(ImportError::new(
+                ImportErrorCode::BackgroundRunInFlight,
+                format!(
+                    "session '{}' in workspace {} has background run '{}' in flight, by its \
+                     log; tick it on its own host once the run has ended (or cancel it there), \
+                     then import again",
+                    source.name, source.workspace, run_id
+                ),
+            ));
         }
 
         if self.is_takeover(req, &source) {
@@ -6769,29 +7270,94 @@ impl CloudBackend {
         let staging = Staging { dir, moved: false };
         let dir = staging.dir.as_path();
 
-        // Context keys, one fetched and written at a time. The manifest says
-        // each exists, so each is one GET with no listing first.
+        // Context keys. The manifest says each exists, so each is one GET
+        // with no listing first, asked again while the bucket fails
+        // transiently and sent FLUSH_PARALLELISM at a time. Each key whose
+        // size and hash match the manifest is kept in
+        // `.import-fetched-<target>` as it lands, and a run reuses every
+        // kept key that still matches, so a re-run after a failed read
+        // fetches only what's left.
         let ctx_dir = dir.join("ctx");
         std::fs::create_dir_all(&ctx_dir).map_err(|e| write_failed(&ctx_dir, &e))?;
-        for (key, meta) in &manifest.keys {
-            let what = format!("context key {:?}", key);
-            let bytes = self
-                .fetch_object(&source.key(&format!("ctx/{}", key)))
-                .map_err(|e| source.unreadable(&what, &e))?
-                .ok_or_else(|| {
-                    source.unreadable(&what, &"the manifest lists it but the object is missing")
-                })?;
-            if bytes.len() as u64 != meta.size || crate::cache::sha256_hex(&bytes) != meta.hash {
-                return Err(
-                    source.unreadable(&what, &"its size or SHA-256 doesn't match the manifest")
-                );
-            }
-            let path = ctx_dir.join(key);
+        let fetched_dir = self.fetched_dir(target);
+        if !fetched_dir.is_dir() {
+            create_private_dir(&fetched_dir).map_err(|e| write_failed(&fetched_dir, &e))?;
+        }
+        // The kept keys outlive this call only when the bucket couldn't be
+        // reached, the one refusal a re-run can finish. Any other way out
+        // removes them: a missing or corrupt object refuses the re-run too,
+        // and once every key is copied into staging they aren't needed.
+        let mut kept = KeptFetches {
+            dir: fetched_dir.clone(),
+            for_rerun: false,
+        };
+        let matches = |bytes: &[u8], size: u64, hash: &str| {
+            bytes.len() as u64 == size && crate::cache::sha256_hex(bytes) == hash
+        };
+        let missing: Vec<(&String, u64, &str)> = manifest
+            .keys
+            .iter()
+            .map(|(key, meta)| (key, meta.size, meta.hash.as_str()))
+            .filter(|(key, size, hash)| {
+                !std::fs::read(fetched_dir.join(key))
+                    .is_ok_and(|bytes| matches(&bytes, *size, hash))
+            })
+            .collect();
+        let keep = |path: &Path, bytes: &[u8]| -> Result<(), ImportError> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
             }
-            std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
+            std::fs::write(path, bytes).map_err(|e| write_failed(path, &e))
+        };
+        let total = manifest.keys.len();
+        let mut held = total - missing.len();
+        for chunk in missing.chunks(FLUSH_PARALLELISM) {
+            let results = each_in_parallel(chunk, |(key, _, _)| {
+                Ok(self.fetch_object_retrying(&source.key(&format!("ctx/{}", key))))
+            });
+            let mut failure = None;
+            for ((key, size, hash), result) in chunk.iter().zip(results) {
+                let what = format!("context key {:?}", key);
+                let err =
+                    match result {
+                        Ok(Ok(Some(bytes))) if matches(&bytes, *size, hash) => {
+                            keep(&fetched_dir.join(key), &bytes)?;
+                            held += 1;
+                            continue;
+                        }
+                        Ok(Ok(Some(_))) => source
+                            .unreadable(&what, &"its size or SHA-256 doesn't match the manifest"),
+                        Ok(Ok(None)) => source
+                            .unreadable(&what, &"the manifest lists it but the object is missing"),
+                        Ok(Err(e)) if is_transient(&e) => ImportError::new(
+                            SourceUnreachable,
+                            format!(
+                                "could not reach the bucket for {} of session '{}': {}",
+                                what, source.name, e
+                            ),
+                        ),
+                        Ok(Err(e)) => source.unreadable(&what, &e),
+                        Err(e) => source.unreadable(&what, &e),
+                    };
+                failure.get_or_insert(err);
+            }
+            if let Some(mut err) = failure {
+                if err.code == SourceUnreachable {
+                    kept.for_rerun = true;
+                    err.message.push_str(&format!(
+                        "; {} of {} context keys are kept for a re-run, which fetches only the rest",
+                        held, total
+                    ));
+                }
+                return Err(err);
+            }
         }
+        for key in manifest.keys.keys() {
+            let from = fetched_dir.join(key);
+            let bytes = std::fs::read(&from).map_err(|e| write_failed(&from, &e))?;
+            keep(&ctx_dir.join(key), &bytes)?;
+        }
+        drop(kept);
         // The source's pin and release record, as the bucket holds them,
         // carried verbatim, an unreadable pin included (R25). They stay out
         // of the copy's manifest, as on every cloud copy (R20a), and
@@ -7207,7 +7773,8 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
 }
 
 /// A copy of `bucket` whose requests time out after
-/// [`LOOKUP_REQUEST_TIMEOUT`], for a lookup's small reads. It keeps the
+/// [`LOOKUP_REQUEST_TIMEOUT`], for a lookup's or a probe's small reads
+/// ([`CloudBackend::probe_bucket`]). It keeps the
 /// bucket's name, endpoint, credentials and addressing.
 ///
 /// That timeout starts only once the connection is up, so it isn't the
@@ -7242,7 +7809,7 @@ fn is_answered_failure(e: &S3Error) -> bool {
 /// with a [throttle or a failure on its side](is_answered_failure), or the
 /// connection failed. A refusal such as a 403, or an answer koto can't
 /// parse, would only fail again.
-fn is_transient(e: &S3Error) -> bool {
+pub(crate) fn is_transient(e: &S3Error) -> bool {
     is_answered_failure(e) || matches!(e, S3Error::Atto(_) | S3Error::Io(_))
 }
 
@@ -7384,7 +7951,8 @@ impl Drop for RequestSlot {
 }
 
 /// The limits a lookup's asks run under: [`LookupLimits::lookup`] for a
-/// command, and short ones in tests, each with request slots of its own.
+/// command, [`LookupLimits::probe`] for the probe path's reads, and short
+/// ones in tests, each with request slots of its own.
 #[derive(Clone, Copy)]
 struct LookupLimits {
     /// The longest koto waits for one ask ([`bounded_ask`]).
@@ -7409,12 +7977,25 @@ impl LookupLimits {
             slots: &LOOKUP_SLOTS,
         }
     }
+
+    /// The probe path's limits: one ask of [`LOOKUP_REQUEST_TIMEOUT`]
+    /// within [`PROBE_DEADLINE`], on slots of its own ([`PROBE_SLOTS`]).
+    /// Its reads make one listing or HEAD at a time, so the fanout is 1.
+    fn probe() -> Self {
+        LookupLimits {
+            ask_deadline: LOOKUP_REQUEST_TIMEOUT,
+            deadline: PROBE_DEADLINE,
+            fanout: 1,
+            slots: &PROBE_SLOTS,
+        }
+    }
 }
 
 /// One lookup ([`CloudBackend::check_located`]'s, for a name with no local
 /// copy): its limits, and when it began, which is where its deadline counts
 /// from. Every read of the lookup asks within it: the own-prefix probe, the
 /// index, declaration and top-level reads, and every [`any_holds`] listing.
+/// One of the probe path's reads ([`probe_ask`]) runs within one too.
 #[derive(Clone, Copy)]
 struct LookupRun {
     limits: LookupLimits,
@@ -7518,6 +8099,9 @@ fn whole_ms(d: std::time::Duration) -> std::time::Duration {
 /// read deadline, and usually less ([`LookupRun::wait`]). When both are
 /// 10 s either can fire first; both failures are transient and are asked
 /// again alike, so the tie needs no breaking.
+///
+/// A lookup's reads ask through here, and so do the probe path's
+/// ([`probe_ask`]), which ask once.
 fn bounded_ask<T: Send + 'static>(
     run: LookupRun,
     wait: std::time::Duration,
@@ -7557,6 +8141,26 @@ fn bounded_ask<T: Send + 'static>(
             Err(S3Error::Io(std::io::Error::other(ended)))
         }
     }
+}
+
+/// One of the probe path's reads (koto#605): `request` asked once
+/// ([`bounded_ask`]), waiting at most [`LookupRun::wait`]. A read whose
+/// `run` has no time left isn't asked and fails as a [`timed_out`] one.
+/// No retry of koto's own: rust-s3's single retry still runs inside the
+/// ask, so a failure costs the requests it always did, only bounded.
+///
+/// For reads only, as [`bounded_ask`] is.
+fn probe_ask<T: Send + 'static>(
+    run: LookupRun,
+    request: impl FnOnce() -> Result<T, S3Error> + Send + 'static,
+) -> Result<T, S3Error> {
+    let Some(wait) = run.wait() else {
+        return Err(timed_out(format!(
+            "not asked: koto stopped waiting at the probe's {:?} deadline",
+            whole_ms(run.limits.deadline)
+        )));
+    };
+    bounded_ask(run, wait, request)
 }
 
 /// [`asked_retrying`]'s policy for one of a lookup's reads, where `ask`
@@ -8451,6 +9055,56 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// An import refuses a source whose log has a background run no tick
+    /// settled, and takes one whose every run was settled (PRD R24).
+    #[test]
+    fn an_unsettled_background_run_is_found_in_the_source_log() {
+        use crate::engine::types::{BackgroundFinished, BackgroundStarted, Event, EventPayload};
+        let event = |seq: u64, payload: EventPayload| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let started = |id: &str| {
+            EventPayload::BackgroundStarted(BackgroundStarted {
+                state: "test".into(),
+                run_id: id.into(),
+                machine: "alpha".into(),
+                boot_id: None,
+                pool: Some("test-suite".into()),
+            })
+        };
+        let finished = |id: &str| {
+            EventPayload::BackgroundFinished(BackgroundFinished {
+                state: "test".into(),
+                run_id: id.into(),
+                outcome: "done".into(),
+            })
+        };
+        let lines: Vec<String> = [
+            event(1, started("r1")),
+            event(2, finished("r1")),
+            event(3, started("r2")),
+        ]
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+        let events: Vec<Event> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events).as_deref(),
+            Some("r2")
+        );
+        assert_eq!(
+            crate::engine::types::unsettled_background_run(&events[..2]),
+            None
+        );
+    }
+
     /// Create a CloudBackend backed by a temp directory and a bucket pointing
     /// at a fake endpoint. S3 operations will fail, exercising the non-fatal
     /// error handling paths.
@@ -8467,7 +9121,11 @@ mod tests {
         let credentials =
             Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
         let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
-        CloudBackend::with_parts(local, bucket, "test-prefix".to_string())
+        let mut backend = CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+        // Every probe-path read fails here; a short deadline keeps a host
+        // whose connects to it hang from waiting the full one.
+        backend.probes.limits = test_limits(ms(500), ms(500), 1);
+        backend
     }
 
     /// Helper: write a minimal state file header into a session directory.
@@ -9825,6 +10483,174 @@ mod tests {
         );
     }
 
+    // -- the probe path's reads (koto#605) --
+
+    #[test]
+    fn probe_limits_wait_one_full_ask_and_keep_slots_of_their_own() {
+        let probe = LookupLimits::probe();
+        assert_eq!(probe.ask_deadline, LOOKUP_REQUEST_TIMEOUT);
+        assert_eq!(probe.ask_deadline, std::time::Duration::from_secs(10));
+        assert_eq!(probe.deadline, PROBE_DEADLINE);
+        assert_eq!(probe.deadline, std::time::Duration::from_secs(10));
+        assert!(
+            probe.deadline >= probe.ask_deadline,
+            "the deadline cuts the probe's one ask short"
+        );
+        assert!(std::ptr::eq(probe.slots, &PROBE_SLOTS));
+        assert!(!std::ptr::eq(probe.slots, &LOOKUP_SLOTS));
+        assert_eq!(probe.slots.limit, PROBE_LIVE_REQUESTS);
+
+        // A backend asks its probes under them, until a test sets others.
+        let tmp = TempDir::new().unwrap();
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: "http://192.0.2.1:19000".to_string(),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let backend = CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+        assert_eq!(backend.probes.limits.deadline, PROBE_DEADLINE);
+        assert!(std::ptr::eq(backend.probes.limits.slots, &PROBE_SLOTS));
+    }
+
+    /// A backend against a loopback stub that accepts every connection and
+    /// never answers, keeping each one open with its request unread, with
+    /// probe limits of `ask` per ask within `deadline`; and how many
+    /// connections the stub accepted.
+    fn never_answering_backend(
+        base: &Path,
+        ask: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> (CloudBackend, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                kept.push(stream);
+            }
+        });
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: format!("http://{addr}"),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials)
+            .unwrap()
+            .with_path_style();
+        let local = LocalBackend::with_base_dir(base.to_path_buf());
+        let mut backend = CloudBackend::with_parts(local, bucket, "0000000000000005".to_string());
+        backend.probes.limits = test_limits(ask, deadline, 1);
+        (backend, accepted)
+    }
+
+    #[test]
+    fn a_stalled_probe_fails_within_its_deadline_and_names_the_timeout() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = TempDir::new().unwrap();
+        let (backend, accepted) = never_answering_backend(tmp.path(), ms(300), ms(300));
+
+        let started = std::time::Instant::now();
+        let err = backend.probe("wf").expect_err("the stub never answers");
+        let took = started.elapsed();
+        assert!(took < ms(1500), "took {took:?}");
+        assert!(is_timed_out(&err), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("listing 0000000000000005/wf/ failed"),
+            "{text}"
+        );
+        assert!(text.contains("no answer within"), "{text}");
+
+        // The failure stands for the process: no second listing.
+        let waited = std::time::Instant::now();
+        while accepted.load(Ordering::SeqCst) == 0 && waited.elapsed() < ms(1000) {
+            std::thread::sleep(ms(10));
+        }
+        let before = accepted.load(Ordering::SeqCst);
+        assert!(before >= 1, "the listing never connected");
+        let started = std::time::Instant::now();
+        let again = backend
+            .probe("wf")
+            .expect_err("a failed probe stays failed");
+        assert!(started.elapsed() < ms(100), "asked again");
+        assert!(again.to_string().contains("failed earlier"), "{again:#}");
+        std::thread::sleep(ms(50));
+        assert_eq!(accepted.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn a_stalled_candidate_listing_leaves_the_session_unlocated_within_the_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let (backend, _) = never_answering_backend(tmp.path(), ms(300), ms(500));
+        let (first, second) = ("000000000000000a", "000000000000000b");
+
+        let started = std::time::Instant::now();
+        let got = backend.locate(
+            "wf",
+            Some("/the/anchor".to_string()),
+            vec![first.to_string(), second.to_string()],
+        );
+        let took = started.elapsed();
+        assert!(took < ms(1500), "took {took:?}");
+        let unlocated = got.expect_err("the stub never answers");
+        match unlocated.reason {
+            UnlocatedReason::NoRecordedPrefix {
+                anchor,
+                fallback: Fallback::Unreadable { prefix, error },
+            } => {
+                assert_eq!(anchor.as_deref(), Some("/the/anchor"));
+                assert_eq!(prefix, first);
+                assert!(error.contains("no answer within"), "{error}");
+            }
+            other => panic!("not an unreadable candidate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stalled_head_reads_as_absent_within_the_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let (backend, _) = never_answering_backend(tmp.path(), ms(300), ms(300));
+
+        let started = std::time::Instant::now();
+        assert!(!backend.s3_session_exists("wf"));
+        assert!(!backend.exists("wf"));
+        assert!(!backend.remote_state_exists("wf"));
+        let took = started.elapsed();
+        assert!(took < ms(2500), "took {took:?}");
+    }
+
+    #[test]
+    fn a_probe_ask_with_no_time_left_is_not_asked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let run = LookupRun::new(test_limits(ms(200), ms(0), 1));
+        let asked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&asked);
+        let got: Result<(), S3Error> = probe_ask(run, move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let err = got.unwrap_err();
+        assert!(
+            matches!(&err, S3Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut),
+            "{err:?}"
+        );
+        assert!(!asked.load(Ordering::SeqCst), "asked past the deadline");
+    }
+
     // -- the migration marker on state reads --
 
     fn marker_bytes(target: &str, workspace: &str) -> Vec<u8> {
@@ -10223,6 +11049,7 @@ mod tests {
             (NameTaken, "import_name_taken", 2),
             (TemplateUnavailable, "import_template_unavailable", 2),
             (SourceUnreadable, "import_source_unreadable", 1),
+            (SourceUnreachable, "import_source_unreachable", 1),
             (PushFailed, "import_push_failed", 1),
             (Unmarked, "import_unmarked", 1),
             (SourceRunning, "import_source_running", 2),
@@ -10491,6 +11318,109 @@ mod tests {
         write_log(tmp.path(), "wf", &log);
         let backend = cloud_backend_at(tmp.path(), endpoint);
         assert_eq!(ContextStore::get(&backend, "wf", "k").unwrap(), content);
+    }
+
+    /// A pull replaces the log under the append lock, so it waits for a
+    /// writer holding it instead of dropping that writer's append (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_waits_for_the_append_lock_before_it_replaces_the_log() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let hold = std::time::Duration::from_millis(400);
+        let holder = crate::engine::persistence::hold_append_lock_for(&state, hold);
+        let started = std::time::Instant::now();
+        backend.read_header("wf").unwrap();
+        assert!(started.elapsed() >= hold / 2, "the pull did not wait");
+        holder.join().unwrap();
+        assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `force_pull_session` replaces the log under the append lock too, so it
+    /// waits for a writer holding it (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn a_force_pull_waits_for_the_append_lock_before_it_replaces_the_log() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let hold = std::time::Duration::from_millis(400);
+        let holder = crate::engine::persistence::hold_append_lock_for(&state, hold);
+        let started = std::time::Instant::now();
+        backend.force_pull_session("wf").unwrap();
+        assert!(started.elapsed() >= hold / 2, "the force pull did not wait");
+        holder.join().unwrap();
+        assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `context add` takes the log's append lock once and passes it to its
+    /// pull and its append: the pull replaces the log under it rather than
+    /// waiting on it and coming back busy, a replacement from elsewhere is
+    /// kept out until the event is in, and the event lands in the pulled log
+    /// (koto#728).
+    #[cfg(unix)]
+    #[test]
+    fn a_cloud_context_add_pulls_and_appends_under_the_one_lock_it_holds() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let event = crate::engine::types::EventPayload::ContextAdded {
+            key: "k".to_string(),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: Some("agent".to_string()),
+        };
+        let wait = std::time::Duration::from_secs(5);
+        let mut replacement_busy = None;
+        let mut pulled_before_write = false;
+        let started = std::time::Instant::now();
+        backend
+            .add_context_locked_within(
+                "wf",
+                &mut || {
+                    pulled_before_write = fs::read(&state).unwrap() == remote;
+                    let replaced = crate::engine::persistence::with_log_replace_lock(
+                        &state,
+                        std::time::Duration::from_millis(100),
+                        || Ok(()),
+                    );
+                    replacement_busy =
+                        Some(replaced.is_err_and(|e| {
+                            crate::engine::persistence::state_log_busy(&e).is_some()
+                        }));
+                    Ok(())
+                },
+                &event,
+                "2026-01-01T00:00:09Z",
+                wait,
+            )
+            .unwrap();
+        assert!(started.elapsed() < wait, "the add waited on its own lock");
+        assert!(pulled_before_write, "the pull ran before the store write");
+        assert_eq!(replacement_busy, Some(true));
+        let after = fs::read(&state).unwrap();
+        assert!(after.starts_with(&remote), "the event is in the pulled log");
+        let (_, events) = backend.local.read_events("wf").unwrap();
+        assert_eq!(events.last().unwrap().event_type, "context_added");
     }
 
     #[test]

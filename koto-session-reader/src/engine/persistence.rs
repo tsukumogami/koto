@@ -1,24 +1,14 @@
-//! State-file persistence helpers.
-//!
-//! Durability discipline: `sync_data()` (fdatasync) is called after
-//! every header and event append. The first header write of a brand-new
-//! state file ALSO fsyncs the parent directory via
-//! [`fsync_parent_dir`] so the file's directory entry is durable across
-//! a crash. Subsequent appends do NOT re-fsync the parent because the
-//! directory entry is already committed; only the file's data + size
-//! need durability, which `sync_data()` provides. See Fix 3 in the
-//! polish pass for the originating review note (ext4 `data=ordered`
-//! plus a crash between `sync_data()` and the implicit directory
-//! flush could leave a brand-new state file invisible on remount).
+//! State-file persistence, read half: the log header and event parsers,
+//! every `derive_*` fold over a log, the visit, epoch and delivery-window
+//! helpers, the supersede fence readers and the merged-last-line detector.
+//! The write half (appends, locks, whole-log replacement) is koto's
+//! `engine::persistence`, which re-exports this module.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::engine::errors::EngineError;
 use crate::engine::types::{
@@ -56,530 +46,7 @@ impl LogHeader for StateFileHeader {
     }
 }
 
-/// Serialize one header line (no trailing newline).
-///
-/// The single definition of "what a header line looks like on disk",
-/// shared by the append path and by callers that buffer a header plus
-/// their first events into one atomic write.
-pub fn serialize_header_line<H: Serialize>(header: &H) -> anyhow::Result<String> {
-    serde_json::to_string(header).map_err(|e| anyhow::anyhow!("failed to serialize header: {}", e))
-}
-
-/// Write the header line to a new state file.
-///
-/// Creates the file with mode 0600 on unix. The header has no seq field.
-///
-/// When the state file did not exist on entry, this call ALSO fsyncs the
-/// parent directory after the header write so the new file's directory
-/// entry is durable across a crash. Subsequent calls (which reopen an
-/// existing file) skip the parent-dir fsync: the directory entry is
-/// already committed and `sync_data()` is sufficient. The parent-dir
-/// fsync is best-effort — some filesystems reject `O_RDONLY` directory
-/// fsync with `EINVAL`; we tolerate that for parity with the existing
-/// pattern in `discovery.rs`.
-pub fn append_header(path: &Path, header: &StateFileHeader) -> anyhow::Result<()> {
-    append_header_line(path, header)
-}
-
-/// Header-type-generic form of [`append_header`].
-///
-/// Same durability discipline; see that function's doc comment.
-pub fn append_header_line<H: Serialize>(path: &Path, header: &H) -> anyhow::Result<()> {
-    let is_first_write = !path.exists();
-
-    let mut opts = OpenOptions::new();
-    opts.create(true).write(true).truncate(false);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-
-    let mut file = opts
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-
-    let mut line = serialize_header_line(header)?;
-    line.push('\n');
-
-    file.write_all(line.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write header to {}: {}", path.display(), e))?;
-
-    file.sync_data()
-        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
-
-    if is_first_write {
-        fsync_parent_dir(path);
-    }
-
-    Ok(())
-}
-
-/// Best-effort fsync of `path`'s parent directory. Tolerates `EINVAL`
-/// on filesystems that reject `O_RDONLY` directory fsync (mirrors
-/// `discovery.rs:173-183`). On success the file's directory entry is
-/// durable; on failure the prior `sync_data()` on the file is still
-/// the truth-of-record and the directory entry will be flushed at the
-/// filesystem's next journal commit. Called by [`append_header`] only
-/// when a brand-new state file was created — later appends do not
-/// change the directory entry and can skip this step.
-fn fsync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-}
-
-/// Append one event to a session state file, auto-assigning its seq number.
-///
-/// Reads the file to find the last event's seq (or 0 if no events yet),
-/// then appends with `max_seq + 1`. Calls `sync_data()` after every write.
-///
-/// Refuses, writing nothing, unless the file already exists and its first
-/// line is a session header. An append is never how a log comes into being:
-/// creating a session (init, session start, a batch spawn) writes the header
-/// and the first events together in one atomic file. An append that
-/// created the file, or extended one that had lost its header, would leave a
-/// log whose first line is an event, which every reader rejects from then on
-/// (koto#236, koto#200).
-pub fn append_event(path: &Path, payload: &EventPayload, timestamp: &str) -> anyhow::Result<u64> {
-    append_event_in::<StateFileHeader>(path, payload, timestamp)
-}
-
-/// Header-type-generic form of [`append_event`]: the first line must parse
-/// as an `H`.
-pub fn append_event_in<H: LogHeader>(
-    path: &Path,
-    payload: &EventPayload,
-    timestamp: &str,
-) -> anyhow::Result<u64> {
-    append_event_reading::<H>(path, payload, timestamp).map(|(seq, _)| seq)
-}
-
-/// What one committed append to a session's log tells the code that runs
-/// after it, all taken from the bytes the append read under its lock.
-///
-/// Holds no journal types: the run journal is its one reader today, but
-/// nothing here knows about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitInfo {
-    /// The committed event's `seq`.
-    pub seq: u64,
-    /// The log as it stood before this event: the bytes the append read to
-    /// find the next `seq`, moved rather than copied. When the append split
-    /// a merged last line first, these are the split bytes, so every event
-    /// in them has a line of its own.
-    pub prior_log: String,
-}
-
-impl CommitInfo {
-    /// The `seq` of the event that opened the visit the log was in before
-    /// this event, by [`visit_start`]'s rule; `None` for a log with no state
-    /// entry. Computed from [`prior_log`](Self::prior_log) on each call, so
-    /// a commit nobody asks about pays nothing for it.
-    pub(crate) fn prior_visit_seq(&self) -> Option<u64> {
-        visit_start(&self.prior_log)
-    }
-
-    /// The visit `payload` (the committed event) belongs to: its own `seq`
-    /// when it opens a visit itself, otherwise the visit the log was in.
-    pub(crate) fn visit_seq_for(&self, payload: &EventPayload) -> Option<u64> {
-        if opens_visit(payload) {
-            Some(self.seq)
-        } else {
-            self.prior_visit_seq()
-        }
-    }
-}
-
-/// [`append_event`], returning what the append read as well as the `seq` it
-/// took (see [`CommitInfo`]). Writes exactly what [`append_event`] writes.
-pub(crate) fn append_event_tracked(
-    path: &Path,
-    payload: &EventPayload,
-    timestamp: &str,
-) -> anyhow::Result<CommitInfo> {
-    let (seq, prior_log) = append_event_reading::<StateFileHeader>(path, payload, timestamp)?;
-    Ok(CommitInfo { seq, prior_log })
-}
-
-/// The one append: returns the `seq` taken and the log's bytes as read
-/// under the lock, before the new line.
-fn append_event_reading<H: LogHeader>(
-    path: &Path,
-    payload: &EventPayload,
-    timestamp: &str,
-) -> anyhow::Result<(u64, String)> {
-    debug_assert!(
-        !matches!(payload, EventPayload::Unknown { .. }),
-        "Unknown events must not be passed to append_event"
-    );
-    // Held from reading the last seq until the line is synced, so two
-    // processes appending at once can't both take the same seq.
-    let _append_lock = AppendLock::acquire(path);
-    let tail = prepare_append::<H>(path)?;
-    // Checked on the bytes read under the lock, so no write slips in after
-    // a fence another process just appended.
-    refuse_if_fenced(path, &tail.content, payload)?;
-
-    let event = Event {
-        seq: tail.next_seq,
-        timestamp: timestamp.to_string(),
-        event_type: payload.type_name().to_string(),
-        payload: payload.clone(),
-        idempotency_hash: None,
-    };
-    write_event_line(path, &event, tail.unterminated)?;
-
-    Ok((tail.next_seq, tail.content))
-}
-
-/// Append `event` to the log at `path` as one line, in one write, and sync it.
-///
-/// The line and its newline go out in a single `write_all` of one buffer.
-/// Written as two writes (`writeln!` on an unbuffered file issues the line and
-/// the `\n` separately), a writer killed between them -- a timed-out action's
-/// process group gets SIGKILL -- leaves a line with no terminator, and the next
-/// append lands on the same line (koto#419). `unterminated` is the log's own
-/// last line lacking its newline, from a writer that died that way before this
-/// fix: the buffer then starts with the missing `\n`, so this event still gets
-/// a line of its own.
-fn write_event_line(path: &Path, event: &Event, unterminated: bool) -> anyhow::Result<()> {
-    let line = serde_json::to_string(event)
-        .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
-    let mut buf = String::with_capacity(line.len() + 2);
-    if unterminated {
-        buf.push('\n');
-    }
-    buf.push_str(&line);
-    buf.push('\n');
-
-    // No `create`: if the log disappeared since it was read, the open fails
-    // rather than starting a new, headerless one.
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-    file.write_all(buf.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write event to {}: {}", path.display(), e))?;
-    file.sync_data()
-        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
-    Ok(())
-}
-
-/// Outcome of an idempotent append.
-///
-/// Distinguishes "this call wrote a new event" from "this call observed
-/// a prior identical event and short-circuited". Both return the
-/// authoritative seq number the caller should reference; only
-/// [`AppendOutcome::Written`] increments the on-disk event count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppendOutcome {
-    /// A new event was appended at the returned seq. The file gained
-    /// one line and one fsync.
-    Written { seq: u64 },
-    /// An identical prior event was found via the idempotency hash;
-    /// no write or fsync occurred. The returned seq points at the
-    /// prior event so the caller can reference it.
-    Idempotent { seq: u64 },
-}
-
-impl AppendOutcome {
-    /// Return the seq number regardless of whether a write occurred.
-    pub fn seq(&self) -> u64 {
-        match self {
-            AppendOutcome::Written { seq } | AppendOutcome::Idempotent { seq } => *seq,
-        }
-    }
-}
-
-/// Compute the SHA-256 hex digest of canonical-JSON serialization of
-/// `(state_name, payload)`.
-///
-/// "Canonical" means: serde-serialize the tuple, parse the result as a
-/// [`serde_json::Value`], recursively sort all object keys, then
-/// re-serialize without whitespace. Two payloads that differ only in
-/// key order or whitespace produce identical hashes, matching the R17
-/// idempotency contract.
-///
-/// `state_name` is included alongside the payload so identical payloads
-/// at different states do not short-circuit each other. For payload
-/// variants whose serialized form already embeds a `state` field, this
-/// is redundant-but-defensive; for payloads with no `state` (e.g.
-/// `WorkflowInitialized`, `IntentUpdated`), the explicit `state_name`
-/// preserves the hash-domain contract.
-pub fn idempotency_hash(state_name: &str, payload: &EventPayload) -> String {
-    let payload_value = serde_json::to_value(payload).expect("EventPayload is always serializable");
-    let domain = serde_json::json!({
-        "state_name": state_name,
-        "payload": payload_value,
-    });
-    let canonical = canonicalize_json(domain);
-    let serialized = serde_json::to_string(&canonical).expect("canonical JSON is serializable");
-    let mut hasher = Sha256::new();
-    hasher.update(serialized.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Recursively sort object keys in a [`serde_json::Value`] so the
-/// re-serialized form is deterministic regardless of input key order.
-///
-/// Arrays preserve their order (semantic). Objects are rebuilt with
-/// sorted keys (canonicalization).
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
-                std::collections::BTreeMap::new();
-            for (k, v) in map {
-                sorted.insert(k, canonicalize_json(v));
-            }
-            // BTreeMap iterates in sorted key order; build a
-            // serde_json::Map from the sorted entries.
-            let mut out = serde_json::Map::with_capacity(sorted.len());
-            for (k, v) in sorted {
-                out.insert(k, v);
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
-        }
-        other => other,
-    }
-}
-
-/// Append an event with idempotency-hash short-circuit semantics.
-///
-/// Behavior depends on `hash`:
-///
-/// - `None`: identical to [`append_event`]. The event is appended with no
-///   hash field, and the same header check applies.
-/// - `Some(h)`: scan the on-disk log for an event whose stored
-///   `idempotency_hash` equals `h`.
-///   - If found AND its payload bytes-equal the new payload, return
-///     [`AppendOutcome::Idempotent`] with the prior seq; no write, no
-///     fsync (PRD R17).
-///   - If found AND its payload differs, return
-///     [`EngineError::ConcurrentSubmissionConflict`] with the supplied
-///     `state_name`; no write, no fsync (PRD OQ8).
-///   - If not found, append a new event with `idempotency_hash: Some(h)`
-///     and return [`AppendOutcome::Written`].
-///
-/// The hash-vs-payload bytes-equal check is belt-and-suspenders: SHA-256
-/// preimage collisions are cryptographically negligible, but if a future
-/// schema change makes the hash domain narrower than the payload (an
-/// unintended regression) the bytes-equal check catches it.
-///
-/// Concurrent identical retries are serialized via [`acquire_state_flock`]
-/// so the race-condition AC (N=32 concurrent identical retries → 1
-/// event on disk) holds. The flock guards the read-then-write window;
-/// readers outside this path are unaffected.
-pub fn append_event_idempotent(
-    path: &Path,
-    payload: &EventPayload,
-    timestamp: &str,
-    state_name: &str,
-    hash: Option<&str>,
-) -> anyhow::Result<AppendOutcome> {
-    append_event_idempotent_in::<StateFileHeader>(path, payload, timestamp, state_name, hash)
-}
-
-/// Header-type-generic form of [`append_event_idempotent`]. Like
-/// [`append_event_in`], it refuses a log whose first line isn't an `H`.
-pub fn append_event_idempotent_in<H: LogHeader>(
-    path: &Path,
-    payload: &EventPayload,
-    timestamp: &str,
-    state_name: &str,
-    hash: Option<&str>,
-) -> anyhow::Result<AppendOutcome> {
-    debug_assert!(
-        !matches!(payload, EventPayload::Unknown { .. }),
-        "Unknown events must not be passed to append_event_idempotent"
-    );
-
-    // No hash → fall back to the non-idempotent path.
-    let Some(h) = hash else {
-        let seq = append_event_in::<H>(path, payload, timestamp)?;
-        return Ok(AppendOutcome::Written { seq });
-    };
-
-    // Take an exclusive lock on the state file for the duration of the
-    // read-then-write window. The lock file is the same as the state
-    // file; concurrent readers via `read_events` do NOT take a lock and
-    // are unaffected (advisory).
-    let _guard = acquire_state_flock(path)?;
-    // The append lock every append path shares, held through the seq read,
-    // the scan and the write, so a plain `append_event` from another process
-    // can't take the seq this append is about to use.
-    let _append_lock = AppendLock::acquire(path);
-
-    // Check the header first, so a log that is missing, empty or headerless
-    // is refused whether or not the scan below finds a prior event. Doing it
-    // after the scan would let an idempotent hit report success on a log no
-    // reader can parse. The scan below reads the bytes this read returns,
-    // under the lock taken above.
-    let tail = prepare_append::<H>(path)?;
-    refuse_if_fenced(path, &tail.content, payload)?;
-    let next_seq = tail.next_seq;
-
-    // Scan for a prior event with the same hash. A malformed line in the
-    // middle of the log is skipped, the way `read_events` skips it. A
-    // malformed *final* line has been dealt with by this point: the read
-    // above split it if it held merged events, and failed otherwise, since
-    // it parses that line to work out the next seq. Callers that expect a
-    // torn tail repair it before appending, as the request store does. Line 1 is the
-    // header, checked above, so events start at line 2 (1-indexed).
-    for line in tail.content.lines().skip(1) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let prior_hash = parsed.get("idempotency_hash").and_then(|v| v.as_str());
-        if prior_hash != Some(h) {
-            continue;
-        }
-        let prior_seq = parsed
-            .get("seq")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("prior event missing seq"))?;
-        // Bytes-equal payload check (belt-and-suspenders).
-        let prior_payload = parsed
-            .get("payload")
-            .ok_or_else(|| anyhow::anyhow!("prior event missing payload"))?;
-        let new_payload_value =
-            serde_json::to_value(payload).expect("EventPayload is always serializable");
-        if prior_payload == &new_payload_value {
-            return Ok(AppendOutcome::Idempotent { seq: prior_seq });
-        } else {
-            return Err(EngineError::ConcurrentSubmissionConflict {
-                session_id: extract_session_id_from_path(path),
-                state_name: state_name.to_string(),
-            }
-            .into());
-        }
-    }
-
-    // No prior hash hit → append a new event with the hash stored.
-    let event = Event {
-        seq: next_seq,
-        timestamp: timestamp.to_string(),
-        event_type: payload.type_name().to_string(),
-        payload: payload.clone(),
-        idempotency_hash: Some(h.to_string()),
-    };
-    write_event_line(path, &event, tail.unterminated)?;
-
-    Ok(AppendOutcome::Written { seq: next_seq })
-}
-
-/// File name of the per-log append lock, a sidecar in the log's directory.
-/// It holds no data.
-pub const APPEND_LOCK_FILE: &str = "append.lock";
-
-/// An exclusive `flock` on the sidecar [`APPEND_LOCK_FILE`] beside a log,
-/// released on drop.
-///
-/// Every append path takes it, and only around reading the last seq, writing
-/// the line and syncing it: never while a command runs, so a gate's own
-/// `koto context get` can't wait on the tick that is running it. It is a
-/// dedicated file rather than the log itself, so it never contends with the
-/// state-file lock a batch tick holds for the whole tick.
-///
-/// Where the lock can't be had -- no `flock` on this platform, a directory
-/// the sidecar can't be created in, a filesystem that refuses the call --
-/// the append proceeds unlocked, as appends did before the lock existed. A
-/// wait the kernel cuts short with `EINTR` is not one of those: a signal
-/// arriving while another process holds the lock retries the wait, so a
-/// signal can't let an append through unlocked.
-struct AppendLock {
-    #[cfg(unix)]
-    _file: Option<std::fs::File>,
-}
-
-impl AppendLock {
-    #[cfg(unix)]
-    fn acquire(log: &Path) -> Self {
-        use std::os::fd::AsRawFd;
-        let Some(dir) = log.parent() else {
-            return AppendLock { _file: None };
-        };
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(APPEND_LOCK_FILE))
-        {
-            Ok(f) => f,
-            Err(_) => return AppendLock { _file: None },
-        };
-        loop {
-            // SAFETY: `fd` is borrowed from `file`, which outlives the call.
-            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if ret == 0 {
-                return AppendLock { _file: Some(file) };
-            }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                return AppendLock { _file: None };
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn acquire(_log: &Path) -> Self {
-        AppendLock {}
-    }
-
-    /// [`acquire`](Self::acquire) with the wait bounded by `wait`: `None`
-    /// when another process still holds the lock once `wait` has passed.
-    /// Where the lock can't be had at all, the fallback is the one
-    /// `acquire` takes: an unlocked guard.
-    #[cfg(unix)]
-    fn acquire_within(log: &Path, wait: std::time::Duration) -> Option<Self> {
-        use std::os::fd::AsRawFd;
-        let Some(dir) = log.parent() else {
-            return Some(AppendLock { _file: None });
-        };
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(APPEND_LOCK_FILE))
-        {
-            Ok(f) => f,
-            Err(_) => return Some(AppendLock { _file: None }),
-        };
-        match crate::engine::jsonl_append::lock_exclusive(
-            file.as_raw_fd(),
-            Some(wait),
-            std::time::Instant::now(),
-        ) {
-            Ok(()) => Some(AppendLock { _file: Some(file) }),
-            Err(e) if crate::engine::jsonl_append::lock_timeout(&e).is_some() => None,
-            Err(_) => Some(AppendLock { _file: None }),
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn acquire_within(_log: &Path, _wait: std::time::Duration) -> Option<Self> {
-        Some(AppendLock {})
-    }
-}
-
 // ===== The supersede fence =====
-
-/// How long `koto init --supersede` waits for a predecessor's append lock
-/// before it gives up with `fence_unavailable`, having written nothing.
-pub const FENCE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A session's supersede fence: the [`EventPayload::SessionSuperseded`]
 /// event in its own log, which names the session that superseded it.
@@ -655,7 +122,11 @@ pub fn superseded_by_in_log(content: &str) -> Option<SupersedeFence> {
 /// The fence in the log at `path`, read without a lock. A log that doesn't
 /// exist has none.
 pub fn read_fence(path: &Path) -> anyhow::Result<Option<SupersedeFence>> {
-    match std::fs::read_to_string(path) {
+    let read = crate::fs_read::open_plain(path).and_then(|mut file| {
+        let mut content = String::new();
+        file.read_to_string(&mut content).map(|_| content)
+    });
+    match read {
         Ok(content) => Ok(superseded_by_in_log(&content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!(
@@ -664,410 +135,6 @@ pub fn read_fence(path: &Path) -> anyhow::Result<Option<SupersedeFence>> {
             e
         )),
     }
-}
-
-/// An append to a superseded session's log, refused with nothing written
-/// (error kind `session_superseded`). `fence` is the session's own fence;
-/// the CLI follows it forward to the newest session when it reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSupersededError {
-    /// The session whose log refused the append.
-    pub session: String,
-    /// Its fence.
-    pub fence: SupersedeFence,
-}
-
-impl std::fmt::Display for SessionSupersededError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "session '{}' was superseded by '{}' (session_superseded), so nothing was written; \
-             continue as '{}'",
-            self.session, self.fence.by, self.fence.by
-        )
-    }
-}
-
-impl std::error::Error for SessionSupersededError {}
-
-/// The [`SessionSupersededError`] `e` failed with, whatever context was
-/// added to it since.
-pub fn session_superseded(e: &anyhow::Error) -> Option<&SessionSupersededError> {
-    e.chain()
-        .find_map(|cause| cause.downcast_ref::<SessionSupersededError>())
-}
-
-/// Refuse appending `payload` to a log whose bytes (`content`, read under
-/// the append lock) hold a fence. A `context_read` passes: reads of a
-/// superseded session keep working, and an anchored read records itself
-/// in the session it read.
-fn refuse_if_fenced(path: &Path, content: &str, payload: &EventPayload) -> anyhow::Result<()> {
-    if matches!(payload, EventPayload::ContextRead { .. }) {
-        return Ok(());
-    }
-    match superseded_by_in_log(content) {
-        Some(fence) => Err(SessionSupersededError {
-            session: extract_session_id_from_path(path),
-            fence,
-        }
-        .into()),
-        None => Ok(()),
-    }
-}
-
-/// What [`append_supersede_fence`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FenceOutcome {
-    /// The fence was appended at `seq`.
-    Fenced { seq: u64 },
-    /// The log already held this same fence (same successor name and
-    /// session id): an earlier run of the same command wrote it.
-    AlreadyOurs,
-    /// The log already held a fence naming another successor, which won.
-    SupersededByOther(SupersedeFence),
-    /// The append lock was still held elsewhere when the wait ran out.
-    /// Nothing was written.
-    Unavailable,
-}
-
-/// Append `fence` to the session log at `path`, under the append lock every
-/// append takes, held for this one append. The lock is waited for at most
-/// `wait`; a lock still held then is [`FenceOutcome::Unavailable`] with
-/// nothing written. Under the lock the log is checked for a fence again, so
-/// of two successors the first append wins and the second reads it.
-pub fn append_supersede_fence(
-    path: &Path,
-    fence: &SupersedeFence,
-    timestamp: &str,
-    wait: std::time::Duration,
-) -> anyhow::Result<FenceOutcome> {
-    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
-        return Ok(FenceOutcome::Unavailable);
-    };
-    let tail = prepare_append::<StateFileHeader>(path)?;
-    if let Some(existing) = superseded_by_in_log(&tail.content) {
-        return Ok(
-            if existing.by == fence.by && existing.by_session_id == fence.by_session_id {
-                FenceOutcome::AlreadyOurs
-            } else {
-                FenceOutcome::SupersededByOther(existing)
-            },
-        );
-    }
-    let payload = fence.to_payload();
-    let event = Event {
-        seq: tail.next_seq,
-        timestamp: timestamp.to_string(),
-        event_type: payload.type_name().to_string(),
-        payload,
-        idempotency_hash: None,
-    };
-    write_event_line(path, &event, tail.unterminated)?;
-    Ok(FenceOutcome::Fenced { seq: tail.next_seq })
-}
-
-/// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
-/// is released when the returned `File` is dropped.
-///
-/// Used by [`append_event_idempotent`] to serialize the read-then-write
-/// window so concurrent identical retries collapse to a single write
-/// rather than racing past the hash scan.
-///
-/// # Lock order and the invariant it relies on
-///
-/// [`append_event_idempotent_in`] takes this lock first and the sidecar
-/// [`AppendLock`] second. This is the same file
-/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
-/// locks for a whole batch tick, and `flock` locks belong to the open file,
-/// not the process: a thread holding that tick lock that reached this
-/// blocking call on the same state file would wait on itself forever. No
-/// production caller does -- the only idempotent append today writes a
-/// request store's log, a different file -- and nothing may start to: an
-/// idempotent append to a session's state file must not run on a thread
-/// holding that session's tick lock. Debug builds check this with
-/// [`held_state_locks`] and panic instead of hanging.
-#[cfg(unix)]
-fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    #[cfg(debug_assertions)]
-    debug_assert!(
-        !held_state_locks::held_by_this_thread(path),
-        "acquire_state_flock on {} while this thread holds its lock_state_file lock \
-         would deadlock",
-        path.display()
-    );
-    // Open without `create`: a log is created when its session is created,
-    // and a lock open that created the file would leave an empty log behind
-    // for the header check in `prepare_append` to refuse.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to open state file for lock {}: {}",
-                path.display(),
-                e
-            )
-        })?;
-    let fd = file.as_raw_fd();
-    loop {
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if ret == 0 {
-            return Ok(file);
-        }
-        // A signal during the wait is not a failure to lock: wait again.
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(anyhow::anyhow!(
-                "failed to acquire flock on {}: {}",
-                path.display(),
-                err
-            ));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn acquire_state_flock(_path: &Path) -> anyhow::Result<std::fs::File> {
-    // Non-unix targets: idempotency check is best-effort without a
-    // cross-process lock. Concurrent retries on Windows are extremely
-    // unlikely in koto's single-coordinator model; falling through
-    // produces correct semantics in the no-contention case.
-    Err(anyhow::anyhow!("flock not available on this platform"))
-}
-
-/// Debug-build record of which threads hold a
-/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
-/// lock on which state file, so [`acquire_state_flock`] can refuse the
-/// same-thread re-lock that would deadlock. Release builds carry none of it.
-#[cfg(debug_assertions)]
-pub(crate) mod held_state_locks {
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-    use std::thread::ThreadId;
-
-    static HELD: Mutex<Vec<(ThreadId, PathBuf)>> = Mutex::new(Vec::new());
-
-    fn identity(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    }
-
-    /// Marks `path` as locked by the current thread until dropped. Dropping
-    /// it on another thread still removes the right entry.
-    #[derive(Debug)]
-    pub(crate) struct Held {
-        entry: (ThreadId, PathBuf),
-    }
-
-    pub(crate) fn hold(path: &Path) -> Held {
-        let entry = (std::thread::current().id(), identity(path));
-        if let Ok(mut held) = HELD.lock() {
-            held.push(entry.clone());
-        }
-        Held { entry }
-    }
-
-    impl Drop for Held {
-        fn drop(&mut self) {
-            if let Ok(mut held) = HELD.lock() {
-                if let Some(i) = held.iter().position(|e| *e == self.entry) {
-                    held.swap_remove(i);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn held_by_this_thread(path: &Path) -> bool {
-        let entry = (std::thread::current().id(), identity(path));
-        HELD.lock().map(|h| h.contains(&entry)).unwrap_or(false)
-    }
-}
-
-/// Extract the session id (workflow name) from a state file path.
-///
-/// State files live at `<sessions_root>/<session_id>/koto-<session_id>.state.jsonl`.
-/// The session id is the file's parent directory's basename. Used by
-/// [`append_event_idempotent`] to populate the
-/// [`EngineError::ConcurrentSubmissionConflict`] envelope; falls back to
-/// `"<unknown>"` if the path doesn't follow the convention.
-fn extract_session_id_from_path(path: &Path) -> String {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "<unknown>".to_string())
-}
-
-/// fsync the three log files that must be durable BEFORE the
-/// coordinator's `substrate_wake()` call (R19 / Issue 12 Decision 2
-/// sub-question 2):
-///
-/// 1. The child's terminal-evidence log
-/// 2. The coordinator's log (which carries the appended `ChildDispatched` event)
-/// 3. The coordinator's log (which carries the appended `RequesterWoken` event)
-///
-/// Points 2 and 3 are the same file; the helper fsyncs it twice to
-/// reflect the design's three-point discipline. The fsync of an
-/// already-fsync'd file is a benign no-op on Linux/macOS.
-///
-/// `child_log_path` and `coord_log_path` are caller-supplied so the
-/// helper can be unit-tested without a full backend; the wake-emission
-/// path (Issue 15) resolves them from the backend's `session_dir(id)`.
-///
-/// Returns an error if either fsync fails; the wake-delivery primitive
-/// must NOT be invoked when this helper returns `Err`.
-pub fn fsync_wake_preconditions(
-    child_log_path: &Path,
-    coord_log_path: &Path,
-) -> anyhow::Result<()> {
-    fsync_log_file(child_log_path).map_err(|e| {
-        anyhow::anyhow!(
-            "fsync_wake_preconditions: child log {} fsync failed: {}",
-            child_log_path.display(),
-            e
-        )
-    })?;
-    fsync_log_file(coord_log_path).map_err(|e| {
-        anyhow::anyhow!(
-            "fsync_wake_preconditions: coord log {} (post-ChildDispatched) fsync failed: {}",
-            coord_log_path.display(),
-            e
-        )
-    })?;
-    fsync_log_file(coord_log_path).map_err(|e| {
-        anyhow::anyhow!(
-            "fsync_wake_preconditions: coord log {} (post-RequesterWoken) fsync failed: {}",
-            coord_log_path.display(),
-            e
-        )
-    })?;
-    Ok(())
-}
-
-/// Open `path` and call `sync_all`. Missing files are NOT tolerated —
-/// the caller must guarantee the log has been initialized before
-/// invoking `fsync_wake_preconditions`.
-fn fsync_log_file(path: &Path) -> std::io::Result<()> {
-    let file = std::fs::File::open(path)?;
-    file.sync_all()
-}
-
-/// What an append needs to know about the log it is about to extend, read
-/// under the append lock.
-struct AppendTail {
-    /// The seq the appended event takes.
-    next_seq: u64,
-    /// The log's bytes as the append found them, or as the split of a merged
-    /// last line left them.
-    content: String,
-    /// The log's last line has no newline: a complete event from a writer
-    /// that died between writing a line and its `\n`, before appends became
-    /// one write. The append supplies the newline first.
-    unterminated: bool,
-}
-
-/// Read the log at `path` for an append: the seq the next event gets and the
-/// bytes read, refusing a log that has no header. Usually only a read, but it
-/// can write: see the split below. The caller must hold the append lock.
-///
-/// The file must exist and its first line must parse as an `H`. Checking
-/// the header, rather than skipping line 1 unseen, is what stops an append
-/// from ever producing a log koto can't read: a missing or empty file, or
-/// one whose first line is an event, is refused before anything is
-/// written. Skipping it unseen also made a headerless log hide its own
-/// first event, so the next append reused `seq: 1` (koto#236).
-///
-/// Reads only the last non-empty line's seq, since in a valid file seq
-/// equals line index. This avoids silently masking corruption where events
-/// appear out of order.
-///
-/// A last line that doesn't parse fails the append, as a truncated one
-/// always has, with one exception: a line holding two or more well-formed
-/// events written with no newline between them (koto#419), whose seqs follow
-/// the line before (the one case where that line's seq is read too). That
-/// line is split on disk into one line per event, with the log as it was
-/// kept beside it, and the append goes on (see [`split_merged_last_line`]).
-/// Merged events whose seqs don't follow, or whose line before can't be
-/// read, are refused and left as they are.
-fn prepare_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
-                path.display()
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "failed to read state file {}: {}",
-                path.display(),
-                e
-            ))
-        }
-    };
-
-    let mut lines = content.lines();
-    let first_line = lines.next().map(str::trim).unwrap_or("");
-    if first_line.is_empty() {
-        let problem = if content.trim().is_empty() {
-            "state file is empty"
-        } else {
-            "state file has empty first line"
-        };
-        return Err(EngineError::StateFileCorrupted(format!(
-            "{problem}, so nothing was appended to {}",
-            path.display()
-        ))
-        .into());
-    }
-    parse_header::<H>(first_line)?;
-
-    let unterminated = !content.ends_with('\n');
-    let Some(last) = last_event_line(&content) else {
-        return Ok(AppendTail {
-            next_seq: 1,
-            content,
-            unterminated,
-        });
-    };
-    let err = match serde_json::from_str::<serde_json::Value>(last.text.trim()) {
-        Ok(val) => {
-            return Ok(AppendTail {
-                next_seq: val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1,
-                content,
-                unterminated,
-            })
-        }
-        Err(e) => e,
-    };
-    let pieces = match split_last_line(&last) {
-        SplitOutcome::NotMerged => {
-            return Err(anyhow::anyhow!("failed to parse last event line: {}", err));
-        }
-        SplitOutcome::DoesNotFollow(seqs) => {
-            return Err(EngineError::StateFileCorrupted(format!(
-                "line {} of {} holds {} events written with no newline between them (seq {}), \
-                 and their seqs don't follow the line before it (or that line can't be \
-                 read), so nothing was appended. \
-                 Back up the log, then put each of those events on a line of its own",
-                last.line_number,
-                path.display(),
-                seqs.len(),
-                join_seqs(&seqs)
-            ))
-            .into());
-        }
-        SplitOutcome::Split(pieces) => pieces,
-    };
-    let next_seq = pieces[pieces.len() - 1].1.seq + 1;
-    let content = split_merged_last_line(path, &content, last.offset, last.line_number, &pieces)?;
-    Ok(AppendTail {
-        next_seq,
-        content,
-        unterminated: false,
-    })
 }
 
 /// The last non-empty line after a log's header, with where it starts.
@@ -1155,7 +222,8 @@ fn split_last_line<'a>(last: &LastEventLine<'a>) -> SplitOutcome<'a> {
 
 /// Whether the last line of `content` (a whole log) holds merged events an
 /// append would split, so a repair that drops a torn tail must keep it.
-pub(crate) fn last_line_would_split(content: &str) -> bool {
+#[doc(hidden)]
+pub fn last_line_would_split(content: &str) -> bool {
     last_event_line(content)
         .is_some_and(|last| matches!(split_last_line(&last), SplitOutcome::Split(_)))
 }
@@ -1167,122 +235,120 @@ fn consecutive_from(seqs: &[u64], first: u64) -> bool {
         .all(|(i, seq)| first.checked_add(i as u64) == Some(*seq))
 }
 
-fn join_seqs(seqs: &[u64]) -> String {
+#[doc(hidden)]
+pub fn join_seqs(seqs: &[u64]) -> String {
     seqs.iter()
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// Split the merged last line of the log at `path`, which starts at byte
-/// `offset` of `content` and holds `pieces`, into one line per event, and
-/// return the log's new bytes.
+/// What an append to a log will do, worked out from the log's bytes alone.
 ///
-/// The log as it was goes first to a backup beside it, named after the
-/// log and the first merged seq (`<log>.seq<N>-merged.bak`), so the repair
-/// can be checked or undone by hand. Each event keeps the exact text it was
-/// written with. The caller holds the append lock, so no other append runs
-/// in between; what was done is announced on stderr.
+/// [`plan_append`] returns it and `prepare_append` acts on it: a plan with
+/// no [`merged`](Self::merged) line appends at [`next_seq`](Self::next_seq)
+/// as the bytes stand, and one with a merged line splits that line first.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AppendPlan<'a> {
+    /// The seq the appended event takes.
+    pub next_seq: u64,
+    /// The log's last line has no newline, so the append supplies it first.
+    pub unterminated: bool,
+    /// The log's last line holds events written with no newline between
+    /// them, whose seqs follow the line before: the append splits it first.
+    pub merged: Option<MergedLastLine<'a>>,
+}
+
+/// A log's last line holding two or more well-formed events written with no
+/// newline between them (koto#419), as [`plan_append`] found it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MergedLastLine<'a> {
+    /// Byte offset of the line's start in the log.
+    pub offset: usize,
+    /// 1-indexed line number; the header is line 1.
+    pub line_number: usize,
+    /// Each event on the line, with the exact text it was written with.
+    pub pieces: Vec<(&'a str, Event)>,
+}
+
+/// Work out what an append to the log whose bytes are `content` will do:
+/// the seq the next event takes, whether the last line lacks its newline,
+/// and whether that line holds merged events to split first.
 ///
-/// The split is written over the merged line in place, not by renaming a
-/// new file over the log. A `koto next` holds `lock_state_file`'s `flock` on
-/// the log's own inode for its whole tick, and a rename would leave that
-/// lock on an orphaned inode while the next tick locked the new file at
-/// once. Everything before the merged line is untouched, and the new tail is
-/// written in one write. A lock-free reader that lands in the middle of it
-/// sees a final line it can't parse and recovers the way it does from any
-/// torn tail; a crash in the middle leaves the backup to restore from.
-fn split_merged_last_line(
+/// Pure: it reads nothing and writes nothing. `path` only names the log in
+/// error messages. The errors are the ones an append returns for the same
+/// bytes: a log with no header, a last line that doesn't parse and isn't
+/// merged events (a truncated line), and merged events whose seqs don't
+/// follow the line before.
+#[doc(hidden)]
+pub fn plan_append<'a, H: LogHeader>(
+    content: &'a str,
     path: &Path,
-    content: &str,
-    offset: usize,
-    line_number: usize,
-    pieces: &[(&str, Event)],
-) -> anyhow::Result<String> {
-    let mut tail = String::with_capacity(content.len() - offset + pieces.len());
-    for (text, _) in pieces {
-        tail.push_str(text);
-        tail.push('\n');
-    }
-
-    let first_seq = pieces[0].1.seq;
-    let backup = write_backup(path, content, first_seq)?;
-    rewrite_tail(path, offset, &tail)?;
-    let mut split = String::with_capacity(offset + tail.len());
-    split.push_str(&content[..offset]);
-    split.push_str(&tail);
-    let seqs: Vec<u64> = pieces.iter().map(|(_, e)| e.seq).collect();
-    eprintln!(
-        "warning: line {} of {} held {} events written with no newline between them (seq {}); \
-         split it into one line per event. The log as it was is kept at {}",
-        line_number,
-        path.display(),
-        pieces.len(),
-        join_seqs(&seqs),
-        backup.display()
-    );
-    Ok(split)
-}
-
-/// Write `content` to a new file beside `log`, named for `first_seq`, and
-/// sync it. Never overwrites: a name already taken gets a numeric suffix.
-fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std::path::PathBuf> {
-    let name = log
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("state.jsonl");
-    for n in 0..100u32 {
-        let suffix = if n == 0 {
-            String::new()
+) -> anyhow::Result<AppendPlan<'a>> {
+    let mut lines = content.lines();
+    let first_line = lines.next().map(str::trim).unwrap_or("");
+    if first_line.is_empty() {
+        let problem = if content.trim().is_empty() {
+            "state file is empty"
         } else {
-            format!(".{n}")
+            "state file has empty first line"
         };
-        let backup = log.with_file_name(format!("{name}.seq{first_seq}-merged{suffix}.bak"));
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = match opts.open(&backup) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to create backup {} before splitting a merged line: {}",
-                    backup.display(),
-                    e
-                ))
-            }
-        };
-        file.write_all(content.as_bytes())
-            .and_then(|()| file.sync_data())
-            .map_err(|e| anyhow::anyhow!("failed to write backup {}: {}", backup.display(), e))?;
-        return Ok(backup);
+        return Err(EngineError::StateFileCorrupted(format!(
+            "{problem}, so nothing was appended to {}",
+            path.display()
+        ))
+        .into());
     }
-    Err(anyhow::anyhow!(
-        "no free backup name beside {} for seq {}",
-        log.display(),
-        first_seq
-    ))
-}
+    parse_header::<H>(first_line)?;
 
-/// Write `tail` over the file at `path` from byte `offset` on, in one write,
-/// cut the file to end where `tail` does, and sync it. The file keeps its
-/// inode, mode and every byte before `offset`.
-fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-    let end = (offset + tail.len()) as u64;
-    file.seek(SeekFrom::Start(offset as u64))
-        .and_then(|_| file.write_all(tail.as_bytes()))
-        .and_then(|()| file.set_len(end))
-        .and_then(|()| file.sync_data())
-        .map_err(|e| anyhow::anyhow!("failed to split the last line of {}: {}", path.display(), e))
+    let unterminated = !content.ends_with('\n');
+    let Some(last) = last_event_line(content) else {
+        return Ok(AppendPlan {
+            next_seq: 1,
+            unterminated,
+            merged: None,
+        });
+    };
+    let err = match serde_json::from_str::<serde_json::Value>(last.text.trim()) {
+        Ok(val) => {
+            return Ok(AppendPlan {
+                next_seq: val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1,
+                unterminated,
+                merged: None,
+            })
+        }
+        Err(e) => e,
+    };
+    let pieces = match split_last_line(&last) {
+        SplitOutcome::NotMerged => {
+            return Err(anyhow::anyhow!("failed to parse last event line: {}", err));
+        }
+        SplitOutcome::DoesNotFollow(seqs) => {
+            return Err(EngineError::StateFileCorrupted(format!(
+                "line {} of {} holds {} events written with no newline between them (seq {}), \
+                 and their seqs don't follow the line before it (or that line can't be \
+                 read), so nothing was appended. \
+                 Back up the log, then put each of those events on a line of its own",
+                last.line_number,
+                path.display(),
+                seqs.len(),
+                join_seqs(&seqs)
+            ))
+            .into());
+        }
+        SplitOutcome::Split(pieces) => pieces,
+    };
+    Ok(AppendPlan {
+        next_seq: pieces[pieces.len() - 1].1.seq + 1,
+        unterminated,
+        merged: Some(MergedLastLine {
+            offset: last.offset,
+            line_number: last.line_number,
+            pieces,
+        }),
+    })
 }
 
 /// Read the header line from a state file.
@@ -1299,7 +365,7 @@ pub fn read_header(path: &Path) -> anyhow::Result<StateFileHeader> {
 /// Used by the request store's listing walk, which must not pay for a
 /// full replay of every request just to answer an identity filter.
 pub fn read_header_only<H: LogHeader>(path: &Path) -> anyhow::Result<H> {
-    let file = std::fs::File::open(path)
+    let file = crate::fs_read::open_plain(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
     let reader = BufReader::new(file);
@@ -1412,7 +478,11 @@ fn read_log_inner<H: LogHeader>(
     path: &Path,
     report: TailReport,
 ) -> anyhow::Result<(H, Vec<Event>)> {
-    let content = std::fs::read_to_string(path)
+    let content = crate::fs_read::open_plain(path)
+        .and_then(|mut file| {
+            let mut content = String::new();
+            file.read_to_string(&mut content).map(|_| content)
+        })
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
     parse_log_content(&content, &path.display().to_string(), report)
 }
@@ -1426,6 +496,45 @@ pub fn parse_state_log(bytes: &[u8]) -> anyhow::Result<(StateFileHeader, Vec<Eve
     let content = std::str::from_utf8(bytes)
         .map_err(|e| EngineError::StateFileCorrupted(format!("state log is not UTF-8: {}", e)))?;
     parse_log_content(content, "the state log", TailReport::Quiet)
+}
+
+/// Parse a state file's header from bytes that start at the file's first
+/// byte, as [`read_header`] parses the file: only the first line counts,
+/// and it must be UTF-8, not blank, and a header no newer than this
+/// reader. Whatever follows the first newline is not looked at, so the
+/// bytes may be the first line alone or the whole log.
+pub fn parse_header_bytes(bytes: &[u8]) -> anyhow::Result<StateFileHeader> {
+    if bytes.is_empty() {
+        return Err(EngineError::StateFileCorrupted("state file is empty".to_string()).into());
+    }
+    let first = match bytes.iter().position(|&b| b == b'\n') {
+        Some(end) => &bytes[..end],
+        None => bytes,
+    };
+    let first_line = std::str::from_utf8(first)
+        .map_err(|e| anyhow::anyhow!("failed to read first line: {}", e))?;
+    let trimmed = first_line.trim();
+    if trimmed.is_empty() {
+        return Err(
+            EngineError::StateFileCorrupted("state file has empty first line".to_string()).into(),
+        );
+    }
+    parse_header(trimmed)
+}
+
+/// [`parse_state_log`] with the truncated-final-line warning on stderr
+/// naming `path`, exactly as [`read_events`] reads the file at `path`: for
+/// the dashboard scan, which reads the bytes through the hardened read and
+/// keeps `--once`'s stderr what it was.
+#[doc(hidden)]
+pub fn parse_state_log_at(
+    bytes: &[u8],
+    path: &Path,
+) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+    let content = std::str::from_utf8(bytes).map_err(|e| {
+        EngineError::StateFileCorrupted(format!("state log {} is not UTF-8: {}", path.display(), e))
+    })?;
+    parse_log_content(content, &path.display().to_string(), TailReport::Warn)
 }
 
 /// The one parse of a log's text, shared by the file and in-memory readers.
@@ -1726,7 +835,8 @@ pub fn derive_last_gate_evaluated(events: &[Event], gate: &str) -> Option<serde_
 /// a crafted `template_path` can't point the fallback at any other file in
 /// the session directory, and every reader still verifies the bytes against
 /// the header's `template_hash`.
-pub(crate) fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
+#[doc(hidden)]
+pub fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
     if template_path.is_empty() {
         return template_path.to_string();
     }
@@ -1755,7 +865,8 @@ fn is_content_hash_file_name(name: &str) -> bool {
 /// Whether `hash` has the form of a `template_hash`: exactly 64 lowercase
 /// hex digits, the SHA-256 the template cache names files by. Anything that
 /// turns a recorded hash into a file name checks this first.
-pub(crate) fn is_template_hash(hash: &str) -> bool {
+#[doc(hidden)]
+pub fn is_template_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
@@ -1802,7 +913,11 @@ pub fn derive_machine_state(
 /// the single implementation shared by the dashboard read seam and the
 /// `/workflows` projection writer.
 pub fn is_terminal_state(template_path: &str, state_name: &str) -> bool {
-    let bytes = match std::fs::read(template_path) {
+    let read = crate::fs_read::open_plain(template_path).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let bytes = match read {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -1963,7 +1078,8 @@ fn opens_window(payload: &EventPayload, current_state: &str, boundary: Boundary)
 }
 
 /// The state a state-entry event enters, or `None` for any other event.
-pub(crate) fn entered_state(payload: &EventPayload) -> Option<&str> {
+#[doc(hidden)]
+pub fn entered_state(payload: &EventPayload) -> Option<&str> {
     match payload {
         EventPayload::Transitioned { to, .. }
         | EventPayload::DirectedTransition { to, .. }
@@ -1975,7 +1091,8 @@ pub(crate) fn entered_state(payload: &EventPayload) -> Option<&str> {
 /// Whether `payload` opens a visit: a state entry that is an arrival (a
 /// first entry, a transition or directed transition from a different state,
 /// or any rewind). A transition from a state to itself stays in its visit.
-pub(crate) fn opens_visit(payload: &EventPayload) -> bool {
+#[doc(hidden)]
+pub fn opens_visit(payload: &EventPayload) -> bool {
     entered_state(payload)
         .is_some_and(|to| opens_window(payload, to, Boundary::ArrivalFromElsewhere))
 }
@@ -1988,7 +1105,8 @@ pub(crate) fn opens_visit(payload: &EventPayload) -> bool {
 /// searched end to end. A line laid out any other way falls back to
 /// searching all of it for an entry's type word. Either way a `true` is only
 /// a candidate: the caller parses the line.
-pub(crate) fn may_be_entry(line: &str) -> bool {
+#[doc(hidden)]
+pub fn may_be_entry(line: &str) -> bool {
     const ENTRY_TYPES: [&[u8]; 3] = [b"transitioned\"", b"directed_transition\"", b"rewound\""];
     const TYPE_KEY: &[u8] = b"\"type\":\"";
     let bytes = line.as_bytes();
@@ -2019,14 +1137,16 @@ pub(crate) fn may_be_entry(line: &str) -> bool {
 /// entry, so the work is bounded by the length of the current visit, not
 /// the log. `None` when the log holds no state entry. A line that doesn't
 /// parse is skipped, as [`read_events`] skips it.
-pub(crate) fn visit_start(log: &str) -> Option<u64> {
+#[doc(hidden)]
+pub fn visit_start(log: &str) -> Option<u64> {
     current_visit(log).map(|(_, seq)| seq)
 }
 
 /// [`visit_start`], together with the state the log ends in (the state its
 /// last state entry names, as [`derive_state_from_log`] reads it), both
 /// from one scan of the same bytes.
-pub(crate) fn current_visit(log: &str) -> Option<(String, u64)> {
+#[doc(hidden)]
+pub fn current_visit(log: &str) -> Option<(String, u64)> {
     let mut current: Option<String> = None;
     for line in log.lines().rev() {
         if !may_be_entry(line) {
@@ -2053,7 +1173,8 @@ pub(crate) fn current_visit(log: &str) -> Option<(String, u64)> {
 /// way, such as a partial last write, are passed over. This is a cheaper
 /// reading than [`read_events`] and doesn't promise to agree with it on a
 /// damaged log. `None` when no line carries a `seq`.
-pub(crate) fn last_seq(log: &str) -> Option<u64> {
+#[doc(hidden)]
+pub fn last_seq(log: &str) -> Option<u64> {
     #[derive(serde::Deserialize)]
     struct Seq {
         seq: u64,
@@ -2074,7 +1195,8 @@ pub(crate) fn last_seq(log: &str) -> Option<u64> {
 /// Like [`entry_slice`], only meaningful when `current_state` is the phase
 /// the workflow currently occupies; `engine::decider::visit_start_index`
 /// checks that before calling.
-pub(crate) fn any_entry_index(events: &[Event], current_state: &str) -> Option<usize> {
+#[doc(hidden)]
+pub fn any_entry_index(events: &[Event], current_state: &str) -> Option<usize> {
     entry_index(events, current_state, Boundary::AnyEntry)
 }
 
@@ -2083,15 +1205,9 @@ pub(crate) fn any_entry_index(events: &[Event], current_state: &str) -> Option<u
 /// doesn't open one. The [`Boundary::ArrivalFromElsewhere`] boundary
 /// [`delivery_window`] and the `visit_attempt` stamp cut at, exposed so a
 /// decider check's `visit_seq` comes from the same rule.
-pub(crate) fn arrival_index(events: &[Event], current_state: &str) -> Option<usize> {
+#[doc(hidden)]
+pub fn arrival_index(events: &[Event], current_state: &str) -> Option<usize> {
     entry_index(events, current_state, Boundary::ArrivalFromElsewhere)
-}
-
-/// [`epoch_slice`], for tests outside this module that pin the visit
-/// boundary against it.
-#[cfg(test)]
-pub(crate) fn epoch_slice_for_test<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
-    epoch_slice(events, current_state)
 }
 
 /// The events since the workflow last entered `current_state` at all -- the
@@ -2110,7 +1226,8 @@ pub(crate) fn epoch_slice_for_test<'a>(events: &'a [Event], current_state: &str)
 /// keep the blocked badge on. Nothing in the repo exercises that predicate
 /// directly except the one unit test that asserts both boundaries against a
 /// single log.
-fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+#[doc(hidden)]
+pub fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::AnyEntry)
 }
 
@@ -2123,7 +1240,8 @@ fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
 /// re-sent instructions it already holds. Any rewind does open one: a rewind is
 /// an instruction to redo the work rather than to continue it, and the agent it
 /// addresses needs the procedure again.
-pub(crate) fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+#[doc(hidden)]
+pub fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::ArrivalFromElsewhere)
 }
 
@@ -2222,7 +1340,6 @@ mod tests {
     use super::*;
     use crate::engine::types::{Event, EventPayload, StateFileHeader};
     use std::collections::HashMap;
-    use tempfile::TempDir;
 
     fn make_header() -> StateFileHeader {
         StateFileHeader {
@@ -2265,255 +1382,6 @@ mod tests {
             payload,
             idempotency_hash: None,
         }
-    }
-
-    fn write_state_file(
-        dir: &Path,
-        name: &str,
-        header: &StateFileHeader,
-        events: &[Event],
-    ) -> std::path::PathBuf {
-        let path = dir.join(format!("koto-{}.state.jsonl", name));
-        let mut content = serde_json::to_string(header).unwrap();
-        content.push('\n');
-        for event in events {
-            content.push_str(&serde_json::to_string(event).unwrap());
-            content.push('\n');
-        }
-        std::fs::write(&path, &content).unwrap();
-        path
-    }
-
-    // -----------------------------------------------------------------------
-    // Schema version guard
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn schema_version_1_is_accepted() {
-        let dir = TempDir::new().unwrap();
-        let header = make_header(); // schema_version: 1
-        let events = vec![make_event(
-            1,
-            EventPayload::WorkflowInitialized {
-                template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::new(),
-                spawn_entry: None,
-                machine: None,
-            },
-        )];
-        let path = write_state_file(dir.path(), "sv1", &header, &events);
-        assert!(read_events(&path).is_ok());
-    }
-
-    #[test]
-    fn schema_version_2_returns_incompatible_error() {
-        let dir = TempDir::new().unwrap();
-        let mut header = make_header();
-        header.schema_version = 2;
-        let events = vec![make_event(
-            1,
-            EventPayload::WorkflowInitialized {
-                template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::new(),
-                spawn_entry: None,
-                machine: None,
-            },
-        )];
-        let path = write_state_file(dir.path(), "sv2", &header, &events);
-        let err = read_events(&path).unwrap_err();
-        let engine_err = err.downcast::<EngineError>().expect("must be EngineError");
-        assert!(
-            matches!(
-                engine_err,
-                EngineError::IncompatibleSchemaVersion {
-                    found: 2,
-                    max_supported: 1
-                }
-            ),
-            "unexpected error: {:?}",
-            engine_err
-        );
-    }
-
-    #[test]
-    fn header_missing_schema_version_defaults_to_1() {
-        // Older sessions were written before `schema_version` existed in
-        // the header. Such a header must parse (as version 1) rather than
-        // fail with "missing field schema_version", so discovery stops
-        // warning about it and the session stays readable.
-        let dir = TempDir::new().unwrap();
-        let header = make_header();
-        let mut header_json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&header).unwrap()).unwrap();
-        header_json
-            .as_object_mut()
-            .unwrap()
-            .remove("schema_version");
-        assert!(
-            header_json.get("schema_version").is_none(),
-            "test setup: schema_version should be absent"
-        );
-
-        let path = dir.path().join("koto-legacy.state.jsonl");
-        let mut content = serde_json::to_string(&header_json).unwrap();
-        content.push('\n');
-        content.push_str(
-            &serde_json::to_string(&make_event(
-                1,
-                EventPayload::WorkflowInitialized {
-                    template_path: "/cache/abc.json".to_string(),
-                    variables: HashMap::new(),
-                    spawn_entry: None,
-                    machine: None,
-                },
-            ))
-            .unwrap(),
-        );
-        content.push('\n');
-        std::fs::write(&path, &content).unwrap();
-
-        let parsed = read_header(&path).expect("header missing schema_version must parse");
-        assert_eq!(parsed.schema_version, 1);
-
-        // The full read path recovers too, not just the header.
-        let (parsed_header, events) =
-            read_events(&path).expect("read_events must recover legacy header");
-        assert_eq!(parsed_header.schema_version, 1);
-        assert_eq!(events.len(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Header parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn read_events_with_valid_header_and_events() {
-        let dir = TempDir::new().unwrap();
-        let header = make_header();
-        let events = vec![
-            make_event(
-                1,
-                EventPayload::WorkflowInitialized {
-                    template_path: "/cache/abc.json".to_string(),
-                    variables: HashMap::new(),
-                    spawn_entry: None,
-                    machine: None,
-                },
-            ),
-            make_event(
-                2,
-                EventPayload::Transitioned {
-                    from: None,
-                    to: "gather".to_string(),
-                    condition_type: "auto".to_string(),
-                    skip_if_matched: None,
-                    context_assignments: None,
-                    vars_matched: None,
-                },
-            ),
-        ];
-        let path = write_state_file(dir.path(), "test", &header, &events);
-
-        let (parsed_header, parsed_events) = read_events(&path).unwrap();
-        assert_eq!(parsed_header, header);
-        assert_eq!(parsed_events.len(), 2);
-        assert_eq!(parsed_events[0].seq, 1);
-        assert_eq!(parsed_events[1].seq, 2);
-    }
-
-    // -----------------------------------------------------------------------
-    // Sequence gap detection
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sequence_gap_in_middle_produces_error() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-gap.state.jsonl");
-
-        let header = make_header();
-        let e1 = make_event(
-            1,
-            EventPayload::WorkflowInitialized {
-                template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::new(),
-                spawn_entry: None,
-                machine: None,
-            },
-        );
-        // Seq jumps from 1 to 3 (gap at seq 2)
-        let e3 = make_event(
-            3,
-            EventPayload::Transitioned {
-                from: None,
-                to: "gather".to_string(),
-                condition_type: "auto".to_string(),
-                skip_if_matched: None,
-                context_assignments: None,
-                vars_matched: None,
-            },
-        );
-        let e4 = make_event(
-            4,
-            EventPayload::Transitioned {
-                from: Some("gather".to_string()),
-                to: "plan".to_string(),
-                condition_type: "gate".to_string(),
-                skip_if_matched: None,
-                context_assignments: None,
-                vars_matched: None,
-            },
-        );
-
-        let mut content = serde_json::to_string(&header).unwrap() + "\n";
-        content += &serde_json::to_string(&e1).unwrap();
-        content.push('\n');
-        content += &serde_json::to_string(&e3).unwrap();
-        content.push('\n');
-        content += &serde_json::to_string(&e4).unwrap();
-        content.push('\n');
-        std::fs::write(&path, &content).unwrap();
-
-        let result = read_events(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("sequence gap"),
-            "error should mention sequence gap, got: {}",
-            err
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Truncated final line recovery
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn truncated_final_line_recovered() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-trunc.state.jsonl");
-
-        let header = make_header();
-        let e1 = make_event(
-            1,
-            EventPayload::WorkflowInitialized {
-                template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::new(),
-                spawn_entry: None,
-                machine: None,
-            },
-        );
-
-        let mut content = serde_json::to_string(&header).unwrap() + "\n";
-        content += &serde_json::to_string(&e1).unwrap();
-        content.push('\n');
-        content += "{\"seq\":2,\"truncated"; // malformed final line
-        content.push('\n');
-        std::fs::write(&path, &content).unwrap();
-
-        let (parsed_header, events) = read_events(&path).unwrap();
-        assert_eq!(parsed_header, header);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].seq, 1);
     }
 
     // -----------------------------------------------------------------------
@@ -2773,408 +1641,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // append_event with seq assignment
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn append_event_assigns_sequential_seq() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-seq.state.jsonl");
-
-        // Write header first
-        let header = make_header();
-        append_header(&path, &header).unwrap();
-
-        let seq1 = append_event(
-            &path,
-            &EventPayload::WorkflowInitialized {
-                template_path: "/cache/abc.json".to_string(),
-                variables: HashMap::new(),
-                spawn_entry: None,
-                machine: None,
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(seq1, 1);
-
-        let seq2 = append_event(
-            &path,
-            &EventPayload::Transitioned {
-                from: None,
-                to: "gather".to_string(),
-                condition_type: "auto".to_string(),
-                skip_if_matched: None,
-                context_assignments: None,
-                vars_matched: None,
-            },
-            "2026-01-01T00:00:01Z",
-        )
-        .unwrap();
-        assert_eq!(seq2, 2);
-
-        let seq3 = append_event(
-            &path,
-            &EventPayload::Rewound {
-                from: "gather".to_string(),
-                to: "start".to_string(),
-                rationale: None,
-            },
-            "2026-01-01T00:00:02Z",
-        )
-        .unwrap();
-        assert_eq!(seq3, 3);
-
-        // Verify by reading back
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].seq, 1);
-        assert_eq!(events[1].seq, 2);
-        assert_eq!(events[2].seq, 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // append_event_tracked and the visit rule
-    // -----------------------------------------------------------------------
-
-    fn moved(from: Option<&str>, to: &str) -> EventPayload {
-        EventPayload::Transitioned {
-            from: from.map(str::to_string),
-            to: to.to_string(),
-            condition_type: "auto".to_string(),
-            skip_if_matched: None,
-            context_assignments: None,
-            vars_matched: None,
-        }
-    }
-
-    fn noted(state: &str) -> EventPayload {
-        EventPayload::EvidenceSubmitted {
-            state: state.to_string(),
-            fields: HashMap::new(),
-            submitter_cwd: None,
-            source: None,
-            exported_fields: None,
-        }
-    }
-
-    /// Each append returns its own seq, the log as it was before it, and
-    /// the visit that log was in. A self-transition stays in the visit; an
-    /// arrival from elsewhere, a directed transition from a different
-    /// state and a rewind each open one.
-    #[test]
-    fn tracked_appends_report_the_seq_the_prior_log_and_the_visit() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-tracked.state.jsonl");
-        append_header(&path, &make_header()).unwrap();
-        let ts = "2026-01-01T00:00:00Z";
-        let steps: Vec<(EventPayload, Option<u64>, Option<u64>)> = vec![
-            // (payload, prior visit, the event's own visit)
-            (
-                EventPayload::WorkflowInitialized {
-                    template_path: "t".to_string(),
-                    variables: HashMap::new(),
-                    spawn_entry: None,
-                    machine: None,
-                },
-                None,
-                None,
-            ),
-            (moved(None, "a"), None, Some(2)),
-            (noted("a"), Some(2), Some(2)),
-            (moved(Some("a"), "a"), Some(2), Some(2)),
-            (noted("a"), Some(2), Some(2)),
-            (moved(Some("a"), "b"), Some(2), Some(6)),
-            (noted("b"), Some(6), Some(6)),
-            (
-                EventPayload::DirectedTransition {
-                    from: "b".to_string(),
-                    to: "b".to_string(),
-                    rationale: None,
-                    decision: None,
-                },
-                Some(6),
-                Some(6),
-            ),
-            (
-                EventPayload::Rewound {
-                    from: "b".to_string(),
-                    to: "a".to_string(),
-                    rationale: None,
-                },
-                Some(6),
-                Some(9),
-            ),
-            (noted("a"), Some(9), Some(9)),
-            (
-                EventPayload::DirectedTransition {
-                    from: "a".to_string(),
-                    to: "c".to_string(),
-                    rationale: None,
-                    decision: None,
-                },
-                Some(9),
-                Some(11),
-            ),
-            (
-                EventPayload::Rewound {
-                    from: "c".to_string(),
-                    to: "c".to_string(),
-                    rationale: None,
-                },
-                Some(11),
-                Some(12),
-            ),
-        ];
-        for (i, (payload, prior, own)) in steps.iter().enumerate() {
-            let before = std::fs::read_to_string(&path).unwrap();
-            let commit = append_event_tracked(&path, payload, ts).unwrap();
-            assert_eq!(commit.seq, i as u64 + 1, "step {i}");
-            assert_eq!(commit.prior_log, before, "step {i}");
-            assert_eq!(commit.prior_visit_seq(), *prior, "step {i}");
-            assert_eq!(commit.visit_seq_for(payload), *own, "step {i}");
-        }
-        // The tracked append writes exactly what a plain append writes.
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(events.len(), steps.len());
-        assert_eq!(
-            visit_start(&std::fs::read_to_string(&path).unwrap()),
-            Some(12)
-        );
-    }
-
-    /// `visit_start` on a whole log agrees with `arrival_index` on the same
-    /// events, and isn't fooled by a type word inside another event.
-    #[test]
-    fn visit_start_matches_arrival_index_and_skips_lookalike_lines() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-look.state.jsonl");
-        append_header(&path, &make_header()).unwrap();
-        let ts = "2026-01-01T00:00:00Z";
-        append_event(&path, &moved(None, "a"), ts).unwrap();
-        append_event(&path, &moved(Some("a"), "b"), ts).unwrap();
-        let mut fields = HashMap::new();
-        fields.insert("type".to_string(), serde_json::json!("rewound"));
-        fields.insert("to".to_string(), serde_json::json!("a"));
-        append_event(
-            &path,
-            &EventPayload::EvidenceSubmitted {
-                state: "b".to_string(),
-                fields,
-                submitter_cwd: None,
-                source: None,
-                exported_fields: None,
-            },
-            ts,
-        )
-        .unwrap();
-        append_event(&path, &moved(Some("b"), "b"), ts).unwrap();
-        let log = std::fs::read_to_string(&path).unwrap();
-        let (_, events) = read_events(&path).unwrap();
-        let idx = arrival_index(&events, "b").unwrap();
-        assert_eq!(visit_start(&log), Some(events[idx].seq));
-        assert_eq!(visit_start(&log), Some(2));
-        // The state comes from the same scan, and agrees with the log's.
-        assert_eq!(current_visit(&log), Some(("b".to_string(), 2)));
-        assert_eq!(derive_state_from_log(&events).as_deref(), Some("b"));
-        // A log with no state entry has no visit.
-        assert_eq!(visit_start(log.lines().next().unwrap()), None);
-
-        // The prefilter reads the type word where koto writes it, and falls
-        // back to the whole line for any other layout.
-        let lines: Vec<&str> = log.lines().collect();
-        assert!(!may_be_entry(lines[3]), "evidence naming a rewind");
-        assert!(may_be_entry(lines[2]));
-        let reordered = format!(
-            r#"{{"payload":{{"from":"{}","to":"a"}},"type":"rewound","seq":9,"timestamp":"t"}}"#,
-            "b".repeat(200)
-        );
-        assert!(may_be_entry(&reordered));
-        let log = format!("{log}{reordered}\n");
-        assert_eq!(visit_start(&log), Some(9));
-    }
-
-    /// `last_seq` is the last event's seq, skips a partial last line, and
-    /// is `None` for a log holding only its header.
-    #[test]
-    fn last_seq_reads_the_last_event_and_skips_a_partial_line() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-last.state.jsonl");
-        append_header(&path, &make_header()).unwrap();
-        let header_only = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(last_seq(&header_only), None);
-        let ts = "2026-01-01T00:00:00Z";
-        append_event(&path, &moved(None, "a"), ts).unwrap();
-        append_event(&path, &moved(Some("a"), "b"), ts).unwrap();
-        let log = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(last_seq(&log), Some(2));
-        let torn = format!("{log}{{\"seq\":3,\"timest");
-        assert_eq!(last_seq(&torn), Some(2));
-    }
-
-    // -----------------------------------------------------------------------
-    // append refuses a log that has no header (koto#236, koto#200)
-    // -----------------------------------------------------------------------
-
-    fn context_added(key: &str) -> EventPayload {
-        EventPayload::ContextAdded {
-            key: key.to_string(),
-            hash: "abc".to_string(),
-            size: 1,
-            writer: None,
-        }
-    }
-
-    #[test]
-    fn append_event_refuses_a_missing_log_and_creates_nothing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-missing.state.jsonl");
-
-        let err = append_event(&path, &context_added("a.md"), "2026-01-01T00:00:00Z").unwrap_err();
-
-        assert!(err.to_string().contains("does not exist"), "got: {err}");
-        assert!(!path.exists(), "a refused append must not create the log");
-    }
-
-    #[test]
-    fn append_event_refuses_an_empty_log_and_writes_nothing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-empty.state.jsonl");
-        std::fs::write(&path, "").unwrap();
-
-        let err = append_event(&path, &context_added("a.md"), "2026-01-01T00:00:00Z").unwrap_err();
-
-        assert!(
-            err.to_string().contains("state file is empty"),
-            "got: {err}"
-        );
-        assert!(
-            std::fs::read(&path).unwrap().is_empty(),
-            "a refused append must leave an empty log empty"
-        );
-    }
-
-    /// The #236 shape: a log whose first line is an event. Before the fix the
-    /// append skipped that line as if it were the header, wrote a second
-    /// `seq: 1`, and the log stayed unreadable.
-    #[test]
-    fn append_event_refuses_a_log_whose_first_line_is_an_event() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-headerless.state.jsonl");
-        let line = serde_json::to_string(&make_event(1, context_added("a.md"))).unwrap();
-        let content = format!("{line}\n");
-        std::fs::write(&path, &content).unwrap();
-
-        let err = append_event(&path, &context_added("b.md"), "2026-01-01T00:00:01Z").unwrap_err();
-
-        assert!(
-            err.to_string().contains("state log has no header"),
-            "got: {err}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            content,
-            "a refused append must leave the log byte-for-byte unchanged"
-        );
-    }
-
-    #[test]
-    fn append_event_idempotent_refuses_a_missing_log_and_creates_nothing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-missing.state.jsonl");
-
-        let result = append_event_idempotent(
-            &path,
-            &context_added("a.md"),
-            "2026-01-01T00:00:00Z",
-            "work",
-            Some("hash"),
-        );
-
-        assert!(result.is_err(), "an append to a missing log must fail");
-        assert!(
-            !path.exists(),
-            "neither the lock nor the append may create the log"
-        );
-    }
-
-    /// The case the header-before-scan ordering exists for. A headerless log
-    /// that already carries a matching idempotency hash used to short-circuit
-    /// into `Idempotent`, reporting success on a log no reader can parse.
-    /// Move the header check back below the scan and this test fails; the
-    /// missing-log tests would not, because they fail earlier at the open.
-    #[test]
-    fn append_event_idempotent_refuses_a_headerless_log_that_holds_a_matching_hash() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-headerless.state.jsonl");
-        let payload = context_added("a.md");
-        let hash = "matching-hash";
-        let prior = Event {
-            seq: 1,
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            event_type: payload.type_name().to_string(),
-            payload: payload.clone(),
-            idempotency_hash: Some(hash.to_string()),
-        };
-        let content = format!("{}\n", serde_json::to_string(&prior).unwrap());
-        std::fs::write(&path, &content).unwrap();
-
-        let err =
-            append_event_idempotent(&path, &payload, "2026-01-01T00:00:01Z", "work", Some(hash))
-                .unwrap_err();
-
-        assert!(
-            err.to_string().contains("state log has no header"),
-            "the header check must run before the hash scan; got: {err}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            content,
-            "a refused append must leave the log unchanged"
-        );
-    }
-
-    #[test]
-    fn read_header_names_a_log_whose_first_line_is_an_event() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-headerless.state.jsonl");
-        let line = serde_json::to_string(&make_event(1, context_added("a.md"))).unwrap();
-        std::fs::write(&path, format!("{line}\n")).unwrap();
-
-        let err = read_header(&path).unwrap_err().to_string();
-
-        assert!(
-            err.contains("state log has no header")
-                && err.contains("`context_added` event (seq 1)"),
-            "got: {err}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // File permissions (unix only)
-    // -----------------------------------------------------------------------
-
-    #[cfg(unix)]
-    #[test]
-    fn newly_created_state_file_has_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-perm.state.jsonl");
-
-        let header = make_header();
-        append_header(&path, &header).unwrap();
-
-        let metadata = std::fs::metadata(&path).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "file permissions should be 0600, got {:o}",
-            mode
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // derive_machine_state
     // -----------------------------------------------------------------------
 
@@ -3281,69 +1747,6 @@ mod tests {
         assert_eq!(ms.template_path, "");
     }
 
-    // -- the session-directory fallback for a missing absolute template path --
-
-    const HASH_NAME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json";
-
-    #[test]
-    fn missing_absolute_hash_path_falls_back_to_the_session_dir_copy() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("session");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join(HASH_NAME), b"{}").unwrap();
-        let recorded = format!("/elsewhere/.cache/koto/{}", HASH_NAME);
-
-        assert_eq!(
-            resolve_template_path_in_session(&recorded, &session_dir),
-            session_dir.join(HASH_NAME).to_string_lossy()
-        );
-    }
-
-    #[test]
-    fn fallback_is_not_taken_for_a_name_that_is_not_a_content_hash() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let session_dir = tmp.path().join("session");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        // Each of these exists in the session dir, so only the name rule
-        // stands between a crafted template_path and the file.
-        let names = [
-            "manifest.json",
-            "version.json",
-            // Uppercase hex is not what the cache writes.
-            "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef.json",
-            // 63 digits.
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde.json",
-            // Right stem, wrong extension.
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.md",
-        ];
-        for name in names {
-            std::fs::write(session_dir.join(name), b"{}").unwrap();
-            let recorded = format!("/elsewhere/{}", name);
-            assert_eq!(
-                resolve_template_path_in_session(&recorded, &session_dir),
-                recorded,
-                "{name} must not resolve into the session dir"
-            );
-        }
-    }
-
-    #[test]
-    fn an_existing_absolute_path_is_preferred_over_the_session_dir_copy() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = tmp.path().join("cache");
-        let session_dir = tmp.path().join("session");
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(cache.join(HASH_NAME), b"{}").unwrap();
-        std::fs::write(session_dir.join(HASH_NAME), b"{}").unwrap();
-        let recorded = cache.join(HASH_NAME).to_string_lossy().into_owned();
-
-        assert_eq!(
-            resolve_template_path_in_session(&recorded, &session_dir),
-            recorded
-        );
-    }
-
     #[test]
     fn a_template_hash_is_exactly_64_lowercase_hex_digits() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -3354,17 +1757,6 @@ mod tests {
         assert!(!is_template_hash(&hash.to_uppercase()));
         assert!(!is_template_hash(&format!("../{}", &hash[3..])));
         assert!(!is_template_hash(&format!("{}g", &hash[1..])));
-    }
-
-    #[test]
-    fn missing_absolute_path_with_no_session_copy_passes_through() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let recorded = format!("/elsewhere/.cache/koto/{}", HASH_NAME);
-        assert_eq!(
-            resolve_template_path_in_session(&recorded, tmp.path()),
-            recorded,
-            "nothing to fall back to: the reader reports the recorded path"
-        );
     }
 
     #[test]
@@ -4440,59 +2832,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // append_header parent-dir fsync (Fix 3)
-    // -----------------------------------------------------------------------
-
-    /// A first-write `append_header` against a brand-new state file
-    /// must succeed end-to-end. The parent-dir fsync is best-effort
-    /// (some filesystems reject `O_RDONLY` directory fsync); the only
-    /// observable assertion is that the header is durable on the
-    /// filesystem after the call returns. We don't assert the
-    /// directory was actually fsynced — that requires a crash-replay
-    /// harness we don't have — but we DO assert the write path
-    /// tolerates the parent-dir fsync attempt without surfacing an
-    /// error to the caller.
-    #[test]
-    fn append_header_first_write_writes_durably() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-first-write.state.jsonl");
-        assert!(!path.exists());
-        let header = make_header();
-        append_header(&path, &header).expect("first-write append_header must succeed");
-        assert!(path.exists(), "header file must exist after first write");
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"workflow\":\"test-wf\""));
-        assert!(content.ends_with('\n'), "header line must end in newline");
-    }
-
-    /// A subsequent `append_header` call (file already exists) takes
-    /// the non-first-write branch and skips the parent-dir fsync.
-    /// We can't directly observe the skip from a unit test, but the
-    /// call must still succeed and leave the file readable. The
-    /// regression we're guarding against is the parent-dir fsync
-    /// branch firing on every write — which would be benign but
-    /// wastes a syscall on every append in the steady state.
-    #[test]
-    fn append_header_subsequent_write_is_well_formed() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("koto-second-write.state.jsonl");
-        let header = make_header();
-        append_header(&path, &header).expect("first write");
-        // Second call — the file already exists, so the is_first_write
-        // branch should NOT fire. We can only assert the call completes
-        // cleanly; the syscall-count optimisation is internal.
-        append_header(&path, &header).expect("second write");
-        let content = std::fs::read_to_string(&path).unwrap();
-        // The second call rewrites at offset 0 (the file was opened
-        // with .write(true).truncate(false), so the cursor starts at
-        // offset 0 and the second header overwrites the first byte for
-        // byte). We assert the workflow marker is present — not the
-        // count — because the call's existing contract focuses on
-        // durability, not append-vs-overwrite semantics.
-        assert!(content.contains("\"workflow\":\"test-wf\""));
-    }
-
-    // -----------------------------------------------------------------------
     // Merged and unterminated last lines (koto#419)
     // -----------------------------------------------------------------------
 
@@ -4507,270 +2846,6 @@ mod tests {
 
     fn line(event: &Event) -> String {
         serde_json::to_string(event).unwrap()
-    }
-
-    /// A log holding the header, `events` one per line, and then `tail`
-    /// written verbatim.
-    fn log_with_tail(dir: &Path, events: &[Event], tail: &str) -> std::path::PathBuf {
-        let path = write_state_file(dir, "tail", &make_header(), events);
-        let mut content = std::fs::read_to_string(&path).unwrap();
-        content.push_str(tail);
-        std::fs::write(&path, content).unwrap();
-        path
-    }
-
-    fn backups(dir: &Path) -> Vec<std::path::PathBuf> {
-        let mut found: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "bak"))
-            .collect();
-        found.sort();
-        found
-    }
-
-    /// Every line after the header must hold exactly one event, seqs 1..=n.
-    fn assert_one_event_per_line(path: &Path) -> Vec<Event> {
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.ends_with('\n'), "log must end in a newline");
-        let events: Vec<Event> = content
-            .lines()
-            .skip(1)
-            .map(|l| {
-                serde_json::from_str(l)
-                    .unwrap_or_else(|e| panic!("line {l:?} is not one event: {e}"))
-            })
-            .collect();
-        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, (1..=events.len() as u64).collect::<Vec<_>>());
-        events
-    }
-
-    #[test]
-    fn append_writes_one_line_and_leaves_a_well_formed_log_byte_for_byte() {
-        let dir = TempDir::new().unwrap();
-        let path = write_state_file(dir.path(), "wf", &make_header(), &[intent(1, "a")]);
-        let before = std::fs::read_to_string(&path).unwrap();
-        let seq = append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "b".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(seq, 2);
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, format!("{before}{}\n", line(&intent(2, "b"))));
-        assert!(backups(dir.path()).is_empty());
-    }
-
-    /// The precursor of a merge: a writer died after writing an event and
-    /// before its newline. The next append supplies the newline instead of
-    /// starting on the same line.
-    #[test]
-    fn append_after_an_unterminated_complete_event_starts_a_new_line() {
-        let dir = TempDir::new().unwrap();
-        let path = log_with_tail(dir.path(), &[intent(1, "a")], &line(&intent(2, "b")));
-        let seq = append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "c".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(seq, 3);
-        let events = assert_one_event_per_line(&path);
-        assert_eq!(events.len(), 3);
-    }
-
-    /// koto#419 as seen: two complete events on the last line with no
-    /// newline between them refused every later write. The append now
-    /// splits them, keeps the log as it was in a backup, and goes on.
-    #[test]
-    fn append_splits_a_merged_last_line_and_keeps_a_backup() {
-        let dir = TempDir::new().unwrap();
-        let big = "x".repeat(10_000);
-        let merged = format!(
-            "{}{}{}\n",
-            line(&intent(3, "small")),
-            line(&intent(4, &big)),
-            line(&intent(5, "medium sized intent"))
-        );
-        let path = log_with_tail(dir.path(), &[intent(1, "a"), intent(2, "b")], &merged);
-        let original = std::fs::read_to_string(&path).unwrap();
-        #[cfg(unix)]
-        let inode = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&path).unwrap().ino()
-        };
-
-        let seq = append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "after".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(seq, 6);
-        let events = assert_one_event_per_line(&path);
-        assert_eq!(events.len(), 6);
-        match &events[3].payload {
-            EventPayload::IntentUpdated { intent } => assert_eq!(intent, &big),
-            other => panic!("unexpected payload {other:?}"),
-        }
-
-        let backups = backups(dir.path());
-        assert_eq!(backups.len(), 1, "{backups:?}");
-        assert!(
-            backups[0]
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .ends_with(".seq3-merged.bak"),
-            "{backups:?}"
-        );
-        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-            // Split in place: a tick's `flock` on the log's inode still holds.
-            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
-        }
-        // Everything before the merged line is byte-for-byte what it was.
-        let prefix = &original[..original.len() - merged.len()];
-        assert!(std::fs::read_to_string(&path).unwrap().starts_with(prefix));
-    }
-
-    /// A merged line followed by blank lines splits too, and the log ends
-    /// right after the split events and the new one.
-    #[test]
-    fn split_drops_blank_lines_after_a_merged_last_line() {
-        let dir = TempDir::new().unwrap();
-        let merged = format!("{}{}\n\n\n", line(&intent(2, "b")), line(&intent(3, "c")));
-        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
-        append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "d".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(assert_one_event_per_line(&path).len(), 4);
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("\n\n"));
-    }
-
-    /// The merged line without its own newline, and as the log's only
-    /// event line, splits the same way; the idempotent path splits too.
-    #[test]
-    fn idempotent_append_splits_an_unterminated_merged_first_event_line() {
-        let dir = TempDir::new().unwrap();
-        let merged = format!("{}{}", line(&intent(1, "a")), line(&intent(2, "b")));
-        let path = log_with_tail(dir.path(), &[], &merged);
-        let outcome = append_event_idempotent(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "c".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-            "s",
-            Some("hash-c"),
-        )
-        .unwrap();
-        assert_eq!(outcome, AppendOutcome::Written { seq: 3 });
-        assert_eq!(assert_one_event_per_line(&path).len(), 3);
-        assert_eq!(backups(dir.path()).len(), 1);
-    }
-
-    /// A genuinely truncated last line behaves as it always has: the
-    /// append is refused with the same message and nothing is touched.
-    #[test]
-    fn append_still_refuses_a_truncated_last_line_and_touches_nothing() {
-        let dir = TempDir::new().unwrap();
-        let full = line(&intent(2, "b"));
-        for tail in [
-            format!("{}\n", &full[..full.len() / 2]),
-            full[..full.len() - 1].to_string(),
-            // A complete event followed by the start of another.
-            format!("{}{}\n", full, &full[..10]),
-        ] {
-            let path = log_with_tail(dir.path(), &[intent(1, "a")], &tail);
-            let before = std::fs::read_to_string(&path).unwrap();
-            let err = append_event(
-                &path,
-                &EventPayload::IntentUpdated {
-                    intent: "c".to_string(),
-                },
-                "2026-01-01T00:00:00Z",
-            )
-            .unwrap_err();
-            assert!(
-                err.to_string()
-                    .starts_with("failed to parse last event line: "),
-                "{err}"
-            );
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-            assert!(backups(dir.path()).is_empty());
-        }
-    }
-
-    /// Merged events whose seqs don't continue the log are left alone, and
-    /// the refusal names the line and how to repair it.
-    #[test]
-    fn append_refuses_merged_events_that_do_not_follow_and_names_the_line() {
-        let dir = TempDir::new().unwrap();
-        let merged = format!("{}{}\n", line(&intent(5, "x")), line(&intent(6, "y")));
-        let path = log_with_tail(dir.path(), &[intent(1, "a"), intent(2, "b")], &merged);
-        let before = std::fs::read_to_string(&path).unwrap();
-        let err = append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "c".to_string(),
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("line 4 of "), "{msg}");
-        assert!(msg.contains("seq 5, 6"), "{msg}");
-        assert!(
-            msg.contains("put each of those events on a line of its own"),
-            "{msg}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        assert!(backups(dir.path()).is_empty());
-    }
-
-    /// A reader sees a merged final line as the events it holds, instead of
-    /// dropping both as a torn tail; a torn tail is still dropped.
-    #[test]
-    fn reader_reads_a_merged_final_line_as_its_events() {
-        let dir = TempDir::new().unwrap();
-        let merged = format!("{}{}\n", line(&intent(2, "b")), line(&intent(3, "c")));
-        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(
-            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-
-        let full = line(&intent(2, "b"));
-        let path = log_with_tail(dir.path(), &[intent(1, "a")], &full[..full.len() - 3]);
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(events.len(), 1);
-
-        // Merged events that don't continue the log are a torn tail to the
-        // reader, as before.
-        let merged = format!("{}{}\n", line(&intent(7, "b")), line(&intent(8, "c")));
-        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(events.len(), 1);
     }
 
     #[test]
@@ -4789,182 +2864,100 @@ mod tests {
         assert!(split_concatenated("").is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // The supersede fence
-    // -----------------------------------------------------------------------
-
-    fn fence(by: &str, id: &str) -> SupersedeFence {
-        SupersedeFence {
-            by: by.to_string(),
-            by_session_id: id.to_string(),
-            actor: SupersedeActor {
-                claude_session: None,
-                host: Some("box".to_string()),
-                user: Some("dev".to_string()),
-            },
-            at: "2026-01-01T00:00:00Z".to_string(),
-        }
+    fn header_json() -> String {
+        serde_json::to_string(&make_header()).unwrap()
     }
 
-    /// A session log `p` holding a header and one transition.
-    fn fenceable_log(dir: &Path) -> std::path::PathBuf {
-        let session = dir.join("p");
-        std::fs::create_dir_all(&session).unwrap();
-        let path = session.join("koto-p.state.jsonl");
-        append_header(&path, &make_header()).unwrap();
-        append_event(
-            &path,
-            &EventPayload::Transitioned {
-                from: None,
-                to: "start".to_string(),
-                condition_type: "auto".to_string(),
-                skip_if_matched: None,
-                context_assignments: None,
-                vars_matched: None,
-            },
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
-        path
+    #[test]
+    fn parse_header_bytes_reads_the_first_line() {
+        let alone = header_json();
+        assert_eq!(
+            parse_header_bytes(alone.as_bytes()).unwrap().workflow,
+            "test-wf"
+        );
+        let with_newline = format!("{alone}\n");
+        assert_eq!(
+            parse_header_bytes(with_newline.as_bytes())
+                .unwrap()
+                .workflow,
+            "test-wf"
+        );
     }
 
-    fn intent_payload() -> EventPayload {
-        EventPayload::IntentUpdated {
-            intent: "more".to_string(),
+    #[test]
+    fn parse_header_bytes_ignores_what_follows_the_first_line() {
+        let mut bytes = format!("{}\n{{not an event\n", header_json()).into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        assert_eq!(parse_header_bytes(&bytes).unwrap().workflow, "test-wf");
+    }
+
+    fn corrupted(result: anyhow::Result<StateFileHeader>) -> String {
+        match result.unwrap_err().downcast::<EngineError>() {
+            Ok(EngineError::StateFileCorrupted(msg)) => msg,
+            other => panic!("expected StateFileCorrupted, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_fence_refuses_every_later_append_but_a_read() {
-        let dir = TempDir::new().unwrap();
-        let path = fenceable_log(dir.path());
-        let outcome = append_supersede_fence(
-            &path,
-            &fence("s", "id-s"),
-            "2026-01-01T00:00:01Z",
-            FENCE_LOCK_WAIT,
-        )
-        .unwrap();
-        assert_eq!(outcome, FenceOutcome::Fenced { seq: 2 });
-        let before = std::fs::read(&path).unwrap();
+    fn parse_header_bytes_refuses_an_empty_file() {
+        assert_eq!(corrupted(parse_header_bytes(b"")), "state file is empty");
+    }
 
-        let err = append_event(&path, &intent_payload(), "2026-01-01T00:00:02Z").unwrap_err();
-        let refused = session_superseded(&err).expect("a typed refusal");
-        assert_eq!(refused.session, "p");
-        assert_eq!(refused.fence.by, "s");
-        assert!(err.to_string().contains("session_superseded"));
-        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    #[test]
+    fn parse_header_bytes_refuses_a_blank_first_line() {
+        for bytes in [&b"\n"[..], b"   \n", b"  \t", b"\n{\"seq\":1}\n"] {
+            assert_eq!(
+                corrupted(parse_header_bytes(bytes)),
+                "state file has empty first line",
+                "{bytes:?}"
+            );
+        }
+    }
 
-        let err = append_event_idempotent(
-            &path,
-            &intent_payload(),
-            "2026-01-01T00:00:02Z",
-            "start",
-            Some("h"),
-        )
-        .unwrap_err();
-        assert!(session_superseded(&err).is_some());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-
-        let read = EventPayload::ContextRead {
-            key: "record/a".to_string(),
-            reader: "cli".to_string(),
-            state: "start".to_string(),
-            present: true,
-            hash: None,
-            access: None,
-            gate: None,
-            session: None,
-        };
-        assert_eq!(
-            append_event(&path, &read, "2026-01-01T00:00:03Z").unwrap(),
-            3
+    #[test]
+    fn parse_header_bytes_refuses_a_first_line_that_is_not_utf8() {
+        let err = parse_header_bytes(&[b'{', 0xff, b'}', b'\n']).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to read first line"),
+            "{err}"
         );
     }
 
     #[test]
-    fn the_first_fence_wins_and_a_rerun_finds_its_own() {
-        let dir = TempDir::new().unwrap();
-        let path = fenceable_log(dir.path());
-        let ts = "2026-01-01T00:00:01Z";
-        assert!(matches!(
-            append_supersede_fence(&path, &fence("s", "id-s"), ts, FENCE_LOCK_WAIT).unwrap(),
-            FenceOutcome::Fenced { .. }
-        ));
-        let after_first = std::fs::read(&path).unwrap();
-        assert_eq!(
-            append_supersede_fence(&path, &fence("s", "id-s"), ts, FENCE_LOCK_WAIT).unwrap(),
-            FenceOutcome::AlreadyOurs
-        );
-        assert_eq!(
-            append_supersede_fence(&path, &fence("t", "id-t"), ts, FENCE_LOCK_WAIT).unwrap(),
-            FenceOutcome::SupersededByOther(fence("s", "id-s"))
-        );
-        // Same name, another session id: another session, not a re-run.
-        assert_eq!(
-            append_supersede_fence(&path, &fence("s", "id-other"), ts, FENCE_LOCK_WAIT).unwrap(),
-            FenceOutcome::SupersededByOther(fence("s", "id-s"))
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), after_first);
-
-        let (_, events) = read_events(&path).unwrap();
-        assert_eq!(superseded_by(&events), Some(fence("s", "id-s")));
-        assert_eq!(read_fence(&path).unwrap(), Some(fence("s", "id-s")));
+    fn parse_header_bytes_refuses_a_newer_schema() {
+        let mut header = make_header();
+        header.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        let line = serde_json::to_string(&header).unwrap();
+        match parse_header_bytes(line.as_bytes())
+            .unwrap_err()
+            .downcast::<EngineError>()
+        {
+            Ok(EngineError::IncompatibleSchemaVersion {
+                found,
+                max_supported,
+            }) => {
+                assert_eq!(found, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(max_supported, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_log_with_no_fence_reads_as_none() {
-        let dir = TempDir::new().unwrap();
-        let path = fenceable_log(dir.path());
-        assert_eq!(read_fence(&path).unwrap(), None);
-        assert_eq!(read_fence(&dir.path().join("missing.jsonl")).unwrap(), None);
-        // A line mentioning the name that isn't the event is not a fence.
-        append_event(
-            &path,
-            &EventPayload::IntentUpdated {
-                intent: "session_superseded".to_string(),
-            },
-            "2026-01-01T00:00:01Z",
-        )
-        .unwrap();
-        assert_eq!(read_fence(&path).unwrap(), None);
+    fn parse_header_bytes_refuses_a_first_line_that_is_not_a_header() {
+        let msg = corrupted(parse_header_bytes(b"{\"workflow\": 3}\n"));
+        assert!(msg.starts_with("failed to parse header"), "{msg}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_held_lock_makes_the_fence_unavailable_and_writes_nothing() {
-        use std::os::fd::AsRawFd;
-        let dir = TempDir::new().unwrap();
-        let path = fenceable_log(dir.path());
-        let before = std::fs::read(&path).unwrap();
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.parent().unwrap().join(APPEND_LOCK_FILE))
-            .unwrap();
-        // SAFETY: flock on a descriptor `lock` owns for the whole test.
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-        let outcome = append_supersede_fence(
-            &path,
-            &fence("s", "id-s"),
-            "2026-01-01T00:00:01Z",
-            std::time::Duration::from_millis(50),
-        )
-        .unwrap();
-        assert_eq!(outcome, FenceOutcome::Unavailable);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        drop(lock);
-        assert!(matches!(
-            append_supersede_fence(
-                &path,
-                &fence("s", "id-s"),
-                "2026-01-01T00:00:01Z",
-                std::time::Duration::from_millis(50),
-            )
-            .unwrap(),
-            FenceOutcome::Fenced { .. }
-        ));
+    fn parse_state_log_at_parses_as_parse_state_log_does() {
+        let log = format!("{}\n{}\n", header_json(), line(&intent(1, "a")));
+        let (header, events) =
+            parse_state_log_at(log.as_bytes(), Path::new("/s/koto-x.state.jsonl")).unwrap();
+        let (quiet_header, quiet_events) = parse_state_log(log.as_bytes()).unwrap();
+        assert_eq!(header.workflow, quiet_header.workflow);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), quiet_events.len());
+        assert!(parse_state_log_at(&[0xff], Path::new("/s/x")).is_err());
     }
 }

@@ -16,6 +16,7 @@ the durable record of what they can rely on.
 2. [Frozen `SessionBackend` surface](#frozen-sessionbackend-surface)
 3. [`StateFileHeader` additive evolution](#statefileheader-additive-evolution)
 4. [`EventPayload` additive variants](#eventpayload-additive-variants)
+5. [Session store read surface](#session-store-read-surface)
 
 ---
 
@@ -244,6 +245,151 @@ Request logs carry their own version constant,
 `request_store::REQUEST_SCHEMA_VERSION`, deliberately independent of
 this one. Coupling them would mean a session-format change made every
 request log unreadable to the older build.
+
+---
+
+## Session store read surface
+
+The `koto-session-reader` crate reads koto's session store for programs
+other than koto: the dashboard's scan, one session's log
+(`read_session_events`) and one context value (`read_context`), all in
+`koto_session_reader::source`. This section promises exactly what that
+reader reads from disk, so a program pinned to an older crate release
+keeps reading a store a newer koto wrote. Everything else in the sessions
+directory is koto's own and can change in any release;
+`docs/workspace-layout.md` describes those files without promising them.
+
+The crate and koto release together under one version, which the crate
+exports as `KOTO_VERSION`. Each name below is defined once in the crate
+and koto's writer imports it, and
+`koto-stability-tests/tests/store_layout_literals.rs` pins each one as a
+literal, so a rename fails CI and points here.
+
+### Finding the store
+
+`sessions_dir(None)` returns the sessions directory koto uses, found by
+koto's own rule. The koto root is `$KOTO_HOME` when it is set and not
+empty (a relative value is taken against the current directory), else
+`~/.koto`. `Some(BackendKind::Cloud)` gives `<root>/sessions`, the cloud
+backend's local mirror. `Some(BackendKind::Local)` and `None` give
+`KOTO_SESSIONS_BASE` when it is set, else `<root>/sessions`.
+
+`None` is exact inside every koto tick, and outside one except when the
+cloud backend is configured and someone exported `KOTO_SESSIONS_BASE`,
+a variable koto documents for testing, by hand. A caller that wants
+certainty and has koto on `PATH` reads the `sessions` field of
+`koto session dir --json`, which comes from the same function. Neither
+reads anything but the environment, and neither creates a directory.
+
+`LocalDirSource::new(dir)` opens a sessions directory for reading once
+its layout marker passes.
+
+### What is promised
+
+1. **Sessions.** A session is a directory directly under the sessions
+   directory, named for its id, that holds `koto-<id>.state.jsonl`, its
+   state log. A directory whose name starts with `.koto-staging-` isn't
+   a session, and neither is one whose name holds `~`. Any other entry
+   without that file is ignored, so koto can add files and dot-directories
+   freely.
+2. **Context values.** The value of a key is the raw bytes of
+   `<session dir>/ctx/<key>`, for any key `validate_context_key` accepts;
+   the `/` separators of a hierarchical key are subdirectories.
+   `manifest.json` and `manifest.lock` directly under `ctx/` are koto's
+   own files and name no key.
+3. **The leg pointer.** `<session dir>/request-leg.toml` is a TOML file
+   with three string fields: `request_id`, `leg_name` and `bound_at`. A
+   session is bound to a request leg exactly when its pointer parses.
+4. **The template path rule.** A session's compiled template is the file
+   its `workflow_initialized` event's `template_path` names: an absolute
+   path as written, a relative one against the session directory. An
+   absolute path that doesn't exist, whose file name is 64 lowercase hex
+   digits plus `.json`, falls back to the file of that name in the
+   session directory when one is there, which is how an imported session
+   runs. From the template a reader uses only `states.<name>.terminal`,
+   so that is the only part of the template's shape promised here.
+5. **The events that set a context key.** Exactly four event types set or
+   supersede a key: a `transitioned` event's `context_assignments` set
+   keys, and `context_added`, `context_removed` and `context_cleared`
+   supersede them. The crate lists them as `CONTEXT_KEY_EVENTS`.
+6. **The layout marker.** `<sessions dir>/.koto-store-layout` holds the
+   store's layout number as ASCII digits, surrounding whitespace allowed,
+   in at most 64 bytes. A missing marker means layout 1, and nothing
+   writes one yet. A reader reads layouts up to its
+   `STORE_LAYOUT_VERSION`, which is 1.
+
+### The additive rule
+
+The promised surface changes only additively, and additive means an
+older reader stays correct, not just that it still parses. A change an
+older reader would read without an error and get wrong is breaking: a
+fifth event type that sets a key, a second place a context value can
+live, a template fallback an older reader would miss, or a terminal flag
+that moves out of `states.<name>.terminal`. New files and dot-directories
+beside the promised ones, and fields an older reader ignores, are
+additive.
+
+### Breaking changes and the marker
+
+A breaking change to the promised surface goes through the major-release
+rules of the
+[`CURRENT_SCHEMA_VERSION` bump protocol](#current_schema_version-bump-protocol),
+in this order:
+
+1. A crate release that reads both the old layout and the new one ships
+   first.
+2. Only then does a koto release's migration change the store and write
+   the marker, naming the new layout number.
+
+A reader checks the marker before it lists anything: `check_layout`,
+which `LocalDirSource::new` and the dashboard's scan both call. A marker
+naming a layout above the reader's refuses the whole store with an error
+that names the marker's path, the layout found and the layout supported,
+the way a log with a higher `schema_version` is refused. A marker that is
+a symlink, isn't a regular file, is over 64 bytes or doesn't parse as a
+number refuses the store the same way rather than being guessed at.
+
+### What a dependent can rely on
+
+A reader built from a given crate release:
+
+- reads every state log whose `schema_version` is at most its
+  `CURRENT_SCHEMA_VERSION`;
+- reads an event type it doesn't know as `EventPayload::Unknown`, keeping
+  its type name and raw payload, and goes on;
+- ignores header fields it doesn't know;
+- marks a session whose log has a higher `schema_version` unreadable,
+  that one session only, while every other session still reads.
+
+The scan, `read_session_events` and `read_context` read state logs, leg
+pointers, context values and the marker through one hardened read: it
+never blocks on a FIFO or device, refuses a symlink at the file and a
+path that resolves outside the store, and is capped at 512 MiB for a
+state log, 64 KiB for a leg pointer, 16 MiB for a context value and 64
+bytes for the marker. A refused state log or context value marks that
+one session or value unreadable, and a refused leg pointer reads as no
+pointer; the scan goes on. Where the reader gives a reason, it is a
+fixed category and the file's path, never the file's bytes or a parser's
+message, which can quote them.
+
+### Reading a context value
+
+`read_context(session_dir, key, events)` answers a key as
+`koto context get` does, without taking a lock, recording a read or
+writing anything. Given the session's events from `read_session_events`,
+a key whose latest writer is a transition's assignment answers from the
+log, whatever `ctx/` holds; otherwise the value is the file under `ctx/`.
+It refuses a symlink at any component of the value's path, where
+`koto context get` follows one; koto never writes one.
+
+Two limits are part of the promise:
+
+- A read that races koto writing a value's content can see a torn value,
+  since that write takes no lock a reader sees. The next read corrects
+  it, and `koto context get` can see the same.
+- Under the cloud backend the read returns this host's local mirror of
+  the value. That matches the dashboard's local rows, and can trail a
+  write made on another host.
 
 ---
 

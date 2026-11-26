@@ -1,0 +1,84 @@
+{
+  "format_version": 1,
+  "name": "no-pool",
+  "version": "1.0",
+  "description": "A default_action, a polled gate and evidence routing, with none of pool, background or timeout_secs",
+  "initial_state": "build",
+  "variables": {
+    "TARGET": {
+      "description": "What to build",
+      "default": "all"
+    }
+  },
+  "states": {
+    "build": {
+      "directive": "Build {{TARGET}}.",
+      "transitions": [
+        {
+          "target": "test",
+          "when": {
+            "gates.built.exists": true
+          }
+        }
+      ],
+      "gates": {
+        "built": {
+          "type": "context-exists",
+          "key": "build.md"
+        }
+      },
+      "default_action": {
+        "command": "make {{TARGET}}",
+        "working_dir": ".",
+        "capture_stdout_as": "BUILD_LOG"
+      }
+    },
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "test": {
+      "directive": "Run the suite and report the outcome.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "gates.suite.exit_code": 0,
+            "outcome": "passed"
+          }
+        },
+        {
+          "target": "build",
+          "when": {
+            "outcome": "failed"
+          }
+        }
+      ],
+      "gates": {
+        "suite": {
+          "type": "command",
+          "command": "test -f test-report.xml",
+          "poll": {
+            "interval_secs": 5,
+            "timeout_secs": 600,
+            "hold_secs": 0,
+            "pending_exit_code": 75
+          }
+        }
+      },
+      "accepts": {
+        "outcome": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "passed",
+            "failed"
+          ]
+        }
+      },
+      "default_action": {
+        "command": "make test"
+      }
+    }
+  }
+}

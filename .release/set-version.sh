@@ -22,11 +22,16 @@ echo "Stamped Cargo.toml to ${VERSION}"
 # cache for --offline to use. Without this the tagged tree fails
 # `cargo build --locked` and `cargo install --locked`.
 cargo update --workspace
-lock_entry="$(grep -A1 '^name = "koto"$' Cargo.lock)"
-if ! grep -qxF "version = \"${VERSION}\"" <<< "$lock_entry"; then
-  echo "Cargo.lock does not record koto ${VERSION} after cargo update" >&2
-  exit 1
-fi
+# koto and koto-session-reader share the [workspace.package] version, so both
+# lock entries must carry it; a tag whose crate entry trails koto's would
+# hand a dependent a reader that claims an older release.
+for package in koto koto-session-reader; do
+  lock_entry="$(grep -A1 "^name = \"${package}\"$" Cargo.lock || true)"
+  if ! grep -qxF "version = \"${VERSION}\"" <<< "$lock_entry"; then
+    echo "Cargo.lock does not record ${package} ${VERSION} after cargo update" >&2
+    exit 1
+  fi
+done
 echo "Updated Cargo.lock to ${VERSION}"
 
 # Stamp marketplace.json plugins[0].version

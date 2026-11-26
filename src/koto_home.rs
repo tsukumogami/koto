@@ -7,21 +7,23 @@
 //! with them (`<root>/cache`, see `crate::cache`); unset, the root is
 //! `~/.koto` and the cache stays on `XDG_CACHE_HOME`.
 //!
-//! This is the one place koto asks for the user's home directory.
-//! `clippy.toml` disallows `dirs::home_dir` everywhere else, so a new path
-//! built from the home directory fails `cargo clippy -D warnings` instead of
-//! quietly escaping `KOTO_HOME`. The lint can't see a read of the `HOME`
-//! variable itself; the two that exist are the cache fallback and Claude
-//! Code's own `~/.claude` directory, neither a koto root path.
+//! The rule itself lives in `koto_session_reader::koto_root`, so koto and a
+//! program reading koto's store resolve the same root. That module holds the
+//! one home-directory lookup in either crate; `clippy.toml` disallows the
+//! lookup everywhere else, so a new path built from the home directory fails
+//! `cargo clippy -D warnings` instead of quietly escaping `KOTO_HOME`. The
+//! lint can't see a read of the `HOME` variable itself; the two that exist
+//! are the cache fallback and Claude Code's own `~/.claude` directory,
+//! neither a koto root path.
 //!
 //! `KOTO_SESSIONS_BASE` keeps its meaning: it moves only the local backend's
-//! session directory, and wins over `<root>/sessions` when both are set.
+//! session directory, and wins over `<root>/sessions` when both are set
+//! (`koto_session_reader::source::sessions_dir`).
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// The variable that sets the koto root.
-pub const KOTO_HOME_ENV: &str = "KOTO_HOME";
+pub use koto_session_reader::koto_root::KOTO_HOME_ENV;
 
 /// The koto root: `$KOTO_HOME` when it is set and not empty, else `~/.koto`.
 ///
@@ -31,23 +33,12 @@ pub const KOTO_HOME_ENV: &str = "KOTO_HOME";
 /// when `KOTO_HOME` is unset and there is no home directory, or the current
 /// directory can't be read for a relative value.
 pub fn koto_home() -> Option<PathBuf> {
-    #[allow(clippy::disallowed_methods)]
-    let home = dirs::home_dir();
-    resolve(
-        std::env::var_os(KOTO_HOME_ENV),
-        home,
-        std::env::current_dir().ok().as_deref(),
-    )
+    koto_session_reader::koto_root::koto_root()
 }
 
 /// [`koto_home`], or an error naming both ways the root is found.
 pub fn koto_home_or_err() -> anyhow::Result<PathBuf> {
-    koto_home().ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not determine the koto root: KOTO_HOME is unset and there is no home \
-             directory, or KOTO_HOME is relative and the current directory can't be read"
-        )
-    })
+    koto_home().ok_or_else(|| anyhow::anyhow!(koto_session_reader::koto_root::KOTO_ROOT_UNRESOLVED))
 }
 
 /// The root `KOTO_HOME` sets, or `None` when it is unset or empty and the root
@@ -73,85 +64,4 @@ pub fn ensure_private_root(root: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// The resolution itself, apart from the process environment.
-fn resolve(
-    koto_home: Option<OsString>,
-    home: Option<PathBuf>,
-    cwd: Option<&Path>,
-) -> Option<PathBuf> {
-    match koto_home {
-        Some(v) if !v.is_empty() => {
-            let p = PathBuf::from(v);
-            if p.is_absolute() {
-                Some(p)
-            } else {
-                cwd.map(|c| c.join(p))
-            }
-        }
-        _ => home.map(|h| h.join(".koto")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unset_is_dot_koto_under_home() {
-        assert_eq!(
-            resolve(None, Some(PathBuf::from("/h")), Some(Path::new("/w"))),
-            Some(PathBuf::from("/h/.koto"))
-        );
-    }
-
-    #[test]
-    fn empty_counts_as_unset() {
-        assert_eq!(
-            resolve(Some(OsString::new()), Some(PathBuf::from("/h")), None),
-            Some(PathBuf::from("/h/.koto"))
-        );
-    }
-
-    #[test]
-    fn absolute_koto_home_is_the_root() {
-        assert_eq!(
-            resolve(
-                Some("/k".into()),
-                Some(PathBuf::from("/h")),
-                Some(Path::new("/w"))
-            ),
-            Some(PathBuf::from("/k"))
-        );
-    }
-
-    #[test]
-    fn koto_home_needs_no_home_directory() {
-        assert_eq!(
-            resolve(Some("/k".into()), None, None),
-            Some(PathBuf::from("/k"))
-        );
-    }
-
-    #[test]
-    fn relative_koto_home_is_taken_against_the_current_directory() {
-        assert_eq!(
-            resolve(
-                Some("k".into()),
-                Some(PathBuf::from("/h")),
-                Some(Path::new("/w"))
-            ),
-            Some(PathBuf::from("/w/k"))
-        );
-        assert_eq!(
-            resolve(Some("k".into()), Some(PathBuf::from("/h")), None),
-            None
-        );
-    }
-
-    #[test]
-    fn no_root_without_either() {
-        assert_eq!(resolve(None, None, Some(Path::new("/w"))), None);
-    }
 }

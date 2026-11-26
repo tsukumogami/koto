@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Checks a Claude Code release against the conventions koto's /workflows entry
-# depends on: the workflows file shape, the per-session directory convention,
+# depends on: the workflows file shape, the status words it writes, the
+# per-session directory convention,
 # the CLAUDE_CODE_SESSION_ID variable and the SessionStart hook's input fields.
 # Claude Code doesn't publish any of them, so the evidence is the release
 # itself: the executable in its Linux x64 npm package, whose embedded
@@ -31,7 +32,8 @@
 # --alter <slug> applies that convention's demonstration mutation (a
 # same-length rename, listed in the expectations file) to an in-memory copy of
 # the evidence first, so the run shows the guard failing on that convention by
-# name. The slugs are file-shape, directory, session-variable and hook-input.
+# name. The slugs are file-shape, status-words, directory, session-variable and
+# hook-input.
 # It combines with either source.
 #
 # --cache-dir <dir> keeps the downloaded tarball in <dir>, an existing directory

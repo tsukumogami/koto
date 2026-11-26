@@ -579,6 +579,111 @@ impl CloudBackend {
             None => Ok(()),
         }
     }
+
+    /// The highest decision id in the bucket's copy of `pred` under
+    /// workspace prefix `prefix`, from listings of its decision areas
+    /// (keys only, no GET), or `None` when it holds none. The fence takes
+    /// it before its conditional push, since no lock spans this host and
+    /// the predecessor's; a decision written after the listing reads as
+    /// written after the fence, which errs toward the fence. `Err` when a
+    /// listing fails or an area holds more than a session may.
+    pub(crate) fn decisions_through_at(
+        &self,
+        prefix: &str,
+        pred: &str,
+    ) -> anyhow::Result<Option<String>> {
+        check_carry_source(prefix, pred)?;
+        let ctx = format!("{prefix}/{pred}/ctx/");
+        let mut keys = Vec::new();
+        for area in crate::decisions::AREAS {
+            let pages = self
+                .bucket
+                .list(format!("{ctx}{area}/"), None)
+                .map_err(|e| anyhow::anyhow!("{}", without_url_userinfo(&e.to_string())))?;
+            let before = keys.len();
+            for obj in pages.iter().flat_map(|p| p.contents.iter()) {
+                if let Some(key) = obj.key.strip_prefix(&ctx) {
+                    keys.push(key.to_string());
+                }
+            }
+            anyhow::ensure!(
+                keys.len() - before <= crate::decisions::MAX_AREA_ENTRIES,
+                "the bucket's {area}/ holds too many objects"
+            );
+        }
+        Ok(crate::decisions::marker::decisions_through_keys(
+            keys.iter().map(String::as_str),
+        ))
+    }
+
+    /// The bucket key of `pred`'s supersede marker under workspace prefix
+    /// `prefix`: beside its state object, under its `ctx/`.
+    fn supersede_marker_key(&self, prefix: &str, pred: &str) -> anyhow::Result<String> {
+        check_carry_source(prefix, pred)?;
+        Ok(format!(
+            "{prefix}/{pred}/ctx/{}",
+            crate::decisions::marker::SUPERSEDED_BY_KEY
+        ))
+    }
+
+    /// The bytes of `pred`'s supersede marker in the bucket under `prefix`,
+    /// or `None` when there is none.
+    pub(crate) fn supersede_marker_at(
+        &self,
+        prefix: &str,
+        pred: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = self.supersede_marker_key(prefix, pred)?;
+        Ok(self.get_with_etag(&key)?.map(|(bytes, _)| bytes))
+    }
+
+    /// PUT `pred`'s supersede marker under `prefix` create-only, with
+    /// `If-None-Match: *` and never without it: `Ok(true)` when this call
+    /// wrote it, `Ok(false)` when the bucket already held one (a 412), which
+    /// is left as it is. The fence's own push was conditional, so the bucket
+    /// is known to honour a condition before this runs.
+    pub(crate) fn put_supersede_marker(
+        &self,
+        prefix: &str,
+        pred: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<bool> {
+        let key = self.supersede_marker_key(prefix, pred)?;
+        self.refuse_if_read_only(&format!("S3 PUT of {key}"))?;
+        match self.put_state_if(&key, bytes, None) {
+            Ok(r) if (200..300).contains(&r.status_code()) => Ok(true),
+            Ok(r) => anyhow::bail!("PUT {key} answered {}", r.status_code()),
+            Err(e) if is_precondition_failed(&e) => Ok(false),
+            Err(S3Error::HttpFailWithBody(501, _)) => anyhow::bail!(
+                "the bucket doesn't support conditional writes, and the supersede marker is \
+                 never written without one"
+            ),
+            Err(e) => anyhow::bail!("PUT {key} failed: {}", without_url_userinfo(&e.to_string())),
+        }
+    }
+
+    /// Publish `marker` in this host's copy of `pred` too, create-only, when
+    /// it has one homed at `prefix`, so a local read finds it before the
+    /// next pull. Best-effort, as [`Self::adopt_fenced_copy`] is: the
+    /// bucket's marker holds either way, and a pull brings it down without
+    /// replacing what is here.
+    pub(crate) fn copy_supersede_marker_locally(
+        &self,
+        prefix: &str,
+        pred: &str,
+        marker: &crate::decisions::marker::SupersedeMarker,
+    ) {
+        if self.read_local_state_bytes(pred).is_none()
+            || !self.home_prefix(pred).is_ok_and(|h| h.prefix == prefix)
+        {
+            return;
+        }
+        let _ = crate::decisions::marker::write_local(
+            &self.local.session_dir(pred),
+            &self.local.ctx_path(pred),
+            marker,
+        );
+    }
 }
 
 /// Drops [`CloudBackend::defer_writes_to`]'s hold.

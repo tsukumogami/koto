@@ -1,0 +1,37 @@
+{
+  "id": "koto-11111111-2222-4333-8444-555555555555",
+  "koto": {
+    "contractVersion": 6,
+    "currentState": "implement",
+    "sessionId": "11111111-2222-4333-8444-555555555555",
+    "staleSince": 1794535080000,
+    "status": "running",
+    "workflow": "work-on"
+  },
+  "name": "work-on · implement",
+  "phases": [
+    {
+      "title": "Implement"
+    }
+  ],
+  "startTime": 1700000000000,
+  "status": "killed",
+  "summary": "koto · work-on · implement · no activity since 2026-11-13 01:58 UTC",
+  "workflowName": "work-on · implement",
+  "workflowProgress": [
+    {
+      "index": 1,
+      "title": "Implement",
+      "type": "workflow_phase"
+    },
+    {
+      "index": 1,
+      "label": "Implement",
+      "phaseIndex": 1,
+      "phaseTitle": "Implement",
+      "promptPreview": "Implement the change per the gathered context.",
+      "state": "progress",
+      "type": "workflow_agent"
+    }
+  ]
+}

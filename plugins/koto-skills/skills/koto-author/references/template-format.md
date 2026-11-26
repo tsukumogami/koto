@@ -1211,6 +1211,9 @@ states:
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. An absolute literal is a compile error |
 | `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
 | `polling` | No | map | `interval_secs` + `timeout_secs`. Re-runs the command on an interval, re-evaluating the state's gates between runs, until they pass or `timeout_secs` expires |
+| `pool` | No | string | A host pool the action runs under, written literally (`test-suite`). Only the machine's operator sizes it; a pool their config doesn't define is no limit. See [Host pools and background actions](#pool-and-background--host-pools-and-long-commands) |
+| `background` | No | bool | Run the command through a detached runner that outlives the tick. Needs `timeout_secs` |
+| `timeout_secs` | With `background` | integer | A background run's time limit, 1 to 86400 seconds. Refused without `background: true` |
 
 **Invocation.** One `/bin/sh -c` argument, in its own process group, with standard input at end of file. It does not inherit the environment of the `koto next` process: it runs in a cleared environment holding the live values of koto's default list and the template's `pass_env:` names, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. See [`pass_env:`](#pass_env--variables-a-command-reads). Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
 
@@ -1257,6 +1260,29 @@ It covers a state's gates the same way, across every field a gate substitutes �
 One ordering follows from where the check sits, and it is worth knowing when you write a gate against a value the same state produces. A state's gates are resolved after its action has run, so a gate reading that action's own `capture_stdout_as` name resolves normally. Under a **polling** action it does not: the gates are resolved on the way in, before the command has finished, so the value cannot exist yet and the gate is refused. Write such a check into the state that consumes the value rather than the one that produces it.
 
 Lifetime: re-entering the producing state runs the command again and the later value wins; two states declaring the same name is a compile error; a `koto rewind` past the producing state **leaves the value in place**, because a rewind appends an event and truncates nothing; a captured value holding a `{{...}}` token is never re-expanded; and a capture is delivered on a tick that stops for confirmation as well as one that advances.
+
+#### `pool` and `background` — host pools and long commands
+
+A command that loads the machine -- a test suite, a full build -- can name a host pool, so only as many sessions on one machine run it at once as the operator allows:
+
+```yaml
+  test:
+    default_action:
+      command: "cargo test --locked"
+      pool: test-suite
+      background: true
+      timeout_secs: 3600
+    transitions:
+      - target: review
+```
+
+**`pool`.** 1 to 63 characters of lowercase letters, digits and hyphens, starting with a letter or digit, written literally: `{{POOL}}` is refused. The template never sizes the pool: `size`, `claim_secs`, `lapse_secs` and `wait_secs` under a state or its action are compile errors, because only the user config (`[pools.<name>]`) defines a pool. Where no such table exists the action runs as if `pool` weren't there, so naming a pool in a shared template is safe. Where it exists and is full, the tick stops with a temporal `__pool__` condition (`status: "queued"`) before the command and before the gates, and a later tick runs the action once the session's turn comes. Nothing fails.
+
+**`background: true`.** For a command longer than the 30-second action limit. The first tick starts it through a detached runner and returns at once; later ticks report a temporal `__action__` condition with `status: "running"` (or `orphaned`, when the runner died but processes of the run live on) until it ends; the tick after that delivers `capture_stdout_as`, evaluates the gates and advances, or fails the action with `nonzero_exit`, `timed_out` or `lost`. A pooled background run keeps its slot until every process of the run has exited. It needs `timeout_secs` (1 to 86400; the operator's `[background] max_timeout_secs`, 7200 by default, may cut it, which the running report shows as `timeout_capped: true`), and can't be combined with `polling` or `requires_confirmation`. A background action without `pool` runs detached without a slot. Like any action, the command must be safe to re-run: a failed or lost run is started again on the next tick.
+
+**Compile errors.** Each names the state and the field: an invalid or templated `pool`, a pool setting under a state, `timeout_secs` without `background: true`, `background: true` without `timeout_secs`, a `timeout_secs` of 0, negative, fractional or over 86400, `background` with `polling` or `requires_confirmation`, and `background: true` on a platform other than Linux and macOS.
+
+**Compatibility.** A template using none of the three fields keeps its compiled bytes and hash. A koto release from before pools (v0.38.0 and earlier) ignores them and runs the action unthrottled and in the tick, where a `background` command longer than 30 seconds times out. `docs/guides/host-pools.md` in the koto repository covers the operator's settings, the queue's order, the nesting marker and `koto pool status`.
 
 ### `pass_env:` — variables a command reads
 

@@ -21,10 +21,11 @@ on:
     branches: [main]
     paths:
       - 'src/decider/**'
+      - 'koto-session-reader/src/decider/**'
       - 'src/cli/decider.rs'
       - 'src/cli/decider_port.rs'
       - 'src/engine/decider.rs'
-      - 'src/template/decider.rs'
+      - 'koto-session-reader/src/template/decider.rs'
       - 'src/config/**'
       - 'Cargo.lock'
       - 'test/decider-live/**'

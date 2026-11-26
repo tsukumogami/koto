@@ -1,0 +1,947 @@
+koto::engine::types: mod
+koto::engine::types::ANCHOR_ACTIVITY: const: &str = "anchor_activity"
+koto::engine::types::ANCHOR_STARTED: const: &str = "anchor_started"
+koto::engine::types::AnchorActivity: impl Clone
+koto::engine::types::AnchorActivity: impl Debug
+koto::engine::types::AnchorActivity: impl Deserialize<'de>
+koto::engine::types::AnchorActivity: impl Eq
+koto::engine::types::AnchorActivity: impl PartialEq
+koto::engine::types::AnchorActivity: impl Serialize
+koto::engine::types::AnchorActivity: impl StructuralPartialEq
+koto::engine::types::AnchorActivity: struct plain
+koto::engine::types::AnchorActivity::command: field: String
+koto::engine::types::AnchorActivity::session: field: String
+koto::engine::types::AnchorOrigin: #[serde(tag = "state", rename_all = "snake_case")] enum
+koto::engine::types::AnchorOrigin: impl Clone
+koto::engine::types::AnchorOrigin: impl Debug
+koto::engine::types::AnchorOrigin: impl Deserialize<'de>
+koto::engine::types::AnchorOrigin: impl Eq
+koto::engine::types::AnchorOrigin: impl PartialEq
+koto::engine::types::AnchorOrigin: impl Serialize
+koto::engine::types::AnchorOrigin: impl StructuralPartialEq
+koto::engine::types::AnchorOrigin::Dispatched: variant struct
+koto::engine::types::AnchorOrigin::Dispatched::dispatcher: field: String
+koto::engine::types::AnchorOrigin::NoDispatcher: #[serde(rename = "none")] variant
+koto::engine::types::AnchorOrigin::Unrecorded: variant struct
+koto::engine::types::AnchorOrigin::Unrecorded::named: field: String
+koto::engine::types::AnchorOrigin::Unrecorded::reason: field: String
+koto::engine::types::AnchorOrigin::state: fn(self: &Self) -> &'static str
+koto::engine::types::AnchorStarted: impl Clone
+koto::engine::types::AnchorStarted: impl Debug
+koto::engine::types::AnchorStarted: impl Deserialize<'de>
+koto::engine::types::AnchorStarted: impl Eq
+koto::engine::types::AnchorStarted: impl PartialEq
+koto::engine::types::AnchorStarted: impl Serialize
+koto::engine::types::AnchorStarted: impl StructuralPartialEq
+koto::engine::types::AnchorStarted: struct plain
+koto::engine::types::AnchorStarted::dispatched_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AnchorStarted::harness_session: field: String
+koto::engine::types::AnchorStarted::opened: field: String
+koto::engine::types::AnchorStarted::origin: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<AnchorOrigin>
+koto::engine::types::AnchorStarted::predecessor: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AnchorStarted::process: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AnchorStarted::reason: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AnchorStarted::source: field: String
+koto::engine::types::AnchorStarted::transcript: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AnchorStarted::workspace: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::AssignmentClaim: impl Clone
+koto::engine::types::AssignmentClaim: impl Debug
+koto::engine::types::AssignmentClaim: impl Deserialize<'de>
+koto::engine::types::AssignmentClaim: impl Eq
+koto::engine::types::AssignmentClaim: impl PartialEq
+koto::engine::types::AssignmentClaim: impl Serialize
+koto::engine::types::AssignmentClaim: impl StructuralPartialEq
+koto::engine::types::AssignmentClaim: struct plain
+koto::engine::types::AssignmentClaim::claimed_at: field: String
+koto::engine::types::AssignmentClaim::coord_id: field: String
+koto::engine::types::BACKGROUND_FINISHED: const: &str = "background_finished"
+koto::engine::types::BACKGROUND_STARTED: const: &str = "background_started"
+koto::engine::types::BackgroundFinished: impl Clone
+koto::engine::types::BackgroundFinished: impl Debug
+koto::engine::types::BackgroundFinished: impl Deserialize<'de>
+koto::engine::types::BackgroundFinished: impl Eq
+koto::engine::types::BackgroundFinished: impl PartialEq
+koto::engine::types::BackgroundFinished: impl Serialize
+koto::engine::types::BackgroundFinished: impl StructuralPartialEq
+koto::engine::types::BackgroundFinished: struct plain
+koto::engine::types::BackgroundFinished::outcome: field: String
+koto::engine::types::BackgroundFinished::run_id: field: String
+koto::engine::types::BackgroundFinished::state: field: String
+koto::engine::types::BackgroundStarted: impl Clone
+koto::engine::types::BackgroundStarted: impl Debug
+koto::engine::types::BackgroundStarted: impl Deserialize<'de>
+koto::engine::types::BackgroundStarted: impl Eq
+koto::engine::types::BackgroundStarted: impl PartialEq
+koto::engine::types::BackgroundStarted: impl Serialize
+koto::engine::types::BackgroundStarted: impl StructuralPartialEq
+koto::engine::types::BackgroundStarted: struct plain
+koto::engine::types::BackgroundStarted::boot_id: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::BackgroundStarted::machine: field: String
+koto::engine::types::BackgroundStarted::pool: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::BackgroundStarted::run_id: field: String
+koto::engine::types::BackgroundStarted::state: field: String
+koto::engine::types::CHECK_REASONS: const: &[&str] = _
+koto::engine::types::CODE_REVIEW_ROUND_RECORDED: const: &str = "code_review_round_recorded"
+koto::engine::types::CURRENT_SCHEMA_VERSION: const: u32 = 1
+koto::engine::types::CheckEventFields: impl Clone
+koto::engine::types::CheckEventFields: impl Debug
+koto::engine::types::CheckEventFields: impl Default
+koto::engine::types::CheckEventFields: impl Deserialize<'de>
+koto::engine::types::CheckEventFields: impl PartialEq
+koto::engine::types::CheckEventFields: impl Serialize
+koto::engine::types::CheckEventFields: impl StructuralPartialEq
+koto::engine::types::CheckEventFields: struct plain
+koto::engine::types::CheckEventFields::attempt: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::CheckEventFields::duration_ms: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::CheckEventFields::fallback_logged: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::CheckEventFields::findings: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<crate::findings::Finding>
+koto::engine::types::CheckEventFields::findings_truncated: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::CheckEventFields::from_payload: fn(payload: &serde_json::Value) -> Self
+koto::engine::types::CheckEventFields::not_ready: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::CheckEventFields::reason: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::CheckEventFields::rule_counts: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<RuleCounts>
+koto::engine::types::CheckEventFields::rule_counts_truncated: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::CheckEventFields::rules_delivered: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<crate::findings::PrintedRuleDelivery>
+koto::engine::types::CheckEventFields::visit_attempt: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::ChildSnapshot: impl Clone
+koto::engine::types::ChildSnapshot: impl Debug
+koto::engine::types::ChildSnapshot: impl Eq
+koto::engine::types::ChildSnapshot: impl PartialEq
+koto::engine::types::ChildSnapshot: impl StructuralPartialEq
+koto::engine::types::ChildSnapshot: struct plain
+koto::engine::types::ChildSnapshot::current_state: field: String
+koto::engine::types::ChildSnapshot::failure: field: bool
+koto::engine::types::ChildSnapshot::skipped_marker: field: bool
+koto::engine::types::ChildSnapshot::spawn_entry: field: Option<SpawnEntrySnapshot>
+koto::engine::types::ChildSnapshot::terminal: field: bool
+koto::engine::types::CloseDisposition: #[serde(rename_all = "snake_case")] enum
+koto::engine::types::CloseDisposition: impl Clone
+koto::engine::types::CloseDisposition: impl Copy
+koto::engine::types::CloseDisposition: impl Debug
+koto::engine::types::CloseDisposition: impl Deserialize<'de>
+koto::engine::types::CloseDisposition: impl Eq
+koto::engine::types::CloseDisposition: impl PartialEq
+koto::engine::types::CloseDisposition: impl Serialize
+koto::engine::types::CloseDisposition: impl StructuralPartialEq
+koto::engine::types::CloseDisposition::AllResolved: variant
+koto::engine::types::CloseDisposition::ClosedWithAbandonedLegs: variant
+koto::engine::types::CloseDisposition::RequestAbandoned: variant
+koto::engine::types::CodeReviewRoundRecorded: impl Clone
+koto::engine::types::CodeReviewRoundRecorded: impl Debug
+koto::engine::types::CodeReviewRoundRecorded: impl Deserialize<'de>
+koto::engine::types::CodeReviewRoundRecorded: impl PartialEq
+koto::engine::types::CodeReviewRoundRecorded: impl Serialize
+koto::engine::types::CodeReviewRoundRecorded: impl StructuralPartialEq
+koto::engine::types::CodeReviewRoundRecorded: struct plain
+koto::engine::types::CodeReviewRoundRecorded::entries: field: Vec<CodeReviewSeat>
+koto::engine::types::CodeReviewRoundRecorded::head: field: String
+koto::engine::types::CodeReviewRoundRecorded::round: field: u64
+koto::engine::types::CodeReviewRoundRecorded::state: field: String
+koto::engine::types::CodeReviewSeat: impl Clone
+koto::engine::types::CodeReviewSeat: impl Debug
+koto::engine::types::CodeReviewSeat: impl Deserialize<'de>
+koto::engine::types::CodeReviewSeat: impl PartialEq
+koto::engine::types::CodeReviewSeat: impl Serialize
+koto::engine::types::CodeReviewSeat: impl StructuralPartialEq
+koto::engine::types::CodeReviewSeat: struct plain
+koto::engine::types::CodeReviewSeat::model: field: String
+koto::engine::types::CodeReviewSeat::seat: field: String
+koto::engine::types::CodeReviewSeat::verdict: field: String
+koto::engine::types::CommandEnvironment: impl Clone
+koto::engine::types::CommandEnvironment: impl Debug
+koto::engine::types::CommandEnvironment: impl Deserialize<'de>
+koto::engine::types::CommandEnvironment: impl Eq
+koto::engine::types::CommandEnvironment: impl PartialEq
+koto::engine::types::CommandEnvironment: impl Serialize
+koto::engine::types::CommandEnvironment: impl StructuralPartialEq
+koto::engine::types::CommandEnvironment: struct plain
+koto::engine::types::CommandEnvironment::home: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::CommandEnvironment::home_absent: #[serde(default, skip_serializing_if = "std::ops::Not::not")] field: bool
+koto::engine::types::CommandEnvironment::legacy: #[serde(default, skip_serializing_if = "std::ops::Not::not")] field: bool
+koto::engine::types::CommandEnvironment::pass: #[serde(default)] field: Vec<String>
+koto::engine::types::CommandEnvironment::path: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::CommandEnvironment::path_absent: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<String>
+koto::engine::types::CommandEnvironment::xdg_config_home: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::CommandEnvironment::xdg_config_home_absent: #[serde(default, skip_serializing_if = "std::ops::Not::not")] field: bool
+koto::engine::types::DOC_CHECK_RECORDED: const: &str = "doc_check_recorded"
+koto::engine::types::DOC_FIX_RECORDED: const: &str = "doc_fix_recorded"
+koto::engine::types::DOC_RULE_CHECKS_RECORDED: const: &str = "doc_rule_checks_recorded"
+koto::engine::types::DOC_SECTION_RECORDED: const: &str = "doc_section_recorded"
+koto::engine::types::DocCheckRecorded: impl Clone
+koto::engine::types::DocCheckRecorded: impl Debug
+koto::engine::types::DocCheckRecorded: impl Deserialize<'de>
+koto::engine::types::DocCheckRecorded: impl PartialEq
+koto::engine::types::DocCheckRecorded: impl Serialize
+koto::engine::types::DocCheckRecorded: impl StructuralPartialEq
+koto::engine::types::DocCheckRecorded: struct plain
+koto::engine::types::DocCheckRecorded::doc_type: field: String
+koto::engine::types::DocCheckRecorded::outcome: field: String
+koto::engine::types::DocCheckRecorded::rule_id: field: String
+koto::engine::types::DocCheckRecorded::schema: field: String
+koto::engine::types::DocFix: impl Clone
+koto::engine::types::DocFix: impl Debug
+koto::engine::types::DocFix: impl Deserialize<'de>
+koto::engine::types::DocFix: impl PartialEq
+koto::engine::types::DocFix: impl Serialize
+koto::engine::types::DocFix: impl StructuralPartialEq
+koto::engine::types::DocFix: struct plain
+koto::engine::types::DocFix::check_rule: field: String
+koto::engine::types::DocFix::rule_id: field: String
+koto::engine::types::DocFix::section: field: String
+koto::engine::types::DocFixRecorded: impl Clone
+koto::engine::types::DocFixRecorded: impl Debug
+koto::engine::types::DocFixRecorded: impl Deserialize<'de>
+koto::engine::types::DocFixRecorded: impl PartialEq
+koto::engine::types::DocFixRecorded: impl Serialize
+koto::engine::types::DocFixRecorded: impl StructuralPartialEq
+koto::engine::types::DocFixRecorded: struct plain
+koto::engine::types::DocFixRecorded::answers: field: String
+koto::engine::types::DocFixRecorded::doc_format: field: String
+koto::engine::types::DocFixRecorded::entries: field: Vec<DocFix>
+koto::engine::types::DocFixRecorded::round: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::DocFixRecorded::state: field: String
+koto::engine::types::DocRuleCheck: impl Clone
+koto::engine::types::DocRuleCheck: impl Debug
+koto::engine::types::DocRuleCheck: impl Deserialize<'de>
+koto::engine::types::DocRuleCheck: impl PartialEq
+koto::engine::types::DocRuleCheck: impl Serialize
+koto::engine::types::DocRuleCheck: impl StructuralPartialEq
+koto::engine::types::DocRuleCheck: struct plain
+koto::engine::types::DocRuleCheck::outcome: field: String
+koto::engine::types::DocRuleCheck::rule_id: field: String
+koto::engine::types::DocRuleChecksRecorded: impl Clone
+koto::engine::types::DocRuleChecksRecorded: impl Debug
+koto::engine::types::DocRuleChecksRecorded: impl Deserialize<'de>
+koto::engine::types::DocRuleChecksRecorded: impl PartialEq
+koto::engine::types::DocRuleChecksRecorded: impl Serialize
+koto::engine::types::DocRuleChecksRecorded: impl StructuralPartialEq
+koto::engine::types::DocRuleChecksRecorded: struct plain
+koto::engine::types::DocRuleChecksRecorded::doc_format: field: String
+koto::engine::types::DocRuleChecksRecorded::entries: field: Vec<DocRuleCheck>
+koto::engine::types::DocRuleChecksRecorded::moment: field: String
+koto::engine::types::DocRuleChecksRecorded::state: field: String
+koto::engine::types::DocSectionRecorded: impl Clone
+koto::engine::types::DocSectionRecorded: impl Debug
+koto::engine::types::DocSectionRecorded: impl Deserialize<'de>
+koto::engine::types::DocSectionRecorded: impl PartialEq
+koto::engine::types::DocSectionRecorded: impl Serialize
+koto::engine::types::DocSectionRecorded: impl StructuralPartialEq
+koto::engine::types::DocSectionRecorded: struct plain
+koto::engine::types::DocSectionRecorded::doc_format: field: String
+koto::engine::types::DocSectionRecorded::section: field: String
+koto::engine::types::DocSectionRecorded::state: field: String
+koto::engine::types::DocSectionRecorded::write: field: String
+koto::engine::types::Event: impl Clone
+koto::engine::types::Event: impl Debug
+koto::engine::types::Event: impl Deserialize<'de>
+koto::engine::types::Event: impl PartialEq
+koto::engine::types::Event: impl Serialize
+koto::engine::types::Event: impl StructuralPartialEq
+koto::engine::types::Event: struct plain
+koto::engine::types::Event::event_type: field: String
+koto::engine::types::Event::idempotency_hash: field: Option<String>
+koto::engine::types::Event::payload: field: EventPayload
+koto::engine::types::Event::seq: field: u64
+koto::engine::types::Event::timestamp: field: String
+koto::engine::types::EventPayload: #[serde(untagged)] enum
+koto::engine::types::EventPayload: impl Clone
+koto::engine::types::EventPayload: impl Debug
+koto::engine::types::EventPayload: impl Deserialize<'de>
+koto::engine::types::EventPayload: impl PartialEq
+koto::engine::types::EventPayload: impl Serialize
+koto::engine::types::EventPayload: impl StructuralPartialEq
+koto::engine::types::EventPayload::AnchorActivity: variant tuple
+koto::engine::types::EventPayload::AnchorActivity::0: field: AnchorActivity
+koto::engine::types::EventPayload::AnchorStarted: variant tuple
+koto::engine::types::EventPayload::AnchorStarted::0: field: AnchorStarted
+koto::engine::types::EventPayload::BackgroundFinished: variant tuple
+koto::engine::types::EventPayload::BackgroundFinished::0: field: BackgroundFinished
+koto::engine::types::EventPayload::BackgroundStarted: variant tuple
+koto::engine::types::EventPayload::BackgroundStarted::0: field: BackgroundStarted
+koto::engine::types::EventPayload::BatchFinalized: variant struct
+koto::engine::types::EventPayload::BatchFinalized::state: field: String
+koto::engine::types::EventPayload::BatchFinalized::superseded_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<SupersededByRef>
+koto::engine::types::EventPayload::BatchFinalized::timestamp: field: String
+koto::engine::types::EventPayload::BatchFinalized::view: field: serde_json::Value
+koto::engine::types::EventPayload::ChildCompleted: variant struct
+koto::engine::types::EventPayload::ChildCompleted::child_name: field: String
+koto::engine::types::EventPayload::ChildCompleted::failure_reason: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ChildCompleted::final_state: field: String
+koto::engine::types::EventPayload::ChildCompleted::outcome: field: TerminalOutcome
+koto::engine::types::EventPayload::ChildCompleted::result: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<WorkflowResult>
+koto::engine::types::EventPayload::ChildCompleted::task_name: field: String
+koto::engine::types::EventPayload::CodeReviewRoundRecorded: variant tuple
+koto::engine::types::EventPayload::CodeReviewRoundRecorded::0: field: CodeReviewRoundRecorded
+koto::engine::types::EventPayload::ContextAdded: variant struct
+koto::engine::types::EventPayload::ContextAdded::hash: field: String
+koto::engine::types::EventPayload::ContextAdded::key: field: String
+koto::engine::types::EventPayload::ContextAdded::size: field: u64
+koto::engine::types::EventPayload::ContextAdded::writer: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ContextCleared: variant struct
+koto::engine::types::EventPayload::ContextCleared::entry_seq: field: u64
+koto::engine::types::EventPayload::ContextCleared::keys: field: Vec<String>
+koto::engine::types::EventPayload::ContextCleared::state: field: String
+koto::engine::types::EventPayload::ContextRead: variant struct
+koto::engine::types::EventPayload::ContextRead::access: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ContextRead::gate: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ContextRead::hash: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ContextRead::key: field: String
+koto::engine::types::EventPayload::ContextRead::present: field: bool
+koto::engine::types::EventPayload::ContextRead::reader: field: String
+koto::engine::types::EventPayload::ContextRead::session: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::ContextRead::state: field: String
+koto::engine::types::EventPayload::ContextRemoved: variant struct
+koto::engine::types::EventPayload::ContextRemoved::key: field: String
+koto::engine::types::EventPayload::ContextRemoved::writer: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::DeciderCheckAnswered: variant tuple
+koto::engine::types::EventPayload::DeciderCheckAnswered::0: field: crate::decider::check::DeciderCheckAnswered
+koto::engine::types::EventPayload::DeciderChecked: variant tuple
+koto::engine::types::EventPayload::DeciderChecked::0: field: crate::decider::check::DeciderCheck
+koto::engine::types::EventPayload::DeciderConsulted: variant tuple
+koto::engine::types::EventPayload::DeciderConsulted::0: field: crate::decider::record::DeciderConsultation
+koto::engine::types::EventPayload::DeciderFallback: variant tuple
+koto::engine::types::EventPayload::DeciderFallback::0: field: crate::decider::check::DeciderFallback
+koto::engine::types::EventPayload::DecisionRecorded: variant struct
+koto::engine::types::EventPayload::DecisionRecorded::decision: field: serde_json::Value
+koto::engine::types::EventPayload::DecisionRecorded::state: field: String
+koto::engine::types::EventPayload::DefaultActionExecuted: variant struct
+koto::engine::types::EventPayload::DefaultActionExecuted::check: #[serde(flatten)] field: CheckEventFields
+koto::engine::types::EventPayload::DefaultActionExecuted::command: field: String
+koto::engine::types::EventPayload::DefaultActionExecuted::exit_code: field: i32
+koto::engine::types::EventPayload::DefaultActionExecuted::state: field: String
+koto::engine::types::EventPayload::DefaultActionExecuted::stderr: field: String
+koto::engine::types::EventPayload::DefaultActionExecuted::stdout: field: String
+koto::engine::types::EventPayload::DefaultActionExecuted::truncated: #[serde(default)] field: bool
+koto::engine::types::EventPayload::DirectedTransition: variant struct
+koto::engine::types::EventPayload::DirectedTransition::decision: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::EventPayload::DirectedTransition::from: field: String
+koto::engine::types::EventPayload::DirectedTransition::rationale: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::DirectedTransition::to: field: String
+koto::engine::types::EventPayload::DocCheckRecorded: variant tuple
+koto::engine::types::EventPayload::DocCheckRecorded::0: field: DocCheckRecorded
+koto::engine::types::EventPayload::DocFixRecorded: variant tuple
+koto::engine::types::EventPayload::DocFixRecorded::0: field: DocFixRecorded
+koto::engine::types::EventPayload::DocRuleChecksRecorded: variant tuple
+koto::engine::types::EventPayload::DocRuleChecksRecorded::0: field: DocRuleChecksRecorded
+koto::engine::types::EventPayload::DocSectionRecorded: variant tuple
+koto::engine::types::EventPayload::DocSectionRecorded::0: field: DocSectionRecorded
+koto::engine::types::EventPayload::EnvironmentAdopted: variant struct
+koto::engine::types::EventPayload::EnvironmentAdopted::dropped: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<String>
+koto::engine::types::EventPayload::EnvironmentAdopted::environment: field: CommandEnvironment
+koto::engine::types::EventPayload::EvidenceSubmitted: variant struct
+koto::engine::types::EventPayload::EvidenceSubmitted::exported_fields: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::collections::BTreeMap<String, String>>
+koto::engine::types::EventPayload::EvidenceSubmitted::fields: field: std::collections::HashMap<String, serde_json::Value>
+koto::engine::types::EventPayload::EvidenceSubmitted::source: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::EvidenceSubmitted::state: field: String
+koto::engine::types::EventPayload::EvidenceSubmitted::submitter_cwd: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::path::PathBuf>
+koto::engine::types::EventPayload::ExecutionAnchorAdopted: variant struct
+koto::engine::types::EventPayload::ExecutionAnchorAdopted::anchor: field: std::path::PathBuf
+koto::engine::types::EventPayload::ExecutionAnchorRebound: variant struct
+koto::engine::types::EventPayload::ExecutionAnchorRebound::from: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::path::PathBuf>
+koto::engine::types::EventPayload::ExecutionAnchorRebound::to: field: std::path::PathBuf
+koto::engine::types::EventPayload::FindingDisputed: variant tuple
+koto::engine::types::EventPayload::FindingDisputed::0: field: FindingDispute
+koto::engine::types::EventPayload::GateEvaluated: variant struct
+koto::engine::types::EventPayload::GateEvaluated::check: #[serde(flatten)] field: CheckEventFields
+koto::engine::types::EventPayload::GateEvaluated::gate: field: String
+koto::engine::types::EventPayload::GateEvaluated::outcome: field: String
+koto::engine::types::EventPayload::GateEvaluated::output: field: serde_json::Value
+koto::engine::types::EventPayload::GateEvaluated::poll: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<PollRecord>
+koto::engine::types::EventPayload::GateEvaluated::state: field: String
+koto::engine::types::EventPayload::GateEvaluated::streams: #[serde(flatten)] field: Option<LoggedStreams>
+koto::engine::types::EventPayload::GateEvaluated::timestamp: field: String
+koto::engine::types::EventPayload::GateOverrideRecorded: variant struct
+koto::engine::types::EventPayload::GateOverrideRecorded::actual_output: field: serde_json::Value
+koto::engine::types::EventPayload::GateOverrideRecorded::decision: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::EventPayload::GateOverrideRecorded::gate: field: String
+koto::engine::types::EventPayload::GateOverrideRecorded::override_applied: field: serde_json::Value
+koto::engine::types::EventPayload::GateOverrideRecorded::rationale: field: String
+koto::engine::types::EventPayload::GateOverrideRecorded::state: field: String
+koto::engine::types::EventPayload::GateOverrideRecorded::timestamp: field: String
+koto::engine::types::EventPayload::InstructionsDelivered: variant struct
+koto::engine::types::EventPayload::InstructionsDelivered::details_included: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<bool>
+koto::engine::types::EventPayload::InstructionsDelivered::state: field: String
+koto::engine::types::EventPayload::IntegrationInvoked: variant struct
+koto::engine::types::EventPayload::IntegrationInvoked::integration: field: String
+koto::engine::types::EventPayload::IntegrationInvoked::output: field: serde_json::Value
+koto::engine::types::EventPayload::IntegrationInvoked::state: field: String
+koto::engine::types::EventPayload::IntentUpdated: variant struct
+koto::engine::types::EventPayload::IntentUpdated::intent: field: String
+koto::engine::types::EventPayload::OriginUnrecorded: variant tuple
+koto::engine::types::EventPayload::OriginUnrecorded::0: field: OriginUnrecorded
+koto::engine::types::EventPayload::PoolAcquired: variant tuple
+koto::engine::types::EventPayload::PoolAcquired::0: field: PoolAcquired
+koto::engine::types::EventPayload::PoolQueued: variant tuple
+koto::engine::types::EventPayload::PoolQueued::0: field: PoolQueued
+koto::engine::types::EventPayload::PoolReleased: variant tuple
+koto::engine::types::EventPayload::PoolReleased::0: field: PoolReleased
+koto::engine::types::EventPayload::RequestClosed: variant struct
+koto::engine::types::EventPayload::RequestClosed::disposition: field: CloseDisposition
+koto::engine::types::EventPayload::RequestClosed::issued_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestClosed::request_id: field: String
+koto::engine::types::EventPayload::RequestCreated: variant struct
+koto::engine::types::EventPayload::RequestCreated::coordinator_of_record: field: String
+koto::engine::types::EventPayload::RequestCreated::inputs: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::EventPayload::RequestCreated::legs: field: std::collections::BTreeMap<String, LegDeclaration>
+koto::engine::types::EventPayload::RequestCreated::request_id: field: String
+koto::engine::types::EventPayload::RequestCreated::requested_by: field: String
+koto::engine::types::EventPayload::RequestLegAbandoned: variant struct
+koto::engine::types::EventPayload::RequestLegAbandoned::issued_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestLegAbandoned::leg_name: field: String
+koto::engine::types::EventPayload::RequestLegAbandoned::rationale: field: String
+koto::engine::types::EventPayload::RequestLegAbandoned::request_id: field: String
+koto::engine::types::EventPayload::RequestLegBound: variant struct
+koto::engine::types::EventPayload::RequestLegBound::attach: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<LegAttach>
+koto::engine::types::EventPayload::RequestLegBound::child_session_id: field: String
+koto::engine::types::EventPayload::RequestLegBound::dispatch_epoch: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u32>
+koto::engine::types::EventPayload::RequestLegBound::issued_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestLegBound::leg_name: field: String
+koto::engine::types::EventPayload::RequestLegBound::request_id: field: String
+koto::engine::types::EventPayload::RequestLegBound::template: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<TemplateIdentity>
+koto::engine::types::EventPayload::RequestLegProgress: variant struct
+koto::engine::types::EventPayload::RequestLegProgress::content: field: std::collections::BTreeMap<String, serde_json::Value>
+koto::engine::types::EventPayload::RequestLegProgress::issued_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestLegProgress::leg_name: field: String
+koto::engine::types::EventPayload::RequestLegProgress::request_id: field: String
+koto::engine::types::EventPayload::RequestLegResult: variant struct
+koto::engine::types::EventPayload::RequestLegResult::final_state: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestLegResult::issued_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestLegResult::leg_name: field: String
+koto::engine::types::EventPayload::RequestLegResult::request_id: field: String
+koto::engine::types::EventPayload::RequestLegResult::result: field: WorkflowResult
+koto::engine::types::EventPayload::RequestLegResult::source: field: LegResultSource
+koto::engine::types::EventPayload::RequestStoreResult: variant struct
+koto::engine::types::EventPayload::RequestStoreResult::failure_reason: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::RequestStoreResult::result: field: WorkflowResult
+koto::engine::types::EventPayload::ReviewDecisionRecorded: variant tuple
+koto::engine::types::EventPayload::ReviewDecisionRecorded::0: field: ReviewDecisionRecorded
+koto::engine::types::EventPayload::ReviewRoundStarted: variant tuple
+koto::engine::types::EventPayload::ReviewRoundStarted::0: field: ReviewRoundStarted
+koto::engine::types::EventPayload::ReviewVerdictRecorded: variant tuple
+koto::engine::types::EventPayload::ReviewVerdictRecorded::0: field: ReviewVerdictRecorded
+koto::engine::types::EventPayload::Rewound: variant struct
+koto::engine::types::EventPayload::Rewound::from: field: String
+koto::engine::types::EventPayload::Rewound::rationale: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::Rewound::to: field: String
+koto::engine::types::EventPayload::RuleDelivered: variant tuple
+koto::engine::types::EventPayload::RuleDelivered::0: field: crate::decider::check::RuleDelivered
+koto::engine::types::EventPayload::SchedulerRan: variant struct
+koto::engine::types::EventPayload::SchedulerRan::state: field: String
+koto::engine::types::EventPayload::SchedulerRan::tick_summary: field: SchedulerTickSummary
+koto::engine::types::EventPayload::SchedulerRan::timestamp: field: String
+koto::engine::types::EventPayload::SessionImported: variant struct
+koto::engine::types::EventPayload::SessionImported::from_session: field: String
+koto::engine::types::EventPayload::SessionImported::from_session_id: field: String
+koto::engine::types::EventPayload::SessionImported::from_workspace: field: String
+koto::engine::types::EventPayload::SessionImported::machine_id: field: String
+koto::engine::types::EventPayload::SessionImported::machine_name: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::SessionSuperseded: variant struct
+koto::engine::types::EventPayload::SessionSuperseded::actor: field: SupersedeActor
+koto::engine::types::EventPayload::SessionSuperseded::at: field: String
+koto::engine::types::EventPayload::SessionSuperseded::by: field: String
+koto::engine::types::EventPayload::SessionSuperseded::by_session_id: field: String
+koto::engine::types::EventPayload::Transitioned: variant struct
+koto::engine::types::EventPayload::Transitioned::condition_type: field: String
+koto::engine::types::EventPayload::Transitioned::context_assignments: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::collections::BTreeMap<String, String>>
+koto::engine::types::EventPayload::Transitioned::from: field: Option<String>
+koto::engine::types::EventPayload::Transitioned::skip_if_matched: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::collections::BTreeMap<String, serde_json::Value>>
+koto::engine::types::EventPayload::Transitioned::to: field: String
+koto::engine::types::EventPayload::Transitioned::vars_matched: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::collections::BTreeMap<String, String>>
+koto::engine::types::EventPayload::Unknown: variant struct
+koto::engine::types::EventPayload::Unknown::raw_payload: field: serde_json::Value
+koto::engine::types::EventPayload::Unknown::type_name: field: String
+koto::engine::types::EventPayload::VariableCaptured: variant struct
+koto::engine::types::EventPayload::VariableCaptured::key: field: String
+koto::engine::types::EventPayload::VariableCaptured::value: field: String
+koto::engine::types::EventPayload::VariablesRebound: variant struct
+koto::engine::types::EventPayload::VariablesRebound::previous: #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] field: std::collections::BTreeMap<String, String>
+koto::engine::types::EventPayload::VariablesRebound::variables: field: std::collections::BTreeMap<String, String>
+koto::engine::types::EventPayload::WorkflowCancelled: variant struct
+koto::engine::types::EventPayload::WorkflowCancelled::reason: field: String
+koto::engine::types::EventPayload::WorkflowCancelled::state: field: String
+koto::engine::types::EventPayload::WorkflowInitialized: variant struct
+koto::engine::types::EventPayload::WorkflowInitialized::machine: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::EventPayload::WorkflowInitialized::spawn_entry: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<SpawnEntrySnapshot>
+koto::engine::types::EventPayload::WorkflowInitialized::template_path: field: String
+koto::engine::types::EventPayload::WorkflowInitialized::variables: #[serde(default)] field: std::collections::HashMap<String, String>
+koto::engine::types::EventPayload::type_name: fn(self: &Self) -> &'static str
+koto::engine::types::FINDING_DISPUTED: const: &str = "finding_disputed"
+koto::engine::types::FindingDispute: impl Clone
+koto::engine::types::FindingDispute: impl Debug
+koto::engine::types::FindingDispute: impl Deserialize<'de>
+koto::engine::types::FindingDispute: impl PartialEq
+koto::engine::types::FindingDispute: impl Serialize
+koto::engine::types::FindingDispute: impl StructuralPartialEq
+koto::engine::types::FindingDispute: struct plain
+koto::engine::types::FindingDispute::attempt: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::FindingDispute::gate: field: String
+koto::engine::types::FindingDispute::reason: field: String
+koto::engine::types::FindingDispute::rule_id: field: String
+koto::engine::types::FindingDispute::source: field: String
+koto::engine::types::FindingDispute::state: field: String
+koto::engine::types::FindingDispute::visit_attempt: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u64>
+koto::engine::types::LOG_RULE_COUNTS_CAP: const: usize = 50
+koto::engine::types::LOG_STREAM_MAX_BYTES: const: usize = 4096
+koto::engine::types::LegAttach: enum
+koto::engine::types::LegAttach: impl Clone
+koto::engine::types::LegAttach: impl Copy
+koto::engine::types::LegAttach: impl Debug
+koto::engine::types::LegAttach: impl Deserialize<'de>
+koto::engine::types::LegAttach: impl Eq
+koto::engine::types::LegAttach: impl PartialEq
+koto::engine::types::LegAttach: impl Serialize
+koto::engine::types::LegAttach: impl StructuralPartialEq
+koto::engine::types::LegAttach::SelfAttached: #[serde(rename = "self")] variant
+koto::engine::types::LegDeclaration: impl Clone
+koto::engine::types::LegDeclaration: impl Debug
+koto::engine::types::LegDeclaration: impl Deserialize<'de>
+koto::engine::types::LegDeclaration: impl PartialEq
+koto::engine::types::LegDeclaration: impl Serialize
+koto::engine::types::LegDeclaration: impl StructuralPartialEq
+koto::engine::types::LegDeclaration: struct plain
+koto::engine::types::LegDeclaration::inputs: field: serde_json::Value
+koto::engine::types::LegDeclaration::role: field: String
+koto::engine::types::LegDeclaration::template: field: LegTemplates
+koto::engine::types::LegDisposition: #[serde(rename_all = "snake_case")] enum
+koto::engine::types::LegDisposition: impl Clone
+koto::engine::types::LegDisposition: impl Copy
+koto::engine::types::LegDisposition: impl Debug
+koto::engine::types::LegDisposition: impl Deserialize<'de>
+koto::engine::types::LegDisposition: impl Eq
+koto::engine::types::LegDisposition: impl PartialEq
+koto::engine::types::LegDisposition: impl Serialize
+koto::engine::types::LegDisposition: impl StructuralPartialEq
+koto::engine::types::LegDisposition::Abandoned: variant
+koto::engine::types::LegDisposition::Open: variant
+koto::engine::types::LegDisposition::Resolved: variant
+koto::engine::types::LegResultSource: #[serde(rename_all = "snake_case")] enum
+koto::engine::types::LegResultSource: impl Clone
+koto::engine::types::LegResultSource: impl Copy
+koto::engine::types::LegResultSource: impl Debug
+koto::engine::types::LegResultSource: impl Deserialize<'de>
+koto::engine::types::LegResultSource: impl Eq
+koto::engine::types::LegResultSource: impl PartialEq
+koto::engine::types::LegResultSource: impl Serialize
+koto::engine::types::LegResultSource: impl StructuralPartialEq
+koto::engine::types::LegResultSource::Explicit: variant
+koto::engine::types::LegResultSource::Promoted: variant
+koto::engine::types::LegResultSource::Refused: variant
+koto::engine::types::LegTemplates: #[serde(untagged)] enum
+koto::engine::types::LegTemplates: impl Clone
+koto::engine::types::LegTemplates: impl Debug
+koto::engine::types::LegTemplates: impl Deserialize<'de>
+koto::engine::types::LegTemplates: impl Eq
+koto::engine::types::LegTemplates: impl From<&str>
+koto::engine::types::LegTemplates: impl PartialEq
+koto::engine::types::LegTemplates: impl Serialize
+koto::engine::types::LegTemplates: impl StructuralPartialEq
+koto::engine::types::LegTemplates::Many: variant tuple
+koto::engine::types::LegTemplates::Many::0: field: Vec<String>
+koto::engine::types::LegTemplates::One: variant tuple
+koto::engine::types::LegTemplates::One::0: field: String
+koto::engine::types::LegTemplates::admits: fn(self: &Self, identity: Option<&TemplateIdentity>) -> bool
+koto::engine::types::LegTemplates::entries: fn(self: &Self) -> Vec<&str>
+koto::engine::types::LoggedStreams: impl Clone
+koto::engine::types::LoggedStreams: impl Debug
+koto::engine::types::LoggedStreams: impl Default
+koto::engine::types::LoggedStreams: impl Deserialize<'de>
+koto::engine::types::LoggedStreams: impl PartialEq
+koto::engine::types::LoggedStreams: impl Serialize
+koto::engine::types::LoggedStreams: impl StructuralPartialEq
+koto::engine::types::LoggedStreams: struct plain
+koto::engine::types::LoggedStreams::stderr: field: String
+koto::engine::types::LoggedStreams::stderr_truncated: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::LoggedStreams::stdout: field: String
+koto::engine::types::LoggedStreams::stdout_truncated: #[serde(default, skip_serializing_if = "is_false")] field: bool
+koto::engine::types::MAX_LEG_TEMPLATES: const: usize = 8
+koto::engine::types::MachineState: impl Clone
+koto::engine::types::MachineState: impl Debug
+koto::engine::types::MachineState: impl Deserialize<'de>
+koto::engine::types::MachineState: impl PartialEq
+koto::engine::types::MachineState: impl Serialize
+koto::engine::types::MachineState: impl StructuralPartialEq
+koto::engine::types::MachineState: struct plain
+koto::engine::types::MachineState::current_state: field: String
+koto::engine::types::MachineState::template_hash: field: String
+koto::engine::types::MachineState::template_path: field: String
+koto::engine::types::ORIGIN_UNRECORDED: const: &str = "origin_unrecorded"
+koto::engine::types::OriginUnrecorded: impl Clone
+koto::engine::types::OriginUnrecorded: impl Debug
+koto::engine::types::OriginUnrecorded: impl Deserialize<'de>
+koto::engine::types::OriginUnrecorded: impl Eq
+koto::engine::types::OriginUnrecorded: impl PartialEq
+koto::engine::types::OriginUnrecorded: impl Serialize
+koto::engine::types::OriginUnrecorded: impl StructuralPartialEq
+koto::engine::types::OriginUnrecorded: struct plain
+koto::engine::types::OriginUnrecorded::named: field: String
+koto::engine::types::OriginUnrecorded::reason: field: String
+koto::engine::types::POOL_ACQUIRED: const: &str = "pool_acquired"
+koto::engine::types::POOL_QUEUED: const: &str = "pool_queued"
+koto::engine::types::POOL_RELEASED: const: &str = "pool_released"
+koto::engine::types::PollRecord: impl Clone
+koto::engine::types::PollRecord: impl Debug
+koto::engine::types::PollRecord: impl Deserialize<'de>
+koto::engine::types::PollRecord: impl PartialEq
+koto::engine::types::PollRecord: impl Serialize
+koto::engine::types::PollRecord: impl StructuralPartialEq
+koto::engine::types::PollRecord: struct plain
+koto::engine::types::PollRecord::elapsed_secs: field: u64
+koto::engine::types::PollRecord::evaluations: field: u64
+koto::engine::types::PollRecord::since: field: String
+koto::engine::types::PollRecord::status: field: String
+koto::engine::types::PoolAcquired: impl Clone
+koto::engine::types::PoolAcquired: impl Debug
+koto::engine::types::PoolAcquired: impl Deserialize<'de>
+koto::engine::types::PoolAcquired: impl Eq
+koto::engine::types::PoolAcquired: impl PartialEq
+koto::engine::types::PoolAcquired: impl Serialize
+koto::engine::types::PoolAcquired: impl StructuralPartialEq
+koto::engine::types::PoolAcquired: struct plain
+koto::engine::types::PoolAcquired::pool: field: String
+koto::engine::types::PoolAcquired::run_id: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::PoolAcquired::slot: field: usize
+koto::engine::types::PoolAcquired::state: field: String
+koto::engine::types::PoolQueued: impl Clone
+koto::engine::types::PoolQueued: impl Debug
+koto::engine::types::PoolQueued: impl Deserialize<'de>
+koto::engine::types::PoolQueued: impl Eq
+koto::engine::types::PoolQueued: impl PartialEq
+koto::engine::types::PoolQueued: impl Serialize
+koto::engine::types::PoolQueued: impl StructuralPartialEq
+koto::engine::types::PoolQueued: struct plain
+koto::engine::types::PoolQueued::pool: field: String
+koto::engine::types::PoolQueued::state: field: String
+koto::engine::types::PoolQueued::workspace: field: String
+koto::engine::types::PoolReleased: impl Clone
+koto::engine::types::PoolReleased: impl Debug
+koto::engine::types::PoolReleased: impl Deserialize<'de>
+koto::engine::types::PoolReleased: impl Eq
+koto::engine::types::PoolReleased: impl PartialEq
+koto::engine::types::PoolReleased: impl Serialize
+koto::engine::types::PoolReleased: impl StructuralPartialEq
+koto::engine::types::PoolReleased: struct plain
+koto::engine::types::PoolReleased::pool: field: String
+koto::engine::types::PoolReleased::reason: field: String
+koto::engine::types::PoolReleased::run_id: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::PoolReleased::state: field: String
+koto::engine::types::REVIEW_DECISION_RECORDED: const: &str = "review_decision_recorded"
+koto::engine::types::REVIEW_ROUND_STARTED: const: &str = "review_round_started"
+koto::engine::types::REVIEW_VERDICT_RECORDED: const: &str = "review_verdict_recorded"
+koto::engine::types::RequestState: #[serde(rename_all = "snake_case")] enum
+koto::engine::types::RequestState: impl Clone
+koto::engine::types::RequestState: impl Copy
+koto::engine::types::RequestState: impl Debug
+koto::engine::types::RequestState: impl Deserialize<'de>
+koto::engine::types::RequestState: impl Eq
+koto::engine::types::RequestState: impl From<StateFilter>
+koto::engine::types::RequestState: impl PartialEq
+koto::engine::types::RequestState: impl Serialize
+koto::engine::types::RequestState: impl StructuralPartialEq
+koto::engine::types::RequestState::Closed: variant
+koto::engine::types::RequestState::Open: variant
+koto::engine::types::ReviewDecisionRecorded: impl Clone
+koto::engine::types::ReviewDecisionRecorded: impl Debug
+koto::engine::types::ReviewDecisionRecorded: impl Deserialize<'de>
+koto::engine::types::ReviewDecisionRecorded: impl PartialEq
+koto::engine::types::ReviewDecisionRecorded: impl Serialize
+koto::engine::types::ReviewDecisionRecorded: impl StructuralPartialEq
+koto::engine::types::ReviewDecisionRecorded: struct plain
+koto::engine::types::ReviewDecisionRecorded::decision: field: String
+koto::engine::types::ReviewDecisionRecorded::doc_format: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewDecisionRecorded::doc_type: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewDecisionRecorded::round: field: u64
+koto::engine::types::ReviewDecisionRecorded::schema: field: String
+koto::engine::types::ReviewRoundStarted: impl Clone
+koto::engine::types::ReviewRoundStarted: impl Debug
+koto::engine::types::ReviewRoundStarted: impl Deserialize<'de>
+koto::engine::types::ReviewRoundStarted: impl PartialEq
+koto::engine::types::ReviewRoundStarted: impl Serialize
+koto::engine::types::ReviewRoundStarted: impl StructuralPartialEq
+koto::engine::types::ReviewRoundStarted: struct plain
+koto::engine::types::ReviewRoundStarted::doc_format: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewRoundStarted::doc_type: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewRoundStarted::fallback: field: bool
+koto::engine::types::ReviewRoundStarted::round: field: u64
+koto::engine::types::ReviewRoundStarted::schema: field: String
+koto::engine::types::ReviewRoundStarted::seat_count: field: u64
+koto::engine::types::ReviewVerdictRecorded: impl Clone
+koto::engine::types::ReviewVerdictRecorded: impl Debug
+koto::engine::types::ReviewVerdictRecorded: impl Deserialize<'de>
+koto::engine::types::ReviewVerdictRecorded: impl PartialEq
+koto::engine::types::ReviewVerdictRecorded: impl Serialize
+koto::engine::types::ReviewVerdictRecorded: impl StructuralPartialEq
+koto::engine::types::ReviewVerdictRecorded: struct plain
+koto::engine::types::ReviewVerdictRecorded::doc_format: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewVerdictRecorded::doc_type: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::ReviewVerdictRecorded::round: field: u64
+koto::engine::types::ReviewVerdictRecorded::rule_id: field: String
+koto::engine::types::ReviewVerdictRecorded::schema: field: String
+koto::engine::types::ReviewVerdictRecorded::seat: field: String
+koto::engine::types::ReviewVerdictRecorded::section: field: String
+koto::engine::types::ReviewVerdictRecorded::verdict: field: String
+koto::engine::types::RuleCount: impl Clone
+koto::engine::types::RuleCount: impl Copy
+koto::engine::types::RuleCount: impl Debug
+koto::engine::types::RuleCount: impl Default
+koto::engine::types::RuleCount: impl Deserialize<'de>
+koto::engine::types::RuleCount: impl Eq
+koto::engine::types::RuleCount: impl PartialEq
+koto::engine::types::RuleCount: impl Serialize
+koto::engine::types::RuleCount: impl StructuralPartialEq
+koto::engine::types::RuleCount: struct plain
+koto::engine::types::RuleCount::session: field: u64
+koto::engine::types::RuleCount::visit: field: u64
+koto::engine::types::RuleCounts: impl Clone
+koto::engine::types::RuleCounts: impl Debug
+koto::engine::types::RuleCounts: impl Default
+koto::engine::types::RuleCounts: impl Deserialize<'de>
+koto::engine::types::RuleCounts: impl Eq
+koto::engine::types::RuleCounts: impl PartialEq
+koto::engine::types::RuleCounts: impl Serialize
+koto::engine::types::RuleCounts: impl StructuralPartialEq
+koto::engine::types::RuleCounts: struct tuple
+koto::engine::types::RuleCounts::0: field: Vec<(String, RuleCount)>
+koto::engine::types::RuleCounts::get: fn(self: &Self, rule_id: &str) -> Option<RuleCount>
+koto::engine::types::RuleCounts::is_empty: fn(self: &Self) -> bool
+koto::engine::types::SchedulerTickSummary: impl Clone
+koto::engine::types::SchedulerTickSummary: impl Debug
+koto::engine::types::SchedulerTickSummary: impl Deserialize<'de>
+koto::engine::types::SchedulerTickSummary: impl Eq
+koto::engine::types::SchedulerTickSummary: impl PartialEq
+koto::engine::types::SchedulerTickSummary: impl Serialize
+koto::engine::types::SchedulerTickSummary: impl StructuralPartialEq
+koto::engine::types::SchedulerTickSummary: struct plain
+koto::engine::types::SchedulerTickSummary::errored_count: field: usize
+koto::engine::types::SchedulerTickSummary::reclassified: field: bool
+koto::engine::types::SchedulerTickSummary::skipped_count: field: usize
+koto::engine::types::SchedulerTickSummary::spawned_count: field: usize
+koto::engine::types::SessionKind: enum
+koto::engine::types::SessionKind: impl Clone
+koto::engine::types::SessionKind: impl Copy
+koto::engine::types::SessionKind: impl Debug
+koto::engine::types::SessionKind: impl Default
+koto::engine::types::SessionKind: impl Eq
+koto::engine::types::SessionKind: impl PartialEq
+koto::engine::types::SessionKind: impl StructuralPartialEq
+koto::engine::types::SessionKind::ANCHOR: const: &'static str = "anchor"
+koto::engine::types::SessionKind::ANCHOR_CLOSE: const: &'static str = "anchor-close"
+koto::engine::types::SessionKind::Anchor: variant
+koto::engine::types::SessionKind::AnchorClose: variant
+koto::engine::types::SessionKind::Ordinary: #[default] variant
+koto::engine::types::SessionKind::is_koto_owned: fn(self: Self) -> bool
+koto::engine::types::SessionKind::of: fn(kind: Option<&str>) -> Self
+koto::engine::types::SessionOrigin: impl Clone
+koto::engine::types::SessionOrigin: impl Debug
+koto::engine::types::SessionOrigin: impl Deserialize<'de>
+koto::engine::types::SessionOrigin: impl Eq
+koto::engine::types::SessionOrigin: impl PartialEq
+koto::engine::types::SessionOrigin: impl Serialize
+koto::engine::types::SessionOrigin: impl StructuralPartialEq
+koto::engine::types::SessionOrigin: struct plain
+koto::engine::types::SessionOrigin::anchor: field: std::path::PathBuf
+koto::engine::types::SessionOrigin::anchor_epoch: #[serde(default, skip_serializing_if = "is_zero_u64")] field: u64
+koto::engine::types::SessionOrigin::retired_anchors: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<std::path::PathBuf>
+koto::engine::types::SessionOrigin::store: field: SessionStoreIdentity
+koto::engine::types::SessionStoreIdentity: impl Clone
+koto::engine::types::SessionStoreIdentity: impl Debug
+koto::engine::types::SessionStoreIdentity: impl Deserialize<'de>
+koto::engine::types::SessionStoreIdentity: impl Eq
+koto::engine::types::SessionStoreIdentity: impl PartialEq
+koto::engine::types::SessionStoreIdentity: impl Serialize
+koto::engine::types::SessionStoreIdentity: impl StructuralPartialEq
+koto::engine::types::SessionStoreIdentity: struct plain
+koto::engine::types::SessionStoreIdentity::base: field: std::path::PathBuf
+koto::engine::types::SessionStoreIdentity::bucket: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::SessionStoreIdentity::kind: field: String
+koto::engine::types::SessionStoreIdentity::prefix: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::SpawnEntrySnapshot: impl Clone
+koto::engine::types::SpawnEntrySnapshot: impl Debug
+koto::engine::types::SpawnEntrySnapshot: impl Deserialize<'de>
+koto::engine::types::SpawnEntrySnapshot: impl Eq
+koto::engine::types::SpawnEntrySnapshot: impl PartialEq
+koto::engine::types::SpawnEntrySnapshot: impl Serialize
+koto::engine::types::SpawnEntrySnapshot: impl StructuralPartialEq
+koto::engine::types::SpawnEntrySnapshot: struct plain
+koto::engine::types::SpawnEntrySnapshot::new: fn(template: String, vars: BTreeMap<String, serde_json::Value>, waits_on: Vec<String>) -> Self
+koto::engine::types::SpawnEntrySnapshot::template: field: String
+koto::engine::types::SpawnEntrySnapshot::vars: #[serde(default)] field: std::collections::BTreeMap<String, serde_json::Value>
+koto::engine::types::SpawnEntrySnapshot::waits_on: #[serde(default)] field: Vec<String>
+koto::engine::types::StateFileHeader: impl Clone
+koto::engine::types::StateFileHeader: impl Debug
+koto::engine::types::StateFileHeader: impl Deserialize<'de>
+koto::engine::types::StateFileHeader: impl LogHeader
+koto::engine::types::StateFileHeader: impl PartialEq
+koto::engine::types::StateFileHeader: impl Serialize
+koto::engine::types::StateFileHeader: impl StructuralPartialEq
+koto::engine::types::StateFileHeader: struct plain
+koto::engine::types::StateFileHeader::agent_config: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::StateFileHeader::assignment_claim: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<AssignmentClaim>
+koto::engine::types::StateFileHeader::command_environment: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<CommandEnvironment>
+koto::engine::types::StateFileHeader::coordinator_of_record: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::created_at: field: String
+koto::engine::types::StateFileHeader::deadline: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::dispatch_epoch: #[serde(default)] field: u32
+koto::engine::types::StateFileHeader::execution_dir: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::path::PathBuf>
+koto::engine::types::StateFileHeader::inputs: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::StateFileHeader::intent: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::kind: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::needs_agent: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<bool>
+koto::engine::types::StateFileHeader::origin: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<SessionOrigin>
+koto::engine::types::StateFileHeader::parent_session_id: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::parent_workflow: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::priority: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<i32>
+koto::engine::types::StateFileHeader::requested_by: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::respawn_generation: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u32>
+koto::engine::types::StateFileHeader::retry_count: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<u32>
+koto::engine::types::StateFileHeader::role: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::root_session_id: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::schema_version: #[serde(default = "default_schema_version")] field: u32
+koto::engine::types::StateFileHeader::session_id: #[serde(default)] field: String
+koto::engine::types::StateFileHeader::session_kind: fn(self: &Self) -> SessionKind
+koto::engine::types::StateFileHeader::template_hash: field: String
+koto::engine::types::StateFileHeader::template_name: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::template_source_dir: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<std::path::PathBuf>
+koto::engine::types::StateFileHeader::template_source_file: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::StateFileHeader::workflow: field: String
+koto::engine::types::SupersedeActor: impl Clone
+koto::engine::types::SupersedeActor: impl Debug
+koto::engine::types::SupersedeActor: impl Default
+koto::engine::types::SupersedeActor: impl Deserialize<'de>
+koto::engine::types::SupersedeActor: impl Eq
+koto::engine::types::SupersedeActor: impl PartialEq
+koto::engine::types::SupersedeActor: impl Serialize
+koto::engine::types::SupersedeActor: impl StructuralPartialEq
+koto::engine::types::SupersedeActor: struct plain
+koto::engine::types::SupersedeActor::claude_session: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::SupersedeActor::host: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::SupersedeActor::user: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::SupersededByRef: impl Clone
+koto::engine::types::SupersededByRef: impl Debug
+koto::engine::types::SupersededByRef: impl Deserialize<'de>
+koto::engine::types::SupersededByRef: impl Eq
+koto::engine::types::SupersededByRef: impl PartialEq
+koto::engine::types::SupersededByRef: impl Serialize
+koto::engine::types::SupersededByRef: impl StructuralPartialEq
+koto::engine::types::SupersededByRef: struct plain
+koto::engine::types::SupersededByRef::event_type: #[serde(rename = "type")] field: String
+koto::engine::types::SupersededByRef::seq: field: u64
+koto::engine::types::SupersededByRef::timestamp: field: String
+koto::engine::types::TemplateIdentity: impl Clone
+koto::engine::types::TemplateIdentity: impl Debug
+koto::engine::types::TemplateIdentity: impl Deserialize<'de>
+koto::engine::types::TemplateIdentity: impl Eq
+koto::engine::types::TemplateIdentity: impl PartialEq
+koto::engine::types::TemplateIdentity: impl Serialize
+koto::engine::types::TemplateIdentity: impl StructuralPartialEq
+koto::engine::types::TemplateIdentity: struct plain
+koto::engine::types::TemplateIdentity::hash: field: String
+koto::engine::types::TemplateIdentity::name: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<String>
+koto::engine::types::TemplateIdentity::source: field: String
+koto::engine::types::TerminalOutcome: #[serde(rename_all = "snake_case")] enum
+koto::engine::types::TerminalOutcome: impl Clone
+koto::engine::types::TerminalOutcome: impl Copy
+koto::engine::types::TerminalOutcome: impl Debug
+koto::engine::types::TerminalOutcome: impl Deserialize<'de>
+koto::engine::types::TerminalOutcome: impl Eq
+koto::engine::types::TerminalOutcome: impl PartialEq
+koto::engine::types::TerminalOutcome: impl Serialize
+koto::engine::types::TerminalOutcome: impl StructuralPartialEq
+koto::engine::types::TerminalOutcome::Failure: variant
+koto::engine::types::TerminalOutcome::Skipped: variant
+koto::engine::types::TerminalOutcome::Success: variant
+koto::engine::types::ValidatedCoordId: impl AsRef<str>
+koto::engine::types::ValidatedCoordId: impl Clone
+koto::engine::types::ValidatedCoordId: impl Debug
+koto::engine::types::ValidatedCoordId: impl Display
+koto::engine::types::ValidatedCoordId: impl Eq
+koto::engine::types::ValidatedCoordId: impl Hash
+koto::engine::types::ValidatedCoordId: impl PartialEq
+koto::engine::types::ValidatedCoordId: impl StructuralPartialEq
+koto::engine::types::ValidatedCoordId: struct tuple
+koto::engine::types::ValidatedCoordId::0: private field
+koto::engine::types::ValidatedCoordId::as_str: fn(self: &Self) -> &str
+koto::engine::types::ValidatedCoordId::into_inner: fn(self: Self) -> String
+koto::engine::types::ValidatedCoordId::new: fn(input: &str) -> Result<Self, EngineError>
+koto::engine::types::ValidatedSessionId: impl AsRef<str>
+koto::engine::types::ValidatedSessionId: impl Clone
+koto::engine::types::ValidatedSessionId: impl Debug
+koto::engine::types::ValidatedSessionId: impl Display
+koto::engine::types::ValidatedSessionId: impl Eq
+koto::engine::types::ValidatedSessionId: impl Hash
+koto::engine::types::ValidatedSessionId: impl PartialEq
+koto::engine::types::ValidatedSessionId: impl StructuralPartialEq
+koto::engine::types::ValidatedSessionId: struct tuple
+koto::engine::types::ValidatedSessionId::0: private field
+koto::engine::types::ValidatedSessionId::as_str: fn(self: &Self) -> &str
+koto::engine::types::ValidatedSessionId::into_inner: fn(self: Self) -> String
+koto::engine::types::ValidatedSessionId::new: fn(input: &str) -> Result<Self, EngineError>
+koto::engine::types::WorkflowMetadata: impl Clone
+koto::engine::types::WorkflowMetadata: impl Debug
+koto::engine::types::WorkflowMetadata: impl Deserialize<'de>
+koto::engine::types::WorkflowMetadata: impl PartialEq
+koto::engine::types::WorkflowMetadata: impl Serialize
+koto::engine::types::WorkflowMetadata: impl StructuralPartialEq
+koto::engine::types::WorkflowMetadata: struct plain
+koto::engine::types::WorkflowMetadata::created_at: field: String
+koto::engine::types::WorkflowMetadata::name: field: String
+koto::engine::types::WorkflowMetadata::parent_workflow: #[serde(default)] field: Option<String>
+koto::engine::types::WorkflowMetadata::template_hash: field: String
+koto::engine::types::WorkflowResult: impl Clone
+koto::engine::types::WorkflowResult: impl Debug
+koto::engine::types::WorkflowResult: impl Deserialize<'de>
+koto::engine::types::WorkflowResult: impl PartialEq
+koto::engine::types::WorkflowResult: impl Serialize
+koto::engine::types::WorkflowResult: impl StructuralPartialEq
+koto::engine::types::WorkflowResult: struct plain
+koto::engine::types::WorkflowResult::payload: #[serde(default, skip_serializing_if = "Option::is_none")] field: Option<serde_json::Value>
+koto::engine::types::WorkflowResult::status: field: TerminalOutcome
+koto::engine::types::WorkflowResult::summary: field: String
+koto::engine::types::WorkflowResult::with_string_payload: fn<K, V>(status: TerminalOutcome, summary: impl Into<String>, fields: impl IntoIterator<Item = (K, V)>) -> Self where K: Into<String>, V: Into<String>
+koto::engine::types::derive_intent: fn(events: &[Event]) -> Option<String>
+koto::engine::types::derive_state_from_log: fn(events: &[crate::engine::types::Event]) -> Option<String>
+koto::engine::types::effective_intent: fn(header: &StateFileHeader, events: &[Event]) -> Option<String>
+koto::engine::types::generate_session_id: fn() -> String
+koto::engine::types::iso8601_at: fn(t: std::time::SystemTime) -> String
+koto::engine::types::now_iso8601: fn() -> String
+koto::engine::types::producing_machine: fn(events: &[Event]) -> Option<String>
+koto::engine::types::unsettled_background_run: fn(events: &[Event]) -> Option<String>
+koto::error: mod
+koto::error::Error: enum
+koto::error::Error: impl Debug
+koto::error::Error: impl Display
+koto::error::Error: impl Error
+koto::error::Error::ConcurrentSubmissionConflict: #[error("concurrent submission conflict for session '{session_id}' at state '{state_name}'")] variant struct
+koto::error::Error::ConcurrentSubmissionConflict::session_id: field: String
+koto::error::Error::ConcurrentSubmissionConflict::state_name: field: String
+koto::error::Error::EmptyLog: #[error("empty event log")] variant
+koto::error::Error::EpochFenceViolation: #[error("epoch fence violation for {child_session_id}: expected dispatch_epoch={expected}, presented={presented}")] variant struct
+koto::error::Error::EpochFenceViolation::child_session_id: field: String
+koto::error::Error::EpochFenceViolation::expected: field: u32
+koto::error::Error::EpochFenceViolation::presented: field: u32
+koto::error::Error::IncompatibleSchemaVersion: #[error("incompatible schema version: found {found}, max supported {max_supported}")] variant struct
+koto::error::Error::IncompatibleSchemaVersion::found: field: u32
+koto::error::Error::IncompatibleSchemaVersion::max_supported: field: u32
+koto::error::Error::InvalidCoordId: #[error("invalid coord id ({reason}): {input_preview}")] variant struct
+koto::error::Error::InvalidCoordId::input_preview: field: String
+koto::error::Error::InvalidCoordId::reason: field: String
+koto::error::Error::InvalidSessionId: #[error("invalid session id ({reason}): {input_preview}")] variant struct
+koto::error::Error::InvalidSessionId::input_preview: field: String
+koto::error::Error::InvalidSessionId::reason: field: String
+koto::error::Error::ParseError: #[error("parse error: {0}")] variant tuple
+koto::error::Error::ParseError::0: field: String
+koto::error::Error::RecursionCapExceeded: #[error("recursion cap exceeded ({dimension}): observed {observed}, hard reject at {threshold}")] variant struct
+koto::error::Error::RecursionCapExceeded::dimension: field: String
+koto::error::Error::RecursionCapExceeded::observed: field: u32
+koto::error::Error::RecursionCapExceeded::threshold: field: u32
+koto::error::Error::RedelegationCapExceeded: #[error("redelegation cap exceeded for {child_session_id}: cap={cap}")] variant struct
+koto::error::Error::RedelegationCapExceeded::cap: field: u32
+koto::error::Error::RedelegationCapExceeded::child_session_id: field: String
+koto::error::Error::ReservedKindCollision: #[error("reserved audit-event kind: {offending_kind}")] variant struct
+koto::error::Error::ReservedKindCollision::offending_kind: field: String
+koto::error::Error::StateFileCorrupted: #[error("state file corrupted: {0}")] variant tuple
+koto::error::Error::StateFileCorrupted::0: field: String
+koto::error::Error::StateNotFound: #[error("state not found: {0}")] variant tuple
+koto::error::Error::StateNotFound::0: field: String
+koto::error::Error::WakeDeliveryFailed: #[error("wake delivery failed: {0}")] variant tuple
+koto::error::Error::WakeDeliveryFailed::0: field: String
+koto::error::Error::exit_code: fn(self: &Self) -> i32

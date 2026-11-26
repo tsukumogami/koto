@@ -37,7 +37,16 @@ use serde::Serialize;
 /// classification, adds the optional `blocked` and `error` fields on a
 /// `workflow_agent` step, and appends `· blocked on gate <name>` to a blocked
 /// session's `summary`.
-pub const CONTRACT_VERSION: u32 = 5;
+///
+/// Version 6 adds the top-level `status` word `killed` and `koto.staleSince`.
+/// koto's projection never writes either: the retention sweep
+/// (`src/workflows_surface/retention.rs`) rewrites an entry still `running`
+/// whose last write is more than two hours old as `killed`, appends
+/// `· no activity since <time>` to its `summary`, records that last write as
+/// `staleSince`, and sets `contractVersion` to 6 whatever version wrote the
+/// rest of the entry. The session's next commit writes the entry from its
+/// projection again, without either.
+pub const CONTRACT_VERSION: u32 = 6;
 
 /// Longest gate name, in raw characters, written into a step's `error` or a
 /// blocked `summary` before the cut marker. The name is cut before it is
@@ -84,6 +93,10 @@ pub enum ScreenStatus {
     Running,
     Completed,
     Failed,
+    /// Written only by the retention sweep, for an entry whose session has
+    /// been silent past the stale window (contract v6). Claude Code heads it
+    /// "stopped" and counts it out of the running total.
+    Killed,
 }
 
 /// Longest escaped gate name, in characters, written before the cut marker.
@@ -269,6 +282,12 @@ pub struct KotoBlock {
     /// omitted from serialization so that render stays lean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holdings: Option<Holdings>,
+    /// When the retention sweep rewrote a stale entry as `killed` (contract
+    /// v6): the entry's last write, in epoch milliseconds. koto's projection
+    /// never sets it, so a reader can tell a reconciled entry from a
+    /// projected one; omitted when absent.
+    #[serde(rename = "staleSince", skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<u64>,
 }
 
 /// The file koto writes as `koto-<session-uuid>.json`.
@@ -356,6 +375,7 @@ impl WorkflowFile {
                 contract_version: CONTRACT_VERSION,
                 status,
                 holdings: None,
+                stale_since: None,
             },
         }
     }
@@ -488,10 +508,21 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_five() {
-        // Version 5 moved koto's classification to koto.status and added the
-        // blocked step and summary; the shape fixture pins it.
-        assert_eq!(CONTRACT_VERSION, 5);
+    fn contract_version_is_six() {
+        // Version 6 added the `killed` status word and koto.staleSince, both
+        // written only by the retention sweep; the shape fixtures pin it.
+        assert_eq!(CONTRACT_VERSION, 6);
+    }
+
+    #[test]
+    fn killed_is_the_screen_word_and_stale_since_is_omitted_when_absent() {
+        assert_eq!(
+            serde_json::to_value(ScreenStatus::Killed).unwrap(),
+            serde_json::json!("killed")
+        );
+        let wf = WorkflowFile::new("s", "w", "n".to_string(), None, RenderStatus::Running, 0);
+        let v: serde_json::Value = serde_json::from_slice(&wf.to_json_bytes().unwrap()).unwrap();
+        assert!(v["koto"].get("staleSince").is_none());
     }
 
     fn blocked_file(workflow: &str, state: &str, gate: &str) -> serde_json::Value {

@@ -16,31 +16,16 @@
 //!   promotion eligibility behind `koto decider report`.
 //! - [`build_decider`]: the only production constructor of a provider.
 
-pub mod check;
-pub mod evaluate;
 #[cfg(test)]
 pub mod fake;
 pub mod http;
 pub mod jev;
 pub mod ledger;
-pub mod record;
 pub mod report;
-pub mod request;
-pub mod types;
 
-pub use evaluate::{evaluate, EffectiveModes, Evaluation, FieldEvaluation, FieldOutcome};
-pub use record::{
-    ConsultationOutcome, DeciderConsultation, FieldConsultation, UnavailableInput,
-    UnavailableReason,
-};
-pub use request::{
-    build_request, declared_fields, AssembledInputs, BuildRequestError, DeclaredField,
-    DeclaredKind, InputTextError,
-};
-pub use types::{
-    Answer, AnswerOption, ApiKey, Decider, DeciderError, DecisionRequest, DecisionResponse,
-    ErrorClass, GlobalMode, LabelledInput, Question, QuestionKind, SettingOrigin,
-};
+// `types`, `request`, `evaluate`, `record` and `check` live in
+// koto-session-reader, with the re-exports of their main items.
+pub use koto_session_reader::decider::*;
 
 use crate::config::resolve::DeciderSettings;
 

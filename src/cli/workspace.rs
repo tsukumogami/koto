@@ -20,7 +20,7 @@
 //!
 //! TODO(issue-3): switch the `--root` validator to `ValidatedSessionId::new`
 //! once Issue 3 lands. The current site reuses `validate_session_id()`
-//! from `src/session/validate.rs` which already implements the same
+//! from `koto-session-reader/src/session/validate.rs` which already implements the same
 //! character allowlist; the refactor is type-signature only.
 
 use std::collections::{HashMap, HashSet};

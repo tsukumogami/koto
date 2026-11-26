@@ -1,0 +1,79 @@
+# koto-session-reader reads the session store and never writes it. Clippy
+# reads the first clippy.toml walking up from the crate's manifest, so this
+# file replaces the root one for this crate and carries its two home_dir
+# entries too. lib.rs denies both lints, and two files hold the only
+# #[allow]s: src/fs_read.rs, through which every file open in the crate goes,
+# and src/koto_root.rs, whose one home-directory lookup is the koto root rule.
+# scripts/check-reader-readonly.sh checks that every entry below is still
+# here.
+#
+# allow-invalid = true marks a path clippy can't resolve on every toolchain
+# the crate builds with: the File::lock family is newer than the MSRV (1.88).
+# The dirs entry keeps it too, as it had before dirs became a dependency.
+disallowed-methods = [
+    # Writes, copies, renames, removals, creations and links through std::fs.
+    { path = "std::fs::write", reason = "the reader never writes" },
+    { path = "std::fs::copy", reason = "the reader never writes" },
+    { path = "std::fs::rename", reason = "the reader never writes" },
+    { path = "std::fs::remove_file", reason = "the reader never writes" },
+    { path = "std::fs::remove_dir", reason = "the reader never writes" },
+    { path = "std::fs::remove_dir_all", reason = "the reader never writes" },
+    { path = "std::fs::create_dir", reason = "the reader never writes" },
+    { path = "std::fs::create_dir_all", reason = "the reader never writes" },
+    { path = "std::fs::hard_link", reason = "the reader never writes" },
+    { path = "std::fs::soft_link", reason = "the reader never writes" },
+    { path = "std::fs::set_permissions", reason = "the reader never writes" },
+    # File methods that create, resize, retime, sync or lock.
+    { path = "std::fs::File::create", reason = "the reader never writes" },
+    { path = "std::fs::File::create_new", reason = "the reader never writes" },
+    { path = "std::fs::File::set_len", reason = "the reader never writes" },
+    { path = "std::fs::File::set_times", reason = "the reader never writes" },
+    { path = "std::fs::File::set_modified", reason = "the reader never writes" },
+    { path = "std::fs::File::set_permissions", reason = "the reader never writes" },
+    { path = "std::fs::File::sync_all", reason = "the reader never writes" },
+    { path = "std::fs::File::sync_data", reason = "the reader never writes" },
+    { path = "std::fs::File::lock", reason = "the reader takes no lock", allow-invalid = true },
+    { path = "std::fs::File::lock_shared", reason = "the reader takes no lock", allow-invalid = true },
+    { path = "std::fs::File::try_lock", reason = "the reader takes no lock", allow-invalid = true },
+    { path = "std::fs::File::try_lock_shared", reason = "the reader takes no lock", allow-invalid = true },
+    { path = "std::fs::File::unlock", reason = "the reader takes no lock", allow-invalid = true },
+    # OpenOptions write modes, and the unix extensions that set a mode or
+    # pass raw flags (O_CREAT or O_TRUNC create or truncate even on a
+    # read-only open).
+    { path = "std::fs::OpenOptions::write", reason = "the reader never writes" },
+    { path = "std::fs::OpenOptions::append", reason = "the reader never writes" },
+    { path = "std::fs::OpenOptions::create", reason = "the reader never writes" },
+    { path = "std::fs::OpenOptions::create_new", reason = "the reader never writes" },
+    { path = "std::fs::OpenOptions::truncate", reason = "the reader never writes" },
+    { path = "std::os::unix::fs::OpenOptionsExt::mode", reason = "the reader never creates a file" },
+    { path = "std::os::unix::fs::OpenOptionsExt::custom_flags", reason = "raw open flags go through fs_read::read_store_file's fixed constants" },
+    # Links and ownership through the unix extensions.
+    { path = "std::os::unix::fs::symlink", reason = "the reader never writes" },
+    { path = "std::os::unix::fs::chown", reason = "the reader never writes" },
+    { path = "std::os::unix::fs::fchown", reason = "the reader never writes" },
+    { path = "std::os::unix::fs::lchown", reason = "the reader never writes" },
+    # Network resolution and the process environment.
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "the reader makes no network call" },
+    { path = "std::env::set_var", reason = "the reader never changes the process environment" },
+    { path = "std::env::remove_var", reason = "the reader never changes the process environment" },
+    # The root clippy.toml's two entries: koto paths come from the koto root.
+    { path = "dirs::home_dir", reason = "build koto paths from the koto root, which honours KOTO_HOME", allow-invalid = true },
+    { path = "std::env::home_dir", reason = "build koto paths from the koto root, which honours KOTO_HOME" },
+    # The reads themselves, outside fs_read.rs.
+    { path = "std::fs::File::open", reason = "open files through fs_read" },
+    { path = "std::fs::File::options", reason = "open files through fs_read" },
+    { path = "std::fs::read", reason = "read files through fs_read" },
+    { path = "std::fs::read_to_string", reason = "read files through fs_read" },
+    { path = "std::fs::OpenOptions::new", reason = "open files through fs_read" },
+]
+
+disallowed-types = [
+    { path = "std::fs::DirBuilder", reason = "the reader never creates a directory" },
+    { path = "std::process::Command", reason = "the reader runs no process" },
+    { path = "std::net::TcpStream", reason = "the reader makes no network call" },
+    { path = "std::net::TcpListener", reason = "the reader makes no network call" },
+    { path = "std::net::UdpSocket", reason = "the reader makes no network call" },
+    { path = "std::os::unix::net::UnixStream", reason = "the reader opens no socket" },
+    { path = "std::os::unix::net::UnixListener", reason = "the reader opens no socket" },
+    { path = "std::os::unix::net::UnixDatagram", reason = "the reader opens no socket" },
+]

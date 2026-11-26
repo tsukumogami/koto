@@ -835,6 +835,7 @@ pub fn command_outcome_sentence(kind: FailureKind, exit_code: i32) -> String {
         FailureKind::TimedOut => "command timed out".to_string(),
         FailureKind::SpawnFailed => "command could not be started".to_string(),
         FailureKind::WaitFailed => "waiting for the command failed".to_string(),
+        FailureKind::Lost => "the background run was lost: its runner left no result".to_string(),
     }
 }
 
@@ -880,7 +881,7 @@ fn command_gate_result(
                 "failure_kind": FailureKind::TimedOut.as_str(),
             }),
         ),
-        FailureKind::SpawnFailed | FailureKind::WaitFailed => (
+        FailureKind::SpawnFailed | FailureKind::WaitFailed | FailureKind::Lost => (
             GateOutcome::Error,
             serde_json::json!({
                 "exit_code": -1,
