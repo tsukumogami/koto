@@ -426,6 +426,7 @@ fn list_prints_a_tree_with_the_values_koto_holds() {
     // An unknown root is a usage error naming it.
     let unknown = store.list_cmd(&["list", "--root", "golden-nobody", "--key", KEY]);
     assert_eq!(unknown.code, Some(2), "an unknown root exits 2");
+    assert_eq!(unknown.stdout, "", "an unknown root prints no row");
     assert!(
         unknown.stderr.contains("golden-nobody"),
         "the unknown root's error names it: {:?}",
