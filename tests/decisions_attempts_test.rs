@@ -783,8 +783,8 @@ fn a_provisional_waits_until_a_person_answers_a_question_naming_it() {
     // the review waits on, but doesn't make it a question worker2 attempted.
     assert_eq!(list(&v)[0]["question"], Value::Null);
 
-    // A session's answer doesn't end the wait.
-    env.ok(&[
+    // A session's answer to a question waiting on a person is refused.
+    let out = env.run(&[
         "decisions",
         "answer",
         "director",
@@ -796,6 +796,7 @@ fn a_provisional_waits_until_a_person_answers_a_question_naming_it() {
         "--text",
         "fine by me",
     ]);
+    assert_eq!(out.code, 2, "{}", out.all());
     assert_eq!(awaiting(&env), vec![p1.identity.clone()]);
 
     let answer = env.owner_answers(&q7, "manager");
@@ -836,6 +837,133 @@ fn a_review_belongs_to_the_judgment_it_names_not_a_reused_identifier() {
         shown["review"],
         serde_json::json!({"state": "awaiting", "question": null})
     );
+}
+
+#[test]
+fn the_review_reports_the_answer_that_governs_the_question() {
+    let env = Env::new();
+    tree(&env);
+    let p1 = env.judgment(
+        "worker2",
+        &["what=name the table cache_entries", "result=provisional"],
+        &[],
+    );
+    let q7 = env.question("director", "person:owner", &[], &[&p1]);
+    let first = env.owner_answers(&q7, "manager");
+    let second = env.owner_answers(&q7, "other-lead");
+    // Of two person answers citing neither, the later governs; the earlier
+    // still counts but is outranked.
+    let earlier = env.ok(&["decisions", "show", "manager", &first.id]).json();
+    assert_eq!(earlier["counted"], true, "{earlier}");
+    assert_eq!(earlier["governs"], false, "{earlier}");
+    let v = env.attempts(&["--at", "director", "--result", "provisional"]);
+    let review = &list(&v)[0]["review"];
+    assert_eq!(review["state"], "reviewed", "{v}");
+    assert_eq!(review["question"], q7.identity.as_str());
+    assert_eq!(review["answer"]["session"], "other-lead");
+    assert_eq!(review["answer"]["id"], second.id.as_str());
+    let shown = env.ok(&["decisions", "show", "worker2", &p1.id]).json();
+    assert_eq!(shown["review"], *review);
+}
+
+#[test]
+fn an_uncounted_answer_a_settle_and_a_withdrawal_dont_end_the_wait() {
+    let env = Env::new();
+    tree(&env);
+    let p1 = env.judgment(
+        "worker2",
+        &["what=name the table cache_entries", "result=provisional"],
+        &[],
+    );
+    let waiting = |env: &Env| {
+        assert_eq!(awaiting_at(env, "director"), vec![p1.identity.clone()]);
+        let shown = env.ok(&["decisions", "show", "worker2", &p1.id]).json();
+        assert_eq!(shown["review"]["state"], "awaiting", "{shown}");
+    };
+
+    // A session's answer that governs a question waiting on that session.
+    let qa = env.question("director", "session:manager", &[], &[&p1]);
+    let out = env.ok(&[
+        "decisions",
+        "answer",
+        "director",
+        &qa.id,
+        "--in",
+        "manager",
+        "--by",
+        "session",
+        "--text",
+        "fine by me",
+    ]);
+    let said = out.json()["id"].as_str().unwrap().to_string();
+    let e = env.ok(&["decisions", "show", "manager", &said]).json();
+    assert_eq!(e["governs"], true, "{e}");
+    waiting(&env);
+
+    let qw = env.question("director", "person:owner", &[], &[&p1]);
+    // The raiser withdraws a question waiting on a person.
+    env.ok(&[
+        "decisions",
+        "answer",
+        "director",
+        &qw.id,
+        "--in",
+        "director",
+        "--outcome",
+        "withdrawn",
+        "--reason",
+        "asked elsewhere",
+        "--by",
+        "session",
+    ]);
+    waiting(&env);
+
+    // The raiser settles another from the owner's answer to a question
+    // with its label.
+    let qb = env.question("other-worker", "person:owner", &["label=cache"], &[]);
+    let owner = env.owner_answers(&qb, "manager");
+    let qc = env.question("director", "person:owner", &["label=cache"], &[&p1]);
+    let basis = owner.basis();
+    env.ok(&[
+        "decisions",
+        "answer",
+        "director",
+        &qc.id,
+        "--in",
+        "director",
+        "--outcome",
+        "settled",
+        "--text",
+        "settled",
+        "--by",
+        "session",
+        "--basis",
+        &basis,
+    ]);
+    let settled = out_id(&env, "director", &qc);
+    waiting(&env);
+
+    // The owner answers the labelled question again: the settle reads
+    // counted false and the wait goes on.
+    env.owner_answers(&qb, "other-lead");
+    let e = env.ok(&["decisions", "show", "director", &settled]).json();
+    assert_eq!(e["counted"], false, "{e}");
+    waiting(&env);
+}
+
+/// The id of the newest entry `session` aimed at `q`.
+fn out_id(env: &Env, session: &str, q: &D) -> String {
+    let v = env
+        .ok(&["decisions", "list", session, "--format", "v1"])
+        .json();
+    v["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["decision"]["target"]["decision"] == q.id.as_str())
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .unwrap()
 }
 
 fn awaiting_at(env: &Env, at: &str) -> Vec<String> {

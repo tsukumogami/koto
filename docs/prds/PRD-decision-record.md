@@ -202,7 +202,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `verdict` | judging evidence, such as a review verdict or a production verdict | `pass`, `fail`, `inconclusive` |
   | `reverse` | overruling an earlier decision | `reversed` |
   | `refused` | a decision attempt koto refused | `refused` |
-  | `answer` | answering a question an `escalate` raised (R50) | `answered` |
+  | `answer` | answering a question an `escalate` raised (R50), or its raiser closing it (R77) | `answered`, `settled`, `withdrawn` |
   | `readdress` | passing a question an `escalate` raised up to a new recipient (R55) | `passed` |
 
 - **R2.** Every decision names its subject in a form a reader can resolve after the deciding
@@ -215,14 +215,14 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `accept` of an intent or staged draft | where it lives (a koto request identifier, a repository path, or a forge issue), plus an optional link to the ticket or alert it came from |
   | `merge` | repository, pull request number, merged head commit |
   | `gate-pass` | workflow (koto session name), state, gate |
-  | `escalate` | a question identifier and text, and the recipient: `session:<name>`, `anchor:<name>`, `person:<handle>`, or, on an entry written before R49, an untyped value; optionally `state` (R72) |
+  | `escalate` | a question identifier and text, and the recipient: `session:<name>`, `anchor:<name>`, `person:<handle>`, or, on an entry written before R49, an untyped value; optionally a `packet` (R69), a `label` and a `need` (R78), and a `state` (R80) |
   | `decline-escalation` | a question identifier and text |
-  | `judgment` | what was judged, as free text plus an optional pointer; optionally `state` and `result` (R72) |
+  | `judgment` | what was judged, as free text plus an optional pointer; optionally `state` and `result` (R80) |
   | `verdict` | what was judged, at least one evidence pointer, and, for a change or a release, the repository and commit judged |
   | `reverse` | the session name and identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason |
-  | `answer` | the asking session's name, the question's identifier in that session, and the answer text |
-  | `readdress` | the asking session's name, the question's identifier in that session, and the new recipient, typed as R49 types an `escalate`'s |
+  | `answer` | the asking session's name, the question's identifier in that session, and the answer text, which a `withdrawn` answer may leave out |
+  | `readdress` | the asking session's name, the question's identifier in that session, and the new recipient, typed as R49 types an `escalate`'s; when the recording session has a dispatcher, that dispatcher's name (R75) |
 
   A command given a kind, outcome or subject these tables don't allow fails with an error naming
   the field and records nothing.
@@ -591,8 +591,8 @@ to an id-shaped value, and both say so.
   session's id with the question's identifier, never the session's name alone, so a later session
   that reuses the name is not answered by it. koto refuses an answer whose question doesn't exist,
   isn't an `escalate`, has an untyped recipient or doesn't read `in-effect` (a reversed question
-  takes no answer), an answer given in the asking session itself, and a person's answer that fails
-  R62 to R67; each refusal exits 2 and writes nothing. An
+  takes no answer), an `answered` answer given in the asking session itself, a person's answer that
+  fails R62 to R67, and an entry R76 refuses; each refusal exits 2 and writes nothing. An
   answer is never reversed: a `reverse` aimed at one is refused and recorded as `refused` (R18).
   `koto decisions record` doesn't take the `answer` kind; `koto decisions answer` records it.
 - **R51.** An answer is recorded in the session it is given in, beside the reversals that session
@@ -603,16 +603,19 @@ to an id-shaped value, and both say so.
   a question is listed whether or not its session has a parent, an anchor or any link. Each entry
   carries the question's identity, the asking session's name, the question identifier and text,
   the typed recipient and the time it was raised.
-- **R53.** Open is computed when a read runs: a question in effect is open while no `answer` with
-  outcome `answered` targets its identity. No file records a question as closed other than the
-  answer itself. Until person answers and precedence between answers exist, any such answer closes
-  the question.
-- **R54.** While a session's run holds a question that has an answer and no decision in the run
-  cites that answer in its `basis`, every `koto next` on any member of the run carries a
-  `questions` array reporting it: the question's identity, its session and identifier, the state
-  `answered`, and the answer with its session, identifier, text, decider, run mode and time. The
-  report repeats on every call, including once the workflow is terminal, and stops once a decision
-  in the run cites the answer. A citation counts only when the decision it names is an answer to
+- **R53.** Open is computed when a read runs: a question in effect is open while no closing entry
+  that counts (R72) targets its identity. No file records a question as closed other than the
+  closing entry itself, and an entry that doesn't count closes nothing.
+- **R54.** While a session's run holds a question whose entry in effect (R74) is an `answered`
+  answer and no decision in the run cites that answer in its `basis`, every `koto next` on any
+  member of the run carries a `questions` array reporting it: the question's identity, its session
+  and identifier, the state `answered`, and the answer with its session, identifier, text, decider,
+  run mode and time, and for a person's answer the reading R68 gives it. The report follows the
+  entry in effect: only that entry is reported, and when a later entry takes effect the question is
+  reported again with it, even if the run cited the earlier one. A question the run closed itself
+  with a `settled` or `withdrawn` entry is not reported, and neither is an entry that doesn't
+  count. The report repeats on every call, including once the workflow is terminal, and stops once
+  a decision in the run cites the entry in effect. A citation counts only when the decision it names is an answer to
   the question and was recorded no later than the citing decision, so an answer from a later
   session that reuses the cited name and identifier is still reported. Reading it writes nothing, takes no lock, makes no network
   connection and never blocks or changes the exit code; a session with nothing to report carries
@@ -621,9 +624,9 @@ to an id-shaped value, and both say so.
   identity, as an answer's is (R50), and its subject carries the new recipient as `session:<name>`,
   `anchor:<name>` or `person:<handle>`. The question keeps its identity: the `escalate` is
   unchanged and no second one is written. koto refuses a pass-up whose question doesn't exist,
-  isn't an `escalate`, has an untyped recipient, doesn't read `in-effect` or already has an answer
-  with outcome `answered`; whose new recipient has no type prefix, has a prefix with a name or
-  handle koto doesn't accept, or is the recipient the question waits on now; and whose decider is a
+  isn't an `escalate`, has an untyped recipient, doesn't read `in-effect` or is closed (R53); whose
+  new recipient has no type prefix, has a prefix with a name or handle koto doesn't accept, is the
+  recipient the question waits on now, or breaks R75's destination rule; and whose decider is a
   person. Each refusal exits 2 and writes nothing. A pass-up is never reversed: a `reverse` aimed
   at one is refused and recorded as `refused` (R18). `koto decisions record` doesn't take the
   `readdress` kind; `koto decisions readdress` records it.
@@ -633,14 +636,15 @@ to an id-shaped value, and both say so.
 - **R57.** A pass-up is accepted only from the asking session, matched by the session id the
   question carries, or from the session or anchor the question waits on when the pass-up is
   recorded, or from a session that continues one of those through a confirmed succession; any
-  other recording session is refused and nothing is written. Which recipients a
-  pass-up may name beyond R55's checks is not settled by this requirement.
+  other recording session is refused and nothing is written. R75 says which recipients a pass-up
+  may name.
 - **R58.** A question's current addressee and its addressee history are computed when a read runs,
   and no file stores them. The history starts with the recipient the question was raised with and
   adds one entry for each pass-up of the question that R57 would accept against the history built
-  so far, by causality rather than by clock: it repeatedly adds the first pass-up not yet added,
-  in order of time, then recording session name, then identifier, that R57 accepts against the
-  last entry, until none is accepted. A pass-up whose recorded time sorts before the one it
+  so far and that keeps R75's destination rule, by causality rather than by clock: it repeatedly
+  adds the first pass-up not yet added, in order of time, then recording session name, then
+  identifier, that R57 accepts against the last entry, that keeps R75 and that names a recipient
+  other than the last entry, until none is accepted. A pass-up whose recorded time sorts before the one it
   follows is still added. The current addressee is the history's last entry.
 - **R59.** Every entry of an open read carries `recipient`, the recipient the question was raised
   with; `addressee`, the current addressee; and `addressees`, the whole history in order, each
@@ -735,9 +739,101 @@ to an id-shaped value, and both say so.
   `time`, `shape`, `call-position-reused` or `content`). No text from the record appears in koto's
   output.
 
+**Which entries count and which is in effect**
+
+- **R72.** A closing entry is an `answer` of any outcome aimed at a question's identity. Each read
+  judges whether it counts, against the question's addressee history (R58) as it stands when the
+  read runs, so an entry that counted can stop counting when the history or the other entries
+  change, and the reverse:
+  - An `answered` answer by a person decider that R68 reads as verified counts, whichever session
+    it was recorded in and whoever the question waits on.
+  - Any other `answered` answer counts only when the question waits on a session or anchor and the
+    recording session is that addressee or continues it through a confirmed succession. This
+    covers a session's answer and a person's answer read as a remote session's (R68), which is
+    judged as an answer of the session holding it. A session's answer to a question that waits on a
+    person never counts.
+  - A `withdrawn` or `settled` entry counts only as R77 allows.
+- **R73.** An entry that breaks a rule is returned by every read that returned it before, never
+  dropped, and never takes effect. `koto decisions show` and `list --format v1` add to every
+  `answer` and `readdress` entry `counted` (true or false) and, when it is false, a `reason`
+  naming the rule as one of the codes `not_addressee`, `waits_on_person`, `not_raiser`,
+  `person_decider`, `no_reason`, `need_not_settleable`, `settle_basis`, `no_question`,
+  `after_fence`, `destination` and `skipped`; an unreadable entry lists the code `integrity` as
+  its `reason` and the failed check as free text in `detail`. To every closing entry they add `governs`, true on the one entry in effect
+  (R74) and false on every other. A pass-up counts when it is in the question's addressee history.
+  The stored status of an entry is unchanged by this judgment.
+- **R74.** Of a question's closing entries that count, one is in effect. A person's answer counted
+  under R72's first rule outranks every other entry, whichever was recorded first: of several, the
+  one no other of them cites in its `basis` is in effect, and of several uncited, the latest by
+  time, then recording session name, then identifier. With no such answer, the earliest counted
+  entry by the same order is in effect. Exactly one closing entry of a closed question reads
+  `governs` true, and an open question has none.
+- **R75.** A pass-up may name a person, or the session or anchor that is the recording session's
+  dispatcher as `koto session origin` reports it (for a session continuing another through a
+  confirmed succession and having none of its own, the dispatcher of the session it continues). A
+  session with no dispatcher can pass a question only to a person. The pass-up records the
+  dispatcher's name when it is written, and the rule is judged from that recorded name, so a later
+  change to the recorder's links moves no question; a pass-up written before this requirement is
+  judged from the dispatcher its authority recorded. A stored pass-up that breaks the rule is left
+  out of the addressee history and reads `counted` false. `anchor:<dispatcher>` names the same
+  position as `session:<dispatcher>` and is accepted. At read time the rule checks only that a
+  stored pass-up names the dispatcher it recorded; the recorded name isn't checked against the
+  recorder's links in the store, so the rule doesn't hold against files in the store written or
+  edited directly.
+- **R76.** `koto decisions answer` refuses, before any write, every entry that would not count
+  when written: a session's `answered` answer to a question that waits on a person, or recorded in
+  a session that isn't the question's addressee and doesn't continue it; and a session's
+  `answered`, `settled` or `withdrawn` entry aimed at a closed question, with a message naming the
+  entry in effect. A person's `answered` answer is taken while the question is in effect, closed
+  or not, since it outranks what closed it. Each refusal exits 2.
+- **R77.** A question's raiser closes it itself with `koto decisions answer --outcome withdrawn`
+  or `--outcome settled`, recorded `--in` the raising session, matched by session id, or a session
+  continuing it, with a session decider. A withdrawal needs a reason and takes no evidence. A
+  settle needs a text and evidence: for a question that waits on a person, the question needs a
+  `label` and a `--basis` naming an `answered` answer of the same person that R68 reads as verified,
+  that is in effect on its own question, whose own question still reads in effect (not reversed),
+  whose question has the same `label`, and that was recorded no later than the settle; for a
+  question that waits on a session or anchor, a `--basis` naming a decision that reads back and is
+  neither the question itself nor an entry aimed at it, or an `--evidence event:<session>:<seq>`
+  pointer, which is checked for its form only. A decision the raiser recorded only to serve as a
+  basis isn't told apart from any other. A basis names a
+  session and an identifier, resolved when the settle is judged, so a decision a later session
+  writes under a removed session's name and identifier is judged on its own and never read as the
+  removed session's. A stored `withdrawn` or `settled` entry from any other session, by a person,
+  with no reason, of a need (R78), or whose basis no longer meets these rules reads `counted`
+  false. A `reverse` aimed at a `settled` or `withdrawn` entry is refused as one aimed at an
+  answer is (R50).
+- **R78.** An `escalate` may carry `need=decision`, `need=credential` or `need=reserved-step`
+  (any other value is refused on `subject.need`) and a `label` of at most 128 bytes (a longer one
+  is refused on `subject.label`). Every element of `koto decisions open --person` and
+  `open --at` carries `need`, reading `decision` for a question raised with `need=decision` or
+  with no `need`, including one stored before this requirement. A need is listed, passed up and
+  answered like any question, and its raiser can withdraw it but can't settle a `credential` or
+  `reserved-step` need. No read selects by `label`.
+- **R79.** No write adds a twenty-first open question waiting on a person to a session's run.
+  The run is the session, the sessions it continues and the sessions that continue it through a
+  confirmed succession, and its count is of the questions raised in any of them, matched by
+  session id, that are open and whose current addressee is a person, whatever the handles. While it reads twenty, an `escalate` with a `person:`
+  recipient is refused on `subject.recipient`, and a pass-up of one of the run's questions to a
+  person is refused on `to`, whoever records it; both messages name the limit of twenty and
+  nothing is written. A pass-up of a question that already waits on a person to another person is
+  not refused, since it adds nothing to the count, and an `escalate` or pass-up to a session or
+  anchor never is. The count follows the current addressee, so a question passed from a person to
+  a session no longer counts; a closed or reversed question doesn't count; and an entry that
+  doesn't count frees no place. On one host, the writers that can add to the count hold a lock on
+  the run from the count to the write, so writes run at once can't pass twenty; a writer waits at
+  most five seconds for it and otherwise is refused, naming the lock, and writes nothing. An
+  addressee refused a pass-up by the limit is told the raiser's session and what it can do instead:
+  answer the question, pass it to its dispatcher when it has one, or leave it waiting until the
+  raiser's run closes one of its twenty. What the limit
+  doesn't cover: the count reads this host's store, so writers on two hosts are not serialized and
+  can together pass twenty; and a read never refuses, so questions can reopen past twenty without
+  any write by the run, as when twenty settles resting on one person's answer stop counting
+  because that person answers the earlier question again.
+
 **Attempts and provisional decisions**
 
-- **R72.** A `judgment` may carry two more subject fields: `state`, written `<state name>:<visit>`,
+- **R80.** A `judgment` may carry two more subject fields: `state`, written `<state name>:<visit>`,
   and `result`, one of `decided`, `undecided` or `provisional`. An `escalate` may carry `state`
   too. The state name takes the shape a session name takes and the visit is a whole number of 1
   or more with no sign and no leading zero. `state` is the caller's value: koto stores it as
@@ -745,13 +841,13 @@ to an id-shaped value, and both say so.
   separately. Any other `result` exits 2 naming `subject.result`, a malformed `state` exits 2
   naming `subject.state`, and either field on a kind that doesn't take it exits 2; each refusal
   writes nothing.
-- **R73.** A `judgment` carrying `result` is an attempt. One carrying neither field, which every
-  judgment recorded before R72 is, is not: `show` and `list --format v1` print it with no new key,
+- **R81.** A `judgment` carrying `result` is an attempt. One carrying neither field, which every
+  judgment recorded before R80 is, is not: `show` and `list --format v1` print it with no new key,
   byte for byte what they printed before, and no attempts read returns it. A judgment carrying
   either field reports nothing on `koto next`, changes no exit code and is returned by no open
   read. `list --subject result=<value>` and `--subject state=<value>` select on the fields through
   the listing's existing subject filter.
-- **R74.** An attempt is tied to a question through `basis`, in either direction: the attempt
+- **R82.** An attempt is tied to a question through `basis`, in either direction: the attempt
   names the question's `escalate`, or the `escalate` names an attempt recorded in the raiser's own
   run (the raiser, the sessions it continues and those that continue it). An `escalate` naming
   another session's attempt doesn't tie it. A citation counts only when
@@ -759,7 +855,7 @@ to an id-shaped value, and both say so.
   decision citing it, so a recreated session that reuses a name and identifier isn't taken for
   the one cited. An attempt carries every tied question, ordered by time, session name and
   identifier.
-- **R75.** `koto decisions attempts` takes exactly one of `--in <session>` and
+- **R83.** `koto decisions attempts` takes exactly one of `--in <session>` and
   `--at <session or anchor>`. `--in` returns the attempts recorded in the session's run: the
   session and those it continues through a confirmed supersede. `--at` returns those recorded at
   the position, in the sessions it continues and in every session below it, each once, with
@@ -772,22 +868,23 @@ to an id-shaped value, and both say so.
   and combine. Elements are ordered by time, then session name, then identifier. Both or neither
   of `--in` and `--at`, a position naming nothing, a `--result` outside the three or a
   `--question` that isn't an identity exits 2.
-- **R76.** A provisional judgment carries a `review`: `reversed`, with the winning reversal, once
+- **R84.** A provisional judgment carries a `review`: `reversed`, with the winning reversal, once
   a reversal aimed at it is in effect; else `reviewed`, with the question's identity and the
-  answer, once a question whose `escalate` is in effect and names the judgment in its `basis` has
-  a person's answer that reads `verified` on this host; else `awaiting`, with the identity of the
-  earliest such question, or null. The question may be raised in any session. Nothing else ends
-  the wait: not an addressee session's answer, a withdrawn question, a person answer that doesn't
-  read `verified` on this host, or a decision citing the judgment. How a raiser's settle or
-  withdrawal bears on the wait arrives with the change that adds those outcomes. `--awaiting-review` returns only provisional judgments awaiting
+  answer, once a question whose `escalate` is in effect and names the judgment in its `basis` is
+  governed (R74) by a person's answer that reads `verified` on this host; else `awaiting`, with
+  the identity of the earliest such question still open, else the earliest such question, or
+  null. The question may be raised in any session. Nothing else ends the wait: not a session's
+  answer, a settle, a withdrawal, an entry that doesn't count, a verified answer another
+  outranks, a withdrawn question, a person answer that doesn't read `verified` on this host, or
+  a decision citing the judgment. `--awaiting-review` returns only provisional judgments awaiting
   review, and `show` prints the same `review`, read from the same local store. A review is matched by identity, so a review
   question naming a removed session's judgment doesn't review a new judgment that reuses its name
   and identifier.
-- **R77.** The attempts read uses only this machine's store. It takes no lock, pulls nothing,
+- **R85.** The attempts read uses only this machine's store. It takes no lock, pulls nothing,
   makes no bucket request under the cloud backend and writes nothing. koto refuses nothing for
   want of an attempt: an `escalate` or a `readdress` with no attempt behind it is recorded as
   before, and enforcing an attempt before a pass-up is left to the caller.
-- **R78.** Over a store of 1,000 sessions in dispatcher chains four deep, holding 200 open
+- **R86.** Over a store of 1,000 sessions in dispatcher chains four deep, holding 200 open
   questions with attempts and provisional judgments in every chain, `attempts --at` a top
   coordinator, with and without `--awaiting-review`, and `attempts --in` a session each finish in
   under five seconds on a release build.
@@ -1114,17 +1211,17 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
 - [ ] `koto decisions open --person owner` returns a question raised in a session with no parent,
   anchor or link, with its identity, session, identifier, text and recipient, and
   `--person someone-else` returns nothing (R52).
-- [ ] `koto decisions answer A <id> --in B --text ... --by session` writes exactly one file under
-  B's `ctx/koto/aimed/<A's session id>/` and leaves every file in A byte-identical; afterwards the
-  question is no longer open (R50, R51, R53).
+- [ ] With a question raised in A to `session:B`, `koto decisions answer A <id> --in B --text ...
+  --by session` writes exactly one file under B's `ctx/koto/aimed/<A's session id>/` and leaves
+  every file in A byte-identical; afterwards the question is no longer open (R50, R51, R53).
 - [ ] An answer aimed at a missing decision, at a decision that isn't an `escalate`, at an
   untyped or reversed `escalate`, from the asking session, or with `--by person:<handle>` and no
   `--prompt` exits 2 and writes nothing in either session (R50, R62).
 - [ ] After the answering session is removed and a new session of the same name answers another
   question with the same answer identifier, the asker's earlier citation doesn't end the report of
   the new answer (R54).
-- [ ] With q1 and q2 raised to `person:owner` and q3 to `person:someone-else`, answering q1 alone
-  leaves q2 and q3 open and reports only q1 on the asker's `koto next` (R53, R54).
+- [ ] With q1 and q2 raised to `session:B` and q3 to `session:C`, B's answer to q1 alone leaves q2
+  and q3 open and reports only q1 on the asker's `koto next` (R53, R54).
 - [ ] After the asking session is removed and a session of the same name is created, the earlier
   answer closes none of the new session's questions and isn't reported to it (R50).
 - [ ] The asker's `koto next` reports the answer on every call, on a terminal workflow too, and on
@@ -1206,30 +1303,107 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
 - [ ] A judgment recorded with `state=implement:1` and each of the three `result` values exits 0
   and `show` and `list --format v1` return both fields; `result=maybe`, a `state` with no visit or
   a visit of `0`, `result` on an `escalate` and `state` on a `merge` each exit 2 naming the field
-  and leave the session's directory byte-identical (R72).
+  and leave the session's directory byte-identical (R80).
 - [ ] A judgment recorded with neither field prints byte-identical to the previous binary in
   `show` and `list --format v1` and is returned by no attempts read; a judgment with either field
   leaves `koto next` and every open read unchanged; `list --subject result=provisional` returns
-  exactly the provisional judgments (R73).
+  exactly the provisional judgments (R81).
 - [ ] An `escalate` citing an attempt in its raiser's run and a judgment citing an `escalate`
   each tie the attempt to that question, and `questions` lists every tied question; an `escalate`
   citing another session's attempt ties nothing; an `escalate` in a recreated session that reuses the cited name and identifier
-  is not taken for the question (R74).
+  is not taken for the question (R82).
 - [ ] `attempts --in` returns the session's attempts and its confirmed predecessor's and none of
   another session's; `attempts --at` returns those at and below the position once each with
   `relation`, and none from a separate hierarchy; `--question` returns one element once the
   session has an attempt tied to the question and an empty array before; both or neither of `--in`
-  and `--at` exits 2 (R75).
+  and `--at` exits 2 (R83).
 - [ ] A provisional judgment reads `awaiting` until a question citing it is closed by a verified
   person answer, then `reviewed` with the answer's text and decider; a session's answer, a
   withdrawn question, an answer that doesn't read `verified` on this host or a citing judgment
   leaves it `awaiting`; a reversal makes it `reversed`
-  and drops it from `--awaiting-review`; `show` prints the same review (R76).
+  and drops it from `--awaiting-review`; `show` prints the same review (R84).
 - [ ] Every session directory is byte-identical before and after each attempts read, a
   `readdress` by a session with no attempt exits 0, and under the cloud backend the in-process
-  endpoint records no request from any attempts read (R77).
+  endpoint records no request from any attempts read (R85).
 - [ ] The generated store's three reads return the counts its generator intends and each finishes
-  in under five seconds on a release build (R78).
+  in under five seconds on a release build (R86).
+
+**Which entries count and which is in effect**
+
+With `worker` dispatched by `manager`, `manager` by `director`, and an unrelated `other-lead` with
+`other-worker` below it:
+
+- [ ] With q1 raised in `worker` to `session:manager`, a session's answer `--in manager` exits 0
+  and `--in director` or `--in other-lead` exits 2 naming the addressee rule; after `manager`
+  passes q1 to `director`, `--in manager` exits 2 and `--in director` exits 0; a question waiting
+  on `person:owner` takes no session's answer from any session and takes a person's answer
+  recorded in any session; a person's answer closes a question waiting on a session (R72, R76).
+- [ ] A session's answer stored in `other-lead` for a question waiting on `manager` lists with
+  `counted` false and a `reason`, the question stays in every open read, and `koto next worker`
+  reports nothing; a stored answer by `manager` reads `counted` false once the history has moved
+  to `director`; a person's answer in a session whose note of checked prompts is missing counts
+  only when that session is the addressee; a question holding only such entries still takes a
+  pass-up and an entitled answer (R72, R73).
+- [ ] A session's answer and a later person's answer both read `counted` true and the person's
+  alone `governs`; with the person's answer first, a session's answer exits 2 naming the entry in
+  effect, and one stored later reads `counted` true and `governs` false; of two counted session
+  answers the earlier governs; of two person answers the one citing the other governs whatever
+  their stored times, and of two citing neither the later governs; exactly one entry governs
+  (R74).
+- [ ] `koto next worker` reports only the entry in effect, reports q1 again with the owner's answer
+  after `worker` cited `director`'s, and stops once the owner's is cited; a question the run
+  withdrew or settled itself is not reported (R54).
+
+**Where a pass-up may go**
+
+- [ ] With q1 raised in `worker` to `session:manager`, a pass-up `--in manager` to
+  `session:other-lead` or `session:worker`, or `--in worker` to `session:director`, exits 2 naming
+  the rule and the dispatcher it would accept; `--in manager` to `session:director` or
+  `person:owner` and `--in worker` to `person:owner` exit 0; `--in director`, with no dispatcher,
+  exits 2 to `session:manager` and 0 to `person:owner` (R75).
+- [ ] A stored pass-up to a session that isn't its recorded dispatcher, one recorded by a session
+  that was neither raiser nor addressee, one naming the current addressee and the later of two
+  written against one addressee each list `counted` false with a reason and are left out of
+  `addressees`; each pass-up in the history lists `counted` true (R73, R75).
+
+**Withdrawing and settling**
+
+- [ ] `--outcome withdrawn --reason ...` recorded `--in` the raiser or its successor exits 0 and
+  closes the question; without a reason, `--in` any other session or by a person it exits 2 and
+  writes nothing; a stored withdrawal from another session reads `counted` false (R77).
+- [ ] With an owner's answer in effect on q1 labelled `cache`, a settle of q5, waiting on
+  `person:owner` and labelled `cache`, citing it exits 0; with no basis, citing a session's
+  answer, citing an answer that no longer governs, of another handle, read as remote, from a
+  removed session's reused name and identifier, of a question with another label or none, it
+  exits 2; once a later owner's answer replaces the cited one, the settle reads `counted` false
+  and q5 is open again (R77).
+- [ ] A settle of a question waiting on a session exits 0 with a basis that reads back or an event
+  pointer and 2 with neither; a settle or withdrawal of a closed question exits 2 naming the entry
+  in effect; `record --kind answer` is refused for every outcome and a `reverse` of a settle or a
+  withdrawal exits 2 (R76, R77).
+
+**Needs and the limit of twenty**
+
+- [ ] `need=credential`, `need=reserved-step` and `need=decision` are recorded, another value is
+  refused on `subject.need` and a 129-byte `label` on `subject.label`; the open reads carry `need`;
+  a need is answered by a person or its addressee; settling a `credential` need exits 2 naming it,
+  a stored settle of it reads `counted` false and a withdrawal exits 0 (R78).
+- [ ] Fifteen open questions to `person:owner` and five to `person:someone-else` refuse the next
+  `escalate` to either handle naming the limit of twenty and writing nothing, while one to a
+  session or anchor and another session's twenty are recorded; a person's answer, a withdrawal or
+  a settle frees one place and an entry that doesn't count frees none; a question passed up to a
+  person counts toward its raiser and one passed from a person to a session doesn't; a successor
+  is refused while its predecessor holds twenty, a new session under a removed one's name starts
+  at zero, and a reversed `escalate` doesn't count (R79).
+- [ ] With the raiser's run at twenty, a pass-up of one of its questions to a person exits 2 on
+  `to` naming the limit, from the addressee and from the raiser, writing nothing; a pass-up to a
+  session is recorded; a question already waiting on a person passes to another person; and six
+  `escalate` commands to a person started at once at nineteen record exactly one (R79).
+- [ ] A run whose predecessor holds 10 questions to a person and 5 to a session, and whose
+  successor holds 10 more to a person, refuses a pass-up of each of the 5 to a person from the
+  addressee and from the successor, writing nothing; an addressee with no dispatcher is told the
+  raiser and that it can answer the question itself; and a writer finding the run's lock held is
+  refused within a bounded wait, writing nothing (R79).
 
 ## Out of Scope
 
@@ -1270,12 +1444,10 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
-- **The rest of a question's life.** R49 to R71 are the first parts of questions and answers.
-  Which answers to one question count and the precedence between them, the rule on where a pass-up may go (beyond R57's rule on
-  who may record one), the re-judging of every stored pass-up at read time with the ones that break
-  a rule marked as not counted, settling and withdrawing a question, and how long questions and
-  answers are kept are not covered yet, so R53's rule that any answer closes a question, including
-  one from a session the question has moved away from, is interim.
+- **The rest of a question's life.** R49 to R79 cover raising, passing up, answering, settling
+  and withdrawing a question. How long questions and answers are kept is not covered yet, and
+  neither is a read that selects earlier answers by `label` or one question's whole history as a
+  read of its own.
 
 ## Known Limitations
 
@@ -1326,9 +1498,6 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   stored answer cites it and the position can verify another answer.
 - `koto session import` carries the decisions its source recorded itself, not the ones the source
   carried from an earlier import: a copy of a copy holds only its immediate source's own decisions.
-- R76 ends a provisional judgment's wait on any verified person answer to a question citing it,
-  not only on the answer that governs the question. Once the record marks which answer governs a
-  question, the rule narrows to that answer.
 
 ## Decisions and Trade-offs
 

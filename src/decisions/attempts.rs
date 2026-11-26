@@ -20,9 +20,11 @@
 //! A provisional judgment (`result` `provisional`) awaits a person's
 //! review until one of two things happens: it is reversed, or a question
 //! whose in-effect `escalate` names it in its `basis`, raised in any
-//! session, takes a person's answer that reads `verified` on this host.
-//! Nothing else ends the wait: not a session's answer, not a remote person
-//! answer, not a decision that cites the judgment.
+//! session, is governed by a person's answer that reads `verified` on this
+//! host (the question's answer in effect). Nothing else ends the wait: not
+//! a session's answer, a settle or a withdrawal, an answer that doesn't
+//! count or is outranked, a remote person answer, or a decision that cites
+//! the judgment.
 //!
 //! A stored `state` or `result` that the write would have refused (a body
 //! edited by hand) makes the decision unreadable to these reads.
@@ -223,27 +225,29 @@ impl<'i> Ties<'i> {
     }
 }
 
-/// The first answer to `question` by a person that reads `verified` on
-/// this host, in the order answers are kept (time, then the answering
-/// session's name, then id).
-fn verified_person_answer<'i>(
+/// The answer that governs `question` (koto's answer in effect), when it
+/// is a person's `answered` answer that reads `verified` on this host.
+/// An earlier verified answer the governing one outranks, a settle, a
+/// withdrawal and an entry that doesn't count never qualify.
+fn governing_person_answer<'i>(
     backend: &Backend,
     index: &'i Index,
+    runs: &questions::Runs<'_>,
     question: &DecisionBody,
 ) -> Option<&'i DecisionBody> {
-    index
-        .answers_of(&question.session.id, &question.id)
-        .into_iter()
-        .filter(|a| a.prompt.is_some())
-        .find(|a| {
-            index
-                .holders(a)
-                .iter()
-                .any(|h| standing::verified_in(backend, h, a))
-        })
+    let a = questions::answer_in_effect(index, runs, question)?;
+    let verified = a.outcome == "answered"
+        && a.prompt.is_some()
+        && index
+            .holders(a)
+            .iter()
+            .any(|h| standing::verified_in(backend, h, a));
+    verified.then_some(a)
 }
 
 fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &DecisionBody) -> Value {
+    // `status` reads reversed only once the reversal wins; the winner is
+    // what `reversed_by` reports.
     if let Some(w) = index.winner_of(&body.session.id, &body.id) {
         if index.status(body) == "reversed" {
             return json!({
@@ -252,6 +256,7 @@ fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &Decisio
             });
         }
     }
+    let runs = questions::Runs::new(backend);
     let live: Vec<&DecisionBody> = ties
         .reviews_of(body)
         .iter()
@@ -259,7 +264,7 @@ fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &Decisio
         .filter(|q| index.status(q) == "in-effect")
         .collect();
     for q in &live {
-        if let Some(a) = verified_person_answer(backend, index, q) {
+        if let Some(a) = governing_person_answer(backend, index, &runs, q) {
             return json!({
                 "state": "reviewed",
                 "question": questions::identity(q),
@@ -275,9 +280,16 @@ fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &Decisio
             });
         }
     }
+    // The question named is the earliest citing question still open, else
+    // the earliest in effect: a later person answer can still govern a
+    // question a session's answer closed.
+    let waiting = live
+        .iter()
+        .find(|q| questions::is_open(index, &runs, q))
+        .or(live.first());
     json!({
         "state": "awaiting",
-        "question": live.first().map(|q| questions::identity(q)),
+        "question": waiting.map(|q| questions::identity(q)),
     })
 }
 
