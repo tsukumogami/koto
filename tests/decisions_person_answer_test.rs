@@ -1,5 +1,5 @@
 //! Integration tests for a person's `answer`, checked against the
-//! harness's record of the question-prompt call (PRD R55 to R61).
+//! harness's record of the question-prompt call (PRD R62 to R68).
 //!
 //! Every test runs the real binary with `HOME` and `KOTO_SESSIONS_BASE`
 //! in its own temporary directory, installs a fixture from
@@ -310,6 +310,49 @@ fn a_matching_call_is_accepted_and_the_entry_shows_the_pointer() {
     let entry = &listed["decisions"][0];
     assert_eq!(entry["reading"], "verified");
     assert_eq!(entry["decision"]["prompt"]["mark"]["value"], "verified");
+}
+
+#[test]
+fn a_passed_up_question_takes_a_verified_answer_by_its_identity() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    env.ok(&[
+        "decisions",
+        "readdress",
+        RAISER,
+        &q.id,
+        "--in",
+        RAISER,
+        "--to",
+        "person:dana",
+        "--by",
+        "session",
+    ]);
+    let open = env.ok(&["decisions", "open", "--person", "dana"]).json();
+    assert_eq!(open["questions"].as_array().unwrap().len(), 1, "{open}");
+
+    // The prompt still names the question by the identity it was raised
+    // with: passing it up changes who it waits on, not what it is.
+    fx::install(
+        &env.home(),
+        "proj",
+        HARNESS,
+        &fx::render(&lines, HARNESS, &[&q.header]),
+    );
+    let out = env.answer(
+        &q,
+        Some(HARNESS),
+        "person:dana",
+        Some(&pointer(HARNESS, fx::CALL, 1)),
+        None,
+    );
+    assert_eq!(out.code, 0, "{}", out.all());
+    let d = &out.json()["decision"];
+    assert_eq!(d["prompt"]["mark"]["value"], "verified");
+    assert_eq!(d["subject"]["text"], fx::answer_of(&lines, 1));
+    let open = env.ok(&["decisions", "open", "--person", "dana"]).json();
+    assert!(open["questions"].as_array().unwrap().is_empty(), "{open}");
 }
 
 #[test]

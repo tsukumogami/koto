@@ -924,7 +924,7 @@ withdrawing a question; and retention of questions and answers.
 
 ### A person's answer and the question content area
 
-R55 to R64 let a person answer, on evidence koto checks itself rather than a caller's claim.
+R62 to R71 let a person answer, on evidence koto checks itself rather than a caller's claim.
 
 **The content area.** `koto/packets/` is a fourth write-once area beside the three decision areas.
 It holds one file per question, named by the `escalate`'s id, with the bytes the person is shown:

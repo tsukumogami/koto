@@ -107,7 +107,7 @@ pub struct DecisionBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
     /// The question prompt a person's `answer` was checked against, with
-    /// koto's verified mark (R55 to R61). Only a person's answer has one.
+    /// koto's verified mark (R62 to R68). Only a person's answer has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<super::prompt::Prompt>,
 }

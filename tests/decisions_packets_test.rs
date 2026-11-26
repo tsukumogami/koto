@@ -1,5 +1,5 @@
 //! Integration tests for the question content area, `koto/packets/`
-//! (PRD R62 to R64): a question's content is written once, at most 16 KiB,
+//! (PRD R69 to R71): a question's content is written once, at most 16 KiB,
 //! hashing to the escalate's `packet` subject, and read back byte for byte
 //! by the question's identity.
 

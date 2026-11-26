@@ -1,5 +1,5 @@
 //! A person's verified answer read from a copy of its session that this
-//! host didn't record it in (PRD R61): a copy brought in by `koto session
+//! host didn't record it in (PRD R68): a copy brought in by `koto session
 //! import`, and one brought down by a pull from shared storage. Both read
 //! it as a remote session's answer, though the entry's stored bytes are
 //! the original's; the host that recorded it still reads it verified after

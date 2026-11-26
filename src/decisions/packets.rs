@@ -1,4 +1,4 @@
-//! The question content area, `koto/packets/` (PRD R62 to R64;
+//! The question content area, `koto/packets/` (PRD R69 to R71;
 //! DESIGN-decision-record.md, "A person's answer and the question content
 //! area").
 //!
