@@ -9,8 +9,8 @@ problem: |
   replace a host file (the decider ledger) that exists only because sessions used to vanish.
 decision: |
   Each decision is one create-only key in a koto-reserved area of the session that made it:
-  `koto/decisions/<id>`, or `koto/aimed/<target-session-id>/<id>` when it is a reversal or a
-  replacement aimed at another session's decision. Local writes use an atomic create-rename
+  `koto/decisions/<id>`, or `koto/aimed/<target-session-id>/<id>` when it is a reversal, a
+  replacement or an answer aimed at another session's decision. Local writes use an atomic create-rename
   under the session's manifest lock, which also allocates a dense 12-digit identifier; the bucket
   holds each decision as its own object put with `If-None-Match: *`. A live decider's `koto next`
   lists one near-empty directory per chain session to find what is aimed at it, skips the read
@@ -168,8 +168,9 @@ Two reserved areas in each session, plus one held empty:
 - `koto/decisions/<id>`: every decision not aimed at another session's decision, `refused` records
   included.
 - `koto/aimed/<target-session-id>/<id>`: every decision aimed at another session's decision: each
-  `reverse`, and each replacement whose `basis` names a reversal (R22's clearing path). The target
-  is the original deciding session, addressed by its header `session_id`.
+  `reverse`, each replacement whose `basis` names a reversal (R22's clearing path), and each
+  `answer` to another session's question (R50, R51). The target is the original deciding session,
+  addressed by its header `session_id`.
 - `koto/packs/`: reserved, guarded and empty, so a bulk listing format can be added later without
   moving a key.
 
@@ -410,6 +411,8 @@ output when given none of the new flags. New forms:
 | `koto decisions reverse <session> <id> [--in <session>] [--compensating <url>] [--replacement <outcome>] [decider flags]` | reverse under R17 to R19 and R39 to R43 |
 | `koto decisions report --since <t> --until <t> [--below <session>]` | R29's tables |
 | `koto decisions import <session> <file>` | R28's idempotent import |
+| `koto decisions open --person <handle>` | the questions in this host's store open for a person (R52, R53) |
+| `koto decisions answer <raiser-session> <id> --in <session> --text <text> [decider flags]` | answer a question, recorded in the answering session (R50, R51) |
 
 Shared decider flags: `--by session|person:<handle>|check:<name>`, `--surface`, `--link`,
 `--agent`, `--run-mode`, `--basis` (repeatable), `--evidence` (repeatable), `--reason`. Output is
@@ -764,6 +767,69 @@ winner), plus the existing `session_migrated`.
    walk itself.
 6. **Report.** `report` and `decider report` scan the store, or the hierarchy below a session, read
    decision keys and session events, and print.
+7. **Questions.** `open --person` and the `questions` report on `koto next` scan the local store and
+   compute open from the answers found; `answer` writes one key in the answering session's aimed
+   area (below).
+
+### Questions and answers
+
+This is the first part of questions and answers (R49 to R54). It carries a question from its
+`escalate` to an answer and back to the asker; the rest of a question's life is not built yet.
+
+**The typed recipient.** An `escalate`'s `subject.recipient` stays a string in the body, written
+`session:<name>`, `anchor:<name>` or `person:<handle>`. Recording checks the name with koto's
+session-name rule and the handle with R8's handle rule. Readers parse it into
+`{"typed": true, "kind": "person", "handle": "owner"}`, or `"name"` for a session or an anchor,
+and an entry without one of the prefixes into `{"typed": false, "value": "<as stored>"}`. `show`
+and `list --format v1` add this as a `recipient` field beside the stored `decision`, so the stored
+body and every entry written before the change are unchanged.
+
+**The answer.** `answer` is a kind with the one outcome `answered` and the subject `session` (the
+asking session's name), `id` (the question's identifier) and `text`. Its `target` is the
+question's identity: `{"name", "id": <asking session id>, "decision": <question id>}`. It is written
+to `koto/aimed/<asking session id>/<id>` in the answering session, the area that already holds
+reversals, so nothing is written in the asker's session and the answerer needs no standing over
+it. `koto decisions answer` reads the question through the local store by the asking session's
+name, refuses with `decision_not_found` when it isn't there and with `invalid_decision` (field
+`id`) when it isn't an `escalate`, and refuses an answer `--in` the asking session and one with
+`--by person:<handle>` before any write. An answer read back in `koto/decisions/` is unreadable,
+and a `reverse` aimed at one is refused with the reason `reverses_answer`.
+
+**Open, computed at read time.** The store index groups every `answer` with outcome `answered` by
+its target identity. A question is open when it is an `escalate` in effect and no answer targets
+its identity. `open --person` scans the local store (`Index::scan`, no chain walk) and lists the
+open questions whose recipient is that person, ordered by time, session name and identifier:
+
+```json
+{"v": 1, "person": "owner", "questions": [{"identity": "<session id>/<id>", "session": "A",
+  "id": "000000000001", "question": "q1", "text": "...", "recipient": {...}, "time": "..."}]}
+```
+
+Until a person's answer and precedence exist, any answer closes its question; that rule is interim.
+
+**The `questions` array on `koto next`.** After building its response, `koto next` reads the run
+(the session and the predecessors it confirmed through `--continues --supersede`) through the pure
+read path. When the run holds an `escalate` that has an answer no decision in the run cites in its
+`basis`, the response gains:
+
+```json
+"questions": [{"identity": "<session id>/<id>", "session": "A", "id": "000000000001",
+  "question": "q1", "state": "answered",
+  "answer": {"session": "B", "id": "000000000001", "text": "SQLite", "decider": {...},
+             "run_mode": {...}, "time": "..."}}]
+```
+
+The read writes nothing, takes no lock, reads only the local store, so it makes no network call
+under the cloud backend, and never blocks or changes the exit code. It runs on the natural and the
+directed path and on a terminal workflow. A response with nothing to report has no `questions`
+key and is byte-identical to one from an earlier binary.
+
+**Older binaries.** A binary older than this change doesn't know the `answer` kind, so it reads an
+answer entry as unreadable; it reads a typed recipient as the plain string it is stored as.
+
+**Not yet covered.** A person's answer (koto refuses one until it can verify the person gave it),
+precedence between answers to one question, passing a question up, settling and withdrawing a
+question, and retention of questions and answers.
 
 ## Implementation Approach
 

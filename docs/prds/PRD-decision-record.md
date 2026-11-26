@@ -202,6 +202,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `verdict` | judging evidence, such as a review verdict or a production verdict | `pass`, `fail`, `inconclusive` |
   | `reverse` | overruling an earlier decision | `reversed` |
   | `refused` | a decision attempt koto refused | `refused` |
+  | `answer` | answering a question an `escalate` raised (R50) | `answered` |
 
 - **R2.** Every decision names its subject in a form a reader can resolve after the deciding
   session is gone:
@@ -213,12 +214,13 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `accept` of an intent or staged draft | where it lives (a koto request identifier, a repository path, or a forge issue), plus an optional link to the ticket or alert it came from |
   | `merge` | repository, pull request number, merged head commit |
   | `gate-pass` | workflow (koto session name), state, gate |
-  | `escalate` | a question identifier and text, and the recipient (a session or a person) |
+  | `escalate` | a question identifier and text, and the recipient: `session:<name>`, `anchor:<name>`, `person:<handle>`, or, on an entry written before R49, an untyped value |
   | `decline-escalation` | a question identifier and text |
   | `judgment` | what was judged, as free text plus an optional pointer |
   | `verdict` | what was judged, at least one evidence pointer, and, for a change or a release, the repository and commit judged |
   | `reverse` | the session name and identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason |
+  | `answer` | the asking session's name, the question's identifier in that session, and the answer text |
 
   A command given a kind, outcome or subject these tables don't allow fails with an error naming
   the field and records nothing.
@@ -573,6 +575,44 @@ to an id-shaped value, and both say so.
   `CLAUDE_CODE_SESSION_ID`. The narrowing is deliberate: a value that isn't id-shaped can never
   equal a tick's driver, so a decider established by it couldn't be checked by any gate.
 
+**Questions and answers**
+
+- **R49.** The recipient of an `escalate` is typed: `session:<name>` or `anchor:<name>`, with a
+  name koto accepts for a session, or `person:<handle>`, with a handle R8 accepts. A recipient with
+  one of these prefixes and a name or handle koto doesn't accept fails with an error naming
+  `subject.recipient` and records nothing. `koto decisions show` and `list --format v1` return the
+  recipient beside the stored subject as separate values (`kind` and `handle`, or `kind` and
+  `name`), so a caller selects a person's questions by comparing fields. A recipient with none of
+  the prefixes, such as one written before this requirement, still reads, with the value it was
+  stored with and marked untyped, and is never a person's question.
+- **R50.** An `answer` answers one `escalate`. Its target is the question's identity, the asking
+  session's id with the question's identifier, never the session's name alone, so a later session
+  that reuses the name is not answered by it. koto refuses an answer whose question doesn't exist
+  or isn't an `escalate`, an answer given in the asking session itself, and an answer whose
+  decider is a person, which koto can't yet verify; each refusal exits 2 and writes nothing. An
+  answer is never reversed: a `reverse` aimed at one is refused and recorded as `refused` (R18).
+  `koto decisions record` doesn't take the `answer` kind; `koto decisions answer` records it.
+- **R51.** An answer is recorded in the session it is given in, beside the reversals that session
+  aims at other sessions, and never in the asker's session: answering writes no file in the asking
+  session.
+- **R52.** `koto decisions open --person <handle>` lists every question in this host's store whose
+  recipient is that person and that is open. It takes no session argument and makes no chain test:
+  a question is listed whether or not its session has a parent, an anchor or any link. Each entry
+  carries the question's identity, the asking session's name, the question identifier and text,
+  the typed recipient and the time it was raised.
+- **R53.** Open is computed when a read runs: a question in effect is open while no `answer` with
+  outcome `answered` targets its identity. No file records a question as closed other than the
+  answer itself. Until person answers and precedence between answers exist, any such answer closes
+  the question.
+- **R54.** While a session's run holds a question that has an answer and no decision in the run
+  cites that answer in its `basis`, every `koto next` on any member of the run carries a
+  `questions` array reporting it: the question's identity, its session and identifier, the state
+  `answered`, and the answer with its session, identifier, text, decider, run mode and time. The
+  report repeats on every call, including once the workflow is terminal, and stops once a decision
+  in the run cites the answer. Reading it writes nothing, takes no lock, makes no network
+  connection and never blocks or changes the exit code; a session with nothing to report carries
+  no `questions` key, so its response is byte-identical to one from a binary that predates it.
+
 ### Non-functional
 
 - **R32.** Decisions are immutable once written. Two sessions each recording 100 decisions at once
@@ -887,6 +927,29 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
 - [ ] A benchmark job on the CI runner measures R36's three timings over the stated fixtures and
   fails when a median exceeds its limit.
 
+**Questions and answers**
+
+- [ ] An `escalate` recorded with `recipient=person:owner` shows its recipient as kind `person`
+  and handle `owner`; `session:` and `anchor:` recipients show their own kind and name; one stored
+  as `recipient=coord` shows as untyped with value `coord` and is open for no person (R49).
+- [ ] `koto decisions open --person owner` returns a question raised in a session with no parent,
+  anchor or link, with its identity, session, identifier, text and recipient, and
+  `--person someone-else` returns nothing (R52).
+- [ ] `koto decisions answer A <id> --in B --text ... --by session` writes exactly one file under
+  B's `ctx/koto/aimed/<A's session id>/` and leaves every file in A byte-identical; afterwards the
+  question is no longer open (R50, R51, R53).
+- [ ] An answer aimed at a missing decision, at a decision that isn't an `escalate`, from the
+  asking session, or with `--by person:<handle>` exits 2 and writes nothing in either session
+  (R50).
+- [ ] With q1 and q2 raised to `person:owner` and q3 to `person:someone-else`, answering q1 alone
+  leaves q2 and q3 open and reports only q1 on the asker's `koto next` (R53, R54).
+- [ ] After the asking session is removed and a session of the same name is created, the earlier
+  answer closes none of the new session's questions and isn't reported to it (R50).
+- [ ] The asker's `koto next` reports the answer on every call, on a terminal workflow too, and on
+  its successor's first `koto next` after `--continues A --supersede`; a call that only reports
+  leaves both sessions byte-identical; once a decision in the run cites the answer, the response
+  has no `questions` key (R54).
+
 ## Out of Scope
 
 - **On whose behalf a decision was made.** Naming the person a session acted for is a later
@@ -926,6 +989,11 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
+- **The rest of a question's life.** R49 to R54 are the first part of questions and answers. A
+  person's answer, which needs koto to verify the person gave it, precedence between answers to
+  one question, passing a question up to the next recipient, settling and withdrawing a question,
+  and how long questions and answers are kept are not covered yet, so R53's rule that any answer
+  closes a question is interim.
 
 ## Known Limitations
 
