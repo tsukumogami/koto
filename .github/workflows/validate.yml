@@ -881,7 +881,10 @@ jobs:
           echo "SESSION_LIST_BIN=$GITHUB_WORKSPACE/target/release/koto-session-list" >> "$GITHUB_ENV"
 
       # The same pattern run on koto must match, so a renamed crate or a
-      # changed cargo tree format can't turn the check into a pass.
+      # changed cargo tree format can't turn the check into a pass. Each
+      # command's output is captured before it is searched, so a failing
+      # cargo tree or nm fails the step under `set -e` rather than handing
+      # grep an empty input that reads as a pass.
       - name: Check the build graph has no storage, TLS, HTTP or terminal crate
         run: |
           set -euo pipefail
@@ -991,6 +994,8 @@ jobs:
     steps:
       # The two suite jobs, tests and stability-tests, must be exactly
       # `success`: a cancelled or skipped suite run would otherwise pass.
+      # session-list is held to the same rule, since its parity and
+      # hundred-read tests run nowhere else.
       - name: Check results
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \

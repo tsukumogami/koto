@@ -36,7 +36,7 @@
 //!
 //! The column rules below copy the ones koto's dashboard applies in its own
 //! `src/cli/dashboard.rs`, where they are private. koto's
-//! `tests/session_list_test.rs` runs both programs on the same store and
+//! `tests/koto_session_list_test.rs` runs both programs on the same store and
 //! fails when their rows differ.
 //!
 //! Exit status: 0 on success, 1 when the store can't be found or read, and 2
@@ -274,6 +274,9 @@ fn list(
                     notes.push(format!("note: {id}: {reason}"));
                     String::new()
                 }
+                // The key itself can't name a context value (it fails the
+                // key grammar or names one of koto's own files), so it is
+                // the caller's error, exit 2, not the store's.
                 ContextRead::Unusable(reason) => return Err(reason),
             },
             Err(e) => {
