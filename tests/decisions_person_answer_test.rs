@@ -154,9 +154,16 @@ impl Env {
         self.ok(&["init", name, "--template", template.to_str().unwrap()]);
     }
 
-    /// Raise a question to `session:answerer` in the raiser with `content`
+    /// Raise a question to `person:owner` in the raiser with `content`
     /// stored for it.
     fn raise(&self, content: &[u8]) -> Q {
+        self.raise_to(content, "person:owner")
+    }
+
+    /// Raise a question to `recipient` in the raiser with `content` stored
+    /// for it.
+    fn raise_to(&self, content: &[u8], recipient: &str) -> Q {
+        let recipient = format!("recipient={recipient}");
         let packet = format!("packet={}", fx::packet(content));
         let out = self
             .ok(&[
@@ -172,7 +179,7 @@ impl Env {
                 "--subject",
                 "text=which way?",
                 "--subject",
-                "recipient=session:answerer",
+                &recipient,
                 "--subject",
                 &packet,
                 "--by",
@@ -201,8 +208,13 @@ impl Env {
 
     /// Raise a question whose content is what `lines` shows at `position`.
     fn raise_shown(&self, lines: &[Value], position: usize) -> Q {
+        self.raise_shown_to(lines, position, "person:owner")
+    }
+
+    /// [`raise_shown`](Self::raise_shown) to `recipient`.
+    fn raise_shown_to(&self, lines: &[Value], position: usize, recipient: &str) -> Q {
         let (question, labels) = fx::shown(lines, position);
-        self.raise(&fx::content(&question, &labels))
+        self.raise_to(&fx::content(&question, &labels), recipient)
     }
 
     fn answer(
@@ -909,7 +921,7 @@ fn an_unrecognized_record_shape_is_refused() {
 fn a_person_answer_with_no_evidence_is_refused() {
     let env = Env::new();
     let lines = fx::lines("accepted");
-    let q = env.raise_shown(&lines, 1);
+    let q = env.raise_shown_to(&lines, 1, "session:answerer");
     let out = env.answer(
         &q,
         Some(fx::harness().as_str()),
@@ -938,7 +950,7 @@ fn a_person_answer_with_no_evidence_is_refused() {
 fn no_caller_input_produces_the_mark() {
     let env = Env::new();
     let lines = fx::lines("accepted");
-    let q = env.raise_shown(&lines, 1);
+    let q = env.raise_shown_to(&lines, 1, "session:answerer");
     fx::install(
         &fx::harness(),
         &fx::render(&lines, &fx::harness(), &[&q.header]),
@@ -1245,8 +1257,13 @@ fn answers_from_two_sessions_racing_on_one_call_position_leave_one_entry() {
 /// Record a verified answer to a fresh question; return the question and
 /// the answer's id.
 fn verified_answer(env: &Env) -> (Q, String) {
+    verified_answer_to(env, "person:owner")
+}
+
+/// [`verified_answer`] on a question raised to `recipient`.
+fn verified_answer_to(env: &Env, recipient: &str) -> (Q, String) {
     let lines = fx::lines("accepted");
-    let q = env.raise_shown(&lines, 1);
+    let q = env.raise_shown_to(&lines, 1, recipient);
     let out = answer_with(env, &q, &lines);
     assert_eq!(out.code, 0, "{}", out.all());
     let id = out.json()["id"].as_str().unwrap().to_string();
@@ -1279,7 +1296,7 @@ fn next_reading(env: &Env, extra: &[(&str, &Path)], q: &Q) -> Value {
 #[test]
 fn the_questions_on_next_carry_the_answers_reading() {
     let env = Env::new();
-    let (q, _) = verified_answer(&env);
+    let (q, _) = verified_answer_to(&env, "session:answerer");
     assert_eq!(next_reading(&env, &[], &q), "verified");
     // Without this host's note the same answer reads remote.
     std::fs::remove_file(
@@ -1295,7 +1312,7 @@ fn the_questions_on_next_carry_the_answers_reading() {
 #[test]
 fn a_copied_session_directory_or_a_hand_written_note_reads_remote() {
     let env = Env::new();
-    let (q, id) = verified_answer(&env);
+    let (q, id) = verified_answer_to(&env, "session:answerer");
     let sessions = env.root.join("sessions");
 
     // The sessions directory copied to another koto root, note and all.

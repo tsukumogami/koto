@@ -800,16 +800,22 @@ to an id-shaped value, and both say so.
   with no `need`, including one stored before this requirement. A need is listed, passed up and
   answered like any question, and its raiser can withdraw it but can't settle a `credential` or
   `reserved-step` need. No read selects by `label`.
-- **R79.** A session's run holds at most twenty open questions waiting on a person: an `escalate`
-  with a `person:` recipient is refused on `subject.recipient`, with a message naming the limit
-  of twenty, while the questions raised in the session or in the sessions it continues through a
-  confirmed succession, matched by session id, that are open and whose current addressee is a
-  person number twenty, whatever the handles. The count follows the current addressee, so a
-  question passed up to a person counts toward its raiser and one passed from a person to a
-  session no longer counts; a closed or reversed question doesn't count; and an entry that doesn't
-  count frees no place. A pass-up to a person is never refused by the limit. The count reads this
-  host's store, and the check and the write are not one atomic step, so two `escalate` commands
-  run at once at nineteen can both be recorded.
+- **R79.** No write adds a twenty-first open question waiting on a person to a session's run.
+  The run's count is of the questions raised in the session or in the sessions it continues
+  through a confirmed succession, matched by session id, that are open and whose current addressee
+  is a person, whatever the handles. While it reads twenty, an `escalate` with a `person:`
+  recipient is refused on `subject.recipient`, and a pass-up of one of the run's questions to a
+  person is refused on `to`, whoever records it; both messages name the limit of twenty and
+  nothing is written. A pass-up of a question that already waits on a person to another person is
+  not refused, since it adds nothing to the count, and an `escalate` or pass-up to a session or
+  anchor never is. The count follows the current addressee, so a question passed from a person to
+  a session no longer counts; a closed or reversed question doesn't count; and an entry that
+  doesn't count frees no place. On one host, the writers that can add to the count hold a lock on
+  the run from the count to the write, so writes run at once can't pass twenty. What the limit
+  doesn't cover: the count reads this host's store, so writers on two hosts are not serialized and
+  can together pass twenty; and a read never refuses, so questions can reopen past twenty without
+  any write by the run, as when twenty settles resting on one person's answer stop counting
+  because that person answers the earlier question again.
 
 ### Non-functional
 
@@ -1290,6 +1296,10 @@ With `worker` dispatched by `manager`, `manager` by `director`, and an unrelated
   person counts toward its raiser and one passed from a person to a session doesn't; a successor
   is refused while its predecessor holds twenty, a new session under a removed one's name starts
   at zero, and a reversed `escalate` doesn't count (R79).
+- [ ] With the raiser's run at twenty, a pass-up of one of its questions to a person exits 2 on
+  `to` naming the limit, from the addressee and from the raiser, writing nothing; a pass-up to a
+  session is recorded; a question already waiting on a person passes to another person; and six
+  `escalate` commands to a person started at once at nineteen record exactly one (R79).
 
 ## Out of Scope
 

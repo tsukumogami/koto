@@ -77,6 +77,9 @@ pub mod reasons {
     /// An entry whose question isn't in the local store, or isn't a
     /// question.
     pub const NO_QUESTION: &str = "no_question";
+    /// An entry written in a fenced session after its fence: it reads
+    /// `refused` and counts toward nothing.
+    pub const AFTER_FENCE: &str = "after_fence";
     /// A pass-up to a session or anchor other than the dispatcher it
     /// recorded.
     pub const DESTINATION: &str = "destination";
@@ -404,8 +407,11 @@ pub fn question_of<'i>(index: &'i Index, target: &Target) -> Option<&'i Decision
 /// A question that waits on `person:<h>` now is settled only from a basis
 /// naming a verified answer of `<h>`'s that is in effect on another
 /// question carrying the same `label`. One that waits on a session or
-/// anchor is settled from a basis naming a decision that reads back, or an
-/// `event` evidence pointer. A cited decision recorded after `at` (the
+/// anchor is settled from a basis naming a decision that reads back and
+/// is neither the question itself nor an entry aimed at it, or an `event`
+/// evidence pointer. A cited person answer stands only while the question
+/// it answers reads in effect, so reversing that question withdraws the
+/// basis. A cited decision recorded after `at` (the
 /// settle's time) is never taken for the one cited, so a later session
 /// reusing a removed session's name, and an id, stands in for nothing.
 pub fn settle_basis(
@@ -425,12 +431,39 @@ pub fn settle_basis(
         let event = evidence
             .iter()
             .any(|e| e.get("kind").and_then(Value::as_str) == Some("event"));
-        if event || basis.iter().any(|c| cited(c).is_some()) {
+        if event {
             return Ok(());
         }
+        // The question itself, and an entry aimed at it (an answer, a
+        // settle, a withdrawal, a pass-up or a reversal of it), are about
+        // the question, not evidence for its answer.
+        let about_question = |b: &DecisionBody| {
+            same(b, question)
+                || b.target
+                    .as_ref()
+                    .is_some_and(|t| t.id == question.session.id && t.decision == question.id)
+        };
+        let mut why = Vec::new();
+        for c in basis {
+            let named = format!("{}:{}", c.session, c.id);
+            match cited(c) {
+                None => why.push(format!("{named} doesn't read back")),
+                Some(b) if same(b, question) => why.push(format!("{named} is the question itself")),
+                Some(b) if about_question(b) => {
+                    why.push(format!("{named} is an entry aimed at the question"))
+                }
+                Some(_) => return Ok(()),
+            }
+        }
+        let tail = if why.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", why.join("; "))
+        };
         return Err(format!(
             "a settle of a question waiting on {} needs a --basis naming a decision that reads \
-             back, or an --evidence event:<session>:<seq> pointer",
+             back and isn't the question or an entry aimed at it, or an --evidence \
+             event:<session>:<seq> pointer{tail}",
             label(current)
         ));
     };
@@ -484,7 +517,18 @@ pub fn settle_basis(
             ));
             continue;
         }
-        match question_of(index, t).and_then(label_of) {
+        let Some(answered) = question_of(index, t) else {
+            why.push(format!("{named} answers a question this host doesn't hold"));
+            continue;
+        };
+        let status = index.status(answered);
+        if status != "in-effect" {
+            why.push(format!(
+                "{named} answers a question that reads '{status}', not in effect"
+            ));
+            continue;
+        }
+        match label_of(answered) {
             Some(l) if l == own_label => return Ok(()),
             Some(l) => why.push(format!(
                 "{named} answers a question labelled '{l}', not '{own_label}'"
@@ -639,7 +683,16 @@ pub fn resolve<'i>(index: &'i Index, runs: &Runs, question: &DecisionBody) -> Re
     }
 }
 
-/// The closing entry in effect on `question`, or `None` while it is open.
+/// The closing entry in effect on `question` (an `answered`, `settled` or
+/// `withdrawn` answer that counts and wins under [`resolve`]), or `None`
+/// while nothing closes it.
+///
+/// This is the public entry point for "what closes this question". Every
+/// caller outside this module that needs it calls this, never its own
+/// reading of the aimed entries: retention and cleanup call it, as the open
+/// reads and the `koto next` report do. [`Index::answers_of`] returns every
+/// entry aimed at a question, whatever its outcome and whether it counts,
+/// so taking the first of them as closing is wrong.
 pub fn answer_in_effect<'i>(
     index: &'i Index,
     runs: &Runs,
@@ -648,8 +701,15 @@ pub fn answer_in_effect<'i>(
     resolve(index, runs, question).in_effect
 }
 
-/// koto's one test of open: a question in effect that no counted entry
-/// closes.
+/// koto's one test of open: `body` is a question (an `escalate` with a
+/// typed recipient), it reads in effect, and [`answer_in_effect`] finds
+/// nothing closing it.
+///
+/// This is the public entry point for "is this question open". The open
+/// reads and the limit of twenty go through it, and retention and cleanup
+/// call it rather than a test of their own, so the rule has one place to
+/// change. The `koto next` report, which needs the closing entry itself,
+/// calls [`answer_in_effect`].
 pub fn is_open(index: &Index, runs: &Runs, body: &DecisionBody) -> bool {
     is_question(body)
         && index.status(body) == "in-effect"
@@ -670,6 +730,13 @@ pub struct EntryJudgment {
 /// the local store holds it now.
 pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> EntryJudgment {
     let answer = body.kind == "answer";
+    if index.after_fence(body) {
+        return EntryJudgment {
+            counted: false,
+            reason: Some(reasons::AFTER_FENCE),
+            governs: answer.then_some(false),
+        };
+    }
     let lost = EntryJudgment {
         counted: false,
         reason: Some(reasons::NO_QUESTION),
@@ -722,33 +789,101 @@ fn decisions(index: &Index) -> impl Iterator<Item = &DecisionBody> {
 
 /// The open questions in the local store, each with its addressee
 /// history, sorted by time, then the raising session's name, then id.
+/// Open is [`is_open`]'s test.
 fn open_questions<'i>(index: &'i Index, runs: &Runs) -> Vec<(&'i DecisionBody, Vec<Recipient>)> {
     let mut seen = BTreeSet::new();
     let mut found: Vec<(&DecisionBody, Vec<Recipient>)> = decisions(index)
-        .filter(|b| is_question(b) && index.status(b) == "in-effect")
         .filter(|b| seen.insert((b.session.id.clone(), b.id.clone())))
-        .filter_map(|b| {
-            let r = resolve(index, runs, b);
-            r.in_effect.is_none().then_some((b, r.history))
-        })
+        .filter(|b| is_open(index, runs, b))
+        .map(|b| (b, addressees(index, runs, b)))
         .collect();
     found.sort_by(|(a, _), (b, _)| order_key(a).cmp(&order_key(b)));
     found
 }
 
-/// How many open questions raised by the sessions whose ids are in
-/// `raisers` wait on a person now, across every handle.
-pub fn open_to_person(index: &Index, runs: &Runs, raisers: &BTreeSet<String>) -> usize {
+/// How many open questions ([`is_open`]) raised by the sessions whose ids
+/// are in `raisers` wait on a person now, across every handle, leaving out
+/// the question `except` names by `(raiser's session id, id)`.
+pub fn open_to_person(
+    index: &Index,
+    runs: &Runs,
+    raisers: &BTreeSet<String>,
+    except: Option<(&str, &str)>,
+) -> usize {
     let mut seen = BTreeSet::new();
     decisions(index)
-        .filter(|b| raisers.contains(&b.session.id) && is_question(b))
+        .filter(|b| raisers.contains(&b.session.id))
+        .filter(|b| except != Some((b.session.id.as_str(), b.id.as_str())))
         .filter(|b| seen.insert((b.session.id.clone(), b.id.clone())))
-        .filter(|b| index.status(b) == "in-effect")
+        .filter(|b| is_open(index, runs, b))
         .filter(|b| {
-            let r = resolve(index, runs, b);
-            r.in_effect.is_none() && matches!(r.current(), Some(Recipient::Person(_)))
+            matches!(
+                addressees(index, runs, b).last(),
+                Some(Recipient::Person(_))
+            )
         })
         .count()
+}
+
+/// The session ids of the run `raiser` (whose header id is `raiser_id`)
+/// belongs to: its own and those of the sessions it continues that this
+/// host holds. The limit of twenty counts the open questions these
+/// sessions raised.
+pub fn run_ids(backend: &Backend, raiser: &str, raiser_id: &str) -> Vec<String> {
+    let mut ids = vec![raiser_id.to_string()];
+    for p in chain::run_predecessors(backend, raiser) {
+        if let Some(id) = read::local_session_id(backend, &p) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The directory under the koto root that holds the limit's locks, one per
+/// run.
+pub const PERSON_LIMIT_LOCKS_DIR: &str = "person-limit";
+
+/// The limit's lock on one run, held until dropped.
+pub struct LimitLock {
+    _file: std::fs::File,
+}
+
+/// Take the limit's lock for the run whose session ids are `ids` (as
+/// [`run_ids`] lists them, the raiser's first), waiting as long as it
+/// takes. A writer that would add a question waiting on a person holds it
+/// from the count to the write, so two writers on this host can't both
+/// count nineteen and both write. The lock is keyed by the run's earliest
+/// session this host holds, so a successor and the session it continues
+/// share it. It is a file under the koto root, outside every session's
+/// synced files, and serializes writers on this host only.
+pub fn lock_person_limit(home: &std::path::Path, ids: &[String]) -> std::io::Result<LimitLock> {
+    use sha2::{Digest, Sha256};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = home.join(PERSON_LIMIT_LOCKS_DIR);
+    crate::koto_home::ensure_private_root(&dir)?;
+    let root = ids.last().map(String::as_str).unwrap_or_default();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(hex::encode(Sha256::digest(root.as_bytes()))))?;
+    loop {
+        // SAFETY: flock on a descriptor borrowed from `file`, which
+        // outlives the call; the lock is released when `file` closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(LimitLock { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 /// One element of an open read: the question, what it asks for, the

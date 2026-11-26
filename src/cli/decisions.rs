@@ -202,51 +202,64 @@ fn split_pairs(command: &str, field: &str, pairs: &[String]) -> Vec<(String, Str
         .collect()
 }
 
-/// Refuse an `escalate` to a person from `name` (whose session id is
-/// `session_id`) while the session, with the sessions it continues, holds
-/// the limit of open questions waiting on a person. The count is by the
-/// raising session's id, so a new session reusing a removed session's
-/// name starts at zero, and it follows the addressee each question has
-/// now. Nothing is written.
+/// The limit of twenty, checked by a writer that would leave one more
+/// question waiting on a person: an `escalate` to a person, or a pass-up to
+/// a person. `raiser` (whose session id is `raiser_id`) is the question's
+/// raiser, whoever records the entry. The count is of the open questions
+/// raised in the raiser's run (its own session and the sessions it
+/// continues, by session id, so a new session reusing a removed session's
+/// name starts at zero) that wait on a person now, across every handle,
+/// leaving out the question being passed up, which is already counted
+/// when it waits on a person. At twenty the command exits 2 on `field`,
+/// naming the limit, and nothing is written.
+///
+/// The returned lock is the run's limit lock, taken before the count; the
+/// caller holds it until its write returns, so writers on this host are
+/// serialized and two of them can't both count nineteen. A lock that can't
+/// be taken refuses the command rather than writing unserialized.
 fn check_person_limit(
     backend: &Backend,
-    name: &str,
-    session_id: &str,
-    subject: &std::collections::BTreeMap<String, serde_json::Value>,
-) {
-    use crate::decisions::body::Recipient;
+    command: &str,
+    field: &str,
+    raiser: &str,
+    raiser_id: &str,
+    except: Option<(&str, &str)>,
+) -> crate::decisions::questions::LimitLock {
     use crate::decisions::questions;
-    let to_person = subject
-        .get("recipient")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|r| matches!(Recipient::parse(r), Recipient::Person(_)));
-    if !to_person {
-        return;
-    }
-    let mut raisers = std::collections::BTreeSet::new();
-    raisers.insert(session_id.to_string());
-    for p in chain::run_predecessors(backend, name) {
-        if let Some(id) = crate::decisions::read::local_session_id(backend, &p) {
-            raisers.insert(id);
-        }
-    }
+    let ids = questions::run_ids(backend, raiser, raiser_id);
+    let lock = crate::koto_home::koto_home()
+        .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+        .and_then(|home| questions::lock_person_limit(&home, &ids))
+        .unwrap_or_else(|e| {
+            refuse(
+                command,
+                &DecisionError::invalid(
+                    field,
+                    format!(
+                        "koto couldn't take the lock that keeps '{raiser}' within the limit of                          twenty open questions waiting on a person, so it can't count them                          safely: {e}"
+                    ),
+                ),
+            )
+        });
+    let raisers: std::collections::BTreeSet<String> = ids.into_iter().collect();
     let index = Index::scan(backend, false);
     let runs = questions::Runs::new(backend);
-    let open = questions::open_to_person(&index, &runs, &raisers);
+    let open = questions::open_to_person(&index, &runs, &raisers, except);
     if open >= questions::PERSON_LIMIT {
         refuse(
-            "decisions record",
+            command,
             &DecisionError::invalid(
-                "subject.recipient",
+                field,
                 format!(
-                    "'{name}' holds {open} open questions waiting on a person, and the limit of \
-                     twenty ({}) is reached: one has to be answered, settled or withdrawn \
-                     before another is raised to a person",
+                    "'{raiser}' holds {open} open questions waiting on a person, and the limit \
+                     of twenty ({}) is reached: one has to be answered, settled or withdrawn \
+                     before another waits on a person",
                     questions::PERSON_LIMIT
                 ),
             ),
         );
     }
+    lock
 }
 
 /// `koto decisions record <session> --kind <k> --outcome <o> ...`.
@@ -352,9 +365,27 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
     let state = crate::engine::persistence::derive_state_from_log(&events).unwrap_or_default();
     let log_seq = events.last().map(|e| e.seq).unwrap_or(0);
 
-    if req.kind == "escalate" {
-        check_person_limit(backend, name, &header.session_id, &subject);
-    }
+    let to_person = req.kind == "escalate"
+        && subject
+            .get("recipient")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|r| {
+                matches!(
+                    crate::decisions::body::Recipient::parse(r),
+                    crate::decisions::body::Recipient::Person(_)
+                )
+            });
+    // Held until the write returns.
+    let _limit = to_person.then(|| {
+        check_person_limit(
+            backend,
+            COMMAND,
+            "subject.recipient",
+            name,
+            &header.session_id,
+            None,
+        )
+    });
 
     // A reversal entered through this session may have lost since (R19).
     standing::settle(backend, name);
@@ -1879,6 +1910,20 @@ pub fn handle_readdress(
             serde_json::Value::String(d.clone()),
         );
     }
+
+    // A pass-up to a person is held to the raiser's limit of twenty,
+    // whoever records it; one to a session or anchor never is. The lock is
+    // held until the write returns.
+    let _limit = matches!(to, Recipient::Person(_)).then(|| {
+        check_person_limit(
+            backend,
+            COMMAND,
+            "to",
+            name,
+            &question.session.id,
+            Some((question.session.id.as_str(), id)),
+        )
+    });
 
     standing::settle(backend, &recorder);
     let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));

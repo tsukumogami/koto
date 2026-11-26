@@ -833,7 +833,14 @@ answer is told again once a person's answer outranks it. A question whose entry 
 run's own `settled` or `withdrawn` entry is not reported. Because a person's answer can arrive in
 any session at any time, citing an answer no longer ends the scan: the store is scanned on every
 tick while the run holds a typed question, once per tick. A run with only untyped
-escalations, or with none, reads its own decisions and stops.
+escalations, or with none, reads its own decisions and stops. That scan is the cost of telling a
+raiser when a person overrules an answer it already cited. It reads every local session's decision
+areas, so it grows with the number of sessions in the store, and it is paid on each tick of a run
+holding a typed question even after every one is answered and cited. On a store of about a
+thousand sessions, such a tick takes several times as long as one for a run with no question, an
+extra cost of the order of a tenth of a second on a release build, and the extra grows linearly
+with the store. No cheaper test tells, without the scan, that no person's answer has arrived, so
+the scan isn't narrowed further.
 
 The read writes nothing, takes no lock, reads only the local store, so it makes no network call
 under the cloud backend, and never blocks or changes the exit code. It runs on the natural and the
@@ -930,7 +937,12 @@ recorded value: the subject's `dispatcher`, or for an entry written before the f
 `dispatcher` its authority recorded (an authority reading `none` counts as no dispatcher). A later
 change to the recorder's links therefore moves no question. A session with no dispatcher passes
 only to a person. A refused destination exits 2 on field `to`, naming the dispatcher the rule would
-accept or saying there is none.
+accept or saying there is none. `anchor:<dispatcher>` is accepted as well as
+`session:<dispatcher>`: an addressee is matched by name whether it was typed as a session or an
+anchor, so both name the same position. At read time the rule checks only that a stored pass-up
+names the dispatcher it recorded. The recorded name isn't cross-checked against the recorder's
+links in the store, so an entry edited on disk to name another dispatcher and recipient reads
+counted; writing files in the store directly is outside what the rule protects against.
 
 **The read-time resolution.** Every read that asks whether a question is open, who it waits on or
 what answers it (`open --person`, `open --at`, `show`, `list --format v1`, the `questions` on
@@ -947,8 +959,10 @@ what answers it (`open --person`, `open --at`, `show`, `list --format v1`, the `
    reason. A `settled` entry needs the same recorder and decider, a question that isn't a
    `credential` or `reserved-step` need, and evidence: for a question waiting on a person, a basis
    naming that person's verified answer, in effect on its own question, with the same `label`, and
-   recorded no later than the settle; for one waiting on a session or anchor, a basis that reads
-   back or an `event` evidence pointer.
+   recorded no later than the settle, whose own question still reads in effect; for one waiting
+   on a session or anchor, a basis that reads back and is neither the question itself nor an entry
+   aimed at it, or an `event` evidence pointer, which is checked for its form only. A decision
+   the settling run recorded only to serve as evidence isn't told apart from any other.
 3. *The entry in effect.* Among the verified person answers that count, the one no other cites in
    its basis, then the latest by (time, session name, identifier); with none, the earliest
    counted entry by the same order.
@@ -966,10 +980,14 @@ whether step 1 applied it. The stored status is never changed. The reason values
 | `person_decider` | a settle or withdrawal by a person decider |
 | `no_reason` | a withdrawal with no reason |
 | `need_not_settleable` | a settle of a `credential` or `reserved-step` need |
-| `settle_basis` | a settle whose evidence doesn't meet its question's rule, including one whose cited answer no longer governs |
+| `settle_basis` | a settle whose evidence doesn't meet its question's rule, including one whose cited answer no longer governs or answers a question no longer in effect, and one citing the question or an entry aimed at it |
 | `no_question` | an entry whose question isn't in this host's store or isn't an `escalate` |
+| `after_fence` | an entry written in a fenced session after its fence; its status reads `refused` |
 | `destination` | a pass-up to a session or anchor other than the dispatcher it recorded |
 | `skipped` | a pass-up the history leaves out for another reason: recorded by a session that was neither raiser nor addressee at that point, naming the addressee the question already had, or the later of two written against one addressee |
+
+`reason` is a code on every listed entry. An unreadable entry lists `reason: integrity`, with the
+check it failed as free text in `detail`.
 
 A person's answer reads as verified only in a session whose host-local note lists it (R68). The
 same body anywhere else, after an import or a pull, is counted as an answer of the session
@@ -990,11 +1008,17 @@ earlier one.
 and `label` (at most 128 bytes). Both are optional subject fields; an entry without `need` reads
 `decision`. The settle rule compares labels; no read selects by one.
 
-**The limit of twenty.** Before an `escalate` with a `person:` recipient is written, koto counts the
-open questions raised by the recording session's id or the ids of the sessions it continues whose
-current addressee is a person, using the same `resolve`, and refuses on `subject.recipient` at
-twenty. The count reads this host's store, and like the writers' checks it isn't atomic with the
-write.
+**The limit of twenty.** Before an `escalate` with a `person:` recipient, or a pass-up to a
+person, is written, koto counts the open questions (`is_open`) raised by the raiser's session id
+or the ids of the sessions it continues whose current addressee is a person, using the same
+`resolve`, leaving out the question being passed up. At twenty it refuses, on `subject.recipient`
+or `to`. The raiser's run is counted whoever records the pass-up. The count and the write are
+serialized on this host by an exclusive `flock` on a file under the koto root
+(`person-limit/<sha256 of the run's earliest session id>`), taken before the count and held until
+the write returns; a lock that can't be taken refuses the command. Two hosts are not serialized,
+since each counts its own store. A read never refuses, so the count can pass twenty without a
+write by the run: a settle counts only while the person answer it cites governs, so twenty settles
+resting on one answer reopen together when that person answers the earlier question again.
 
 **Not yet covered.** Retention of questions and answers; a read selecting earlier answers by
 `label`; and one question's whole history as a read of its own.

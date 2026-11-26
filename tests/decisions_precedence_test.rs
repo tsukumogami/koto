@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 #[path = "support/prompt_fixture.rs"]
@@ -134,7 +136,8 @@ impl Env {
         self.root.join("sessions")
     }
 
-    fn run_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Out {
+    /// The koto command for `args` in this scratch home, not yet run.
+    fn command(&self, envs: &[(&str, &str)], args: &[&str]) -> std::process::Command {
         let mut cmd = koto_command::koto_std();
         for name in CLEARED_ENV {
             cmd.env_remove(name);
@@ -146,7 +149,12 @@ impl Env {
         cmd.env("HOME", self.root.join("home"));
         cmd.env("KOTO_HOME", self.root.join("home"));
         cmd.env("KOTO_SESSIONS_BASE", self.sessions());
-        let output = cmd.args(args).output().unwrap();
+        cmd.args(args);
+        cmd
+    }
+
+    fn run_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Out {
+        let output = self.command(envs, args).output().unwrap();
         Out {
             code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1563,9 +1571,31 @@ fn the_count_follows_the_addressee_the_raiser_and_its_run() {
         0
     );
     refused_at_limit(&env, "worker", "person:owner");
-    // Pass `up` to a person: never refused by the limit, and `worker` now
-    // holds twenty-one.
-    env.readdress(&up, "manager", "person:owner");
+    // A pass-up of `up` to a person is held to the raiser's limit, whoever
+    // records it: `manager`, the addressee, and `worker`, the raiser, are
+    // refused and nothing is written. A pass-up to a session isn't.
+    for recorder in ["manager", "worker"] {
+        let all0 = env.snapshot_all();
+        let out = env.readdress_run(&up, recorder, "person:owner");
+        assert_eq!(out.code, 2, "{recorder}: {}", out.all());
+        assert_eq!(out.json()["field"], "to", "{}", out.all());
+        assert!(out.error().contains("twenty"), "{}", out.error());
+        assert_eq!(env.snapshot_all(), all0);
+    }
+    env.readdress(&up, "manager", "session:director");
+    // Once one of `worker`'s closes, the pass-up to a person is taken, and
+    // a question already waiting on a person passes to another person at
+    // the limit, since that adds nothing to the count.
+    let first = Q {
+        session: "worker".to_string(),
+        id: env.open("owner")[0]["id"].as_str().unwrap().to_string(),
+        session_id: String::new(),
+        header: String::new(),
+    };
+    assert_eq!(env.withdraw(&first, "worker", "dropped").code, 0);
+    env.readdress(&up, "director", "person:owner");
+    refused_at_limit(&env, "worker", "person:owner");
+    env.readdress(&up, "worker", "person:someone-else");
     raise_many(&env, "manager", 20, "person:owner");
 
     // A successor is refused while `worker` holds twenty.
@@ -1621,4 +1651,189 @@ fn the_count_follows_the_addressee_the_raiser_and_its_run() {
         env.escalate_run("solo", "fresh", "person:owner", &[]).code,
         0
     );
+}
+
+#[test]
+fn escalates_run_at_once_at_nineteen_record_only_one() {
+    let env = Env::new();
+    chain(&env);
+    raise_many(&env, "worker", 19, "person:owner");
+    let children: Vec<std::process::Child> = (0..6)
+        .map(|i| {
+            let q = format!("question=race-{i}");
+            env.command(
+                &[],
+                &[
+                    "decisions",
+                    "record",
+                    "worker",
+                    "--kind",
+                    "escalate",
+                    "--outcome",
+                    "escalated",
+                    "--subject",
+                    &q,
+                    "--subject",
+                    "text=at once?",
+                    "--subject",
+                    "recipient=person:owner",
+                    "--by",
+                    "session",
+                ],
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+        })
+        .collect();
+    let codes: Vec<i32> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap().status.code().unwrap_or(-1))
+        .collect();
+    assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "{codes:?}");
+    assert_eq!(codes.iter().filter(|c| **c == 2).count(), 5, "{codes:?}");
+    assert_eq!(env.open("owner").len(), 20);
+}
+
+// A settle's evidence.
+
+#[test]
+fn a_settle_cites_neither_its_own_question_nor_an_entry_aimed_at_it() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.raise("worker", "q", "session:manager", &[]);
+    let pass = env.readdress(&q, "manager", "session:director");
+    let all0 = env.snapshot_all();
+    for (basis, why) in [
+        (format!("worker:{}", q.id), "the question itself"),
+        (format!("manager:{pass}"), "aimed at the question"),
+    ] {
+        let out = env.settle(&q, "worker", &["--basis", &basis]);
+        assert_eq!(out.code, 2, "{basis}: {}", out.all());
+        assert!(out.error().contains(why), "{}", out.error());
+        assert_eq!(env.snapshot_all(), all0);
+    }
+
+    // Stored anyway, such a settle reads not counted and closes nothing.
+    let other = env.raise("worker", "other", "session:director", &[]);
+    let id = {
+        let out = env.settle(&other, "worker", &["--basis", &format!("manager:{pass}")]);
+        assert_eq!(out.code, 0, "{}", out.all());
+        out.json()["id"].as_str().unwrap().to_string()
+    };
+    let mut body = env.stored("worker", &other, &id);
+    body["id"] = json!("000000000070");
+    body["target"] = json!({"name": "worker", "id": q.session_id, "decision": q.id});
+    body["subject"]["id"] = json!(q.id);
+    body["basis"] = json!([{"session": "worker", "id": q.id}]);
+    env.plant("worker", &q, "000000000070", &body);
+    let e = env.show("worker", "000000000070");
+    assert_eq!(e["counted"], false, "{e}");
+    assert_eq!(e["reason"], "settle_basis");
+    assert!(holds(&env.at("director"), "q"));
+
+    // A decision that is neither is evidence.
+    let out = env.settle(&q, "worker", &["--basis", &format!("worker:{}", other.id)]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(!holds(&env.at("director"), "q"));
+}
+
+#[test]
+fn a_settle_from_an_answer_whose_question_was_reversed_doesnt_stand() {
+    let env = Env::new();
+    chain(&env);
+    let p = env.raise("worker", "p", "person:owner", &["label=cache"]);
+    let owner = env.person(&p, "other-lead");
+    let a = env.raise("worker", "a", "person:owner", &["label=cache"]);
+    let b = env.raise("worker", "b", "person:owner", &["label=cache"]);
+    let basis = format!("other-lead:{owner}");
+    let settled = {
+        let out = env.settle(&a, "worker", &["--basis", &basis]);
+        assert_eq!(out.code, 0, "{}", out.all());
+        out.json()["id"].as_str().unwrap().to_string()
+    };
+    assert_eq!(env.show("worker", &settled)["counted"], true);
+
+    // The precedent's question is reversed: the settle stops counting, `a`
+    // is open again, and a new settle from it is refused.
+    env.ok(&[
+        "decisions",
+        "reverse",
+        "worker",
+        &p.id,
+        "--in",
+        "manager",
+        "--by",
+        "session",
+    ]);
+    let e = env.show("worker", &settled);
+    assert_eq!(e["counted"], false, "{e}");
+    assert_eq!(e["reason"], "settle_basis");
+    assert!(holds(&env.open("owner"), "a"));
+    let all0 = env.snapshot_all();
+    let out = env.settle(&b, "worker", &["--basis", &basis]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.error().contains("not in effect"), "{}", out.error());
+    assert_eq!(env.snapshot_all(), all0);
+}
+
+// The destination rule.
+
+#[test]
+fn a_pass_up_to_the_dispatchers_anchor_is_taken() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.raise("worker", "q", "session:other-lead", &[]);
+    let id = env.readdress(&q, "worker", "anchor:manager");
+    assert_eq!(env.show("worker", &id)["counted"], true);
+    assert!(holds(&env.at("manager"), "q"));
+    // Any other anchor is refused.
+    let out = env.readdress_run(&q, "manager", "anchor:other-lead");
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.error().contains("dispatcher"), "{}", out.error());
+}
+
+// Reason codes.
+
+#[test]
+fn an_answer_written_after_its_sessions_fence_reads_after_fence() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.raise("worker", "q", "session:manager", &[]);
+    let id = env.say_ok(&q, "manager", "yes");
+    env.init(
+        "manager2",
+        &[
+            "--continues",
+            "manager",
+            "--supersede",
+            "--dispatched-by",
+            "director",
+        ],
+    );
+    // A copy written in `manager` after the fence, by a writer that hadn't
+    // seen it: the next id.
+    let mut late = env.stored("manager", &q, &id);
+    let late_id = format!("{:012}", id.parse::<u64>().unwrap() + 1);
+    late["id"] = json!(late_id);
+    env.plant("manager", &q, &late_id, &late);
+    let e = env.listed("manager", &late_id);
+    assert_eq!(e["status"], "refused", "{e}");
+    assert_eq!(e["counted"], false);
+    assert_eq!(e["reason"], "after_fence");
+    assert_eq!(e["governs"], false);
+}
+
+#[test]
+fn an_unreadable_entry_lists_a_reason_code_and_its_detail() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.raise("worker", "q", "session:manager", &[]);
+    let id = env.say_ok(&q, "manager", "yes");
+    std::fs::write(env.aimed("manager", &q, &id), b"{not json").unwrap();
+    let e = env.listed("manager", &id);
+    assert_eq!(e["status"], "unreadable", "{e}");
+    assert_eq!(e["reason"], "integrity");
+    assert!(e["detail"].as_str().is_some_and(|d| !d.is_empty()), "{e}");
 }
