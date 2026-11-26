@@ -65,6 +65,8 @@ pub mod reasons {
     /// The reverser would stand on the chain only through a supersede hop
     /// koto can't confirm (R40).
     pub const SUPERSEDE_UNCONFIRMED: &str = "supersede_unconfirmed";
+    /// The decision is an `answer`, which a reversal doesn't overrule.
+    pub const REVERSES_ANSWER: &str = "reverses_answer";
 }
 
 /// R19's order: time, then the reverser's session name, then id, then the
@@ -122,10 +124,12 @@ fn reference(b: &DecisionBody) -> BasisRef {
 }
 
 /// Every session in the local store's decisions, and the readable
-/// reversals among them keyed by `(target session id, decision id)`.
+/// reversals and answers among them keyed by `(target session id,
+/// decision id)`.
 pub struct Index {
     sessions: BTreeMap<String, Vec<Entry>>,
     reversals: BTreeMap<(String, String), Vec<DecisionBody>>,
+    answers: BTreeMap<(String, String), Vec<DecisionBody>>,
     /// Each fenced session's `decisions_through`, by session name (R37).
     cutoffs: BTreeMap<String, Option<String>>,
 }
@@ -172,23 +176,28 @@ impl Index {
         cutoffs: BTreeMap<String, Option<String>>,
     ) -> Self {
         let mut reversals: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
+        let mut answers: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
         for entries in sessions.values() {
             for entry in entries {
                 let Entry::Decision(b) = entry else { continue };
                 if past_cutoff(&cutoffs, b) {
                     continue;
                 }
-                if let (true, Some(t)) = (b.kind == "reverse", &b.target) {
-                    reversals
-                        .entry((t.id.clone(), t.decision.clone()))
-                        .or_default()
-                        .push((**b).clone());
-                }
+                let Some(t) = &b.target else { continue };
+                let into = match b.kind.as_str() {
+                    "reverse" => &mut reversals,
+                    "answer" if b.outcome == "answered" => &mut answers,
+                    _ => continue,
+                };
+                into.entry((t.id.clone(), t.decision.clone()))
+                    .or_default()
+                    .push((**b).clone());
             }
         }
         Self {
             sessions,
             reversals,
+            answers,
             cutoffs,
         }
     }
@@ -224,6 +233,26 @@ impl Index {
             .get(&(session_id.to_string(), id.to_string()))
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Every `answered` answer aimed at decision `id` of the session whose
+    /// id is `session_id`, wherever it was recorded, earliest first by
+    /// time, then the answering session's name, then id.
+    pub fn answers_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
+        let mut out: Vec<&DecisionBody> = self
+            .answers
+            .get(&(session_id.to_string(), id.to_string()))
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| {
+            (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
+        });
+        out
+    }
+
+    /// Every session the scan read, with its entries.
+    pub fn sessions(&self) -> &BTreeMap<String, Vec<Entry>> {
+        &self.sessions
     }
 
     /// The reversal of `session_id`'s decision `id` that wins R19's race.
@@ -265,6 +294,11 @@ impl Index {
             return out;
         };
         out["status"] = json!(self.status(body));
+        if body.kind == "escalate" {
+            if let Some(r) = body.subject.get("recipient").and_then(Value::as_str) {
+                out["recipient"] = body::Recipient::parse(r).to_json();
+            }
+        }
         if self.after_fence(body) {
             // Written after the fence: it reads refused and nothing more.
             out["after_fence"] = json!(true);

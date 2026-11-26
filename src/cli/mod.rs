@@ -1358,6 +1358,25 @@ pub enum DecisionsSubcommand {
         #[command(flatten)]
         reversal: decisions::ReverseArgs,
     },
+    /// Answer an escalation, by its session name and id, recording the
+    /// answer in the session named by `--in`. Nothing is written in the
+    /// question's session
+    Answer {
+        /// The question's session name
+        name: String,
+        /// The escalation's decision id
+        id: String,
+        #[command(flatten)]
+        answer: decisions::AnswerArgs,
+    },
+    /// List the questions open for a person: in-effect escalations whose
+    /// recipient is `person:<handle>` and that no answer has closed, from
+    /// every session in the local store. Records nothing
+    Open {
+        /// The person's handle
+        #[arg(long, required = true)]
+        person: String,
+    },
 }
 
 /// Read and validate a compiled template JSON file.
@@ -3209,6 +3228,13 @@ pub fn run(app: App) -> Result<()> {
                     refuse_if_superseded(&backend, &reverser, "decisions reverse");
                     decisions::handle_reverse(&backend, &name, &id, reversal)
                 }
+                DecisionsSubcommand::Answer { name, id, answer } => {
+                    let answerer = answer.in_session.clone();
+                    refuse_if_unlocated(&backend, &answerer, "decisions answer");
+                    refuse_if_superseded(&backend, &answerer, "decisions answer");
+                    decisions::handle_answer(&backend, &name, &id, answer)
+                }
+                DecisionsSubcommand::Open { person } => decisions::handle_open(&backend, &person),
             }
         }
         Command::Overrides { subcommand } => {
@@ -7256,12 +7282,15 @@ fn handle_next(
                     resp: &'a next_types::NextResponse,
                     #[serde(skip_serializing_if = "Vec::is_empty")]
                     reserved_actions: Vec<crate::cli::retry::ReservedAction>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    questions: Option<serde_json::Value>,
                 }
                 let out = DirectedResponse {
                     resp: &resp,
                     reserved_actions: crate::cli::retry::synthesize_reserved_actions(
                         &name, &retryable,
                     ),
+                    questions: crate::decisions::questions::report(backend, &name),
                 };
                 println!("{}", serde_json::to_string(&out)?);
                 // The rules the printed directive carried, recorded after
@@ -9105,6 +9134,12 @@ fn handle_next(
             // A passing check's warnings, after `attempts` and only when
             // there are any.
             next_types::attach_advisories(&mut envelope, &advisories)?;
+            // The answered questions of this session's run that it hasn't
+            // cited yet. Read only: no write, no lock, no network call.
+            next_types::attach_questions(
+                &mut envelope,
+                crate::decisions::questions::report(backend, &name),
+            );
 
             println!(
                 "{}",

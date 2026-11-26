@@ -150,18 +150,27 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
                 }
                 match &f.area {
                     Area::Aimed(target) => {
-                        if body.kind != "reverse" {
-                            return Err("an aimed decision isn't a reversal".to_string());
+                        if body.kind != "reverse" && body.kind != "answer" {
+                            return Err(
+                                "an aimed decision is neither a reversal nor an answer".to_string()
+                            );
                         }
                         if body.target.as_ref().is_none_or(|t| &t.id != target) {
-                            return Err(
-                                "the reversal's target isn't the session it is filed under"
-                                    .to_string(),
-                            );
+                            return Err(format!(
+                                "the {}'s target isn't the session it is filed under",
+                                if body.kind == "answer" {
+                                    "answer"
+                                } else {
+                                    "reversal"
+                                }
+                            ));
                         }
                     }
                     Area::Decisions if body.kind == "reverse" => {
                         return Err("a reversal sits outside koto/aimed/".to_string());
+                    }
+                    Area::Decisions if body.kind == "answer" => {
+                        return Err("an answer sits outside koto/aimed/".to_string());
                     }
                     Area::Decisions => {}
                 }

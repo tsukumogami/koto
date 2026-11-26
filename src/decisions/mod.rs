@@ -34,6 +34,7 @@ pub mod chain;
 pub mod decider;
 pub mod gate_pass;
 pub mod marker;
+pub mod questions;
 pub mod read;
 pub mod standing;
 pub mod store;

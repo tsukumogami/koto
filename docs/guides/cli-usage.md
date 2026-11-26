@@ -219,6 +219,14 @@ The `--with-data` and `--to` flags are mutually exclusive. Passing both produces
 
 **Agent-session anchor.** `koto next` reads `KOTO_ANCHOR` the way [init](#init) does: a held-by link to the named anchor in the ticked session when it has none, the same successor rule, and a throttled `anchor_activity` event in the anchor. A second tick under the same anchor adds no link; a tick under another anchor adds a second one. A nested tick writes nothing. `koto next` on an anchor or an anchor's close session is refused with `precondition_failed` (exit 2) and changes nothing.
 
+**Questions.** When the session's run (the session and the predecessors it continues through `--continues --supersede`) raised a question with `koto decisions record --kind escalate`, and the question has an answer no decision in the run cites yet, the response carries a top-level `questions` array, one element per such question:
+
+```json
+"questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","state":"answered","answer":{"session":"B","id":"000000000001","text":"SQLite","decider":{"kind":"session",...},"run_mode":{"source":"observed","value":"unknown"},"time":"2026-11-26T14:35:45.667Z"}}]
+```
+
+`identity` is the asking session's id and the question's decision id; `answer` is the entry [decisions answer](#decisions-answer) recorded. The array repeats on every call, a terminal workflow's included, until a decision in the run names the answer in its `basis` (`--basis B:<answer id>`), recorded after the answer. Reading it writes nothing, makes no network call and never blocks or changes the exit code. A response with nothing to report has no `questions` key.
+
 **Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all; when that cap leaves warnings out, the response also carries `advisories_truncated: true` (absent otherwise). A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
 
 #### Directed transitions and non-overridable gates
@@ -1667,6 +1675,32 @@ koto decisions chain <session>
 ```
 
 It fails closed. A marker koto can't read (a symlink, not a regular file, over 4 KiB, or a body that doesn't parse) ends the step at that session, adds `"unreadable": "<reason>"` to its link and sets `incomplete`; the session's own unreadable marker reads as `"marker": null` with `"marker_unreadable": "<reason>"`. A successor already met on the step, or more than 64 hops, also sets `incomplete`. The read reaches only sessions this host holds a copy of, and a session this host doesn't hold exits 2.
+
+### decisions open
+
+Lists the questions open for a person, across every session in this host's store. A question is an `escalate` decision whose recipient is `person:<handle>`; it is open while it is in effect and no `answer` targets it. Open is worked out each time the command runs, and the command records nothing.
+
+```bash
+koto decisions open --person <handle>
+```
+
+```json
+{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"time":"2026-11-26T14:35:45.564Z"}]}
+```
+
+It takes no session argument and follows no link: a question is listed whatever its session's parent, anchor or chain. Questions are ordered by time, then session name and id. An `escalate` recipient is typed as `session:<name>`, `anchor:<name>` or `person:<handle>`; `decisions show` and `decisions list --format v1` return it as `recipient` beside the stored decision, and a recipient recorded with none of the prefixes reads as `{"typed":false,"value":"<as stored>"}` and is never a person's question.
+
+### decisions answer
+
+Answers a question another session raised, recording an `answer` decision with outcome `answered` in the answering session.
+
+```bash
+koto decisions answer <raiser-session> <decision-id> --in <session> --text <text> [--by session] [decider flags]
+```
+
+The answer's target is the question's identity, the raiser's session id with the decision id, so it never answers a later session that reuses the name. It is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session, and nothing is written in the raiser's session. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","decision":{...}}` and exits 0. Once recorded, the question no longer lists in `decisions open`, and the raiser's `koto next` reports the answer in its `questions` array.
+
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), when `--in` names the raiser, or when the answer would be recorded for a person (`--by person:<handle>`: koto can't yet verify that the person gave it). An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question; a person's answer, precedence between answers and passing a question up aren't built yet.
 
 ### decider answer
 
