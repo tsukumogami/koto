@@ -12,6 +12,12 @@
 //! pin record set under the local backend, whose index entry it drops under
 //! the manifest lock. Its wait for the manifest lock is bounded, so a flush
 //! never waits forever on a context write that waits on its batch lock.
+//! `koto session pin` carries such a record the same way, and a busy
+//! manifest there still leaves the pin in the bucket, reported as the
+//! existing pin.
+//!
+//! A removal inside a tick takes the manifest lock before the batch lock
+//! even in a session with no ctx directory yet, as an add does.
 //!
 //! The binary is driven directly, since the deadlock is between processes.
 //! Every command runs under a timeout, so a regression fails here instead
@@ -275,6 +281,16 @@ fn indexed(session_dir: &Path, key: &str) -> bool {
     manifest["keys"].get(key).is_some()
 }
 
+/// Whether the batch journal at `journal` records a write `op` (`add` or
+/// `remove`) of `key`.
+fn batched(journal: &Path, op: &str, key: &str) -> bool {
+    std::fs::read_to_string(journal)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|w| w["op"] == op && w["key"] == key)
+}
+
 /// The bytes of session [`NAME`]'s object `rest` (`ctx/<key>`, say) in
 /// `s3`, under whatever prefix the workspace has.
 fn bucket_object(s3: &FakeS3, rest: &str) -> Option<Vec<u8>> {
@@ -434,5 +450,99 @@ fn a_flush_carrying_a_pin_record_does_not_wait_forever_on_the_manifest() {
     assert!(
         bucket_object(&s3, &format!("ctx/{PIN_KEY}")).is_some(),
         "the bucket holds no pin object: {out}"
+    );
+}
+
+#[test]
+fn a_deferred_cloud_remove_on_a_session_with_no_ctx_takes_the_manifest_lock() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new();
+    let (code, out) = run(host.cloud(&s3, &["init", NAME, "--template", TEMPLATE_FILE]));
+    assert_eq!(code, Some(0), "init: {out}");
+    let session_dir = host.cloud_session_dir();
+    let ctx = session_dir.join("ctx");
+    let journal = session_dir.join("cloud-batch.jsonl");
+
+    // A session whose context was never written has a directory but no ctx
+    // directory, so no manifest lock file either.
+    assert!(
+        session_dir.is_dir(),
+        "the cloud session isn't at {}: {out}",
+        session_dir.display()
+    );
+    assert!(!ctx.exists(), "init made a ctx directory: {out}");
+
+    // A removal by a command of the session's tick, which joins its batch.
+    let mut cmd = host.cloud(&s3, &["context", "remove", NAME, KEY]);
+    cmd.env("KOTO_TICK_SESSION", NAME);
+    let (code, out) = run(cmd);
+    assert_eq!(code, Some(0), "context remove: {out}");
+    assert!(
+        batched(&journal, "remove", KEY),
+        "the tick's removal isn't in its batch: {out}"
+    );
+
+    // The deadlock is a race between processes, which a harness outside
+    // them can't time, so the lock file is the evidence: nothing else in a
+    // deferred removal of a key the session never held creates it, and the
+    // removal takes the manifest lock before the batch lock or not at all.
+    assert!(
+        ctx.join("manifest.lock").exists(),
+        "the removal took the batch lock without the manifest lock: {out}"
+    );
+}
+
+#[test]
+fn a_pin_whose_carry_finds_the_manifest_busy_reports_the_existing_pin() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new();
+    let (code, out) = run(host.cloud(&s3, &["init", NAME, "--template", TEMPLATE_FILE]));
+    assert_eq!(code, Some(0), "init: {out}");
+    let session_dir = host.cloud_session_dir();
+
+    // A pin set under the local backend, on the same store: an indexed
+    // record the bucket hasn't seen.
+    let (code, out) = run(host.base(&["session", "pin", NAME, "--reason", "kept"]));
+    assert_eq!(code, Some(0), "session pin: {out}");
+    assert!(
+        indexed(&session_dir, PIN_KEY),
+        "the local pin isn't indexed: {out}"
+    );
+    assert!(
+        bucket_object(&s3, &format!("ctx/{PIN_KEY}")).is_none(),
+        "the local pin is in the bucket already"
+    );
+
+    // A pin under the cloud backend carries it, while another process holds
+    // the manifest lock its index entry is dropped under. The carry's wait
+    // for it is bounded as a flush's is, so the flush's bound serves.
+    let manifest = hold_lock(&session_dir.join("ctx").join("manifest.lock"));
+    let started = Instant::now();
+    let pin = host
+        .cloud(&s3, &["session", "pin", NAME, "--reason", "again"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (code, out) = finish_within(pin, started, FLUSH_BOUND);
+    drop(manifest);
+
+    assert_eq!(code, Some(0), "session pin: {out}");
+    assert!(
+        out.contains("\"reason\":\"kept\""),
+        "the existing pin isn't the one reported: {out}"
+    );
+    assert!(
+        out.contains("only its index entry is kept"),
+        "the busy manifest isn't reported: {out}"
+    );
+    assert!(
+        bucket_object(&s3, &format!("ctx/{PIN_KEY}")).is_some(),
+        "the bucket holds no pin object: {out}"
+    );
+    assert!(
+        indexed(&session_dir, PIN_KEY),
+        "the pin left the index though the manifest was busy: {out}"
     );
 }
