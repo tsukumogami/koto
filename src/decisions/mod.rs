@@ -34,6 +34,8 @@ pub mod chain;
 pub mod decider;
 pub mod gate_pass;
 pub mod marker;
+pub mod packets;
+pub mod prompt;
 pub mod questions;
 pub mod read;
 pub mod standing;
@@ -52,6 +54,13 @@ pub const PACKS_AREA: &str = "koto/packs";
 /// The three areas, as context-key prefixes without the trailing slash.
 pub const AREAS: [&str; 3] = [DECISIONS_AREA, AIMED_AREA, PACKS_AREA];
 
+/// The question content area: one write-once file per question, keyed by
+/// the escalate's decision id, holding the bytes a person was shown
+/// ([`packets`]). It isn't a decision area: nothing in it is a decision
+/// body, so the readers that iterate [`AREAS`] never see it, but it is as
+/// write-once as they are.
+pub const PACKETS_AREA: &str = "koto/packets";
+
 /// How many digits a decision id has.
 pub const ID_WIDTH: usize = 12;
 
@@ -64,8 +73,8 @@ pub const FORMAT_VERSION: u32 = 1;
 /// sessions below it.
 pub const MAX_AREA_ENTRIES: usize = 100_000;
 
-/// Whether `key` lies in one of the three decision areas, or names an area
-/// root itself. The first component is compared case-insensitively, as
+/// Whether `key` lies in one of the three decision areas or the question
+/// content area, or names an area root itself. The first component is compared case-insensitively, as
 /// [`crate::session::links::is_reserved_key`] does, so `KOTO/decisions/...`
 /// can't reach the same directory on a case-insensitive filesystem; the
 /// area component is compared the same way.
@@ -74,7 +83,7 @@ pub fn is_decision_area_key(key: &str) -> bool {
     let first = parts.next().unwrap_or("");
     let second = parts.next().unwrap_or("");
     first.eq_ignore_ascii_case("koto")
-        && ["decisions", "aimed", "packs"]
+        && ["decisions", "aimed", "packs", "packets"]
             .iter()
             .any(|area| second.eq_ignore_ascii_case(area))
 }
@@ -113,6 +122,9 @@ pub mod codes {
     /// A reversal was refused; the output names the reason from
     /// [`super::standing::reasons`].
     pub const REVERSAL_REFUSED: &str = "reversal_refused";
+    /// A person's answer failed a check against the harness's record of
+    /// its question prompt; the message names the check.
+    pub const PROMPT_UNVERIFIED: &str = "prompt_unverified";
 }
 
 /// A decision command's refusal: a code from [`codes`], the field it names
@@ -161,6 +173,8 @@ mod tests {
         assert!(is_decision_area_key("koto/aimed/abc/000000000001"));
         assert!(is_decision_area_key("koto/packs"));
         assert!(is_decision_area_key("koto/decisions"));
+        assert!(is_decision_area_key("koto/packets/000000000001"));
+        assert!(is_decision_area_key("KOTO/PACKETS"));
         assert!(!is_decision_area_key("koto/links/held-by/a"));
         assert!(!is_decision_area_key("decisions/000000000001"));
         assert!(!is_decision_area_key("koto/decisionsx/1"));

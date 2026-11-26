@@ -320,6 +320,26 @@ impl Index {
             if let Some(r) = body.subject.get("recipient").and_then(Value::as_str) {
                 out["recipient"] = body::Recipient::parse(r).to_json();
             }
+            if body.subject.contains_key("packet") {
+                out["prompt_header"] = json!(super::prompt::tag(&super::questions::identity(body)));
+            }
+        }
+        if body.prompt.is_some() {
+            // The stored mark reads verified only on the host that checked
+            // the prompt; a copy that arrived by import or by a pull reads
+            // it as a remote session's answer. The record isn't opened.
+            let here = super::prompt::verified_here(
+                &crate::session::SessionBackend::session_dir(scope.backend, &body.session.name),
+                &body.session.id,
+                &body.id,
+            );
+            if here {
+                out["reading"] = json!(super::prompt::VERIFIED);
+            } else {
+                out["reading"] = json!(super::prompt::REMOTE_READING);
+                out["decision"]["prompt"]["mark"] =
+                    json!(super::decider::Sourced::observed(super::prompt::REMOTE));
+            }
         }
         if self.after_fence(body) {
             // Written after the fence: it reads refused and nothing more.
@@ -814,6 +834,7 @@ pub fn refused_body(
         compensating: None,
         replacement: None,
         refusal: Some(what.refusal),
+        prompt: None,
     })
 }
 
@@ -1030,6 +1051,7 @@ mod tests {
             compensating: None,
             replacement: None,
             refusal: None,
+            prompt: None,
         }
     }
 

@@ -1395,6 +1395,12 @@ pub enum DecisionsSubcommand {
         #[arg(long, value_name = "SESSION_OR_ANCHOR")]
         at: Option<String>,
     },
+    /// Write or read a question's content: the write-once bytes a person is
+    /// shown, in the raiser's `koto/packets/`
+    Content {
+        #[command(subcommand)]
+        action: decisions::ContentAction,
+    },
 }
 
 /// Read and validate a compiled template JSON file.
@@ -3266,6 +3272,16 @@ pub fn run(app: App) -> Result<()> {
                     (Some(person), _) => decisions::handle_open(&backend, &person),
                     (None, Some(at)) => decisions::handle_open_at(&backend, &at),
                     (None, None) => unreachable!("clap requires --person or --at"),
+                },
+                DecisionsSubcommand::Content { action } => match action {
+                    decisions::ContentAction::Write { name, id, file } => {
+                        refuse_if_unlocated(&backend, &name, "decisions content write");
+                        refuse_if_superseded(&backend, &name, "decisions content write");
+                        decisions::handle_content_write(&backend, &name, &id, &file)
+                    }
+                    decisions::ContentAction::Read { identity } => {
+                        decisions::handle_content_read(&backend, &identity)
+                    }
                 },
             }
         }
