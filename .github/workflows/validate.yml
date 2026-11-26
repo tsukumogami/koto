@@ -102,6 +102,24 @@ jobs:
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
 
+  attempts-cost:
+    # The attempts read's cost bound: on a generated store of 1,000
+    # sessions in chains four deep, `koto decisions attempts --at` the top
+    # coordinator and `--in` a worker each answer within 5 seconds. The
+    # bound holds for a release build only, so the default suite runs the
+    # test on a smaller store and checks only its counts.
+    name: Attempts Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the cost test in release mode
+        run: cargo test --locked --release --test precedent_cost -- --nocapture
+
   pool-tick-cost:
     # Host resource pools' cost bound (PRD-host-resource-pools.md R28): the
     # median of 50 ticks on a state whose action names an undefined pool is
@@ -988,7 +1006,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, tests, retention-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, reader-write-guard, reader-version, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, session-list, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, tests, retention-cost, attempts-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, reader-write-guard, reader-version, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, session-list, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -1001,6 +1019,7 @@ jobs:
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.tests.result }}" != "success" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
+             [ "${{ needs.attempts-cost.result }}" = "failure" ] || \
              [ "${{ needs.pool-tick-cost.result }}" = "failure" ] || \
              [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
              [ "${{ needs.stability-tests.result }}" != "success" ] || \

@@ -398,7 +398,7 @@ fn is_acceptance(b: &DecisionBody) -> bool {
 }
 
 /// The winning reversal as a reversed decision names it (R20, R44).
-fn reversal_json(w: &DecisionBody) -> Value {
+pub(crate) fn reversal_json(w: &DecisionBody) -> Value {
     let mut out = json!({
         "session": w.session.name,
         "id": w.id,
@@ -536,6 +536,11 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
     let mut out = index.entry_json(session, entry, &Scope::new(backend, session));
     out["v"] = json!(FORMAT_VERSION);
     out["id"] = json!(id);
+    if let Entry::Decision(body) = entry {
+        if super::attempts::is_provisional(body) {
+            out["review"] = super::attempts::review(backend, &index, body);
+        }
+    }
     Some(out)
 }
 

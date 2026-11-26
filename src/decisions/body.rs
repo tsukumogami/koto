@@ -265,15 +265,17 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
     }];
     const ESCALATE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text", "recipient"],
-        optional: &["packet"],
+        optional: &["packet", "state"],
     }];
     const DECLINE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text"],
         optional: &[],
     }];
+    // `state` and `result` make a judgment an attempt to decide
+    // (super::attempts).
     const JUDGMENT: &[SubjectShape] = &[SubjectShape {
         required: &["what"],
-        optional: &["pointer"],
+        optional: &["pointer", "state", "result"],
     }];
     const VERDICT: &[SubjectShape] = &[
         SubjectShape {
@@ -422,6 +424,31 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
                     "subject.packet",
                     "subject field 'packet' is the question content's hash, sha256: and 64 \
                      lowercase hex characters",
+                ));
+            }
+        }
+    }
+    if req.kind == "judgment" || req.kind == "escalate" {
+        if let Some(v) = given.get("state").and_then(|v| v.first()) {
+            if !super::attempts::is_state_visit(v) {
+                return Err(DecisionError::invalid(
+                    "subject.state",
+                    "subject field 'state' is a state name, ':' and a visit number of 1 or more, \
+                     such as implement:1",
+                ));
+            }
+        }
+    }
+    if req.kind == "judgment" {
+        if let Some(v) = given.get("result").and_then(|v| v.first()) {
+            if !super::attempts::RESULTS.contains(&v.as_str()) {
+                return Err(DecisionError::invalid(
+                    "subject.result",
+                    format!(
+                        "subject field 'result' is one of {}; got '{}'",
+                        super::attempts::RESULTS.join(", "),
+                        preview(v)
+                    ),
                 ));
             }
         }

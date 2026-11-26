@@ -1051,6 +1051,76 @@ and the check. No record text is echoed, since the record holds the person's who
 - **Trust the caller's `--text`.** Rejected: the answer text comes from the result, so a caller
   can't put words in the person's mouth.
 
+### Attempts and provisional decisions
+
+A caller one layer up needs two answers from the record: whether a session tried to decide a
+question itself before passing it up, and which decisions an unattended run made on its own that
+nobody has looked at yet. Both ride on two optional subject fields and one read over the local
+scan the open reads use (`src/decisions/attempts.rs`).
+
+**The fields.** A `judgment` may carry `state` and `result`, and an `escalate` may carry `state`.
+`result` is `decided`, `undecided` or `provisional`. `state` is `<state name>:<visit>`: the name
+takes a session name's shape and the visit is a whole number of 1 or more, with no sign and no
+leading zero. It's the caller's value, stored as handed and never compared with the workflow
+state R3 already records in the body's own `state`. `record` checks both fields alongside the
+rest of the subject, so a refusal writes nothing. A judgment carrying `result` is an attempt; one
+carrying neither field is not, prints exactly as it did, and no attempts read returns it. Open
+elements add `state` only when the `escalate` carries one.
+
+**The tie between an attempt and a question.** An attempt is tied to a question through `basis`,
+in either direction: the question's `escalate` names the attempt, or the attempt names the
+`escalate`. A basis entry names its session by name, which a later session can reuse, so a
+citation counts only when the decision it names, read now, is of the right kind and recorded no
+later than the citing decision. That's the check the `questions` report on `koto next` makes. An
+attempt tied to several questions reports the earliest by time, session name and identifier.
+
+**The end of a provisional judgment's wait.** A provisional judgment's `review` is `reversed`,
+with the winning reversal as `show` prints it, once a reversal aimed at it is in effect. Failing
+that, it's `reviewed` once a question whose `escalate` is in effect and names the judgment in its
+`basis` has a person's answer that reads `verified` on this host, taking the first such answer in
+the order answers are kept. Otherwise it's `awaiting`, naming the earliest such question or null.
+A session's answer, the raiser's settle or withdrawal, a remote person answer and a decision that
+merely cites the judgment leave it awaiting. Review is matched by session id and identifier, so
+a recreated session reusing a name and identifier inherits no review. This rule takes any
+verified person answer to the question; once the record marks which answer governs a question,
+it narrows to that answer.
+
+**The command surface.** `koto decisions attempts` takes exactly one of `--in <session>` and
+`--at <session or anchor>`, plus `--result`, `--state`, `--question <identity>` and
+`--awaiting-review`, which keeps provisional judgments still awaiting review. `--in` covers the
+session's run (the session and those it continues through a confirmed supersede, as
+`chain::run_predecessors` finds them); `--at` covers the position's run and every session below
+it, as `open --at` does, and adds `relation`. Elements are ordered by time, session name and
+identifier, and a provisional element carries `review`. `koto decisions show` adds the same
+`review` beside a provisional judgment; `list` is unchanged apart from the stored fields.
+
+```json
+{"v": 1, "in": "worker", "attempts": [{"identity": "<session id>/000000000001",
+  "session": "worker", "id": "000000000001", "what": "Postgres or SQLite for the cache",
+  "state": "implement:1", "result": "undecided", "decider": {"kind": "session", "...": "..."},
+  "run_mode": {"source": "observed", "value": "unknown"}, "time": "...",
+  "status": "in-effect", "question": null}]}
+```
+
+**Enforcement is the caller's.** koto refuses nothing for want of an attempt. An `escalate` or a
+`readdress` with no attempt behind it is recorded as before; a caller that wants an attempt
+before a pass-up asks `attempts --in <session> --question <identity>` and decides.
+
+**Local only.** The read builds on `Index::scan` with `remote` unset: no lock, no pull, no bucket
+request under the cloud backend, and no write.
+
+**Older binaries.** A binary older than this change reads a `judgment` or `escalate` carrying the
+new fields as it reads any other: `show` and `list` print the stored subject, new keys included.
+Its `repair`, which publishes a decision whose key a stopped writer never wrote, checks bodies
+against its own subject table and skips such a body with a warning.
+
+**Measured cost.** On a release build on a Linux development host, over 1,001 sessions in
+dispatcher chains three deep holding 200 open questions, 100 questions closed by a verified
+person answer, 600 closed by a session's answer, 1,700 attempts and 800 provisional judgments,
+`attempts --at` the top coordinator took 284 ms, the same read with `--awaiting-review` 239 ms,
+and `attempts --in` one worker 173 ms. `tests/precedent_cost.rs` asserts each under five seconds
+on a release build.
+
 ## Implementation Approach
 
 ### Phase 1: The write-once store
