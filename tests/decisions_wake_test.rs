@@ -265,6 +265,12 @@ impl Env {
         out["questions"].as_array().unwrap().clone()
     }
 
+    /// The open questions `koto decisions open --at <position>` lists.
+    fn at(&self, position: &str) -> Vec<Value> {
+        let out = self.ok(&["decisions", "open", "--at", position]).json();
+        out["questions"].as_array().unwrap().clone()
+    }
+
     /// `koto next <name> --no-cleanup`, so a terminal session stays.
     fn next(&self, name: &str) -> Value {
         self.ok(&["next", name, "--no-cleanup"]).json()
@@ -385,8 +391,8 @@ fn an_answer_appends_one_line_and_wakes_a_watch() {
     let env = Env::new();
     env.init("asker", &[]);
     env.init("helper", &[]);
-    let q1 = env.escalate("asker", "q1", "person:owner");
-    let q2 = env.escalate("asker", "q2", "person:owner");
+    let q1 = env.escalate("asker", "q1", "session:helper");
+    let q2 = env.escalate("asker", "q2", "session:helper");
     assert!(!env.wake_file("asker").exists());
 
     let (woke, before) = env.watch("asker", "0", None);
@@ -461,7 +467,7 @@ fn an_answer_writes_nothing_in_the_asker_and_its_wake_carries_nothing() {
         "asker",
         "storage-engine",
         "which storage engine do we pick",
-        "person:owner",
+        "session:zed-answerer",
     );
     // The answering session's own directory may change; nothing else but
     // the asker's wake file may.
@@ -508,7 +514,7 @@ fn an_answer_to_a_superseded_raiser_rings_its_newest_successor_too() {
     let env = Env::at_root();
     env.init("raiser", &[]);
     env.init("helper", &[]);
-    let q = env.escalate("raiser", "q1", "person:owner");
+    let q = env.escalate("raiser", "q1", "session:helper");
     env.init("succ", &["--continues", "raiser", "--supersede"]);
     let (raiser0, succ0) = (env.wake_lines("raiser"), env.wake_lines("succ"));
     let bystander0 = env.wake_lines("helper");
@@ -526,7 +532,7 @@ fn a_refused_answer_a_readdress_and_a_record_ring_nothing() {
     env.init("coord", &[]);
     env.init("w", &["--dispatched-by", "coord"]);
     env.init("helper", &[]);
-    let q1 = env.escalate("w", "q1", "person:owner");
+    let q1 = env.escalate("w", "q1", "session:helper");
     let q2 = env.escalate("w", "q2", "session:coord");
     let q3 = env.escalate("helper", "q3", "session:coord");
     // Give the wakes directory files to watch: one ring for `w`, one for
@@ -584,6 +590,49 @@ fn a_refused_answer_a_readdress_and_a_record_ring_nothing() {
     env.escalate("helper", "q4", "session:w");
     assert_eq!(env.wakes_state(), before, "a decisions record rang");
 
+    // The raiser withdrawing one question and settling another: accepted,
+    // and neither rings.
+    let q5 = env.escalate("w", "q5", "session:coord");
+    let q6 = env.escalate("w", "q6", "session:coord");
+    let bytes_before = snapshot_tree(&env.wakes(), &[]);
+    env.ok(&[
+        "decisions",
+        "answer",
+        "w",
+        &q5.id,
+        "--in",
+        "w",
+        "--outcome",
+        "withdrawn",
+        "--reason",
+        "not needed",
+        "--by",
+        "session",
+    ]);
+    env.ok(&[
+        "decisions",
+        "answer",
+        "w",
+        &q6.id,
+        "--in",
+        "w",
+        "--outcome",
+        "settled",
+        "--text",
+        "settled",
+        "--evidence",
+        "event:w:1",
+        "--by",
+        "session",
+    ]);
+    let closed = identities(&env.at("w"));
+    assert!(
+        !closed.contains(&q5.identity()) && !closed.contains(&q6.identity()),
+        "{closed:?}"
+    );
+    assert_eq!(env.wakes_state(), before, "a withdrawal or a settle rang");
+    assert_eq!(snapshot_tree(&env.wakes(), &[]), bytes_before);
+
     // The pass-up stood: q2 now waits on the owner.
     let open = env.open("owner");
     assert!(identities(&open).contains(&q2.identity()), "{open:?}");
@@ -602,7 +651,7 @@ fn answer_despite_failed_ring(env: &Env, q: &Rec, answerer: &str) {
         q.session
     );
     assert!(
-        !identities(&env.open("owner")).contains(&q.identity()),
+        !identities(&env.at(&q.session)).contains(&q.identity()),
         "{} is still open",
         q.session
     );
@@ -618,7 +667,7 @@ fn a_ring_that_fails_never_fails_the_answer() {
     let mut qs = BTreeMap::new();
     for name in ["dir-at-path", "fifo-at-path", "link-at-path", "unwritable"] {
         env.init(name, &[]);
-        qs.insert(name, env.escalate(name, "q1", "person:owner"));
+        qs.insert(name, env.escalate(name, "q1", "session:helper"));
     }
     std::fs::create_dir_all(env.wakes()).unwrap();
     std::fs::set_permissions(env.wakes(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -688,7 +737,16 @@ fn the_answer_is_found_whatever_state_the_wake_file_is_in() {
     env.init("asker", &[]);
     env.init("first", &[]);
     env.init("second", &[]);
-    let q = env.escalate("asker", "q1", "person:owner");
+    let q = env.escalate("asker", "q1", "session:first");
+    // A question is answered once, by its addressee: the later answer that
+    // rings is `second`'s, to a second question.
+    let q2 = env.escalate("asker", "q2", "session:second");
+    let first_of = |next: Value| -> Vec<Value> {
+        questions(&next)
+            .into_iter()
+            .filter(|e| e["identity"] == q.identity().as_str())
+            .collect()
+    };
 
     // Never written: the first answer's ring fails.
     std::fs::create_dir_all(env.wakes()).unwrap();
@@ -702,14 +760,14 @@ fn the_answer_is_found_whatever_state_the_wake_file_is_in() {
     assert_eq!(never[0]["answer"]["text"], "the answer");
 
     // Intact: a later answer rings, and the earlier one stays in effect.
-    env.answer(&q, "second", "a later answer");
+    env.answer(&q2, "second", "a later answer");
     assert_eq!(env.wake_lines("asker").len(), 1);
-    let intact = questions(&env.next("asker"));
+    let intact = first_of(env.next("asker"));
     assert_eq!(intact, never);
 
     // Deleted.
     std::fs::remove_file(env.wake_file("asker")).unwrap();
-    assert_eq!(questions(&env.next("asker")), intact);
+    assert_eq!(first_of(env.next("asker")), intact);
 
     // Replaced by 64 KiB of arbitrary bytes, newlines and NULs included.
     let mut junk = Vec::with_capacity(64 * 1024);
@@ -721,7 +779,7 @@ fn the_answer_is_found_whatever_state_the_wake_file_is_in() {
         junk.push((x & 0xff) as u8);
     }
     std::fs::write(env.wake_file("asker"), &junk).unwrap();
-    assert_eq!(questions(&env.next("asker")), intact);
+    assert_eq!(first_of(env.next("asker")), intact);
     assert_eq!(std::fs::read(env.wake_file("asker")).unwrap(), junk);
 }
 
@@ -758,9 +816,6 @@ fn the_wake_file_stays_bounded_across_two_thousand_answers() {
 
     let env = Env::new();
     env.init("asker", &[]);
-    let qs: Vec<Rec> = (0..4)
-        .map(|i| env.escalate("asker", &format!("q{i}"), "person:owner"))
-        .collect();
     let answerers: Vec<Vec<String>> = (0..THREADS)
         .map(|t| {
             (0..ANSWERERS_PER_THREAD)
@@ -772,24 +827,29 @@ fn the_wake_file_stays_bounded_across_two_thousand_answers() {
         env.init(name, &[]);
     }
 
-    // All but the last answer, from several threads at once.
+    // All but the last answer, from several threads at once. A question is
+    // answered once, by the session it waits on, so each answer closes a
+    // question of its own, raised in the asker just before it.
     let per_thread = (ANSWERS - 1).div_ceil(THREADS);
     std::thread::scope(|s| {
         for (t, names) in answerers.iter().enumerate() {
-            let (env, qs) = (&env, &qs);
+            let env = &env;
             s.spawn(move || {
                 let start = t * per_thread;
                 let end = ((t + 1) * per_thread).min(ANSWERS - 1);
                 for i in start..end {
-                    let q = &qs[i % qs.len()];
-                    env.answer(q, &names[i % names.len()], &format!("answer {i}"));
+                    let to = &names[i % names.len()];
+                    let q = env.escalate("asker", &format!("q{i}"), &format!("session:{to}"));
+                    env.answer(&q, to, &format!("answer {i}"));
                 }
             });
         }
     });
 
+    let last = &answerers[0][0];
+    let q = env.escalate("asker", "q-last", &format!("session:{last}"));
     let (_, cursor) = env.watch("asker", "0", None);
-    env.answer(&qs[0], &answerers[0][0], "the last answer");
+    env.answer(&q, last, "the last answer");
 
     let len = std::fs::metadata(env.wake_file("asker")).unwrap().len();
     assert!(len < 64 * 1024, "the wake file grew to {len} bytes");

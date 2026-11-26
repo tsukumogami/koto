@@ -323,7 +323,8 @@ impl Store {
         let (w2, m2) = (format!("w{h}-2"), format!("m{h}-2"));
         let answered = if h == 0 { ANSWERED_AT_TARGET } else { 1 };
         for i in 0..answered {
-            let id = self.escalate(&w2, &format!("qc{i}"), "person:owner");
+            // A session's answer closes only a question waiting on it.
+            let id = self.escalate(&w2, &format!("qc{i}"), &format!("session:{m2}"));
             self.answer(&w2, &id, &m2);
         }
         got.answered += answered;

@@ -159,10 +159,16 @@ says how.
 
 A session that raises a question (`koto decisions record --kind escalate`
 with a typed recipient) needs to be there when the answer comes. So while the
-question is open, in effect with no answer, the session is a keeper of its
-hierarchy, alive or not, with no expiry. It stays until the question is
-answered, reversed or fenced. What counts as open is the test
-`koto decisions open` applies, so every read and every removal agree on it.
+question is open, the session is a keeper of its hierarchy, alive or not,
+with no expiry. It stays until the question is closed, reversed or fenced.
+Open means exactly what `koto decisions open` means: the question is in
+effect and no entry that counts closes it. Which answers, settles and
+withdrawals count, and which one is in effect, are the decision record's
+rules (see "Which entries count" under
+[decisions answer](cli-usage.md#decisions-answer)); retention adds none of its
+own, so every read and every removal agree on it. A question its raiser
+withdrew or settled holds nothing, and the raiser is removed at its terminal
+tick like any session holding no question, with no `--force` needed.
 
 **At its terminal tick** the session is kept with or without
 `--no-cleanup`, and `koto next` says why:
@@ -199,7 +205,8 @@ with that detail, and `koto workspace prune --root` follows the same verdict.
 `koto session prune --older-than` and `koto session prune --execution-dir`
 can remove some members of a hierarchy and leave others. None of them
 removes a session holding the answer in effect for a question, or a pass-up
-an open question's current addressee rests on, unless the question's raiser
+that counts and that an open question's current addressee rests on, unless
+the question's raiser
 is removed in the same run. Such a session is kept and listed with a detail
 naming the question. When the raiser and the holder both go in that run,
 both are removed.
@@ -207,7 +214,8 @@ both are removed.
 **Removing one by hand.** `koto session cleanup <name>` refuses a session an
 open question depends on: one that raised an open question, holds the answer
 in effect for a question whose raiser is still in the store, or holds a
-pass-up the question's current addressee rests on. Nothing is stopped,
+pass-up that counts and that the question's current addressee rests on.
+Nothing is stopped,
 written or removed; it exits 2 with code `holds_question`, a message naming
 each question and what removing the session would lose, a `questions` list
 of `{"question": "<identity>", "held": "raised" | "answer" | "pass_up"}`,
@@ -228,10 +236,21 @@ koto session cleanup A --force
 objects, beside `live_members`, with one warning on stderr per question. A
 cleanup of a session that holds nothing prints what it printed before, with
 or without `--force`; `orphaned_questions` appears only when a forced removal
-orphaned something. Holds are matched by identity: a second answer to a
-question already answered, an answer whose raiser is gone and a pass-up of a
-question since answered hold nothing, so once a question is answered,
-removing its raiser and then its answerer needs no `--force` at all.
+orphaned something. Holds are matched by identity and read from the same
+judgment `koto decisions show` prints, so these hold nothing:
+
+- a withdrawn or settled question, and so its raiser;
+- an answer that reads `counted` false, such as a session's answer from a
+  session the question doesn't wait on;
+- an answer that counts but doesn't govern. When a person's verified answer
+  outranks a session's, the session holding the person's answer holds the
+  question and the session holding the outranked answer is released;
+- an answer whose raiser is gone;
+- a pass-up that reads `counted` false, which no open question rests on;
+- a pass-up of a question since closed.
+
+So once a question is closed, removing its raiser and then its answerer needs
+no `--force` at all.
 
 **Replacing one under the same name.** `koto init <name> --replace-terminal`
 doesn't move such a session aside the way it moves other kept predecessors.
@@ -246,9 +265,10 @@ koto session cleanup <name> --force
 koto init <name> --template <path> --replace-terminal
 ```
 
-What a forced removal leaves is what the reads then show. Removing the only
-answer reopens the question, and the raiser's next terminal tick keeps it for
-`open_question` again. Removing a pass-up returns the question to the
+What a forced removal leaves is what the reads then show. Removing the
+answer in effect hands the question to the next entry that counts, and when
+none does the question reopens and the raiser's next terminal tick keeps it
+for `open_question` again. Removing a pass-up returns the question to the
 addressee it had before it. Removing the raiser drops the question from every
 open read, while the answers and pass-ups aimed at it still list in their own
 sessions.
@@ -265,7 +285,8 @@ asker and its answerer, so both are kept at their terminal ticks as one
 hierarchy, reason `hierarchy`, until `koto session prune` runs after the
 retention period (`retention.keep`, 7 days by default) has passed since the
 last of them stopped. A question addressed to a person keeps its session
-until someone answers it, reverses it or forces the session out; nothing
+until that person answers it, its raiser withdraws or settles it, someone
+reverses it or forces the session out; nothing
 expires it. A host where many questions are answered keeps every one of
 those pairs until a prune, so schedule one:
 
@@ -273,8 +294,8 @@ those pairs until a prune, so schedule one:
 koto session prune --apply --all
 ```
 
-The session holding an answer needs `--force` to be removed by hand for as
-long as its asker is in the store. A prune after the retention period, which
+The session holding the answer in effect needs `--force` to be removed by
+hand for as long as its asker is in the store. A prune after the retention period, which
 removes the asker and the answerer together, is the unforced way out; so is
 removing the asker first and the answerer after.
 

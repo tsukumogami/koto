@@ -572,15 +572,18 @@ Wiring:
 A question is an `escalate` decision with a typed recipient (the decision
 record's design). Two rules make questions part of the retention rule, and
 both rest on one test of open: `is_open` in `src/decisions/questions.rs`, a
-question that is in effect (not reversed, not past a fence) with no answer
-in effect. The open reads (`koto decisions open --person` and `--at`, the
+question that is in effect (not reversed, not past a fence) with no closing
+entry in effect. Which answers, settles and withdrawals count, and which one
+is in effect, come from the decision record's read-time resolution;
+retention adds no rule of its own, so a withdrawn or settled question keeps
+nothing. The open reads (`koto decisions open --person` and `--at`, the
 `questions` array on `koto next`), the terminal tick, the engine's keepers
 and the cleanup refusal all call it, so a change to what counts as open
 reaches every one of them at once.
 
 - **An open question keeps.** A session that raised a question still open
   is a keeper of its hierarchy, alive or not, with no expiry: it keeps until
-  the question is answered, reversed or fenced, and no retention period
+  the question is closed, reversed or fenced, and no retention period
   runs while it does. `Keeper` gains `alive` and `questions` (the
   identities, `<session id>/<decision id>`). The `Judge` asks only about
   members whose `SessionFacts` say they hold a file under `koto/decisions/`,
@@ -636,8 +639,8 @@ which drops the lineage between the root and its children, and
 `koto session prune --older-than` and `--execution-dir`, whose filters pick
 candidates) could otherwise remove the holder of an answer or pass-up while
 leaving the question's raiser in the store. So each of them keeps a session
-holding the answer in effect for a question, or a pass-up an open question's
-current addressee rests on, whenever that question's raiser isn't removed
+holding the answer in effect for a question, or a pass-up that counts and
+that an open question's current addressee rests on, whenever that question's raiser isn't removed
 in the same run, and lists it with a detail naming the question. When the
 raiser and the holder are both removed in that run, both go. The check is
 the identity match the cleanup refusal makes (below), applied to the run's
@@ -648,7 +651,8 @@ what it broke, a removal that would orphan a question is now refused unless
 it is forced. `koto session cleanup <name>` refuses, before anything is
 stopped or written, a session that raised an open question, holds the
 answer in effect for a question whose raiser is in the store, or holds a
-pass-up that the current addressee of an open question rests on: exit 2,
+pass-up that counts and that the current addressee of an open question rests
+on: exit 2,
 
 ```json
 {"error": {"code": "holds_question", "message": "...", "session": "<name>",
@@ -660,10 +664,14 @@ with `held` one of `raised`, `answer` and `pass_up`. The message names each
 question, what the session holds of it and what removing it loses. A pin is
 refused first, with code `pinned`, with or without `--force`. `koto cancel
 <name> --cleanup` is refused the same way before the cancel is written, and
-its `force_command` is the cleanup command. Holds are matched by identity:
-an answer that isn't the one in effect, an answer whose raiser is no longer
-in the store, and a pass-up of a question since answered hold nothing, so a
-raiser and its answerer can both be removed without force, raiser first.
+its `force_command` is the cleanup command. Holds are matched by identity
+and read from the resolution, so these hold nothing: a withdrawn or settled
+question; an answer reading `counted` false; a counted answer that doesn't
+govern, so when a person's verified answer outranks a session's the person's
+holder is kept and the outranked holder released; an answer whose raiser is
+no longer in the store; a pass-up reading `counted` false; and a pass-up of a
+question since closed. A raiser and its answerer can both be removed without
+force, raiser first.
 The refusal reads the session's own decisions first and scans the local
 store only when they hold a question or an aimed answer or pass-up.
 

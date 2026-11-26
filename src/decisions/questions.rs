@@ -1,21 +1,39 @@
-//! Questions: the open read for a person and the report on `koto next`.
+//! Questions: the open reads, the report on `koto next`, and the one
+//! read-time resolution every read and every writer applies.
 //!
-//! A question is an `escalate` decision. Its identity is the raising
-//! session's id with the decision's id, never the session's name, so a
-//! later session that reuses the name raises different questions. An
-//! answer is an `answer` decision recorded in the session it was given in,
-//! filed under that session's `koto/aimed/<raiser's session id>/`, and
-//! never written into the asker's session.
+//! A question is an `escalate` decision with a typed recipient. Its
+//! identity is the raising session's id with the decision's id, never the
+//! session's name, so a later session that reuses the name raises
+//! different questions. Every entry aimed at a question (an `answer` with
+//! outcome `answered`, `settled` or `withdrawn`, or a `readdress`) is
+//! recorded in the session it was given in, filed under that session's
+//! `koto/aimed/<raiser's session id>/`; a settle or a withdrawal is given
+//! in the raiser, so it sits in the raiser's own aimed area.
 //!
-//! Whether a question is open is computed every time it is read: an
-//! in-effect escalation with no `answered` answer aimed at it is open.
-//! Nothing records a question as closed. In this version any `answered`
-//! answer closes its question, and the one in effect is the earliest by
-//! time, then the answering session's name, then id. Which answers count
-//! (a person's answer needs verification koto doesn't do yet) and which
-//! one governs when several disagree are not settled here.
+//! Nothing records a question as closed. [`resolve`] works it out on every
+//! read, in this order:
 //!
-//! Both reads look only at the local store, the way [`Index::scan`] does
+//! 1. The addressee history: the recipient the question was raised with,
+//!    then one per pass-up that moves it (the causal walk [`addressees`]
+//!    describes), where a pass-up to a session or anchor must also name
+//!    the dispatcher it recorded when it was written. A pass-up left out
+//!    reads not counted.
+//! 2. The closing entries, each judged against the addressee the question
+//!    has now: a verified person answer always counts; a session's
+//!    `answered` answer counts only from the session or anchor the
+//!    question waits on, or a session continuing it, and never while it
+//!    waits on a person; a `withdrawn` or `settled` entry counts only from
+//!    the raiser or a session continuing it, by a decider that isn't a
+//!    person, a withdrawal with a reason and a settle with the evidence
+//!    its question needs. An entry that doesn't count is still returned,
+//!    with the reason.
+//! 3. The entry in effect: among counted verified person answers, the one
+//!    no other cites, the later in time when several are uncited; with
+//!    none, the earliest counted entry by time, then the recording
+//!    session's name, then id.
+//! 4. Open: a question in effect with no entry in effect.
+//!
+//! Every read looks only at the local store, the way [`Index::scan`] does
 //! with `remote` unset: no lock, no pull, no bucket listing, no write.
 
 use std::cell::RefCell;
@@ -23,15 +41,54 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use super::body::{DecisionBody, Recipient};
+use super::body::{BasisRef, DecisionBody, Recipient, Target};
 use super::chain;
+use super::decider::Decider;
 use super::read::{self, Entry};
-use super::standing::Index;
+use super::standing::{self, Index};
 use super::FORMAT_VERSION;
 use crate::session::{origin, Backend};
 
 /// Set in a test to have `report` say on stderr when it scans the store.
 pub const SCAN_PROBE_ENV: &str = "KOTO_TEST_QUESTIONS_SCAN_PROBE";
+
+/// The most open questions one raising session, with the sessions it
+/// continues, holds waiting on a person, across every handle.
+pub const PERSON_LIMIT: usize = 20;
+
+/// Why an entry aimed at a question doesn't count.
+pub mod reasons {
+    /// A session's answer from a session that isn't, and doesn't
+    /// continue, the session or anchor the question waits on now.
+    pub const NOT_ADDRESSEE: &str = "not_addressee";
+    /// A session's answer to a question that waits on a person now.
+    pub const WAITS_ON_PERSON: &str = "waits_on_person";
+    /// A settle or a withdrawal recorded outside the raiser and the
+    /// sessions continuing it.
+    pub const NOT_RAISER: &str = "not_raiser";
+    /// A settle or a withdrawal by a person decider.
+    pub const PERSON_DECIDER: &str = "person_decider";
+    /// A withdrawal with no reason.
+    pub const NO_REASON: &str = "no_reason";
+    /// A settle of a `credential` or `reserved-step` need.
+    pub const NEED: &str = "need_not_settleable";
+    /// A settle without the evidence its question needs.
+    pub const SETTLE_BASIS: &str = "settle_basis";
+    /// An entry whose question isn't in the local store, or isn't a
+    /// question.
+    pub const NO_QUESTION: &str = "no_question";
+    /// An entry written in a fenced session after its fence: it reads
+    /// `refused` and counts toward nothing.
+    pub const AFTER_FENCE: &str = "after_fence";
+    /// A pass-up to a session or anchor other than the dispatcher it
+    /// recorded.
+    pub const DESTINATION: &str = "destination";
+    /// A pass-up the history's ordering leaves out: one recorded by a
+    /// session that was neither the raiser nor the addressee at that
+    /// point, one naming the addressee the question already had, or the
+    /// later of two written against the same addressee.
+    pub const SKIPPED: &str = "skipped";
+}
 
 /// A question's identity: `<raiser's session id>/<decision id>`.
 pub fn identity(body: &DecisionBody) -> String {
@@ -59,37 +116,46 @@ pub fn is_question(body: &DecisionBody) -> bool {
         )
 }
 
-/// The questions the run's decisions cite an answer of, as `(raiser's
-/// session id, question id)`.
-///
-/// A basis entry names a session only by name, and a name can be reused
-/// after its session is removed, so each citation is resolved by reading
-/// the cited decision: it counts only when it is an `answered` answer and
-/// was recorded no later than the decision citing it. A later session that
-/// reuses the name, and an id, therefore never stands in for the answer
-/// that was cited.
-fn cited_questions(backend: &Backend, decisions: &[&DecisionBody]) -> BTreeSet<(String, String)> {
-    let mut sessions: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
-    let mut out = BTreeSet::new();
-    for d in decisions {
-        for c in &d.basis {
-            let entries = sessions
-                .entry(c.session.clone())
-                .or_insert_with(|| read::read_session_with(backend, &c.session, false));
-            let cited = entries.iter().find_map(|e| match e {
-                Entry::Decision(b) if b.id == c.id => Some(&**b),
-                _ => None,
-            });
-            let Some(a) = cited else { continue };
-            if a.kind != "answer" || a.outcome != "answered" || a.time > d.time {
-                continue;
-            }
-            if let Some(t) = &a.target {
-                out.insert((t.id.clone(), t.decision.clone()));
-            }
-        }
+/// What a question asks for: its `need` subject field, or `decision` for
+/// one raised without it.
+pub fn need_of(question: &DecisionBody) -> &str {
+    subject_str(question, "need").unwrap_or("decision")
+}
+
+/// Whether `question` is a need its raiser can't settle for itself.
+pub fn unsettleable(question: &DecisionBody) -> bool {
+    need_of(question) != "decision"
+}
+
+/// A question's `label` subject field, when it has one.
+pub fn label_of(question: &DecisionBody) -> Option<&str> {
+    subject_str(question, "label")
+}
+
+/// The handle of a person decider.
+pub fn person_handle(body: &DecisionBody) -> Option<&str> {
+    match &body.decider {
+        Decider::Person { handle, .. } => Some(handle.value.as_str()),
+        _ => None,
     }
-    out
+}
+
+fn same(a: &DecisionBody, b: &DecisionBody) -> bool {
+    a.session.id == b.session.id && a.id == b.id
+}
+
+fn order_key(b: &DecisionBody) -> (&str, &str, &str) {
+    (&b.time, &b.session.name, &b.id)
+}
+
+/// `bodies` with each decision once, by identity: a copy held in a second
+/// session is the same entry.
+fn distinct(bodies: Vec<&DecisionBody>) -> Vec<&DecisionBody> {
+    let mut seen = BTreeSet::new();
+    bodies
+        .into_iter()
+        .filter(|b| seen.insert((b.session.id.clone(), b.id.clone())))
+        .collect()
 }
 
 /// The names each session stands for: itself and the earlier members of
@@ -108,6 +174,11 @@ impl<'a> Runs<'a> {
         }
     }
 
+    /// The backend the runs are read from.
+    pub fn backend(&self) -> &'a Backend {
+        self.backend
+    }
+
     /// `name` and every session it continues.
     pub fn stands_for(&self, name: &str) -> Vec<String> {
         if let Some(hit) = self.cache.borrow().get(name) {
@@ -122,6 +193,23 @@ impl<'a> Runs<'a> {
     }
 }
 
+/// Whether the session `recorder` (whose header id is `recorder_id`) is
+/// `question`'s raiser, by session id, or continues it.
+pub fn raised_by(runs: &Runs, question: &DecisionBody, recorder: &str, recorder_id: &str) -> bool {
+    // The question is read from the raiser's own directory, so the session
+    // now holding the raiser's name is the raiser.
+    recorder_id == question.session.id
+        || runs.stands_for(recorder)[1..].contains(&question.session.name)
+}
+
+/// Whether the session `recorder` is, or continues, the session or anchor
+/// `current` names.
+pub fn addressed_to(runs: &Runs, current: &Recipient, recorder: &str) -> bool {
+    runs.stands_for(recorder)
+        .iter()
+        .any(|s| waits_on_session(current, s))
+}
+
 /// Whether the session `recorder` (whose header id is `recorder_id`) may
 /// pass `question` up while it waits on `current`: the recorder is the
 /// raiser (by session id) or continues it, or it is, or continues, the
@@ -133,14 +221,73 @@ pub fn may_pass(
     recorder: &str,
     recorder_id: &str,
 ) -> bool {
-    if recorder_id == question.session.id {
-        return true;
+    raised_by(runs, question, recorder, recorder_id) || addressed_to(runs, current, recorder)
+}
+
+/// The dispatcher the destination rule accepts for a pass-up recorded in
+/// `recorder`: the session its nearest dispatched-by link names, or, for a
+/// successor with no link of its own, that of the nearest session it
+/// continues that has one.
+pub fn dispatcher_for(backend: &Backend, recorder: &str) -> Option<String> {
+    chain::dispatcher(backend, recorder).or_else(|| {
+        chain::run_predecessors(backend, recorder)
+            .iter()
+            .find_map(|p| chain::dispatcher(backend, p))
+    })
+}
+
+/// The dispatcher a stored pass-up was judged against when it was
+/// written: its `dispatcher` subject field, or, for a pass-up written
+/// before koto recorded one, the dispatcher its authority names.
+fn recorded_dispatcher(pass: &DecisionBody) -> Option<&str> {
+    subject_str(pass, "dispatcher").or_else(|| {
+        let d = pass.authority.dispatcher.as_str();
+        (!d.is_empty() && d != "none").then_some(d)
+    })
+}
+
+/// Whether a pass-up's destination keeps the rule: a person, or the
+/// session or anchor its recorded dispatcher names. Judged from what the
+/// entry recorded, so a later change to the recorder's links moves no
+/// question.
+pub fn destination_ok(to: &Recipient, dispatcher: Option<&str>) -> bool {
+    match to {
+        Recipient::Person(_) => true,
+        Recipient::Session(n) | Recipient::Anchor(n) => dispatcher == Some(n.as_str()),
+        Recipient::Untyped(_) => false,
     }
-    let stands = runs.stands_for(recorder);
-    // The question is read from the raiser's own directory, so the session
-    // now holding the raiser's name is the raiser.
-    stands[1..].contains(&question.session.name)
-        || stands.iter().any(|s| waits_on_session(current, s))
+}
+
+/// The addressee history and the pass-ups that built it; see
+/// [`addressees`].
+fn walk<'i>(
+    index: &'i Index,
+    runs: &Runs,
+    question: &DecisionBody,
+) -> (Vec<Recipient>, Vec<&'i DecisionBody>) {
+    let Some(first) = recipient_of(question) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut history = vec![first];
+    let mut applied = Vec::new();
+    let mut pending = distinct(index.readdresses_of(&question.session.id, &question.id));
+    loop {
+        let current = history
+            .last()
+            .expect("the history starts with one recipient");
+        let next = pending.iter().position(|r| {
+            recipient_of(r).is_some_and(|to| {
+                !matches!(to, Recipient::Untyped(_))
+                    && &to != current
+                    && destination_ok(&to, recorded_dispatcher(r))
+            }) && may_pass(runs, question, current, &r.session.name, &r.session.id)
+        });
+        let Some(i) = next else { break };
+        let r = pending.remove(i);
+        history.push(recipient_of(r).expect("checked above"));
+        applied.push(r);
+    }
+    (history, applied)
 }
 
 /// The recipients `question` has had, in order: the one it was raised
@@ -149,56 +296,34 @@ pub fn may_pass(
 ///
 /// The history is built by causality, not by clock: it repeatedly applies
 /// the earliest (time, then the recording session's name, then id) pass-up
-/// not yet applied that [`may_pass`] accepts against the current addressee
-/// and that names a typed recipient other than it, until none applies. A
-/// pass-up whose recorded time sorts before the one it depends on is still
-/// applied once that one is. The tie-break only decides between two
-/// pass-ups that are both valid against the same addressee, which can only
-/// happen when they were written at once; the later one is then skipped,
-/// so the history stays a single line.
+/// not yet applied that [`may_pass`] accepts against the current addressee,
+/// that names a typed recipient other than it, and whose destination keeps
+/// the rule ([`destination_ok`]), until none applies. A pass-up whose
+/// recorded time sorts before the one it depends on is still applied once
+/// that one is. The tie-break only decides between two pass-ups that are
+/// both valid against the same addressee, which can only happen when they
+/// were written at once; the later one is then skipped, so the history
+/// stays a single line.
 pub fn addressees(index: &Index, runs: &Runs, question: &DecisionBody) -> Vec<Recipient> {
-    history(index, runs, question)
-        .into_iter()
-        .map(|(r, _)| r)
-        .collect()
-}
-
-/// [`addressees`] with the pass-up that moved the question to each
-/// recipient: `None` for the first, which it was raised with.
-fn history<'i>(
-    index: &'i Index,
-    runs: &Runs,
-    question: &DecisionBody,
-) -> Vec<(Recipient, Option<&'i DecisionBody>)> {
-    let Some(first) = recipient_of(question) else {
-        return Vec::new();
-    };
-    let mut out = vec![(first, None)];
-    let mut pending = index.readdresses_of(&question.session.id, &question.id);
-    loop {
-        let (current, _) = out.last().expect("the history starts with one recipient");
-        let next = pending.iter().position(|r| {
-            recipient_of(r).is_some_and(|to| !matches!(to, Recipient::Untyped(_)) && &to != current)
-                && may_pass(runs, question, current, &r.session.name, &r.session.id)
-        });
-        let Some(i) = next else { break };
-        let r = pending.remove(i);
-        out.push((recipient_of(r).expect("checked above"), Some(r)));
-    }
-    out
+    walk(index, runs, question).0
 }
 
 /// The addressee history as `<kind>:<name>` strings, for an error message.
 pub fn history_labels(index: &Index, runs: &Runs, question: &DecisionBody) -> Vec<String> {
     addressees(index, runs, question)
         .iter()
-        .map(|r| match r {
-            Recipient::Session(n) => format!("session:{n}"),
-            Recipient::Anchor(n) => format!("anchor:{n}"),
-            Recipient::Person(h) => format!("person:{h}"),
-            Recipient::Untyped(v) => v.clone(),
-        })
+        .map(label)
         .collect()
+}
+
+/// A recipient as `<kind>:<name>`.
+pub fn label(r: &Recipient) -> String {
+    match r {
+        Recipient::Session(n) => format!("session:{n}"),
+        Recipient::Anchor(n) => format!("anchor:{n}"),
+        Recipient::Person(h) => format!("person:{h}"),
+        Recipient::Untyped(v) => v.clone(),
+    }
 }
 
 /// Whether `recipient` names the session or anchor called `name`.
@@ -206,57 +331,605 @@ pub fn waits_on_session(recipient: &Recipient, name: &str) -> bool {
     matches!(recipient, Recipient::Session(n) | Recipient::Anchor(n) if n == name)
 }
 
-/// Whether `b` is a question that still stands: an `escalate` with a
-/// typed recipient whose status is in effect (not reversed, not past a
-/// fence).
-fn stands(index: &Index, b: &DecisionBody) -> bool {
-    is_question(b) && index.status(b) == "in-effect"
+/// Whether `answer` is a person's answer this host verified: an
+/// `answered` answer by a person decider carrying a prompt that the
+/// host-local note of one of its holders lists. A copy that arrived by
+/// import or by a pull reads as a remote session's answer instead, and is
+/// judged as an answer of the session holding it.
+pub fn verified_person(index: &Index, backend: &Backend, answer: &DecisionBody) -> bool {
+    answer.kind == "answer"
+        && answer.outcome == "answered"
+        && answer.prompt.is_some()
+        && person_handle(answer).is_some()
+        && index
+            .holders(answer)
+            .iter()
+            .any(|h| standing::verified_in(backend, h, answer))
 }
 
-/// The answer in effect for `question`: the earliest `answered` answer
-/// aimed at it, by time, then the answering session's name, then id.
-pub fn answer_in_effect<'i>(index: &'i Index, question: &DecisionBody) -> Option<&'i DecisionBody> {
-    index
-        .answers_of(&question.session.id, &question.id)
+/// The person answer in effect among `persons`: the one no other of them
+/// cites in its basis, the later by time (then session name, then id) when
+/// several are uncited, and the later of all of them when every one is
+/// cited.
+fn person_winner<'i>(persons: &[&'i DecisionBody]) -> Option<&'i DecisionBody> {
+    let cites = |by: &DecisionBody, p: &DecisionBody| {
+        by.basis
+            .iter()
+            .any(|c| c.id == p.id && c.session == p.session.name)
+    };
+    let uncited: Vec<&'i DecisionBody> = persons
+        .iter()
+        .copied()
+        .filter(|p| !persons.iter().any(|o| !same(o, p) && cites(o, p)))
+        .collect();
+    let pool = if uncited.is_empty() {
+        persons.to_vec()
+    } else {
+        uncited
+    };
+    pool.into_iter()
+        .max_by(|a, b| order_key(a).cmp(&order_key(b)))
+}
+
+/// The verified person answer in effect on the question whose identity is
+/// `(raiser's session id, question id)`, if any.
+pub fn person_in_effect<'i>(
+    index: &'i Index,
+    backend: &Backend,
+    session_id: &str,
+    id: &str,
+) -> Option<&'i DecisionBody> {
+    let persons: Vec<&DecisionBody> = distinct(index.answers_of(session_id, id))
         .into_iter()
-        .next()
+        .filter(|a| verified_person(index, backend, a))
+        .collect();
+    person_winner(&persons)
 }
 
-/// Whether `b` is an open question: one that stands with no answer in
-/// effect.
+/// The question `target` names, as the local store holds it: read from
+/// the raiser's directory when its session id matches, else from any copy
+/// carrying that identity.
+pub fn question_of<'i>(index: &'i Index, target: &Target) -> Option<&'i DecisionBody> {
+    let matches = |b: &DecisionBody| b.session.id == target.id && b.id == target.decision;
+    if let Some(Entry::Decision(b)) = index.find(&target.name, &target.decision) {
+        if matches(b) {
+            return Some(b);
+        }
+    }
+    index.sessions().values().flatten().find_map(|e| match e {
+        Entry::Decision(b) if matches(b) => Some(&**b),
+        _ => None,
+    })
+}
+
+/// Why a settle of `question` doesn't stand, or `Ok` when it does.
 ///
-/// This is koto's one test of open. The open reads, the terminal tick's
-/// retention, the retention engine's keepers and the cleanup refusal all
-/// come here (the last three through [`raised_open`] and [`holds_of`]), so
-/// a change to what counts as open, or to which answer is in effect,
-/// reaches every one of them at once.
-pub fn is_open(index: &Index, b: &DecisionBody) -> bool {
-    stands(index, b) && answer_in_effect(index, b).is_none()
+/// A question that waits on `person:<h>` now is settled only from a basis
+/// naming a verified answer of `<h>`'s that is in effect on another
+/// question carrying the same `label`. One that waits on a session or
+/// anchor is settled from a basis naming a decision that reads back and
+/// is neither the question itself nor an entry aimed at it, or an `event`
+/// evidence pointer. A cited person answer stands only while the question
+/// it answers reads in effect, so reversing that question withdraws the
+/// basis. A cited decision recorded after `at` (the
+/// settle's time) is never taken for the one cited, so a later session
+/// reusing a removed session's name, and an id, stands in for nothing.
+pub fn settle_basis(
+    index: &Index,
+    backend: &Backend,
+    question: &DecisionBody,
+    current: &Recipient,
+    basis: &[BasisRef],
+    evidence: &[Value],
+    at: &str,
+) -> Result<(), String> {
+    let cited = |c: &BasisRef| match index.find(&c.session, &c.id) {
+        Some(Entry::Decision(b)) if b.time.as_str() <= at => Some(&**b),
+        _ => None,
+    };
+    let Recipient::Person(handle) = current else {
+        let event = evidence
+            .iter()
+            .any(|e| e.get("kind").and_then(Value::as_str) == Some("event"));
+        if event {
+            return Ok(());
+        }
+        // The question itself, and an entry aimed at it (an answer, a
+        // settle, a withdrawal, a pass-up or a reversal of it), are about
+        // the question, not evidence for its answer.
+        let about_question = |b: &DecisionBody| {
+            same(b, question)
+                || b.target
+                    .as_ref()
+                    .is_some_and(|t| t.id == question.session.id && t.decision == question.id)
+        };
+        let mut why = Vec::new();
+        for c in basis {
+            let named = format!("{}:{}", c.session, c.id);
+            match cited(c) {
+                None => why.push(format!("{named} doesn't read back")),
+                Some(b) if same(b, question) => why.push(format!("{named} is the question itself")),
+                Some(b) if about_question(b) => {
+                    why.push(format!("{named} is an entry aimed at the question"))
+                }
+                Some(_) => return Ok(()),
+            }
+        }
+        let tail = if why.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", why.join("; "))
+        };
+        return Err(format!(
+            "a settle of a question waiting on {} needs a --basis naming a decision that reads \
+             back and isn't the question or an entry aimed at it, or an --evidence \
+             event:<session>:<seq> pointer{tail}",
+            label(current)
+        ));
+    };
+    let Some(own_label) = label_of(question) else {
+        return Err(format!(
+            "the question waits on person:{handle} and has no label, so no answer to another \
+             question settles it"
+        ));
+    };
+    if basis.is_empty() {
+        return Err(format!(
+            "a settle of a question waiting on person:{handle} needs a --basis naming an answer \
+             of person:{handle}'s that is in effect on a question labelled '{own_label}'"
+        ));
+    }
+    let mut why = Vec::new();
+    for c in basis {
+        let named = format!("{}:{}", c.session, c.id);
+        let Some(a) = cited(c) else {
+            why.push(format!("{named} doesn't read back"));
+            continue;
+        };
+        if a.kind != "answer" || a.outcome != "answered" || a.prompt.is_none() {
+            why.push(format!("{named} isn't a person's answer"));
+            continue;
+        }
+        match person_handle(a) {
+            Some(h) if h == handle => {}
+            Some(h) => {
+                why.push(format!(
+                    "{named} is an answer of person:{h}, not person:{handle}"
+                ));
+                continue;
+            }
+            None => {
+                why.push(format!("{named} isn't a person's answer"));
+                continue;
+            }
+        }
+        if !standing::verified_in(backend, &c.session, a) {
+            why.push(format!("{named} reads as a remote session's answer"));
+            continue;
+        }
+        let Some(t) = &a.target else {
+            why.push(format!("{named} answers no question"));
+            continue;
+        };
+        if person_in_effect(index, backend, &t.id, &t.decision).is_none_or(|w| !same(w, a)) {
+            why.push(format!(
+                "{named} isn't the answer in effect on its own question"
+            ));
+            continue;
+        }
+        let Some(answered) = question_of(index, t) else {
+            why.push(format!("{named} answers a question this host doesn't hold"));
+            continue;
+        };
+        let status = index.status(answered);
+        if status != "in-effect" {
+            why.push(format!(
+                "{named} answers a question that reads '{status}', not in effect"
+            ));
+            continue;
+        }
+        match label_of(answered) {
+            Some(l) if l == own_label => return Ok(()),
+            Some(l) => why.push(format!(
+                "{named} answers a question labelled '{l}', not '{own_label}'"
+            )),
+            None => why.push(format!("{named} answers a question with no label")),
+        }
+    }
+    Err(format!(
+        "no --basis settles a question waiting on person:{handle}: {}",
+        why.join("; ")
+    ))
 }
 
-/// The open questions in the local store: in-effect escalations with a
-/// typed recipient that no answer has closed, each with its addressee
-/// history, sorted by time, then the raising session's name, then id.
-fn open_questions<'i>(index: &'i Index, runs: &Runs) -> Vec<(&'i DecisionBody, Vec<Recipient>)> {
-    let mut found: Vec<(&DecisionBody, Vec<Recipient>)> = index
-        .sessions()
-        .values()
-        .flatten()
-        .filter_map(|e| match e {
-            Entry::Decision(b) => Some(&**b),
-            Entry::Unreadable { .. } => None,
+/// One closing entry, judged.
+#[derive(Debug, Clone)]
+pub struct Judged<'i> {
+    pub entry: &'i DecisionBody,
+    pub counted: bool,
+    pub reason: Option<&'static str>,
+    /// A verified person answer.
+    pub person: bool,
+}
+
+/// What [`resolve`] works out for one question.
+#[derive(Debug, Clone)]
+pub struct Resolution<'i> {
+    /// The recipients the question has had; the last is the one it waits
+    /// on now.
+    pub history: Vec<Recipient>,
+    /// The pass-ups that built the history.
+    pub applied: Vec<&'i DecisionBody>,
+    /// Every answer aimed at the question, once each, judged.
+    pub closing: Vec<Judged<'i>>,
+    /// The closing entry in effect: `None` while the question is open.
+    pub in_effect: Option<&'i DecisionBody>,
+}
+
+impl Resolution<'_> {
+    /// The recipient the question waits on now.
+    pub fn current(&self) -> Option<&Recipient> {
+        self.history.last()
+    }
+}
+
+/// Judge one closing entry of `question`, whose current addressee is
+/// `current`: whether it counts, why not, and whether it is a verified
+/// person answer.
+fn judge_closing(
+    index: &Index,
+    runs: &Runs,
+    question: &DecisionBody,
+    current: &Recipient,
+    e: &DecisionBody,
+) -> (bool, Option<&'static str>, bool) {
+    let backend = runs.backend();
+    let holders = index.holders(e);
+    match e.outcome.as_str() {
+        "answered" => {
+            if verified_person(index, backend, e) {
+                return (true, None, true);
+            }
+            if matches!(current, Recipient::Person(_)) {
+                return (false, Some(reasons::WAITS_ON_PERSON), false);
+            }
+            if holders.iter().any(|h| addressed_to(runs, current, h)) {
+                (true, None, false)
+            } else {
+                (false, Some(reasons::NOT_ADDRESSEE), false)
+            }
+        }
+        "withdrawn" | "settled" => {
+            if !holders
+                .iter()
+                .any(|h| raised_by(runs, question, h, &e.session.id))
+            {
+                return (false, Some(reasons::NOT_RAISER), false);
+            }
+            if person_handle(e).is_some() {
+                return (false, Some(reasons::PERSON_DECIDER), false);
+            }
+            if e.outcome == "withdrawn" {
+                return if e.reason.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+                    (true, None, false)
+                } else {
+                    (false, Some(reasons::NO_REASON), false)
+                };
+            }
+            if unsettleable(question) {
+                return (false, Some(reasons::NEED), false);
+            }
+            match settle_basis(
+                index,
+                backend,
+                question,
+                current,
+                &e.basis,
+                &e.evidence,
+                &e.time,
+            ) {
+                Ok(()) => (true, None, false),
+                Err(_) => (false, Some(reasons::SETTLE_BASIS), false),
+            }
+        }
+        _ => (false, Some(reasons::NO_QUESTION), false),
+    }
+}
+
+/// Work out `question`'s addressee history, which entries aimed at it
+/// count, and which one is in effect. This is koto's one computation of
+/// what closes a question: every open read, the `koto next` report, the
+/// `counted` and `governs` fields of a listing and every writer's check
+/// apply it.
+pub fn resolve<'i>(index: &'i Index, runs: &Runs, question: &DecisionBody) -> Resolution<'i> {
+    let (history, applied) = walk(index, runs, question);
+    let Some(current) = history.last().cloned() else {
+        return Resolution {
+            history,
+            applied,
+            closing: Vec::new(),
+            in_effect: None,
+        };
+    };
+    let closing: Vec<Judged> = distinct(index.answers_of(&question.session.id, &question.id))
+        .into_iter()
+        .map(|e| {
+            let (counted, reason, person) = judge_closing(index, runs, question, &current, e);
+            Judged {
+                entry: e,
+                counted,
+                reason,
+                person,
+            }
         })
-        .filter(|b| is_open(index, b))
+        .collect();
+    let persons: Vec<&DecisionBody> = closing
+        .iter()
+        .filter(|j| j.counted && j.person)
+        .map(|j| j.entry)
+        .collect();
+    let in_effect = person_winner(&persons).or_else(|| {
+        closing
+            .iter()
+            .filter(|j| j.counted)
+            .map(|j| j.entry)
+            .min_by(|a, b| order_key(a).cmp(&order_key(b)))
+    });
+    Resolution {
+        history,
+        applied,
+        closing,
+        in_effect,
+    }
+}
+
+/// The closing entry in effect on `question` (an `answered`, `settled` or
+/// `withdrawn` answer that counts and wins under [`resolve`]), or `None`
+/// while nothing closes it.
+///
+/// This is the public entry point for "what closes this question". Every
+/// caller outside this module that needs it calls this, never its own
+/// reading of the aimed entries: retention and cleanup call it, as the open
+/// reads and the `koto next` report do. [`Index::answers_of`] returns every
+/// entry aimed at a question, whatever its outcome and whether it counts,
+/// so taking the first of them as closing is wrong.
+pub fn answer_in_effect<'i>(
+    index: &'i Index,
+    runs: &Runs,
+    question: &DecisionBody,
+) -> Option<&'i DecisionBody> {
+    resolve(index, runs, question).in_effect
+}
+
+/// koto's one test of open: `body` is a question (an `escalate` with a
+/// typed recipient), it reads in effect, and [`answer_in_effect`] finds
+/// nothing closing it.
+///
+/// This is the public entry point for "is this question open". The open
+/// reads and the limit of twenty go through it, and retention and cleanup
+/// call it rather than a test of their own, so the rule has one place to
+/// change. The `koto next` report, which needs the closing entry itself,
+/// calls [`answer_in_effect`].
+pub fn is_open(index: &Index, runs: &Runs, body: &DecisionBody) -> bool {
+    is_question(body)
+        && index.status(body) == "in-effect"
+        && answer_in_effect(index, runs, body).is_none()
+}
+
+/// How a listing shows an `answer` or `readdress` entry: whether it counts
+/// toward its question, the reason when it doesn't, and, on an answer,
+/// whether it is the entry in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryJudgment {
+    pub counted: bool,
+    pub reason: Option<&'static str>,
+    pub governs: Option<bool>,
+}
+
+/// Judge the stored `answer` or `readdress` `body` against its question as
+/// the local store holds it now.
+pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> EntryJudgment {
+    let answer = body.kind == "answer";
+    if index.after_fence(body) {
+        return EntryJudgment {
+            counted: false,
+            reason: Some(reasons::AFTER_FENCE),
+            governs: answer.then_some(false),
+        };
+    }
+    let lost = EntryJudgment {
+        counted: false,
+        reason: Some(reasons::NO_QUESTION),
+        governs: answer.then_some(false),
+    };
+    let Some(question) = body.target.as_ref().and_then(|t| question_of(index, t)) else {
+        return lost;
+    };
+    if !is_question(question) {
+        return lost;
+    }
+    let runs = Runs::new(backend);
+    let r = resolve(index, &runs, question);
+    if answer {
+        let Some(j) = r.closing.iter().find(|j| same(j.entry, body)) else {
+            return lost;
+        };
+        return EntryJudgment {
+            counted: j.counted,
+            reason: j.reason,
+            governs: Some(r.in_effect.is_some_and(|w| same(w, body))),
+        };
+    }
+    if r.applied.iter().any(|p| same(p, body)) {
+        return EntryJudgment {
+            counted: true,
+            reason: None,
+            governs: None,
+        };
+    }
+    let destination =
+        recipient_of(body).is_some_and(|to| !destination_ok(&to, recorded_dispatcher(body)));
+    EntryJudgment {
+        counted: false,
+        reason: Some(if destination {
+            reasons::DESTINATION
+        } else {
+            reasons::SKIPPED
+        }),
+        governs: None,
+    }
+}
+
+fn decisions(index: &Index) -> impl Iterator<Item = &DecisionBody> {
+    index.sessions().values().flatten().filter_map(|e| match e {
+        Entry::Decision(b) => Some(&**b),
+        Entry::Unreadable { .. } => None,
+    })
+}
+
+/// The open questions in the local store, each with its addressee
+/// history, sorted by time, then the raising session's name, then id.
+/// Open is [`is_open`]'s test.
+fn open_questions<'i>(index: &'i Index, runs: &Runs) -> Vec<(&'i DecisionBody, Vec<Recipient>)> {
+    let mut seen = BTreeSet::new();
+    let mut found: Vec<(&DecisionBody, Vec<Recipient>)> = decisions(index)
+        .filter(|b| seen.insert((b.session.id.clone(), b.id.clone())))
+        .filter(|b| is_open(index, runs, b))
         .map(|b| (b, addressees(index, runs, b)))
         .collect();
-    found.sort_by(|(a, _), (b, _)| {
-        (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
-    });
+    found.sort_by(|(a, _), (b, _)| order_key(a).cmp(&order_key(b)));
     found
 }
 
-/// One element of an open read: the question, the recipient it was raised
-/// with, the one it waits on now and every one it has had.
+/// How many open questions ([`is_open`]) raised by the sessions whose ids
+/// are in `raisers` wait on a person now, across every handle, leaving out
+/// the question `except` names by `(raiser's session id, id)`.
+pub fn open_to_person(
+    index: &Index,
+    runs: &Runs,
+    raisers: &BTreeSet<String>,
+    except: Option<(&str, &str)>,
+) -> usize {
+    let mut seen = BTreeSet::new();
+    decisions(index)
+        .filter(|b| raisers.contains(&b.session.id))
+        .filter(|b| except != Some((b.session.id.as_str(), b.id.as_str())))
+        .filter(|b| seen.insert((b.session.id.clone(), b.id.clone())))
+        .filter(|b| is_open(index, runs, b))
+        .filter(|b| {
+            matches!(
+                addressees(index, runs, b).last(),
+                Some(Recipient::Person(_))
+            )
+        })
+        .count()
+}
+
+/// The run a question's raiser belongs to, as the limit of twenty counts
+/// it: the session ids this host holds for the raiser, the sessions it
+/// continues and the sessions that continue it, and the id of the run's
+/// earliest session, which keys the run's lock.
+pub struct Run {
+    pub ids: Vec<String>,
+    pub root: String,
+}
+
+/// The whole run of `raiser` (whose header id is `raiser_id`): its own
+/// session id, those of the sessions it continues
+/// ([`chain::run_predecessors`]) and those of the sessions that continue it
+/// ([`chain::run_successors`]), as far as this host holds them. A pass-up
+/// recorded by an addressee and an `escalate` recorded by a successor
+/// therefore count the same questions and take the same lock.
+pub fn run_ids(backend: &Backend, raiser: &str, raiser_id: &str) -> Run {
+    let mut ids = vec![raiser_id.to_string()];
+    let mut root = raiser_id.to_string();
+    for p in chain::run_predecessors(backend, raiser) {
+        if let Some(id) = read::local_session_id(backend, &p) {
+            if !ids.contains(&id) {
+                ids.push(id.clone());
+            }
+            root = id;
+        }
+    }
+    for s in chain::run_successors(backend, raiser) {
+        if let Some(id) = read::local_session_id(backend, &s) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    Run { ids, root }
+}
+
+/// The directory under the koto root that holds the limit's locks, one file
+/// per run. The files are never removed: each is empty, and one left by a
+/// run that has ended only costs a directory entry.
+pub const PERSON_LIMIT_LOCKS_DIR: &str = "person-limit";
+
+/// How long a writer waits for another writer of the same run to release
+/// the limit's lock before it refuses.
+pub const PERSON_LIMIT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The limit's lock on one run, held until dropped.
+pub struct LimitLock {
+    _file: std::fs::File,
+}
+
+/// Take the limit's lock for the run whose earliest session id is `root`
+/// ([`Run::root`]), waiting at most [`PERSON_LIMIT_LOCK_WAIT`]. A writer
+/// that would add a question waiting on a person holds it from the count to
+/// the write, so two writers on this host can't both count nineteen and
+/// both write. Every member of a run keys it by the same earliest session,
+/// so a successor, the sessions it continues and an addressee passing up
+/// one of their questions share it. It is a file under the koto root,
+/// outside every session's synced files, and serializes writers on this
+/// host only. A lock still held when the wait ends is an error of kind
+/// `TimedOut` naming the file.
+pub fn lock_person_limit(home: &std::path::Path, root: &str) -> std::io::Result<LimitLock> {
+    use sha2::{Digest, Sha256};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = home.join(PERSON_LIMIT_LOCKS_DIR);
+    crate::koto_home::ensure_private_root(&dir)?;
+    let path = dir.join(hex::encode(Sha256::digest(root.as_bytes())));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let deadline = std::time::Instant::now() + PERSON_LIMIT_LOCK_WAIT;
+    loop {
+        // SAFETY: flock on a descriptor borrowed from `file`, which
+        // outlives the call; the lock is released when `file` closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(LimitLock { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {}
+            _ => return Err(err),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "another koto command has held {} for more than {} seconds",
+                    path.display(),
+                    PERSON_LIMIT_LOCK_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// One element of an open read: the question, what it asks for, the
+/// recipient it was raised with, the one it waits on now and every one it
+/// has had.
 fn element(b: &DecisionBody, history: &[Recipient]) -> Value {
     json!({
         "identity": identity(b),
@@ -264,6 +937,7 @@ fn element(b: &DecisionBody, history: &[Recipient]) -> Value {
         "id": b.id,
         "question": subject_str(b, "question"),
         "text": subject_str(b, "text"),
+        "need": need_of(b),
         "recipient": recipient_of(b).map(|r| r.to_json()),
         "addressee": history.last().map(Recipient::to_json),
         "addressees": history.iter().map(Recipient::to_json).collect::<Vec<_>>(),
@@ -344,22 +1018,48 @@ pub fn open_at(backend: &Backend, position: &str) -> Value {
     })
 }
 
+/// The decisions the run's decisions cite, as `(session id, id)` of the
+/// cited body.
+///
+/// A basis entry names a session only by name, and a name can be reused
+/// after its session is removed, so each citation is resolved by reading
+/// the cited decision: it counts only when it was recorded no later than
+/// the decision citing it. A later session that reuses the name, and an
+/// id, therefore never stands in for the decision that was cited.
+fn cited(index: &Index, decisions: &[&DecisionBody]) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    for d in decisions {
+        for c in &d.basis {
+            if let Some(Entry::Decision(a)) = index.find(&c.session, &c.id) {
+                if a.time <= d.time {
+                    out.insert((a.session.id.clone(), a.id.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The `questions` array `koto next <session>` carries, or `None` when it
 /// carries none.
 ///
 /// The questions reported are the ones raised in `session` or in an
 /// earlier member of its run (its confirmed predecessors through koto's
-/// succession) that an answer has closed and that no decision in the run
-/// cites yet: a decision whose `basis` names an answer of the question,
-/// recorded no later than that decision, ends the report. Each element
-/// names the answer in effect.
+/// succession) whose entry in effect is an `answered` answer that no
+/// decision in the run cites yet: a decision whose `basis` names that
+/// entry, recorded no later than that decision, ends the report. The
+/// report follows the entry in effect, so a raiser that cited a session's
+/// answer is told again when a person's answer later governs. A question
+/// the run closed itself, by a `settled` or `withdrawn` entry, isn't
+/// reported, and an entry that doesn't count never is.
 ///
-/// The store is scanned only while the run holds a question no decision
-/// in it has cited an answer of. A run with no question, or with only
-/// untyped escalations, or whose every question is cited, costs a read of
-/// its own decision directories, its continues link and the decisions it
-/// cites, and nothing more. The read never writes, never takes a lock and
-/// makes no network call, so it never blocks the tick it rides on.
+/// The store is scanned whenever the run holds a question: one read of
+/// every local session's decision directories per tick, since a person's
+/// answer can arrive in any session at any time and replace the one in
+/// effect. A run with no question, or with only untyped escalations,
+/// costs a read of its own decision directories and its continues link,
+/// and nothing more. The read never writes, never takes a lock and makes
+/// no network call, so it never blocks the tick it rides on.
 pub fn report(backend: &Backend, session: &str) -> Option<Value> {
     let mut run = vec![session.to_string()];
     run.extend(chain::run_predecessors(backend, session));
@@ -367,37 +1067,35 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
         .iter()
         .flat_map(|s| read::read_session_with(backend, s, false))
         .collect();
-    let decisions: Vec<&DecisionBody> = entries
+    let own: Vec<&DecisionBody> = entries
         .iter()
         .filter_map(|e| match e {
             Entry::Decision(b) => Some(&**b),
             Entry::Unreadable { .. } => None,
         })
         .collect();
-    if !decisions.iter().any(|b| is_question(b)) {
-        return None;
-    }
-    let cited = cited_questions(backend, &decisions);
-    let pending: Vec<&DecisionBody> = decisions
-        .iter()
-        .copied()
-        .filter(|q| is_question(q) && !cited.contains(&(q.session.id.clone(), q.id.clone())))
-        .collect();
-    if pending.is_empty() {
+    if !own.iter().any(|b| is_question(b)) {
         return None;
     }
     if std::env::var_os(SCAN_PROBE_ENV).is_some() {
         eprintln!("koto: questions: store scanned");
     }
     let index = Index::scan(backend, false);
+    let runs = Runs::new(backend);
+    let cited = cited(&index, &own);
     let mut out = Vec::new();
-    for q in pending {
-        if !stands(&index, q) {
+    for q in own.iter().copied().filter(|q| is_question(q)) {
+        if index.status(q) != "in-effect" {
             continue;
         }
-        let Some(answer) = answer_in_effect(&index, q) else {
+        let Some(answer) = answer_in_effect(&index, &runs, q) else {
             continue;
         };
+        if answer.outcome != "answered"
+            || cited.contains(&(answer.session.id.clone(), answer.id.clone()))
+        {
+            continue;
+        }
         let mut answer_json = json!({
             "session": answer.session.name,
             "id": answer.id,
@@ -412,7 +1110,7 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
             let here = index
                 .holders(answer)
                 .iter()
-                .any(|h| super::standing::verified_in(backend, h, answer));
+                .any(|h| standing::verified_in(backend, h, answer));
             answer_json["reading"] = json!(if here {
                 super::prompt::VERIFIED
             } else {
@@ -497,38 +1195,31 @@ fn decisions_in<'i>(index: &'i Index, session: &str) -> impl Iterator<Item = &'i
         })
 }
 
-/// The question `id` raised in the session whose header id is
-/// `session_id`, when that session is in the store.
-fn question_of<'i>(index: &'i Index, session_id: &str, id: &str) -> Option<&'i DecisionBody> {
-    index.sessions().values().flatten().find_map(|e| match e {
-        Entry::Decision(b) if b.session.id == session_id && b.id == id && is_question(b) => {
-            Some(&**b)
-        }
-        _ => None,
-    })
+/// The question `target` names, when the local store holds it and it is
+/// a question: [`question_of`], narrowed to questions.
+fn aimed_question<'i>(index: &'i Index, target: &Target) -> Option<&'i DecisionBody> {
+    question_of(index, target).filter(|q| is_question(q))
 }
 
-fn same_entry(a: &DecisionBody, b: &DecisionBody) -> bool {
-    a.session.id == b.session.id && a.id == b.id
-}
-
-/// The identities of the open questions raised in session directory
-/// `session`, in the order it recorded them.
-pub fn raised_open(index: &Index, session: &str) -> Vec<String> {
+/// The identities of the open questions ([`is_open`]) raised in session
+/// directory `session`, in the order it recorded them.
+pub fn raised_open(index: &Index, runs: &Runs, session: &str) -> Vec<String> {
     decisions_in(index, session)
-        .filter(|b| is_open(index, b))
+        .filter(|b| is_open(index, runs, b))
         .map(identity)
         .collect()
 }
 
 /// Every question session directory `session` holds something of that its
-/// removal would lose: an open question it raised, the answer in effect
-/// for a question whose raiser is in the store, and a pass-up the current
-/// addressee of an open question rests on. Each is matched by identity,
+/// removal would lose: an open question it raised ([`is_open`]), the entry
+/// [`answer_in_effect`] names for a question whose raiser is in the store,
+/// and a counted pass-up (one [`resolve`] applied) the current addressee
+/// of an open question rests on. An entry that doesn't count, or that a
+/// person's answer outranks, holds nothing. Each is matched by identity,
 /// never by name, so an answer aimed at a removed session's id holds
 /// nothing once that session is gone, whatever now carries its name.
 pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
-    let mut out: Vec<Hold> = raised_open(index, session)
+    let mut out: Vec<Hold> = raised_open(index, runs, session)
         .into_iter()
         .map(|identity| Hold {
             identity,
@@ -546,18 +1237,25 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
             "readdress" => Held::PassUp,
             _ => continue,
         };
-        let Some(q) = question_of(index, &t.id, &t.decision) else {
+        let Some(q) = aimed_question(index, t) else {
             continue;
         };
         let holds = match held {
+            // The entry in effect, whatever its outcome, for a question in
+            // effect: an entry that doesn't count, or one outranked by a
+            // person's answer, holds nothing. A settle or a withdrawal the
+            // raiser recorded in its own directory goes with the question,
+            // so it holds nothing apart from it.
             Held::Answer => {
-                stands(index, q) && answer_in_effect(index, q).is_some_and(|a| same_entry(a, b))
+                b.session.id != q.session.id
+                    && index.status(q) == "in-effect"
+                    && answer_in_effect(index, runs, q).is_some_and(|a| same(a, b))
             }
+            // A counted pass-up (one the resolution applied to build the
+            // addressee history) of a question that is still open.
             Held::PassUp => {
-                is_open(index, q)
-                    && history(index, runs, q)
-                        .iter()
-                        .any(|(_, r)| r.is_some_and(|r| same_entry(r, b)))
+                is_open(index, runs, q)
+                    && resolve(index, runs, q).applied.iter().any(|r| same(r, b))
             }
             Held::Raised => false,
         };
@@ -600,7 +1298,7 @@ pub fn raised_open_in(backend: &Backend, session: &str) -> Vec<String> {
     if !may_hold(backend, session, false) {
         return Vec::new();
     }
-    raised_open(&Index::scan(backend, false), session)
+    raised_open(&Index::scan(backend, false), &Runs::new(backend), session)
 }
 
 /// What an explicit removal of a session would orphan, and what couldn't
@@ -684,8 +1382,7 @@ pub fn orphans(backend: &Backend, session: &str) -> Orphans {
     // holds under that question's session id, may rest on an open question.
     for b in decisions_in(&index, session) {
         let Some(t) = &b.target else { continue };
-        if !matches!(b.kind.as_str(), "answer" | "readdress")
-            || question_of(&index, &t.id, &t.decision).is_some()
+        if !matches!(b.kind.as_str(), "answer" | "readdress") || aimed_question(&index, t).is_some()
         {
             continue;
         }
@@ -775,11 +1472,12 @@ pub fn kept_for_raisers_text(holds: &[Hold]) -> String {
 /// for the retention engine; sessions that raised none are left out.
 pub fn open_by_session(backend: &Backend) -> BTreeMap<String, Vec<String>> {
     let index = Index::scan(backend, false);
+    let runs = Runs::new(backend);
     index
         .sessions()
         .keys()
         .filter_map(|s| {
-            let open = raised_open(&index, s);
+            let open = raised_open(&index, &runs, s);
             (!open.is_empty()).then(|| (s.clone(), open))
         })
         .collect()

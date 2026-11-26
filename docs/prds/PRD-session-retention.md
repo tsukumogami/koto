@@ -578,12 +578,15 @@ names only in passing.
 ### Questions
 
 A question is an `escalate` decision with a typed recipient, as the decision
-record defines it. It is open while it is in effect and no answer is in
-effect for it, decided by the same test every open read uses.
+record defines it. It is open exactly when the decision record says it is:
+in effect, with no answer, settle or withdrawal in effect for it. Which of
+those entries count, and which one is in effect, are the decision record's
+rules; retention adds none and reads them through the same test every open
+read uses. A withdrawn or settled question keeps nothing.
 
 - **R36. A session holding an open question keeps its hierarchy, with no
   expiry.** A session that raised a question still open is a keeper of its
-  hierarchy whether or not it is alive, until the question is answered,
+  hierarchy whether or not it is alive, until the question is closed,
   reversed or fenced; no retention period runs while it is open. At its
   terminal tick it is kept with or without `--no-cleanup`, with the reason
   `open_question` and the open questions' identities. The hierarchy query
@@ -601,8 +604,8 @@ effect for it, decided by the same test every open read uses.
   gives the reason `hierarchy`. A prune that can remove part of a component
   (`koto workspace prune --root`, and `koto session prune` with
   `--older-than` or `--execution-dir`) keeps a session holding the answer in
-  effect for a question, or a pass-up an open question's current addressee
-  rests on, while the question's raiser isn't removed in the same run, and
+  effect for a question, or a pass-up that counts and that an open
+  question's current addressee rests on, while the question's raiser isn't removed in the same run, and
   lists it with a detail naming the question; when both are removed in that
   run, both go.
 - **R38. The terminal tick learns of questions without a second scan for a
@@ -618,15 +621,18 @@ effect for it, decided by the same test every open read uses.
 - **R39. An explicit removal that would orphan a question is refused unless
   forced.** `koto session cleanup <name>` on a session that raised an open
   question, holds the answer in effect for a question whose raiser is in the
-  store, or holds a pass-up that the current addressee of an open question
-  rests on exits 2 with code `holds_question`, names each question's
+  store, or holds a pass-up that counts and that the current addressee of an
+  open question rests on exits 2 with code `holds_question`, names each question's
   identity and which of the three the session holds, names
   `koto session cleanup <name> --force`, and removes, stops and writes
   nothing. `koto cancel <name> --cleanup` on such a session is refused the
   same way before the cancel is written. A pinned session is refused for its
-  pin first, with or without `--force`. Holds are matched by identity: an
-  answer that isn't the one in effect, an answer whose raiser is gone and a
-  pass-up of a question since answered hold nothing. Both commands also
+  pin first, with or without `--force`. Holds are matched by identity and
+  judged by the decision record's rules as the removal runs, so these hold
+  nothing: a withdrawn or settled question; an answer that doesn't count; an
+  answer that counts but isn't the one in effect, as when a person's
+  verified answer outranks a session's; an answer whose raiser is gone; a
+  pass-up that doesn't count; and a pass-up of a question since closed. Both commands also
   refuse without `--force`, with the same code, when the session's own
   decisions can't be read or a question one of its aimed entries points at
   can't be read, and the message names what couldn't be read.
@@ -1121,9 +1127,12 @@ with q1's decision id.
   holding the answer in effect, `koto session cleanup B` is refused with
   `held: "answer"`, and `koto cancel B --cleanup` is refused the same way
   before the cancel is written. A pinned A is refused with code `pinned`,
-  with and without `--force`. A second answer to an answered question, and
-  an answer whose raiser was removed, are removed by a plain cleanup with
-  exit 0. A session whose decisions directory can't be read, and a holder
+  with and without `--force`. An answer that doesn't count, an answer
+  outranked by a person's verified answer, and an answer whose raiser was
+  removed are removed by a plain cleanup with exit 0, while the session
+  holding the outranking person's answer is refused with `held: "answer"`;
+  a raiser whose question was withdrawn or settled is removed at its
+  terminal tick. A session whose decisions directory can't be read, and a holder
   whose answer points at a question that can't be read in A, are refused
   with `holds_question` and a message naming what couldn't be read, and are
   removed with `--force` (R39).

@@ -14,6 +14,10 @@
 mod fake_s3;
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/prompt_fixture.rs"]
+mod prompt_fixture;
+
+use prompt_fixture as fx;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -254,8 +258,8 @@ impl Env {
     }
 
     /// Pass `q` up from `in_session` to `to`.
-    fn readdress(&self, q: &Rec, in_session: &str, to: &str) {
-        self.ok(&[
+    fn readdress(&self, q: &Rec, in_session: &str, to: &str) -> String {
+        let out = self.ok(&[
             "decisions",
             "readdress",
             &q.session,
@@ -264,6 +268,160 @@ impl Env {
             in_session,
             "--to",
             to,
+            "--by",
+            "session",
+        ]);
+        out.json()["id"].as_str().unwrap().to_string()
+    }
+
+    /// Where `holder` stores its entry `id` aimed at `q`.
+    fn aimed_path(&self, holder: &str, q: &Rec, id: &str) -> PathBuf {
+        self.sessions()
+            .join(holder)
+            .join("ctx/koto/aimed")
+            .join(&q.session_id)
+            .join(id)
+    }
+
+    fn stored(&self, holder: &str, q: &Rec, id: &str) -> Value {
+        serde_json::from_slice(&std::fs::read(self.aimed_path(holder, q, id)).unwrap()).unwrap()
+    }
+
+    /// Store `body` as `holder`'s entry `id` aimed at `q`, the way
+    /// `tests/decisions_precedence_test.rs` places an entry koto's commands
+    /// won't write.
+    fn plant(&self, holder: &str, q: &Rec, id: &str, body: &Value) {
+        let path = self.aimed_path(holder, q, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(body).unwrap()).unwrap();
+    }
+
+    /// `koto decisions show <holder> <id>`.
+    fn show(&self, holder: &str, id: &str) -> Value {
+        self.ok(&["decisions", "show", holder, id]).json()
+    }
+
+    /// Raise `question` in `name` to `recipient` with the content the
+    /// accepted prompt fixture shows stored for it, so a person's answer
+    /// can be recorded to it; the question and its prompt header.
+    fn raise_for_person(&self, name: &str, question: &str, recipient: &str) -> (Rec, String) {
+        let lines = fx::lines("accepted");
+        let (shown, labels) = fx::shown(&lines, 1);
+        let content = fx::content(&shown, &labels);
+        let q = format!("question={question}");
+        let t = format!("text=what about {question}?");
+        let r = format!("recipient={recipient}");
+        let packet = format!("packet={}", fx::packet(&content));
+        let out = self
+            .ok(&[
+                "decisions",
+                "record",
+                name,
+                "--kind",
+                "escalate",
+                "--outcome",
+                "escalated",
+                "--subject",
+                &q,
+                "--subject",
+                &t,
+                "--subject",
+                &r,
+                "--subject",
+                &packet,
+                "--by",
+                "session",
+            ])
+            .json();
+        let rec = Rec {
+            session: name.to_string(),
+            id: out["id"].as_str().unwrap().to_string(),
+            session_id: out["decision"]["session"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        };
+        let file = self.root.join(format!("content-{name}-{}", rec.id));
+        std::fs::write(&file, &content).unwrap();
+        let written = self
+            .ok(&[
+                "decisions",
+                "content",
+                "write",
+                name,
+                &rec.id,
+                "--file",
+                file.to_str().unwrap(),
+            ])
+            .json();
+        let header = written["prompt_header"].as_str().unwrap().to_string();
+        (rec, header)
+    }
+
+    /// Record `person:owner`'s verified answer to `q` in `in_session` from
+    /// the accepted fixture, installed as this thread's harness record
+    /// (the caller holds a [`fx::Records`]); its id.
+    fn person_answer(&self, q: &Rec, header: &str, in_session: &str) -> String {
+        let call = "toolu_ZQXMARKERretention01";
+        let lines = fx::with_call(&fx::lines("accepted"), call);
+        let harness = fx::harness();
+        fx::install(&harness, &fx::render(&lines, &harness, &[header]));
+        let pointer = format!("{harness}/{call}/1");
+        let out = self.run_env(
+            &[("CLAUDE_CODE_SESSION_ID", harness.as_str())],
+            &[
+                "decisions",
+                "answer",
+                &q.session,
+                &q.id,
+                "--in",
+                in_session,
+                "--by",
+                "person:owner",
+                "--prompt",
+                &pointer,
+            ],
+        );
+        assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+        out.json()["id"].as_str().unwrap().to_string()
+    }
+
+    /// `q`'s raiser withdraws it, recorded in `in_session`.
+    fn withdraw(&self, q: &Rec, in_session: &str, reason: &str) {
+        self.ok(&[
+            "decisions",
+            "answer",
+            &q.session,
+            &q.id,
+            "--in",
+            in_session,
+            "--outcome",
+            "withdrawn",
+            "--reason",
+            reason,
+            "--by",
+            "session",
+        ]);
+    }
+
+    /// `q`'s raiser settles it from `--evidence event:<raiser>:1`, recorded
+    /// in `in_session`: the evidence a question waiting on a session or
+    /// anchor takes.
+    fn settle_q(&self, q: &Rec, in_session: &str) {
+        let evidence = format!("event:{}:1", q.session);
+        self.ok(&[
+            "decisions",
+            "answer",
+            &q.session,
+            &q.id,
+            "--in",
+            in_session,
+            "--outcome",
+            "settled",
+            "--text",
+            "settled",
+            "--evidence",
+            &evidence,
             "--by",
             "session",
         ]);
@@ -664,7 +822,7 @@ fn the_terminal_tick_keeps_a_raiser_exactly_when_the_open_read_lists_its_questio
 
     // Answered.
     env.init("answered", &[]);
-    let q = env.escalate("answered", "q1", "person:owner");
+    let q = env.escalate("answered", "q1", "session:c");
     env.answer(&q, "c", "yes");
     check(&q, false);
 
@@ -682,7 +840,7 @@ fn an_answer_or_pass_up_aimed_at_a_question_joins_holder_and_raiser() {
     // An answer: holder and raiser are each kept with `hierarchy`.
     env.init("asker", &[]);
     env.init("answerer", &[]);
-    let q = env.escalate("asker", "q1", "person:owner");
+    let q = env.escalate("asker", "q1", "session:answerer");
     env.answer(&q, "answerer", "yes");
     assert_eq!(
         env.finish("answerer")["retention"],
@@ -722,7 +880,7 @@ fn a_terminal_raiser_kept_for_its_question_still_gets_the_answer() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     assert_eq!(env.finish("a")["retention"]["reason"], "open_question");
     env.answer(&q, "b", "SQLite");
 
@@ -821,15 +979,14 @@ fn a_hierarchy_holding_an_open_question_is_kept_by_every_prune() {
 fn the_hold_ends_with_the_question() {
     let env = Env::new();
     let q = held_pair(&env);
-    env.init("answerer", &[]);
-    env.answer(&q, "answerer", "yes");
-    env.finish_env(&FAST, "answerer");
-    settle();
+    // A session never answers a question waiting on a person: the raiser
+    // ends it by withdrawing it.
+    env.withdraw(&q, "raiser", "not needed");
 
     let preview = env.prune(&[]);
     assert_eq!(
         names_of(&preview["remove"]),
-        vec!["answerer", "passer", "raiser"],
+        vec!["passer", "raiser"],
         "{preview:#}"
     );
     assert!(
@@ -838,7 +995,7 @@ fn the_hold_ends_with_the_question() {
     );
 
     env.prune(&["--apply", "--all"]);
-    for name in ["answerer", "passer", "raiser"] {
+    for name in ["passer", "raiser"] {
         assert!(!env.exists(name), "{name} is still there");
     }
 }
@@ -903,7 +1060,7 @@ fn cleanup_refuses_the_holder_of_the_answer_in_effect_or_a_resting_pass_up() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("answerer", &[]);
-    let answered = env.escalate("a", "q1", "person:owner");
+    let answered = env.escalate("a", "q1", "session:answerer");
     env.answer(&answered, "answerer", "yes");
     let before = env.snapshot_all();
     let out = env.cleanup("answerer", &[]);
@@ -928,7 +1085,7 @@ fn cancel_cleanup_is_refused_before_the_cancel() {
     env.init("r", &[]);
     env.init("passer", &[]);
     let q = env.escalate("a", "q1", "person:owner");
-    let answered = env.escalate("a", "q2", "person:owner");
+    let answered = env.escalate("a", "q2", "session:answerer");
     env.answer(&answered, "answerer", "yes");
     let passed = env.escalate("r", "q1", "session:passer");
     env.readdress(&passed, "passer", "person:owner");
@@ -957,7 +1114,7 @@ fn the_refusal_follows_the_raisers_id_not_its_name() {
     env.init("answerer", &[]);
     let passed = env.escalate("a", "q1", "session:passer");
     env.readdress(&passed, "passer", "person:owner");
-    let answered = env.escalate("a", "q2", "person:owner");
+    let answered = env.escalate("a", "q2", "session:answerer");
     env.answer(&answered, "answerer", "yes");
 
     let out = env.cleanup("a", &["--force"]);
@@ -983,34 +1140,30 @@ fn the_refusal_follows_the_raisers_id_not_its_name() {
 fn holds_that_no_open_question_rests_on_are_removed_without_force() {
     let env = Env::new();
 
-    // A second answer, not the one in effect.
+    // The raiser of an answered question, then its answerer, whose answer
+    // now aims at a session no longer in the store. (An answer that isn't
+    // the one in effect is the `counted: false` and outranked cases below.)
     env.init("a", &[]);
     env.init("first", &[]);
-    env.init("second", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:first");
     env.answer(&q, "first", "yes");
-    env.answer(&q, "second", "no");
-    let out = env.cleanup("second", &[]);
-    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
-
-    // The raiser of an answered question, then its answerer, whose answer
-    // now aims at a session no longer in the store.
     let out = env.cleanup("a", &[]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     let out = env.cleanup("first", &[]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
 
-    // A pass-up of a question since answered.
+    // A pass-up of a question since answered: `passer` passes it up to its
+    // dispatcher, which answers it.
     env.init("r", &[]);
-    env.init("passer", &[]);
     env.init("answerer", &[]);
+    env.init("passer", &["--dispatched-by", "answerer"]);
     let q = env.escalate("r", "q1", "session:passer");
-    env.readdress(&q, "passer", "person:owner");
+    env.readdress(&q, "passer", "session:answerer");
     env.answer(&q, "answerer", "yes");
     let out = env.cleanup("passer", &[]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
 
-    for name in ["second", "a", "first", "passer"] {
+    for name in ["a", "first", "passer"] {
         assert!(!env.exists(name), "{name} is still there");
     }
 }
@@ -1020,9 +1173,9 @@ fn a_forced_removal_of_the_answer_reopens_the_question() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
-    assert!(env.open("owner").is_empty());
+    assert!(!env.listed_as_raised(&q));
 
     let before = env.snapshot_except("b");
     let out = env.cleanup("b", &["--force"]);
@@ -1041,7 +1194,6 @@ fn a_forced_removal_of_the_answer_reopens_the_question() {
     );
     assert!(!env.exists("b"));
 
-    assert_eq!(identities(&env.open("owner")), vec![q.identity()]);
     assert!(env.listed_as_raised(&q));
     let next = env.ok(&["next", "a", "--no-cleanup"]).json();
     assert!(next.get("questions").is_none(), "{next}");
@@ -1139,7 +1291,7 @@ fn a_pinned_holder_of_an_answer_or_a_pass_up_is_refused_for_its_pin_even_with_fo
     env.init("answerer", &[]);
     env.init("r", &[]);
     env.init("passer", &[]);
-    let answered = env.escalate("a", "q1", "person:owner");
+    let answered = env.escalate("a", "q1", "session:answerer");
     env.answer(&answered, "answerer", "yes");
     let passed = env.escalate("r", "q1", "session:passer");
     env.readdress(&passed, "passer", "person:owner");
@@ -1202,7 +1354,7 @@ fn force_leaves_children_hierarchy_members_and_the_raiser_byte_identical() {
     env.init("b", &["--dispatched-by", "coord"]);
     env.init("child", &["--parent", "b"]);
     env.init("a", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
 
     let before = env.snapshot_except("b");
@@ -1238,7 +1390,7 @@ fn a_replace_over_a_finished_question_holder_is_refused_and_moves_nothing() {
     // The holder of the answer in effect.
     env.init("asker", &[]);
     env.init("answerer", &[]);
-    let answered = env.escalate("asker", "q1", "person:owner");
+    let answered = env.escalate("asker", "q1", "session:answerer");
     env.answer(&answered, "answerer", "yes");
     env.finish("answerer");
 
@@ -1268,11 +1420,11 @@ fn a_replace_over_a_finished_question_holder_is_refused_and_moves_nothing() {
 
 // ===== By-rule prunes keep a holder whose raiser stays =====
 
-/// `a` asks a person, `b` answers; both end and the retention passes.
+/// `a` asks `b`, `b` answers; both end and the retention passes.
 fn answered_pair(env: &Env) -> Rec {
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
     env.finish_env(&FAST, "a");
     env.finish_env(&FAST, "b");
@@ -1309,7 +1461,6 @@ fn workspace_prune_of_the_answerer_alone_keeps_it_while_the_asker_stays() {
     assert_kept_for_raiser(kept["reason"].as_str().unwrap(), &q);
     assert!(env.exists("a") && env.exists("b"));
     // The question is still answered.
-    assert!(env.open("owner").is_empty());
     assert!(!env.listed_as_raised(&q));
 }
 
@@ -1318,7 +1469,7 @@ fn workspace_prune_removes_asker_and_answerer_together() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &["--parent", "a"]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
     env.finish_env(&FAST, "b");
     env.finish_env(&FAST, "a");
@@ -1343,7 +1494,7 @@ fn session_prune_older_than_keeps_an_answerer_whose_asker_is_too_young() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
     env.finish_env(&FAST, "b");
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -1363,7 +1514,7 @@ fn session_prune_older_than_keeps_an_answerer_whose_asker_is_too_young() {
     let applied = env.prune(&["--older-than", "4s", "--apply"]);
     assert_eq!(applied["removed"], json!([]), "{applied:#}");
     assert!(env.exists("a") && env.exists("b"));
-    assert!(env.open("owner").is_empty());
+    assert!(!env.listed_as_raised(&q));
 
     // Both old enough: removed together.
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1380,7 +1531,7 @@ fn session_prune_by_execution_dir_keeps_an_answerer_whose_asker_is_elsewhere() {
     let sub_arg = sub.to_string_lossy().into_owned();
     env.init("a", &[]);
     env.init("b", &["--execution-dir", sub_arg.as_str()]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "yes");
     env.finish_env(&FAST, "a");
     let out = env.run_at(
@@ -1401,13 +1552,168 @@ fn session_prune_by_execution_dir_keeps_an_answerer_whose_asker_is_elsewhere() {
     let applied = env.prune(&["--execution-dir", sub_arg.as_str(), "--apply"]);
     assert_eq!(applied["removed"], json!([]), "{applied:#}");
     assert!(env.exists("a") && env.exists("b"));
-    assert!(env.open("owner").is_empty());
+    assert!(!env.listed_as_raised(&q));
 
     // A directory holding both: removed together.
     let ws = env.root.join("ws").to_string_lossy().into_owned();
     let applied = env.prune(&["--execution-dir", ws.as_str(), "--apply"]);
     assert_eq!(names_of(&applied["removed"]), vec!["a", "b"], "{applied:#}");
     assert!(!env.exists("a") && !env.exists("b"));
+}
+
+// ===== What closes a question, and which entry holds it =====
+
+/// Assert a plain `koto session cleanup <name>`, without `--force`, removed
+/// it and reported nothing orphaned.
+fn assert_cleaned_without_force(env: &Env, name: &str) {
+    let out = env.cleanup(name, &[]);
+    assert_eq!(out.code, 0, "{name}\n{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.json().get("orphaned_questions").is_none(),
+        "{}",
+        out.stdout
+    );
+    assert!(!env.exists(name), "{name} is still there");
+}
+
+#[test]
+fn a_withdrawn_question_is_not_open_and_holds_nothing() {
+    let env = Env::new();
+    // At the terminal tick.
+    env.init("w1", &[]);
+    let q = env.escalate("w1", "q1", "person:owner");
+    env.withdraw(&q, "w1", "not needed");
+    assert!(!env.listed_as_raised(&q));
+    assert!(env.open("owner").is_empty());
+    assert_eq!(env.finish("w1")["retention"], json!({"retained": false}));
+    assert!(!env.exists("w1"));
+
+    // At cleanup.
+    env.init("w2", &[]);
+    let q = env.escalate("w2", "q1", "person:owner");
+    env.withdraw(&q, "w2", "not needed");
+    assert_cleaned_without_force(&env, "w2");
+}
+
+#[test]
+fn a_settled_question_is_not_open_and_holds_nothing() {
+    let env = Env::new();
+    env.init("b", &[]);
+    // At the terminal tick.
+    env.init("s1", &[]);
+    let q = env.escalate("s1", "q1", "session:b");
+    env.settle_q(&q, "s1");
+    assert!(!env.listed_as_raised(&q));
+    assert_eq!(env.finish("s1")["retention"], json!({"retained": false}));
+    assert!(!env.exists("s1"));
+
+    // At cleanup, of the raiser and of the addressee it waited on.
+    env.init("s2", &[]);
+    let q = env.escalate("s2", "q1", "session:b");
+    env.settle_q(&q, "s2");
+    assert_cleaned_without_force(&env, "s2");
+    assert_cleaned_without_force(&env, "b");
+}
+
+#[test]
+fn an_answer_that_doesnt_count_holds_nothing() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    env.init("x", &[]);
+    let q1 = env.escalate("a", "q1", "session:b");
+    let q2 = env.escalate("a", "q2", "session:b");
+    // `b`'s answer to q2, placed in `x` as an answer to q1 recorded there:
+    // `x` isn't q1's addressee, so it doesn't count.
+    let id = env.answer(&q2, "b", "planted");
+    let mut body = env.stored("b", &q2, &id);
+    let judged = env
+        .ok(&[
+            "decisions",
+            "record",
+            "x",
+            "--kind",
+            "judgment",
+            "--outcome",
+            "settled",
+            "--subject",
+            "what=x",
+            "--by",
+            "session",
+        ])
+        .json();
+    body["session"] = judged["decision"]["session"].clone();
+    body["id"] = json!("000000000050");
+    body["target"]["decision"] = json!(q1.id);
+    body["subject"]["id"] = json!(q1.id);
+    env.plant("x", &q1, "000000000050", &body);
+    let shown = env.show("x", "000000000050");
+    assert_eq!(shown["counted"], false, "{shown}");
+    assert_eq!(shown["governs"], false, "{shown}");
+    assert!(env.listed_as_raised(&q1));
+
+    assert_cleaned_without_force(&env, "x");
+    // q1 still waits on `b`; its raiser still holds it.
+    assert!(env.listed_as_raised(&q1));
+    assert_holds_refusal(&env.cleanup("a", &[]), "a", &[(&q1.identity(), "raised")]);
+}
+
+#[test]
+fn a_persons_answer_in_effect_is_the_hold_and_the_outranked_answer_is_released() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    env.init("p", &[]);
+    let (q, header) = env.raise_for_person("a", "q1", "session:b");
+    let by_session = env.answer(&q, "b", "Postgres");
+    let by_person = env.person_answer(&q, &header, "p");
+    let s = env.show("b", &by_session);
+    assert_eq!(
+        (&s["counted"], &s["governs"]),
+        (&json!(true), &json!(false))
+    );
+    assert_eq!(env.show("p", &by_person)["governs"], true);
+
+    // The person's answer is the one in effect: its holder is refused, by
+    // cleanup and by a replace once it has finished.
+    let before = env.snapshot_all();
+    let out = env.cleanup("p", &[]);
+    assert_holds_refusal(&out, "p", &[(&q.identity(), "answer")]);
+    assert_eq!(env.snapshot_all(), before);
+    env.finish("p");
+    let before = env.snapshot_all();
+    assert_replace_refusal(&env.replace("p"), "p", &[(&q.identity(), "answer")]);
+    assert_eq!(env.snapshot_all(), before);
+
+    // The outranked session answer holds nothing.
+    assert_cleaned_without_force(&env, "b");
+    assert!(!env.listed_as_raised(&q));
+    assert!(env.exists("p") && env.exists("a"));
+}
+
+#[test]
+fn a_pass_up_that_doesnt_count_holds_nothing() {
+    let env = Env::new();
+    env.init("r", &[]);
+    env.init("d", &[]);
+    env.init("passer", &["--dispatched-by", "d"]);
+    let q = env.escalate("r", "q1", "session:passer");
+    let id = env.readdress(&q, "passer", "session:d");
+    // Edited to a destination other than the dispatcher it recorded: the
+    // destination rule leaves it out of the history.
+    let mut body = env.stored("passer", &q, &id);
+    body["subject"]["recipient"] = json!("session:elsewhere");
+    env.plant("passer", &q, &id, &body);
+    let shown = env.show("passer", &id);
+    assert_eq!(shown["counted"], false, "{shown}");
+    assert_eq!(shown["reason"], "destination", "{shown}");
+    let at = env.at("r");
+    assert_eq!(at.len(), 1, "{at:?}");
+    assert_eq!(at[0]["addressees"], json!([session("passer")]));
+
+    assert_cleaned_without_force(&env, "passer");
+    assert!(env.listed_as_raised(&q));
 }
 
 // ===== Decisions that can't be read =====
@@ -1420,7 +1726,7 @@ fn unreadable_decisions_refuse_cleanup_cancel_and_replace_and_remove_nothing() {
     // `d` answered `c`'s question; `c`'s decisions will be unreadable.
     env.init("c", &[]);
     env.init("d", &[]);
-    let cq = env.escalate("c", "q1", "person:owner");
+    let cq = env.escalate("c", "q1", "session:d");
     env.answer(&cq, "d", "yes");
 
     let before = env.snapshot_all();
