@@ -518,9 +518,15 @@ agents encounter today for any state that uses `integration:`.
   `koto session unpin`), `{"retained": true, "reason": "bucket_unchecked"}`
   with `bucket_unchecked.error` (cloud backend only: the bucket couldn't be
   checked for a pin, so the session wasn't removed), `{"retained": true,
+  "reason": "open_question", "open_questions": ["<session id>/<decision id>"]}`
+  (the session raised a question that is still open, which keeps it with no
+  expiry until the question is answered, reversed or fenced; `koto decisions
+  open` still returns it, and a later `koto next` on the ended session carries
+  the answer in `questions`), `{"retained": true,
   "reason": "hierarchy"}` (the session has a
-  link or lineage: a dispatcher, a koto parent, a `chain/parent`, or another
-  session naming it; kept with or without `--no-cleanup` until `koto session
+  link or lineage: a dispatcher, a koto parent, a `chain/parent`, another
+  session naming it, or an answer or pass-up aimed at a question in another
+  session in the store, either way round; kept with or without `--no-cleanup` until `koto session
   prune` finds its hierarchy released; a session a later session continues
   adds `relation_keepers`, each `{keeper, standing, path}`, naming the later
   sessions whose standing keeps it, which under the cloud backend may be

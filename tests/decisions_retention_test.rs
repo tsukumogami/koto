@@ -1,0 +1,1160 @@
+//! Integration tests for keeping sessions that hold open questions: the
+//! terminal tick's `open_question` retention, answers and pass-ups as
+//! hierarchy edges, the prunes, and the `holds_question` refusal of
+//! `koto session cleanup` and `koto cancel --cleanup` with its `--force`.
+//!
+//! Every local test runs the real binary with `HOME` and
+//! `KOTO_SESSIONS_BASE` pointed into its own temporary directory, and with
+//! every variable koto reads an identity or a backend from removed. The
+//! cloud case runs against the in-process endpoint in `support/fake_s3.rs`.
+
+#![cfg(unix)]
+
+#[path = "support/fake_s3.rs"]
+mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use assert_fs::TempDir;
+use serde_json::{json, Value};
+
+/// Variables koto reads an identity, a run mode, an authority or a
+/// session backend from.
+const CLEARED_ENV: [&str; 9] = [
+    "CLAUDE_CODE_SESSION_ID",
+    "KOTO_ANCHOR",
+    "KOTO_AGENT_ID",
+    "KOTO_RUN_MODE",
+    "KOTO_AUTHORITY",
+    "KOTO_TEST_DECISIONS_FAULT",
+    "KOTO_SESSION_BACKEND",
+    "KOTO_SESSION_ID",
+    "KOTO_SESSION_NAME",
+];
+
+/// A retention short enough for a test to wait out.
+const FAST: [(&str, &str); 1] = [("KOTO_RETENTION_KEEP", "1s")];
+
+const TEMPLATE: &str = r#"---
+name: work
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      go:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: done
+        when:
+          go: go
+  done:
+    terminal: true
+---
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#;
+
+/// Wait out [`FAST`]'s retention.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+}
+
+struct Env {
+    _tmp: TempDir,
+    root: PathBuf,
+}
+
+struct Out {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Out {
+    fn json(&self) -> Value {
+        serde_json::from_str(self.stdout.trim())
+            .unwrap_or_else(|e| panic!("not JSON: {e}\n{}\n{}", self.stdout, self.stderr))
+    }
+
+    /// The last non-empty stdout line as JSON, for a command that prints a
+    /// text preview before its report.
+    fn last_json(&self) -> Value {
+        let line = self
+            .stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| panic!("no output\n{}", self.stderr));
+        serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("not JSON: {e}\n{}\n{}", self.stdout, self.stderr))
+    }
+}
+
+/// A recorded escalation: its session, id and the session's id.
+#[derive(Clone)]
+struct Rec {
+    session: String,
+    id: String,
+    session_id: String,
+}
+
+impl Rec {
+    fn identity(&self) -> String {
+        format!("{}/{}", self.session_id, self.id)
+    }
+}
+
+impl Env {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["home", "ws", "sessions"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("work.md"), TEMPLATE).unwrap();
+        Env { _tmp: tmp, root }
+    }
+
+    fn sessions(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    fn template(&self) -> String {
+        self.root.join("work.md").to_string_lossy().into_owned()
+    }
+
+    fn run(&self, args: &[&str]) -> Out {
+        self.run_env(&[], args)
+    }
+
+    fn run_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Out {
+        self.run_input(envs, args, None)
+    }
+
+    /// Run koto with `envs` set and `input` on its stdin (none: empty).
+    fn run_input(&self, envs: &[(&str, &str)], args: &[&str], input: Option<&str>) -> Out {
+        let mut cmd = koto_command::koto_std();
+        for name in CLEARED_ENV {
+            cmd.env_remove(name);
+        }
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.current_dir(self.root.join("ws"));
+        cmd.env("HOME", self.root.join("home"));
+        cmd.env("KOTO_HOME", self.root.join("home"));
+        cmd.env("KOTO_SESSIONS_BASE", self.sessions());
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            if let Some(input) = input {
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        Out {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    fn ok(&self, args: &[&str]) -> Out {
+        self.ok_env(&[], args)
+    }
+
+    fn ok_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Out {
+        let out = self.run_env(envs, args);
+        assert_eq!(
+            out.code, 0,
+            "expected success from {args:?}\n{}\n{}",
+            out.stdout, out.stderr
+        );
+        out
+    }
+
+    fn init(&self, name: &str, extra: &[&str]) {
+        let template = self.template();
+        let mut args = vec!["init", name, "--template", template.as_str()];
+        args.extend_from_slice(extra);
+        self.ok(&args);
+    }
+
+    fn escalate(&self, name: &str, question: &str, recipient: &str) -> Rec {
+        let q = format!("question={question}");
+        let t = format!("text=what about {question}?");
+        let r = format!("recipient={recipient}");
+        let out = self
+            .ok(&[
+                "decisions",
+                "record",
+                name,
+                "--kind",
+                "escalate",
+                "--outcome",
+                "escalated",
+                "--subject",
+                &q,
+                "--subject",
+                &t,
+                "--subject",
+                &r,
+                "--by",
+                "session",
+            ])
+            .json();
+        Rec {
+            session: name.to_string(),
+            id: out["id"].as_str().unwrap().to_string(),
+            session_id: out["decision"]["session"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        }
+    }
+
+    /// Answer `q` from `in_session`; returns the answer's id.
+    fn answer(&self, q: &Rec, in_session: &str, text: &str) -> String {
+        let out = self.ok(&[
+            "decisions",
+            "answer",
+            &q.session,
+            &q.id,
+            "--in",
+            in_session,
+            "--text",
+            text,
+            "--by",
+            "session",
+        ]);
+        out.json()["id"].as_str().unwrap().to_string()
+    }
+
+    /// Pass `q` up from `in_session` to `to`.
+    fn readdress(&self, q: &Rec, in_session: &str, to: &str) {
+        self.ok(&[
+            "decisions",
+            "readdress",
+            &q.session,
+            &q.id,
+            "--in",
+            in_session,
+            "--to",
+            to,
+            "--by",
+            "session",
+        ]);
+    }
+
+    /// Reverse `q` from `in_session`.
+    fn reverse(&self, q: &Rec, in_session: &str) {
+        self.ok(&[
+            "decisions",
+            "reverse",
+            &q.session,
+            &q.id,
+            "--in",
+            in_session,
+            "--by",
+            "session",
+        ]);
+    }
+
+    fn open(&self, person: &str) -> Vec<Value> {
+        let out = self.ok(&["decisions", "open", "--person", person]).json();
+        out["questions"].as_array().unwrap().clone()
+    }
+
+    fn at(&self, position: &str) -> Vec<Value> {
+        let out = self.ok(&["decisions", "open", "--at", position]).json();
+        out["questions"].as_array().unwrap().clone()
+    }
+
+    /// Whether `koto decisions open --at <raiser>` lists `q` as raised there.
+    fn listed_as_raised(&self, q: &Rec) -> bool {
+        self.at(&q.session)
+            .iter()
+            .any(|e| e["identity"] == q.identity().as_str() && e["relation"] == "raised")
+    }
+
+    /// The terminal tick: `koto next <name>` with the evidence that ends the
+    /// workflow, without `--no-cleanup`.
+    fn finish(&self, name: &str) -> Value {
+        self.finish_env(&[], name)
+    }
+
+    fn finish_env(&self, envs: &[(&str, &str)], name: &str) -> Value {
+        let out = self.ok_env(envs, &["next", name, "--with-data", r#"{"go":"go"}"#]);
+        let v = out.json();
+        assert_eq!(v["action"], "done", "{v}");
+        v
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.sessions().join(name).is_dir()
+    }
+
+    fn hierarchy(&self, name: &str) -> Value {
+        self.ok(&["session", "hierarchy", name, "--json"]).json()
+    }
+
+    fn prune(&self, args: &[&str]) -> Value {
+        let mut all = vec!["session", "prune"];
+        all.extend_from_slice(args);
+        self.ok_env(&FAST, &all).json()
+    }
+
+    fn cleanup(&self, name: &str, extra: &[&str]) -> Out {
+        let mut args = vec!["session", "cleanup", name];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
+    /// Every file under a session's directory with its bytes, lock files
+    /// aside.
+    fn snapshot(&self, name: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+        snapshot_dir(&self.sessions().join(name))
+    }
+
+    fn aimed_files(&self, name: &str, target_id: &str) -> Vec<String> {
+        let dir = self
+            .sessions()
+            .join(name)
+            .join("ctx/koto/aimed")
+            .join(target_id);
+        match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+fn snapshot_dir(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if !path.to_string_lossy().ends_with(".lock") {
+                out.insert(
+                    path.strip_prefix(base).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn session(name: &str) -> Value {
+    json!({"typed": true, "kind": "session", "name": name})
+}
+
+fn person(handle: &str) -> Value {
+    json!({"typed": true, "kind": "person", "handle": handle})
+}
+
+/// The sorted `name` of each entry of a JSON array.
+fn names_of(list: &Value) -> Vec<String> {
+    let mut out: Vec<String> = list
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {list}"))
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+fn identities(qs: &[Value]) -> Vec<String> {
+    qs.iter()
+        .map(|q| q["identity"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The `joined_by` vias of every member of a hierarchy report, sorted.
+fn vias(h: &Value) -> Vec<String> {
+    let mut out: Vec<String> = h["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["joined_by"].as_array().unwrap().clone())
+        .map(|e| e["via"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `kept` entry for `name` in a prune preview.
+fn kept_entry<'a>(preview: &'a Value, name: &str) -> &'a Value {
+    preview["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == name)
+        .unwrap_or_else(|| panic!("{name} isn't kept: {preview:#}"))
+}
+
+/// Assert `out` is the `holds_question` refusal of `name` for `holds`, each
+/// a question identity with what is held of it.
+fn assert_holds_refusal(out: &Out, name: &str, holds: &[(&str, &str)]) {
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    let err = &out.json()["error"];
+    assert_eq!(err["code"], "holds_question", "{err}");
+    assert_eq!(err["session"], name);
+    let force = format!("koto session cleanup {name} --force");
+    assert_eq!(err["force_command"], force.as_str());
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains(&force), "{message}");
+    let expected: Vec<Value> = holds
+        .iter()
+        .map(|(q, held)| json!({"question": q, "held": held}))
+        .collect();
+    assert_eq!(err["questions"], Value::Array(expected));
+    for (q, held) in holds {
+        assert!(message.contains(q), "{message}");
+        let says = match *held {
+            "raised" => "raised the open question",
+            "answer" => "holds the answer in effect",
+            "pass_up" => "holds a pass-up",
+            other => panic!("unknown hold {other}"),
+        };
+        assert!(message.contains(says), "{message}");
+    }
+}
+
+// ===== Kept at the terminal tick =====
+
+#[test]
+fn an_unlinked_raiser_is_kept_at_its_terminal_tick_for_its_open_question() {
+    let env = Env::new();
+    env.init("a", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+
+    let end = env.finish("a");
+    assert_eq!(
+        end["retention"],
+        json!({
+            "retained": true,
+            "reason": "open_question",
+            "open_questions": [q.identity()],
+        })
+    );
+    assert!(env.exists("a"));
+    assert_eq!(identities(&env.open("owner")), vec![q.identity()]);
+}
+
+#[test]
+fn a_session_with_no_open_question_is_removed_at_its_terminal_tick() {
+    let env = Env::new();
+
+    // No decision at all.
+    env.init("plain", &[]);
+    assert_eq!(env.finish("plain")["retention"], json!({"retained": false}));
+    assert!(!env.exists("plain"));
+
+    // A decision, but not a question.
+    env.init("judged", &[]);
+    env.ok(&[
+        "decisions",
+        "record",
+        "judged",
+        "--kind",
+        "judgment",
+        "--outcome",
+        "settled",
+        "--subject",
+        "what=x",
+        "--by",
+        "session",
+    ]);
+    assert_eq!(
+        env.finish("judged")["retention"],
+        json!({"retained": false})
+    );
+    assert!(!env.exists("judged"));
+
+    // An escalation whose recipient is untyped.
+    env.init("untyped", &[]);
+    env.escalate("untyped", "q0", "coord");
+    assert_eq!(
+        env.finish("untyped")["retention"],
+        json!({"retained": false})
+    );
+    assert!(!env.exists("untyped"));
+
+    // A question whose escalate was reversed.
+    env.init("reversed", &[]);
+    let q = env.escalate("reversed", "q1", "person:owner");
+    env.reverse(&q, "reversed");
+    assert!(env.open("owner").is_empty());
+    assert_eq!(
+        env.finish("reversed")["retention"],
+        json!({"retained": false})
+    );
+    assert!(!env.exists("reversed"));
+}
+
+#[test]
+fn the_terminal_tick_keeps_a_raiser_exactly_when_the_open_read_lists_its_question() {
+    let env = Env::new();
+    env.init("b", &[]);
+    env.init("c", &[]);
+
+    // Each point gets its own raiser, since a session ends only once.
+    let check = |q: &Rec, expect_open: bool| {
+        let listed = env.listed_as_raised(q);
+        assert_eq!(listed, expect_open, "open --at {}", q.session);
+        let end = env.finish(&q.session);
+        let kept_for_question = end["retention"]["reason"] == "open_question";
+        assert_eq!(
+            kept_for_question, listed,
+            "{}: open read lists it: {listed}; retention: {}",
+            q.session, end["retention"]
+        );
+        if kept_for_question {
+            assert_eq!(end["retention"]["open_questions"], json!([q.identity()]));
+        } else {
+            assert!(end["retention"].get("open_questions").is_none());
+        }
+    };
+
+    // Raised.
+    env.init("raised", &[]);
+    let q = env.escalate("raised", "q1", "session:b");
+    check(&q, true);
+
+    // Passed up.
+    env.init("passed", &[]);
+    let q = env.escalate("passed", "q1", "session:b");
+    env.readdress(&q, "b", "person:owner");
+    check(&q, true);
+
+    // Answered.
+    env.init("answered", &[]);
+    let q = env.escalate("answered", "q1", "person:owner");
+    env.answer(&q, "c", "yes");
+    check(&q, false);
+
+    // Reversed.
+    env.init("reversed", &[]);
+    let q = env.escalate("reversed", "q1", "person:owner");
+    env.reverse(&q, "reversed");
+    check(&q, false);
+}
+
+#[test]
+fn an_answer_or_pass_up_aimed_at_a_question_joins_holder_and_raiser() {
+    let env = Env::new();
+
+    // An answer: holder and raiser are each kept with `hierarchy`.
+    env.init("asker", &[]);
+    env.init("answerer", &[]);
+    let q = env.escalate("asker", "q1", "person:owner");
+    env.answer(&q, "answerer", "yes");
+    assert_eq!(
+        env.finish("answerer")["retention"],
+        json!({"retained": true, "reason": "hierarchy"})
+    );
+    assert_eq!(
+        env.finish("asker")["retention"],
+        json!({"retained": true, "reason": "hierarchy"})
+    );
+    assert!(env.exists("asker") && env.exists("answerer"));
+    for name in ["asker", "answerer"] {
+        let h = env.hierarchy(name);
+        assert_eq!(names_of(&h["members"]), vec!["answerer", "asker"], "{h:#}");
+        assert_eq!(vias(&h), vec!["answer aimed at its question"], "{h:#}");
+    }
+
+    // A pass-up: its holder is kept with `hierarchy`, and the raiser, whose
+    // question is still open, with `open_question`.
+    env.init("raiser", &[]);
+    env.init("passer", &[]);
+    let q = env.escalate("raiser", "q1", "session:passer");
+    env.readdress(&q, "passer", "person:owner");
+    assert_eq!(
+        env.finish("passer")["retention"],
+        json!({"retained": true, "reason": "hierarchy"})
+    );
+    assert_eq!(env.finish("raiser")["retention"]["reason"], "open_question");
+    for name in ["raiser", "passer"] {
+        let h = env.hierarchy(name);
+        assert_eq!(names_of(&h["members"]), vec!["passer", "raiser"], "{h:#}");
+        assert_eq!(vias(&h), vec!["pass-up aimed at its question"], "{h:#}");
+    }
+}
+
+#[test]
+fn a_terminal_raiser_kept_for_its_question_still_gets_the_answer() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    assert_eq!(env.finish("a")["retention"]["reason"], "open_question");
+    env.answer(&q, "b", "SQLite");
+
+    let next = env.ok(&["next", "a"]).json();
+    let qs = next["questions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{next}"));
+    assert_eq!(qs.len(), 1, "{next}");
+    assert_eq!(qs[0]["identity"], q.identity().as_str());
+    assert_eq!(qs[0]["state"], "answered");
+    assert_eq!(qs[0]["answer"]["text"], "SQLite");
+}
+
+// ===== Kept by the prunes =====
+
+/// `raiser` raised a question to `passer`, which passed it up to a person:
+/// both are terminal, the question is open, and the retention has passed.
+fn held_pair(env: &Env) -> Rec {
+    env.init("raiser", &[]);
+    env.init("passer", &[]);
+    let q = env.escalate("raiser", "q1", "session:passer");
+    env.readdress(&q, "passer", "person:owner");
+    env.finish_env(&FAST, "raiser");
+    env.finish_env(&FAST, "passer");
+    settle();
+    q
+}
+
+#[test]
+fn a_hierarchy_holding_an_open_question_is_kept_by_every_prune() {
+    let env = Env::new();
+    let q = held_pair(&env);
+    let id = q.identity();
+
+    for member in ["raiser", "passer"] {
+        let h = env
+            .ok_env(&FAST, &["session", "hierarchy", member, "--json"])
+            .json();
+        assert_eq!(h["kept"], true, "{h:#}");
+        let keepers = h["keepers"].as_array().unwrap();
+        assert_eq!(keepers.len(), 1, "{h:#}");
+        assert_eq!(keepers[0]["name"], "raiser");
+        assert_eq!(keepers[0]["alive"], false);
+        assert_eq!(keepers[0]["open_questions"], json!([id]));
+    }
+
+    let preview = env.prune(&[]);
+    assert!(
+        preview["remove"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+    assert_eq!(names_of(&preview["kept"]), vec!["passer", "raiser"]);
+    for member in ["raiser", "passer"] {
+        let detail = kept_entry(&preview, member)["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&format!("holds open question {id}")),
+            "{member}: {detail}"
+        );
+    }
+
+    let applied = env.prune(&["--apply", "--all"]);
+    assert_eq!(applied["removed"], json!([]), "{applied:#}");
+    assert_eq!(names_of(&applied["kept"]), vec!["passer", "raiser"]);
+    assert!(env.exists("raiser") && env.exists("passer"));
+
+    for root in ["raiser", "passer"] {
+        let out = env.run_env(&FAST, &["workspace", "prune", "--root", root, "--yes"]);
+        assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+        let report = out.last_json();
+        assert_eq!(report["removed"], json!([]), "{report:#}");
+        assert_eq!(report["pruned"], false);
+        assert!(env.exists("raiser") && env.exists("passer"));
+
+        let out = env.run_input(
+            &FAST,
+            &["workspace", "prune", "--root", root, "--yes", "--force"],
+            Some("force-prune\n"),
+        );
+        assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+        let report = out.last_json();
+        assert_eq!(report["removed"], json!([]), "{report:#}");
+        assert!(env.exists("raiser") && env.exists("passer"));
+    }
+    assert_eq!(identities(&env.open("owner")), vec![id.clone()]);
+
+    // A same-name replace moves the raiser aside rather than removing it.
+    let template = env.template();
+    let replaced = env
+        .ok_env(
+            &FAST,
+            &[
+                "init",
+                "raiser",
+                "--template",
+                template.as_str(),
+                "--replace-terminal",
+            ],
+        )
+        .json();
+    assert_eq!(replaced["outcome"], "replaced", "{replaced}");
+    let moved_to = replaced["moved_to"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{replaced}"));
+    assert!(
+        replaced["moved_reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("holds open question {id}")),
+        "{replaced}"
+    );
+    assert!(env.exists(moved_to) && env.exists("raiser") && env.exists("passer"));
+}
+
+#[test]
+fn the_hold_ends_with_the_question() {
+    let env = Env::new();
+    let q = held_pair(&env);
+    env.init("answerer", &[]);
+    env.answer(&q, "answerer", "yes");
+    env.finish_env(&FAST, "answerer");
+    settle();
+
+    let preview = env.prune(&[]);
+    assert_eq!(
+        names_of(&preview["remove"]),
+        vec!["answerer", "passer", "raiser"],
+        "{preview:#}"
+    );
+    assert!(
+        preview["kept"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+
+    env.prune(&["--apply", "--all"]);
+    for name in ["answerer", "passer", "raiser"] {
+        assert!(!env.exists(name), "{name} is still there");
+    }
+}
+
+/// `w`, dispatched by `coord`; with `reverse`, `w` records a question
+/// that `coord` reverses, so `coord` holds a reversal aimed at `w`. Both
+/// end; returns each terminal retention, the hierarchy's vias and the
+/// prune preview's removed names once the retention has passed.
+fn reversal_world(reverse: bool) -> (Value, Value, Vec<String>, Vec<String>) {
+    let env = Env::new();
+    env.init("coord", &[]);
+    env.init("w", &["--dispatched-by", "coord"]);
+    if reverse {
+        let q = env.escalate("w", "q1", "person:owner");
+        env.reverse(&q, "coord");
+        assert_eq!(env.aimed_files("coord", &q.session_id).len(), 1);
+    }
+    let w_end = env.finish_env(&FAST, "w")["retention"].clone();
+    let coord_end = env.finish_env(&FAST, "coord")["retention"].clone();
+    let h = env.hierarchy("coord");
+    settle();
+    let preview = env.prune(&[]);
+    (w_end, coord_end, vias(&h), names_of(&preview["remove"]))
+}
+
+#[test]
+fn a_reversal_aimed_elsewhere_keeps_its_holder_exactly_as_before() {
+    let with_reversal = reversal_world(true);
+    let without = reversal_world(false);
+    assert_eq!(with_reversal, without);
+    let (w_end, coord_end, vias, removed) = with_reversal;
+    assert_eq!(w_end, json!({"retained": true, "reason": "hierarchy"}));
+    assert_eq!(coord_end, json!({"retained": true, "reason": "hierarchy"}));
+    // The reversal adds no edge: only the dispatched-by link joins them.
+    assert_eq!(vias, vec!["dispatched-by link"]);
+    assert_eq!(removed, vec!["coord", "w"]);
+}
+
+// ===== Explicit removal =====
+
+#[test]
+fn cleanup_refuses_a_raiser_and_changes_nothing() {
+    let env = Env::new();
+    env.init("a", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    let before = env.snapshot("a");
+
+    let out = env.cleanup("a", &[]);
+    assert_holds_refusal(&out, "a", &[(&q.identity(), "raised")]);
+    assert_eq!(env.snapshot("a"), before);
+
+    // And after its terminal tick kept it.
+    env.finish("a");
+    let before = env.snapshot("a");
+    let out = env.cleanup("a", &[]);
+    assert_holds_refusal(&out, "a", &[(&q.identity(), "raised")]);
+    assert_eq!(env.snapshot("a"), before);
+}
+
+#[test]
+fn cleanup_refuses_the_holder_of_the_answer_in_effect_or_a_resting_pass_up() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("answerer", &[]);
+    let answered = env.escalate("a", "q1", "person:owner");
+    env.answer(&answered, "answerer", "yes");
+    let before = env.snapshot("answerer");
+    let out = env.cleanup("answerer", &[]);
+    assert_holds_refusal(&out, "answerer", &[(&answered.identity(), "answer")]);
+    assert_eq!(env.snapshot("answerer"), before);
+
+    env.init("r", &[]);
+    env.init("passer", &[]);
+    let passed = env.escalate("r", "q1", "session:passer");
+    env.readdress(&passed, "passer", "person:owner");
+    let before = env.snapshot("passer");
+    let out = env.cleanup("passer", &[]);
+    assert_holds_refusal(&out, "passer", &[(&passed.identity(), "pass_up")]);
+    assert_eq!(env.snapshot("passer"), before);
+}
+
+#[test]
+fn cancel_cleanup_is_refused_before_the_cancel() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("answerer", &[]);
+    env.init("r", &[]);
+    env.init("passer", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    let answered = env.escalate("a", "q2", "person:owner");
+    env.answer(&answered, "answerer", "yes");
+    let passed = env.escalate("r", "q1", "session:passer");
+    env.readdress(&passed, "passer", "person:owner");
+
+    let cases = [
+        ("a", q.identity(), "raised"),
+        ("answerer", answered.identity(), "answer"),
+        ("passer", passed.identity(), "pass_up"),
+    ];
+    for (name, identity, held) in &cases {
+        let before = env.snapshot(name);
+        let out = env.run(&["cancel", name, "--cleanup"]);
+        assert_holds_refusal(&out, name, &[(identity, held)]);
+        assert_eq!(env.snapshot(name), before, "{name} changed");
+        // Not cancelled: it still advances.
+        let next = env.ok(&["next", name, "--no-cleanup"]).json();
+        assert_eq!(next["state"], "work", "{name}: {next}");
+    }
+}
+
+#[test]
+fn the_refusal_follows_the_raisers_id_not_its_name() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("passer", &[]);
+    env.init("answerer", &[]);
+    let passed = env.escalate("a", "q1", "session:passer");
+    env.readdress(&passed, "passer", "person:owner");
+    let answered = env.escalate("a", "q2", "person:owner");
+    env.answer(&answered, "answerer", "yes");
+
+    let out = env.cleanup("a", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    env.init("a", &[]);
+
+    // The new `a` is joined to neither holder and is removed at its end.
+    let h = env.hierarchy("a");
+    assert_eq!(names_of(&h["members"]), vec!["a"], "{h:#}");
+    assert_eq!(env.finish("a")["retention"], json!({"retained": false}));
+    assert!(!env.exists("a"));
+
+    // Neither holder refuses cleanup.
+    for name in ["passer", "answerer"] {
+        let out = env.cleanup(name, &[]);
+        assert_eq!(out.code, 0, "{name}\n{}\n{}", out.stdout, out.stderr);
+        assert!(out.json().get("orphaned_questions").is_none());
+        assert!(!env.exists(name));
+    }
+}
+
+#[test]
+fn holds_that_no_open_question_rests_on_are_removed_without_force() {
+    let env = Env::new();
+
+    // A second answer, not the one in effect.
+    env.init("a", &[]);
+    env.init("first", &[]);
+    env.init("second", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "first", "yes");
+    env.answer(&q, "second", "no");
+    let out = env.cleanup("second", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+
+    // The raiser of an answered question, then its answerer, whose answer
+    // now aims at a session no longer in the store.
+    let out = env.cleanup("a", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let out = env.cleanup("first", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+
+    // A pass-up of a question since answered.
+    env.init("r", &[]);
+    env.init("passer", &[]);
+    env.init("answerer", &[]);
+    let q = env.escalate("r", "q1", "session:passer");
+    env.readdress(&q, "passer", "person:owner");
+    env.answer(&q, "answerer", "yes");
+    let out = env.cleanup("passer", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+
+    for name in ["second", "a", "first", "passer"] {
+        assert!(!env.exists(name), "{name} is still there");
+    }
+}
+
+#[test]
+fn a_forced_removal_of_the_answer_reopens_the_question() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+    assert!(env.open("owner").is_empty());
+
+    let out = env.cleanup("b", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(
+        v["orphaned_questions"],
+        json!([{"question": q.identity(), "held": "answer"}])
+    );
+    assert!(v["live_members"].is_array(), "{v}");
+    assert!(
+        out.stderr.contains("with --force") && out.stderr.contains(&q.identity()),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.exists("b"));
+
+    assert_eq!(identities(&env.open("owner")), vec![q.identity()]);
+    assert!(env.listed_as_raised(&q));
+    let next = env.ok(&["next", "a", "--no-cleanup"]).json();
+    assert!(next.get("questions").is_none(), "{next}");
+    assert_eq!(
+        env.finish("a")["retention"],
+        json!({
+            "retained": true,
+            "reason": "open_question",
+            "open_questions": [q.identity()],
+        })
+    );
+}
+
+#[test]
+fn a_forced_removal_of_a_pass_up_returns_the_question_to_its_earlier_addressee() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("passer", &[]);
+    let q = env.escalate("a", "q1", "session:passer");
+    env.readdress(&q, "passer", "person:owner");
+    let before = env.open("owner");
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0]["addressees"],
+        json!([session("passer"), person("owner")])
+    );
+
+    let out = env.cleanup("passer", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(
+        out.json()["orphaned_questions"],
+        json!([{"question": q.identity(), "held": "pass_up"}])
+    );
+
+    assert!(env.open("owner").is_empty());
+    let at = env.at("a");
+    assert_eq!(at.len(), 1, "{at:?}");
+    assert_eq!(at[0]["identity"], q.identity().as_str());
+    assert_eq!(at[0]["addressee"], session("passer"));
+    assert_eq!(at[0]["addressees"], json!([session("passer")]));
+}
+
+#[test]
+fn a_forced_removal_of_the_raiser_leaves_the_aimed_entries_listed() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("passer", &[]);
+    let q = env.escalate("a", "q1", "session:passer");
+    env.readdress(&q, "passer", "person:owner");
+
+    let out = env.cleanup("a", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(
+        out.json()["orphaned_questions"],
+        json!([{"question": q.identity(), "held": "raised"}])
+    );
+    assert!(!env.exists("a"));
+
+    assert!(env.open("owner").is_empty());
+    assert!(env.at("passer").is_empty());
+    let listing = env
+        .ok(&["decisions", "list", "passer", "--format", "v1"])
+        .json();
+    let entries = listing["decisions"].as_array().unwrap();
+    assert!(
+        entries.iter().any(|e| e["decision"]["kind"] == "readdress"
+            && e["decision"]["target"]["id"] == q.session_id.as_str()),
+        "{listing:#}"
+    );
+}
+
+#[test]
+fn a_pinned_session_is_refused_for_its_pin_with_or_without_force() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.escalate("a", "q1", "person:owner");
+    env.ok(&["session", "pin", "a", "--reason", "x"]);
+    let before = env.snapshot("a");
+    for extra in [&[][..], &["--force"][..]] {
+        let out = env.cleanup("a", extra);
+        assert_eq!(out.code, 2, "{extra:?}\n{}\n{}", out.stdout, out.stderr);
+        assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
+        assert_eq!(env.snapshot("a"), before);
+    }
+}
+
+#[test]
+fn cleanup_of_a_session_holding_no_question_prints_what_it_did_before() {
+    let env = Env::new();
+    for extra in [&[][..], &["--force"][..]] {
+        env.init("a", &[]);
+        let out = env.cleanup("a", extra);
+        assert_eq!(out.code, 0, "{extra:?}\n{}\n{}", out.stdout, out.stderr);
+        let v = out.json();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["children", "cleaned_up", "live_members", "name"],
+            "{extra:?}: {v}"
+        );
+        assert_eq!(
+            v,
+            json!({"name": "a", "cleaned_up": true, "children": [], "live_members": []}),
+            "{extra:?}"
+        );
+        assert!(!env.exists("a"), "{extra:?}");
+    }
+}
+
+// ===== Cloud backend =====
+
+const BUCKET: &str = "koto-retention";
+const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+#[test]
+fn a_cloud_cleanup_refusal_deletes_nothing_from_the_bucket() {
+    let s3 = fake_s3::FakeS3::start(BUCKET);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let (home, cache, ws) = (root.join("home"), root.join("cache"), root.join("ws"));
+    for dir in [&home, &cache, &ws] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(ws.join("work.md"), TEMPLATE).unwrap();
+    let koto_dir = koto_command::koto_bin().parent().unwrap().to_path_buf();
+    let run = |args: &[&str]| -> Out {
+        let o = koto_command::koto_std()
+            .env_clear()
+            .current_dir(&ws)
+            .env("PATH", format!("{}:{}", koto_dir.display(), SYSTEM_PATH))
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("KOTO_SESSION_BACKEND", "cloud")
+            .env("KOTO_SESSION_CLOUD_ENDPOINT", s3.endpoint())
+            .env("KOTO_SESSION_CLOUD_BUCKET", BUCKET)
+            .env("KOTO_SESSION_CLOUD_REGION", "us-east-1")
+            .env("KOTO_SESSION_CLOUD_PATH_STYLE", "true")
+            .env("KOTO_SESSION_CLOUD_ACCESS_KEY", "test-access-key")
+            .env("KOTO_SESSION_CLOUD_SECRET_KEY", "test-secret-key")
+            .args(args)
+            .output()
+            .unwrap();
+        Out {
+            code: o.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    };
+    let ok = |args: &[&str]| -> Value {
+        let out = run(args);
+        assert_eq!(out.code, 0, "{args:?}\n{}\n{}", out.stdout, out.stderr);
+        out.json()
+    };
+
+    ok(&["init", "a", "--template", "work.md"]);
+    let recorded = ok(&[
+        "decisions",
+        "record",
+        "a",
+        "--kind",
+        "escalate",
+        "--outcome",
+        "escalated",
+        "--subject",
+        "question=q1",
+        "--subject",
+        "text=which?",
+        "--subject",
+        "recipient=person:owner",
+        "--by",
+        "session",
+    ]);
+    let identity = format!(
+        "{}/{}",
+        recorded["decision"]["session"]["id"].as_str().unwrap(),
+        recorded["id"].as_str().unwrap()
+    );
+    let local = home.join(".koto/sessions/a");
+    assert!(local.is_dir(), "no local copy at {}", local.display());
+    let (keys, files) = (s3.keys(), snapshot_dir(&local));
+    assert!(!keys.is_empty());
+
+    s3.clear_requests();
+    let out = run(&["session", "cleanup", "a"]);
+    assert_holds_refusal(&out, "a", &[(&identity, "raised")]);
+    let deletes: Vec<String> = s3
+        .requests()
+        .iter()
+        .filter(|r| r.method == "DELETE" || r.method == "POST")
+        .map(|r| format!("{} {}", r.method, r.key))
+        .collect();
+    assert!(deletes.is_empty(), "the refusal deleted: {deletes:?}");
+    assert_eq!(s3.keys(), keys);
+    assert_eq!(snapshot_dir(&local), files);
+
+    // `koto cancel --cleanup` is refused the same way.
+    s3.clear_requests();
+    let out = run(&["cancel", "a", "--cleanup"]);
+    assert_holds_refusal(&out, "a", &[(&identity, "raised")]);
+    assert!(
+        s3.requests().iter().all(|r| r.method != "DELETE"),
+        "{:?}",
+        s3.requests()
+    );
+    assert_eq!(s3.keys(), keys);
+    assert_eq!(snapshot_dir(&local), files);
+}

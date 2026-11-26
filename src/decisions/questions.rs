@@ -483,16 +483,12 @@ fn decisions_in<'i>(index: &'i Index, session: &str) -> impl Iterator<Item = &'i
 /// The question `id` raised in the session whose header id is
 /// `session_id`, when that session is in the store.
 fn question_of<'i>(index: &'i Index, session_id: &str, id: &str) -> Option<&'i DecisionBody> {
-    index
-        .sessions()
-        .values()
-        .flatten()
-        .find_map(|e| match e {
-            Entry::Decision(b) if b.session.id == session_id && b.id == id && is_question(b) => {
-                Some(&**b)
-            }
-            _ => None,
-        })
+    index.sessions().values().flatten().find_map(|e| match e {
+        Entry::Decision(b) if b.session.id == session_id && b.id == id && is_question(b) => {
+            Some(&**b)
+        }
+        _ => None,
+    })
 }
 
 fn same_entry(a: &DecisionBody, b: &DecisionBody) -> bool {

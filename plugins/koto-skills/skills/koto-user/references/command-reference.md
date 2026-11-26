@@ -800,10 +800,12 @@ Note: this command uses `id` where `koto workflows` uses `name`. Both refer to t
 ## koto session cleanup
 
 ```
-koto session cleanup <name>
+koto session cleanup <name> [--force]
 ```
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist.
+
+A session holding something an open question depends on is refused before anything is stopped or written: exit 2, code `holds_question`, with `questions` listing each `{"question": "<session id>/<decision id>", "held": "raised" | "answer" | "pass_up"}` (it raised the open question, holds the answer in effect for it, or holds a pass-up its current addressee rests on) and `force_command`. Answer, reverse or pass the question first. `--force` removes it anyway and adds `orphaned_questions` (the same list) to the output, with a stderr warning per question: removing the only answer reopens the question, removing a pass-up returns it to its earlier addressee, and removing the raiser drops it from every open read. `koto cancel --cleanup` is refused the same way, before it cancels, naming `koto session cleanup <name> --force`. Without `--force`, a session holding none of these prints exactly what it printed before.
 
 A pinned session is refused: exit 2, code `pinned` (or `pin_unreadable`), naming the pin's reason, setter and time, and nothing is removed. Unpin it first with `koto session unpin <name>`, and only when the pin's reason says the record can go. A migrated source is the exception: its moved copy holds the pin, so cleanup removes the source and unpin refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`. `koto cancel --cleanup` refuses the same way, before it cancels.
 

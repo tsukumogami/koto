@@ -564,7 +564,10 @@ pub fn reason_text(verdict: &Verdict) -> String {
                     .map(question_keeper_text)
                     .collect();
                 let mut text = if names.is_empty() {
-                    format!("kept: an open question is held in its hierarchy: {}", held.join("; "))
+                    format!(
+                        "kept: an open question is held in its hierarchy: {}",
+                        held.join("; ")
+                    )
                 } else if held.is_empty() {
                     format!("kept: alive in its hierarchy: {}", names.join(", "))
                 } else {

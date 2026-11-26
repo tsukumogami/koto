@@ -1,9 +1,10 @@
 # Session retention and pins
 
 koto keeps a finished session while something still needs it and removes it
-once nothing does. This guide covers the two ways a session is kept past that
-rule: a pin, which keeps one session, and the continues relation, which keeps
-a session while a later one that carries on its work still stands. The
+once nothing does. This guide covers the ways a session is kept past that rule: a
+pin, which keeps one session; the continues relation, which keeps a session
+while a later one that carries on its work still stands; and an open
+question, which keeps the session that raised it until it is answered. The
 retention rule itself, and every command that removes sessions, are in the
 [CLI usage guide](cli-usage.md#session-hierarchy).
 
@@ -20,6 +21,10 @@ A pin keeps one session from all of them until it is unpinned, with no expiry.
 It keeps that session only. The rest of its hierarchy is kept or released by
 the rule as before, so a pinned child doesn't keep its parent and a pinned
 parent doesn't keep its children.
+
+A session that raised a question still open keeps its hierarchy too, with
+no expiry, and an answer or pass-up aimed at a question joins its holder to
+that hierarchy (see [Open questions](#open-questions)).
 
 A session `koto session import` moved is kept too, by the copy. The import
 leaves the source in place as a read-only predecessor, and the source stays
@@ -106,7 +111,8 @@ id, so the relation still names it; `koto workspace prune` in every form; and
 `koto session prune` with `--all`, `--execution-dir`, `--older-than` and
 `--apply --plan`, including the re-judgment an apply makes before it deletes.
 `koto session cleanup` and `koto cancel --cleanup` remove anyway and report
-what they passed over; a pin still refuses them.
+what they passed over; a pin still refuses them, and so does a session an
+open question depends on, unless cleanup is given `--force`.
 
 **Reading the report.** A kept entry carries `kept_by_relation: true` and
 `relation_keepers`, one object per keeper ordered by name:
@@ -147,6 +153,89 @@ no unlink verb.
 Under the cloud backend the relation holds on every host sharing the bucket;
 [the continues relation in the bucket](#the-continues-relation-in-the-bucket)
 says how.
+
+## Open questions
+
+A session that raises a question (`koto decisions record --kind escalate`
+with a typed recipient) needs to be there when the answer comes. So while the
+question is open, in effect with no answer, the session is a keeper of its
+hierarchy, alive or not, with no expiry. It stays until the question is
+answered, reversed or fenced. What counts as open is the test
+`koto decisions open` applies, so every read and every removal agree on it.
+
+**At its terminal tick** the session is kept with or without
+`--no-cleanup`, and `koto next` says why:
+
+```json
+"retention": {"retained": true, "reason": "open_question",
+              "open_questions": ["58eabc99-.../000000000001"]}
+```
+
+`open_questions` lists each open question's identity, the raising session's
+id and the question's decision id. The check comes after a failure terminal
+and a pin, and before the hierarchy. It reads the session's own decisions
+and scans the local store only when the session raised a question, so a
+session with none pays one read, and under the cloud backend it asks the
+bucket nothing. A parent's sweep keeps a terminal child that raised an open
+question the way it keeps a pinned one, and lists it in `kept_children` with
+`"reason": "open_question"` and its `open_questions`.
+
+**Answers and pass-ups join a hierarchy.** An answer
+(`koto decisions answer`) or a pass-up (`koto decisions readdress`) is stored
+in the session that recorded it, under `ctx/koto/aimed/<raiser id>/`. Each
+one is an edge between that session and the raiser, matched by the raiser's
+session id, never its name, so a new session that takes a removed raiser's
+name joins nothing. A session kept by such an edge at its terminal tick
+reads reason `hierarchy`. `koto session hierarchy` names the edge in
+`joined_by` as `answer aimed at its question` or `pass-up aimed at its
+question`, and a member holding an open question as a keeper with
+`open_questions` (and `"alive": false` when it has stopped). Its reason
+reads `kept: an open question is held in its hierarchy: <name> holds open
+question <id>`. `koto session prune` keeps such a hierarchy under rule `h`
+with that detail, and `koto workspace prune --root` and
+`koto init --replace-terminal` follow the same verdict.
+
+**Removing one by hand.** `koto session cleanup <name>` refuses a session an
+open question depends on: one that raised an open question, holds the answer
+in effect for a question whose raiser is still in the store, or holds a
+pass-up the question's current addressee rests on. Nothing is stopped,
+written or removed; it exits 2 with code `holds_question`, a message naming
+each question and what removing the session would lose, a `questions` list
+of `{"question": "<identity>", "held": "raised" | "answer" | "pass_up"}`,
+and `force_command`, the command that removes it anyway. A pin is refused
+first, with code `pinned`, whatever the flags. `koto cancel <name> --cleanup`
+is refused the same way before the cancel is written.
+
+```bash
+koto session cleanup A --force
+```
+
+`--force` removes the session and adds `orphaned_questions`, the same
+objects, beside `live_members`, with one warning on stderr per question. A
+cleanup of a session that holds nothing prints what it printed before, with
+or without `--force`; `orphaned_questions` appears only when a forced removal
+orphaned something. Holds are matched by identity: a second answer to a
+question already answered, an answer whose raiser is gone and a pass-up of a
+question since answered hold nothing, so once a question is answered,
+removing its raiser and then its answerer needs no `--force` at all.
+
+What a forced removal leaves is what the reads then show. Removing the only
+answer reopens the question, and the raiser's next terminal tick keeps it for
+`open_question` again. Removing a pass-up returns the question to the
+addressee it had before it. Removing the raiser drops the question from every
+open read, while the answers and pass-ups aimed at it still list in their own
+sessions.
+
+**The asker is woken.** A recorded answer rings the raiser's wake file
+(`wakes/<raiser>` under the koto home), and the newest session continuing it
+when it was superseded, before `koto decisions answer` returns, so a harness
+running `koto request watch --session <raiser>` knows to tick. The wake is one
+opaque line with nothing of the question or the answer in it; the raiser's
+next `koto next` reads the answer from the store and reports it in its
+`questions` array. A refused answer and a pass-up ring nothing, and a ring
+that fails is one warning on stderr, never a failed answer. The
+[CLI usage guide](cli-usage.md#leg-wakes-and-request-watch) covers the wake
+file and the watch.
 
 ## Coordinator sessions and the retired name rule
 
@@ -320,8 +409,9 @@ and the `sessions` it couldn't check, each with its own error; the text line
 is `kept: bucket not checked for what continues it: <name> (<error>)`. A later
 run with the bucket reachable, or with room, clears it. `koto session cleanup`
 and `koto cancel --cleanup` still remove a session whatever its
-back-references say, a flood of them included; a pin still refuses them, and
-a bucket that can't be listed for the pin still makes them exit 3.
+back-references say, a flood of them included; a pin still refuses them, as
+does a held question without `--force`, and a bucket that can't be listed
+for the pin still makes them exit 3.
 
 **How long back-references stay.** A back-reference outlives its
 predecessor: removing the predecessor leaves the back-references beside it,

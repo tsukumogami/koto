@@ -2687,7 +2687,7 @@ pub fn run(app: App) -> Result<()> {
                         "children": children,
                         "live_members": live.members,
                     });
-                    if force {
+                    if !holds.is_empty() {
                         out["orphaned_questions"] = session::orphaned_json(&holds);
                     }
                     if let Some(e) = live.error {
@@ -5346,9 +5346,7 @@ fn terminal_retention_report(
     };
     let kept_children = if matches!(
         reason,
-        Some(
-            RetentionReason::Hierarchy | RetentionReason::Pinned | RetentionReason::OpenQuestion
-        )
+        Some(RetentionReason::Hierarchy | RetentionReason::Pinned | RetentionReason::OpenQuestion)
     ) {
         workspace::kept_children(backend, name, compiled)
     } else {

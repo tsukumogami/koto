@@ -660,6 +660,57 @@ to an id-shaped value, and both say so.
   once it is passed on to someone else. A pass-up reports nothing on the asking session's
   `koto next`; R54's report of an answer applies to a question that was passed up as to any other.
 
+**Keeping questions and waking the asker**
+
+- **R62.** A session holding an open question is kept, with no expiry, until the question is
+  answered, reversed or fenced. Open is R53's test, made by one function every reader calls, so the
+  open reads, `koto next`'s `questions` array, the terminal tick, the retention engine and the
+  cleanup refusal (R64) never disagree on it. At its terminal tick, with or without `--no-cleanup`,
+  the session is kept with `retention` reading `{"retained": true, "reason": "open_question",
+  "open_questions": ["<identity>"]}`. `koto session hierarchy` names it as a keeper of its
+  hierarchy with the questions' identities, and `"alive": false` when it isn't alive; the prunes,
+  the same-name replace and the parent sweep keep it by that verdict.
+- **R63.** An answer or pass-up links its holder to the question's session. An `answer` or
+  `readdress` stored in the holder's aimed area for a question is an edge between the holder and the
+  session whose session id is the question's, matched by id and never by name; a reversal and an
+  entry that can't be read are none. `koto session hierarchy` shows it in the member's `joined_by`
+  as `answer aimed at its question` or `pass-up aimed at its question`, and a session kept by it at
+  its terminal tick gives the reason `hierarchy`.
+- **R64.** `koto session cleanup <name>` refuses a session that raised an open question, holds the
+  answer in effect for a question whose raiser is in the store, or holds a pass-up that the current
+  addressee of an open question rests on. It exits 2 with code `holds_question`, a message naming
+  each question's identity, what the session holds of it (`raised`, `answer` or `pass_up`) and the
+  `--force` flag, a `questions` list and a `force_command`, and decides this before anything is
+  stopped or written. `koto cancel <name> --cleanup` is refused the same way before the cancel is
+  written. A pinned session is refused for its pin first. Holds are matched by identity, so an
+  answer that isn't the one in effect, an answer whose raiser is no longer in the store and a
+  pass-up of a question since answered hold nothing.
+- **R65.** `koto session cleanup <name> --force` removes a session R64 refuses, exits 0, prints
+  `orphaned_questions` with each question's identity and what the session held, beside
+  `live_members`, and warns on stderr for each; a pinned session is still refused. A cleanup of a
+  session holding nothing prints what it printed before, with or without `--force`, so
+  `orphaned_questions` appears only on a forced removal that orphaned a question. What a forced removal leaves is what the reads then show: removing the only
+  answer reopens the question; removing a pass-up returns the question to the addressee it had
+  before it, with an `addressees` list one shorter; removing the raiser drops the question from
+  every open read, while the entries aimed at it still list in their holders.
+- **R66.** A recorded answer (outcome `answered`) rings the raiser's wake file,
+  `<koto home>/wakes/<raiser>`, before `koto decisions answer` returns, and also the wake file of
+  the newest session continuing the raiser when it was superseded, as a request's ring does. A
+  refused answer, a `readdress` and a `koto decisions record` ring nothing.
+- **R67.** A wake carries no content and is never taken as an answer. The line it appends is an
+  opaque token holding no answer text, question text, identity or answering session's name; the
+  file stays bounded by the leg wake's 32 KiB truncation; the asker's next tick finds the answer by
+  reading the store, whatever state the wake file is in. Ringing never fails the answer: with no
+  koto root, an unwritable wakes directory, or a symbolic link, directory or FIFO at the path, the
+  answer is stored, exits 0, warns once on stderr and leaves the path untouched.
+- **R68.** On a store of 1,000 sessions in dispatcher chains at least three deep, holding 200 open
+  questions (some addressed to a person, some to sessions, some passed up once or twice) beside
+  answered ones, `koto decisions open --person`, `koto decisions open --at` a top coordinator and the
+  `questions` read on `koto next` each finish in under five seconds on a release build and return
+  the counts the store was built with. The same holds with the store under the cloud test backend,
+  where none of the three reads makes a request to the bucket. On the same store, a terminal tick of
+  a session holding an open question, and a refused cleanup of it, each finish in under five seconds.
+
 ### Non-functional
 
 - **R32.** Decisions are immutable once written. Two sessions each recording 100 decisions at once
@@ -1040,6 +1091,56 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   no session, exits 2; both reads leave every session byte-identical and, under the cloud backend,
   make no request to the bucket (R60).
 
+**Keeping questions and waking the asker**
+
+In these criteria A, B and C are sessions with no link, lineage or anchor between them, and q1 is
+an `escalate` A records with `recipient=person:owner`.
+
+- [ ] A reaches its terminal state without `--no-cleanup` while q1 is open: `retention` reads
+  retained with reason `open_question` and q1's identity, A is still in the store, and
+  `koto session hierarchy A --json` reads `kept: true` with a keeper naming A and q1's identity. C,
+  holding no question, reaches its terminal state and is removed (R62).
+- [ ] After B answers q1, B reaching its terminal state is kept with reason `hierarchy`, and
+  `koto session hierarchy B --json` lists A among its members, joined by `answer aimed at its
+  question`. After A is removed by force and a new A with no question is created, B's answer joins
+  nothing to the new A and doesn't make B refuse a plain cleanup (R63, R64).
+- [ ] `koto session cleanup A` while q1 is open exits 2 with code `holds_question`, its message names
+  q1's identity and `--force`, and every file under A's directory is byte-identical before and
+  after; under the cloud backend no object is deleted from the bucket. `koto session cleanup B`,
+  with B holding the answer in effect, is refused with `held: "answer"`, and a session holding a
+  pass-up the current addressee rests on with `held: "pass_up"`; `koto cancel <name> --cleanup` on
+  each is refused before the session is cancelled and names `koto session cleanup <name> --force`.
+  A second answer to a question an earlier answer already closed, an answer whose raiser is gone and
+  a pass-up of a question since answered are removed by a plain cleanup with exit 0 (R64).
+- [ ] `koto session cleanup B --force` exits 0 and prints `orphaned_questions` naming q1's identity
+  beside `live_members`, with a warning on stderr; afterwards `koto decisions open --person owner`
+  returns q1 again, `koto next A` carries no `questions` key, and A's terminal tick reads reason
+  `open_question`. Removing a pass-up's holder by force returns q1 to its earlier addressee with an
+  `addressees` list one shorter. `koto session cleanup A --force` leaves no open read returning q1,
+  while `koto decisions list <holder> --format v1` still lists the entries aimed at it. A pinned
+  session is refused with `pinned` with or without `--force`, and a cleanup of a session holding
+  nothing, with or without `--force`, prints no new key (R65).
+- [ ] With a cursor taken by `koto request watch --session A --timeout-secs 0`, `koto decisions
+  answer A <id> --in B --text SQLite --by session` exits 0 having appended one line to
+  `<koto home>/wakes/A`, and `koto request watch --session A --timeout-secs 5 --since <cursor>`
+  returns `woke: true` at once; a watch started before the answer exits within one second of it.
+  With A superseded, the newest session continuing it is rung too. A refused answer, an accepted
+  pass-up and a `koto decisions record` leave every file under `<koto home>/wakes/` unchanged in
+  size and modification time (R66).
+- [ ] `grep -c SQLite <koto home>/wakes/A` prints 0, and neither the question's text, its identity
+  nor B's name appears in the file. With the wake file deleted, replaced by 64 KiB of arbitrary
+  bytes, or never written, `koto next A` carries the same `questions` array; a line appended by hand
+  while no answer exists leaves `koto next A` with no `questions` key and q1 open. With the wakes
+  directory unwritable, or a directory, FIFO or symbolic link at the path, the answer exits 0, is
+  stored, warns on stderr and leaves the planted object untouched. After 2,000 answers to questions
+  raised in one session, its wake file is under 64 KiB (R67).
+- [ ] `cargo test --release --test questions_cost` builds the store R68 describes under a temporary
+  directory and asserts the five-second bound and the counts for each read, on the local backend
+  and under the in-process cloud test endpoint, which records no request from any of the three
+  reads, and the bound for the terminal tick and the refused cleanup; a debug build checks the
+  counts on a store a tenth the size and asserts no time. `cargo test --release --test
+  retention_cost` passes with its bounds and fixtures unedited (R68).
+
 ## Out of Scope
 
 - **On whose behalf a decision was made.** Naming the person a session acted for is a later
@@ -1051,8 +1152,10 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
 - **Undoing effects outside koto.** koto doesn't revert merges, reopen pull requests or edit
   documents when a decision is reversed.
 - **Session retention, dispatch links and anchors.** They already shipped; this feature reads them
-  and changes none of their rules. A person's explicit `koto session cleanup` still removes a
-  session and its decisions. The one change to succession is R38's marker, which the fencing
+  and changes their rules only where questions need it: an open question keeps its session (R62),
+  an answer or pass-up is an edge (R63), and an explicit removal that would orphan a question is
+  refused unless forced (R64, R65). A person's explicit `koto session cleanup` otherwise still
+  removes a session and its decisions. The one change to succession is R38's marker, which the fencing
   command writes beside the fence it already appends.
 - **Who may fence a session.** Anyone who can fence a session can already cancel or change it,
   locally or through the bucket credential. A rule limiting who may fence belongs to succession,
@@ -1079,13 +1182,13 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
-- **The rest of a question's life.** R49 to R61 are the first part of questions and answers. A
+- **The rest of a question's life.** R49 to R68 are the first part of questions and answers. A
   person's answer, which needs koto to verify the person gave it, which answers to one question
   count and the precedence between them, the rule on where a pass-up may go (beyond R57's rule on
   who may record one), the re-judging of every stored pass-up at read time with the ones that break
-  a rule marked as not counted, settling and withdrawing a question, and how long questions and
-  answers are kept are not covered yet, so R53's rule that any answer closes a question, including
-  one from a session the question has moved away from, is interim.
+  a rule marked as not counted, and settling and withdrawing a question are not covered yet, so
+  R53's rule that any answer closes a question, including one from a session the question has moved
+  away from, is interim.
 
 ## Known Limitations
 

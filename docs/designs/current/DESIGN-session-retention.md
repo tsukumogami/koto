@@ -81,7 +81,11 @@ The PRD wants one rule over the whole connected hierarchy (R14) at every
 removal by rule or subtree, the terminal tick keeping every session with an
 edge (R15), a re-run moving a held predecessor aside (R17), explicit removal
 reporting what it broke (R18), and a reason wherever koto keeps something
-(R19).
+(R19). Questions raised with `escalate` add two rules to the one over the
+hierarchy (R36 to R40): a session holding an open question keeps its
+hierarchy with no expiry, an answer or pass-up aimed at a question joins its
+holder to the question's session, and an explicit removal that would orphan
+a question is refused unless it is forced.
 
 **Reads write.** `koto context get` and `koto context exists` append a
 `context_read` event to the read session's log, from the reader's process.
@@ -524,7 +528,10 @@ Wiring:
   the session's own `koto/links/`, `parent_workflow`, `chain/parent` and
   child signals, then makes one pass that stops at the first inbound hit. No
   retention is evaluated and no settings are read, so a lone session costs
-  one header-level pass and is removed as today.
+  one header-level pass and is removed as today. Since questions joined the
+  rule, an `open_question` check sits after the failure terminal and the pin
+  and before `edge_of`, and `edge_of` also tests aimed answers and pass-ups
+  in both directions ("Questions" below).
 - **Parent sweep.** A parent with children always has an edge, so it is
   kept at its terminal tick, and so are its children, which have lineage to
   it. The sweep at that tick therefore removes nothing: it lists each
@@ -553,7 +560,109 @@ Wiring:
   remove something the plan didn't name.
 - **`koto session cleanup` and `koto cancel --cleanup`.** Before removing,
   the output gains `live_members: [{name, kind, observed}]`, every other live
-  member when the rule would have kept the session, else empty.
+  member when the rule would have kept the session, else empty. A member
+  kept only for the open questions it holds is not alive and isn't listed
+  there. A removal that would orphan a question is refused unless forced
+  ("Questions" below).
+
+#### Questions
+
+A question is an `escalate` decision with a typed recipient (the decision
+record's design). Two rules make questions part of the retention rule, and
+both rest on one test of open: `is_open` in `src/decisions/questions.rs`, a
+question that is in effect (not reversed, not past a fence) with no answer
+in effect. The open reads (`koto decisions open --person` and `--at`, the
+`questions` array on `koto next`), the terminal tick, the engine's keepers
+and the cleanup refusal all call it, so a change to what counts as open
+reaches every one of them at once.
+
+- **An open question keeps.** A session that raised a question still open
+  is a keeper of its hierarchy, alive or not, with no expiry: it keeps until
+  the question is answered, reversed or fenced, and no retention period
+  runs while it does. `Keeper` gains `alive` and `questions` (the
+  identities, `<session id>/<decision id>`). The `Judge` asks only about
+  members whose `SessionFacts` say they hold a file under `koto/decisions/`,
+  and reads the store's decisions once per command, the first time such a
+  member is judged, so a hierarchy with no decision costs nothing new.
+- **An aimed answer or pass-up is an edge.** An `answer` or `readdress`
+  stored under `ctx/koto/aimed/<raiser id>/` in its holder joins the holder
+  to the session whose header id is `<raiser id>`. The match is by id, never
+  by name, so a later session that takes a removed raiser's name joins
+  nothing. A reversal under the same directory, and a body that can't be
+  read as a decision or is larger than a decision body may be, is not an
+  edge. `SessionFacts` gains `aimed` (target id and kind, read from each
+  body's `kind`) and `holds_decisions`; `Graph::scan` adds one edge per
+  aimed fact whose target id is a session in the store, with `Via::Aimed`.
+
+**What the terminal tick reads.** After the failure terminal and the pin,
+and before the edge test, the tick reads the session's own
+`koto/decisions/` directory. Only when that holds a question does it scan
+the local store (never the bucket, under the cloud backend) and test each of
+the session's questions with `is_open`. A session it keeps that way answers
+`"retention": {"retained": true, "reason": "open_question",
+"open_questions": ["<session id>/<decision id>"]}`, with or without
+`--no-cleanup`, and its `kept_children` are listed as for `hierarchy`. A
+session that raised no question pays that one directory read and no store
+scan. `edge_of` then learns of aimed entries in the pass it already makes:
+it collects the target ids of the session's own aimed answers and pass-ups
+and compares them with each other session's header id, which the pass
+already reads, and for each other session it looks up
+`ctx/koto/aimed/<own id>/`, one directory lookup per session. A directory
+there that can't be listed counts as an edge, which only keeps. So a session
+holding neither a question nor an aimed entry, and aimed at by none, costs
+what it cost before.
+
+**What the query and the prunes print.** In `koto session hierarchy --json`
+a member holding an open question is a keeper; its keeper object gains
+`"open_questions": [...]` and, when the member isn't alive,
+`"alive": false`. The reason text is `kept: an open question is held in its
+hierarchy: <name> holds open question <id>`, or that clause appended to the
+alive text when a member is also alive. An aimed edge shows in the member's
+`joined_by` with via `answer aimed at its question` or `pass-up aimed at its
+question`. `koto session prune` lists a session kept that way under rule
+`h`, whose `detail` is that text: rule `a` stays the session's own life, so
+a stopped session holding an open question is kept with its hierarchy, not
+as alive. `koto workspace prune --root`, whose `--force` passes only its
+terminal-state gate, and `koto init --replace-terminal`, which moves the
+predecessor aside, follow the same verdict. The parent sweep keeps a
+terminal child that raised an open question, as it keeps a pinned one, with
+a `kept_children` entry of reason `open_question`, its `open_questions` and
+a detail naming them; like a pin it keeps nothing above the child.
+
+**Explicit removal.** Where explicit removal always removed and reported
+what it broke, a removal that would orphan a question is now refused unless
+it is forced. `koto session cleanup <name>` refuses, before anything is
+stopped or written, a session that raised an open question, holds the
+answer in effect for a question whose raiser is in the store, or holds a
+pass-up that the current addressee of an open question rests on: exit 2,
+
+```json
+{"error": {"code": "holds_question", "message": "...", "session": "<name>",
+  "questions": [{"question": "<identity>", "held": "raised"}],
+  "force_command": "koto session cleanup <name> --force"}}
+```
+
+with `held` one of `raised`, `answer` and `pass_up`. The message names each
+question, what the session holds of it and what removing it loses. A pin is
+refused first, with code `pinned`, with or without `--force`. `koto cancel
+<name> --cleanup` is refused the same way before the cancel is written, and
+its `force_command` is the cleanup command. Holds are matched by identity:
+an answer that isn't the one in effect, an answer whose raiser is no longer
+in the store, and a pass-up of a question since answered hold nothing, so a
+raiser and its answerer can both be removed without force, raiser first.
+The refusal reads the session's own decisions first and scans the local
+store only when they hold a question or an aimed answer or pass-up.
+
+`--force` removes the session and adds `orphaned_questions` (the same
+objects as `questions`) beside `live_members`, with one stderr warning per
+question. A removal of a session that holds nothing prints what it printed
+before, with or without `--force`: `orphaned_questions` appears only on a
+forced removal that orphaned a question.
+The reads then show what the removal left. Removing the only answer reopens
+the question, and the raiser's terminal tick keeps it for `open_question`
+again. Removing a pass-up returns the question to the addressee it had
+before. Removing the raiser drops the question from every open read, while
+the entries aimed at it still list in their holders.
 
 #### Alternatives Considered
 
@@ -944,8 +1053,11 @@ dispatched agent session's own anchor reading the inherited variable. niwa,
 when present, marks sessions it will reap; the anchor records that marker.
 
 Every removal by rule or subtree asks one engine one question: is anything
-in this session's connected hierarchy alive, and if not, has the retention
-passed since the last member stopped? An anchor is alive until niwa's
+in this session's connected hierarchy alive or holding an open question,
+and if not, has the retention passed since the last member stopped? An
+answer or pass-up aimed at a question joins its holder to the question's
+session, and an explicit removal that would orphan a question needs
+`--force`. An anchor is alive until niwa's
 on-reap command records its observed close; only an unobserved or imported
 anchor closes after its idle period, counted from activity in its own log.
 An observed anchor closes only through an observed close: niwa's next reap
@@ -1139,6 +1251,7 @@ koto session anchor open --harness-session <id> --source <s> [--process <t>]
 koto session anchor observe --anchor <name> (--key=<v> | --inherit)
 koto session anchor close --key=<v> --harness-session=<id>
 koto session hierarchy <name> [--json]
+koto session cleanup <name> [--force]
 
 KOTO_ANCHOR                      the running agent session's anchor
 KOTO_DISPATCHER_ANCHOR           the dispatcher's anchor, read only by the start hook
@@ -1168,9 +1281,16 @@ When nothing is alive, `keepers` is empty and `retention` is
 `"stale": true` and `"close_command"`, the hand-close command with the
 anchor's marker and harness session id filled in; prune prints the same.
 
+A keeper held for open questions adds `"open_questions"`, and
+`"alive": false` when it isn't alive.
+
 Tick answer: `"retention": {"retained": true, "reason": "hierarchy"}` and
-`"kept_children": [{"name", "reason"}]`. Cleanup and cancel:
-`"live_members": [{"name", "kind", "observed"}]`. Replace: `"moved_to"`.
+`"kept_children": [{"name", "reason"}]`; a session kept for its open
+questions reads `"reason": "open_question"` with `"open_questions"`.
+Cleanup and cancel: `"live_members": [{"name", "kind", "observed"}]`; a
+refusal for a held question exits 2 with code `holds_question`, and
+`cleanup --force` adds `"orphaned_questions": [{"question", "held"}]`.
+Replace: `"moved_to"`.
 Prune kept entries: rule `h` with a `hierarchy` object equal to the query's
 JSON.
 
@@ -1200,8 +1320,10 @@ timeout = "10s"
 3. **Read.** `context get/exists` log in the read session only for the
    session's own agent session; other readers' records go into their own
    anchors.
-4. **Terminal.** The tick keeps any session with an edge (`hierarchy`); the
-   sweep lists kept children; lone sessions go as today.
+4. **Terminal.** The tick keeps a session that raised an open question
+   (`open_question`) and any session with an edge (`hierarchy`), an aimed
+   answer or pass-up included; the sweep lists kept children; lone sessions
+   go as today.
 5. **Close.** niwa's reap runs the on-reap command, which writes
    `anchor-<S>-closed`, and repeats at later reaps until it succeeds; with
    no niwa, the engine reads an unobserved anchor closed after its idle
@@ -1448,6 +1570,10 @@ store shared by mixed koto versions loses the guarantee.
   the anchor hook is registered; the existing /workflows and Stop hooks
   stay off.
 - Hierarchies follow a session through import by name.
+- A question stays answerable while it is open: its raiser and the
+  hierarchy around it, the sessions it was passed through included, are
+  kept until it is answered, reversed or fenced, and an explicit removal
+  names the question it would orphan before it removes anything.
 
 ### Negative
 
@@ -1474,6 +1600,12 @@ store shared by mixed koto versions loses the guarantee.
   deletion.
 - Every `koto init` and tick under an anchor may append one event to that
   anchor, throttled to one per tenth of the idle period.
+- A question nobody answers keeps its raiser's hierarchy indefinitely: an
+  open question has no expiry. It goes once the question is answered,
+  reversed or fenced, or when someone removes the raiser with
+  `koto session cleanup --force`.
+- A person removing a session that holds what an open question depends on
+  now has to pass `--force`, where before the removal always went through.
 - Four existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.
@@ -1483,6 +1615,10 @@ store shared by mixed koto versions loses the guarantee.
 - The changelog and the CLI guide say plainly that end-of-run removal no
   longer reclaims hierarchy members; `koto session hierarchy` shows why each
   is kept, and prune's reasons name it.
+- `koto decisions open --person` and `--at` list every question that keeps
+  a session, the refusal names each question and the one command that
+  removes the session anyway, and `orphaned_questions` records what a forced
+  removal lost.
 - The 7-day idle default keeps a weekend away inside the hold; all three
   durations are configurable.
 - Every taint names the item, so the unreadable header is one
