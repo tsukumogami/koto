@@ -298,3 +298,39 @@ fn the_question_reads_answer_within_their_bound_and_ask_nothing_of_the_bucket() 
     reads(&store, "cloud", &cloud);
     assert_eq!(s3.requests().len(), 0, "{:?}", s3.requests());
 }
+
+/// A question whose history is long: answered by its addressee, then 500
+/// more answers aimed at it (50 on a debug build), each a copy of the first
+/// stored straight into the addressee's aimed area under its own id. Each
+/// entry is judged against the one resolution of the question, so the read
+/// stays within the bound however many entries the question has.
+#[test]
+fn a_long_history_reads_within_the_bound() {
+    let env = Env::new();
+    env.ladder();
+    let copies = if RELEASE { 500 } else { 50 };
+    let q = env.raise("worker", "long", "session:manager", &["label=long"]);
+    let first = env.say_ok(&q, "manager", "settled");
+    let body = env.stored("manager", &q, &first);
+    for i in 0..copies {
+        let id = format!("{:012}", 900_000 + i);
+        let mut copy = body.clone();
+        copy["id"] = json!(id);
+        env.plant("manager", &q, &id, &copy);
+    }
+    env.ok(&["version"]);
+    let identity = q.identity();
+    let (v, took) = timed(
+        "history, long",
+        env.command(&[], &["decisions", "history", &identity]),
+    );
+    // The raise and every answer, the first of them the one in effect.
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), copies + 2, "{v}");
+    assert_eq!(v["answer"]["id"], first.as_str());
+    let governing = entries.iter().filter(|e| e["governs"] == true).count();
+    assert_eq!(governing, 1, "{v}");
+    if RELEASE {
+        assert!(took < BOUND, "history, long took {took:?}");
+    }
+}
