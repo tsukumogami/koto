@@ -949,15 +949,20 @@ holds the harness session koto last saw driving it (written when the session was
 any later command run with a different driver), the two must agree. koto then looks one directory
 below `.claude/projects/` in the effective user's home, read from the account database
 (`getpwuid_r` on the effective uid) and never from `$HOME`, for exactly one regular
-`<harness>.jsonl`, refusing symbolic links, and requires the record's canonical path to lie under
-the canonical root. Nothing else is searched, so a record can't be borrowed from another harness
-session or from a home the caller pointed `HOME` at.
+`<harness>.jsonl` that isn't itself a symbolic link, and requires the record's canonical path to
+lie under the root's canonical path. A symbolic link to `~/.claude` itself is followed; what is
+enforced is where the record really is, not how the path to it was spelled. Nothing else is
+searched, so a record can't be borrowed from another harness session or from a home the caller
+pointed `HOME` at. `CLAUDE_CONFIG_DIR` isn't honoured: a harness configured with it keeps its
+records elsewhere, and a person's answer there always fails `record`, a known limit; reading the
+variable would let any process point koto at a record it wrote.
 
 The harness session id itself is not authenticated. It's an environment value, so any process
 running as the user can set it; where the sidecar holds no driver (a session created outside
-Claude Code), it is the only thing naming the harness session. The binding to the sidecar narrows
-that: an answer can't swap in another harness session's id for a koto session koto already saw
-driven by a different one, unless a command has since run in that session under the new id.
+Claude Code), it is the only thing naming the harness session. The binding to the sidecar catches
+a mismatch where a driver is recorded, such as an answer given from the wrong harness session by
+mistake. It narrows nothing against a deliberate forger: the caller picks `--in`, a session created
+without the harness variable has no driver, and the sidecar is a file the user can delete.
 
 **Reading the record.** Lines are read with a 16 MiB cap on each and 1 GiB in all, and a record
 past either fails `shape`, so a huge line can't exhaust memory. Only lines containing the quoted
@@ -982,19 +987,29 @@ reading as absent: the trust rests on a format koto observes and doesn't own, an
 must refuse answers, not misread them.
 
 **Reuse.** One call position verifies one answer on a host. Every local answer to the question is
-scanned for one citing the same pointer before any check. Then, before the write, the answer
-creates `prompt-uses/<sha256 of harness/call/position>` under the koto root with create-only
-semantics: whichever answer creates it goes on, and any other, from any answering session, fails
-`call-position-reused`. A write that fails removes the marker. The answering session's listing is
-checked again inside its write lock as well. Two hosts aren't serialized, and a process killed
-between the marker and the write leaves the position used, which errs toward refusing.
+scanned for one citing the same pointer before any check. Then, before the write, the answer takes
+`prompt-uses/<sha256 of harness/call/position>` under the koto root. A new marker is written and
+`flock`ed under a name of its own and hard-linked into place, so it never appears unlocked while
+its answer is being written; the lock is held until the answer is published or abandoned. An
+answer that finds the marker already there tries the lock. If another process holds it, an answer
+is being written now, and this one fails `call-position-reused`. If the lock is free, the writer is
+gone: when a stored answer on this host cites the position, the position is used and the answer
+fails the same way; when none does, the writer stopped before publishing, so the marker is stale
+and this answer takes it over under the lock. A write that fails removes the marker while still
+holding the lock. The answering session's listing is checked again inside its write lock as well.
+Two hosts aren't serialized.
 
 **Created here or arrived.** The mark is stored as `verified`, `observed`, but the reading isn't
 taken from the stored bytes alone, since a pull or an import copies them unchanged. Each host keeps
 an identity, `host-id` under the koto root: 32 random bytes created once, outside every session
-directory, never synced or imported. When an answer is recorded, koto appends
+directory, never synced or imported. It is written whole under a name of its own and hard-linked
+into place, so a racing first answer never reads it half written, and it isn't used when its group
+or others may write it. When an answer is recorded, koto appends
 `<session id> <decision id> <seal>` to `koto-verified-here` in the answering session's directory,
 beside `ctx/` rather than in it, so no manifest lists it and no sync, pull or import carries it. The
+line is written inside the write's critical section, after the body is built and before it is
+published: a process stopped between the two leaves a line naming no stored answer, which reads as
+nothing, instead of a stored answer that reads remote on its own host for good. The
 seal is SHA-256 over the host identity, the session directory's name and the SHA-256 of the stored
 answer body. A read looks in the directory of the session it read the answer from, never one a
 field of the body names, and shows `verified` only when that note holds the answer's sealed line.
@@ -1008,8 +1023,11 @@ answer, so a session created here that pulls an answer recorded on another host 
 remote too. A directory restored in place on the same host, under the same koto root, still reads
 verified, since the host did check that body there.
 
-The residual is the same trust limit as the record's: a process that can write both the koto root's
-host identity and the session files can compute a seal and write a line that reads verified.
+What the verified reading protects against is a session mistaking a relayed or typed remark for
+an answered prompt, and a copy that arrives by import or pull being read as checked here. It is not
+protection against a process running as the same user that sets out to forge. Reading `host-id` is
+enough to seal a hand-written answer that was never prompted, with no harness record needed, and a
+copy of the whole koto root, `host-id` included, on another machine still reads verified.
 
 The cloud import now carries the decision areas and `koto/packets/`, as this design's Decision 1
 always meant it to: each area is listed in the source's bucket prefix, each object read and pushed

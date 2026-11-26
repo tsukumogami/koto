@@ -672,11 +672,14 @@ to an id-shaped value, and both say so.
 - **R63.** koto finds the record from the harness session alone: the named harness session must
   be the one running the command, as `CLAUDE_CODE_SESSION_ID` reports it (R47), and, when koto has
   recorded a harness session driving the answering koto session (at its creation or on a later
-  command), the same one. Exactly one regular file named `<harness>.jsonl` must sit one directory
-  below `.claude/projects/` in the effective user's home as the account database gives it, never
-  `$HOME`, with no symbolic link on the way and a real path under that root. The harness session
-  id is an unauthenticated value from the environment: any process running as the user can set
-  it, and where koto holds no recorded driver it is the only thing naming the harness session.
+  command), the same one. Exactly one regular file named `<harness>.jsonl`, not itself a symbolic
+  link, must sit one directory below `.claude/projects/` in the effective user's home as the
+  account database gives it, never `$HOME`, and its canonical path must lie under the root's
+  canonical path (a symbolic link to `.claude` itself is followed). `CLAUDE_CONFIG_DIR` isn't read.
+  The harness session id is an unauthenticated value from the environment: any process running as
+  the user can set it. The driver binding catches a mismatch where a driver is recorded; it narrows
+  nothing against a deliberate forger, who picks `--in`, can use a session created without the
+  harness variable (which records no driver) and can delete the sidecar that holds it.
 - **R64.** The call must be the harness's question tool, `AskUserQuestion`; the position must
   name one of its questions; and that question's `header` must be the question's prompt header,
   `#` followed by the first 11 hexadecimal digits of the SHA-256 of `<asking session id>/<question
@@ -697,14 +700,19 @@ to an id-shaped value, and both say so.
   or more than 1 GiB in all fails with the `shape` check, so a change in the harness's record
   format refuses answers instead of misreading them.
 - **R67.** One position of one call verifies one answer on a host. Before writing, an answer takes
-  a create-only marker under the koto root named for the harness session, call and position, and
-  frees it if the write fails; a second answer citing the same position, from any answering session
-  on the host, is refused, so of two answers racing on one position exactly one is recorded.
+  a marker under the koto root named for the harness session, call and position, locked while it
+  writes and freed if the write fails; a second answer citing the same position, from any
+  answering session on the host, is refused while the marker is locked or a stored answer on the
+  host cites the position, so of two answers racing on one position exactly one is recorded. A
+  marker left by a process that stopped before publishing, with no stored answer citing it, is
+  taken over.
 - **R68.** A verified answer stores the pointer and a mark, `verified`, labelled `observed`; no
   caller input produces it. The answering host keeps a note of each answer it verified in the
-  answering session's directory, outside its context, which no sync, pull or import carries. Each
-  note line is sealed: a SHA-256 over a host identity koto keeps under its root (created once, never
-  synced or imported), the session directory's name and the SHA-256 of the stored answer. A read
+  answering session's directory, outside its context, which no sync, pull or import carries,
+  written before the answer is published. Each note line is sealed: a SHA-256 over a host identity
+  koto keeps under its root (created once, published whole, never synced or imported, and not used
+  when its group or others may write it), the session directory's name and the SHA-256 of the
+  stored answer. A read
   shows the answer as `verified` only when the note in the directory it read the answer from holds
   that answer's sealed line. Anywhere else (a copy brought by a pull or an import, on this host or
   another, a session directory copied by hand to another koto root, a line written for another
@@ -1219,11 +1227,19 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   format koto observes and doesn't own. The `shape` check refuses a record whose format changed,
   but anything running as the operator can write a record that passes, in the account's own
   `.claude/projects`, and can set `CLAUDE_CODE_SESSION_ID`; the evidence shows the prompt happened
-  as recorded, not that no one wrote the record. The same holds for the verified reading: a process
-  that can write both the koto root's host identity and the session files can write a sealed note
-  line.
+  as recorded, not that no one wrote the record.
+- The verified reading protects against a session mistaking a relayed or typed remark for an
+  answered prompt, and against copies that arrive by import or pull. It is not protection against a
+  process running as the same user that sets out to forge: reading the koto root's `host-id` is
+  enough to seal a hand-written answer that was never prompted, with no harness record at all. A
+  copy of the whole koto root, `host-id` included, on another machine still reads verified, and so
+  does a session directory restored in place.
+- A harness configured with `CLAUDE_CONFIG_DIR` keeps its records outside `~/.claude/projects`,
+  so a person's answer there always fails the `record` check. koto doesn't honour the variable,
+  since any process can set it.
 - R67's marker is per host. Two hosts answering from copies of one harness record aren't
-  serialized, and a process killed between taking the marker and writing leaves the position used.
+  serialized. Once the session holding the answer that used a position is removed from the host, no
+  stored answer cites it and the position can verify another answer.
 - `koto session import` carries the decisions its source recorded itself, not the ones the source
   carried from an earlier import: a copy of a copy holds only its immediate source's own decisions.
 

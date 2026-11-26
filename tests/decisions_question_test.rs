@@ -515,7 +515,7 @@ fn an_answer_is_refused_and_writes_nothing_when_its_target_is_wrong() {
         out.json()["error"]
             .as_str()
             .unwrap()
-            .contains("a person's answer can't be recorded yet"),
+            .contains("a person's answer needs the question-prompt evidence"),
         "{}",
         out.stdout
     );

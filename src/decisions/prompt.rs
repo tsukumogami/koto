@@ -355,45 +355,78 @@ fn open_plain(path: &Path) -> Option<std::fs::File> {
 }
 
 /// This host's identity under `koto_home`, or `None` when it doesn't exist
-/// yet or isn't what koto writes.
+/// yet, isn't what koto writes, or its group or others may write it (anyone
+/// who can replace it can seal a note line).
 fn read_host_id(koto_home: &Path) -> Option<[u8; 32]> {
     use std::io::Read;
+    let file = open_plain(&koto_home.join(HOST_ID_FILE))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata().ok()?.permissions().mode() & 0o022 != 0 {
+            return None;
+        }
+    }
     let mut text = String::new();
-    open_plain(&koto_home.join(HOST_ID_FILE))?
-        .take(65)
-        .read_to_string(&mut text)
-        .ok()?;
+    file.take(65).read_to_string(&mut text).ok()?;
     let bytes = hex::decode(text.trim_end_matches('\n')).ok()?;
     bytes.try_into().ok()
 }
 
+/// `n` random bytes from the system's source.
+fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    use std::io::Read;
+    let mut b = [0u8; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b)
+}
+
 /// This host's identity, created under `koto_home` when there is none.
-/// Creation is create-only, so two racing processes agree on one value.
+/// The bytes are written whole to a file of their own in the same
+/// directory and then linked into place create-only, so no reader ever sees
+/// a partly written identity and two racing processes read back the one
+/// that won.
 fn host_id(koto_home: &Path) -> std::io::Result<[u8; 32]> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     if let Some(id) = read_host_id(koto_home) {
         return Ok(id);
     }
+    let unusable = || {
+        std::io::Error::other(
+            "the host identity file under the koto root isn't one koto wrote, or its group or \
+             others may write it",
+        )
+    };
     crate::koto_home::ensure_private_root(koto_home)?;
-    let mut id = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
+    let target = koto_home.join(HOST_ID_FILE);
+    if target.symlink_metadata().is_ok() {
+        return read_host_id(koto_home).ok_or_else(unusable);
+    }
+    let id: [u8; 32] = random_bytes()?;
+    let tmp = koto_home.join(format!(
+        ".{HOST_ID_FILE}.{}.{}",
+        std::process::id(),
+        hex::encode(random_bytes::<8>()?)
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    match options.open(koto_home.join(HOST_ID_FILE)) {
-        Ok(mut f) => {
-            f.write_all(format!("{}\n", hex::encode(id)).as_bytes())?;
-            f.sync_all()?;
-        }
+    let written = options.open(&tmp).and_then(|mut f| {
+        f.write_all(format!("{}\n", hex::encode(id)).as_bytes())?;
+        f.sync_all()
+    });
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, &target));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    read_host_id(koto_home)
-        .ok_or_else(|| std::io::Error::other("the host identity file isn't one koto wrote"))
+    read_host_id(koto_home).ok_or_else(unusable)
 }
 
 /// The seal a note line carries for answer `body` held in the session
@@ -422,8 +455,11 @@ fn note_line(host: &[u8; 32], holder: &str, body: &DecisionBody) -> String {
     )
 }
 
-/// Note that this host checked the prompt of answer `body`, written in the
-/// session `holder` whose directory is `session_dir`.
+/// Note that this host checked the prompt of answer `body`, about to be
+/// written in the session `holder` whose directory is `session_dir`. The
+/// note is written before the answer is published, so a process stopped
+/// between the two leaves a line naming no stored answer, which reads as
+/// nothing, rather than a stored answer this host can't read verified.
 pub fn note_verified_here(
     koto_home: &Path,
     session_dir: &Path,
@@ -469,11 +505,13 @@ pub fn verified_here(
     String::from_utf8_lossy(&bytes).lines().any(|l| l == want)
 }
 
-/// The create-only marker that holds one call position for one answer on
-/// this host. Dropping it without [`UseMarker::keep`] removes it, so a
+/// The marker that holds one call position for one answer on this host.
+/// While an answer is being written its process holds an exclusive `flock`
+/// on the marker. Dropping it without [`UseMarker::keep`] removes it, so a
 /// write that fails frees the position again.
 pub struct UseMarker {
     path: Option<PathBuf>,
+    _lock: std::fs::File,
 }
 
 impl UseMarker {
@@ -485,32 +523,101 @@ impl UseMarker {
 
 impl Drop for UseMarker {
     fn drop(&mut self) {
+        // Removed while the lock is still held, so a waiter that locks it
+        // next finds the path gone and starts again.
         if let Some(p) = self.path.take() {
             let _ = std::fs::remove_file(p);
         }
     }
 }
 
+/// Whether `file` is still the file at `path`.
+#[cfg(unix)]
+fn same_file(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// Take the call position `pointer` names for one answer, host-wide:
-/// `Ok(None)` when another answer on this host already holds it.
-pub fn take_use(koto_home: &Path, pointer: &Pointer) -> std::io::Result<Option<UseMarker>> {
+/// `Ok(None)` when another answer on this host holds it.
+///
+/// A new marker is written and locked under a name of its own, then linked
+/// into place create-only, so it is never visible unlocked while its answer
+/// is being written. A marker that already exists is held when another
+/// process has it locked (an answer being written now) or when `cited`
+/// reports a stored answer on this host citing the position. Otherwise its
+/// writer stopped before publishing anything: the marker is stale, and the
+/// caller takes it over under the lock, so of two answers racing for a
+/// stale marker the second waits for the first and then finds its answer.
+pub fn take_use(
+    koto_home: &Path,
+    pointer: &Pointer,
+    cited: impl Fn() -> bool,
+) -> std::io::Result<Option<UseMarker>> {
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = koto_home.join(PROMPT_USES_DIR);
     crate::koto_home::ensure_private_root(&dir)?;
     let name = hex::encode(Sha256::digest(pointer.display().as_bytes()));
-    let path = dir.join(name);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let path = dir.join(&name);
+    for _ in 0..16 {
+        let tmp = dir.join(format!(
+            ".{name}.{}.{}",
+            std::process::id(),
+            hex::encode(random_bytes::<8>()?)
+        ));
+        let fresh = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        if !crate::pool::store::try_flock(&fresh) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(std::io::Error::other("a new marker couldn't be locked"));
+        }
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                return Ok(Some(UseMarker {
+                    path: Some(path),
+                    _lock: fresh,
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        drop(fresh);
+        let existing = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !crate::pool::store::try_flock(&existing) {
+            return Ok(None);
+        }
+        if !same_file(&existing, &path) {
+            continue;
+        }
+        if cited() {
+            return Ok(None);
+        }
+        return Ok(Some(UseMarker {
+            path: Some(path),
+            _lock: existing,
+        }));
     }
-    match options.open(&path) {
-        Ok(_) => Ok(Some(UseMarker { path: Some(path) })),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(e) => Err(e),
-    }
+    Err(std::io::Error::other(
+        "the marker kept changing under this answer",
+    ))
 }
 
 /// The effective user's home directory from the account database, never
@@ -936,5 +1043,65 @@ mod tests {
                 Check::Content
             );
         }
+    }
+
+    #[test]
+    fn racing_first_uses_agree_on_one_complete_host_identity() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("koto");
+            let ids: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| s.spawn(|| host_id(&home).unwrap()))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(ids.iter().all(|i| *i == ids[0]));
+            assert_eq!(read_host_id(&home), Some(ids[0]));
+            let names: Vec<_> = std::fs::read_dir(&home)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [HOST_ID_FILE], "no partial file is left behind");
+        }
+    }
+
+    #[test]
+    fn a_host_identity_others_may_write_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("koto");
+        let id = host_id(&home).unwrap();
+        let file = home.join(HOST_ID_FILE);
+        for mode in [0o620, 0o602] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(read_host_id(&home), None);
+            assert!(host_id(&home).is_err());
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(host_id(&home).unwrap(), id);
+    }
+
+    #[test]
+    fn a_marker_is_held_while_locked_or_cited_and_taken_over_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("koto");
+        let pointer = Pointer::parse("ZQX-harness/toolu_ZQXMARKER/1").unwrap();
+        // A live holder: refused, cited or not.
+        let live = take_use(&home, &pointer, || false).unwrap().unwrap();
+        assert!(take_use(&home, &pointer, || false).unwrap().is_none());
+        // Kept after its answer was written: held while that answer is
+        // stored, taken over once nothing cites the position.
+        live.keep();
+        assert!(take_use(&home, &pointer, || true).unwrap().is_none());
+        let taken = take_use(&home, &pointer, || false).unwrap().unwrap();
+        assert!(take_use(&home, &pointer, || false).unwrap().is_none());
+        // Dropped: the position is free again.
+        drop(taken);
+        let names: Vec<_> = std::fs::read_dir(home.join(PROMPT_USES_DIR))
+            .unwrap()
+            .collect();
+        assert!(names.is_empty());
+        assert!(take_use(&home, &pointer, || true).unwrap().is_some());
     }
 }

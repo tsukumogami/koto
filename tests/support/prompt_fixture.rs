@@ -10,9 +10,13 @@
 //! line's timestamp is set to the moment the record is rendered.
 //!
 //! koto reads a harness record only under the effective user's home from
-//! the account database, never under `$HOME`, so a test installs its
-//! records in the real `~/.claude/projects`, in a project folder of its own
-//! named `koto-test-<tag>` that [`Records`] removes when dropped. Harness
+//! the account database, never under `$HOME` or any other variable: being
+//! impossible to redirect is the point of the check, so no test switch moves
+//! it either. A test therefore installs its records in the real
+//! `~/.claude/projects`, in a project folder of its own named
+//! [`PREFIX`]`<tag>` that [`Records`] removes when dropped. A run that was
+//! killed leaves its folders behind; the first [`Records`] of each run
+//! removes any such folder last changed more than an hour ago. Harness
 //! session ids carry the same per-thread tag, so tests running at once
 //! never find each other's records.
 
@@ -162,19 +166,48 @@ fn tag() -> String {
     TAG.with(Clone::clone)
 }
 
+/// The start of every project folder and harness session id the tests
+/// make: unmistakably a koto test's, never a real project's.
+pub const PREFIX: &str = "koto-integration-test-artefact-";
+
 /// This thread's harness session id.
 pub fn harness() -> String {
-    format!("koto-test-{}-a", tag())
+    format!("{PREFIX}{}-a", tag())
 }
 
 /// A second harness session id for this thread.
 pub fn other_harness() -> String {
-    format!("koto-test-{}-b", tag())
+    format!("{PREFIX}{}-b", tag())
 }
 
 /// This thread's project folder under [`records_root`].
 pub fn project() -> String {
-    format!("koto-test-{}", tag())
+    format!("{PREFIX}{}", tag())
+}
+
+/// Remove the [`PREFIX`] folders an earlier, killed run left under
+/// [`records_root`]: those last changed more than an hour ago, so a run
+/// going on at the same moment keeps its own.
+fn sweep_leftovers() {
+    let Ok(dir) = std::fs::read_dir(records_root()) else {
+        return;
+    };
+    let hour = std::time::Duration::from_secs(3600);
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(PREFIX) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > hour);
+        if old {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// This thread's project folder, emptied when made and removed when
@@ -184,6 +217,8 @@ pub struct Records(());
 
 impl Records {
     pub fn new() -> Self {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(sweep_leftovers);
         let _ = std::fs::remove_dir_all(records_root().join(project()));
         Records(())
     }

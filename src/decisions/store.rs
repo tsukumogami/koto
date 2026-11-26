@@ -342,6 +342,18 @@ pub fn write_in(
     write_area(backend, session, area, build, None)
 }
 
+/// [`write_in`], with `commit` run once the body is built and size-checked,
+/// before it is published.
+pub fn write_in_with(
+    backend: &Backend,
+    session: &str,
+    area: &Area,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+    commit: Commit<'_>,
+) -> Result<DecisionBody, DecisionError> {
+    write_area(backend, session, area, build, Some(commit))
+}
+
 /// A step [`write_with`] runs inside the critical section once the body is
 /// built and size-checked, before the body is published: a gate-passing
 /// command appends its event here with the body embedded in it, so the

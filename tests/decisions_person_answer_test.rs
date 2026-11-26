@@ -1354,3 +1354,92 @@ fn a_copied_session_directory_or_a_hand_written_note_reads_remote() {
     assert_eq!(shown["reading"], "a remote session's answer", "{shown}");
     assert_eq!(shown["decision"]["prompt"]["mark"]["value"], "remote");
 }
+
+#[test]
+fn an_answer_stopped_before_its_entry_is_published_frees_the_position() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    fx::install(
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
+    );
+    let p = pointer(&fx::harness(), fx::CALL, 1);
+    let args = [
+        "decisions",
+        "answer",
+        RAISER,
+        &q.id,
+        "--in",
+        ANSWERER,
+        "--by",
+        "person:owner",
+        "--prompt",
+        &p,
+    ];
+    // The debug build's existing fault point after the pre-publish step:
+    // the process stops as a killed one would, with the marker taken and
+    // the note line written, before the entry exists.
+    let stopped = env
+        .command(Some(&fx::harness()), &args)
+        .env("KOTO_TEST_DECISION_FAULT", "after-event")
+        .output()
+        .unwrap();
+    assert_eq!(stopped.status.code(), Some(86));
+    assert_eq!(env.entries(), 0);
+    assert!(std::fs::read_dir(env.home().join("prompt-uses"))
+        .unwrap()
+        .next()
+        .is_some());
+    let note = env
+        .root
+        .join("sessions")
+        .join(ANSWERER)
+        .join("koto-verified-here");
+    assert_eq!(std::fs::read_to_string(&note).unwrap().lines().count(), 1);
+
+    // The same answer again: the stale marker is taken over, the answer is
+    // recorded once and reads verified.
+    let out = env.run_h(Some(&fx::harness()), &args);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert_eq!(env.entries(), 1);
+    let id = out.json()["id"].as_str().unwrap().to_string();
+    let shown = env.ok(&["decisions", "show", ANSWERER, &id]).json();
+    assert_eq!(shown["reading"], "verified");
+    // And another is refused: the position is used now.
+    let again = env.run_h(Some(&fx::harness()), &args);
+    refused(&env, &again, 1, "call-position-reused");
+}
+
+#[test]
+fn a_host_identity_others_may_write_seals_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let (_, first) = verified_answer(&env);
+    let host_id = env.home().join("host-id");
+    std::fs::set_permissions(&host_id, std::fs::Permissions::from_mode(0o620)).unwrap();
+    let shown = env.ok(&["decisions", "show", ANSWERER, &first]).json();
+    assert_eq!(shown["reading"], "a remote session's answer");
+    // A new answer is recorded, with the warning, and reads remote.
+    let call = "toolu_ZQXMARKERmode";
+    let lines = fx::with_call(&fx::lines("accepted"), call);
+    let q = env.raise_shown(&lines, 1);
+    fx::install(
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
+    );
+    let out = env.answer(
+        &q,
+        Some(fx::harness().as_str()),
+        "person:owner",
+        Some(&pointer(&fx::harness(), call, 1)),
+        None,
+    );
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(out
+        .all()
+        .contains("reads as a remote session's answer here"));
+    let id = out.json()["id"].as_str().unwrap().to_string();
+    let shown = env.ok(&["decisions", "show", ANSWERER, &id]).json();
+    assert_eq!(shown["reading"], "a remote session's answer");
+}

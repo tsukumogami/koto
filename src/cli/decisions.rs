@@ -1061,9 +1061,9 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             COMMAND,
             &DecisionError::invalid(
                 "prompt",
-                "a person's answer can't be recorded yet without --prompt: a person's answer \
-                 needs the question-prompt evidence, --prompt <harness session id>/<call \
-                 id>/<position>, naming the question-tool call that showed the question",
+                "a person's answer needs the question-prompt evidence: pass --prompt <harness \
+                 session id>/<call id>/<position>, naming the question-tool call that showed \
+                 the question",
             ),
         ),
         (Some(_), false) => refuse(
@@ -1261,14 +1261,22 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     );
     let chain = chain::snapshot(backend, &answerer);
     let koto_home = crate::koto_home::koto_home();
-    // One use per call position on this host: a create-only marker under
-    // the koto root, taken before the write and freed if the write fails,
-    // serializes answers from different answering sessions.
+    // One use per call position on this host: a marker under the koto root,
+    // locked while this answer is written and freed if the write fails,
+    // serializes answers from different answering sessions. A marker left by
+    // a process that stopped before publishing is taken over when no stored
+    // answer on this host cites the position.
     let mut marker = pointer.as_ref().map(|p| {
+        let cited = || {
+            Index::scan(backend, false)
+                .answers_of(&question.session.id, id)
+                .iter()
+                .any(|a| a.prompt.as_ref().is_some_and(|q| p.cites(q)))
+        };
         let taken = koto_home
             .as_deref()
             .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
-            .and_then(|home| prompt::take_use(home, p));
+            .and_then(|home| prompt::take_use(home, p, cited));
         match taken {
             Ok(Some(m)) => m,
             Ok(None) => refuse(
@@ -1290,7 +1298,24 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             ),
         }
     });
-    let written = store::write_in(backend, &answerer, &Area::Aimed(target.id.clone()), |aid| {
+    // This host checked the prompt: note it outside the synced files,
+    // sealed to this host and this answer, so only this host's copy of the
+    // session reads the mark verified. The note goes in before the answer is
+    // published: a line naming no stored answer reads as nothing, while an
+    // answer published without its line would read remote here for good.
+    let session_dir = backend.session_dir(&answerer);
+    let mut note_error: Option<std::io::Error> = None;
+    let mut note = |body: &DecisionBody| -> Result<(), DecisionError> {
+        if body.prompt.is_some() {
+            note_error = koto_home
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+                .and_then(|home| prompt::note_verified_here(home, &session_dir, &answerer, body))
+                .err();
+        }
+        Ok(())
+    };
+    let build = |aid: &str| {
         // Under the lock: a racing answer in this session that cites the
         // same call position was published first.
         if let Some(p) = &verified {
@@ -1323,7 +1348,14 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             refusal: None,
             prompt: verified.clone(),
         })
-    })
+    };
+    let written = store::write_in_with(
+        backend,
+        &answerer,
+        &Area::Aimed(target.id.clone()),
+        build,
+        &mut note,
+    )
     .unwrap_or_else(|e| {
         drop(marker.take());
         refuse(COMMAND, &e)
@@ -1331,27 +1363,11 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     if let Some(m) = marker.take() {
         m.keep();
     }
-    if written.prompt.is_some() {
-        // This host checked the prompt: note it outside the synced files,
-        // sealed to this host and this stored answer, so only this host's
-        // copy of the session reads the mark verified.
-        let noted = koto_home
-            .as_deref()
-            .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
-            .and_then(|home| {
-                prompt::note_verified_here(
-                    home,
-                    &backend.session_dir(&answerer),
-                    &answerer,
-                    &written,
-                )
-            });
-        if let Err(e) = noted {
-            eprintln!(
-                "warning: the answer is recorded, but this host couldn't note that it checked \
-                 the prompt, so it reads as a remote session's answer here: {e}"
-            );
-        }
+    if let Some(e) = note_error {
+        eprintln!(
+            "warning: the answer is recorded, but this host couldn't note that it checked \
+             the prompt, so it reads as a remote session's answer here: {e}"
+        );
     }
 
     println!(
