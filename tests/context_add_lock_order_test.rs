@@ -17,7 +17,8 @@
 //! existing pin.
 //!
 //! A removal inside a tick takes the manifest lock before the batch lock
-//! even in a session with no ctx directory yet, as an add does.
+//! even in a session with no ctx directory yet, as an add does. Taking it
+//! there writes no manifest, so the next flush leaves the bucket's alone.
 //!
 //! The binary is driven directly, since the deadlock is between processes.
 //! Every command runs under a timeout, so a regression fails here instead
@@ -489,6 +490,51 @@ fn a_deferred_cloud_remove_on_a_session_with_no_ctx_takes_the_manifest_lock() {
     assert!(
         ctx.join("manifest.lock").exists(),
         "the removal took the batch lock without the manifest lock: {out}"
+    );
+}
+
+#[test]
+fn a_deferred_remove_on_a_session_with_no_ctx_leaves_the_bucket_manifest_alone() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new();
+    let (code, out) = run(host.cloud(&s3, &["init", NAME, "--template", TEMPLATE_FILE]));
+    assert_eq!(code, Some(0), "init: {out}");
+    let session_dir = host.cloud_session_dir();
+    let ctx = session_dir.join("ctx");
+    let journal = session_dir.join("cloud-batch.jsonl");
+
+    // A key written outside any tick goes up at once, with a manifest
+    // listing it.
+    let (code, out) = finish(
+        spawn_add(host.cloud(&s3, &["context", "add", NAME, "other.md"])),
+        Instant::now(),
+    );
+    assert_eq!(code, Some(0), "context add: {out}");
+    let before = bucket_object(&s3, "ctx/manifest.json").expect("the bucket holds no manifest");
+
+    // This host now holds the session's state but none of its context, as
+    // a host does whose only context writes came from another host.
+    std::fs::remove_dir_all(&ctx).unwrap();
+
+    // A tick's removal of a key the session never held, then the flush that
+    // pushes its batch.
+    let mut cmd = host.cloud(&s3, &["context", "remove", NAME, KEY]);
+    cmd.env("KOTO_TICK_SESSION", NAME);
+    let (code, out) = run(cmd);
+    assert_eq!(code, Some(0), "context remove: {out}");
+    assert!(
+        batched(&journal, "remove", KEY),
+        "the tick's removal isn't in its batch: {out}"
+    );
+    let (code, out) = run(host.cloud(&s3, &["session", "flush", NAME]));
+    assert_eq!(code, Some(0), "session flush: {out}");
+    assert!(out.contains("\"flushed\":true"), "{out}");
+    assert!(!journal.exists(), "the batch is still open: {out}");
+
+    assert_eq!(
+        bucket_object(&s3, "ctx/manifest.json").as_deref(),
+        Some(before.as_slice()),
+        "the flush replaced the bucket's manifest with this host's empty one: {out}"
     );
 }
 
