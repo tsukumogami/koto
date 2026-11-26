@@ -1430,15 +1430,6 @@ pub fn handle_readdress(
         .last()
         .cloned()
         .expect("a question has a typed recipient");
-    if to == current {
-        refuse(
-            COMMAND,
-            &DecisionError::invalid(
-                "to",
-                format!("decision {id} in '{name}' already waits on '{}'", args.to),
-            ),
-        );
-    }
     let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));
     let by_raiser = stamp.session.id == question.session.id;
     if !by_raiser && !questions::waits_on_session(&current, &recorder) {
@@ -1451,6 +1442,15 @@ pub fn handle_readdress(
                      it waits on now; '{recorder}' is neither ({})",
                     questions::history_labels(&index, &question).join(" -> ")
                 ),
+            ),
+        );
+    }
+    if to == current {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "to",
+                format!("decision {id} in '{name}' already waits on '{}'", args.to),
             ),
         );
     }
