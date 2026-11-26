@@ -791,8 +791,9 @@ to `koto/aimed/<asking session id>/<id>` in the answering session, the area that
 reversals, so nothing is written in the asker's session and the answerer needs no standing over
 it. `koto decisions answer` reads the question through the local store by the asking session's
 name, refuses with `decision_not_found` when it isn't there and with `invalid_decision` (field
-`id`) when it isn't an `escalate`, and refuses an answer `--in` the asking session and one with
-`--by person:<handle>` before any write. An answer read back in `koto/decisions/` is unreadable,
+`id`) when it isn't an `escalate`, has an untyped recipient or doesn't read `in-effect`, and
+refuses an answer `--in` the asking session and one with `--by person:<handle>`, all before any
+write. A file in the asker's decision directory whose name isn't a decision id is passed over. An answer read back in `koto/decisions/` is unreadable,
 and a `reverse` aimed at one is refused with the reason `reverses_answer`.
 
 **Open, computed at read time.** The store index groups every `answer` with outcome `answered` by
@@ -818,6 +819,13 @@ read path. When the run holds an `escalate` that has an answer no decision in th
   "answer": {"session": "B", "id": "000000000001", "text": "SQLite", "decider": {...},
              "run_mode": {...}, "time": "..."}}]
 ```
+
+A `basis` entry names a session only by name, so a citation is resolved by reading the cited
+decision: it counts when that decision is an `answered` answer recorded no later than the citing
+decision, and it ends the report of the question that answer targets. The store is scanned only
+while the run holds a typed question that no decision has cited an answer of; a run with only
+untyped escalations, or whose every question is cited, reads its own decisions and the ones they
+cite and stops.
 
 The read writes nothing, takes no lock, reads only the local store, so it makes no network call
 under the cloud backend, and never blocks or changes the exit code. It runs on the natural and the

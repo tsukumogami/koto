@@ -587,9 +587,10 @@ to an id-shaped value, and both say so.
   stored with and marked untyped, and is never a person's question.
 - **R50.** An `answer` answers one `escalate`. Its target is the question's identity, the asking
   session's id with the question's identifier, never the session's name alone, so a later session
-  that reuses the name is not answered by it. koto refuses an answer whose question doesn't exist
-  or isn't an `escalate`, an answer given in the asking session itself, and an answer whose
-  decider is a person, which koto can't yet verify; each refusal exits 2 and writes nothing. An
+  that reuses the name is not answered by it. koto refuses an answer whose question doesn't exist,
+  isn't an `escalate`, has an untyped recipient or doesn't read `in-effect` (a reversed question
+  takes no answer), an answer given in the asking session itself, and an answer whose decider is
+  a person, which koto can't yet verify; each refusal exits 2 and writes nothing. An
   answer is never reversed: a `reverse` aimed at one is refused and recorded as `refused` (R18).
   `koto decisions record` doesn't take the `answer` kind; `koto decisions answer` records it.
 - **R51.** An answer is recorded in the session it is given in, beside the reversals that session
@@ -609,7 +610,9 @@ to an id-shaped value, and both say so.
   `questions` array reporting it: the question's identity, its session and identifier, the state
   `answered`, and the answer with its session, identifier, text, decider, run mode and time. The
   report repeats on every call, including once the workflow is terminal, and stops once a decision
-  in the run cites the answer. Reading it writes nothing, takes no lock, makes no network
+  in the run cites the answer. A citation counts only when the decision it names is an answer to
+  the question and was recorded no later than the citing decision, so an answer from a later
+  session that reuses the cited name and identifier is still reported. Reading it writes nothing, takes no lock, makes no network
   connection and never blocks or changes the exit code; a session with nothing to report carries
   no `questions` key, so its response is byte-identical to one from a binary that predates it.
 
@@ -938,9 +941,12 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
 - [ ] `koto decisions answer A <id> --in B --text ... --by session` writes exactly one file under
   B's `ctx/koto/aimed/<A's session id>/` and leaves every file in A byte-identical; afterwards the
   question is no longer open (R50, R51, R53).
-- [ ] An answer aimed at a missing decision, at a decision that isn't an `escalate`, from the
-  asking session, or with `--by person:<handle>` exits 2 and writes nothing in either session
-  (R50).
+- [ ] An answer aimed at a missing decision, at a decision that isn't an `escalate`, at an
+  untyped or reversed `escalate`, from the asking session, or with `--by person:<handle>` exits 2
+  and writes nothing in either session (R50).
+- [ ] After the answering session is removed and a new session of the same name answers another
+  question with the same answer identifier, the asker's earlier citation doesn't end the report of
+  the new answer (R54).
 - [ ] With q1 and q2 raised to `person:owner` and q3 to `person:someone-else`, answering q1 alone
   leaves q2 and q3 open and reports only q1 on the asker's `koto next` (R53, R54).
 - [ ] After the asking session is removed and a session of the same name is created, the earlier

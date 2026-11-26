@@ -776,7 +776,7 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
     let found = entries.iter().find(|e| match e {
         Entry::Decision(b) => b.id == id,
         Entry::Unreadable { id: Some(i), .. } => i == id,
-        Entry::Unreadable { id: None, .. } => true,
+        Entry::Unreadable { id: None, .. } => false,
     });
     let original = match found {
         None => refuse_recorded(
@@ -1085,11 +1085,13 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
 
     // The question, read from the asker's own copy with no lock and no
     // pull: nothing in the asker's session is touched.
+    // An unreadable file whose name isn't a decision id (a stray file in
+    // the directory) is no candidate for the id asked for.
     let entries = crate::decisions::read::read_session_with(backend, name, false);
     let found = entries.iter().find(|e| match e {
         Entry::Decision(b) => b.id == id,
         Entry::Unreadable { id: Some(i), .. } => i == id,
-        Entry::Unreadable { id: None, .. } => true,
+        Entry::Unreadable { id: None, .. } => false,
     });
     let question = match found {
         None => refuse(
@@ -1116,6 +1118,31 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
                 format!(
                     "decision {id} in '{name}' is a '{}', and only an 'escalate' is answered",
                     question.kind
+                ),
+            ),
+        );
+    }
+    if !crate::decisions::questions::is_question(&question) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' has no typed recipient (session:, anchor: or \
+                     person:), so it isn't a question koto answers"
+                ),
+            ),
+        );
+    }
+    let status = Index::scan(backend, false).status(&question);
+    if status != "in-effect" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' reads '{status}', and only a question in effect \
+                     is answered"
                 ),
             ),
         );

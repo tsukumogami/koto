@@ -103,9 +103,16 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Out {
+        self.run_env(&[], args)
+    }
+
+    fn run_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Out {
         let mut cmd = koto_command::koto_std();
         for name in CLEARED_ENV {
             cmd.env_remove(name);
+        }
+        for (k, v) in envs {
+            cmd.env(k, v);
         }
         cmd.current_dir(self.root.join("ws"));
         cmd.env("HOME", self.root.join("home"));
@@ -604,4 +611,144 @@ fn a_session_with_no_question_carries_no_questions_key() {
     env.answer(&q, "a", "answered from a");
     // `a` holds an answer, not a question: nothing to report.
     assert!(env.next("a").get("questions").is_none());
+}
+
+/// `koto next <name> --no-cleanup` with the scan probe set: the response,
+/// and whether the questions read scanned the store.
+fn next_probed(env: &Env, name: &str) -> (Value, bool) {
+    let out = env.run_env(
+        &[(SCAN_PROBE.0, SCAN_PROBE.1)],
+        &["next", name, "--no-cleanup"],
+    );
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    (out.json(), out.stderr.contains("questions: store scanned"))
+}
+
+/// The variable that has the questions read say when it scans the store.
+const SCAN_PROBE: (&str, &str) = ("KOTO_TEST_QUESTIONS_SCAN_PROBE", "1");
+
+fn cite(env: &Env, name: &str, basis: &str) {
+    env.ok(&[
+        "decisions",
+        "record",
+        name,
+        "--kind",
+        "judgment",
+        "--outcome",
+        "settled",
+        "--subject",
+        "what=cited",
+        "--by",
+        "session",
+        "--basis",
+        basis,
+    ]);
+}
+
+#[test]
+fn a_recreated_answering_session_reusing_an_answer_id_isnt_taken_as_cited() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q1 = env.escalate("a", "q1", "person:owner");
+    let q2 = env.escalate("a", "q2", "person:owner");
+    let first = env.answer(&q1, "b", "yes to q1");
+    cite(&env, "a", &format!("b:{first}"));
+    assert!(env.next("a").get("questions").is_none());
+
+    // `b` goes, a new `b` answers q2, and its answer gets the same id.
+    std::fs::remove_dir_all(env.sessions().join("b")).unwrap();
+    env.init("b", &[]);
+    let second = env.answer(&q2, "b", "yes to q2");
+    assert_eq!(second, first, "the ids must collide for this test");
+
+    let reported = questions(&env.next("a"));
+    assert_eq!(names(&reported), vec!["q2"], "{reported:?}");
+    assert_eq!(reported[0]["identity"], q2.identity().as_str());
+    assert_eq!(reported[0]["answer"]["text"], "yes to q2");
+    // q2 is answered, so it isn't open; the new answer closes nothing but
+    // the question it targets.
+    assert!(!names(&env.open("owner")).contains(&"q2"));
+
+    // Citing it now ends the report.
+    cite(&env, "a", &format!("b:{second}"));
+    assert!(env.next("a").get("questions").is_none());
+}
+
+#[test]
+fn a_question_not_in_effect_isnt_answered() {
+    let env = Env::new();
+    env.init("coord", &[]);
+    env.init("w", &["--dispatched-by", "coord"]);
+    env.init("b", &[]);
+    let q = env.escalate("w", "q1", "person:owner");
+    let out = env.run(&[
+        "decisions",
+        "reverse",
+        "w",
+        &q.id,
+        "--in",
+        "coord",
+        "--by",
+        "session",
+    ]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let (w0, b0) = (env.snapshot("w"), env.snapshot("b"));
+
+    let out = env.answer_run(&q, "b", "too late", "session");
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    assert_eq!(out.json()["code"], "invalid_decision");
+    assert!(
+        out.json()["error"].as_str().unwrap().contains("reversed"),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(env.snapshot("w"), w0);
+    assert_eq!(env.snapshot("b"), b0);
+    assert!(env.open("owner").is_empty());
+}
+
+#[test]
+fn the_store_is_scanned_only_while_a_question_is_uncited() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+
+    // No decision, then only an untyped escalation: no scan, no key.
+    let (resp, scanned) = next_probed(&env, "a");
+    assert!(!scanned && resp.get("questions").is_none());
+    let legacy = env.escalate("a", "q0", "coord");
+    let (resp, scanned) = next_probed(&env, "a");
+    assert!(!scanned && resp.get("questions").is_none());
+    // An untyped escalation isn't a question this version answers.
+    let out = env.answer_run(&legacy, "b", "x", "session");
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    assert_eq!(out.json()["code"], "invalid_decision");
+
+    // An open question, then an answered one: the store is scanned.
+    let q = env.escalate("a", "q1", "person:owner");
+    let (resp, scanned) = next_probed(&env, "a");
+    assert!(scanned && resp.get("questions").is_none());
+    let answer_id = env.answer(&q, "b", "yes");
+    let (resp, scanned) = next_probed(&env, "a");
+    assert!(scanned);
+    assert_eq!(names(&questions(&resp)), vec!["q1"]);
+
+    // Once every question is cited, the scan stops.
+    cite(&env, "a", &format!("b:{answer_id}"));
+    let (resp, scanned) = next_probed(&env, "a");
+    assert!(!scanned && resp.get("questions").is_none());
+}
+
+#[test]
+fn a_stray_file_beside_the_question_doesnt_stop_its_answer() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    let dir = env.sessions().join("a/ctx/koto/decisions");
+    std::fs::write(dir.join(".DS_Store"), b"junk").unwrap();
+    let out = env.answer_run(&q, "b", "yes", "session");
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(env.open("owner").is_empty());
 }
