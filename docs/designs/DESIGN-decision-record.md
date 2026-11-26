@@ -1115,7 +1115,7 @@ Its `repair`, which publishes a decision whose key a stopped writer never wrote,
 against its own subject table and skips such a body with a warning.
 
 **Measured cost.** On a release build on a Linux development host, over 1,001 sessions in
-dispatcher chains three deep holding 200 open questions, 100 questions closed by a verified
+dispatcher chains four deep holding 200 open questions, 100 questions closed by a verified
 person answer, 600 closed by a session's answer, 1,700 attempts and 800 provisional judgments,
 `attempts --at` the top coordinator took 284 ms, the same read with `--awaiting-review` 239 ms,
 and `attempts --in` one worker 173 ms. `tests/precedent_cost.rs` asserts each under five seconds

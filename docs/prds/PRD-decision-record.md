@@ -781,7 +781,7 @@ to an id-shaped value, and both say so.
   makes no bucket request under the cloud backend and writes nothing. koto refuses nothing for
   want of an attempt: an `escalate` or a `readdress` with no attempt behind it is recorded as
   before, and enforcing an attempt before a pass-up is left to the caller.
-- **R78.** Over a store of 1,000 sessions in dispatcher chains three deep, holding 200 open
+- **R78.** Over a store of 1,000 sessions in dispatcher chains four deep, holding 200 open
   questions with attempts and provisional judgments in every chain, `attempts --at` a top
   coordinator, with and without `--awaiting-review`, and `attempts --in` a session each finish in
   under five seconds on a release build.

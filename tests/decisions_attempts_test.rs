@@ -814,6 +814,31 @@ fn a_provisional_waits_until_a_person_answers_a_question_naming_it() {
     assert_eq!(shown["decision"]["subject"]["result"], "provisional");
 }
 
+#[test]
+fn a_review_belongs_to_the_judgment_it_names_not_a_reused_identifier() {
+    let env = Env::new();
+    tree(&env);
+    let old = env.judgment("worker2", &["what=old", "result=provisional"], &[]);
+    let q = env.question("manager", "person:owner", &[], &[&old]);
+    env.owner_answers(&q, "director");
+    let v = env.attempts(&["--at", "director", "--result", "provisional"]);
+    assert_eq!(list(&v)[0]["review"]["state"], "reviewed", "{v}");
+
+    // worker2 goes, and a new worker2 records a provisional judgment that
+    // reuses the id the review question names.
+    std::fs::remove_dir_all(env.sessions().join("worker2")).unwrap();
+    env.init("worker2", Some("manager"));
+    let new = env.judgment("worker2", &["what=new", "result=provisional"], &[]);
+    assert_eq!(new.id, old.id, "the ids must collide for this test");
+
+    assert_eq!(awaiting_at(&env, "director"), vec![new.identity.clone()]);
+    let shown = env.ok(&["decisions", "show", "worker2", &new.id]).json();
+    assert_eq!(
+        shown["review"],
+        serde_json::json!({"state": "awaiting", "question": null})
+    );
+}
+
 fn awaiting_at(env: &Env, at: &str) -> Vec<String> {
     ids(&env.attempts(&["--at", at, "--result", "provisional", "--awaiting-review"]))
 }
