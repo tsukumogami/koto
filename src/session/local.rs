@@ -1455,6 +1455,64 @@ mod tests {
         assert!(!tmp.path().join("gone").exists());
     }
 
+    /// `add_as` takes the manifest lock before it writes anything: while
+    /// another descriptor holds the lock, the content file isn't there yet.
+    #[cfg(unix)]
+    #[test]
+    fn add_as_takes_the_manifest_lock_before_it_writes_the_content_file() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        fs::create_dir_all(backend.ctx_dir("s")).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(backend.manifest_lock_path("s"))
+            .unwrap();
+        // SAFETY: the fd belongs to `held`, which outlives the call.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let writer = Arc::clone(&backend);
+        let add = std::thread::spawn(move || writer.add_as("s", "k.md", b"v", None));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let written_early = backend.content_path("s", "k.md").exists();
+        drop(held);
+        add.join().unwrap().unwrap();
+
+        assert!(
+            !written_early,
+            "the content file was written before the manifest lock was held"
+        );
+        assert_eq!(fs::read(backend.content_path("s", "k.md")).unwrap(), b"v");
+    }
+
+    /// A context write inside a manifest lock its own thread holds runs
+    /// under that hold instead of waiting on it forever.
+    #[test]
+    fn a_context_add_under_its_own_manifest_lock_does_not_wait_on_itself() {
+        use std::sync::{mpsc, Arc};
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        fs::create_dir_all(tmp.path().join("s")).unwrap();
+
+        let (done, finished) = mpsc::channel();
+        let writer = Arc::clone(&backend);
+        let nested = std::thread::spawn(move || {
+            let out = writer.with_manifest_lock("s", || writer.add_as("s", "k.md", b"v", None));
+            let _ = done.send(out);
+        });
+        match finished.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(out) => out.unwrap(),
+            Err(_) => panic!("a context add under its own manifest lock waited on itself"),
+        }
+        nested.join().unwrap();
+        assert_eq!(fs::read(backend.content_path("s", "k.md")).unwrap(), b"v");
+        let manifest = backend.read_manifest("s").unwrap();
+        assert!(manifest.keys.contains_key("k.md"));
+    }
+
     /// Helper: create a LocalBackend using a temp directory as base.
     fn test_backend(dir: &Path) -> LocalBackend {
         LocalBackend::with_base_dir(dir.to_path_buf())
