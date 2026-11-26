@@ -203,6 +203,11 @@ impl Env {
         out["questions"].as_array().unwrap().clone()
     }
 
+    fn open_at(&self, at: &str) -> Vec<Value> {
+        let out = self.ok(&["decisions", "open", "--at", at]).json();
+        out["questions"].as_array().unwrap().clone()
+    }
+
     /// `koto next <name> --no-cleanup`, so a terminal session stays.
     fn next(&self, name: &str) -> Value {
         self.ok(&["next", name, "--no-cleanup"]).json()
@@ -326,15 +331,15 @@ fn a_question_is_open_answered_elsewhere_and_reported_until_cited() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
 
-    let open = env.open("owner");
+    let open = env.open_at("b");
     assert_eq!(open.len(), 1);
     assert_eq!(open[0]["identity"], q.identity().as_str());
     assert_eq!(open[0]["session"], "a");
     assert_eq!(open[0]["question"], "q1");
-    assert_eq!(open[0]["recipient"]["kind"], "person");
-    assert_eq!(open[0]["recipient"]["handle"], "owner");
+    assert_eq!(open[0]["recipient"]["kind"], "session");
+    assert_eq!(open[0]["recipient"]["name"], "b");
     assert!(env.open("someone-else").is_empty());
 
     let before = env.snapshot("a");
@@ -353,7 +358,7 @@ fn a_question_is_open_answered_elsewhere_and_reported_until_cited() {
     assert_eq!(env.aimed_files("b", &q.session_id), vec![answer_id.clone()]);
     assert_eq!(env.snapshot("a"), before, "the asker's session changed");
 
-    assert!(env.open("owner").is_empty());
+    assert!(env.open_at("b").is_empty());
 
     let listing = env.ok(&["decisions", "list", "b", "--format", "v1"]).json();
     let listed = &listing["decisions"].as_array().unwrap()[0];
@@ -418,7 +423,7 @@ fn an_answer_closes_only_its_own_question() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q1 = env.escalate("a", "q1", "person:owner");
+    let q1 = env.escalate("a", "q1", "session:b");
     let _q2 = env.escalate("a", "q2", "person:owner");
     let _q3 = env.escalate("a", "q3", "person:someone-else");
     let answer_id = env.answer(&q1, "b", "yes to q1");
@@ -552,7 +557,7 @@ fn an_answer_is_not_reversed() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     let answer_id = env.answer(&q, "b", "yes");
     let out = env.run(&[
         "decisions",
@@ -566,7 +571,7 @@ fn an_answer_is_not_reversed() {
     ]);
     assert_eq!(out.code, 2, "{}", out.stdout);
     assert_eq!(out.json()["reason"], "reverses_answer");
-    assert!(env.open("owner").is_empty());
+    assert!(env.open_at("b").is_empty());
 }
 
 #[test]
@@ -574,16 +579,16 @@ fn the_answer_follows_the_question_id_not_the_session_name() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "old answer");
 
     std::fs::remove_dir_all(env.sessions().join("a")).unwrap();
     env.init("a", &[]);
-    let fresh = env.escalate("a", "q1", "person:owner");
+    let fresh = env.escalate("a", "q1", "session:b");
     assert_ne!(fresh.session_id, q.session_id);
 
-    assert_eq!(names(&env.open("owner")), vec!["q1"]);
-    assert_eq!(env.open("owner")[0]["identity"], fresh.identity().as_str());
+    assert_eq!(names(&env.open_at("b")), vec!["q1"]);
+    assert_eq!(env.open_at("b")[0]["identity"], fresh.identity().as_str());
     assert!(env.next("a").get("questions").is_none());
 }
 
@@ -592,7 +597,7 @@ fn a_successor_gets_the_answer_to_its_predecessors_question() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     env.answer(&q, "b", "SQLite");
     env.init("s", &["--continues", "a", "--supersede"]);
 
@@ -607,7 +612,7 @@ fn a_session_with_no_question_carries_no_questions_key() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("b", "q1", "person:owner");
+    let q = env.escalate("b", "q1", "session:a");
     env.answer(&q, "a", "answered from a");
     // `a` holds an answer, not a question: nothing to report.
     assert!(env.next("a").get("questions").is_none());
@@ -650,8 +655,8 @@ fn a_recreated_answering_session_reusing_an_answer_id_isnt_taken_as_cited() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q1 = env.escalate("a", "q1", "person:owner");
-    let q2 = env.escalate("a", "q2", "person:owner");
+    let q1 = env.escalate("a", "q1", "session:b");
+    let q2 = env.escalate("a", "q2", "session:b");
     let first = env.answer(&q1, "b", "yes to q1");
     cite(&env, "a", &format!("b:{first}"));
     assert!(env.next("a").get("questions").is_none());
@@ -668,7 +673,7 @@ fn a_recreated_answering_session_reusing_an_answer_id_isnt_taken_as_cited() {
     assert_eq!(reported[0]["answer"]["text"], "yes to q2");
     // q2 is answered, so it isn't open; the new answer closes nothing but
     // the question it targets.
-    assert!(!names(&env.open("owner")).contains(&"q2"));
+    assert!(!names(&env.open_at("b")).contains(&"q2"));
 
     // Citing it now ends the report.
     cite(&env, "a", &format!("b:{second}"));
@@ -726,7 +731,7 @@ fn the_store_is_scanned_only_while_a_question_is_uncited() {
     assert_eq!(out.json()["code"], "invalid_decision");
 
     // An open question, then an answered one: the store is scanned.
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     let (resp, scanned) = next_probed(&env, "a");
     assert!(scanned && resp.get("questions").is_none());
     let answer_id = env.answer(&q, "b", "yes");
@@ -734,10 +739,12 @@ fn the_store_is_scanned_only_while_a_question_is_uncited() {
     assert!(scanned);
     assert_eq!(names(&questions(&resp)), vec!["q1"]);
 
-    // Once every question is cited, the scan stops.
+    // Once every question is cited, the store is still scanned, since a
+    // later person's answer would replace the one in effect, and the
+    // response carries no key.
     cite(&env, "a", &format!("b:{answer_id}"));
     let (resp, scanned) = next_probed(&env, "a");
-    assert!(!scanned && resp.get("questions").is_none());
+    assert!(scanned && resp.get("questions").is_none());
 }
 
 #[test]
@@ -745,10 +752,10 @@ fn a_stray_file_beside_the_question_doesnt_stop_its_answer() {
     let env = Env::new();
     env.init("a", &[]);
     env.init("b", &[]);
-    let q = env.escalate("a", "q1", "person:owner");
+    let q = env.escalate("a", "q1", "session:b");
     let dir = env.sessions().join("a/ctx/koto/decisions");
     std::fs::write(dir.join(".DS_Store"), b"junk").unwrap();
     let out = env.answer_run(&q, "b", "yes", "session");
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
-    assert!(env.open("owner").is_empty());
+    assert!(env.open_at("b").is_empty());
 }

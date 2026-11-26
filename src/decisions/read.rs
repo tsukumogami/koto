@@ -27,6 +27,10 @@ fn status_of(body: &DecisionBody) -> &'static str {
 }
 
 /// One entry a read found: a readable decision, or something unreadable.
+/// The `reason` code an unreadable entry lists with: the file failed one of
+/// the integrity checks [`read_session`] makes, which `detail` names.
+pub const UNREADABLE_REASON: &str = "integrity";
+
 #[derive(Debug, Clone)]
 pub enum Entry {
     Decision(Box<DecisionBody>),
@@ -54,10 +58,19 @@ impl Entry {
                 "session": session,
                 "id": id,
                 "status": "unreadable",
-                "reason": reason,
+                // `reason` is a code on every entry; what failed is in
+                // `detail`.
+                "reason": UNREADABLE_REASON,
+                "detail": reason,
             }),
         }
     }
+}
+
+/// The session id the local state file of `session` names, read with no
+/// lock and no pull.
+pub fn local_session_id(backend: &Backend, session: &str) -> Option<String> {
+    session_id(backend, session, false)
 }
 
 /// The session id the state file of `session` names, read from the file
