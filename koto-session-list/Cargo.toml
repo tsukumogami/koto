@@ -1,0 +1,19 @@
+[package]
+name = "koto-session-list"
+# Not published and not released: this is the minimal second program that
+# reads koto's session store through koto-session-reader, kept in the
+# workspace so CI can check it against `koto dashboard`. The version is
+# pinned at 0.0.0, as koto-stability-tests' is, so it never surfaces in a
+# release.
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Lists koto sessions the way koto dashboard --once does, through koto-session-reader alone"
+license = "MIT"
+publish = false
+
+# One dependency, the reader, so the program's build graph is the one a
+# dependent of the reader gets: no storage, TLS, HTTP or terminal crate.
+# validate.yml's Session List Checks job checks that with cargo tree.
+[dependencies]
+koto-session-reader = { path = "../koto-session-reader" }
