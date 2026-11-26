@@ -77,6 +77,11 @@ pub mod reasons {
     /// An entry whose question isn't in the local store, or isn't a
     /// question.
     pub const NO_QUESTION: &str = "no_question";
+    /// A verified person answer the store reads as in effect on a question
+    /// it no longer holds ([`super::gone_question_answer`]). It is the one
+    /// reason an entry carries while it counts: it says the question it
+    /// counts toward is gone.
+    pub const QUESTION_GONE: &str = "question_gone";
     /// An entry written in a fenced session after its fence: it reads
     /// `refused` and counts toward nothing.
     pub const AFTER_FENCE: &str = "after_fence";
@@ -352,11 +357,6 @@ pub fn verified_person(index: &Index, backend: &Backend, answer: &DecisionBody) 
 /// several are uncited, and the later of all of them when every one is
 /// cited.
 fn person_winner<'i>(persons: &[&'i DecisionBody]) -> Option<&'i DecisionBody> {
-    let cites = |by: &DecisionBody, p: &DecisionBody| {
-        by.basis
-            .iter()
-            .any(|c| c.id == p.id && c.session == p.session.name)
-    };
     let uncited: Vec<&'i DecisionBody> = persons
         .iter()
         .copied()
@@ -384,6 +384,48 @@ pub fn person_in_effect<'i>(
         .filter(|a| verified_person(index, backend, a))
         .collect();
     person_winner(&persons)
+}
+
+/// The verified person answer in effect on the question whose identity is
+/// `(raiser's session id, question id)`, read for a question the local
+/// store no longer holds because its raiser was removed.
+///
+/// A raiser's settles and withdrawals sat in the raiser's own area and went
+/// with it, and a verified person answer wins over any session's answer, so
+/// the person answer in effect ([`person_in_effect`]) is the answer in
+/// effect, except when what is left still says otherwise:
+///
+/// - a reversal of the question stored anywhere this store reads (one
+///   recorded `--in` another session) withdraws every answer to it;
+/// - an answer of any kind aimed at the question that cites the person
+///   answer in its `basis` has replaced it, whether or not that answer reads
+///   as verified here.
+///
+/// What this can't see: a reversal recorded in the raiser itself went with
+/// the raiser, and a replacing answer whose session was removed leaves the
+/// one it replaced looking in effect.
+pub fn gone_question_answer<'i>(
+    index: &'i Index,
+    backend: &Backend,
+    session_id: &str,
+    id: &str,
+) -> Option<&'i DecisionBody> {
+    if index.winner_of(session_id, id).is_some() {
+        return None;
+    }
+    let w = person_in_effect(index, backend, session_id, id)?;
+    let replaced = index
+        .answers_of(session_id, id)
+        .into_iter()
+        .any(|o| !same(o, w) && cites(o, w));
+    (!replaced).then_some(w)
+}
+
+/// Whether `by` names `p` in its `basis`.
+fn cites(by: &DecisionBody, p: &DecisionBody) -> bool {
+    by.basis
+        .iter()
+        .any(|c| c.id == p.id && c.session == p.session.name)
 }
 
 /// The question `target` names, as the local store holds it: read from
@@ -513,15 +555,23 @@ pub fn settle_basis(
             why.push(format!("{named} answers no question"));
             continue;
         };
-        if person_in_effect(index, backend, &t.id, &t.decision).is_none_or(|w| !same(w, a)) {
+        let held = question_of(index, t);
+        let in_effect = match held {
+            Some(_) => person_in_effect(index, backend, &t.id, &t.decision),
+            None => gone_question_answer(index, backend, &t.id, &t.decision),
+        };
+        if in_effect.is_none_or(|w| !same(w, a)) {
             why.push(format!(
                 "{named} isn't the answer in effect on its own question"
             ));
             continue;
         }
-        // A question removed with its raiser can no longer be reversed, so
-        // its answer stands on the label koto copied onto it.
-        let answered_label = match question_of(index, t) {
+        // A question removed with its raiser stands on the label koto
+        // copied onto its answer. A reversal of it recorded in another
+        // session, or an answer citing this one as replaced, still
+        // withdraws it (`gone_question_answer`); one recorded in the raiser
+        // went with the raiser.
+        let answered_label = match held {
             Some(answered) => {
                 let status = index.status(answered);
                 if status != "in-effect" {
@@ -748,17 +798,52 @@ pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> Ent
         reason: Some(reasons::NO_QUESTION),
         governs: answer.then_some(false),
     };
-    let Some(question) = body.target.as_ref().and_then(|t| question_of(index, t)) else {
+    let Some(target) = body.target.as_ref() else {
         return lost;
+    };
+    let Some(question) = question_of(index, target) else {
+        // The question went with its raiser. The answer the precedent read
+        // and a settle take as in effect reads that way here too.
+        let in_effect = answer
+            && gone_question_answer(index, backend, &target.id, &target.decision)
+                .is_some_and(|w| same(w, body));
+        return if in_effect {
+            EntryJudgment {
+                counted: true,
+                reason: Some(reasons::QUESTION_GONE),
+                governs: Some(true),
+            }
+        } else {
+            lost
+        };
     };
     if !is_question(question) {
         return lost;
     }
     let runs = Runs::new(backend);
-    let r = resolve(index, &runs, question);
+    judge_resolved(index, body, &resolve(index, &runs, question))
+}
+
+/// [`judge_entry`] for an entry aimed at a question whose resolution the
+/// caller already holds, so a read judging every entry about one question
+/// resolves it once rather than once per entry. `r` must be the question's
+/// resolution against the same `index`.
+pub(crate) fn judge_resolved(index: &Index, body: &DecisionBody, r: &Resolution) -> EntryJudgment {
+    let answer = body.kind == "answer";
+    if index.after_fence(body) {
+        return EntryJudgment {
+            counted: false,
+            reason: Some(reasons::AFTER_FENCE),
+            governs: answer.then_some(false),
+        };
+    }
     if answer {
         let Some(j) = r.closing.iter().find(|j| same(j.entry, body)) else {
-            return lost;
+            return EntryJudgment {
+                counted: false,
+                reason: Some(reasons::NO_QUESTION),
+                governs: Some(false),
+            };
         };
         return EntryJudgment {
             counted: j.counted,

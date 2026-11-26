@@ -114,7 +114,7 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
 
     let mut items: Vec<Item> = Vec::new();
     for b in &aimed {
-        let judged = questions::judge_entry(&index, backend, b);
+        let judged = questions::judge_resolved(&index, b, &resolution);
         let mut e = json!({
             "entry": if b.kind == "answer" { "answer" } else { "pass-up" },
             "session": b.session.name,
@@ -156,8 +156,9 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
     }
 
     // Decisions citing one of the question's answers.
-    let answers: Vec<usize> = (0..aimed.len())
+    let answers: std::collections::BTreeMap<(&str, &str), usize> = (0..aimed.len())
         .filter(|&i| aimed[i].kind == "answer")
+        .map(|i| ((aimed[i].session.id.as_str(), aimed[i].id.as_str()), i))
         .collect();
     let mut seen_citing = BTreeSet::new();
     for d in questions::decisions(&index) {
@@ -168,7 +169,7 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
         for c in &d.basis {
             if let Some(Entry::Decision(a)) = index.find(&c.session, &c.id) {
                 if a.time <= d.time {
-                    if let Some(&i) = answers.iter().find(|&&i| questions::same(aimed[i], a)) {
+                    if let Some(&i) = answers.get(&(a.session.id.as_str(), a.id.as_str())) {
                         if !cites.contains(&i) {
                             cites.push(i);
                         }

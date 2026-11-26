@@ -688,3 +688,131 @@ mod remote {
         assert!(second.precedent(&ws_b, "answerer").is_empty());
     }
 }
+
+/// Reverse `q` in `in_session`, as an operator does.
+fn reverse(env: &Env, q: &Q, in_session: &str) {
+    env.ok(&[
+        "decisions",
+        "reverse",
+        &q.session,
+        &q.id,
+        "--in",
+        in_session,
+        "--by",
+        "session",
+    ]);
+}
+
+#[test]
+fn a_reversed_question_stays_reversed_once_its_raiser_is_removed() {
+    let env = Env::new();
+    env.ladder();
+    let (q, a) = q1(&env, "director");
+    reverse(&env, &q, "director");
+    assert!(found(&env, "worker2", Some("cache")).is_empty());
+
+    // The raiser goes, and with it the question; the reversal recorded in
+    // director still withdraws the answer, for the read and for a settle.
+    env.cleanup("worker");
+    assert!(found(&env, "worker2", Some("cache")).is_empty());
+    assert!(found(&env, "manager", None).is_empty());
+    let q7 = env.raise("worker2", "q7", "person:owner", &["label=cache"]);
+    let out = env.settle(&q7, "worker2", &["--basis", &format!("director:{a}")]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(
+        out.error().contains("isn't the answer in effect"),
+        "{}",
+        out.error()
+    );
+    let shown = env.show("director", &a);
+    assert_eq!(shown["counted"], false, "{shown}");
+    assert_eq!(shown["governs"], false, "{shown}");
+    assert_eq!(shown["reason"], "no_question", "{shown}");
+}
+
+#[test]
+fn a_replaced_answer_stays_replaced_while_its_replacement_is_readable() {
+    let env = Env::new();
+    env.ladder();
+    let (q, first) = q1(&env, "director");
+    // The second person answer cites the one it replaces.
+    let second = env.person(&q, "manager");
+    let basis = env.stored("manager", &q, &second)["basis"].clone();
+    assert_eq!(
+        basis,
+        serde_json::json!([{"session": "director", "id": first}]),
+        "{basis}"
+    );
+    assert_eq!(found(&env, "worker2", Some("cache")), one(&q, &second));
+
+    // With the raiser removed, the replacement governs; once it no longer
+    // reads as verified here it isn't precedent, and it still keeps the
+    // answer it cites from coming back.
+    env.cleanup("worker");
+    assert_eq!(found(&env, "worker2", Some("cache")), one(&q, &second));
+    env.forget_verified("manager");
+    assert!(found(&env, "worker2", Some("cache")).is_empty());
+    let q7 = env.raise("worker2", "q7", "person:owner", &["label=cache"]);
+    let out = env.settle(&q7, "worker2", &["--basis", &format!("director:{first}")]);
+    assert_eq!(out.code, 2, "{}", out.all());
+}
+
+#[test]
+fn removing_the_replacing_session_is_the_stated_limit() {
+    let env = Env::new();
+    env.ladder();
+    let (q, first) = q1(&env, "director");
+    let second = env.person(&q, "worker2");
+    assert_eq!(found(&env, "manager", Some("cache")), one(&q, &second));
+    // Nothing readable says the first answer was replaced once both the
+    // raiser and the session holding the replacement are gone.
+    env.cleanup("worker");
+    env.cleanup("worker2");
+    assert_eq!(found(&env, "manager", Some("cache")), one(&q, &first));
+}
+
+#[test]
+fn a_succession_joins_the_chain_in_both_directions() {
+    let env = Env::new();
+    env.ladder();
+    let (q, a) = q1(&env, "director");
+    // manager-next continues manager and has no dispatcher of its own; it
+    // dispatches worker3.
+    env.init("manager-next", &["--continues", "manager", "--supersede"]);
+    env.init("worker3", &["--dispatched-by", "manager-next"]);
+    let q3 = env.raise("worker3", "q3", "person:owner", &["label=queue"]);
+    let a3 = env.person(&q3, "manager-next");
+    for at in [
+        "worker3",
+        "manager-next",
+        "manager",
+        "worker",
+        "worker2",
+        "director",
+    ] {
+        assert_eq!(
+            found(&env, at, Some("queue")),
+            one(&q3, &a3),
+            "--chain {at}"
+        );
+        assert_eq!(found(&env, at, Some("cache")), one(&q, &a), "--chain {at}");
+    }
+    assert!(found(&env, "other-worker", Some("queue")).is_empty());
+}
+
+#[test]
+fn show_reads_a_removed_raisers_answer_the_way_precedent_does() {
+    let env = Env::new();
+    env.ladder();
+    let (_, a) = q1(&env, "director");
+    let before = env.show("director", &a);
+    assert_eq!(before["counted"], true, "{before}");
+    assert_eq!(before["governs"], true, "{before}");
+    assert!(before.get("reason").is_none(), "{before}");
+    env.cleanup("worker");
+    assert_eq!(found(&env, "manager", Some("cache")).len(), 1);
+    let after = env.show("director", &a);
+    assert_eq!(after["counted"], true, "{after}");
+    assert_eq!(after["governs"], true, "{after}");
+    assert_eq!(after["reason"], "question_gone", "{after}");
+}

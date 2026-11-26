@@ -1342,6 +1342,42 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     check_closing(
         backend, &index, &question, &answerer, &outcome, person, &basis, &evidence,
     );
+    // A person's answer to a question that already has a verified person
+    // answer in effect replaces it, and says so in its `basis`: a person
+    // answer cited by another of the question's answers is never the one in
+    // effect, so the replaced answer stays replaced for as long as this one
+    // is readable, whatever the two answers' times.
+    let mut basis = basis;
+    if person && outcome == "answered" {
+        if let Some(prev) =
+            crate::decisions::questions::person_in_effect(&index, backend, &question.session.id, id)
+        {
+            let cited = basis
+                .iter()
+                .any(|c| c.session == prev.session.name && c.id == prev.id);
+            if !cited {
+                if basis.len() >= body::MAX_LIST_ENTRIES {
+                    refuse(
+                        COMMAND,
+                        &DecisionError::invalid(
+                            "basis",
+                            format!(
+                                "this answer replaces {}:{} and cites it, so it takes at most {} \
+                                 more --basis entries",
+                                prev.session.name,
+                                prev.id,
+                                body::MAX_LIST_ENTRIES - 1
+                            ),
+                        ),
+                    );
+                }
+                basis.push(BasisRef {
+                    session: prev.session.name.clone(),
+                    id: prev.id.clone(),
+                });
+            }
+        }
+    }
     let target = Target {
         name: name.to_string(),
         id: question.session.id.clone(),
