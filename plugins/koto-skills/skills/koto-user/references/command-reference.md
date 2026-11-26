@@ -20,6 +20,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto review record` | Runner — a skill recording a document review as telemetry |
 | `koto decisions record` | Runner — primary |
 | `koto decisions list` | Runner — primary |
+| `koto decisions attempts` | Coordinators — whether a session tried a question before passing it up, and which provisional decisions still await review |
 | `koto session dir` | Runner — primary |
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
@@ -748,6 +749,27 @@ Lists decisions recorded in the current epoch.
 ```
 
 Returns decisions for the current epoch only. Decisions recorded before the last state reset (rewind) are excluded. After `koto rewind`, `decisions.count` resets to 0.
+
+---
+
+## koto decisions attempts
+
+```
+koto decisions attempts --in <session> [--result <r>] [--state <name:visit>] [--question <identity>] [--awaiting-review]
+koto decisions attempts --at <session-or-anchor> [same filters]
+```
+
+An attempt is a `judgment` recorded with `--subject result=decided|undecided|provisional`, optionally with `--subject state=<state name>:<visit>` (an `escalate` takes `state` too). A judgment with neither field isn't an attempt. Neither field changes `koto next` or any exit code.
+
+Takes exactly one of `--in` (the session and the sessions it continues) and `--at` (the position, the sessions it continues and every session below it; each element adds `relation`, `at` or `below`). Both or neither exits 2. The filters keep exact matches and combine.
+
+```json
+{"v":1,"in":"worker","attempts":[{"identity":"<session id>/000000000001","session":"worker","id":"000000000001","what":"...","state":"implement:1","result":"undecided","decider":{...},"run_mode":{...},"time":"...","status":"in-effect","question":null,"questions":[]}],"unreadable":[]}
+```
+
+`questions` lists every question the attempt is tied to through `--basis`, and `question` is the first (or null), or the one `--question` named. The attempt citing the `escalate` always ties; the `escalate` citing the attempt ties only when the attempt is in the raiser's own run (the raiser and the sessions it continues or that continue it), so a raiser can't make another session look as if it tried. `--in manager --question <identity>` returning an empty array means `manager` recorded no attempt at that question. koto never refuses a pass-up for lack of an attempt; checking is the caller's job.
+
+A provisional element carries `review`: `awaiting` (with the earliest question citing it, or null), `reviewed` (a question citing it is governed by a person's answer that reads `verified`; carries the question and the answer), or `reversed` (with `reversed_by`). Only a governing verified person answer or a reversal ends the wait; a settle, a withdrawal or an outranked answer doesn't. `--awaiting-review` keeps the `awaiting` ones. `koto decisions show` prints the same `review`. `unreadable` lists entries the read couldn't use, including a decision whose stored `state` or `result` was edited into a value `record` would refuse; non-empty means the listing may be incomplete. The read uses only the local store and writes nothing, and `show` computes `review` from the same local reading, except that its `review` reads `reversed` whenever its `status` does.
 
 ---
 

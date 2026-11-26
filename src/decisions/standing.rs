@@ -414,7 +414,7 @@ fn is_acceptance(b: &DecisionBody) -> bool {
 }
 
 /// The winning reversal as a reversed decision names it (R20, R44).
-fn reversal_json(w: &DecisionBody) -> Value {
+pub(crate) fn reversal_json(w: &DecisionBody) -> Value {
     let mut out = json!({
         "session": w.session.name,
         "id": w.id,
@@ -552,6 +552,21 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
     let mut out = index.entry_json(session, entry, &Scope::new(backend, session));
     out["v"] = json!(FORMAT_VERSION);
     out["id"] = json!(id);
+    if let Entry::Decision(body) = entry {
+        if super::attempts::is_provisional(body) {
+            // The review comes from the local store, as `decisions
+            // attempts` reads it, so the two never disagree; whether it is
+            // reversed follows the `status` this response prints.
+            let local;
+            let reading = if matches!(backend, Backend::Cloud(_)) {
+                local = Index::scan(backend, false);
+                &local
+            } else {
+                &index
+            };
+            out["review"] = super::attempts::review(backend, &index, reading, body);
+        }
+    }
     Some(out)
 }
 

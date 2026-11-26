@@ -937,7 +937,7 @@ pub fn lock_person_limit(home: &std::path::Path, root: &str) -> std::io::Result<
 /// recipient it was raised with, the one it waits on now and every one it
 /// has had.
 fn element(b: &DecisionBody, history: &[Recipient]) -> Value {
-    json!({
+    let mut e = json!({
         "identity": identity(b),
         "session": b.session.name,
         "id": b.id,
@@ -948,7 +948,14 @@ fn element(b: &DecisionBody, history: &[Recipient]) -> Value {
         "addressee": history.last().map(Recipient::to_json),
         "addressees": history.iter().map(Recipient::to_json).collect::<Vec<_>>(),
         "time": b.time,
-    })
+    });
+    // The workflow state and visit the question was raised in, only when
+    // the escalate carries one, so an element for one raised without it
+    // prints as it did before the field existed.
+    if let Some(state) = subject_str(b, "state") {
+        e["state"] = json!(state);
+    }
+    e
 }
 
 /// `koto decisions open --person <handle>`: every open question in the

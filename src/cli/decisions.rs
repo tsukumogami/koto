@@ -2362,3 +2362,106 @@ pub fn handle_content_read(backend: &Backend, identity: &str) -> Result<()> {
     out.flush()?;
     Ok(())
 }
+
+/// The flags `koto decisions attempts` takes.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AttemptsArgs {
+    /// The session whose run to read: it and the sessions it continues
+    #[arg(long = "in", id = "in_session", value_name = "SESSION")]
+    pub in_session: Option<String>,
+    /// The session or anchor whose position to read: it, the sessions it
+    /// continues and every session below it
+    #[arg(long, value_name = "SESSION_OR_ANCHOR")]
+    pub at: Option<String>,
+    /// Only attempts with this result: decided, undecided or provisional
+    #[arg(long)]
+    pub result: Option<String>,
+    /// Only attempts recorded with this state, as <state name>:<visit>
+    #[arg(long)]
+    pub state: Option<String>,
+    /// Only attempts tied to this question, by its identity
+    /// <raiser's session id>/<decision id>
+    #[arg(long)]
+    pub question: Option<String>,
+    /// Only provisional judgments still awaiting a person's review
+    #[arg(long = "awaiting-review")]
+    pub awaiting_review: bool,
+}
+
+/// `koto decisions attempts --in <session> | --at <session-or-anchor>`.
+pub fn handle_attempts(backend: &Backend, args: &AttemptsArgs) -> Result<()> {
+    use crate::decisions::attempts::{self, Position};
+    const COMMAND: &str = "decisions attempts";
+    let (field, name) = match (&args.in_session, &args.at) {
+        (Some(s), None) => ("in", s.as_str()),
+        (None, Some(a)) => ("at", a.as_str()),
+        _ => unreachable!("clap requires exactly one of --in and --at"),
+    };
+    if crate::discover::validate_workflow_name(name).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(field, format!("--{field} takes a session or anchor name")),
+        );
+    }
+    if !chain::session_present(backend, name) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                field,
+                format!("no session or anchor named '{name}' in the local store"),
+            ),
+        );
+    }
+    if let Some(r) = &args.result {
+        if !attempts::RESULTS.contains(&r.as_str()) {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "result",
+                    format!("--result is one of {}", attempts::RESULTS.join(", ")),
+                ),
+            );
+        }
+    }
+    if let Some(s) = &args.state {
+        if !attempts::is_state_visit(s) {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "state",
+                    "--state is a state name, ':' and a visit number of 1 or more",
+                ),
+            );
+        }
+    }
+    if let Some(q) = &args.question {
+        let shaped = q.split_once('/').is_some_and(|(sid, did)| {
+            store::is_target_id(sid) && crate::decisions::is_decision_id(did)
+        });
+        if !shaped {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "question",
+                    "a question's identity is <raiser's session id>/<decision id>",
+                ),
+            );
+        }
+    }
+    let position = if field == "in" {
+        Position::In(name)
+    } else {
+        Position::At(name)
+    };
+    let filters = attempts::Filters {
+        result: args.result.clone(),
+        state: args.state.clone(),
+        question: args.question.clone(),
+        awaiting_review: args.awaiting_review,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&attempts::attempts(backend, &position, &filters))?
+    );
+    Ok(())
+}

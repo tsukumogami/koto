@@ -13,6 +13,8 @@
 //! or removal reaches them: [`crate::session::links::check_decision_key`]
 //! refuses every writer under the three areas. Only [`store`] writes them.
 //!
+//! - [`attempts`]: judgments carrying `state` and `result`, the attempts
+//!   read and the review of a provisional judgment.
 //! - [`body`]: the decision body, its kinds, outcomes and subjects, and its
 //!   size caps.
 //! - [`decider`]: the decider, agent, run mode and authority, from koto's
@@ -29,6 +31,7 @@
 //! - [`standing`]: who may reverse what, where a reversal is recorded,
 //!   racing reversals and each decision's status.
 
+pub mod attempts;
 pub mod body;
 pub mod chain;
 pub mod decider;
