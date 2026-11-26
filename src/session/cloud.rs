@@ -2850,15 +2850,9 @@ impl CloudBackend {
             return;
         }
         if let Err(e) = crate::session::pin::carry_indexed(self, id) {
-            if e.downcast_ref::<crate::session::pin::CarryManifestBusy>()
-                .is_some()
-            {
-                eprintln!(
-                    "warning: cloud sync: the pin of '{id}' is in the bucket, and only its \
-                     index entry is kept: {e:#}"
-                );
-            } else {
-                eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}");
+            match crate::session::pin::carry_busy_warning(id, &e) {
+                Some(warning) => eprintln!("{warning}"),
+                None => eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}"),
             }
         }
     }
@@ -6031,8 +6025,19 @@ impl ContextStore for CloudBackend {
                 eprintln!("warning: cloud sync: {:#}", e);
             }
         };
-        if self.defers(session) {
-            let record_and_remove = || -> anyhow::Result<bool> {
+        // The manifest lock before the batch lock, the order every context
+        // write takes them in, and the local removal runs under it. Taken
+        // whenever the session's directory exists, ctx directory or not: the
+        // local removal looks for ctx/ again, and one that another process's
+        // deferred add created in between would have it wait on the manifest
+        // lock, which that add holds, while holding the batch lock the add
+        // waits on. Taking it creates ctx/ and its manifest.lock in a session
+        // that had neither. A session with no directory opens no batch (the
+        // batch lock has nowhere to go), so its removal isn't deferred and
+        // goes the undeferred way below, which holds no batch lock while it
+        // removes locally; store_key's deferred write makes the same check.
+        if self.defers(session) && self.local.session_dir(session).is_dir() {
+            let batched = self.local.with_manifest_lock(session, || {
                 let Some((journal, lock)) = self.open_batch(session)? else {
                     return Ok(false);
                 };
@@ -6045,16 +6050,7 @@ impl ContextStore for CloudBackend {
                 self.local.remove(session, key)?;
                 forget_owed();
                 Ok(true)
-            };
-            // The manifest lock before the batch lock, the order every
-            // context write takes them in; the local removal runs under it.
-            // A session with no ctx directory has no manifest to update, and
-            // taking the lock would create the directory.
-            let batched = if self.local.ctx_path(session).is_dir() {
-                self.local.with_manifest_lock(session, record_and_remove)?
-            } else {
-                record_and_remove()?
-            };
+            })?;
             if batched {
                 return Ok(());
             }
