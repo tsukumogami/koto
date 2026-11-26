@@ -79,6 +79,9 @@ fn reading(index: &Index, backend: &Backend, body: &DecisionBody) -> Option<&'st
 struct Item {
     key: (String, String, String),
     /// Indexes into the item list of the entries this one must follow.
+    /// The items for `aimed` are pushed first, one per entry and in its
+    /// order, so an index into `aimed` is also an index into the item list;
+    /// pass-up and citing constraints rely on that.
     after: Vec<usize>,
     json: Value,
 }
@@ -141,16 +144,15 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
             json: e,
         });
     }
-    // A pass-up that moved the question follows the one before it.
-    let position = |b: &DecisionBody| {
-        aimed
-            .iter()
-            .position(|a| questions::same(a, b))
-            .expect("every applied pass-up is aimed at the question")
-    };
+    // A pass-up that moved the question follows the one before it. Every
+    // applied pass-up comes from the same index and is aimed at the
+    // question, so it is in `aimed`; one that somehow isn't only loses its
+    // ordering constraint rather than failing the read.
+    let position = |b: &DecisionBody| aimed.iter().position(|a| questions::same(a, b));
     for pair in resolution.applied.windows(2) {
-        let (before, next) = (position(pair[0]), position(pair[1]));
-        items[next].after.push(before);
+        if let (Some(before), Some(next)) = (position(pair[0]), position(pair[1])) {
+            items[next].after.push(before);
+        }
     }
 
     // Decisions citing one of the question's answers.

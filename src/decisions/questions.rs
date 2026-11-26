@@ -150,7 +150,7 @@ pub(crate) fn order_key(b: &DecisionBody) -> (&str, &str, &str) {
 
 /// `bodies` with each decision once, by identity: a copy held in a second
 /// session is the same entry.
-pub(crate) fn distinct(bodies: Vec<&DecisionBody>) -> Vec<&DecisionBody> {
+fn distinct(bodies: Vec<&DecisionBody>) -> Vec<&DecisionBody> {
     let mut seen = BTreeSet::new();
     bodies
         .into_iter()
