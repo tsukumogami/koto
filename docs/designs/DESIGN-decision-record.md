@@ -836,10 +836,9 @@ tick while the run holds a typed question, once per tick. A run with only untype
 escalations, or with none, reads its own decisions and stops. That scan is the cost of telling a
 raiser when a person overrules an answer it already cited. It reads every local session's decision
 areas, so it grows with the number of sessions in the store, and it is paid on each tick of a run
-holding a typed question even after every one is answered and cited. On a store of about a
-thousand sessions, such a tick takes several times as long as one for a run with no question, an
-extra cost of the order of a tenth of a second on a release build, and the extra grows linearly
-with the store. No cheaper test tells, without the scan, that no person's answer has arrived, so
+holding a typed question even after every one is answered and cited, so such a tick costs
+several times what one for a run with no question costs, and the extra grows linearly with the
+number of sessions in the store. No cheaper test tells, without the scan, that no person's answer has arrived, so
 the scan isn't narrowed further.
 
 The read writes nothing, takes no lock, reads only the local store, so it makes no network call
@@ -1009,16 +1008,25 @@ and `label` (at most 128 bytes). Both are optional subject fields; an entry with
 `decision`. The settle rule compares labels; no read selects by one.
 
 **The limit of twenty.** Before an `escalate` with a `person:` recipient, or a pass-up to a
-person, is written, koto counts the open questions (`is_open`) raised by the raiser's session id
-or the ids of the sessions it continues whose current addressee is a person, using the same
-`resolve`, leaving out the question being passed up. At twenty it refuses, on `subject.recipient`
+person, is written, koto counts the open questions (`is_open`) raised in the raiser's whole run
+whose current addressee is a person, using the same `resolve`, leaving out the question being
+passed up. The run is the raiser, the sessions it continues and the sessions that continue it,
+each through a confirmed succession, matched by session id (`questions::run_ids`), so an
+addressee passing up an older session's question counts that session's successor too. At twenty it refuses, on `subject.recipient`
 or `to`. The raiser's run is counted whoever records the pass-up. The count and the write are
 serialized on this host by an exclusive `flock` on a file under the koto root
 (`person-limit/<sha256 of the run's earliest session id>`), taken before the count and held until
-the write returns; a lock that can't be taken refuses the command. Two hosts are not serialized,
+the write returns. A writer waits at most five seconds for it; a lock still held then, or one that
+can't be taken, refuses the command with a message naming the lock file and the run, and nothing
+is written. The lock files are never removed: each is empty, keyed by a session id, and one left
+by a finished run costs a directory entry and nothing else. Two hosts are not serialized,
 since each counts its own store. A read never refuses, so the count can pass twenty without a
 write by the run: a settle counts only while the person answer it cites governs, so twenty settles
-resting on one answer reopen together when that person answers the earlier question again.
+resting on one answer reopen together when that person answers the earlier question again. A
+question can also be stranded: while its raiser's run holds twenty, an addressee with no
+dispatcher can pass it neither to a person (the limit) nor to a session (the destination rule).
+The refusal names the raiser and says what is left to the addressee: answer the question itself,
+or leave it waiting until the raiser's run closes one of its twenty.
 
 **Not yet covered.** Retention of questions and answers; a read selecting earlier answers by
 `label`; and one question's whole history as a read of its own.

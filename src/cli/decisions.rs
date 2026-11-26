@@ -224,40 +224,42 @@ fn check_person_limit(
     raiser: &str,
     raiser_id: &str,
     except: Option<(&str, &str)>,
+    instead: Option<String>,
 ) -> crate::decisions::questions::LimitLock {
     use crate::decisions::questions;
-    let ids = questions::run_ids(backend, raiser, raiser_id);
+    let run = questions::run_ids(backend, raiser, raiser_id);
     let lock = crate::koto_home::koto_home()
         .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
-        .and_then(|home| questions::lock_person_limit(&home, &ids))
+        .and_then(|home| questions::lock_person_limit(&home, &run.root))
         .unwrap_or_else(|e| {
             refuse(
                 command,
                 &DecisionError::invalid(
                     field,
                     format!(
-                        "koto couldn't take the lock that keeps '{raiser}' within the limit of                          twenty open questions waiting on a person, so it can't count them                          safely: {e}"
+                        "koto couldn't take the lock that keeps the run of '{raiser}' within \
+                         the limit of twenty open questions waiting on a person, so it can't \
+                         count them safely and wrote nothing: {e}"
                     ),
                 ),
             )
         });
-    let raisers: std::collections::BTreeSet<String> = ids.into_iter().collect();
+    let raisers: std::collections::BTreeSet<String> = run.ids.into_iter().collect();
     let index = Index::scan(backend, false);
     let runs = questions::Runs::new(backend);
     let open = questions::open_to_person(&index, &runs, &raisers, except);
     if open >= questions::PERSON_LIMIT {
-        refuse(
-            command,
-            &DecisionError::invalid(
-                field,
-                format!(
-                    "'{raiser}' holds {open} open questions waiting on a person, and the limit \
-                     of twenty ({}) is reached: one has to be answered, settled or withdrawn \
-                     before another waits on a person",
-                    questions::PERSON_LIMIT
-                ),
-            ),
+        let mut message = format!(
+            "the run of '{raiser}' holds {open} open questions waiting on a person, and the \
+             limit of twenty ({}) is reached: one has to be answered, settled or withdrawn \
+             before another waits on a person",
+            questions::PERSON_LIMIT
         );
+        if let Some(instead) = instead {
+            message.push_str(". ");
+            message.push_str(&instead);
+        }
+        refuse(command, &DecisionError::invalid(field, message));
     }
     lock
 }
@@ -383,6 +385,7 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             "subject.recipient",
             name,
             &header.session_id,
+            None,
             None,
         )
     });
@@ -1889,7 +1892,9 @@ pub fn handle_readdress(
                     None => format!(
                         "a pass-up goes to a person or to the recording session's dispatcher: \
                          '{recorder}' has no recorded dispatcher, so it may pass a question \
-                         only to person:<handle>, not '{}'",
+                         only to person:<handle>, not '{}'; while the run of '{name}' holds \
+                         twenty questions waiting on a person, '{recorder}' can only answer it \
+                         itself, or leave it waiting until that run closes one",
                         args.to
                     ),
                 },
@@ -1922,6 +1927,22 @@ pub fn handle_readdress(
             name,
             &question.session.id,
             Some((question.session.id.as_str(), id)),
+            // Said to an addressee, which can't close the raiser's questions.
+            (recorder != name
+                && !chain::run_predecessors(backend, &recorder)
+                    .iter()
+                    .any(|p| p == name))
+            .then(|| match &dispatcher {
+                Some(d) => format!(
+                    "'{recorder}' can answer the question itself, or pass it to its dispatcher \
+                     as session:{d}"
+                ),
+                None => format!(
+                    "'{recorder}' has no recorded dispatcher, so it can answer the question \
+                     itself if it can; otherwise the question waits on '{recorder}' until the \
+                     run of '{name}' closes one of its twenty"
+                ),
+            }),
         )
     });
 

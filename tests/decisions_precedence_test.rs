@@ -1696,6 +1696,130 @@ fn escalates_run_at_once_at_nineteen_record_only_one() {
     assert_eq!(env.open("owner").len(), 20);
 }
 
+/// A question raised in `session` whose id is `id`, for the commands that
+/// name it by session and id.
+fn q_of(session: &str, id: &str) -> Q {
+    Q {
+        session: session.to_string(),
+        id: id.to_string(),
+        session_id: String::new(),
+        header: String::new(),
+    }
+}
+
+/// A pass-up to a person refused at the limit, writing nothing; the
+/// refusal's message.
+fn pass_refused_at_limit(env: &Env, q: &Q, in_session: &str, to: &str) -> String {
+    let all0 = env.snapshot_all();
+    let out = env.readdress_run(q, in_session, to);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert_eq!(out.json()["field"], "to", "{}", out.all());
+    assert!(out.error().contains("twenty"), "{}", out.error());
+    assert_eq!(env.snapshot_all(), all0);
+    out.error()
+}
+
+#[test]
+fn a_successors_questions_count_toward_a_pass_up_from_either_recorder() {
+    let env = Env::new();
+    chain(&env);
+    let held = raise_many(&env, "worker", 5, "session:manager");
+    raise_many(&env, "worker", 10, "person:owner");
+    env.init(
+        "worker2",
+        &[
+            "--continues",
+            "worker",
+            "--supersede",
+            "--dispatched-by",
+            "manager",
+        ],
+    );
+    raise_many(&env, "worker2", 10, "person:owner");
+    refused_at_limit(&env, "worker2", "person:owner");
+
+    // The addressee counts the raiser's successor, and so does the successor.
+    for q in &held {
+        pass_refused_at_limit(&env, &q_of("worker", q), "manager", "person:owner");
+        pass_refused_at_limit(&env, &q_of("worker", q), "worker2", "person:owner");
+    }
+    assert_eq!(env.open("owner").len(), 20);
+
+    // Once the run closes one, one pass-up is taken and the next refused.
+    let first = env.open("owner")[0].clone();
+    let closing = q_of(
+        first["session"].as_str().unwrap(),
+        first["id"].as_str().unwrap(),
+    );
+    assert_eq!(env.withdraw(&closing, "worker2", "dropped").code, 0);
+    env.readdress(&q_of("worker", &held[0]), "manager", "person:owner");
+    pass_refused_at_limit(&env, &q_of("worker", &held[1]), "worker2", "person:owner");
+    assert_eq!(env.open("owner").len(), 20);
+}
+
+#[test]
+fn an_addressee_with_no_dispatcher_is_told_what_it_can_do_at_the_limit() {
+    let env = Env::new();
+    chain(&env);
+    env.init("lone", &[]);
+    let held = raise_many(&env, "worker", 1, "session:lone");
+    raise_many(&env, "worker", 20, "person:owner");
+    let q = q_of("worker", &held[0]);
+    let message = pass_refused_at_limit(&env, &q, "lone", "person:owner");
+    assert!(message.contains("'worker'"), "{message}");
+    assert!(message.contains("answer the question itself"), "{message}");
+    assert!(message.contains("no recorded dispatcher"), "{message}");
+
+    let all0 = env.snapshot_all();
+    let out = env.readdress_run(&q, "lone", "session:director");
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.error().contains("'worker'"), "{}", out.error());
+    assert!(out.error().contains("answer it"), "{}", out.error());
+    assert_eq!(env.snapshot_all(), all0);
+    assert_eq!(env.say(&q, "lone", "done here").code, 0);
+}
+
+#[test]
+fn a_held_limit_lock_refuses_after_a_bounded_wait() {
+    use std::os::fd::AsRawFd;
+    let env = Env::new();
+    chain(&env);
+    raise_many(&env, "worker", 1, "person:owner");
+    let dir = env.root.join("home").join("person-limit");
+    let held: Vec<std::fs::File> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::File::open(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(held.len(), 1);
+    for f in &held {
+        // SAFETY: flock on a descriptor `f` owns for the rest of the test.
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+    }
+    let all0 = env.snapshot_all();
+    let started = std::time::Instant::now();
+    let out = env.escalate_run("worker", "blocked", "person:owner", &[]);
+    let waited = started.elapsed();
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.error().contains("lock"), "{}", out.error());
+    assert!(out.error().contains("'worker'"), "{}", out.error());
+    assert!(out.error().contains("person-limit"), "{}", out.error());
+    assert!(waited < std::time::Duration::from_secs(30), "{waited:?}");
+    assert_eq!(env.snapshot_all(), all0);
+
+    // A question to a session takes no lock.
+    assert_eq!(
+        env.escalate_run("worker", "free", "session:manager", &[])
+            .code,
+        0
+    );
+    drop(held);
+    assert_eq!(
+        env.escalate_run("worker", "after", "person:owner", &[])
+            .code,
+        0
+    );
+}
+
 // A settle's evidence.
 
 #[test]

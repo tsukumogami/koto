@@ -543,6 +543,41 @@ pub fn run_predecessors(store: &dyn SessionBackend, session: &str) -> Vec<String
     out
 }
 
+/// The later members of `session`'s run: the successor its supersede
+/// marker names, then that one's, each kept only while the hop is
+/// confirmed (the successor is present under the id the marker records)
+/// and the successor's continues link names the session it took over, so
+/// a session lists `session` among its [`run_predecessors`] exactly when
+/// this lists it. Reads only; no lock, no pull, no write.
+pub fn run_successors(store: &dyn SessionBackend, session: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = session.to_string();
+    for _ in 0..MAX_SUPERSEDE_HOPS {
+        let Ok(Some(m)) = marker::read(&store.session_dir(&at).join("ctx")) else {
+            break;
+        };
+        let next = m.successor.name.clone();
+        if crate::discover::validate_workflow_name(&next).is_err()
+            || next == session
+            || out.contains(&next)
+            || !session_present(store, &next)
+            || header_session_id(store, &next).as_deref() != Some(m.successor.id.as_str())
+        {
+            break;
+        }
+        let continues = peers(store, &next, LinkKind::Continues)
+            .ok()
+            .and_then(|p| p.into_iter().next())
+            .map(|(pred, _)| pred);
+        if continues.as_deref() != Some(at.as_str()) {
+            break;
+        }
+        out.push(next.clone());
+        at = next;
+    }
+    out
+}
+
 /// The sessions among `sessions` whose confirmed supersede hops reach
 /// `session`: the fenced predecessors it stands in for (R39). Only a
 /// session with a readable marker can be one, so a session with none

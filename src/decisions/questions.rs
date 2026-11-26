@@ -825,46 +825,73 @@ pub fn open_to_person(
         .count()
 }
 
-/// The session ids of the run `raiser` (whose header id is `raiser_id`)
-/// belongs to: its own and those of the sessions it continues that this
-/// host holds. The limit of twenty counts the open questions these
-/// sessions raised.
-pub fn run_ids(backend: &Backend, raiser: &str, raiser_id: &str) -> Vec<String> {
+/// The run a question's raiser belongs to, as the limit of twenty counts
+/// it: the session ids this host holds for the raiser, the sessions it
+/// continues and the sessions that continue it, and the id of the run's
+/// earliest session, which keys the run's lock.
+pub struct Run {
+    pub ids: Vec<String>,
+    pub root: String,
+}
+
+/// The whole run of `raiser` (whose header id is `raiser_id`): its own
+/// session id, those of the sessions it continues
+/// ([`chain::run_predecessors`]) and those of the sessions that continue it
+/// ([`chain::run_successors`]), as far as this host holds them. A pass-up
+/// recorded by an addressee and an `escalate` recorded by a successor
+/// therefore count the same questions and take the same lock.
+pub fn run_ids(backend: &Backend, raiser: &str, raiser_id: &str) -> Run {
     let mut ids = vec![raiser_id.to_string()];
+    let mut root = raiser_id.to_string();
     for p in chain::run_predecessors(backend, raiser) {
         if let Some(id) = read::local_session_id(backend, &p) {
+            if !ids.contains(&id) {
+                ids.push(id.clone());
+            }
+            root = id;
+        }
+    }
+    for s in chain::run_successors(backend, raiser) {
+        if let Some(id) = read::local_session_id(backend, &s) {
             if !ids.contains(&id) {
                 ids.push(id);
             }
         }
     }
-    ids
+    Run { ids, root }
 }
 
-/// The directory under the koto root that holds the limit's locks, one per
-/// run.
+/// The directory under the koto root that holds the limit's locks, one file
+/// per run. The files are never removed: each is empty, and one left by a
+/// run that has ended only costs a directory entry.
 pub const PERSON_LIMIT_LOCKS_DIR: &str = "person-limit";
+
+/// How long a writer waits for another writer of the same run to release
+/// the limit's lock before it refuses.
+pub const PERSON_LIMIT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The limit's lock on one run, held until dropped.
 pub struct LimitLock {
     _file: std::fs::File,
 }
 
-/// Take the limit's lock for the run whose session ids are `ids` (as
-/// [`run_ids`] lists them, the raiser's first), waiting as long as it
-/// takes. A writer that would add a question waiting on a person holds it
-/// from the count to the write, so two writers on this host can't both
-/// count nineteen and both write. The lock is keyed by the run's earliest
-/// session this host holds, so a successor and the session it continues
-/// share it. It is a file under the koto root, outside every session's
-/// synced files, and serializes writers on this host only.
-pub fn lock_person_limit(home: &std::path::Path, ids: &[String]) -> std::io::Result<LimitLock> {
+/// Take the limit's lock for the run whose earliest session id is `root`
+/// ([`Run::root`]), waiting at most [`PERSON_LIMIT_LOCK_WAIT`]. A writer
+/// that would add a question waiting on a person holds it from the count to
+/// the write, so two writers on this host can't both count nineteen and
+/// both write. Every member of a run keys it by the same earliest session,
+/// so a successor, the sessions it continues and an addressee passing up
+/// one of their questions share it. It is a file under the koto root,
+/// outside every session's synced files, and serializes writers on this
+/// host only. A lock still held when the wait ends is an error of kind
+/// `TimedOut` naming the file.
+pub fn lock_person_limit(home: &std::path::Path, root: &str) -> std::io::Result<LimitLock> {
     use sha2::{Digest, Sha256};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = home.join(PERSON_LIMIT_LOCKS_DIR);
     crate::koto_home::ensure_private_root(&dir)?;
-    let root = ids.last().map(String::as_str).unwrap_or_default();
+    let path = dir.join(hex::encode(Sha256::digest(root.as_bytes())));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -872,17 +899,31 @@ pub fn lock_person_limit(home: &std::path::Path, ids: &[String]) -> std::io::Res
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join(hex::encode(Sha256::digest(root.as_bytes()))))?;
+        .open(&path)?;
+    let deadline = std::time::Instant::now() + PERSON_LIMIT_LOCK_WAIT;
     loop {
         // SAFETY: flock on a descriptor borrowed from `file`, which
         // outlives the call; the lock is released when `file` closes.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(LimitLock { _file: file });
         }
         let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {}
+            _ => return Err(err),
         }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "another koto command has held {} for more than {} seconds",
+                    path.display(),
+                    PERSON_LIMIT_LOCK_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 

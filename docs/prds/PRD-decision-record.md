@@ -756,7 +756,10 @@ to an id-shaped value, and both say so.
 - **R73.** An entry that breaks a rule is returned by every read that returned it before, never
   dropped, and never takes effect. `koto decisions show` and `list --format v1` add to every
   `answer` and `readdress` entry `counted` (true or false) and, when it is false, a `reason`
-  naming the rule; to every closing entry they add `governs`, true on the one entry in effect
+  naming the rule as one of the codes `not_addressee`, `waits_on_person`, `not_raiser`,
+  `person_decider`, `no_reason`, `need_not_settleable`, `settle_basis`, `no_question`,
+  `after_fence`, `destination` and `skipped`; an unreadable entry lists the code `integrity` as
+  its `reason` and the failed check as free text in `detail`. To every closing entry they add `governs`, true on the one entry in effect
   (R74) and false on every other. A pass-up counts when it is in the question's addressee history.
   The stored status of an entry is unchanged by this judgment.
 - **R74.** Of a question's closing entries that count, one is in effect. A person's answer counted
@@ -772,7 +775,11 @@ to an id-shaped value, and both say so.
   dispatcher's name when it is written, and the rule is judged from that recorded name, so a later
   change to the recorder's links moves no question; a pass-up written before this requirement is
   judged from the dispatcher its authority recorded. A stored pass-up that breaks the rule is left
-  out of the addressee history and reads `counted` false.
+  out of the addressee history and reads `counted` false. `anchor:<dispatcher>` names the same
+  position as `session:<dispatcher>` and is accepted. At read time the rule checks only that a
+  stored pass-up names the dispatcher it recorded; the recorded name isn't checked against the
+  recorder's links in the store, so the rule doesn't hold against files in the store written or
+  edited directly.
 - **R76.** `koto decisions answer` refuses, before any write, every entry that would not count
   when written: a session's `answered` answer to a question that waits on a person, or recorded in
   a session that isn't the question's addressee and doesn't continue it; and a session's
@@ -784,9 +791,12 @@ to an id-shaped value, and both say so.
   continuing it, with a session decider. A withdrawal needs a reason and takes no evidence. A
   settle needs a text and evidence: for a question that waits on a person, the question needs a
   `label` and a `--basis` naming an `answered` answer of the same person that R68 reads as verified,
-  that is in effect on its own question, whose question has the same `label`, and that was recorded
-  no later than the settle; for a question that waits on a session or anchor, a `--basis` naming a
-  decision that reads back, or an `--evidence event:<session>:<seq>` pointer. A basis names a
+  that is in effect on its own question, whose own question still reads in effect (not reversed),
+  whose question has the same `label`, and that was recorded no later than the settle; for a
+  question that waits on a session or anchor, a `--basis` naming a decision that reads back and is
+  neither the question itself nor an entry aimed at it, or an `--evidence event:<session>:<seq>`
+  pointer, which is checked for its form only. A decision the raiser recorded only to serve as a
+  basis isn't told apart from any other. A basis names a
   session and an identifier, resolved when the settle is judged, so a decision a later session
   writes under a removed session's name and identifier is judged on its own and never read as the
   removed session's. A stored `withdrawn` or `settled` entry from any other session, by a person,
@@ -801,9 +811,9 @@ to an id-shaped value, and both say so.
   answered like any question, and its raiser can withdraw it but can't settle a `credential` or
   `reserved-step` need. No read selects by `label`.
 - **R79.** No write adds a twenty-first open question waiting on a person to a session's run.
-  The run's count is of the questions raised in the session or in the sessions it continues
-  through a confirmed succession, matched by session id, that are open and whose current addressee
-  is a person, whatever the handles. While it reads twenty, an `escalate` with a `person:`
+  The run is the session, the sessions it continues and the sessions that continue it through a
+  confirmed succession, and its count is of the questions raised in any of them, matched by
+  session id, that are open and whose current addressee is a person, whatever the handles. While it reads twenty, an `escalate` with a `person:`
   recipient is refused on `subject.recipient`, and a pass-up of one of the run's questions to a
   person is refused on `to`, whoever records it; both messages name the limit of twenty and
   nothing is written. A pass-up of a question that already waits on a person to another person is
@@ -811,7 +821,11 @@ to an id-shaped value, and both say so.
   anchor never is. The count follows the current addressee, so a question passed from a person to
   a session no longer counts; a closed or reversed question doesn't count; and an entry that
   doesn't count frees no place. On one host, the writers that can add to the count hold a lock on
-  the run from the count to the write, so writes run at once can't pass twenty. What the limit
+  the run from the count to the write, so writes run at once can't pass twenty; a writer waits at
+  most five seconds for it and otherwise is refused, naming the lock, and writes nothing. An
+  addressee refused a pass-up by the limit is told the raiser's session and what it can do instead:
+  answer the question, pass it to its dispatcher when it has one, or leave it waiting until the
+  raiser's run closes one of its twenty. What the limit
   doesn't cover: the count reads this host's store, so writers on two hosts are not serialized and
   can together pass twenty; and a read never refuses, so questions can reopen past twenty without
   any write by the run, as when twenty settles resting on one person's answer stop counting
@@ -1300,6 +1314,11 @@ With `worker` dispatched by `manager`, `manager` by `director`, and an unrelated
   `to` naming the limit, from the addressee and from the raiser, writing nothing; a pass-up to a
   session is recorded; a question already waiting on a person passes to another person; and six
   `escalate` commands to a person started at once at nineteen record exactly one (R79).
+- [ ] A run whose predecessor holds 10 questions to a person and 5 to a session, and whose
+  successor holds 10 more to a person, refuses a pass-up of each of the 5 to a person from the
+  addressee and from the successor, writing nothing; an addressee with no dispatcher is told the
+  raiser and that it can answer the question itself; and a writer finding the run's lock held is
+  refused within a bounded wait, writing nothing (R79).
 
 ## Out of Scope
 
