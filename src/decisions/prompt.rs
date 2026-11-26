@@ -9,11 +9,16 @@
 //! id>/<position>`; koto reads the record itself and takes the answer text
 //! from the call's result.
 //!
-//! Where koto looks is fixed by koto, never by the caller: the harness
-//! session is the one the answering command runs in (`CLAUDE_CODE_SESSION_ID`
-//! through the run journal's driver rule), and its record is the one file
-//! `$HOME/.claude/projects/<project>/<harness session id>.jsonl`. A pointer
-//! naming any other harness session is refused before a file is opened.
+//! Where koto looks is fixed by koto: the record is the one file
+//! `<account home>/.claude/projects/<project>/<harness session id>.jsonl`,
+//! where the account home is the effective user's entry in the account
+//! database, never `$HOME`, and the record's real path must lie under that
+//! root. The harness session is the one the answering command runs in
+//! (`CLAUDE_CODE_SESSION_ID` through the run journal's driver rule), and
+//! when koto has recorded a driving harness session for the answering koto
+//! session, the two must agree. Neither is authenticated: both are values
+//! a process running as the user can set, so the check is as strong as the
+//! user's control of their own processes and home.
 //!
 //! The record's format is observed, not a documented contract: the fields
 //! read here are listed in [`FIELDS_READ`], each with its path in a captured
@@ -27,6 +32,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::body::DecisionBody;
 use super::decider::Sourced;
 
 /// The harness's question-prompt tool.
@@ -53,6 +59,8 @@ pub const TAG_HEX: usize = 11;
 pub const FIELDS_READ: &[(&str, bool)] = &[
     ("call: type", false),
     ("call: sessionId", false),
+    ("call: isSidechain", false),
+    ("call: timestamp", false),
     ("call: message.content[].type", false),
     ("call: message.content[].id", false),
     ("call: message.content[].name", false),
@@ -64,6 +72,7 @@ pub const FIELDS_READ: &[(&str, bool)] = &[
     ),
     ("result: type", false),
     ("result: sessionId", false),
+    ("result: isSidechain", false),
     ("result: message.content[].type", false),
     ("result: message.content[].tool_use_id", false),
     ("result: message.content[].is_error", true),
@@ -181,6 +190,11 @@ pub enum Check {
     CallPositionReused,
     /// The question has no stored content koto can compare against.
     Content,
+    /// The call or its result was made in a side conversation (a
+    /// subagent's), not the harness session's own.
+    Sidechain,
+    /// The call was made before the question was raised.
+    Time,
 }
 
 impl Check {
@@ -198,6 +212,8 @@ impl Check {
             Check::Shape => "shape",
             Check::CallPositionReused => "call-position-reused",
             Check::Content => "content",
+            Check::Sidechain => "sidechain",
+            Check::Time => "time",
         }
     }
 
@@ -223,6 +239,10 @@ impl Check {
             Check::Content => {
                 "the question has no stored content holding a question and option labels"
             }
+            Check::Sidechain => {
+                "the call or its result was made in a side conversation, not the session's own"
+            }
+            Check::Time => "the call was made before the question was raised",
         }
     }
 
@@ -252,13 +272,17 @@ pub struct Expected {
     pub labels: Vec<String>,
     /// The header that carries the question's identity ([`tag`]).
     pub header: String,
+    /// When the question was raised: a prompt opened earlier can't have
+    /// shown it. `None` when the question's time can't be read, which
+    /// fails the `time` check.
+    pub asked: Option<std::time::SystemTime>,
 }
 
 impl Expected {
     /// Read the stored content: a JSON object with a `question` string and
     /// an `options` array whose every element has a `label` string. Other
     /// fields are allowed and ignored.
-    pub fn from_content(bytes: &[u8], identity: &str) -> Result<Self, Check> {
+    pub fn from_content(bytes: &[u8], identity: &str, asked: &str) -> Result<Self, Check> {
         let v: Value = serde_json::from_slice(bytes).map_err(|_| Check::Content)?;
         let question = v
             .get("question")
@@ -276,6 +300,7 @@ impl Expected {
             question: question.to_string(),
             labels,
             header: tag(identity),
+            asked: crate::engine::wake::parse_rfc3339_millis(asked),
         })
     }
 }
@@ -291,20 +316,122 @@ pub fn tag(identity: &str) -> String {
 
 /// The file in a session's directory, beside its state file and outside
 /// everything sync carries, listing the answers whose prompt this host
-/// checked: one `<header session id> <decision id>` line each.
+/// checked: one `<session id> <decision id> <seal>` line each, the seal
+/// binding the line to this host, to the session directory's name and to
+/// the stored answer ([`seal`]).
 pub const VERIFIED_HERE_FILE: &str = "koto-verified-here";
+
+/// The file under the koto root holding this host's identity: 32 random
+/// bytes as 64 hex digits, created once and never synced or imported.
+pub const HOST_ID_FILE: &str = "host-id";
+
+/// The directory under the koto root holding one create-only marker per
+/// call position a person's answer on this host has cited.
+pub const PROMPT_USES_DIR: &str = "prompt-uses";
 
 /// The most bytes [`verified_here`] reads of the note.
 const MAX_NOTE_BYTES: u64 = 1 << 20;
 
-/// Note that this host checked the prompt of answer `decision` in the
-/// session with header id `session_id`.
+/// The most bytes of a record koto reads on one line. A longer line fails
+/// the `shape` check, so a huge line can't exhaust memory.
+pub const MAX_RECORD_LINE_BYTES: usize = 16 << 20;
+
+/// The most bytes of a record koto reads in all. A longer record fails the
+/// `shape` check.
+pub const MAX_RECORD_BYTES: u64 = 1 << 30;
+
+/// Open `path` for reading without following a final symlink, and only
+/// when it is a regular file.
+fn open_plain(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().is_ok_and(|m| m.is_file()).then_some(file)
+}
+
+/// This host's identity under `koto_home`, or `None` when it doesn't exist
+/// yet or isn't what koto writes.
+fn read_host_id(koto_home: &Path) -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut text = String::new();
+    open_plain(&koto_home.join(HOST_ID_FILE))?
+        .take(65)
+        .read_to_string(&mut text)
+        .ok()?;
+    let bytes = hex::decode(text.trim_end_matches('\n')).ok()?;
+    bytes.try_into().ok()
+}
+
+/// This host's identity, created under `koto_home` when there is none.
+/// Creation is create-only, so two racing processes agree on one value.
+fn host_id(koto_home: &Path) -> std::io::Result<[u8; 32]> {
+    use std::io::{Read, Write};
+    if let Some(id) = read_host_id(koto_home) {
+        return Ok(id);
+    }
+    crate::koto_home::ensure_private_root(koto_home)?;
+    let mut id = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(koto_home.join(HOST_ID_FILE)) {
+        Ok(mut f) => {
+            f.write_all(format!("{}\n", hex::encode(id)).as_bytes())?;
+            f.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    read_host_id(koto_home)
+        .ok_or_else(|| std::io::Error::other("the host identity file isn't one koto wrote"))
+}
+
+/// The seal a note line carries for answer `body` held in the session
+/// directory named `holder`: SHA-256 over this host's identity, the
+/// holder's name and the SHA-256 of the answer as stored. A line copied to
+/// another host, to another session directory, or written for another body
+/// doesn't match.
+fn seal(host: &[u8; 32], holder: &str, body: &DecisionBody) -> String {
+    use sha2::{Digest, Sha256};
+    let stored = Sha256::digest(serde_json::to_vec(body).unwrap_or_default());
+    let mut h = Sha256::new();
+    h.update(host);
+    h.update([0]);
+    h.update(holder.as_bytes());
+    h.update([0]);
+    h.update(stored);
+    hex::encode(h.finalize())
+}
+
+fn note_line(host: &[u8; 32], holder: &str, body: &DecisionBody) -> String {
+    format!(
+        "{} {} {}",
+        body.session.id,
+        body.id,
+        seal(host, holder, body)
+    )
+}
+
+/// Note that this host checked the prompt of answer `body`, written in the
+/// session `holder` whose directory is `session_dir`.
 pub fn note_verified_here(
+    koto_home: &Path,
     session_dir: &Path,
-    session_id: &str,
-    decision: &str,
+    holder: &str,
+    body: &DecisionBody,
 ) -> std::io::Result<()> {
     use std::io::Write;
+    let host = host_id(koto_home)?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -313,54 +440,146 @@ pub fn note_verified_here(
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(session_dir.join(VERIFIED_HERE_FILE))?;
-    file.write_all(format!("{session_id} {decision}\n").as_bytes())?;
+    file.write_all(format!("{}\n", note_line(&host, holder, body)).as_bytes())?;
     file.sync_all()
 }
 
-/// Whether this host checked the prompt of answer `decision` in the
-/// session with header id `session_id`. A session that arrived by import
-/// or by a pull has no such note for an answer recorded elsewhere, so its
-/// answers read remote.
-pub fn verified_here(session_dir: &Path, session_id: &str, decision: &str) -> bool {
+/// Whether this host checked the prompt of answer `body`, as held in the
+/// session `holder` whose directory is `session_dir`. A copy that arrived
+/// by import or by a pull, a session directory copied by hand, and a host
+/// whose koto root holds no identity all read it remote.
+pub fn verified_here(
+    koto_home: Option<&Path>,
+    session_dir: &Path,
+    holder: &str,
+    body: &DecisionBody,
+) -> bool {
     use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let Ok(file) = options.open(session_dir.join(VERIFIED_HERE_FILE)) else {
+    let Some(host) = koto_home.and_then(read_host_id) else {
         return false;
     };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
+    let Some(file) = open_plain(&session_dir.join(VERIFIED_HERE_FILE)) else {
         return false;
-    }
+    };
     let mut bytes = Vec::new();
     if file.take(MAX_NOTE_BYTES).read_to_end(&mut bytes).is_err() {
         return false;
     }
-    let want = format!("{session_id} {decision}");
+    let want = note_line(&host, holder, body);
     String::from_utf8_lossy(&bytes).lines().any(|l| l == want)
 }
 
+/// The create-only marker that holds one call position for one answer on
+/// this host. Dropping it without [`UseMarker::keep`] removes it, so a
+/// write that fails frees the position again.
+pub struct UseMarker {
+    path: Option<PathBuf>,
+}
+
+impl UseMarker {
+    /// Keep the marker: the answer citing it was written.
+    pub fn keep(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for UseMarker {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Take the call position `pointer` names for one answer, host-wide:
+/// `Ok(None)` when another answer on this host already holds it.
+pub fn take_use(koto_home: &Path, pointer: &Pointer) -> std::io::Result<Option<UseMarker>> {
+    use sha2::{Digest, Sha256};
+    let dir = koto_home.join(PROMPT_USES_DIR);
+    crate::koto_home::ensure_private_root(&dir)?;
+    let name = hex::encode(Sha256::digest(pointer.display().as_bytes()));
+    let path = dir.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(&path) {
+        Ok(_) => Ok(Some(UseMarker { path: Some(path) })),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The effective user's home directory from the account database, never
+/// from `$HOME`. `None` when there is no entry or it names no absolute
+/// directory.
+#[cfg(unix)]
+pub fn account_home() -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: geteuid has no preconditions and can't fail.
+    let uid = unsafe { libc::geteuid() };
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: getpwuid_r writes only `pwd`, `result` and `buf`, which
+        // is live for the length passed; every pointer read from `pwd`
+        // afterwards points into `buf`.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        let path = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+        return path.is_absolute().then_some(path);
+    }
+}
+
+/// Without an account database there is no home koto trusts.
+#[cfg(not(unix))]
+pub fn account_home() -> Option<PathBuf> {
+    None
+}
+
 /// Where Claude Code keeps each project's session records:
-/// `$HOME/.claude/projects`, the root koto's `/workflows` surface reads.
+/// `<account home>/.claude/projects`.
 pub fn projects_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".claude").join("projects"))
+    Some(account_home()?.join(".claude").join("projects"))
 }
 
 /// Check `pointer` for a person's answer recorded by a command running in
 /// harness session `observed`, against the record under `root`, and return
 /// the answer text the call's result holds for the pointer's position.
+/// `recorded` is the harness session koto last recorded driving the
+/// answering koto session, when it holds one; it must be `observed`.
 pub fn verify(
     root: Option<&Path>,
     observed: Option<&str>,
+    recorded: Option<&str>,
     pointer: &Pointer,
     expected: &Expected,
 ) -> Result<String, Check> {
     if observed != Some(pointer.harness.as_str()) {
+        return Err(Check::Session);
+    }
+    if recorded.is_some_and(|r| r != pointer.harness) {
         return Err(Check::Session);
     }
     let record = find_record(root.ok_or(Check::Record)?, &pointer.harness)?;
@@ -373,11 +592,21 @@ pub fn verify(
             Check::Shape
         });
     }
+    main_line(&call)?;
     let item = call_item(&call, &pointer.call).ok_or(Check::Shape)?;
     match item.get("name").and_then(Value::as_str) {
         Some(QUESTION_TOOL) => {}
         Some(_) => return Err(Check::Tool),
         None => return Err(Check::Shape),
+    }
+    let made = call
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(crate::engine::wake::parse_rfc3339_millis)
+        .ok_or(Check::Shape)?;
+    match expected.asked {
+        Some(asked) if made >= asked => {}
+        _ => return Err(Check::Time),
     }
     let questions = item
         .get("input")
@@ -428,6 +657,7 @@ pub fn verify(
         Some(_) => return Err(Check::Session),
         None => return Err(Check::Shape),
     }
+    main_line(&result)?;
     let reply = result_item(&result, &pointer.call).ok_or(Check::Shape)?;
     match reply.get("is_error") {
         None | Some(Value::Bool(false)) => {}
@@ -443,15 +673,15 @@ pub fn verify(
         Some(Value::Object(m)) => m,
         _ => return Err(Check::Result),
     };
-    // The reply must be the person's: an accepted decision whose source is
-    // one of the user's own choices. Those sources share the `user` prefix
-    // (a hook or a rule names another), and the prefix rather than one
-    // observed value keeps a person's other replies from being refused.
+    // The reply must be the person's: an accepted decision from one of
+    // the sources the captured records show for a reply the user gave.
+    // Any other source, a hook's, a rule's or one not seen yet, is refused
+    // rather than guessed at.
     if decision.get("decision").and_then(Value::as_str) != Some("accept")
         || !decision
             .get("source")
             .and_then(Value::as_str)
-            .is_some_and(|s| s.starts_with("user"))
+            .is_some_and(|s| USER_REPLY_SOURCES.contains(&s))
     {
         return Err(Check::Result);
     }
@@ -465,13 +695,30 @@ pub fn verify(
     Ok(answer.to_string())
 }
 
+/// The permission sources a captured record shows on a reply the user
+/// gave to a question prompt. Exact values only.
+pub const USER_REPLY_SOURCES: &[&str] = &["user_temporary"];
+
+/// A line of the harness session's own conversation: `isSidechain` is
+/// `false`. A side conversation's line fails the `sidechain` check, and a
+/// line without the flag the `shape` check.
+fn main_line(line: &Value) -> Result<(), Check> {
+    match line.get("isSidechain") {
+        Some(Value::Bool(false)) => Ok(()),
+        Some(Value::Bool(true)) => Err(Check::Sidechain),
+        _ => Err(Check::Shape),
+    }
+}
+
 /// The one record `<root>/<project>/<harness>.jsonl`: a regular file, not
-/// a symlink, in a project directory that isn't one either. None, or more
-/// than one, fails the `record` check.
+/// a symlink, in a project directory that isn't one either, whose real
+/// path lies under `root`'s. None, or more than one, fails the `record`
+/// check.
 fn find_record(root: &Path, harness: &str) -> Result<PathBuf, Check> {
+    let real_root = std::fs::canonicalize(root).map_err(|_| Check::Record)?;
     let name = format!("{harness}.jsonl");
     let mut found = Vec::new();
-    for entry in std::fs::read_dir(root)
+    for entry in std::fs::read_dir(&real_root)
         .map_err(|_| Check::Record)?
         .flatten()
     {
@@ -484,41 +731,63 @@ fn find_record(root: &Path, harness: &str) -> Result<PathBuf, Check> {
             found.push(candidate);
         }
     }
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        _ => Err(Check::Record),
+    if found.len() != 1 {
+        return Err(Check::Record);
     }
+    let record = std::fs::canonicalize(found.remove(0)).map_err(|_| Check::Record)?;
+    if !record.starts_with(&real_root) {
+        return Err(Check::Record);
+    }
+    Ok(record)
 }
 
-/// Stream the record line by line and return the first line holding the
-/// call and the first holding its result. Only lines that mention the call
-/// id are parsed; such a line that isn't valid JSON fails the `shape`
-/// check.
+/// Stream the record line by line and return the line holding the call
+/// and the line holding its result. Only lines that mention the call id
+/// are parsed. The `shape` check fails on such a line that isn't valid
+/// JSON, on a second line holding the call or a second holding its
+/// result, on a result that comes before its call, and on a line or a
+/// record past [`MAX_RECORD_LINE_BYTES`] or [`MAX_RECORD_BYTES`].
 fn read_call(path: &Path, call: &str) -> Result<(Option<Value>, Option<Value>), Check> {
-    let file = std::fs::File::open(path).map_err(|_| Check::Record)?;
+    use std::io::Read;
+    let file = open_plain(path).ok_or(Check::Record)?;
+    if file.metadata().map_err(|_| Check::Record)?.len() > MAX_RECORD_BYTES {
+        return Err(Check::Shape);
+    }
     let needle = format!("\"{call}\"");
     let needle = needle.as_bytes();
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(MAX_RECORD_BYTES + 1));
     let mut line = Vec::new();
+    let mut total: u64 = 0;
     let (mut found_call, mut found_result) = (None, None);
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => return Err(Check::Record),
+        let n = (&mut reader)
+            .take(MAX_RECORD_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| Check::Record)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > MAX_RECORD_BYTES
+            || (line.len() > MAX_RECORD_LINE_BYTES && line.last() != Some(&b'\n'))
+        {
+            return Err(Check::Shape);
         }
         if !line.windows(needle.len()).any(|w| w == needle) {
             continue;
         }
         let value: Value = serde_json::from_slice(&line).map_err(|_| Check::Shape)?;
-        if found_call.is_none() && call_item(&value, call).is_some() {
+        if call_item(&value, call).is_some() {
+            if found_call.is_some() {
+                return Err(Check::Shape);
+            }
             found_call = Some(value);
-        } else if found_result.is_none() && result_item(&value, call).is_some() {
+        } else if result_item(&value, call).is_some() {
+            if found_result.is_some() || found_call.is_none() {
+                return Err(Check::Shape);
+            }
             found_result = Some(value);
-        }
-        if found_call.is_some() && found_result.is_some() {
-            break;
         }
     }
     Ok((found_call, found_result))
@@ -653,7 +922,7 @@ mod tests {
     fn content_needs_a_question_and_labelled_options() {
         let ok =
             br#"{"question":"q","options":[{"label":"a"},{"label":"b","description":"d"}],"x":1}"#;
-        let e = Expected::from_content(ok, "s/1").unwrap();
+        let e = Expected::from_content(ok, "s/1", "2026-01-01T00:00:00.000Z").unwrap();
         assert_eq!(e.question, "q");
         assert_eq!(e.labels, vec!["a", "b"]);
         for bad in [
@@ -663,7 +932,7 @@ mod tests {
             br#"{"question":"q","options":[{"description":"d"}]}"#,
         ] {
             assert_eq!(
-                Expected::from_content(bad, "s/1").unwrap_err(),
+                Expected::from_content(bad, "s/1", "2026-01-01T00:00:00.000Z").unwrap_err(),
                 Check::Content
             );
         }

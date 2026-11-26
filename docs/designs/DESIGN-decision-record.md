@@ -944,34 +944,72 @@ header short; 44 bits are enough to tell apart the questions one record could ho
 collision would still have to pass the text and option checks.
 
 **Finding the record.** The pointer names a harness session; koto accepts only the one running
-the command (`CLAUDE_CODE_SESSION_ID`, R47) and looks one directory below
-`$HOME/.claude/projects/` for exactly one regular `<harness>.jsonl`, refusing symbolic links.
-Nothing else is searched, so a record can't be borrowed from another harness session or another
-home. Only lines containing the quoted call id are parsed, which bounds the work on a long record.
+the command (`CLAUDE_CODE_SESSION_ID`, R47). When the answering koto session's run-journal sidecar
+holds the harness session koto last saw driving it (written when the session was created, and on
+any later command run with a different driver), the two must agree. koto then looks one directory
+below `.claude/projects/` in the effective user's home, read from the account database
+(`getpwuid_r` on the effective uid) and never from `$HOME`, for exactly one regular
+`<harness>.jsonl`, refusing symbolic links, and requires the record's canonical path to lie under
+the canonical root. Nothing else is searched, so a record can't be borrowed from another harness
+session or from a home the caller pointed `HOME` at.
+
+The harness session id itself is not authenticated. It's an environment value, so any process
+running as the user can set it; where the sidecar holds no driver (a session created outside
+Claude Code), it is the only thing naming the harness session. The binding to the sidecar narrows
+that: an answer can't swap in another harness session's id for a koto session koto already saw
+driven by a different one, unless a command has since run in that session under the new id.
+
+**Reading the record.** Lines are read with a 16 MiB cap on each and 1 GiB in all, and a record
+past either fails `shape`, so a huge line can't exhaust memory. Only lines containing the quoted
+call id are parsed. The whole record is scanned: the call and its result must each appear on
+exactly one line, the result after the call, or the record is ambiguous and fails `shape`. Both
+lines must carry `isSidechain: false`; a side conversation's call or result fails `sidechain`,
+since a subagent's prompt isn't the session's own. The call's `timestamp` must be no earlier than
+the question's `time`: a prompt opened before the question existed can't have shown it, and that
+fails `time`.
 
 **What koto reads.** `prompt::FIELDS_READ` lists every path koto reads from a record: from the
-call, the tool name, the call id, and each question's `question`, `header` and option `label`; from
-the result, the tool-use id, `is_error`, `toolUseResult.answers` and `permissionDecision`'s
-`decision` and `source`. A unit test walks each path through the committed fixtures, which keep
-the real record's structure with every text value replaced by a marker string, so a path the
-structure lacks fails the build. At run time a missing field fails the `shape` check rather than
+call, `isSidechain`, `timestamp`, the tool name, the call id, and each question's `question`,
+`header` and option `label`; from the result, `isSidechain`, the tool-use id, `is_error`,
+`toolUseResult.answers` and `permissionDecision`'s `decision` and `source`. The source must be
+exactly one of `prompt::USER_REPLY_SOURCES`, the values the captured records show for a reply the
+user gave (`user_temporary` so far); any other, a prefix match included, fails `result`. A unit
+test walks each path through the committed fixtures, which keep the real record's structure with
+every text value replaced by a marker string, so a path the structure lacks fails the build. The
+list is kept by hand beside the reads; deriving it from them would need a recording wrapper around
+every `Value` access, more machinery than the list it replaces. At run time a missing field fails the `shape` check rather than
 reading as absent: the trust rests on a format koto observes and doesn't own, and a change to it
 must refuse answers, not misread them.
 
-**Reuse.** One call position verifies one answer. Every local answer to the question is scanned
-for one citing the same pointer before any check, and the answering session's listing again
-inside the write lock, so two answers racing on one position leave one entry. The lock is the answering session's, so two
-different answering sessions citing one position at once aren't serialized; the PRD records that
-limit.
+**Reuse.** One call position verifies one answer on a host. Every local answer to the question is
+scanned for one citing the same pointer before any check. Then, before the write, the answer
+creates `prompt-uses/<sha256 of harness/call/position>` under the koto root with create-only
+semantics: whichever answer creates it goes on, and any other, from any answering session, fails
+`call-position-reused`. A write that fails removes the marker. The answering session's listing is
+checked again inside its write lock as well. Two hosts aren't serialized, and a process killed
+between the marker and the write leaves the position used, which errs toward refusing.
 
 **Created here or arrived.** The mark is stored as `verified`, `observed`, but the reading isn't
-taken from the stored bytes alone, since a pull or an import copies them unchanged. When an answer
-is recorded, koto appends `<session id> <decision id>` to `koto-verified-here` in the session's
-directory on this host, beside `ctx/` rather than in it, so no manifest lists it and no sync, pull
-or import carries it. A read shows `verified` only when the note lists the answer; anywhere else
-the mark reads `remote` and the reading "a remote session's answer". This is per answer rather than
-per session, so a session created here that pulls an answer recorded on another host reads that
-answer remote too.
+taken from the stored bytes alone, since a pull or an import copies them unchanged. Each host keeps
+an identity, `host-id` under the koto root: 32 random bytes created once, outside every session
+directory, never synced or imported. When an answer is recorded, koto appends
+`<session id> <decision id> <seal>` to `koto-verified-here` in the answering session's directory,
+beside `ctx/` rather than in it, so no manifest lists it and no sync, pull or import carries it. The
+seal is SHA-256 over the host identity, the session directory's name and the SHA-256 of the stored
+answer body. A read looks in the directory of the session it read the answer from, never one a
+field of the body names, and shows `verified` only when that note holds the answer's sealed line.
+An imported copy, even on the recording host under a new name, has no note of its own. A sessions
+directory copied with its notes to another koto root meets a different host identity. A note line
+written for a body koto never verified, bare or carrying a real line's seal, doesn't match the body
+it names. All of those read the mark `remote` and the reading "a remote session's answer". `show`,
+`list --format v1` and each answer in the `questions` on `koto next` carry that reading;
+`koto context get` prints the stored body, whose mark is not the reading. The reading is per
+answer, so a session created here that pulls an answer recorded on another host reads that answer
+remote too. A directory restored in place on the same host, under the same koto root, still reads
+verified, since the host did check that body there.
+
+The residual is the same trust limit as the record's: a process that can write both the koto root's
+host identity and the session files can compute a seal and write a line that reads verified.
 
 The cloud import now carries the decision areas and `koto/packets/`, as this design's Decision 1
 always meant it to: each area is listed in the source's bucket prefix, each object read and pushed

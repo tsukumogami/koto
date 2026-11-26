@@ -359,20 +359,34 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
         let Some(answer) = answers.first() else {
             continue;
         };
+        let mut answer_json = json!({
+            "session": answer.session.name,
+            "id": answer.id,
+            "text": subject_str(answer, "text"),
+            "decider": answer.decider,
+            "run_mode": answer.authority.run_mode,
+            "time": answer.time,
+        });
+        if answer.prompt.is_some() {
+            // The same reading `show` and `list` give: verified only where
+            // this host's note in a holder's directory lists the answer.
+            let here = index
+                .holders(answer)
+                .iter()
+                .any(|h| super::standing::verified_in(backend, h, answer));
+            answer_json["reading"] = json!(if here {
+                super::prompt::VERIFIED
+            } else {
+                super::prompt::REMOTE_READING
+            });
+        }
         out.push(json!({
             "identity": identity(q),
             "session": q.session.name,
             "id": q.id,
             "question": subject_str(q, "question"),
             "state": "answered",
-            "answer": {
-                "session": answer.session.name,
-                "id": answer.id,
-                "text": subject_str(answer, "text"),
-                "decider": answer.decider,
-                "run_mode": answer.authority.run_mode,
-                "time": answer.time,
-            },
+            "answer": answer_json,
         }));
     }
     (!out.is_empty()).then_some(Value::Array(out))

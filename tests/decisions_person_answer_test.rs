@@ -1,10 +1,11 @@
 //! Integration tests for a person's `answer`, checked against the
 //! harness's record of the question-prompt call (PRD R62 to R68).
 //!
-//! Every test runs the real binary with `HOME` and `KOTO_SESSIONS_BASE`
-//! in its own temporary directory, installs a fixture from
-//! `tests/fixtures/prompt/` as the record of a harness session under
-//! `$HOME/.claude/projects/`, and runs the answer with
+//! Every test runs the real binary with `HOME`, `KOTO_HOME` and
+//! `KOTO_SESSIONS_BASE` in its own temporary directory, installs a fixture
+//! from `tests/fixtures/prompt/` as the record of a harness session under
+//! the account home's `.claude/projects/` (koto never reads `$HOME` for
+//! it; see `support/prompt_fixture.rs`), and runs the answer with
 //! `CLAUDE_CODE_SESSION_ID` naming that harness session. No live prompt is
 //! involved. Each refusal asserts the exit code, that the answering
 //! session holds no new entry, the check named, and that the fixture's
@@ -12,6 +13,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 #[path = "support/prompt_fixture.rs"]
@@ -60,12 +63,11 @@ Work.
 Done.
 "#;
 
-const HARNESS: &str = "harness-a";
-const OTHER_HARNESS: &str = "harness-b";
 const RAISER: &str = "raiser";
 const ANSWERER: &str = "answerer";
 
 struct Env {
+    _records: fx::Records,
     _tmp: TempDir,
     root: PathBuf,
 }
@@ -102,7 +104,11 @@ impl Env {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         std::fs::write(root.join("work.md"), TEMPLATE).unwrap();
-        let env = Env { _tmp: tmp, root };
+        let env = Env {
+            _records: fx::Records::new(),
+            _tmp: tmp,
+            root,
+        };
         env.init(RAISER);
         env.init(ANSWERER);
         env
@@ -220,6 +226,11 @@ impl Env {
 
     /// The answering session's decision files.
     fn entries(&self) -> usize {
+        self.entries_of(ANSWERER)
+    }
+
+    /// Session `name`'s decision files.
+    fn entries_of(&self, name: &str) -> usize {
         fn count(p: &Path) -> usize {
             match std::fs::read_dir(p) {
                 Ok(rd) => rd
@@ -236,7 +247,7 @@ impl Env {
                 Err(_) => 0,
             }
         }
-        let ctx = self.root.join("sessions").join(ANSWERER).join("ctx/koto");
+        let ctx = self.root.join("sessions").join(name).join("ctx/koto");
         count(&ctx.join("aimed")) + count(&ctx.join("decisions"))
     }
 }
@@ -263,20 +274,19 @@ fn refused(env: &Env, out: &Out, before: usize, check: &str) {
     );
 }
 
-/// Install `lines` (one question at position 1, header `q`'s) for HARNESS,
-/// raise nothing, and answer `q` with the fixture pointer.
+/// Install `lines` (one question at position 1, header `q`'s) for this
+/// thread's harness session, raise nothing, and answer `q` with the
+/// fixture pointer.
 fn answer_with(env: &Env, q: &Q, lines: &[Value]) -> Out {
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(lines, &fx::harness(), &[&q.header]),
     );
     env.answer(
         q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     )
 }
@@ -289,7 +299,7 @@ fn a_matching_call_is_accepted_and_the_entry_shows_the_pointer() {
     let out = answer_with(&env, &q, &lines);
     assert_eq!(out.code, 0, "{}", out.all());
     let d = &out.json()["decision"];
-    assert_eq!(d["prompt"]["harness"], HARNESS);
+    assert_eq!(d["prompt"]["harness"], fx::harness().as_str());
     assert_eq!(d["prompt"]["call"], fx::CALL);
     assert_eq!(d["prompt"]["position"], 1);
     assert_eq!(d["prompt"]["mark"]["value"], "verified");
@@ -335,16 +345,14 @@ fn a_passed_up_question_takes_a_verified_answer_by_its_identity() {
     // The prompt still names the question by the identity it was raised
     // with: passing it up changes who it waits on, not what it is.
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:dana",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     assert_eq!(out.code, 0, "{}", out.all());
@@ -368,16 +376,14 @@ fn answer_text_is_taken_from_the_result_when_the_caller_passed_other_text() {
     lines[1]["toolUseResult"]["answers"][question.as_str()] = Value::String(reply.clone());
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         Some("something else"),
     );
     assert_eq!(out.code, 0, "{}", out.all());
@@ -391,17 +397,15 @@ fn three_positions_of_one_call_are_each_accepted_once() {
     let qs: Vec<Q> = (1..=3).map(|p| env.raise_shown(&lines, p)).collect();
     let headers: Vec<&str> = qs.iter().map(|q| q.header.as_str()).collect();
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &headers),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &headers),
     );
     for (i, q) in qs.iter().enumerate() {
         let out = env.answer(
             q,
-            Some(HARNESS),
+            Some(fx::harness().as_str()),
             "person:owner",
-            Some(&pointer(HARNESS, fx::CALL, i + 1)),
+            Some(&pointer(&fx::harness(), fx::CALL, i + 1)),
             None,
         );
         assert_eq!(out.code, 0, "position {}: {}", i + 1, out.all());
@@ -423,9 +427,9 @@ fn a_reused_call_position_is_refused_and_the_first_entry_is_unchanged() {
     let before_show = env.ok(&["decisions", "show", ANSWERER, &id]).json();
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 1, "call-position-reused");
@@ -439,16 +443,14 @@ fn a_missing_call_is_refused() {
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, "toolu_absent", 1)),
+        Some(&pointer(&fx::harness(), "toolu_absent", 1)),
         None,
     );
     refused(&env, &out, 0, "call");
@@ -474,16 +476,14 @@ fn a_call_for_another_question_is_refused() {
         header: other.header.clone(),
     };
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&wrong.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&wrong.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "identity");
@@ -495,16 +495,14 @@ fn a_position_outside_the_call_is_refused() {
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 2)),
+        Some(&pointer(&fx::harness(), fx::CALL, 2)),
         None,
     );
     refused(&env, &out, 0, "position");
@@ -644,40 +642,40 @@ fn a_call_in_another_harness_sessions_record_is_refused() {
     // The matching call exists only in harness B's record; the answer runs
     // in harness A.
     fx::install(
-        &env.home(),
-        "proj",
-        OTHER_HARNESS,
-        &fx::render(&lines, OTHER_HARNESS, &[&q.header]),
+        &fx::other_harness(),
+        &fx::render(&lines, &fx::other_harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(OTHER_HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::other_harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "session");
     // Naming its own harness session with B's call id finds no record.
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "record");
     // With a record of its own that lacks the call, the call isn't found.
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&fx::with_call(&lines, "toolu_mine"), HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(
+            &fx::with_call(&lines, "toolu_mine"),
+            &fx::harness(),
+            &[&q.header],
+        ),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "call");
@@ -686,7 +684,7 @@ fn a_call_in_another_harness_sessions_record_is_refused() {
         &q,
         None,
         "person:owner",
-        Some(&pointer(OTHER_HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::other_harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "session");
@@ -698,16 +696,14 @@ fn a_session_decider_handing_in_a_pointer_is_refused() {
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "session",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         Some("x"),
     );
     assert_eq!(out.code, 2, "{}", out.all());
@@ -722,16 +718,14 @@ fn a_handle_other_than_owner_reads_as_that_handles_answer() {
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:dana",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     assert_eq!(out.code, 0, "{}", out.all());
@@ -749,13 +743,11 @@ fn two_answers_racing_on_one_call_position_leave_one_entry() {
         let lines = fx::with_call(&base, &call);
         let q = env.raise_shown(&lines, 1);
         fx::install(
-            &env.home(),
-            "proj",
-            HARNESS,
-            &fx::render(&lines, HARNESS, &[&q.header]),
+            &fx::harness(),
+            &fx::render(&lines, &fx::harness(), &[&q.header]),
         );
         let before = env.entries();
-        let p = pointer(HARNESS, &call, 1);
+        let p = pointer(&fx::harness(), &call, 1);
         let args = [
             "decisions",
             "answer",
@@ -768,8 +760,12 @@ fn two_answers_racing_on_one_call_position_leave_one_entry() {
             "--prompt",
             &p,
         ];
-        let a = env.command(Some(HARNESS), &args).output_spawned();
-        let b = env.command(Some(HARNESS), &args).output_spawned();
+        let a = env
+            .command(Some(fx::harness().as_str()), &args)
+            .output_spawned();
+        let b = env
+            .command(Some(fx::harness().as_str()), &args)
+            .output_spawned();
         let (a, b) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
         let codes = [a.status.code(), b.status.code()];
         assert!(
@@ -811,16 +807,14 @@ fn a_result_not_from_the_user_is_refused() {
     let lines = fx::lines("denied");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header, "#x"]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header, "#x"]),
     );
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "result");
@@ -893,19 +887,19 @@ fn an_unrecognized_record_shape_is_refused() {
     let env = Env::new();
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
-    let text = fx::render(&lines, HARNESS, &[&q.header]);
+    let text = fx::render(&lines, &fx::harness(), &[&q.header]);
     let mut broken: Vec<String> = text.lines().map(str::to_string).collect();
     broken[0] = format!(
         "{{\"type\":\"assistant\",\"id\":\"{}\", {} not json",
         fx::CALL,
         fx::MARKER
     );
-    fx::install(&env.home(), "proj", HARNESS, &(broken.join("\n") + "\n"));
+    fx::install(&fx::harness(), &(broken.join("\n") + "\n"));
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 1)),
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
         None,
     );
     refused(&env, &out, 0, "shape");
@@ -916,7 +910,13 @@ fn a_person_answer_with_no_evidence_is_refused() {
     let env = Env::new();
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
-    let out = env.answer(&q, Some(HARNESS), "person:owner", None, Some("yes"));
+    let out = env.answer(
+        &q,
+        Some(fx::harness().as_str()),
+        "person:owner",
+        None,
+        Some("yes"),
+    );
     assert_eq!(out.code, 2, "{}", out.all());
     assert_eq!(env.entries(), 0);
     assert!(out.json()["error"]
@@ -924,7 +924,13 @@ fn a_person_answer_with_no_evidence_is_refused() {
         .unwrap()
         .contains("a person's answer needs the question-prompt evidence"));
     // A session's answer with no pointer is still accepted.
-    let out = env.answer(&q, Some(HARNESS), "session", None, Some("yes"));
+    let out = env.answer(
+        &q,
+        Some(fx::harness().as_str()),
+        "session",
+        None,
+        Some("yes"),
+    );
     assert_eq!(out.code, 0, "{}", out.all());
 }
 
@@ -934,23 +940,21 @@ fn no_caller_input_produces_the_mark() {
     let lines = fx::lines("accepted");
     let q = env.raise_shown(&lines, 1);
     fx::install(
-        &env.home(),
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[&q.header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
     );
     // A claim of verification in the caller's text, with a pointer that
     // fails a check, is refused.
     let out = env.answer(
         &q,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         "person:owner",
-        Some(&pointer(HARNESS, fx::CALL, 3)),
+        Some(&pointer(&fx::harness(), fx::CALL, 3)),
         Some("verified"),
     );
     refused(&env, &out, 0, "position");
     let out = env.run_h(
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         &[
             "decisions",
             "answer",
@@ -978,7 +982,7 @@ fn reading_a_verified_entry_does_not_open_the_record() {
     let out = answer_with(&env, &q, &lines);
     assert_eq!(out.code, 0, "{}", out.all());
     let id = out.json()["id"].as_str().unwrap().to_string();
-    std::fs::remove_file(fx::record_path(&env.home(), "proj", HARNESS)).unwrap();
+    std::fs::remove_file(fx::record_path(&fx::harness())).unwrap();
     let shown = env.ok(&["decisions", "show", ANSWERER, &id]).json();
     assert_eq!(shown["reading"], "verified");
 }
@@ -1012,4 +1016,341 @@ fn a_question_without_stored_content_is_refused() {
         header: "#00000000000".to_string(),
     };
     refused(&env, &answer_with(&env, &q, &lines), 0, "content");
+}
+
+/// Answer `q` from session `answerer`, in harness session `harness`, citing
+/// `pointer`.
+fn answer_in(env: &Env, q: &Q, answerer: &str, harness: &str, pointer: &str) -> Out {
+    env.run_h(
+        Some(harness),
+        &[
+            "decisions",
+            "answer",
+            RAISER,
+            &q.id,
+            "--in",
+            answerer,
+            "--by",
+            "person:owner",
+            "--prompt",
+            pointer,
+        ],
+    )
+}
+
+#[test]
+fn a_record_under_a_redirected_home_is_not_read() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    // A record the caller wrote under the `HOME` the command runs with,
+    // not under the account's home: koto never looks there.
+    let forged = env
+        .home()
+        .join(".claude/projects/forged")
+        .join(format!("{}.jsonl", fx::harness()));
+    std::fs::create_dir_all(forged.parent().unwrap()).unwrap();
+    std::fs::write(&forged, fx::render(&lines, &fx::harness(), &[&q.header])).unwrap();
+    let out = env.answer(
+        &q,
+        Some(&fx::harness()),
+        "person:owner",
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
+        None,
+    );
+    refused(&env, &out, 0, "record");
+}
+
+#[test]
+fn a_harness_session_other_than_the_one_koto_recorded_is_refused() {
+    let env = Env::new();
+    // A session koto saw created by harness session A.
+    let template = env.root.join("work.md");
+    let created = env.run_h(
+        Some(&fx::harness()),
+        &["init", "bound", "--template", template.to_str().unwrap()],
+    );
+    assert_eq!(created.code, 0, "{}", created.all());
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    // A valid record for harness session B, and the answer run with B.
+    fx::install(
+        &fx::other_harness(),
+        &fx::render(&lines, &fx::other_harness(), &[&q.header]),
+    );
+    let p = pointer(&fx::other_harness(), fx::CALL, 1);
+    let out = answer_in(&env, &q, "bound", &fx::other_harness(), &p);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("'session' check"));
+    assert_eq!(env.entries_of("bound"), 0);
+    // The same answer from harness session A is accepted.
+    fx::install(
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[&q.header]),
+    );
+    let p = pointer(&fx::harness(), fx::CALL, 1);
+    let out = answer_in(&env, &q, "bound", &fx::harness(), &p);
+    assert_eq!(out.code, 0, "{}", out.all());
+}
+
+#[test]
+fn a_reply_source_outside_the_allow_list_is_refused() {
+    for source in ["userSettings", "user_abort", "user", "user_temporaryx"] {
+        let env = Env::new();
+        let mut lines = fx::lines("accepted");
+        lines[1]["permissionDecision"]["source"] = Value::String(source.into());
+        let q = env.raise_shown(&lines, 1);
+        refused(&env, &answer_with(&env, &q, &lines), 0, "result");
+    }
+}
+
+#[test]
+fn a_side_conversation_call_or_result_is_refused() {
+    for line in [0, 1] {
+        let env = Env::new();
+        let mut lines = fx::lines("accepted");
+        lines[line]["isSidechain"] = Value::Bool(true);
+        let q = env.raise_shown(&lines, 1);
+        refused(&env, &answer_with(&env, &q, &lines), 0, "sidechain");
+    }
+}
+
+#[test]
+fn a_result_before_its_call_or_a_repeated_call_id_is_refused() {
+    // The result line first.
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let swapped = vec![lines[1].clone(), lines[0].clone()];
+    refused(&env, &answer_with(&env, &q, &swapped), 0, "shape");
+
+    // The call twice, then its result.
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let doubled = vec![lines[0].clone(), lines[0].clone(), lines[1].clone()];
+    refused(&env, &answer_with(&env, &q, &doubled), 0, "shape");
+
+    // The call, then its result twice.
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let doubled = vec![lines[0].clone(), lines[1].clone(), lines[1].clone()];
+    refused(&env, &answer_with(&env, &q, &doubled), 0, "shape");
+}
+
+#[test]
+fn a_call_made_before_the_question_was_raised_is_refused() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    fx::install(
+        &fx::harness(),
+        &fx::render_at(
+            &lines,
+            &fx::harness(),
+            &[&q.header],
+            "2020-01-01T00:00:00.000Z",
+        ),
+    );
+    let out = env.answer(
+        &q,
+        Some(&fx::harness()),
+        "person:owner",
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
+        None,
+    );
+    refused(&env, &out, 0, "time");
+}
+
+#[test]
+fn a_record_line_past_the_cap_is_refused() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let mut text = "x".repeat(16 * 1024 * 1024 + 1);
+    text.push('\n');
+    text.push_str(&fx::render(&lines, &fx::harness(), &[&q.header]));
+    fx::install(&fx::harness(), &text);
+    let out = env.answer(
+        &q,
+        Some(&fx::harness()),
+        "person:owner",
+        Some(&pointer(&fx::harness(), fx::CALL, 1)),
+        None,
+    );
+    refused(&env, &out, 0, "shape");
+}
+
+#[test]
+fn answers_from_two_sessions_racing_on_one_call_position_leave_one_entry() {
+    let env = Env::new();
+    env.init("answerer2");
+    let base = fx::lines("accepted");
+    for i in 0..20 {
+        let call = format!("toolu_ZQXMARKERpair{i:04}");
+        let lines = fx::with_call(&base, &call);
+        let q = env.raise_shown(&lines, 1);
+        fx::install(
+            &fx::harness(),
+            &fx::render(&lines, &fx::harness(), &[&q.header]),
+        );
+        let before = env.entries_of(ANSWERER) + env.entries_of("answerer2");
+        let p = pointer(&fx::harness(), &call, 1);
+        let args = |answerer: &'static str| {
+            vec![
+                "decisions".to_string(),
+                "answer".to_string(),
+                RAISER.to_string(),
+                q.id.clone(),
+                "--in".to_string(),
+                answerer.to_string(),
+                "--by".to_string(),
+                "person:owner".to_string(),
+                "--prompt".to_string(),
+                p.clone(),
+            ]
+        };
+        let a_args = args(ANSWERER);
+        let b_args = args("answerer2");
+        let a_args: Vec<&str> = a_args.iter().map(String::as_str).collect();
+        let b_args: Vec<&str> = b_args.iter().map(String::as_str).collect();
+        let a = env.command(Some(&fx::harness()), &a_args).output_spawned();
+        let b = env.command(Some(&fx::harness()), &b_args).output_spawned();
+        let (a, b) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+        let codes = [a.status.code(), b.status.code()];
+        assert!(
+            codes.contains(&Some(0)) && codes.contains(&Some(2)),
+            "round {i}: {codes:?}\n{}\n{}",
+            String::from_utf8_lossy(&a.stdout),
+            String::from_utf8_lossy(&b.stdout)
+        );
+        let loser = if a.status.code() == Some(2) { &a } else { &b };
+        let text = String::from_utf8_lossy(&loser.stdout);
+        assert!(
+            text.contains("'call-position-reused' check"),
+            "round {i}: {text}"
+        );
+        assert_eq!(
+            env.entries_of(ANSWERER) + env.entries_of("answerer2"),
+            before + 1,
+            "round {i}"
+        );
+    }
+}
+
+/// Record a verified answer to a fresh question; return the question and
+/// the answer's id.
+fn verified_answer(env: &Env) -> (Q, String) {
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let out = answer_with(env, &q, &lines);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let id = out.json()["id"].as_str().unwrap().to_string();
+    (q, id)
+}
+
+/// The reading `koto next` gives the answer to `q` in its `questions`.
+fn next_reading(env: &Env, extra: &[(&str, &Path)], q: &Q) -> Value {
+    let mut cmd = env.command(None, &["next", RAISER]);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "not JSON: {e}\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    json["questions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no questions: {json}"))
+        .iter()
+        .find(|e| e["id"] == q.id.as_str())
+        .unwrap_or_else(|| panic!("no entry for the question: {json}"))["answer"]["reading"]
+        .clone()
+}
+
+#[test]
+fn the_questions_on_next_carry_the_answers_reading() {
+    let env = Env::new();
+    let (q, _) = verified_answer(&env);
+    assert_eq!(next_reading(&env, &[], &q), "verified");
+    // Without this host's note the same answer reads remote.
+    std::fs::remove_file(
+        env.root
+            .join("sessions")
+            .join(ANSWERER)
+            .join("koto-verified-here"),
+    )
+    .unwrap();
+    assert_eq!(next_reading(&env, &[], &q), "a remote session's answer");
+}
+
+#[test]
+fn a_copied_session_directory_or_a_hand_written_note_reads_remote() {
+    let env = Env::new();
+    let (q, id) = verified_answer(&env);
+    let sessions = env.root.join("sessions");
+
+    // The sessions directory copied to another koto root, note and all.
+    let other = env.root.join("other-home");
+    let copied = env.root.join("copied-sessions");
+    std::fs::create_dir_all(&other).unwrap();
+    let status = std::process::Command::new("cp")
+        .args(["-a"])
+        .arg(&sessions)
+        .arg(&copied)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let extra: [(&str, &Path); 2] = [("KOTO_HOME", &other), ("KOTO_SESSIONS_BASE", &copied)];
+    let mut cmd = env.command(None, &["decisions", "show", ANSWERER, &id]);
+    for (k, v) in &extra {
+        cmd.env(k, v);
+    }
+    let shown: Value = serde_json::from_slice(&cmd.output().unwrap().stdout).unwrap();
+    assert_eq!(shown["reading"], "a remote session's answer", "{shown}");
+    assert_eq!(next_reading(&env, &extra, &q), "a remote session's answer");
+    // The original still reads verified.
+    let shown = env.ok(&["decisions", "show", ANSWERER, &id]).json();
+    assert_eq!(shown["reading"], "verified");
+
+    // A body written by hand beside the real one, never prompted, with
+    // note lines naming it: one bare, one carrying the real line's seal.
+    let aimed = sessions.join(ANSWERER).join("ctx/koto/aimed");
+    let dir = std::fs::read_dir(&aimed)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let real = std::fs::read_to_string(dir.join(&id)).unwrap();
+    let forged_id = format!("{:012}", id.parse::<u64>().unwrap() + 1);
+    let mut body: Value = serde_json::from_str(&real).unwrap();
+    body["id"] = Value::String(forged_id.clone());
+    body["subject"]["text"] = Value::String("forged".into());
+    std::fs::write(dir.join(&forged_id), serde_json::to_vec(&body).unwrap()).unwrap();
+    let note_path = sessions.join(ANSWERER).join("koto-verified-here");
+    let note = std::fs::read_to_string(&note_path).unwrap();
+    let real_line = note.lines().next().unwrap();
+    let mut parts = real_line.split(' ');
+    let (sid, _, seal) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    std::fs::write(
+        &note_path,
+        format!("{note}{sid} {forged_id}\n{sid} {forged_id} {seal}\n"),
+    )
+    .unwrap();
+    let shown = env.ok(&["decisions", "show", ANSWERER, &forged_id]).json();
+    assert_eq!(shown["reading"], "a remote session's answer", "{shown}");
+    assert_eq!(shown["decision"]["prompt"]["mark"]["value"], "remote");
 }

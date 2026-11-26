@@ -1212,7 +1212,7 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         let fail = |c: prompt::Check| -> ! { refuse(COMMAND, &c.error(&pointer.display())) };
         let identity = crate::decisions::questions::identity(&question);
         let expected = question_content(backend, &question)
-            .and_then(|bytes| prompt::Expected::from_content(&bytes, &identity))
+            .and_then(|bytes| prompt::Expected::from_content(&bytes, &identity, &question.time))
             .unwrap_or_else(|c| fail(c));
         let reused = Index::scan(backend, false)
             .answers_of(&question.session.id, id)
@@ -1222,9 +1222,14 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             fail(prompt::Check::CallPositionReused);
         }
         let root = prompt::projects_root();
+        // The harness session koto last saw driving the answering session,
+        // when it saw one: the command's own must be the same.
+        let recorded = crate::run_journal::sidecar::read(&backend.session_dir(&answerer))
+            .and_then(|s| s.driver);
         let text = prompt::verify(
             root.as_deref(),
             observed.harness.as_deref(),
+            recorded.as_deref(),
             pointer,
             &expected,
         )
@@ -1255,6 +1260,36 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         run_mode,
     );
     let chain = chain::snapshot(backend, &answerer);
+    let koto_home = crate::koto_home::koto_home();
+    // One use per call position on this host: a create-only marker under
+    // the koto root, taken before the write and freed if the write fails,
+    // serializes answers from different answering sessions.
+    let mut marker = pointer.as_ref().map(|p| {
+        let taken = koto_home
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+            .and_then(|home| prompt::take_use(home, p));
+        match taken {
+            Ok(Some(m)) => m,
+            Ok(None) => refuse(
+                COMMAND,
+                &prompt::Check::CallPositionReused.error(&p.display()),
+            ),
+            Err(e) => refuse(
+                COMMAND,
+                &DecisionError {
+                    code: codes::PROMPT_UNVERIFIED,
+                    field: Some("prompt".to_string()),
+                    message: format!(
+                        "koto couldn't record on this host that an answer cites the \
+                         question-prompt evidence {}, so it can't rule out a second answer \
+                         citing it: {e}",
+                        p.display()
+                    ),
+                },
+            ),
+        }
+    });
     let written = store::write_in(backend, &answerer, &Area::Aimed(target.id.clone()), |aid| {
         // Under the lock: a racing answer in this session that cites the
         // same call position was published first.
@@ -1289,15 +1324,29 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             prompt: verified.clone(),
         })
     })
-    .unwrap_or_else(|e| refuse(COMMAND, &e));
+    .unwrap_or_else(|e| {
+        drop(marker.take());
+        refuse(COMMAND, &e)
+    });
+    if let Some(m) = marker.take() {
+        m.keep();
+    }
     if written.prompt.is_some() {
         // This host checked the prompt: note it outside the synced files,
-        // so only this host's copy of the session reads the mark verified.
-        if let Err(e) = prompt::note_verified_here(
-            &backend.session_dir(&answerer),
-            &stamp.session.id,
-            &written.id,
-        ) {
+        // sealed to this host and this stored answer, so only this host's
+        // copy of the session reads the mark verified.
+        let noted = koto_home
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+            .and_then(|home| {
+                prompt::note_verified_here(
+                    home,
+                    &backend.session_dir(&answerer),
+                    &answerer,
+                    &written,
+                )
+            });
+        if let Err(e) = noted {
             eprintln!(
                 "warning: the answer is recorded, but this host couldn't note that it checked \
                  the prompt, so it reads as a remote session's answer here: {e}"

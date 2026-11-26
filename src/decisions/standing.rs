@@ -256,6 +256,21 @@ impl Index {
         out
     }
 
+    /// The sessions whose directories this scan read `body` from: its
+    /// recording session, and any copy of it this host holds.
+    pub fn holders(&self, body: &DecisionBody) -> Vec<&str> {
+        self.sessions
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|e| {
+                    matches!(e, Entry::Decision(b)
+                        if b.session.id == body.session.id && b.id == body.id)
+                })
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// Every `passed` pass-up aimed at decision `id` of the session whose
     /// id is `session_id`, wherever it was recorded, earliest first by
     /// time, then the recording session's name, then id: the order the
@@ -310,7 +325,8 @@ impl Index {
     /// status, and what R20 and R21 add: the winning reversal of a reversed
     /// decision, the winner a refused reversal lost to, an escalation's
     /// effect, and the decisions whose `basis` names a reversed acceptance.
-    pub fn entry_json(&self, entry: &Entry, scope: &Scope<'_>) -> Value {
+    /// `holder` is the session whose directory the entry was read from.
+    pub fn entry_json(&self, holder: &str, entry: &Entry, scope: &Scope<'_>) -> Value {
         let mut out = entry.to_json();
         let Entry::Decision(body) = entry else {
             return out;
@@ -325,15 +341,11 @@ impl Index {
             }
         }
         if body.prompt.is_some() {
-            // The stored mark reads verified only on the host that checked
-            // the prompt; a copy that arrived by import or by a pull reads
-            // it as a remote session's answer. The record isn't opened.
-            let here = super::prompt::verified_here(
-                &crate::session::SessionBackend::session_dir(scope.backend, &body.session.name),
-                &body.session.id,
-                &body.id,
-            );
-            if here {
+            // The stored mark reads verified only in the session directory
+            // of the host that checked the prompt; a copy that arrived by
+            // import or by a pull, or under another name, reads it as a
+            // remote session's answer. The record isn't opened.
+            if verified_in(scope.backend, holder, body) {
                 out["reading"] = json!(super::prompt::VERIFIED);
             } else {
                 out["reading"] = json!(super::prompt::REMOTE_READING);
@@ -477,22 +489,27 @@ pub fn list(backend: &Backend, session: &str, below: bool, filters: &read::Filte
     } else {
         vec![session.to_string()]
     };
-    let mut entries: Vec<Entry> = sessions
+    let mut entries: Vec<(String, Entry)> = sessions
         .iter()
-        .flat_map(|s| index.entries(backend, s))
-        .filter(|e| match e {
+        .flat_map(|s| {
+            index
+                .entries(backend, s)
+                .into_iter()
+                .map(move |e| (s.clone(), e))
+        })
+        .filter(|(_, e)| match e {
             Entry::Decision(body) => filters.matches(body),
             Entry::Unreadable { .. } => true,
         })
         .collect();
-    read::sort(&mut entries);
+    entries.sort_by_key(|(_, e)| read::sort_key(e));
     let scope = Scope::new(backend, session);
     let mut out = json!({
         "v": FORMAT_VERSION,
         "session": session,
         "decisions": entries
             .iter()
-            .map(|e| index.entry_json(e, &scope))
+            .map(|(holder, e)| index.entry_json(holder, e, &scope))
             .collect::<Vec<_>>(),
     });
     if below {
@@ -516,10 +533,23 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
         .iter()
         .find(|e| matches!(e, Entry::Unreadable { id: None, .. }));
     let entry = found.or(whole_session_unreadable)?;
-    let mut out = index.entry_json(entry, &Scope::new(backend, session));
+    let mut out = index.entry_json(session, entry, &Scope::new(backend, session));
     out["v"] = json!(FORMAT_VERSION);
     out["id"] = json!(id);
     Some(out)
+}
+
+/// Whether this host checked the prompt of answer `body`, as held in
+/// session `holder`'s directory: the host-local note there lists it,
+/// sealed to this host's identity (DESIGN-decision-record.md, "A person's
+/// answer and the question content area").
+pub fn verified_in(backend: &Backend, holder: &str, body: &DecisionBody) -> bool {
+    super::prompt::verified_here(
+        crate::koto_home::koto_home().as_deref(),
+        &crate::session::SessionBackend::session_dir(backend, holder),
+        holder,
+        body,
+    )
 }
 
 /// Where a reversal is recorded and the standing it carries.

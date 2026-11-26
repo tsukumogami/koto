@@ -263,23 +263,26 @@ impl Filters {
 /// Sort entries by time, then session, then id; unreadable entries,
 /// which have no time, go last in session and id order.
 pub fn sort(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        let key = |e: &Entry| match e {
-            Entry::Decision(body) => (
-                0,
-                body.time.clone(),
-                body.session.name.clone(),
-                body.id.clone(),
-            ),
-            Entry::Unreadable { session, id, .. } => (
-                1,
-                String::new(),
-                session.clone(),
-                id.clone().unwrap_or_default(),
-            ),
-        };
-        key(a).cmp(&key(b))
-    });
+    entries.sort_by_key(sort_key);
+}
+
+/// The key [`sort`] orders entries by: readable ones first, by time, then
+/// the recording session's name, then id.
+pub fn sort_key(e: &Entry) -> (u8, String, String, String) {
+    match e {
+        Entry::Decision(body) => (
+            0,
+            body.time.clone(),
+            body.session.name.clone(),
+            body.id.clone(),
+        ),
+        Entry::Unreadable { session, id, .. } => (
+            1,
+            String::new(),
+            session.clone(),
+            id.clone().unwrap_or_default(),
+        ),
+    }
 }
 
 /// The sessions in the local store whose chain, walked now, includes

@@ -10,6 +10,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 #[path = "support/prompt_fixture.rs"]
@@ -24,7 +26,6 @@ use serde_json::Value;
 const BUCKET: &str = "koto-person-answer";
 const TEMPLATE_FILE: &str = "work.md";
 const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-const HARNESS: &str = "harness-a";
 const RAISER: &str = "raiser";
 const ANSWERER: &str = "answerer";
 
@@ -205,15 +206,13 @@ fn record_verified_answer(host: &Host, ws: &Path) -> Answer {
     );
     let header = written["prompt_header"].as_str().unwrap();
     fx::install(
-        &host.home,
-        "proj",
-        HARNESS,
-        &fx::render(&lines, HARNESS, &[header]),
+        &fx::harness(),
+        &fx::render(&lines, &fx::harness(), &[header]),
     );
-    let pointer = format!("{HARNESS}/{}/1", fx::CALL);
+    let pointer = format!("{}/{}/1", fx::harness(), fx::CALL);
     let answer = host.ok(
         ws,
-        Some(HARNESS),
+        Some(fx::harness().as_str()),
         &[
             "decisions",
             "answer",
@@ -249,6 +248,7 @@ fn assert_remote(shown: &Value) {
 
 #[test]
 fn an_imported_copy_reads_the_answer_as_a_remote_sessions_answer() {
+    let _records = fx::Records::new();
     let s3 = FakeS3::start(BUCKET);
     let first = Host::new(&s3);
     let shared = tempfile::TempDir::new().unwrap();
@@ -301,7 +301,41 @@ fn an_imported_copy_reads_the_answer_as_a_remote_sessions_answer() {
 }
 
 #[test]
+fn a_copy_imported_on_the_recording_host_reads_remote() {
+    let _records = fx::Records::new();
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new(&s3);
+    let shared = tempfile::TempDir::new().unwrap();
+    let ws_a = workspace(shared.path().join("ws-a"));
+    let answer = record_verified_answer(&host, &ws_a);
+
+    let ws_b = workspace(shared.path().join("ws-b"));
+    let compiled = host.run(&ws_b, None, &["template", "compile", TEMPLATE_FILE]);
+    assert_eq!(compiled.code, Some(0), "{}", compiled.stderr);
+    host.ok(
+        &ws_b,
+        None,
+        &[
+            "session",
+            "import",
+            ANSWERER,
+            "--from",
+            ws_a.to_str().unwrap(),
+            "--as",
+            "copy",
+        ],
+    );
+    // The body names the answerer, but the copy's own directory holds no
+    // note, so the copy reads remote on the very host that checked it.
+    assert!(!host.session_dir("copy").join("koto-verified-here").exists());
+    assert_remote(&host.ok(&ws_b, None, &["decisions", "show", "copy", &answer.id]));
+    let shown = host.ok(&ws_a, None, &["decisions", "show", ANSWERER, &answer.id]);
+    assert_eq!(shown["reading"], "verified");
+}
+
+#[test]
 fn a_pulled_copy_reads_remote_and_the_recording_host_still_reads_verified() {
+    let _records = fx::Records::new();
     let s3 = FakeS3::start(BUCKET);
     let shared = tempfile::TempDir::new().unwrap();
     let ws = workspace(shared.path().join("ws"));
