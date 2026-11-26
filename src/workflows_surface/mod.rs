@@ -11,18 +11,23 @@
 //! - [`project`]   -- the minimal projection derived from koto's read seam.
 //! - [`discover`]  -- context-store publish + the nearest-published-ancestor walk.
 //! - [`materialize`] -- the commit-funnel entry point tying it together.
+//! - [`retention`] -- the sweep that bounds a `/workflows` directory after each write.
 
 pub mod contract;
 pub mod discover;
 pub mod materialize;
 pub mod project;
+pub mod retention;
 
 pub use contract::{
     gate_name_display, workflow_filename, HoldingKey, Holdings, Phase, ProgressNode, RenderStatus,
     ScreenStatus, WorkflowFile, CONTRACT_VERSION, GATE_NAME_CAP, HOLDINGS_KEY_CAP,
     HOLDINGS_STORE_CAP,
 };
-pub use discover::{publish_location, resolve_publish_location, PUBLISH_LOCATION_KEY};
+pub use discover::{
+    is_explicit_location, publish_explicit_location, publish_location, resolve_publish_location,
+    resolve_publish_owner, EXPLICIT_LOCATION_KEY, PUBLISH_LOCATION_KEY,
+};
 pub use materialize::{materialize_after_commit, WORKFLOWS_DIR_ENV};
 pub use project::{
     derive_enriched_projection, derive_minimal_projection, ordered_phases, per_state_outcomes,

@@ -9,12 +9,13 @@ pub mod decisions;
 pub mod discover;
 pub mod engine;
 pub mod export;
-pub mod findings;
+pub use koto_session_reader::findings;
 #[cfg(unix)]
 pub mod gate;
 pub(crate) mod host_env;
 pub(crate) mod koto_home;
-pub mod redact;
+pub mod pool;
+pub use koto_session_reader::redact;
 pub(crate) mod run_journal;
 pub mod session;
 pub mod session_view;
@@ -42,7 +43,8 @@ mod test_home;
 // `derive_state_from_log` is the one exception: it lives in
 // `engine::persistence` but is aliased into `engine::types` via
 // `pub use crate::engine::persistence::derive_state_from_log;`
-// inside `src/engine/types.rs`. The alias decouples the canonical
+// inside `koto-session-reader/src/engine/types.rs`, the module
+// `koto::engine::types` re-exports. The alias decouples the canonical
 // export path from the implementation module so a future refactor
 // that moves the function does not surface as a visible-to-bunki
 // change.

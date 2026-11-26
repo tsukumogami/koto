@@ -16,6 +16,17 @@ use crate::session::SessionBackend;
 /// session log. A failed append fails the command, as it always has.
 ///
 /// When `from_file` is provided, reads from that path instead of stdin.
+///
+/// The header check, the store write and the append run under the session
+/// log's append lock, held across all three (see
+/// [`SessionBackend::add_context_locked`]): a header rewrite (a rebind, an
+/// anchor adoption) or a pull that replaced the log between them could leave
+/// the stored content with no `context_added` naming it (koto#728). A lock
+/// another process still holds after
+/// [`LOG_REPLACE_LOCK_WAIT`](crate::engine::persistence::LOG_REPLACE_LOCK_WAIT)
+/// fails the command as
+/// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), with nothing
+/// stored, and running it again is safe.
 pub fn handle_add(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,
@@ -23,22 +34,11 @@ pub fn handle_add(
     key: &str,
     from_file: Option<&str>,
 ) -> Result<()> {
-    // The append below refuses a log that has no header, but by then the
-    // store would already hold the content. Check the header first so a
-    // refused write stores nothing.
-    //
-    // This read is load-bearing on the cloud backend for a second reason: it
-    // pulls the remote copy over the local one, so an append that follows
-    // sees what S3 has. A session whose directory is missing locally still
-    // fails here, because the pull writes no directory of its own. (Inside a
-    // tick on this session there is no pull: the tick pulled, and the local
-    // copy holds writes the bucket doesn't have yet.)
-    backend.read_header(session)?;
-
     // A reserved key is refused by the store itself; checking here as well
     // refuses it before stdin is read, rather than after.
     crate::session::links::check_writer_key(key, WRITER_AGENT)?;
 
+    // Read before the lock is taken, so a slow or idle stdin never holds it.
     let content = match from_file {
         Some(path) => {
             fs::read(path).map_err(|e| anyhow::anyhow!("failed to read file '{}': {}", path, e))?
@@ -52,19 +52,34 @@ pub fn handle_add(
         }
     };
 
-    store.add_with_writer(session, key, &content, WRITER_AGENT)?;
-
-    let hash = sha256_hex(&content);
-    let size = content.len() as u64;
     let event = EventPayload::ContextAdded {
         key: key.to_string(),
-        hash,
-        size,
+        hash: sha256_hex(&content),
+        size: content.len() as u64,
         writer: Some(WRITER_AGENT.to_string()),
     };
-    backend.append_event(session, &event, &now_iso8601())?;
 
-    Ok(())
+    // The backend reads the header first: the append refuses a log that has
+    // no header, but by then the store would already hold the content, so a
+    // refused write stores nothing this way.
+    //
+    // That read is load-bearing on the cloud backend for a second reason: it
+    // pulls the remote copy over the local one, so the append that follows
+    // sees what S3 has. A session whose directory is missing locally still
+    // fails there, because the pull writes no directory of its own. (Inside
+    // a tick on this session there is no pull: the tick pulled, and the
+    // local copy holds writes the bucket doesn't have yet.)
+    //
+    // The store write is confirmed: under the cloud backend an upload the
+    // bucket doesn't confirm fails the command, naming the key, and returns
+    // before the `context_added`, so the bucket's log never names a key its
+    // manifest leaves out (koto#646).
+    backend.add_context_locked(
+        session,
+        &mut || store.add_confirmed(session, key, &content, WRITER_AGENT),
+        &event,
+        &now_iso8601(),
+    )
 }
 
 /// The log of `session`, read for a `koto context get` or `exists` of `key`
@@ -1169,5 +1184,78 @@ mod tests {
         let history = write_history(&events, "k");
         assert!(history.is_empty());
         assert_eq!(serde_json::to_string(&history).unwrap(), "[]");
+    }
+
+    /// A store that, as it is written, tries what a header rewrite does
+    /// first: take the session log's append lock, waiting a short while.
+    /// Whether it got the lock says whether a rewrite could have landed
+    /// between `context add`'s header check and its append.
+    struct WindowProbe {
+        inner: LocalBackend,
+        log: std::path::PathBuf,
+        replacer_got_lock: std::sync::Mutex<Option<bool>>,
+    }
+
+    impl crate::session::context::ContextStore for WindowProbe {
+        fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+            self.inner.add(session, key, content)
+        }
+        fn add_confirmed(
+            &self,
+            session: &str,
+            key: &str,
+            content: &[u8],
+            writer: &str,
+        ) -> anyhow::Result<()> {
+            let got = crate::engine::persistence::with_log_replace_lock(
+                &self.log,
+                std::time::Duration::from_millis(200),
+                || Ok(()),
+            )
+            .is_ok();
+            *self.replacer_got_lock.lock().unwrap() = Some(got);
+            self.inner.add_confirmed(session, key, content, writer)
+        }
+        fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get(session, key)
+        }
+        fn ctx_exists(&self, session: &str, key: &str) -> bool {
+            self.inner.ctx_exists(session, key)
+        }
+        fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+            self.inner.remove(session, key)
+        }
+        fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+            self.inner.list_keys(session, prefix)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_replacement_cannot_land_between_the_header_check_and_the_append() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        let probe = WindowProbe {
+            inner: LocalBackend::with_base_dir(dir.path().to_path_buf()),
+            log: dir.path().join("s").join(state_file_name("s")),
+            replacer_got_lock: std::sync::Mutex::new(None),
+        };
+        let input = dir.path().join("in.txt");
+        std::fs::write(&input, b"content").unwrap();
+
+        handle_add(&probe, &backend, "s", "k", Some(input.to_str().unwrap())).unwrap();
+
+        let got = probe
+            .replacer_got_lock
+            .lock()
+            .unwrap()
+            .expect("the store was written");
+        assert!(
+            !got,
+            "context add runs its header check, store write and append with \
+             no lock held across them: a log replacement took the append lock \
+             between them"
+        );
+        assert_eq!(event_types(&backend), vec!["transitioned", "context_added"]);
     }
 }

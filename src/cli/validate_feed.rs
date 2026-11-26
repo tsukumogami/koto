@@ -390,6 +390,21 @@ Body text.
         assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
     }
 
+    /// An anchor log carrying an `origin` on its creating event and an
+    /// `origin_unrecorded` event, as an open whose link write failed writes
+    /// it, validates clean against the shipped contract.
+    #[test]
+    fn shipped_spec_accepts_an_anchor_log_with_its_origin() {
+        let log = write_temp(&format!(
+            "{}\n{}\n{}\n",
+            r#"{"schema_version":1,"workflow":"anchor-h1","template_hash":"h","created_at":"2024-01-01T00:00:00Z","kind":"anchor"}"#,
+            r#"{"seq":3,"timestamp":"2024-01-01T00:00:00Z","type":"anchor_started","payload":{"source":"startup","harness_session":"h1","opened":"new","dispatched_by":"anchor-h0","origin":{"state":"dispatched","dispatcher":"anchor-h0"}}}"#,
+            r#"{"seq":4,"timestamp":"2024-01-01T00:00:01Z","type":"origin_unrecorded","payload":{"named":"anchor-h0","reason":"link write failed: store error"}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
     /// Acceptance alone would prove nothing: the validator skips event types it
     /// does not recognize, so an unregistered event passes silently. Feeding a
     /// malformed instance of each new event is what shows the contract declares
@@ -436,6 +451,10 @@ Body text.
             (
                 "anchor_activity",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"anchor_activity","payload":{"session":"wf"}}"#,
+            ),
+            (
+                "origin_unrecorded",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"origin_unrecorded","payload":{"named":"anchor-h0"}}"#,
             ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));

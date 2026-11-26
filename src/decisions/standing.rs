@@ -13,8 +13,19 @@
 //!   calls it for its session first, so a reversal entered through that
 //!   session that has since lost gets a `refused` naming the winner there.
 //!
+//! Succession (R37, R39 to R41, R43): when neither the reverser nor its
+//! anchor is on the original's chain, [`place`] looks for a chain session
+//! whose confirmed supersede hops ([`chain::hops_to`]) reach one of them.
+//! The one reached stands exactly in that session's position, R17's rules
+//! apply as if the reversal were recorded there, and the path records each
+//! hop. A reach that needs a hop koto can't confirm is refused
+//! `supersede_unconfirmed`, never `asserted`. [`Index`] reads each fenced
+//! session's marker and treats a decision there with an id above the
+//! marker's `decisions_through` as written after the fence: `refused`,
+//! with no standing and no win. The reversal read at `koto next` (R22) and
+//! R42 aren't handled here.
+//!
 //! This module sits above [`store`] and [`read`]; neither calls into it.
-//! Supersede hops (R39 to R43) aren't followed here.
 
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
@@ -25,7 +36,7 @@ use super::body::{self, BasisRef, DecisionBody, PathStep, Refusal, Request, Sess
 use super::decider::{Authority, Decider};
 use super::read::{self, Entry};
 use super::store::{self, Area};
-use super::{chain, codes, DecisionError, FORMAT_VERSION};
+use super::{chain, codes, marker, DecisionError, FORMAT_VERSION};
 use crate::session::{Backend, SessionBackend};
 
 /// The standing a recorded reversal carries.
@@ -51,6 +62,13 @@ pub mod reasons {
     pub const NOT_ON_CHAIN: &str = "not_on_chain";
     /// A competing reversal won R19's race.
     pub const LOST_RACE: &str = "lost_race";
+    /// The reverser would stand on the chain only through a supersede hop
+    /// koto can't confirm (R40).
+    pub const SUPERSEDE_UNCONFIRMED: &str = "supersede_unconfirmed";
+    /// The decision is an `answer`, which a reversal doesn't overrule.
+    pub const REVERSES_ANSWER: &str = "reverses_answer";
+    /// The decision is a `readdress`, which a reversal doesn't overrule.
+    pub const REVERSES_READDRESS: &str = "reverses_readdress";
 }
 
 /// R19's order: time, then the reverser's session name, then id, then the
@@ -108,44 +126,92 @@ fn reference(b: &DecisionBody) -> BasisRef {
 }
 
 /// Every session in the local store's decisions, and the readable
-/// reversals among them keyed by `(target session id, decision id)`.
+/// reversals and answers among them keyed by `(target session id,
+/// decision id)`.
 pub struct Index {
     sessions: BTreeMap<String, Vec<Entry>>,
     reversals: BTreeMap<(String, String), Vec<DecisionBody>>,
+    answers: BTreeMap<(String, String), Vec<DecisionBody>>,
+    readdresses: BTreeMap<(String, String), Vec<DecisionBody>>,
+    /// Each fenced session's `decisions_through`, by session name (R37).
+    cutoffs: BTreeMap<String, Option<String>>,
+}
+
+/// Whether `body` sits in a fenced session whose marker's
+/// `decisions_through` is below its id, or is `null` (R37). Decision ids
+/// are fixed-width digits, so their byte order is the order a session
+/// recorded them in.
+fn past_cutoff(cutoffs: &BTreeMap<String, Option<String>>, body: &DecisionBody) -> bool {
+    cutoffs
+        .get(&body.session.name)
+        .is_some_and(|through| through.as_deref().is_none_or(|t| body.id.as_str() > t))
 }
 
 impl Index {
     /// Read every session in the local store. With `remote` set, under the
     /// cloud backend each session's bucket objects are listed too, once.
+    /// Each session's supersede marker is read from its local copy.
     pub fn scan(backend: &Backend, remote: bool) -> Self {
+        let mut cutoffs = BTreeMap::new();
         let sessions = read::local_sessions(backend)
             .into_iter()
             .map(|s| {
+                if let Ok(Some(m)) = marker::read(&backend.session_dir(&s).join("ctx")) {
+                    cutoffs.insert(s.clone(), m.decisions_through);
+                }
                 let entries = read::read_session_with(backend, &s, remote);
                 (s, entries)
             })
             .collect();
-        Self::from_sessions(sessions)
+        Self::from_sessions_cut(sessions, cutoffs)
     }
 
     /// An index over sessions already read.
     pub fn from_sessions(sessions: BTreeMap<String, Vec<Entry>>) -> Self {
+        Self::from_sessions_cut(sessions, BTreeMap::new())
+    }
+
+    /// An index over sessions already read, with the `decisions_through`
+    /// of each fenced one. A decision past its session's cutoff is never
+    /// counted as a reversal.
+    pub fn from_sessions_cut(
+        sessions: BTreeMap<String, Vec<Entry>>,
+        cutoffs: BTreeMap<String, Option<String>>,
+    ) -> Self {
         let mut reversals: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
+        let mut answers: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
+        let mut readdresses: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
         for entries in sessions.values() {
             for entry in entries {
                 let Entry::Decision(b) = entry else { continue };
-                if let (true, Some(t)) = (b.kind == "reverse", &b.target) {
-                    reversals
-                        .entry((t.id.clone(), t.decision.clone()))
-                        .or_default()
-                        .push((**b).clone());
+                if past_cutoff(&cutoffs, b) {
+                    continue;
                 }
+                let Some(t) = &b.target else { continue };
+                let into = match b.kind.as_str() {
+                    "reverse" => &mut reversals,
+                    "answer" if b.outcome == "answered" => &mut answers,
+                    "readdress" if b.outcome == "passed" => &mut readdresses,
+                    _ => continue,
+                };
+                into.entry((t.id.clone(), t.decision.clone()))
+                    .or_default()
+                    .push((**b).clone());
             }
         }
         Self {
             sessions,
             reversals,
+            answers,
+            readdresses,
+            cutoffs,
         }
+    }
+
+    /// Whether `body` was written in a fenced session after its fence, by
+    /// the marker's `decisions_through` (R37).
+    pub fn after_fence(&self, body: &DecisionBody) -> bool {
+        past_cutoff(&self.cutoffs, body)
     }
 
     /// `session`'s entries: from the scan, or read now (bucket included)
@@ -175,6 +241,57 @@ impl Index {
             .unwrap_or(&[])
     }
 
+    /// Every `answered` answer aimed at decision `id` of the session whose
+    /// id is `session_id`, wherever it was recorded, earliest first by
+    /// time, then the answering session's name, then id.
+    pub fn answers_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
+        let mut out: Vec<&DecisionBody> = self
+            .answers
+            .get(&(session_id.to_string(), id.to_string()))
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| {
+            (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
+        });
+        out
+    }
+
+    /// The sessions whose directories this scan read `body` from: its
+    /// recording session, and any copy of it this host holds.
+    pub fn holders(&self, body: &DecisionBody) -> Vec<&str> {
+        self.sessions
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|e| {
+                    matches!(e, Entry::Decision(b)
+                        if b.session.id == body.session.id && b.id == body.id)
+                })
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Every `passed` pass-up aimed at decision `id` of the session whose
+    /// id is `session_id`, wherever it was recorded, earliest first by
+    /// time, then the recording session's name, then id: the order the
+    /// addressee history is built in.
+    pub fn readdresses_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
+        let mut out: Vec<&DecisionBody> = self
+            .readdresses
+            .get(&(session_id.to_string(), id.to_string()))
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| {
+            (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
+        });
+        out
+    }
+
+    /// Every session the scan read, with its entries.
+    pub fn sessions(&self) -> &BTreeMap<String, Vec<Entry>> {
+        &self.sessions
+    }
+
     /// The reversal of `session_id`'s decision `id` that wins R19's race.
     pub fn winner_of(&self, session_id: &str, id: &str) -> Option<&DecisionBody> {
         winner(self.reversals_of(session_id, id))
@@ -182,6 +299,9 @@ impl Index {
 
     /// A readable decision's status (PRD Terms).
     pub fn status(&self, body: &DecisionBody) -> &'static str {
+        if self.after_fence(body) {
+            return "refused";
+        }
         match body.kind.as_str() {
             "refused" => "refused",
             "reverse" => {
@@ -205,12 +325,39 @@ impl Index {
     /// status, and what R20 and R21 add: the winning reversal of a reversed
     /// decision, the winner a refused reversal lost to, an escalation's
     /// effect, and the decisions whose `basis` names a reversed acceptance.
-    pub fn entry_json(&self, entry: &Entry, scope: &Scope<'_>) -> Value {
+    /// `holder` is the session whose directory the entry was read from.
+    pub fn entry_json(&self, holder: &str, entry: &Entry, scope: &Scope<'_>) -> Value {
         let mut out = entry.to_json();
         let Entry::Decision(body) = entry else {
             return out;
         };
         out["status"] = json!(self.status(body));
+        if body.kind == "escalate" || body.kind == "readdress" {
+            if let Some(r) = body.subject.get("recipient").and_then(Value::as_str) {
+                out["recipient"] = body::Recipient::parse(r).to_json();
+            }
+            if body.subject.contains_key("packet") {
+                out["prompt_header"] = json!(super::prompt::tag(&super::questions::identity(body)));
+            }
+        }
+        if body.prompt.is_some() {
+            // The stored mark reads verified only in the session directory
+            // of the host that checked the prompt; a copy that arrived by
+            // import or by a pull, or under another name, reads it as a
+            // remote session's answer. The record isn't opened.
+            if verified_in(scope.backend, holder, body) {
+                out["reading"] = json!(super::prompt::VERIFIED);
+            } else {
+                out["reading"] = json!(super::prompt::REMOTE_READING);
+                out["decision"]["prompt"]["mark"] =
+                    json!(super::decider::Sourced::observed(super::prompt::REMOTE));
+            }
+        }
+        if self.after_fence(body) {
+            // Written after the fence: it reads refused and nothing more.
+            out["after_fence"] = json!(true);
+            return out;
+        }
         match body.kind.as_str() {
             "refused" => {}
             "reverse" => {
@@ -342,22 +489,27 @@ pub fn list(backend: &Backend, session: &str, below: bool, filters: &read::Filte
     } else {
         vec![session.to_string()]
     };
-    let mut entries: Vec<Entry> = sessions
+    let mut entries: Vec<(String, Entry)> = sessions
         .iter()
-        .flat_map(|s| index.entries(backend, s))
-        .filter(|e| match e {
+        .flat_map(|s| {
+            index
+                .entries(backend, s)
+                .into_iter()
+                .map(move |e| (s.clone(), e))
+        })
+        .filter(|(_, e)| match e {
             Entry::Decision(body) => filters.matches(body),
             Entry::Unreadable { .. } => true,
         })
         .collect();
-    read::sort(&mut entries);
+    entries.sort_by_key(|(_, e)| read::sort_key(e));
     let scope = Scope::new(backend, session);
     let mut out = json!({
         "v": FORMAT_VERSION,
         "session": session,
         "decisions": entries
             .iter()
-            .map(|e| index.entry_json(e, &scope))
+            .map(|(holder, e)| index.entry_json(holder, e, &scope))
             .collect::<Vec<_>>(),
     });
     if below {
@@ -381,10 +533,23 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
         .iter()
         .find(|e| matches!(e, Entry::Unreadable { id: None, .. }));
     let entry = found.or(whole_session_unreadable)?;
-    let mut out = index.entry_json(entry, &Scope::new(backend, session));
+    let mut out = index.entry_json(session, entry, &Scope::new(backend, session));
     out["v"] = json!(FORMAT_VERSION);
     out["id"] = json!(id);
     Some(out)
+}
+
+/// Whether this host checked the prompt of answer `body`, as held in
+/// session `holder`'s directory: the host-local note there lists it,
+/// sealed to this host's identity (DESIGN-decision-record.md, "A person's
+/// answer and the question content area").
+pub fn verified_in(backend: &Backend, holder: &str, body: &DecisionBody) -> bool {
+    super::prompt::verified_here(
+        crate::koto_home::koto_home().as_deref(),
+        &crate::session::SessionBackend::session_dir(backend, holder),
+        holder,
+        body,
+    )
 }
 
 /// Where a reversal is recorded and the standing it carries.
@@ -449,6 +614,7 @@ pub fn judge(
                 .iter()
                 .any(|l| l.session == original.session.name)
         },
+        hops_to: &|from: &str, to: &str| chain::hops_to(store, from, to),
     };
     place(original, reverser, decider, anchor, &live)
 }
@@ -463,6 +629,87 @@ pub struct Live<'a> {
     pub chain_incomplete: &'a dyn Fn() -> bool,
     /// Whether the original's deciding session is on the reverser's chain.
     pub reverser_below: &'a dyn Fn() -> bool,
+    /// How the supersede hops followed forward from a chain session reach
+    /// a session ([`chain::hops_to`]).
+    pub hops_to: &'a dyn Fn(&str, &str) -> chain::Reach,
+}
+
+/// What following supersede hops from the original's chain found for a
+/// reverser off it (R39, R40).
+enum Succession {
+    /// A confirmed reach with a rule that matches and a live path.
+    Placed(Placement),
+    /// A rule would match only through a hop koto can't confirm.
+    Unconfirmed,
+    /// A confirmed reach, but no rule gives standing.
+    NoRule,
+    /// A reach only through a hop koto can't confirm, where no rule would
+    /// give standing either: refused, and never asserted (R40).
+    UnconfirmedNoRule,
+    /// No hop from the chain reaches it.
+    Off,
+}
+
+/// Look for a session on the original's chain (its own session, then its
+/// recorded links in order) whose supersede hops reach the reverser, or
+/// else its anchor. The one reached stands exactly in that session's
+/// position: R17's rules apply as if the reversal were recorded there, and
+/// the path is the live walk from the original to it plus one step per
+/// hop. The reversal is recorded in the session reached. The successor's
+/// own links are never followed.
+fn succession(
+    original: &DecisionBody,
+    reverser: &str,
+    decider: &Decider,
+    anchor: Option<&str>,
+    live: &Live<'_>,
+) -> Succession {
+    let chain_sessions: Vec<&str> = std::iter::once(original.session.name.as_str())
+        .chain(original.chain.links.iter().map(|l| l.session.as_str()))
+        .collect();
+    let mut found = Succession::Off;
+    for cand in std::iter::once(reverser).chain(anchor) {
+        for &c in &chain_sessions {
+            if c == cand {
+                continue;
+            }
+            match (live.hops_to)(c, cand) {
+                chain::Reach::No => {}
+                chain::Reach::Unconfirmed => {
+                    if rule_matches(original, c, decider) {
+                        found = Succession::Unconfirmed;
+                    } else if matches!(found, Succession::Off | Succession::NoRule) {
+                        found = Succession::UnconfirmedNoRule;
+                    }
+                }
+                chain::Reach::Confirmed(hops) => {
+                    if !rule_matches(original, c, decider) {
+                        if matches!(found, Succession::Off) {
+                            found = Succession::NoRule;
+                        }
+                        continue;
+                    }
+                    let base = if c == original.session.name {
+                        Some(Vec::new())
+                    } else {
+                        (live.path_to)(c)
+                    };
+                    if let Some(mut path) = base {
+                        path.extend(hops);
+                        return Succession::Placed(Placement {
+                            session: cand.to_string(),
+                            standing: VERIFIED,
+                            path,
+                        });
+                    }
+                    if matches!(found, Succession::Off) {
+                        found = Succession::NoRule;
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 /// [`judge`] over facts already read.
@@ -474,6 +721,12 @@ pub struct Live<'a> {
 /// rule gives standing: the reversal is `asserted` if the chain, recorded
 /// or live, is incomplete and the reverser isn't below the original, and
 /// refused otherwise.
+///
+/// A reverser (or anchor) off the chain that a chain session's confirmed
+/// supersede hops reach is judged in that session's position (R39, R43),
+/// and one reached only through an unconfirmed hop is refused
+/// `supersede_unconfirmed` before the asserted fallback is considered
+/// (R40).
 pub fn place(
     original: &DecisionBody,
     reverser: &str,
@@ -502,6 +755,19 @@ pub fn place(
             }
         }
     }
+    // Off the chain: a later member of a chain session's run stands in
+    // its position (R39). An unconfirmed hop gives no standing and is
+    // never asserted (R40), so it is refused before the fallback below.
+    let mut through_hop = false;
+    if recorded_in.is_none() {
+        match succession(original, reverser, decider, anchor, live) {
+            Succession::Placed(p) => return Ok(p),
+            Succession::Unconfirmed => return Err(reasons::SUPERSEDE_UNCONFIRMED),
+            Succession::UnconfirmedNoRule => return Err(reasons::NO_STANDING),
+            Succession::NoRule => through_hop = true,
+            Succession::Off => {}
+        }
+    }
     // No rule gave standing. Beyond a broken chain the reversal is
     // asserted, unless the reverser sits below the original's deciding
     // session.
@@ -515,7 +781,7 @@ pub fn place(
             path: Vec::new(),
         });
     }
-    Err(if recorded_in.is_some() {
+    Err(if recorded_in.is_some() || through_hop {
         reasons::NO_STANDING
     } else {
         reasons::NOT_ON_CHAIN
@@ -598,6 +864,7 @@ pub fn refused_body(
         compensating: None,
         replacement: None,
         refusal: Some(what.refusal),
+        prompt: None,
     })
 }
 
@@ -814,6 +1081,7 @@ mod tests {
             compensating: None,
             replacement: None,
             refusal: None,
+            prompt: None,
         }
     }
 
@@ -873,6 +1141,7 @@ mod tests {
             path_to,
             chain_incomplete,
             reverser_below: &|| false,
+            hops_to: &|_, _| chain::Reach::No,
         }
     }
 
@@ -885,13 +1154,7 @@ mod tests {
             session_decider("w"),
             &["c"],
         );
-        let reached = |to: &str| {
-            Some(vec![PathStep {
-                session: "w".to_string(),
-                via: "init".to_string(),
-                to: to.to_string(),
-            }])
-        };
+        let reached = |to: &str| Some(vec![PathStep::link("w", "init", to)]);
         let p = place(
             &w,
             "c",
@@ -943,6 +1206,280 @@ mod tests {
         .unwrap();
         assert_eq!(p.standing, VERIFIED);
         assert!(p.path.is_empty());
+    }
+
+    fn hop(fenced: &str, successor: &str) -> PathStep {
+        PathStep {
+            session: fenced.to_string(),
+            via: chain::VIA_SUPERSEDE.to_string(),
+            to: successor.to_string(),
+            successor_id: Some(format!("{successor}-id")),
+            actor: Some(crate::engine::types::SupersedeActor {
+                claude_session: None,
+                host: Some("h".to_string()),
+                user: Some("u".to_string()),
+            }),
+            time: Some("2026-11-10T00:00:05.000Z".to_string()),
+        }
+    }
+
+    fn never() -> bool {
+        false
+    }
+
+    fn always() -> bool {
+        true
+    }
+
+    static LINK_TO: fn(&str) -> Option<Vec<PathStep>> = link_to;
+    static P_TO_S: fn(&str, &str) -> chain::Reach = p_to_s;
+    static NEVER: fn() -> bool = never;
+    static ALWAYS: fn() -> bool = always;
+
+    /// Facts where the live walk reaches every session it is asked for
+    /// with one link step and supersede hops reach as `hops_to` says.
+    fn hops_live<'a>(
+        hops_to: &'a dyn Fn(&str, &str) -> chain::Reach,
+        chain_incomplete: &'a dyn Fn() -> bool,
+    ) -> Live<'a> {
+        Live {
+            path_to: &LINK_TO,
+            chain_incomplete,
+            reverser_below: &NEVER,
+            hops_to,
+        }
+    }
+
+    fn p_to_s(from: &str, to: &str) -> chain::Reach {
+        match (from, to) {
+            ("p", "s") => chain::Reach::Confirmed(vec![hop("p", "s")]),
+            ("p", "s2") => chain::Reach::Confirmed(vec![hop("p", "s"), hop("s", "s2")]),
+            _ => chain::Reach::No,
+        }
+    }
+
+    fn link_to(to: &str) -> Option<Vec<PathStep>> {
+        Some(vec![PathStep::link("w", "leg", to)])
+    }
+
+    #[test]
+    fn a_successor_stands_in_the_fenced_sessions_position() {
+        let w = body(
+            "w",
+            "000000000001",
+            "judgment",
+            session_decider("w"),
+            &["p", "x"],
+        );
+        let live = hops_live(&P_TO_S, &NEVER);
+        let p = place(&w, "s", &session_decider("s"), None, &live).unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert_eq!(p.session, "s", "the reversal is recorded in the successor");
+        assert_eq!(p.path, vec![PathStep::link("w", "leg", "p"), hop("p", "s")]);
+        assert!(p.path[1].is_hop());
+        assert_eq!(p.path[1].successor_id.as_deref(), Some("s-id"));
+        assert!(p.path[1].actor.is_some() && p.path[1].time.is_some());
+
+        // Two hops: both are named, in order.
+        let p = place(&w, "s2", &session_decider("s2"), None, &live).unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert_eq!(
+            p.path,
+            vec![
+                PathStep::link("w", "leg", "p"),
+                hop("p", "s"),
+                hop("s", "s2")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_successor_reverses_the_fenced_sessions_own_session_decision() {
+        let own = body(
+            "p",
+            "000000000001",
+            "judgment",
+            session_decider("p"),
+            &["x"],
+        );
+        let live = hops_live(&P_TO_S, &NEVER);
+        let p = place(&own, "s", &session_decider("s"), None, &live).unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert_eq!(p.session, "s");
+        assert_eq!(p.path, vec![hop("p", "s")]);
+    }
+
+    #[test]
+    fn succession_does_not_change_who_may_reverse_a_person() {
+        let persons = body("p", "000000000001", "judgment", person("ana", "p"), &["x"]);
+        let live = hops_live(&P_TO_S, &NEVER);
+        assert_eq!(
+            place(&persons, "s", &session_decider("s"), None, &live),
+            Err(reasons::NO_STANDING),
+            "a later member, as a session, can't reverse a person"
+        );
+        let p = place(&persons, "s", &person("bea", "s"), None, &live).unwrap();
+        assert_eq!(p.standing, VERIFIED);
+        assert_eq!(p.session, "s");
+        assert_eq!(p.path, vec![hop("p", "s")]);
+
+        // Entered through the person's own session's successor from
+        // above, too.
+        let w_persons = body("w", "000000000002", "judgment", person("ana", "w"), &["p"]);
+        assert_eq!(
+            place(&w_persons, "s", &session_decider("s"), None, &live),
+            Err(reasons::NO_STANDING)
+        );
+        let p = place(&w_persons, "s", &person("bea", "s"), None, &live).unwrap();
+        assert_eq!(p.path.last(), Some(&hop("p", "s")));
+    }
+
+    #[test]
+    fn a_successor_gains_nothing_beside_or_above_the_fenced_session() {
+        let live = hops_live(&P_TO_S, &NEVER);
+        // A sibling of P under X: no hop from Q's chain reaches S.
+        let sibling = body(
+            "q",
+            "000000000001",
+            "judgment",
+            session_decider("q"),
+            &["x"],
+        );
+        assert_eq!(
+            place(&sibling, "s", &session_decider("s"), None, &live),
+            Err(reasons::NOT_ON_CHAIN)
+        );
+        // The session above P.
+        let above_p = body("x", "000000000001", "judgment", session_decider("x"), &[]);
+        assert_eq!(
+            place(&above_p, "s", &session_decider("s"), None, &live),
+            Err(reasons::NOT_ON_CHAIN)
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_hop_is_refused_and_never_asserted() {
+        let w = body(
+            "w",
+            "000000000001",
+            "judgment",
+            session_decider("w"),
+            &["p"],
+        );
+        let unconfirmed = |from: &str, to: &str| match (from, to) {
+            ("p", "s") => chain::Reach::Unconfirmed,
+            _ => chain::Reach::No,
+        };
+        // A broken chain would assert a reverser off it; an unconfirmed
+        // hop comes first.
+        for incomplete in [&NEVER, &ALWAYS] {
+            let live = hops_live(&unconfirmed, incomplete);
+            assert_eq!(
+                place(&w, "s", &session_decider("s"), None, &live),
+                Err(reasons::SUPERSEDE_UNCONFIRMED)
+            );
+        }
+        let mut broken = w.clone();
+        broken.chain.incomplete = true;
+        let live = hops_live(&unconfirmed, &ALWAYS);
+        assert_eq!(
+            place(&broken, "s", &session_decider("s"), None, &live),
+            Err(reasons::SUPERSEDE_UNCONFIRMED)
+        );
+        // Where no rule would match even through the hop (a session alone
+        // against a person's decision), the reversal is still never
+        // asserted, however broken the chain.
+        let mut ruling = body("w", "000000000002", "judgment", person("ana", "w"), &["p"]);
+        ruling.chain.incomplete = true;
+        assert_eq!(
+            place(&ruling, "s", &session_decider("s"), None, &live),
+            Err(reasons::NO_STANDING)
+        );
+    }
+
+    #[test]
+    fn a_decision_past_the_fences_cutoff_reads_refused_and_wins_nothing() {
+        let w = body(
+            "w",
+            "000000000001",
+            "judgment",
+            session_decider("w"),
+            &["p"],
+        );
+        let before = body("p", "000000000001", "judgment", session_decider("p"), &[]);
+        let after = body("p", "000000000002", "judgment", session_decider("p"), &[]);
+        let late = reversal("p", "000000000003", "2026-11-10T00:00:01.000Z", &w);
+        let sessions: BTreeMap<String, Vec<Entry>> = [
+            ("w".to_string(), vec![Entry::Decision(Box::new(w.clone()))]),
+            (
+                "p".to_string(),
+                [&before, &after, &late]
+                    .into_iter()
+                    .map(|b| Entry::Decision(Box::new(b.clone())))
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let cut = |through: Option<&str>| {
+            Index::from_sessions_cut(
+                sessions.clone(),
+                [("p".to_string(), through.map(str::to_string))]
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        let index = cut(Some("000000000001"));
+        assert_eq!(index.status(&before), "in-effect");
+        assert_eq!(index.status(&after), "refused");
+        assert_eq!(index.status(&late), "refused");
+        assert!(index.winner_of("w-id", "000000000001").is_none());
+        assert_eq!(
+            index.status(&w),
+            "in-effect",
+            "a late reversal blocks nothing"
+        );
+
+        let index = cut(None);
+        assert_eq!(index.status(&before), "refused", "a null cutoff saw none");
+
+        // Without a marker the same reversal wins.
+        let index = Index::from_sessions(sessions.clone());
+        assert_eq!(index.status(&w), "reversed");
+        assert_eq!(index.status(&after), "in-effect");
+    }
+
+    #[test]
+    fn the_fenced_filter_keeps_reversals_with_a_hop_from_that_session() {
+        let w = body(
+            "w",
+            "000000000001",
+            "judgment",
+            session_decider("w"),
+            &["p"],
+        );
+        let mut through = reversal("s", "000000000001", "2026-11-10T00:00:01.000Z", &w);
+        through.path = Some(vec![PathStep::link("w", "leg", "p"), hop("p", "s")]);
+        let mut direct = reversal("p", "000000000001", "2026-11-10T00:00:01.000Z", &w);
+        direct.path = Some(vec![PathStep::link("w", "leg", "p")]);
+        let filters = read::Filters {
+            fenced: Some("p".to_string()),
+            ..read::Filters::default()
+        };
+        assert!(filters.matches(&through));
+        assert!(!filters.matches(&direct), "a link step from p isn't a hop");
+        assert!(!filters.matches(&w));
+        let other = read::Filters {
+            fenced: Some("s".to_string()),
+            ..read::Filters::default()
+        };
+        assert!(!other.matches(&through));
+
+        // A body written before hops were recorded still parses.
+        let old = r#"{"session":"w","via":"leg","to":"p"}"#;
+        let step: PathStep = serde_json::from_str(old).unwrap();
+        assert_eq!(step, PathStep::link("w", "leg", "p"));
+        assert!(!serde_json::to_string(&step).unwrap().contains("actor"));
     }
 
     #[test]

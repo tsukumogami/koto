@@ -31,11 +31,7 @@ use crate::session::context_log::{
 };
 use crate::session::SessionBackend;
 
-/// The reserved area of a session's context. Only koto writes keys here.
-pub const RESERVED_PREFIX: &str = "koto/";
-
-/// The first component of every reserved key, compared case-insensitively.
-const RESERVED_COMPONENT: &str = "koto";
+pub use koto_session_reader::session::links::{is_reserved_key, RESERVED_PREFIX};
 
 /// Where a session's links live: `koto/links/<kind>/<peer>`.
 pub const LINKS_PREFIX: &str = "koto/links/";
@@ -103,27 +99,26 @@ pub fn link_key(kind: LinkKind, peer: &str) -> String {
     format!("{LINKS_PREFIX}{}/{peer}", kind.as_str())
 }
 
-/// Whether `key` lies in the reserved area: its first component is `koto`,
-/// compared case-insensitively so `KOTO/links/...` can't reach the same
-/// directory on a case-insensitive filesystem. The bare key `koto` counts
-/// too, since a file of that name would block the reserved directory.
-pub fn is_reserved_key(key: &str) -> bool {
-    let first = key.split('/').next().unwrap_or("");
-    first.eq_ignore_ascii_case(RESERVED_COMPONENT)
-}
-
 /// A write or removal of a reserved key by a writer that may not touch it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservedKeyError {
     pub key: String,
-    /// The key lies in a decision area, which no writer may change or
-    /// remove, koto's own included.
+    /// The key is write-once (a decision area, or the supersede marker),
+    /// so no writer may change or remove it, koto's own included.
     pub write_once: bool,
 }
 
 impl std::fmt::Display for ReservedKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.write_once {
+            if crate::decisions::marker::is_marker_key(&self.key) {
+                return write!(
+                    f,
+                    "context key '{}' is the supersede marker: it is write-once, so no writer \
+                     may change or remove it, and only `koto init --supersede` writes it",
+                    self.key
+                );
+            }
             return write!(
                 f,
                 "context key '{}' is a decision key: decision keys are write-once, so no \
@@ -143,13 +138,15 @@ impl std::fmt::Display for ReservedKeyError {
 impl std::error::Error for ReservedKeyError {}
 
 /// Refuse a write or removal of a reserved key by the agent writer, and of
-/// a key in a decision area by any writer.
+/// a write-once key (a decision area, or the supersede marker) by any
+/// writer.
 ///
 /// Called from the context store's write path (the local and cloud stores'
 /// writes and [`ContextStore::remove_with_writer`]), so every caller of the
-/// store meets it. Outside the decision areas every other writer passes:
+/// store meets it. Outside the write-once keys every other writer passes:
 /// koto's own, a transition's, and a cloud pull's. Decisions are written
-/// only by [`crate::decisions::store`], which never goes through a context
+/// only by [`crate::decisions::store`], and the marker only by
+/// [`crate::decisions::marker`]; neither goes through a context
 /// store.
 pub fn check_writer_key(key: &str, writer: &str) -> Result<(), ReservedKeyError> {
     check_decision_key(key)?;
@@ -162,12 +159,13 @@ pub fn check_writer_key(key: &str, writer: &str) -> Result<(), ReservedKeyError>
     Ok(())
 }
 
-/// Refuse a context-store write or removal of `key` when it lies in a
-/// decision area ([`crate::decisions::is_decision_area_key`]), whoever the
-/// writer is. The stores call this from their writer-less primitives too,
-/// so nothing that goes through a context store reaches a decision file.
+/// Refuse a context-store write or removal of `key` when it is write-once
+/// ([`crate::decisions::is_write_once_key`]: a decision area, or the
+/// supersede marker), whoever the writer is. The stores call this from
+/// their writer-less primitives too, so nothing that goes through a context
+/// store reaches a decision file or the marker.
 pub fn check_decision_key(key: &str) -> Result<(), ReservedKeyError> {
-    if crate::decisions::is_decision_area_key(key) {
+    if crate::decisions::is_write_once_key(key) {
         return Err(ReservedKeyError {
             key: key.to_string(),
             write_once: true,

@@ -313,7 +313,7 @@ mod pairing;
 #[cfg(unix)]
 pub(crate) mod rotate;
 mod run_id;
-mod sidecar;
+pub(crate) mod sidecar;
 
 use std::path::Path;
 

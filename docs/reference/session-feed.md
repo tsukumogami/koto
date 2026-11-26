@@ -971,6 +971,19 @@ events:
       dispatched_by:
         type: string
         required: false
+      origin:
+        type: object
+        required: false
+
+  origin_unrecorded:
+    tier: 3
+    fields:
+      named:
+        type: string
+        required: true
+      reason:
+        type: string
+        required: true
 
   anchor_activity:
     tier: 3
@@ -2750,7 +2763,42 @@ it. A created anchor carries it among its initial events.
 | `transcript` | string | No | A SHA-256 prefix of the harness's transcript path, never the path. |
 | `predecessor` | string | No | For a successor, the anchor it succeeds. |
 | `reason` | string | No | Why a successor was opened: `closed` (its predecessor read closed), `migrated`, `resume` (a resume under a new id, matched through a hint) or `clear`. |
-| `dispatched_by` | string | No | The dispatcher the caller inherited, when it named one. Recorded on every call; the dispatched-by link itself is written only when the anchor is created. |
+| `dispatched_by` | string | No | The dispatcher the caller inherited, when it named a valid anchor name other than this anchor's own. Recorded on every call; the dispatched-by link itself is written only when the anchor is created. A malformed or self-naming value is never put here. |
+| `origin` | object | No | Where the anchor came from, on the event that created it (`opened` of `new`, `reopened` or `successor`); absent on a continue and on events written before koto recorded it. `state` is `dispatched` (with `dispatcher`, the name the starting environment gave), `none` (it gave none, or an empty value), or `unrecorded` (with `named` and `reason`). `named` is the value's first 64 characters when it holds only letters, digits, `.`, `_` and `-`, and otherwise `sha256:<prefix> (<n> bytes)`. `reason` is `malformed: not an anchor name` (over 256 bytes, or not a valid session name) or `self: names this anchor` (it names this anchor or its family's first anchor). `dispatched` is what the starting environment claimed, not an authenticated fact. `koto session origin` reports it, read together with the dispatched-by link and any `origin_unrecorded` event. |
+
+```json
+{"source": "startup", "harness_session": "h2", "opened": "new",
+ "dispatched_by": "anchor-h1",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-h1"}}
+```
+
+---
+
+#### `origin_unrecorded`
+
+Appended to an anchor by the `koto session anchor open` that created it,
+when the dispatched-by link its creating `anchor_started` called for couldn't
+be written. At most one per anchor. The open still succeeds and prints
+`origin=unrecorded`. The store's error is never recorded.
+`koto session origin` reads the anchor as `unrecorded` with this event's
+`named` and `reason`, and as `unrecorded` with `link not found` when the
+creating event names a dispatcher with no link beside it and this event is
+missing too.
+
+```json
+{
+  "type": "origin_unrecorded",
+  "payload": {
+    "named": "anchor-h1",
+    "reason": "link write failed: store error"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `named` | string | Yes | The dispatcher the creating event named, as a preview. |
+| `reason` | string | Yes | `link write failed: store error`. |
 
 ---
 
@@ -3331,7 +3379,11 @@ JSON's backslash doubling): roughly 28 KiB.
 
 On every event append, a session with a published `/workflows` location (the
 `workflows/publish-location` context key) writes a `koto-<uuid>.json` file into
-that directory for Claude Code's workflow view. The screen titles the entry
+that directory for Claude Code's workflow view. A location koto found from the
+Claude Code session follows the session driving the run: after a resume or a
+rebind under a new `CLAUDE_CODE_SESSION_ID`, the file goes to the new session's
+folder and the old folder's file stops changing. A location set with
+`koto workflows publish` stays where it was put. The screen titles the entry
 from `workflowName` (the session's intent, else its template and state) and
 shows `summary` (`koto · <session> · <state>`) beneath it; `name` carries the
 same title for readers of contract versions before 4. These field names were
@@ -3358,8 +3410,7 @@ but never listed in `keys` (so `keyCount` can exceed the list length with
 `keysTruncated` still false), and anchor and store strings are sanitized and
 length-capped before they are written.
 
-From contract version 5 (the current version, `koto.contractVersion: 5`) the
-file separates the screen's word from koto's:
+From contract version 5 the file separates the screen's word from koto's:
 
 - **Top-level `status`** is written in the vocabulary Claude Code 2.1.314
   knows: `running`, `completed` or `failed`. It never reads `blocked`. That
@@ -3392,6 +3443,58 @@ failed step's `error`, is cut at 128 characters with the cut marker. A gate's ca
 file. `koto.workflow` and `koto.currentState` are the exception: they are
 written unescaped, as the session records them. Claude Code 2.1.314 doesn't
 draw them, but a reader of the file must treat them as untrusted text.
+
+### Retention and stale entries
+
+Contract version 6 (the current version, `koto.contractVersion: 6`) adds
+what koto writes into an entry it didn't project. Every write into a
+`/workflows` directory ends with a sweep of that directory, which keeps at
+most 10 koto entries (oldest `startTime` first among finished ones; live
+entries and the entry just written stay) and reconciles stale ones.
+
+The sweep counts and touches only koto-owned regular files: a file of at most
+1 MiB named `koto-<session-id>.json` whose `id` is `koto-<session-id>`, whose
+`koto.sessionId` is `<session-id>`, whose `koto.contractVersion` is an unsigned
+integer and whose top-level `status` is a string. Anything else in the
+directory, a `koto-*.json` symlink, directory or lookalike included, is left
+as it is and doesn't count toward the bound. It also removes koto's own
+`.koto-wf-*.tmp` staging files once they are more than a minute old. Each
+write lists the directory once; within the bound it reads only entries last
+written more than 2 hours ago, and over the bound it reads every
+`koto-*.json` file.
+
+An entry is stale when its top-level `status` is `running` and its file was
+last written more than **2 hours** ago, the same window after which
+`koto dashboard` calls a session stalled. A last write exactly 2 hours ago,
+or one in the future, is live. The sweep rewrites a stale entry in three
+fields and leaves every other field as it was:
+
+- **Top-level `status`** becomes `killed`, which Claude Code heads "stopped"
+  and counts out of the running total.
+- **`summary`** gains ` · no activity since <YYYY-MM-DD HH:MM UTC>`, the
+  last write in UTC to the minute. When the line would pass the fact cap,
+  the existing summary is cut before the suffix. An entry written before
+  contract version 4 has no summary and gets `no activity since <time>`.
+- **`koto.staleSince`** is the last write in epoch milliseconds. koto's
+  projection never writes it, so its presence marks a reconciled entry.
+
+`koto.contractVersion` is set to 6 on the rewrite, whatever version wrote the
+rest of the entry, since the entry now carries a version-6 field.
+`koto.status` keeps koto's last classification of the session (`running` or
+`blocked`): the session's log hasn't changed. A reconciled entry is finished
+from then on, so the bound removes it in `startTime` order like any other.
+
+koto can't tell a session whose driver died from one that is alive but quiet,
+waiting on a person, say. Both read "stopped · no activity since ..." once the
+window passes, and the session's next commit writes its entry from its
+projection again: `running`, no `staleSince`, no suffix. If that commit lands
+in the few system calls between the sweep's last check of the entry and its
+rename, the entry reads `killed` until the commit after it.
+
+Reconciliation needs a later koto write into the same directory: nothing
+runs between writes, so a stale entry keeps `running` until another session
+writes there. `koto dashboard --once` is the live view; it classifies every
+session from its log whenever it runs.
 
 ## Lifecycle Metadata Surface
 

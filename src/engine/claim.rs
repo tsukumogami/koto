@@ -367,7 +367,58 @@ pub fn release_sidecar(session_dir: &Path) -> Result<()> {
 /// `mutate` runs against the current header and returns the new shape.
 /// `mutate` returning the input unchanged is fine; the rewrite still
 /// happens (cheap relative to the safety guarantee).
+///
+/// The read, the temp file and the rename all happen under the log's append
+/// lock, so an append can't land in the old file after the read and be
+/// dropped by the rename (koto#239). The lock is waited for at most
+/// [`LOG_REPLACE_LOCK_WAIT`](crate::engine::persistence::LOG_REPLACE_LOCK_WAIT);
+/// past that the rewrite fails with
+/// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), having
+/// written nothing.
 pub fn rewrite_header_atomically<F>(path: &Path, mutate: F) -> Result<()>
+where
+    F: FnOnce(StateFileHeader) -> StateFileHeader,
+{
+    rewrite_header_atomically_within(
+        path,
+        crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+        mutate,
+    )
+}
+
+/// [`rewrite_header_atomically`] with the lock wait bounded by `wait`.
+pub(crate) fn rewrite_header_atomically_within<F>(
+    path: &Path,
+    wait: Duration,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(StateFileHeader) -> StateFileHeader,
+{
+    crate::engine::persistence::with_log_replace_lock(path, wait, || {
+        rewrite_header_under_lock(path, mutate)
+    })
+}
+
+/// [`rewrite_header_atomically`] for a caller that already holds the log's
+/// append lock through `held`: the rewrite runs under it, with no second
+/// acquisition. Refused, writing nothing, when `held` locks another log.
+pub(crate) fn rewrite_header_atomically_held<F>(
+    held: &crate::engine::persistence::HeldLogLock,
+    path: &Path,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(StateFileHeader) -> StateFileHeader,
+{
+    crate::engine::persistence::with_held_log_lock(held, path, || {
+        rewrite_header_under_lock(path, mutate)
+    })
+}
+
+/// The body of every header rewrite, run with the log's append lock held by
+/// the caller.
+fn rewrite_header_under_lock<F>(path: &Path, mutate: F) -> Result<()>
 where
     F: FnOnce(StateFileHeader) -> StateFileHeader,
 {
@@ -380,44 +431,15 @@ where
     let header: StateFileHeader = serde_json::from_str(header_line)
         .with_context(|| format!("failed to parse header from {}", path.display()))?;
     let new_header = mutate(header);
-    let new_header_line = serde_json::to_string(&new_header).context("serialize header")?;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("state file path has no parent: {}", path.display()))?;
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
-        std::process::id()
-    ));
-
-    {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(&tmp)
-            .with_context(|| format!("failed to open temp {}", tmp.display()))?;
-        writeln!(file, "{}", new_header_line)
-            .with_context(|| format!("failed to write header to {}", tmp.display()))?;
-        for tail in lines {
-            // Preserve original trailing newline shape — `.lines()`
-            // strips terminators but the file is well-formed when every
-            // line (including the last) ends in `\n`.
-            writeln!(file, "{}", tail)
-                .with_context(|| format!("failed to write event line to {}", tmp.display()))?;
-        }
-        file.sync_all()
-            .with_context(|| format!("failed to fsync {}", tmp.display()))?;
+    let mut content = serde_json::to_string(&new_header).context("serialize header")?;
+    content.push('\n');
+    // `.lines()` strips terminators; every line, the last included,
+    // goes back with its `\n`.
+    for tail in lines {
+        content.push_str(tail);
+        content.push('\n');
     }
-
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename {} → {}", tmp.display(), path.display()))?;
-    Ok(())
+    crate::engine::persistence::replace_log_bytes(path, content.as_bytes())
 }
 
 /// Best-effort write of `assignment_claim` to the header. Failure is
@@ -829,5 +851,104 @@ mod tests {
             observed_dispatch_epoch: 3,
         }
         .mutated());
+    }
+
+    const RACE_HEADER: &str = r#"{"schema_version":1,"workflow":"wf","template_hash":"abc","created_at":"2025-01-01T00:00:00Z"}"#;
+
+    fn context_added(i: usize) -> crate::engine::types::EventPayload {
+        crate::engine::types::EventPayload::ContextAdded {
+            key: format!("k{i}"),
+            hash: "0".repeat(64),
+            size: 1,
+            writer: None,
+        }
+    }
+
+    /// The `seq` and type of every event line in the log at `path`.
+    fn event_lines(path: &Path) -> Vec<(u64, String)> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let e: crate::engine::types::Event = serde_json::from_str(line).unwrap();
+                (e.seq, e.event_type)
+            })
+            .collect()
+    }
+
+    /// A header rewrite meeting a held append lock reports the log busy and
+    /// leaves it as it was (koto#239).
+    #[cfg(unix)]
+    #[test]
+    fn a_header_rewrite_under_a_held_append_lock_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("koto-wf.state.jsonl");
+        fs::write(&path, format!("{RACE_HEADER}\n")).unwrap();
+        let before = fs::read(&path).unwrap();
+        let _held = crate::engine::persistence::hold_append_lock(&path);
+        let err = rewrite_header_atomically_within(&path, Duration::from_millis(200), |mut h| {
+            h.dispatch_epoch += 1;
+            h
+        })
+        .unwrap_err();
+        assert!(
+            crate::engine::persistence::state_log_busy(&err).is_some(),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// Header rewrites racing appends lose none of them (koto#239): the
+    /// rewrite reads the log, writes a temp file and renames it over the log,
+    /// so an append landing between the read and the rename must wait for it.
+    #[test]
+    fn header_rewrites_racing_appends_lose_no_append() {
+        const ROUNDS: usize = 20;
+        const PER_ROUND: usize = 40;
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("koto-wf.state.jsonl");
+            fs::write(&path, format!("{RACE_HEADER}\n")).unwrap();
+
+            let appender = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..PER_ROUND {
+                        crate::engine::persistence::append_event(
+                            &path,
+                            &context_added(i),
+                            "2025-01-01T00:00:00Z",
+                        )
+                        .unwrap();
+                    }
+                })
+            };
+            let rewriter = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER_ROUND {
+                        rewrite_header_atomically(&path, |mut h| {
+                            h.dispatch_epoch += 1;
+                            h
+                        })
+                        .unwrap();
+                    }
+                })
+            };
+            appender.join().unwrap();
+            rewriter.join().unwrap();
+
+            let events = event_lines(&path);
+            let added = events.iter().filter(|(_, t)| t == "context_added").count();
+            let lost = PER_ROUND - added;
+            assert_eq!(
+                lost, 0,
+                "round {round}: concurrent appends vanished: {lost} of {PER_ROUND}"
+            );
+            let seqs: Vec<u64> = events.iter().map(|(s, _)| *s).collect();
+            let want: Vec<u64> = (1..=seqs.len() as u64).collect();
+            assert_eq!(seqs, want, "round {round}: seqs are not contiguous");
+        }
     }
 }

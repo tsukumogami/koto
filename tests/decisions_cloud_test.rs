@@ -402,3 +402,73 @@ fn a_host_with_no_local_copy_and_a_workspace_read_list_the_decisions() {
     );
     assert_ne!(refused.code, Some(0));
 }
+
+#[test]
+fn the_open_reads_make_no_request_under_the_cloud_backend() {
+    let s3 = FakeS3::start(BUCKET);
+    let shared = tempfile::TempDir::new().unwrap();
+    let ws = workspace(shared.path());
+    let host = Host::new(&s3);
+    host.ok(&ws, &["init", "director", "--template", TEMPLATE_FILE]);
+    host.ok(
+        &ws,
+        &[
+            "init",
+            NAME,
+            "--template",
+            TEMPLATE_FILE,
+            "--dispatched-by",
+            "director",
+        ],
+    );
+    let q = host.ok(
+        &ws,
+        &[
+            "decisions",
+            "record",
+            NAME,
+            "--kind",
+            "escalate",
+            "--outcome",
+            "escalated",
+            "--subject",
+            "question=q1",
+            "--subject",
+            "text=which?",
+            "--subject",
+            "recipient=session:director",
+            "--by",
+            "session",
+        ],
+    );
+    let id = q["id"].as_str().unwrap();
+    host.ok(
+        &ws,
+        &[
+            "decisions",
+            "readdress",
+            NAME,
+            id,
+            "--in",
+            "director",
+            "--to",
+            "person:owner",
+            "--by",
+            "session",
+        ],
+    );
+
+    s3.clear_requests();
+    let at = host.ok(&ws, &["decisions", "open", "--at", "director"]);
+    assert_eq!(at["questions"].as_array().unwrap().len(), 1, "{at}");
+    let person = host.ok(&ws, &["decisions", "open", "--person", "owner"]);
+    assert_eq!(person["questions"].as_array().unwrap().len(), 1, "{person}");
+    assert!(
+        s3.requests().is_empty(),
+        "an open read reached the bucket: {:?}",
+        s3.requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.key))
+            .collect::<Vec<_>>()
+    );
+}

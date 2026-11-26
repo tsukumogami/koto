@@ -3,6 +3,8 @@
 pub mod advance;
 pub mod atomic_fs;
 pub mod audit;
+#[cfg(unix)]
+pub mod background;
 pub mod batch_validation;
 pub mod caps;
 #[cfg(unix)]
@@ -13,7 +15,7 @@ pub mod context_assign;
 pub mod decider;
 pub mod discovery;
 pub mod epoch;
-pub mod errors;
+pub use koto_session_reader::engine::errors;
 pub mod evidence;
 pub mod jsonl_append;
 pub mod leg_pointer;
@@ -31,7 +33,7 @@ pub mod supersede_chain;
 pub mod template_source_status;
 pub mod terminal_index;
 pub mod terminal_result;
-pub mod types;
+pub use koto_session_reader::engine::types;
 pub mod variables;
 #[cfg(unix)]
 pub mod wake;

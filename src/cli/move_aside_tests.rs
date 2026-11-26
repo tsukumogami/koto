@@ -260,6 +260,16 @@ impl Store {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
+                } else if p.file_name()
+                    == Some(std::ffi::OsStr::new(
+                        crate::engine::persistence::APPEND_LOCK_FILE,
+                    ))
+                {
+                    // The append lock's sidecar holds no data. A header
+                    // rewrite takes the lock, so it creates the file, and
+                    // removing it on rollback would race another writer
+                    // waiting on it. It isn't part of what a restore restores.
+                    continue;
                 } else {
                     out.insert(
                         p.strip_prefix(&self.base).unwrap().to_path_buf(),

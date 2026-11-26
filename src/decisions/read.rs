@@ -82,6 +82,23 @@ fn session_id(backend: &Backend, session: &str, remote: bool) -> Option<String> 
     }
 }
 
+/// The session id `session`'s copy was imported from, as its
+/// `koto/imported-from` records it in this host's copy. A body carrying
+/// that id was carried by the import and reads as the session's own.
+fn imported_from_id(backend: &Backend, session: &str) -> Option<String> {
+    let path = backend
+        .session_dir(session)
+        .join("ctx")
+        .join(crate::session::hierarchy::IMPORTED_FROM_KEY);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let record: crate::session::hierarchy::ImportedFrom = serde_json::from_slice(&bytes).ok()?;
+    Some(record.from_session_id).filter(|id| !id.is_empty())
+}
+
 /// Every decision in `session`'s two areas, readable or not, after the
 /// integrity checks: a file whose name isn't a decision id, an id in both
 /// areas, a body that doesn't parse or whose own id, session name or
@@ -104,6 +121,7 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
         return vec![unreadable(None, problem)];
     }
     let own_id = session_id(backend, session, remote);
+    let imported_id = imported_from_id(backend, session);
 
     let mut seen_in: std::collections::BTreeMap<String, Vec<Area>> = Default::default();
     for f in &listing.found {
@@ -142,26 +160,40 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
                 if body.id != f.name {
                     return Err("the body's id isn't its file name".to_string());
                 }
-                if body.session.name != session {
+                // A body an import carried names the source session.
+                let carried = imported_id.as_deref() == Some(body.session.id.as_str());
+                if body.session.name != session && !carried {
                     return Err("the body names another session".to_string());
                 }
-                if own_id.as_deref().is_some_and(|id| id != body.session.id) {
+                if !carried && own_id.as_deref().is_some_and(|id| id != body.session.id) {
                     return Err("the body's session id isn't the session's".to_string());
                 }
                 match &f.area {
                     Area::Aimed(target) => {
-                        if body.kind != "reverse" {
-                            return Err("an aimed decision isn't a reversal".to_string());
-                        }
+                        let what = match body.kind.as_str() {
+                            "reverse" => "reversal",
+                            "answer" => "answer",
+                            "readdress" => "pass-up",
+                            _ => {
+                                return Err("an aimed decision is neither a reversal, an \
+                                            answer nor a pass-up"
+                                    .to_string())
+                            }
+                        };
                         if body.target.as_ref().is_none_or(|t| &t.id != target) {
-                            return Err(
-                                "the reversal's target isn't the session it is filed under"
-                                    .to_string(),
-                            );
+                            return Err(format!(
+                                "the {what}'s target isn't the session it is filed under"
+                            ));
                         }
                     }
                     Area::Decisions if body.kind == "reverse" => {
                         return Err("a reversal sits outside koto/aimed/".to_string());
+                    }
+                    Area::Decisions if body.kind == "answer" => {
+                        return Err("an answer sits outside koto/aimed/".to_string());
+                    }
+                    Area::Decisions if body.kind == "readdress" => {
+                        return Err("a pass-up sits outside koto/aimed/".to_string());
                     }
                     Area::Decisions => {}
                 }
@@ -187,11 +219,20 @@ pub struct Filters {
     pub until: Option<String>,
     pub run_mode: Option<String>,
     pub defaulted: Option<bool>,
+    /// Only reversals whose standing path holds a supersede hop from this
+    /// fenced session (R41).
+    pub fenced: Option<String>,
 }
 
 impl Filters {
     pub fn matches(&self, body: &DecisionBody) -> bool {
-        self.kind.as_deref().is_none_or(|k| body.kind == k)
+        self.fenced.as_deref().is_none_or(|f| {
+            body.kind == "reverse"
+                && body
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| p.iter().any(|s| s.is_hop() && s.session == f))
+        }) && self.kind.as_deref().is_none_or(|k| body.kind == k)
             && self
                 .decider
                 .as_deref()
@@ -222,37 +263,47 @@ impl Filters {
 /// Sort entries by time, then session, then id; unreadable entries,
 /// which have no time, go last in session and id order.
 pub fn sort(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        let key = |e: &Entry| match e {
-            Entry::Decision(body) => (
-                0,
-                body.time.clone(),
-                body.session.name.clone(),
-                body.id.clone(),
-            ),
-            Entry::Unreadable { session, id, .. } => (
-                1,
-                String::new(),
-                session.clone(),
-                id.clone().unwrap_or_default(),
-            ),
-        };
-        key(a).cmp(&key(b))
-    });
+    entries.sort_by_key(sort_key);
+}
+
+/// The key [`sort`] orders entries by: readable ones first, by time, then
+/// the recording session's name, then id.
+pub fn sort_key(e: &Entry) -> (u8, String, String, String) {
+    match e {
+        Entry::Decision(body) => (
+            0,
+            body.time.clone(),
+            body.session.name.clone(),
+            body.id.clone(),
+        ),
+        Entry::Unreadable { session, id, .. } => (
+            1,
+            String::new(),
+            session.clone(),
+            id.clone().unwrap_or_default(),
+        ),
+    }
 }
 
 /// The sessions in the local store whose chain, walked now, includes
 /// `root`: every session below it, through any number of finished
 /// sessions in between. Sorted by name.
+///
+/// `root` stands in the position of each fenced session whose confirmed
+/// supersede hops reach it (R39), so the sessions below those are below
+/// `root` too. The successor's own links add nothing here beyond its own
+/// chain walk.
 pub fn sessions_below(backend: &Backend, root: &str) -> Vec<String> {
-    local_sessions(backend)
-        .into_iter()
+    let all = local_sessions(backend);
+    let mut roots = chain::predecessors(backend, &all, root);
+    roots.push(root.to_string());
+    all.into_iter()
         .filter(|n| n != root)
         .filter(|n| {
             chain::snapshot(backend, n)
                 .links
                 .iter()
-                .any(|l| l.session == root)
+                .any(|l| roots.contains(&l.session))
         })
         .collect()
 }

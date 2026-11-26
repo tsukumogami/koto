@@ -20,7 +20,7 @@ pub const MAX_REASON_BYTES: usize = 4 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 64;
 
 /// The closed set of kinds and, for each, its closed set of outcomes (R1).
-pub const KINDS: [(&str, &[&str]); 9] = [
+pub const KINDS: [(&str, &[&str]); 11] = [
     ("accept", &["accepted", "rejected"]),
     ("merge", &["merged"]),
     ("gate-pass", &["passed"]),
@@ -30,6 +30,8 @@ pub const KINDS: [(&str, &[&str]); 9] = [
     ("verdict", &["pass", "fail", "inconclusive"]),
     ("reverse", &["reversed"]),
     ("refused", &["refused"]),
+    ("answer", &["answered"]),
+    ("readdress", &["passed"]),
 ];
 
 /// The outcomes `kind` allows, or `None` for a kind outside R1's set.
@@ -104,6 +106,10 @@ pub struct DecisionBody {
     /// a race (R18, R19).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// The question prompt a person's `answer` was checked against, with
+    /// koto's verified mark (R62 to R68). Only a person's answer has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<super::prompt::Prompt>,
 }
 
 /// The decision a reversal is aimed at.
@@ -176,6 +182,34 @@ impl DecisionBody {
                 return Err("a reversal's body lacks its target, standing or path".to_string());
             }
         }
+        if body.kind == "answer"
+            && body
+                .target
+                .as_ref()
+                .is_none_or(|t| !is_decision_id(&t.decision))
+        {
+            return Err("an answer's body lacks the question it answers".to_string());
+        }
+        if body.kind == "readdress"
+            && body
+                .target
+                .as_ref()
+                .is_none_or(|t| !is_decision_id(&t.decision))
+        {
+            return Err("a pass-up's body lacks the question it passes up".to_string());
+        }
+        if let Some(p) = &body.prompt {
+            let person = matches!(body.decider, super::decider::Decider::Person { .. });
+            if body.kind != "answer" || !person {
+                return Err("only a person's answer carries a question prompt".to_string());
+            }
+            if p.mark.value != super::prompt::VERIFIED
+                || p.mark.source != super::decider::Source::Observed
+                || p.position == 0
+            {
+                return Err("an answer's question prompt isn't one koto verified".to_string());
+            }
+        }
         Ok(body)
     }
 }
@@ -231,7 +265,7 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
     }];
     const ESCALATE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text", "recipient"],
-        optional: &[],
+        optional: &["packet"],
     }];
     const DECLINE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text"],
@@ -260,6 +294,18 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
         required: &["kind", "subject"],
         optional: &[],
     }];
+    // The question answered, by its raising session's name and the
+    // escalation's id, and the answer's text.
+    const ANSWER: &[SubjectShape] = &[SubjectShape {
+        required: &["session", "id", "text"],
+        optional: &[],
+    }];
+    // The question passed up, by its raising session's name and the
+    // escalation's id, and the typed recipient it now waits on.
+    const READDRESS: &[SubjectShape] = &[SubjectShape {
+        required: &["session", "id", "recipient"],
+        optional: &[],
+    }];
     match kind {
         "accept" => ACCEPT,
         "merge" => MERGE,
@@ -270,6 +316,8 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
         "verdict" => VERDICT,
         "reverse" => REVERSE,
         "refused" => REFUSED,
+        "answer" => ANSWER,
+        "readdress" => READDRESS,
         _ => &[],
     }
 }
@@ -364,6 +412,20 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
         ));
     }
 
+    if req.kind == "escalate" {
+        if let Some(r) = given.get("recipient").and_then(|v| v.first()) {
+            check_recipient(r)?;
+        }
+        if let Some(p) = given.get("packet").and_then(|v| v.first()) {
+            if !super::packets::is_hash(p) {
+                return Err(DecisionError::invalid(
+                    "subject.packet",
+                    "subject field 'packet' is the question content's hash, sha256: and 64 \
+                     lowercase hex characters",
+                ));
+            }
+        }
+    }
     if req.kind == "verdict" && req.evidence.is_empty() {
         return Err(DecisionError::invalid(
             "evidence",
@@ -521,6 +583,16 @@ pub fn validate_stored(
             "a reversal isn't stored in koto/decisions/".to_string(),
         ));
     }
+    if parsed.kind == "answer" {
+        return Err(invalid(
+            "an answer isn't stored in koto/decisions/".to_string(),
+        ));
+    }
+    if parsed.kind == "readdress" {
+        return Err(invalid(
+            "a pass-up isn't stored in koto/decisions/".to_string(),
+        ));
+    }
     let mut subject = Vec::new();
     for (field, value) in &parsed.subject {
         match (field.as_str(), value) {
@@ -574,6 +646,74 @@ pub fn validate_stored(
         ));
     }
     Ok(())
+}
+
+/// The prefixes that type an escalation's recipient.
+pub const RECIPIENT_KINDS: [&str; 3] = ["session", "anchor", "person"];
+
+/// An escalation's recipient as it reads back: typed when the stored value
+/// is `session:<name>`, `anchor:<name>` or `person:<handle>` with a name or
+/// handle koto accepts, and untyped otherwise, which every recipient
+/// written before the types existed is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recipient {
+    Session(String),
+    Anchor(String),
+    Person(String),
+    Untyped(String),
+}
+
+impl Recipient {
+    pub fn parse(value: &str) -> Self {
+        let typed = value.split_once(':').and_then(|(kind, rest)| match kind {
+            "session" if crate::discover::validate_workflow_name(rest).is_ok() => {
+                Some(Recipient::Session(rest.to_string()))
+            }
+            "anchor" if crate::discover::validate_workflow_name(rest).is_ok() => {
+                Some(Recipient::Anchor(rest.to_string()))
+            }
+            "person" if super::decider::check_handle("recipient", rest).is_ok() => {
+                Some(Recipient::Person(rest.to_string()))
+            }
+            _ => None,
+        });
+        typed.unwrap_or_else(|| Recipient::Untyped(value.to_string()))
+    }
+
+    /// The recipient as `show`, `list` and `open` print it: the kind and
+    /// the name or handle as separate fields, so a caller compares fields
+    /// and never splits the stored string.
+    pub fn to_json(&self) -> Value {
+        use serde_json::json;
+        match self {
+            Recipient::Session(n) => json!({"typed": true, "kind": "session", "name": n}),
+            Recipient::Anchor(n) => json!({"typed": true, "kind": "anchor", "name": n}),
+            Recipient::Person(h) => json!({"typed": true, "kind": "person", "handle": h}),
+            Recipient::Untyped(v) => json!({"typed": false, "value": v}),
+        }
+    }
+}
+
+/// Refuse a recipient that names a type but whose name or handle koto
+/// doesn't accept, so a typed recipient is never stored as untyped by
+/// mistake. A value with no type prefix is accepted as it always was.
+fn check_recipient(value: &str) -> Result<(), DecisionError> {
+    let Some((kind, _)) = value.split_once(':') else {
+        return Ok(());
+    };
+    if !RECIPIENT_KINDS.contains(&kind) || !matches!(Recipient::parse(value), Recipient::Untyped(_))
+    {
+        return Ok(());
+    }
+    let wants = if kind == "person" {
+        "a handle of 1 to 256 bytes with no control characters"
+    } else {
+        "a session name"
+    };
+    Err(DecisionError::invalid(
+        "subject.recipient",
+        format!("a '{kind}:' recipient needs {wants} after the prefix"),
+    ))
 }
 
 /// A short, printable preview of caller input for an error message.

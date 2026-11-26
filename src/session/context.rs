@@ -56,11 +56,13 @@ pub fn is_pin_record_key(key: &str) -> bool {
 /// A host-local key is written to the local store only, no manifest pushed
 /// to the bucket names it, and an import skips it, even when a manifest an
 /// older koto pushed lists it. The destination resolves its own value on its
-/// first commit. The one such key is `workflows/publish-location`, which
-/// names a Claude Code `/workflows` folder on this host and is meaningless
-/// on any other.
+/// first commit. There are two such keys: `workflows/publish-location`,
+/// which names a Claude Code `/workflows` folder on this host and is
+/// meaningless on any other, and `workflows/publish-explicit`, which marks
+/// that same folder as set with `koto workflows publish`.
 pub fn is_host_local_key(key: &str) -> bool {
     key == crate::workflows_surface::PUBLISH_LOCATION_KEY
+        || key == crate::workflows_surface::EXPLICIT_LOCATION_KEY
 }
 
 /// Content store for workflow context artifacts.
@@ -117,6 +119,22 @@ pub trait ContextStore: Send + Sync {
     ) -> anyhow::Result<()> {
         crate::session::links::check_writer_key(key, writer)?;
         self.add(session, key, content)
+    }
+
+    /// [`add_with_writer`](Self::add_with_writer) for a caller that must
+    /// know the key reached every copy the store keeps, as `koto context
+    /// add` must: a store that keeps a remote copy fails, naming the key,
+    /// when the remote copy isn't confirmed, where `add_with_writer` only
+    /// warns (koto#646). The local write stands either way. The default
+    /// is `add_with_writer`, for a store that keeps one copy.
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_with_writer(session, key, content, writer)
     }
 
     /// The stored metadata for `key`, or `None` when the key is absent, fails
@@ -216,6 +234,7 @@ mod tests {
         let mut manifest = Manifest::default();
         for key in [
             "workflows/publish-location",
+            "workflows/publish-explicit",
             "workflows/other",
             "batch_final_view",
         ] {
@@ -227,6 +246,21 @@ mod tests {
             ["batch_final_view", "workflows/other"]
         );
         assert!(!manifest.drop_host_local());
+    }
+
+    #[test]
+    fn both_workflows_location_keys_are_host_local() {
+        for key in ["workflows/publish-location", "workflows/publish-explicit"] {
+            assert!(is_host_local_key(key), "{key}");
+        }
+        for key in [
+            "workflows/other",
+            "workflows/publish-location/x",
+            "workflows",
+            "notes.md",
+        ] {
+            assert!(!is_host_local_key(key), "{key}");
+        }
     }
 
     #[test]

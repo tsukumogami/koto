@@ -30,10 +30,10 @@ The bucket, endpoint and credentials still come from the environment or the othe
 `koto session dir --json`, with no session name, reports what koto resolved without building a backend, making a request or writing anything:
 
 ```json
-{"root": "/tmp/tmp.x1/koto", "backend": "local", "backend_source": "default", "backend_ignored": "KOTO_SESSION_BACKEND"}
+{"root": "/tmp/tmp.x1/koto", "backend": "local", "backend_source": "default", "backend_ignored": "KOTO_SESSION_BACKEND", "sessions": "/tmp/tmp.x1/koto/sessions"}
 ```
 
-`root` is the koto root. `backend` is `local` or `cloud`. `backend_source` says where the backend came from: `default`, `user-config` (the root's `config.toml`), `project-config` or `env`. `bucket` appears for the cloud backend. `backend_ignored` appears when `KOTO_HOME` kept the run off a cloud backend another layer asked for, and names that layer. A test harness can check `root` and `backend` before running anything else. Bare `koto session dir` still prints the root alone. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache moves to `$KOTO_HOME/cache` when `KOTO_HOME` is set; unset, it stays at `$XDG_CACHE_HOME/koto` (or `~/.cache/koto`).
+`root` is the koto root. `backend` is `local` or `cloud`. `backend_source` says where the backend came from: `default`, `user-config` (the root's `config.toml`), `project-config` or `env`. `sessions` is the sessions directory that backend keeps on this host: `<root>/sessions`, or `KOTO_SESSIONS_BASE` when that is set on the local backend. It is what a program reading koto's store with `koto-session-reader` gets from `sessions_dir`, and computing it creates nothing. `bucket` appears for the cloud backend. `backend_ignored` appears when `KOTO_HOME` kept the run off a cloud backend another layer asked for, and names that layer. A test harness can check `root` and `backend` before running anything else. Bare `koto session dir` still prints the root alone. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache moves to `$KOTO_HOME/cache` when `KOTO_HOME` is set; unset, it stays at `$XDG_CACHE_HOME/koto` (or `~/.cache/koto`).
 
 Older koto versions namespaced sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`). koto migrates that layout on first use. A name that was reused across repositories has several old-layout sources and one flat destination, so only one of them can keep the name; the rest are moved aside into `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and are not listed until you restore them. See [session recover](#session-recover).
 
@@ -151,27 +151,29 @@ koto init <succ> --template <path> --continues <pred> --supersede [--carry <pref
 
 The command works in five steps, and the successor's session id is chosen before anything is written:
 
-1. **Check.** koto reads `<pred>`'s log. If `<pred>` is already superseded by `<succ>`, this is a re-run and it goes straight to step 3. If it's superseded by another session, or `--expect-state` names a state `<pred>` isn't in, or the command would loop, it refuses with nothing written.
-2. **Fence.** koto appends a `session_superseded` event to `<pred>`'s own log: `{"by", "by_session_id", "actor": {"claude_session", "host", "user"}, "at"}`, naming the successor by name and session id and recording who ran the command (`CLAUDE_CODE_SESSION_ID`, the host name, and `USER` or `LOGNAME`). The append takes the same per-append lock every write to that log takes, and waits for it at most 10 seconds. The log is checked again under the lock, so when two successors race for one predecessor the first append wins and the second is refused.
+1. **Check.** koto reads `<pred>`'s log. If `<pred>` is already superseded by `<succ>`, this is a re-run: it writes the supersede marker if an earlier run stopped before writing it, and goes on to step 3. If it's superseded by another session, or `--expect-state` names a state `<pred>` isn't in, or the command would loop, it refuses with nothing written.
+2. **Fence.** koto appends a `session_superseded` event to `<pred>`'s own log: `{"by", "by_session_id", "actor": {"claude_session", "host", "user"}, "at"}`, naming the successor by name and session id and recording who ran the command (`CLAUDE_CODE_SESSION_ID`, the host name, and `USER` or `LOGNAME`). Before the append koto takes `<pred>`'s context manifest lock, the one every context and decision write in `<pred>` takes, and reads the highest decision id `<pred>` holds under it. The append then takes the same per-append lock every write to that log takes, inside the manifest lock. koto waits for each lock at most 10 seconds. The log is checked again under the lock, so when two successors race for one predecessor the first append wins and the second is refused.
+
+   Then koto writes the supersede marker, `koto/superseded-by`, in `<pred>`: `{"v": 1, "successor": {"name", "id"}, "actor", "time", "decisions_through"}`, naming `<succ>` by name and session id, with the fence's actor and time, and the highest decision id it read (12 digits) or `null` when `<pred>` held none. The marker is write-once: it's published create-only, sits outside the context manifest (so `koto context list` doesn't show it), and `koto context add` and `koto context remove` refuse it for every writer. A `<pred>` holding decision files koto can't read is refused `persistence_error` before the fence, since the marker couldn't say which decisions came before it. If the marker can't be written, the command exits 3 `persistence_error` before `<succ>` is created; running it again writes the marker and finishes. [`koto decisions chain`](#decisions-chain) reads it.
 3. **Create.** koto creates `<succ>` with its continues relation, as plain `--continues` does, unless an earlier run of the same command already created it.
 4. **Carry.** For each `--carry <prefix>` (repeatable), koto copies every context key of `<pred>` starting with `<prefix>` into `<succ>`. The match is a plain string prefix, as [`koto context list --prefix`](#context-list) matches it, so `--carry taken_legs` takes `taken_legs/a` and `taken_legs.idx` alike. A key `<succ>` already holds with the same value is skipped, keys under `koto/` are never carried, and reading `<pred>` for the carry logs no read in it. Each copied key is written with writer `koto` and logged as a `context_added` event in `<succ>`. Then koto writes `koto/superseded-carry-complete` in `<succ>`; a later run that finds it carries nothing.
 5. **Ring.** koto rings `<pred>`'s wake file once, best-effort, so anything waiting on it looks again.
 
 Nothing is created before the fence, so a refusal leaves both sessions as they were. Running the same command again finishes a run that was interrupted (a crash after the fence creates `<succ>` with the session id the fence recorded) or, when everything is done, changes nothing and reports `"outcome": "unchanged"`.
 
-**Under the cloud backend.** `<pred>` usually lives under another workspace's bucket prefix (name it with `--continues-from <workspace>` when this directory holds no copy of it), and `<succ>` lives under this directory's. Steps 1 and 2 work on the bucket's copy of `<pred>`, not on a local one: koto pulls `<pred>`'s state file from its prefix along with its ETag, checks that copy, and pushes it back with the fence appended as a PUT conditional on that ETag (`If-Match`), the conditional write every cloud state push makes. If the bucket refuses that push (`<pred>` moved since the pull), the push fails, or the bucket doesn't support conditional writes, the command exits 3 `fence_unavailable` with nothing written in either prefix; it never falls back to an unconditional write. When two successors race, the first push wins; the other's push is refused, it reads the winner's fence and refuses `superseded_by`. In step 4 koto reads `<pred>`'s context manifest from its prefix once, skips each key this host's copy of `<succ>` already holds with the hash the manifest gives it (the skip trusts only this host's store, never `<succ>`'s copy in the bucket), and reads the rest eight at a time, each read asked again on a transient failure and each value checked against its manifest hash. Each batch of eight is written into `<succ>` as it lands, and when every key is in, the marker is written last and everything goes up under this directory's prefix as one push. A carry that stops partway pushes the keys it wrote, without the marker, once and best-effort, and refuses `carry_incomplete`; running the same command again skips the keys it holds and reads only what's left.
+**Under the cloud backend.** `<pred>` usually lives under another workspace's bucket prefix (name it with `--continues-from <workspace>` when this directory holds no copy of it), and `<succ>` lives under this directory's. Steps 1 and 2 work on the bucket's copy of `<pred>`, not on a local one: koto pulls `<pred>`'s state file from its prefix along with its ETag, checks that copy, lists `<pred>`'s decision objects under that prefix for the marker's `decisions_through`, and pushes it back with the fence appended as a PUT conditional on that ETag (`If-Match`), the conditional write every cloud state push makes. The supersede marker then goes up beside `<pred>`'s state object as a create-only PUT (`If-None-Match: *`); a marker already there is left alone. If the decision listing fails, the bucket refuses that push (`<pred>` moved since the pull), the push fails, or the bucket doesn't support conditional writes, the command exits 3 `fence_unavailable` with nothing written in either prefix; it never falls back to an unconditional write. When two successors race, the first push wins; the other's push is refused, it reads the winner's fence and refuses `superseded_by`. In step 4 koto reads `<pred>`'s context manifest from its prefix once, skips each key this host's copy of `<succ>` already holds with the hash the manifest gives it (the skip trusts only this host's store, never `<succ>`'s copy in the bucket), and reads the rest eight at a time, each read asked again on a transient failure and each value checked against its manifest hash. Each batch of eight is written into `<succ>` as it lands, and when every key is in, the marker is written last and everything goes up under this directory's prefix as one push. A carry that stops partway pushes the keys it wrote, without the marker, once and best-effort, and refuses `carry_incomplete`; running the same command again skips the keys it holds and reads only what's left.
 
-What each prefix gets: under `<pred>`'s, its state file with the fence appended, the one conditional write, and the back-reference plain `--continues` puts beside a predecessor; under `<succ>`'s, `<succ>` itself with its relation, the carried keys and the marker. So the host running the command needs write access to both prefixes. A host holding a copy of `<pred>` refuses writes to it once it pulls the fence: `koto context add` and every log append check the fence after their pull, and a push from a copy that predates the fence is refused `session_superseded` rather than reported as a conflict. A copy of `<pred>` on the host that ran the command takes the fence at once.
+What each prefix gets: under `<pred>`'s, its state file with the fence appended, the one conditional write, the supersede marker, and the back-reference plain `--continues` puts beside a predecessor; under `<succ>`'s, `<succ>` itself with its relation, the carried keys and the marker. So the host running the command needs write access to both prefixes. A host holding a copy of `<pred>` refuses writes to it once it pulls the fence: `koto context add` and every log append check the fence after their pull, and a push from a copy that predates the fence is refused `session_superseded` rather than reported as a conflict. A copy of `<pred>` on the host that ran the command takes the fence at once.
 
 Names read from `<pred>`'s log or the bucket are checked before koto builds a path or key from them: a fence naming an invalid session refuses `invalid_fence` (exit 2), and a manifest naming an invalid key fails the carry as `carry_incomplete` with `failure` `invalid_source` (exit 3), before any key is read.
 
 **Output (JSON):**
 
 ```json
-{"name":"coord-2","state":"plan","outcome":"superseded","superseded":"coord-1","carried":9,"forward":"coord-2"}
+{"name":"coord-2","state":"plan","outcome":"superseded","superseded":"coord-1","carried":9,"forward":"coord-2","marker":"written"}
 ```
 
-`outcome` is `superseded` on the run that wrote the fence and `unchanged` on a re-run; `carried` counts the keys this run copied.
+`outcome` is `superseded` on the run that wrote the fence and `unchanged` on a re-run; `carried` counts the keys this run copied. `marker` is `written` when this run wrote the supersede marker, `present` when one was already there, and `unreadable` when one was there that koto can't read; an existing marker is never replaced.
 
 **After the fence.** koto refuses every attempt to drive `<pred>`: `koto next`, `koto context add` and `koto context remove`, `koto decisions record`, `koto overrides record`, `koto rewind`, `koto cancel`, and any other append to its log. The refusal has error code `session_superseded`, exits 2, writes nothing (a `koto context add` doesn't store the value either), and names the newest session in the chain, found by following each session's fence forward (up to 64 hops). It carries `superseded_by` (the direct successor), `newest` and the fence's `actor`. `koto next` prints it in its usual error shape:
 
@@ -192,7 +194,8 @@ Reads keep working: `koto context get`, `koto context exists`, `koto context lis
 | `session_exists` | 2 | `<succ>` exists and no earlier run of this command opened it. |
 | `invalid_fence` | 2 | `<pred>`'s log already holds a fence naming a session or session id koto doesn't accept. |
 | `invalid_usage` | 2 | `--supersede` with `--parent`, `--from-stdin`, `--attach-live`, `--replace-terminal` or `--koto-leg`, or a `--carry` prefix under `koto/`. `--carry` and `--expect-state` require `--supersede`, which requires `--continues`. |
-| `fence_unavailable` | 3 | `<pred>`'s log stayed locked by another writer for 10 seconds, or, under the cloud backend, the bucket refused or failed the fence's conditional push, can't write conditionally, or holds no copy of `<pred>`. Run the command again. |
+| `fence_unavailable` | 3 | `<pred>`'s context manifest or log stayed locked by another writer for 10 seconds, or, under the cloud backend, its decisions couldn't be listed, or the bucket refused or failed the fence's conditional push, can't write conditionally, or holds no copy of `<pred>`. Run the command again. |
+| `persistence_error` | 3 | `<pred>`'s log or decision files can't be read, or the fence can't be written; nothing was written. Or the fence is in place but the supersede marker couldn't be written; `<succ>` wasn't created, and running the same command again writes the marker and finishes. |
 | `carry_incomplete` | 1 or 3 | Cloud backend only: `<pred>` is fenced and `<succ>` exists, but the carry stopped before its marker reached the bucket. The body carries `superseded`, `name`, `failure`, `retryable`, `keys` (the keys `<pred>`'s manifest names for the carry), `held` (how many of them `<succ>` holds on this host, already held or written by this run), `remaining` (`keys` minus `held`) and `carried` (this run's writes). `failure` is `unreachable`, `timeout` or `throttled` (a bucket read failed), `push_failed` (every key and the marker are written, but the push failed), `denied` (a read was answered 401 or 403), `invalid_source` (`<pred>`'s manifest or a value in the bucket doesn't check out) or `write_failed` (a write into this host's copy of `<succ>` failed). The first four are retryable and exit 1; the rest exit 3. When the manifest itself couldn't be read or trusted, `keys`, `held` and `remaining` are left out and `carried` is 0. The `error` text names at most the key that stopped the carry, never the bucket's own error text. Run the same command again to finish the carry. |
 
 The checks plain `--continues` makes on `<pred>` (the session-name rule, a session that exists, not an anchor or close record) refuse as they do there.
@@ -215,6 +218,14 @@ koto next <name> [--with-data @<file>] [--to <target>] [--no-cleanup]
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 
 **Agent-session anchor.** `koto next` reads `KOTO_ANCHOR` the way [init](#init) does: a held-by link to the named anchor in the ticked session when it has none, the same successor rule, and a throttled `anchor_activity` event in the anchor. A second tick under the same anchor adds no link; a tick under another anchor adds a second one. A nested tick writes nothing. `koto next` on an anchor or an anchor's close session is refused with `precondition_failed` (exit 2) and changes nothing.
+
+**Questions.** When the session's run (the session and the predecessors it continues through `--continues --supersede`) raised a question with `koto decisions record --kind escalate`, and the question has an answer no decision in the run cites yet, the response carries a top-level `questions` array, one element per such question:
+
+```json
+"questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","state":"answered","answer":{"session":"B","id":"000000000001","text":"SQLite","decider":{"kind":"session",...},"run_mode":{"source":"observed","value":"unknown"},"time":"2026-11-26T14:35:45.667Z"}}]
+```
+
+`identity` is the asking session's id and the question's decision id; `answer` is the entry [decisions answer](#decisions-answer) recorded. The array repeats on every call, a terminal workflow's included, until a decision in the run names the answer in its `basis` (`--basis B:<answer id>`), recorded after the answer. Reading it writes nothing, makes no network call and never blocks or changes the exit code. A response with nothing to report has no `questions` key.
 
 **Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all; when that cap leaves warnings out, the response also carries `advisories_truncated: true` (absent otherwise). A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
 
@@ -842,8 +853,9 @@ koto session anchor close --key=<key> --harness-session=<id>
 - `--source clear` (a `/clear` gives the agent session a new id) looks for the anchor the same process ran before: among `anchor-*` sessions whose log changed since the start time in the token `<host>:<pid>:<epoch-start>`, newest first, the first whose `anchor_started` carries the token's digest. On a match the new anchor holds a dispatched-by link to it and copies its observed marker, and the output adds `previous=<name>` and `inherit_until=<rfc3339>`, three minutes on. No match opens an unlinked anchor.
 - `--source resume` with no anchor of its own looks for a predecessor through hints only: an anchor whose `anchor_started` recorded the same transcript path digest, or else the current anchor of the family whose harness id is the transcript path's stem. On a match the new anchor holds a dispatched-by link to it; it never copies the predecessor's marker. No match opens a fresh anchor. The hint never replaces the name match.
 - `--dispatched-by` is written as a dispatched-by link only when the open creates an anchor; on a continue it goes into the event alone. `--observed-key` is written as the observed marker, `koto/anchor/observed`, only when the anchor has none.
+- An open that creates an anchor records its origin in that `anchor_started` event: `dispatched` by the `--dispatched-by` name, `none` when the flag is absent or empty, or `unrecorded` with a fixed reason. The dispatcher value never refuses the open: a value over 256 bytes or not a valid session name creates the anchor and records `malformed: not an anchor name`, and one naming the anchor itself (or its family's first anchor) records `self: names this anchor`; neither becomes a link. When the dispatched-by link write fails after the anchor exists, the open appends one `origin_unrecorded` event (`link write failed: store error`, never the store's error text) and still succeeds. `dispatched` records what the starting environment claimed; it isn't authenticated.
 
-Prints `anchor=<name>`, `opened=new|continued|reopened|successor` and `observed=yes|no`, plus `previous=` and `inherit_until=` after a `clear` that found its predecessor.
+Prints `anchor=<name>`, `opened=new|continued|reopened|successor` and `observed=yes|no`, then `origin=dispatched|none|unrecorded` when the open created the anchor, plus `previous=` and `inherit_until=` after a `clear` that found its predecessor.
 
 **observe.** Writes an observed marker into the named anchor and nowhere else: `--key` writes the key given, `--inherit` copies the marker of the predecessor the anchor's own `anchor_started` recorded (nothing when that one has none yet). The anchor must have `kind: "anchor"`; an anchor that already holds a marker keeps it, so a repeat changes nothing. A key that doesn't match `^[A-Za-z0-9_-]{1,128}$` is refused. Prints `anchor=<name>` and `observed=yes|no`.
 
@@ -876,7 +888,7 @@ koto session anchor close --key=demo-key --harness-session=demo-1
 # closed=1
 ```
 
-**The koto-skills start hook.** With the koto-skills plugin, Claude Code runs `hooks/session-start.sh` at every start, resume, compaction and `/clear`. It opens `anchor-<session id>` with the agent process's token, the transcript path and the working directory, passing the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`) as `--dispatched-by`, and niwa's `NIWA_REAP_KEY` as `--observed-key` only when no `KOTO_ANCHOR` was inherited, so a process started from another agent session's shell never takes that session's key. It then replaces its own block, between `# >>> koto-skills` and `# <<< koto-skills`, in the hook's `CLAUDE_ENV_FILE`, which Claude Code sources before every shell command: `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'`, both naming the session's own anchor, then `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY`, so no shell of the session, and nothing it launches, carries an authority handed to the start (the open records that authority in the anchor). When the open fails, the block unsets both variables instead, so the shells never keep a dispatcher's anchor. When `CLAUDE_ENV_FILE` is unset, a symlink, or in another session's directory, nothing is written and the hook returns the `KOTO_ANCHOR` export line as `additionalContext`. On a start with no key (and a resume that opened a successor), a detached watcher reads, and never sources, the session's other env files for niwa's `export NIWA_REAP_KEY='<value>'` line for three minutes and runs `observe --key` with it; after a `/clear`, one runs `observe --inherit` until `inherit_until`. The hook always exits 0, and does nothing without koto or `jq`; with a koto that has no anchor verbs, or one that takes longer than 5 seconds and is cut off, it unsets both variables. Every koto call it makes, its watchers' included, keeps the `KOTO_SESSION_*` variables, so the anchor lives in the store the session's own koto commands use: the one those variables name, or the one koto's config files name when none is set. A cloud backend chosen through those variables alone puts the anchor in the bucket, where `koto session import` finds it, and so does a backend in a config file with the credentials in `KOTO_SESSION_CLOUD_ACCESS_KEY` and `KOTO_SESSION_CLOUD_SECRET_KEY`. The hook's block never sets a `KOTO_SESSION_*` variable. Don't run the anchor verbs yourself in such a session; `koto session hierarchy` says why a session is kept.
+**The koto-skills start hook.** With the koto-skills plugin, Claude Code runs `hooks/session-start.sh` at every start, resume, compaction and `/clear`. It opens `anchor-<session id>` with the agent process's token, the transcript path and the working directory, passing the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`) as `--dispatched-by`, whatever the value holds, cut to 256 bytes on a character boundary (koto decides whether it names an anchor and records the origin either way; when a koto from before the origin record refuses a value that isn't an anchor name, the hook opens again without it), and niwa's `NIWA_REAP_KEY` as `--observed-key` only when no `KOTO_ANCHOR` was inherited, so a process started from another agent session's shell never takes that session's key. It then replaces its own block, between `# >>> koto-skills` and `# <<< koto-skills`, in the hook's `CLAUDE_ENV_FILE`, which Claude Code sources before every shell command: `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'`, both naming the session's own anchor, then `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY`, so no shell of the session, and nothing it launches, carries an authority handed to the start (the open records that authority in the anchor). When the open prints no anchor because it took longer than 5 seconds and was cut off, or failed without a refusal, both variables name `anchor-<session id>`, the anchor family's first name, so a store slower than the hook's limit doesn't erase the dispatcher a worker launched from those shells records. Only a refused open (exit 2 with no `anchor=` line) makes the block unset both variables instead, so the shells never keep a dispatcher's anchor. When `CLAUDE_ENV_FILE` is unset, a symlink, or in another session's directory, nothing is written and the hook returns the `KOTO_ANCHOR` export line as `additionalContext`, and only for an anchor the open printed. On a start with no key (and a resume that opened a successor), a detached watcher reads, and never sources, the session's other env files for niwa's `export NIWA_REAP_KEY='<value>'` line for three minutes and runs `observe --key` with it; after a `/clear`, one runs `observe --inherit` until `inherit_until`. The watchers run only for an anchor the open printed. The hook always exits 0, and does nothing without koto or `jq`; with a koto that has no anchor verbs, which refuses the open, it unsets both variables. Every koto call it makes, its watchers' included, keeps the `KOTO_SESSION_*` variables, so the anchor lives in the store the session's own koto commands use: the one those variables name, or the one koto's config files name when none is set. A cloud backend chosen through those variables alone puts the anchor in the bucket, where `koto session import` finds it, and so does a backend in a config file with the credentials in `KOTO_SESSION_CLOUD_ACCESS_KEY` and `KOTO_SESSION_CLOUD_SECRET_KEY`. The hook's block never sets a `KOTO_SESSION_*` variable. Don't run the anchor verbs yourself in such a session; `koto session hierarchy` says why a session is kept.
 
 #### session hierarchy
 
@@ -925,6 +937,33 @@ A session holding a continues relation (see [continuing a session](#continuing-a
 When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`. Each anchor member also carries `last_activity`, the instant its idle close and stale report count from (`null` when it can't be read); the `hierarchy` object a prune entry carries leaves it out.
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
+
+#### session origin
+
+Shows which session dispatched a session: an anchor, or a workflow session.
+
+```bash
+koto session origin <name>
+```
+
+It prints one JSON object:
+
+```json
+{"session": "work-on-12", "via": "anchor-1f3c",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-9a07", "dispatcher_kind": "anchor"}}
+```
+
+`origin.state` is one of three values, and every one of them exits 0:
+
+- `dispatched` -- the starting environment named `dispatcher`, and the link that records it is there. `dispatcher_kind` says what the name is: `anchor` when the answer came through an anchor (the anchor of the agent session that dispatched it), `workflow` when it came from a dispatched-by link on the workflow session itself, as `koto init --dispatched-by` and `koto session link` write it. `dispatched` is a claim, not an authenticated fact: any process in the starting environment could have set the name.
+- `none` -- nothing named a dispatcher: the anchor was opened without `--dispatched-by` (or with an empty value), or the workflow session holds neither a dispatched-by nor a held-by link.
+- `unrecorded` -- a dispatcher may have been named and wasn't recorded. `named` is the bounded preview the record kept (empty when nothing was named) and `reason` a fixed text: the anchor's own `malformed: not an anchor name`, `self: names this anchor` or `link write failed: store error` (see [session anchor](#session-anchor)); `link not found` when the anchor's creating event names a dispatcher and holds no dispatched-by link to it; `anchor not found` when a workflow session's held-by link names an anchor the store no longer holds, or a session that isn't an anchor; and `recorded before koto tracked origin` for an anchor created by a koto that wrote no `origin` and whose creating event names no dispatcher, since its dispatcher may have been lost.
+
+For an anchor, `via` is the anchor itself, and the answer is the `origin` its creating `anchor_started` event recorded (the first one opened `new`, `reopened` or `successor`; a `continued` event never counts), read together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. Only the link to the named dispatcher counts, so a successor's link to its predecessor is never taken for its dispatcher's. An anchor with no `origin` reads as `dispatched` when its creating event's `dispatched_by` names a dispatcher with its link beside it.
+
+For a workflow session, a dispatched-by link of its own comes first, with `via` `null`. Otherwise the answer is the origin of the anchor its held-by link names, and `via` names that anchor. With several links of one kind, the one with the earliest `at` wins (for held-by, the link written when the session was opened). A link whose `at` can be read comes before one whose `at` can't, so a body damaged later never displaces the link written first, and links whose `at` is equal, or both unreadable, fall back to the lowest name.
+
+The command reads through the configured store backend, as `koto status` does, and writes nothing to it. Under the cloud backend it may refresh this host's copy of what it reads, as every read does, but it never pushes to the bucket: where `koto context get` would push this host's newer copy of a key, this command leaves it. A malformed name or a name with no session exits 2; a read that fails otherwise exits 3, a held-by anchor whose log is there but can't be read included, so a store that can't be read is never reported as a lost dispatcher.
 
 #### session cleanup
 
@@ -1333,8 +1372,10 @@ Unlike other template subcommands, export errors go to stderr as plain text (not
 
 The `config` subcommand group reads and writes koto's configuration. koto looks for config in two places, merged in this order (later wins):
 
-1. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
-2. **User config** -- `~/.koto/config.toml` (`$KOTO_HOME/config.toml` when `KOTO_HOME` is set). Machine-specific settings and credentials.
+1. **User config** -- `~/.koto/config.toml` (`$KOTO_HOME/config.toml` when `KOTO_HOME` is set). Machine-specific settings and credentials.
+2. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
+
+A key a trusted project file sets therefore replaces the user's value for it, and environment variables (`KOTO_SESSION_*`, `KOTO_RETENTION_*`, `KOTO_DECIDER*` and the others named below) replace both. Two exceptions: a project `decider.mode` can only lower the user's mode (see below), and keys outside the project allowlist, among them every `pools.*` and `background.*` key, are read from the user config alone, so a project can't change them at all.
 
 Project config applies only once you trust it. A `.koto/config.toml` koto hasn't been told to trust is ignored and not even read, and every command that loads config says so in one note on stderr. Run `koto config trust` in the directory to apply it. koto records the trust in `~/.koto/trust.toml` (`$KOTO_HOME/trust.toml` when `KOTO_HOME` is an absolute path), outside the repository, bound to that directory and to the file's exact contents. Any later change to the file, including one a `git pull` brings in, needs `koto config trust` again, and running it again shows what changed since the last time. A file you create or edit with `koto config set` or `koto config unset` is trusted as written, so you only trust a file yourself when someone else wrote it or you edited it by hand.
 
@@ -1441,6 +1482,14 @@ The output says whether the directory's project config applied. With `--json` th
 | `decider.endpoint` | `https` URL of the decision call (plain `http` only for loopback) | `"https://api.typesafe.ai/v1/systemone"` | no |
 | `decider.timeout_ms` | Integer, 1 to 10000 | `2000` | no |
 | `machine.name` | Machine name, 1 to 64 characters of `[A-Za-z0-9._-]`, not `unknown` | short hostname | no (user config only) |
+| `pools.<name>.size` | Slots in host pool `<name>`, 1 to 1024 | -- (required to define the pool) | no (user config only) |
+| `pools.<name>.claim_secs` | Seconds a freed slot is kept for the first waiter, 1 to 86400 | `120` | no (user config only) |
+| `pools.<name>.lapse_secs` | Seconds a waiter may go without ticking before it loses its place, 1 to 86400 | `600` | no (user config only) |
+| `pools.<name>.wait_secs` | Seconds a tick waits for a slot before it reports the session queued, 0 to 60 | `10` | no (user config only) |
+| `background.enabled` | `true`, `false` | `true` | no (user config only) |
+| `background.max_timeout_secs` | Longest a background action may run, 1 to 86400 | `7200` | no (user config only) |
+
+The `pools` and `background` keys size host resource pools and switch background actions on this machine; a project file that sets them is ignored for those keys, and `koto config list` lists them among its dropped keys. A pool's values are judged only when a tick reaches an action on that pool, never when config loads. The [host pools guide](host-pools.md) covers both tables.
 
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
 
@@ -1507,6 +1556,16 @@ and, after checking that the endpoint and bucket are the team's, trusts the file
 ```bash
 koto config trust
 ```
+
+### pool
+
+#### pool status
+
+```
+koto pool status [--json]
+```
+
+Lists every pool the user config defines, with its size, how many slots are held and free, how many sessions wait, each holder (session, workspace, state, seconds held) and each waiter in queue order (session, workspace, seconds waited). It reads only: it takes no lock, creates nothing and changes no file under the koto root, so it answers while a holder runs. With no pools configured it says so and exits 0. A pool whose config entry is invalid is reported with `pool_config_invalid`, naming the config file and key, and the command exits 1. A pool that templates name but the config doesn't define isn't listed: it imposes no limit. The [host pools guide](host-pools.md) has the output and what the queue means.
 
 ### Cloud sync
 
@@ -1602,6 +1661,81 @@ koto dashboard --once
 koto dashboard --once my-workflow
 koto dashboard --interval 200
 ```
+
+### decisions chain
+
+Prints a session's chain as koto would walk it now, and records nothing: each session above it, in the order a decision's chain lists them, with the kind of link that reached it, and from each one the supersede hops its [supersede marker](#superseding-a-session) leads to. A hop is `confirmed` when the successor is on this host and its header carries the session id the marker names; an unconfirmed hop ends the step there. The upward walk follows the chain sessions' own links, never a successor's. The read also reports the session's own marker, or `null` when it has none.
+
+```bash
+koto decisions chain <session>
+```
+
+```json
+{"v":1,"session":"worker","marker":null,"links":[{"session":"coord-1","via":"init","hops":[{"successor":{"name":"coord-2","id":"9c1e..."},"confirmed":true,"actor":{"host":"build-1","user":"dev"},"time":"2026-01-01T00:00:00Z"}]}],"incomplete":false}
+```
+
+It fails closed. A marker koto can't read (a symlink, not a regular file, over 4 KiB, or a body that doesn't parse) ends the step at that session, adds `"unreadable": "<reason>"` to its link and sets `incomplete`; the session's own unreadable marker reads as `"marker": null` with `"marker_unreadable": "<reason>"`. A successor already met on the step, or more than 64 hops, also sets `incomplete`. The read reaches only sessions this host holds a copy of, and a session this host doesn't hold exits 2.
+
+### decisions open
+
+Lists open questions across every session in this host's store, for a person or for a position. A question is an `escalate` decision with a typed recipient; it is open while it is in effect and no `answer` targets it. Open, and who a question waits on, are worked out each time the command runs, and the command records nothing. It takes exactly one of `--person` and `--at`; both or neither is a usage error (exit 2).
+
+```bash
+koto decisions open --person <handle>
+koto decisions open --at <session-or-anchor>
+```
+
+```json
+{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"addressee":{"typed":true,"kind":"person","handle":"owner"},"addressees":[{"typed":true,"kind":"person","handle":"owner"}],"time":"2026-11-26T14:35:45.564Z"}]}
+```
+
+Every element carries `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress).
+
+`--person` lists the questions whose `addressee` is `person:<handle>`, so a question shows for a person only while it waits on that person. It follows no link: a question is listed whatever its session's parent, anchor or chain.
+
+`--at` lists, once each, the open questions raised in the named session or anchor, waiting on it now, or raised in a session below it. The position includes the sessions it continues through `--continues ... --supersede`. A session is directly below the dispatcher `koto session origin` reports for it and below the anchor holding it (below both when it has both), and "below" goes down any number of those links, matched by session name. Each element adds `relation`: `raised`, `addressee`, `both`, or `below` when the question only comes from a session below. The response names the position as `"at"` in place of `"person"`. An `--at` naming no session or anchor exits 2. Questions are ordered by time, then session name and id. An `escalate` recipient is typed as `session:<name>`, `anchor:<name>` or `person:<handle>`; `decisions show` and `decisions list --format v1` return it as `recipient` beside the stored decision, and a recipient recorded with none of the prefixes reads as `{"typed":false,"value":"<as stored>"}` and is never a person's question.
+
+### decisions answer
+
+Answers a question another session raised, recording an `answer` decision with outcome `answered` in the answering session.
+
+```bash
+koto decisions answer <raiser-session> <decision-id> --in <session> --text <text> [--by session] [decider flags]
+koto decisions answer <raiser-session> <decision-id> --in <session> --by person:<handle> --prompt <harness>/<call>/<position>
+```
+
+The answer's target is the question's identity, the raiser's session id with the decision id, so it never answers a later session that reuses the name. It is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session, and nothing is written in the raiser's session. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","decision":{...}}` and exits 0. Once recorded, the question no longer lists in `decisions open`, and the raiser's `koto next` reports the answer in its `questions` array.
+
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), or when `--in` names the raiser. An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question, even after it has been passed up past the answering session; which answers count isn't built yet.
+
+**A person's answer.** `--by person:<handle>` needs `--prompt`, the evidence that the person was asked: the harness session that asked (it must be the one running the command, `CLAUDE_CODE_SESSION_ID`, and, when koto has recorded a harness session driving the answering session, that one), the id of its `AskUserQuestion` call, and the 1-based position of the question in that call. The question must carry a `packet` and its content must be stored (see [decisions content](#decisions-content)). The prompt must show the question with its `prompt_header` as the question's `header`, and the content's question text and option labels exactly, in order. koto reads the call and its result from the harness session's record under `.claude/projects/` in your account's home as the system's user database gives it (`HOME` doesn't move it, and a record whose real path is outside that folder is refused; a harness configured with `CLAUDE_CONFIG_DIR` keeps its records elsewhere, so a person's answer there always fails the `record` check) and records the person's reply from the result as the answer's text; `--text` isn't needed and is ignored. The entry stores the pointer with the mark `verified`, labelled `observed`, and the decider's handle labelled `handed`. The call and its result must be in the harness session's own conversation, not a subagent's, and the call must have been made no earlier than the question was raised. The reply's permission source must be exactly `user_temporary`, the value the harness records for a reply the person gave. One call position verifies one answer on a host: koto keeps a marker for each position used under the koto root, so a second answer citing it from any session is refused while the first is being written or once it is stored. A marker left by an answer that stopped before it was stored is taken over.
+
+`decisions show`, `decisions list --format v1` and each answer in the `questions` on `koto next` carry a `reading`. On the host that recorded the answer it reads `"verified"`, from the session that recorded it. Anywhere else (a copy brought by a pull or an import, on another host or under a new name on the same one, or the session directory copied to another koto root) the mark reads `remote` and the reading `a remote session's answer`. The host keeps a note of each answer it verified beside the session's context, sealed with a host identity kept under the koto root and the answer's stored bytes; no sync or import carries either. `koto context get` prints the stored body as written, and its mark is not the reading. The reading guards against a remark relayed or typed into a session being taken for an answered prompt, and against copies that arrive by import or pull; it isn't protection against a process running as you that sets out to forge. Reading the koto root's `host-id` is enough to seal a hand-written answer, and a copy of the whole koto root on another machine still reads verified. A `host-id` its group or others may write is not used, and new answers then read remote with a warning.
+
+A person's answer that fails a check exits 2 with code `prompt_unverified`, field `prompt`, and a message naming the pointer and the check: `session`, `record`, `call`, `tool`, `position`, `identity`, `question-text`, `options`, `result` (the call was denied or errored, or the reply didn't come from the person), `sidechain` (the call or result is a subagent's), `time` (the call was made before the question was raised), `shape` (the record lacks a field koto reads, holds the call or its result twice, puts the result before the call, or has a line over 16 MiB or more than 1 GiB in all), `call-position-reused` or `content`. No text from the record is printed. Without `--prompt`, a person's answer is refused with a message saying it needs the question-prompt evidence; `--prompt` with `--by session` is refused.
+
+### decisions readdress
+
+Passes a question up to a new recipient, recording a `readdress` decision with outcome `passed`. The question keeps its identity: its `escalate` is unchanged, and `decisions show` prints it as raised.
+
+```bash
+koto decisions readdress <raiser-session> <decision-id> --in <session> --to <recipient> [--by session] [decider flags]
+```
+
+`--to` is typed like an `escalate`'s recipient: `session:<name>`, `anchor:<name>` or `person:<handle>`. `--in` is the session recording the pass-up, and it has to be the raiser or the session or anchor the question waits on now, or a session that continues one of those through `--continues ... --supersede`; a superseded session is pointed at its successor. The entry's target is the question's identity, and it is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session and nowhere else. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","addressee":{...},"addressees":[...],"decision":{...}}` and exits 0. From then on `decisions open` shows the new `addressee`, `--person` follows it, and the raiser's `koto next` is unchanged: a pass-up reports nothing until an answer comes.
+
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` with field `id` when it isn't an `escalate`, its recipient is untyped, it doesn't read `in-effect` or it is already answered; with field `to` when `--to` has no type prefix, a bad name or handle, or names the current addressee; with field `in` when `--in` is neither the raiser nor the current addressee, nor a successor of either; and with field `by` for `--by person:<handle>`. `decisions record --kind readdress` is refused, and `decisions reverse` aimed at a pass-up is refused with `reverses_readdress`. Where a question may be passed, beyond who may pass it, isn't checked yet.
+
+### decisions content
+
+Stores and reads the content of a question raised to a person: the question text and option labels the prompt shows.
+
+```bash
+koto decisions content write <session> <decision-id> --file <path>
+koto decisions content read <session id>/<decision-id>
+```
+
+Raise the question first with its content's hash in the subject, `--subject packet=sha256:<hex>` (for example from `sha256sum`). The content is JSON, `{"question": "...", "options": [{"label": "..."}]}`, at most 16 KiB. `write` stores it once under `ctx/koto/packets/<decision-id>` in the raiser's session and prints `{"v":1,"session":...,"id":...,"question":"<identity>","packet":...,"bytes":...,"prompt_header":"#..."}`; it refuses content over the cap, content that doesn't hash to the `packet`, a question without one, and a second write. `read` takes the question's identity and prints the stored bytes unchanged, from any session or directory. `decisions show` and `list --format v1` return `prompt_header` beside every `escalate` that carries a `packet`. No `context` command writes or removes a key under `koto/packets/`.
 
 ### decider answer
 

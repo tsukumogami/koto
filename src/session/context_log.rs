@@ -329,6 +329,16 @@ impl ContextStore for RecordingStore<'_> {
         self.inner.add_with_writer(session, key, content, writer)
     }
 
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.add_confirmed(session, key, content, writer)
+    }
+
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         let result = self.inner.get(session, key);
         if let Some(read) = ContextReadRecord::content(key, result.as_deref().ok()) {

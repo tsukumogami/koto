@@ -160,12 +160,14 @@ pub struct RedactedText(String);
 impl RedactedText {
     /// Text koto composed itself -- a timeout, polling or `working_dir` note --
     /// that holds no captured output.
-    pub(crate) fn koto_note(text: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn koto_note(text: impl Into<String>) -> Self {
         RedactedText(text.into())
     }
 
     /// Append koto-written `note` exactly as given.
-    pub(crate) fn push_koto_note(&mut self, note: &str) {
+    #[doc(hidden)]
+    pub fn push_koto_note(&mut self, note: &str) {
         self.0.push_str(note);
     }
 
@@ -332,6 +334,24 @@ impl Redactor {
     /// The source names this redactor knows, for diagnostics.
     pub fn sources(&self) -> &[String] {
         &self.sources
+    }
+
+    /// Every searched spelling with its source, in the order [`Redactor::new`]
+    /// takes them. Passing these back to [`Redactor::new`] builds a redactor
+    /// that replaces at least what this one does: it is how a background
+    /// action's runner, a separate process, gets the tick's known set without
+    /// it being written anywhere.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.values
+            .iter()
+            .zip(&self.pattern_source)
+            .map(|(value, &source)| {
+                (
+                    self.sources[source].clone(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )
+            })
+            .collect()
     }
 
     /// How many bytes a capture reader must keep for a `limit`-byte bound so

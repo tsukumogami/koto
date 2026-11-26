@@ -987,18 +987,48 @@ pub fn handle_needed(path: &str) -> Result<()> {
 /// `build_backend` resolves it, without building the backend, and the
 /// cloud configuration when the backend is the cloud one.
 pub(super) fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
+    use koto_session_reader::source::{sessions_dir, BackendKind};
     let config = crate::config::resolve::load_config()?;
     crate::config::session_env::check(&config)?;
-    let koto_sessions = || -> Result<std::path::PathBuf> {
-        Ok(crate::koto_home::koto_home_or_err()?.join("sessions"))
-    };
     match config.session.backend.as_str() {
-        "cloud" => Ok((koto_sessions()?, Some(config.session.cloud.clone()))),
-        "local" => match std::env::var("KOTO_SESSIONS_BASE") {
-            Ok(base) => Ok((std::path::PathBuf::from(base), None)),
-            Err(_) => Ok((koto_sessions()?, None)),
-        },
+        "cloud" => Ok((
+            sessions_dir(Some(BackendKind::Cloud))?,
+            Some(config.session.cloud.clone()),
+        )),
+        "local" => Ok((sessions_dir(Some(BackendKind::Local))?, None)),
         other => anyhow::bail!("unknown backend: {other}"),
+    }
+}
+
+/// Handle `koto session origin <name>`: print where `name` came from as one
+/// JSON object ([`crate::session::origin::OriginReport`]).
+///
+/// Reads through `backend`, as `koto status` does, and writes nothing to it
+/// (under the cloud backend, no push to the bucket either). Every
+/// one of the three states exits 0. A malformed name or one with no session
+/// exits 2; any other read that fails exits 3.
+pub fn handle_origin(backend: &Backend, name: &str) -> Result<()> {
+    use crate::session::origin::{origin_of, OriginRefusal};
+
+    match origin_of(backend, name) {
+        Ok(report) => {
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
+        Err(e) => {
+            let (error, code) = match e.downcast_ref::<OriginRefusal>() {
+                Some(OriginRefusal::NoSuchSession) => (
+                    format!("session '{name}' does not exist"),
+                    super::EXIT_CALLER_ERROR,
+                ),
+                Some(OriginRefusal::InvalidName(_)) => (format!("{e:#}"), super::EXIT_CALLER_ERROR),
+                None => (format!("{e:#}"), super::EXIT_INFRASTRUCTURE),
+            };
+            super::exit_with_error_code(
+                serde_json::json!({ "error": error, "command": "session origin" }),
+                code,
+            )
+        }
     }
 }
 
@@ -1511,6 +1541,24 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         return Ok(());
     }
 
+    // A run in flight runs its command in the old anchor and keeps its
+    // locks in the session's directory; the move waits until it has ended
+    // (PRD R24).
+    #[cfg(unix)]
+    if let Some(run_id) = crate::engine::background::run_in_flight(&backend.session_dir(name)) {
+        super::exit_with_error_code(
+            serde_json::json!({
+                "error": {
+                    "code": "background_run_in_flight",
+                    "message": crate::engine::background::in_flight_refusal(name, &run_id),
+                    "run_id": run_id,
+                },
+                "command": "session rebind",
+            }),
+            2,
+        );
+    }
+
     // Under the cloud backend, the home before the move, when it has one:
     // a session that takes its home from its anchor moves home with it.
     let home_before = backend
@@ -1878,6 +1926,20 @@ pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     // and on a name koto already removed itself the record is the answer
     // `koto status` gives, so it must stay.
     let had_session = backend.session_dir(name).is_dir();
+    // A session about to be removed stops its live background runner and
+    // leaves any pool queue first (PRD R23); with no log left afterwards,
+    // the events that would record it are dropped. A pinned session is
+    // refused below and keeps both, so the pin is checked first.
+    #[cfg(unix)]
+    if had_session
+        && crate::session::pin::guard_removal(backend, name)
+            .refusal(name)
+            .is_none()
+    {
+        if let Ok((_, events)) = backend.read_events(name) {
+            let _ = super::stop_session_pool_work(backend, name, &events);
+        }
+    }
     // Through the pin guard: a pinned session is refused with exit 2 and
     // nothing removed, naming the pin and saying to unpin first.
     if let crate::session::pin::Removal::Kept(guard) =

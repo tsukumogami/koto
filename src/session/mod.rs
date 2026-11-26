@@ -14,17 +14,18 @@ pub mod links;
 pub mod local;
 pub mod name_index;
 pub mod needed;
+pub mod origin;
 pub mod pin;
 pub mod read_spool;
 pub mod rebind_fence;
 pub mod recover;
 pub mod remote_feed;
-pub mod row;
+pub use koto_session_reader::session::row;
 pub mod state_log;
 pub mod summary;
 pub mod sync;
 pub mod sync_stamp;
-pub mod validate;
+pub use koto_session_reader::session::validate;
 pub mod version;
 
 use std::fmt;
@@ -33,7 +34,6 @@ use std::path::PathBuf;
 use self::context::ContextStore;
 use self::local::LocalBackend;
 
-use crate::engine::template_source_status::TemplateSourceStatus;
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
 
 /// Typed error for session-scoped operations.
@@ -504,73 +504,7 @@ pub struct SessionLock {
     _private: (),
 }
 
-/// Information about an existing session.
-#[derive(serde::Serialize)]
-pub struct SessionInfo {
-    /// Session identifier (same as the workflow name).
-    pub id: String,
-
-    /// RFC 3339 UTC timestamp of session creation (from state file header).
-    pub created_at: String,
-
-    /// SHA-256 hash of the compiled template (from state file header).
-    pub template_hash: String,
-
-    /// Name of the parent workflow, if this workflow was created as a child.
-    pub parent_workflow: Option<String>,
-
-    /// Whether the session's recorded `template_source_dir` (if any) still
-    /// resolves on this machine, and on whose.
-    ///
-    /// Populated from the state file header already read into memory while
-    /// building this `SessionInfo` -- backends never perform extra I/O just
-    /// to fill this field.
-    ///
-    /// `None` is ambiguous by design and conflates two distinct cases that
-    /// this field does not (and is not required to) distinguish between:
-    ///
-    /// - The session's header never recorded a `template_source_dir` --
-    ///   there is nothing to check.
-    /// - No header was available to check at all. This is the case for
-    ///   `CloudBackend`'s remote-only placeholder rows (a session that
-    ///   exists in S3 but has not been synced locally): there is no header
-    ///   in scope, so the field is unconditionally `None` there regardless
-    ///   of what the session's real (remote) header might say once synced.
-    ///
-    /// This ambiguity is a known, accepted limitation -- not a bug to fix
-    /// here. See DESIGN-orphaned-session-detection.md for the rationale.
-    pub template_source_status: Option<TemplateSourceStatus>,
-
-    /// The directory the session's ticks run in, from the header
-    /// (`execution_dir`). `None` when the header records none, and for the
-    /// cloud backend's remote-only placeholder rows, which have no header.
-    pub execution_dir: Option<PathBuf>,
-
-    /// The header's `session_id`. `None` for a header written before the
-    /// field existed, and for remote-only placeholder rows.
-    pub session_id: Option<String>,
-
-    /// The header's `kind` (`anchor`, `anchor-close`), omitted for an
-    /// ordinary session. `koto session list` shows it; the workflow views
-    /// leave out every session that carries a kind koto knows.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-}
-
-impl SessionInfo {
-    /// What the session's header says it is.
-    pub fn session_kind(&self) -> crate::engine::types::SessionKind {
-        crate::engine::types::SessionKind::of(self.kind.as_deref())
-    }
-}
-
-/// Return the state file name for a given session ID.
-///
-/// The naming convention (`koto-<id>.state.jsonl`) is a free function
-/// because it doesn't vary across backends.
-pub fn state_file_name(id: &str) -> String {
-    format!("koto-{}.state.jsonl", id)
-}
+pub use koto_session_reader::session::{state_file_name, SessionInfo};
 
 /// Abstraction over where session artifacts are stored.
 ///
@@ -673,6 +607,37 @@ pub trait SessionBackend: Send + Sync {
     /// leave a log no reader can parse (koto#236).
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
+
+    /// # Stability: additive-only
+    ///
+    /// `koto context add`'s three steps on `id`: read its header (as
+    /// [`read_header`](Self::read_header) does, pull included), run
+    /// `store_write`, then append `event` (as
+    /// [`append_event`](Self::append_event) does). Each step runs only when
+    /// the one before it succeeded, so a session with no header stores
+    /// nothing.
+    ///
+    /// A backend with a state log on disk holds the log's append lock from
+    /// before the header read to after the append, taking it once and
+    /// passing it to each step, so no header rewrite or pull replaces the
+    /// log in between and leaves the stored content with no event naming
+    /// it. Its wait for the lock is bounded by
+    /// [`LOG_REPLACE_LOCK_WAIT`](crate::engine::persistence::LOG_REPLACE_LOCK_WAIT)
+    /// and runs out as
+    /// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), with
+    /// nothing stored. The default runs the three steps in order with no
+    /// lock across them.
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.read_header(id)?;
+        store_write()?;
+        self.append_event(id, event, timestamp)
+    }
 
     /// Append a `context_read` that its reader already judged to be `id`'s
     /// own (the CLI's `read_log_target` answered `Session`: the read ran in
@@ -1212,6 +1177,21 @@ impl Backend {
     }
 }
 
+/// Refuse to move session `from` while a background run of it is in
+/// flight on this machine (PRD R24): its runner writes its result into the
+/// session's directory and its processes hold the run's locks there, so a
+/// move would leave the run behind. Undoing a failed move
+/// (`relocate_local_only`) is never refused.
+fn refuse_move_in_flight(backend: &Backend, from: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let Some(run_id) = crate::engine::background::run_in_flight(&backend.session_dir(from)) {
+        anyhow::bail!(crate::engine::background::in_flight_refusal(from, &run_id));
+    }
+    #[cfg(not(unix))]
+    let _ = (backend, from);
+    Ok(())
+}
+
 impl SessionBackend for Backend {
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         match self {
@@ -1293,6 +1273,19 @@ impl SessionBackend for Backend {
         }
     }
 
+    fn add_context_locked(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_context_locked(id, store_write, event, timestamp),
+            Backend::Cloud(b) => b.add_context_locked(id, store_write, event, timestamp),
+        }
+    }
+
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
         match self {
             Backend::Local(b) => b.read_events(id),
@@ -1338,6 +1331,7 @@ impl SessionBackend for Backend {
     }
 
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        refuse_move_in_flight(self, from)?;
         match self {
             Backend::Local(b) => b.relocate(from, to),
             Backend::Cloud(b) => b.relocate(from, to),
@@ -1352,6 +1346,7 @@ impl SessionBackend for Backend {
     }
 
     fn relocate_checked(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        refuse_move_in_flight(self, from)?;
         match self {
             Backend::Local(b) => b.relocate_checked(from, to),
             Backend::Cloud(b) => b.relocate_checked(from, to),
@@ -1453,6 +1448,19 @@ impl ContextStore for Backend {
         }
     }
 
+    fn add_confirmed(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_confirmed(session, key, content, writer),
+            Backend::Cloud(b) => b.add_confirmed(session, key, content, writer),
+        }
+    }
+
     fn meta(&self, session: &str, key: &str) -> Option<context::KeyMeta> {
         match self {
             Backend::Local(b) => b.meta(session, key),
@@ -1509,6 +1517,36 @@ mod tests {
         // callers that pick an exit code by it.
         let wrapped = anyhow::Error::new(err.clone());
         assert_eq!(wrapped.downcast_ref::<SessionMigrated>(), Some(&err));
+    }
+
+    /// A move of a session whose run holds its locks is refused, naming the
+    /// run; once the locks are free it is not (PRD R24).
+    #[cfg(unix)]
+    #[test]
+    fn relocate_refuses_while_a_background_run_is_in_flight() {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Backend::Local(LocalBackend::with_base_dir(tmp.path().to_path_buf()));
+        let run_dir = backend.session_dir("s").join("runs").join("r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let lock = std::fs::File::create(run_dir.join("run.lock")).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        for result in [
+            backend.relocate("s", "t"),
+            backend.relocate_checked("s", "t"),
+        ] {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.starts_with("background_run_in_flight:") && message.contains("'r1'"),
+                "{message}"
+            );
+        }
+        drop(lock);
+        assert!(refuse_move_in_flight(&backend, "s").is_ok());
     }
 
     #[test]
