@@ -685,28 +685,25 @@ fn a_question_and_an_attempt_are_tied_by_basis_either_way() {
 fn a_citation_resolves_to_the_session_recorded_before_the_citer() {
     let env = Env::new();
     tree(&env);
-    let old = env.judgment("worker2", &["what=old", "result=undecided"], &[]);
-    let q = env.question("manager", "person:owner", &[], &[&old]);
+    let old_q = env.question("worker2", "session:manager", &[], &[]);
+    let a = env.judgment("worker", &["what=a", "result=undecided"], &[&old_q]);
     assert_eq!(
-        ids(&env.attempts(&["--at", "director", "--question", &q.identity])),
-        vec![old.identity.clone()]
+        ids(&env.attempts(&["--at", "director", "--question", &old_q.identity])),
+        vec![a.identity.clone()]
     );
 
-    // worker2 goes, a new worker2 records an attempt that reuses the id.
+    // worker2 goes, and a new worker2 raises a question that reuses the id.
     std::fs::remove_dir_all(env.sessions().join("worker2")).unwrap();
     env.init("worker2", Some("manager"));
-    let new = env.judgment("worker2", &["what=new", "result=undecided"], &[]);
-    assert_eq!(new.id, old.id, "the ids must collide for this test");
-    assert_ne!(new.identity, old.identity);
+    let new_q = env.question("worker2", "session:manager", &[], &[]);
+    assert_eq!(new_q.id, old_q.id, "the ids must collide for this test");
+    assert_ne!(new_q.identity, old_q.identity);
 
-    // q cites a decision recorded before it; the new one came after.
-    let v = env.attempts(&["--at", "director"]);
-    let e = list(&v)
-        .iter()
-        .find(|e| e["identity"] == new.identity.as_str())
-        .unwrap();
-    assert_eq!(e["question"], Value::Null, "{v}");
-    assert!(list(&env.attempts(&["--at", "director", "--question", &q.identity])).is_empty());
+    // a cites a question recorded before it; the new one came after.
+    let v = env.attempts(&["--in", "worker"]);
+    assert_eq!(list(&v)[0]["question"], Value::Null, "{v}");
+    assert_eq!(list(&v)[0]["questions"], serde_json::json!([]), "{v}");
+    assert!(list(&env.attempts(&["--at", "director", "--question", &new_q.identity])).is_empty());
 }
 
 #[test]
@@ -782,7 +779,9 @@ fn a_provisional_waits_until_a_person_answers_a_question_naming_it() {
     let q7 = env.question("director", "person:owner", &[], &[&p1]);
     let v = env.attempts(&["--at", "director", "--awaiting-review"]);
     assert_eq!(list(&v)[0]["review"]["question"], q7.identity.as_str());
-    assert_eq!(list(&v)[0]["question"], q7.identity.as_str());
+    // director raised q7 about worker2's judgment: that names the question
+    // the review waits on, but doesn't make it a question worker2 attempted.
+    assert_eq!(list(&v)[0]["question"], Value::Null);
 
     // A session's answer doesn't end the wait.
     env.ok(&[
@@ -916,4 +915,220 @@ fn escalating_and_passing_up_need_no_attempt() {
         "session",
     ]);
     assert!(list(&env.attempts(&["--at", "director"])).is_empty());
+}
+
+#[test]
+fn a_raiser_ties_only_its_own_runs_attempts_to_its_question() {
+    let env = Env::new();
+    tree(&env);
+    // manager's attempt is about something else; worker names it anyway.
+    let m = env.judgment("manager", &["what=unrelated", "result=undecided"], &[]);
+    let own = env.judgment("worker", &["what=own", "result=undecided"], &[]);
+    let q = env.question("worker", "session:manager", &[], &[&m, &own]);
+
+    assert!(list(&env.attempts(&["--in", "manager", "--question", &q.identity])).is_empty());
+    let v = env.attempts(&["--in", "manager"]);
+    assert_eq!(list(&v)[0]["question"], Value::Null, "{v}");
+    assert_eq!(list(&v)[0]["questions"], serde_json::json!([]), "{v}");
+    assert_eq!(
+        ids(&env.attempts(&["--in", "worker", "--question", &q.identity])),
+        vec![own.identity.clone()]
+    );
+
+    // An attempt in another session ties when it names the question itself.
+    let cites = env.judgment("manager", &["what=tried", "result=undecided"], &[&q]);
+    assert_eq!(
+        ids(&env.attempts(&["--in", "manager", "--question", &q.identity])),
+        vec![cites.identity.clone()]
+    );
+    assert_eq!(
+        ids(&env.attempts(&["--at", "director", "--question", &q.identity])),
+        vec![own.identity.clone(), cites.identity.clone()]
+    );
+}
+
+#[test]
+fn a_raiser_ties_the_attempts_of_the_sessions_its_run_continues() {
+    let env = Env::new();
+    env.init("first", None);
+    let a = env.judgment("first", &["what=a", "result=undecided"], &[]);
+    let template = env.root.join("work.md");
+    let out = env.run(&[
+        "init",
+        "second",
+        "--template",
+        template.to_str().unwrap(),
+        "--continues",
+        "first",
+        "--supersede",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let q = env.question("second", "person:owner", &[], &[&a]);
+    let v = env.attempts(&["--in", "second", "--question", &q.identity]);
+    assert_eq!(ids(&v), vec![a.identity.clone()]);
+    assert_eq!(list(&v)[0]["questions"], serde_json::json!([q.identity]));
+}
+
+#[test]
+fn every_tied_question_is_listed_and_the_filtered_one_is_named() {
+    let env = Env::new();
+    tree(&env);
+    let a = env.judgment("worker", &["what=a", "result=undecided"], &[]);
+    let q1 = env.question("worker", "session:manager", &[], &[&a]);
+    let q2 = env.question("worker", "session:manager", &[], &[&a]);
+
+    let v = env.attempts(&["--in", "worker"]);
+    assert_eq!(list(&v)[0]["question"], q1.identity.as_str());
+    assert_eq!(
+        list(&v)[0]["questions"],
+        serde_json::json!([q1.identity, q2.identity])
+    );
+    let v = env.attempts(&["--in", "worker", "--question", &q2.identity]);
+    assert_eq!(ids(&v), vec![a.identity.clone()]);
+    assert_eq!(list(&v)[0]["question"], q2.identity.as_str());
+}
+
+#[test]
+fn an_answer_that_doesnt_read_verified_here_doesnt_end_the_wait() {
+    let env = Env::new();
+    tree(&env);
+    let p = env.judgment("worker", &["what=p", "result=provisional"], &[]);
+    let q = env.question("worker", "person:owner", &[], &[&p]);
+    env.owner_answers(&q, "manager");
+    assert!(awaiting_at(&env, "director").is_empty());
+
+    // Without this host's note the answer reads remote.
+    let note = env.sessions().join("manager").join("koto-verified-here");
+    assert!(note.exists(), "the answer must have left a note");
+    std::fs::remove_file(&note).unwrap();
+    assert_eq!(awaiting_at(&env, "director"), vec![p.identity.clone()]);
+    let v = env.attempts(&["--in", "worker", "--awaiting-review"]);
+    assert_eq!(
+        list(&v)[0]["review"],
+        serde_json::json!({"state": "awaiting", "question": q.identity})
+    );
+    let shown = env.ok(&["decisions", "show", "worker", &p.id]).json();
+    assert_eq!(shown["review"], list(&v)[0]["review"]);
+}
+
+#[test]
+fn attempts_at_takes_an_anchor_as_the_position() {
+    let env = Env::new();
+    let opened = env.ok(&[
+        "session",
+        "anchor",
+        "open",
+        "--harness-session",
+        "6c4b5d2f-3e0a-4b88-94e5-f60718293a64",
+        "--source",
+        "startup",
+    ]);
+    let lead = opened
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("anchor="))
+        .unwrap()
+        .to_string();
+    env.init("w", Some(lead.as_str()));
+    let template = env.root.join("work.md");
+    let held = env
+        .command(
+            None,
+            &["init", "h", "--template", template.to_str().unwrap()],
+        )
+        .env("KOTO_ANCHOR", &lead)
+        .output()
+        .unwrap();
+    assert!(
+        held.status.success(),
+        "{}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    env.init("x", None);
+    let w = env.judgment("w", &["what=w", "result=undecided"], &[]);
+    let h = env.judgment("h", &["what=h", "result=decided"], &[]);
+    env.judgment("x", &["what=x", "result=decided"], &[]);
+
+    let v = env.attempts(&["--at", &lead]);
+    assert_eq!(v["at"], lead.as_str());
+    assert_eq!(ids(&v), vec![w.identity.clone(), h.identity.clone()]);
+    for e in list(&v) {
+        assert_eq!(e["relation"], "below", "{e}");
+    }
+}
+
+#[test]
+fn a_hand_edited_field_reads_as_unreadable_not_as_an_attempt() {
+    let env = Env::new();
+    tree(&env);
+    let good = env.judgment("worker", &["what=good", "result=decided"], &[]);
+    let bad = env.judgment("worker", &["what=bad", "result=decided"], &[]);
+    let staged = env.judgment("worker", &["what=s", "state=implement:1"], &[]);
+    assert_eq!(list(&env.attempts(&["--in", "worker"])).len(), 2);
+    assert_eq!(
+        env.attempts(&["--in", "worker"])["unreadable"],
+        serde_json::json!([])
+    );
+
+    let dir = env.sessions().join("worker/ctx/koto/decisions");
+    for (d, from, to) in [
+        (&bad, "\"result\":\"decided\"", "\"result\":\"maybe\""),
+        (
+            &staged,
+            "\"state\":\"implement:1\"",
+            "\"state\":\"implement\"",
+        ),
+    ] {
+        let path = dir.join(&d.id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{text}");
+        std::fs::write(&path, text.replace(from, to)).unwrap();
+    }
+
+    let v = env.attempts(&["--in", "worker"]);
+    assert_eq!(ids(&v), vec![good.identity.clone()]);
+    let unreadable = v["unreadable"].as_array().unwrap();
+    let got: Vec<&str> = unreadable
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, vec![bad.id.as_str(), staged.id.as_str()], "{v}");
+    for e in unreadable {
+        assert_eq!(e["status"], "unreadable");
+        assert_eq!(e["session"], "worker");
+        assert!(e["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stored subject field"));
+    }
+}
+
+#[test]
+fn a_judgment_without_the_fields_prints_what_main_printed() {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let p = e.unwrap().path();
+            let dest = to.join(p.file_name().unwrap());
+            if p.is_dir() {
+                copy(&p, &dest);
+            } else {
+                std::fs::copy(&p, &dest).unwrap();
+            }
+        }
+    }
+    let env = Env::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decisions-unchanged");
+    copy(&fixture.join("sessions"), &env.sessions());
+    let mut printed = String::new();
+    for args in [
+        &["decisions", "show", "plain", "000000000001"][..],
+        &["decisions", "show", "plain", "000000000002"],
+        &["decisions", "list", "plain"],
+        &["decisions", "list", "lead", "--below"],
+    ] {
+        printed.push_str(&env.ok(args).stdout);
+    }
+    let want = std::fs::read_to_string(fixture.join("main-output.txt")).unwrap();
+    assert_eq!(printed, want);
 }

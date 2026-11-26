@@ -1068,19 +1068,25 @@ carrying neither field is not, prints exactly as it did, and no attempts read re
 elements add `state` only when the `escalate` carries one.
 
 **The tie between an attempt and a question.** An attempt is tied to a question through `basis`,
-in either direction: the question's `escalate` names the attempt, or the attempt names the
-`escalate`. A basis entry names its session by name, which a later session can reuse, so a
+in either direction: the attempt names the question's `escalate`, or the `escalate` names an
+attempt recorded in the raiser's own run (the raiser, the sessions it continues and those that
+continue it). A raiser naming another session's attempt doesn't tie it, so no session can make
+another appear to have attempted a question. A basis entry names its session by name, which a later session can reuse, so a
 citation counts only when the decision it names, read now, is of the right kind and recorded no
 later than the citing decision. That's the check the `questions` report on `koto next` makes. An
-attempt tied to several questions reports the earliest by time, session name and identifier.
+attempt carries every tied question in `questions`, ordered by time, session name and
+identifier, and `question` is the first of them, or the one `--question` named.
 
 **The end of a provisional judgment's wait.** A provisional judgment's `review` is `reversed`,
 with the winning reversal as `show` prints it, once a reversal aimed at it is in effect. Failing
 that, it's `reviewed` once a question whose `escalate` is in effect and names the judgment in its
 `basis` has a person's answer that reads `verified` on this host, taking the first such answer in
 the order answers are kept. Otherwise it's `awaiting`, naming the earliest such question or null.
-A session's answer, the raiser's settle or withdrawal, a remote person answer and a decision that
-merely cites the judgment leave it awaiting. Review is matched by session id and identifier, so
+The question may be raised in any session: putting a judgment before a person ties nothing, and
+only the person's verified answer ends the wait. A session's answer, a withdrawn (reversed)
+question, a remote person answer and a decision that merely cites the judgment leave it awaiting.
+How a raiser's settle or withdrawal of a question bears on the wait arrives with the change that
+adds those outcomes. Review is matched by session id and identifier, so
 a recreated session reusing a name and identifier inherits no review. This rule takes any
 verified person answer to the question; once the record marks which answer governs a question,
 it narrows to that answer.
@@ -1092,14 +1098,19 @@ session's run (the session and those it continues through a confirmed supersede,
 `chain::run_predecessors` finds them); `--at` covers the position's run and every session below
 it, as `open --at` does, and adds `relation`. Elements are ordered by time, session name and
 identifier, and a provisional element carries `review`. `koto decisions show` adds the same
-`review` beside a provisional judgment; `list` is unchanged apart from the stored fields.
+`review` beside a provisional judgment, computed from the same local reading even under the cloud
+backend, so the two never disagree; `list` is unchanged apart from the stored fields. A judgment
+or `escalate` whose stored `state` or `result` the write would refuse (a body edited by hand) is
+not an attempt: the read lists it, with every other unreadable entry at the position, under
+`unreadable`, as `{"session", "id", "status": "unreadable", "reason"}`, so a caller can tell the
+listing is incomplete.
 
 ```json
 {"v": 1, "in": "worker", "attempts": [{"identity": "<session id>/000000000001",
   "session": "worker", "id": "000000000001", "what": "Postgres or SQLite for the cache",
   "state": "implement:1", "result": "undecided", "decider": {"kind": "session", "...": "..."},
   "run_mode": {"source": "observed", "value": "unknown"}, "time": "...",
-  "status": "in-effect", "question": null}]}
+  "status": "in-effect", "question": null, "questions": []}], "unreadable": []}
 ```
 
 **Enforcement is the caller's.** koto refuses nothing for want of an attempt. An `escalate` or a
@@ -1117,8 +1128,8 @@ against its own subject table and skips such a body with a warning.
 **Measured cost.** On a release build on a Linux development host, over 1,001 sessions in
 dispatcher chains four deep holding 200 open questions, 100 questions closed by a verified
 person answer, 600 closed by a session's answer, 1,700 attempts and 800 provisional judgments,
-`attempts --at` the top coordinator took 284 ms, the same read with `--awaiting-review` 239 ms,
-and `attempts --in` one worker 173 ms. `tests/precedent_cost.rs` asserts each under five seconds
+`attempts --at` the top coordinator took 243 ms, the same read with `--awaiting-review` 203 ms,
+and `attempts --in` one worker 138 ms. `tests/precedent_cost.rs` asserts each under five seconds
 on a release build.
 
 ## Implementation Approach

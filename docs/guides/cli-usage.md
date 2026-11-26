@@ -1758,24 +1758,26 @@ koto decisions attempts --at <session-or-anchor> [same filters]
 ```
 
 ```json
-{"v":1,"in":"worker","attempts":[{"identity":"20b56d45-.../000000000001","session":"worker","id":"000000000001","what":"Postgres or SQLite for the cache","state":"implement:1","result":"undecided","decider":{...},"run_mode":{"source":"observed","value":"unknown"},"time":"2026-11-26T20:27:18.291Z","status":"in-effect","question":null}]}
+{"v":1,"in":"worker","attempts":[{"identity":"20b56d45-.../000000000001","session":"worker","id":"000000000001","what":"Postgres or SQLite for the cache","state":"implement:1","result":"undecided","decider":{...},"run_mode":{"source":"observed","value":"unknown"},"time":"2026-11-26T20:27:18.291Z","status":"in-effect","question":null,"questions":[]}],"unreadable":[]}
 ```
 
 It takes exactly one of `--in` and `--at`; both or neither is a usage error (exit 2). `--in` lists the attempts recorded in the session and in the sessions it continues through `--continues ... --supersede`. `--at` lists, once each, those recorded at the position, in the sessions it continues and in every session below it, with "below" meaning what it means for [decisions open](#decisions-open); each element adds `relation`, `at` or `below`, and the response names the position as `"at"` in place of `"in"`. A position naming no session or anchor exits 2 with field `in` or `at`.
 
-`question` is the identity of the question the attempt is tied to, or null. An attempt is tied to a question through `basis`, either way round: the question's `escalate` was recorded with `--basis <session>:<attempt id>`, or the attempt was recorded with `--basis <raiser>:<question id>`. A cited name a later session reused doesn't count. When several questions are tied, `question` is the earliest. So `--in manager --question <identity>` answers whether `manager` tried the question itself, and `--in worker --result undecided` shows each undecided attempt with the question it raised, or null when it raised none. koto never refuses an `escalate` or a `readdress` for lack of an attempt; checking for one before a pass-up is up to the caller.
+`questions` lists the identities of every question the attempt is tied to, ordered by time, session name and id, and `question` is the first of them (or null), or with `--question` the one asked for. An attempt is tied to a question through `basis`, either way round: the attempt was recorded with `--basis <raiser>:<question id>`, or the question's `escalate` was recorded with `--basis <session>:<attempt id>` naming an attempt in the raiser's own run (the raiser, the sessions it continues and those that continue it). An `escalate` naming another session's attempt doesn't tie it, so a raiser can't make another session appear to have tried its question. A cited name a later session reused doesn't count. So `--in manager --question <identity>` answers whether `manager` tried the question itself, and `--in worker --result undecided` shows each undecided attempt with the question it raised, or null when it raised none. koto never refuses an `escalate` or a `readdress` for lack of an attempt; checking for one before a pass-up is up to the caller.
 
 `--result`, `--state` and `--question` keep exact matches and combine; a `--result` outside the three or a `--question` that isn't `<session id>/<decision id>` exits 2 naming the field. Attempts are ordered by time, then session name, then id.
 
 A provisional judgment's element adds `review`, and `decisions show` prints the same `review` beside it:
 
-- `{"state":"awaiting","question":<identity or null>}` -- no person has reviewed it. `question` names the earliest question whose `escalate` cites it in `--basis` and is in effect.
+- `{"state":"awaiting","question":<identity or null>}` -- no person has reviewed it. `question` names the earliest question whose `escalate` cites it in `--basis` and is in effect, raised in any session.
 - `{"state":"reviewed","question":"<identity>","answer":{"session":...,"id":...,"text":...,"decider":{...},"reading":"verified","run_mode":{...},"time":...}}` -- such a question has a person's answer that reads `verified` on this host.
 - `{"state":"reversed","reversed_by":{...}}` -- a reversal aimed at it is in effect; `reversed_by` is the winning reversal as `decisions show` reports it.
 
-An addressee session's answer, the raiser's settle or withdrawal, a person's answer that reads as a remote session's, or a decision citing the judgment doesn't end the wait. `--awaiting-review` keeps only provisional judgments whose review is `awaiting`. For now any verified person answer to the question ends it, not only the one that governs the question.
+An addressee session's answer, a withdrawn (reversed) question, a person's answer that doesn't read `verified` on this host, or a decision citing the judgment doesn't end the wait. How a raiser's settle or withdrawal of a question bears on it arrives with the change that adds those outcomes. `--awaiting-review` keeps only provisional judgments whose review is `awaiting`. For now any verified person answer to the question ends it, not only the one that governs the question.
 
-The read uses only this host's store: it takes no lock, pulls nothing, makes no bucket request under the cloud backend and writes nothing. It is refused under `--workspace`.
+`unreadable` lists every entry at the position the read couldn't use, each as `{"session","id","status":"unreadable","reason"}`: an entry no decision read can parse, and a `judgment` or `escalate` whose stored `state` or `result` the write would have refused (a body edited by hand), which isn't treated as an attempt. A non-empty `unreadable` means the listing may be incomplete.
+
+The read uses only this host's store: it takes no lock, pulls nothing, makes no bucket request under the cloud backend and writes nothing. `decisions show` takes a provisional judgment's `review` from the same local reading, so under the cloud backend the two agree even when the bucket holds a decision this host hasn't pulled. It is refused under `--workspace`.
 
 ### decider answer
 

@@ -751,19 +751,24 @@ to an id-shaped value, and both say so.
   either field reports nothing on `koto next`, changes no exit code and is returned by no open
   read. `list --subject result=<value>` and `--subject state=<value>` select on the fields through
   the listing's existing subject filter.
-- **R74.** An attempt is tied to a question through `basis`, in either direction: the question's
-  `escalate` names the attempt, or the attempt names the `escalate`. A citation counts only when
+- **R74.** An attempt is tied to a question through `basis`, in either direction: the attempt
+  names the question's `escalate`, or the `escalate` names an attempt recorded in the raiser's own
+  run (the raiser, the sessions it continues and those that continue it). An `escalate` naming
+  another session's attempt doesn't tie it. A citation counts only when
   the decision it names, read now, is of the right kind and was recorded no later than the
   decision citing it, so a recreated session that reuses a name and identifier isn't taken for
-  the one cited. An attempt tied to several questions carries the earliest by time, session name
-  and identifier.
+  the one cited. An attempt carries every tied question, ordered by time, session name and
+  identifier.
 - **R75.** `koto decisions attempts` takes exactly one of `--in <session>` and
   `--at <session or anchor>`. `--in` returns the attempts recorded in the session's run: the
   session and those it continues through a confirmed supersede. `--at` returns those recorded at
   the position, in the sessions it continues and in every session below it, each once, with
   `relation` reading `at` or `below`. Each element carries its identity, session, identifier,
-  `what`, `state`, `result`, decider, run mode, time, status and `question` (the tied question's
-  identity, or null). `--result`, `--state` and `--question <identity>` narrow to exact matches
+  `what`, `state`, `result`, decider, run mode, time, status, `questions` (every tied question's
+  identity) and `question` (the first of them or null, or the one `--question` named). The
+  response lists under `unreadable` every entry at the position the read couldn't use, including
+  a `judgment` or `escalate` whose stored `state` or `result` the write would refuse, which is not
+  an attempt. `--result`, `--state` and `--question <identity>` narrow to exact matches
   and combine. Elements are ordered by time, then session name, then identifier. Both or neither
   of `--in` and `--at`, a position naming nothing, a `--result` outside the three or a
   `--question` that isn't an identity exits 2.
@@ -771,10 +776,11 @@ to an id-shaped value, and both say so.
   a reversal aimed at it is in effect; else `reviewed`, with the question's identity and the
   answer, once a question whose `escalate` is in effect and names the judgment in its `basis` has
   a person's answer that reads `verified` on this host; else `awaiting`, with the identity of the
-  earliest such question, or null. Nothing else ends the wait: not
-  an addressee session's answer, the raiser's settle or withdrawal, a remote person answer, or a
-  decision citing the judgment. `--awaiting-review` returns only provisional judgments awaiting
-  review, and `show` prints the same `review`. A review is matched by identity, so a review
+  earliest such question, or null. The question may be raised in any session. Nothing else ends
+  the wait: not an addressee session's answer, a withdrawn question, a person answer that doesn't
+  read `verified` on this host, or a decision citing the judgment. How a raiser's settle or
+  withdrawal bears on the wait arrives with the change that adds those outcomes. `--awaiting-review` returns only provisional judgments awaiting
+  review, and `show` prints the same `review`, read from the same local store. A review is matched by identity, so a review
   question naming a removed session's judgment doesn't review a new judgment that reuses its name
   and identifier.
 - **R77.** The attempts read uses only this machine's store. It takes no lock, pulls nothing,
@@ -1205,8 +1211,9 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   `show` and `list --format v1` and is returned by no attempts read; a judgment with either field
   leaves `koto next` and every open read unchanged; `list --subject result=provisional` returns
   exactly the provisional judgments (R73).
-- [ ] An `escalate` citing an attempt and a judgment citing an `escalate` each tie the attempt to
-  that question; an `escalate` in a recreated session that reuses the cited name and identifier
+- [ ] An `escalate` citing an attempt in its raiser's run and a judgment citing an `escalate`
+  each tie the attempt to that question, and `questions` lists every tied question; an `escalate`
+  citing another session's attempt ties nothing; an `escalate` in a recreated session that reuses the cited name and identifier
   is not taken for the question (R74).
 - [ ] `attempts --in` returns the session's attempts and its confirmed predecessor's and none of
   another session's; `attempts --at` returns those at and below the position once each with
@@ -1215,7 +1222,8 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   and `--at` exits 2 (R75).
 - [ ] A provisional judgment reads `awaiting` until a question citing it is closed by a verified
   person answer, then `reviewed` with the answer's text and decider; a session's answer, a
-  withdrawn question or a citing judgment leaves it `awaiting`; a reversal makes it `reversed`
+  withdrawn question, an answer that doesn't read `verified` on this host or a citing judgment
+  leaves it `awaiting`; a reversal makes it `reversed`
   and drops it from `--awaiting-review`; `show` prints the same review (R76).
 - [ ] Every session directory is byte-identical before and after each attempts read, a
   `readdress` by a session with no attempt exits 0, and under the cloud backend the in-process

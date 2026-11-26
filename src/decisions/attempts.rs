@@ -8,22 +8,29 @@
 //! before the fields existed is, is not, and no read here returns it.
 //!
 //! An attempt is tied to a question through `basis`, in either direction:
-//! the question's `escalate` names the attempt, or the attempt names the
-//! `escalate`. A basis entry names its session by name, which a later
-//! session can reuse, so a citation counts only when the decision it
-//! names, read now, is the one meant: the right kind, and recorded no
-//! later than the decision citing it. That is how the `questions` report
-//! on `koto next` resolves a citation.
+//! the attempt names the question's `escalate`, or the `escalate` names an
+//! attempt recorded in the raiser's own run (the raiser, the sessions it
+//! continues and those that continue it). A raiser naming another
+//! session's attempt doesn't tie it. A basis entry names its session by
+//! name, which a later session can reuse, so a citation counts only when
+//! the decision it names, read now, is the one meant: the right kind, and
+//! recorded no later than the decision citing it. That is how the
+//! `questions` report on `koto next` resolves a citation.
 //!
 //! A provisional judgment (`result` `provisional`) awaits a person's
 //! review until one of two things happens: it is reversed, or a question
-//! whose in-effect `escalate` names it in its `basis` takes a person's
-//! answer that reads `verified` on this host. Nothing else ends the wait:
-//! not a session's answer, not a remote person answer, not a decision that
-//! cites the judgment.
+//! whose in-effect `escalate` names it in its `basis`, raised in any
+//! session, takes a person's answer that reads `verified` on this host.
+//! Nothing else ends the wait: not a session's answer, not a remote person
+//! answer, not a decision that cites the judgment.
+//!
+//! A stored `state` or `result` that the write would have refused (a body
+//! edited by hand) makes the decision unreadable to these reads.
 //!
 //! Every read here uses the local store alone, the way [`Index::scan`]
 //! does with `remote` unset: no lock, no pull, no bucket request, no write.
+//! `decisions show` takes a provisional judgment's review from the same
+//! local reading.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,14 +67,60 @@ fn subject_str<'a>(body: &'a DecisionBody, field: &str) -> Option<&'a str> {
     body.subject.get(field).and_then(Value::as_str)
 }
 
-/// Whether `body` is an attempt: a judgment carrying `result`.
+/// Why the stored `state` or `result` of a judgment or escalate would be
+/// refused at write time, or `None` when both are absent or well formed.
+/// A body edited by hand after it was written can carry either; the reads
+/// here treat such a decision as unreadable rather than as an attempt.
+fn malformed(body: &DecisionBody) -> Option<&'static str> {
+    if body.kind != "judgment" && body.kind != "escalate" {
+        return None;
+    }
+    if let Some(v) = body.subject.get("state") {
+        if !v.as_str().is_some_and(is_state_visit) {
+            return Some("stored subject field 'state' is not a state name, ':' and a visit");
+        }
+    }
+    if body.kind == "judgment" {
+        if let Some(v) = body.subject.get("result") {
+            if !v.as_str().is_some_and(|r| RESULTS.contains(&r)) {
+                return Some(
+                    "stored subject field 'result' is not one of decided, undecided, provisional",
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Whether `body` is an attempt: a judgment carrying a well-formed
+/// `result` (and, when present, a well-formed `state`).
 pub fn is_attempt(body: &DecisionBody) -> bool {
-    body.kind == "judgment" && subject_str(body, "result").is_some()
+    body.kind == "judgment" && subject_str(body, "result").is_some() && malformed(body).is_none()
 }
 
 /// Whether `body` is a provisional judgment.
 pub fn is_provisional(body: &DecisionBody) -> bool {
-    body.kind == "judgment" && subject_str(body, "result") == Some("provisional")
+    is_attempt(body) && subject_str(body, "result") == Some("provisional")
+}
+
+/// Whether sessions `a` and `b` are in one run: the same session, or one
+/// continues the other through confirmed links.
+fn same_run(
+    backend: &Backend,
+    preds: &mut BTreeMap<String, Vec<String>>,
+    a: &str,
+    b: &str,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    let mut of = |s: &str| -> Vec<String> {
+        preds
+            .entry(s.to_string())
+            .or_insert_with(|| chain::run_predecessors(backend, s))
+            .clone()
+    };
+    of(a).iter().any(|p| p == b) || of(b).iter().any(|p| p == a)
 }
 
 fn same(a: &DecisionBody, b: &DecisionBody) -> bool {
@@ -98,18 +151,19 @@ fn decisions(index: &Index) -> Vec<&DecisionBody> {
         .collect()
 }
 
-/// The questions tied to each attempt, keyed by the attempt's identity,
-/// and for each provisional judgment the questions whose `escalate` names
-/// it (only those can end its wait).
+/// The questions tied to each attempt, keyed by the attempt's (session id,
+/// decision id), and for each provisional judgment the questions whose
+/// `escalate` names it (only those can end its wait).
 struct Ties<'i> {
     questions: BTreeMap<(String, String), Vec<&'i DecisionBody>>,
     reviews: BTreeMap<(String, String), Vec<&'i DecisionBody>>,
 }
 
 impl<'i> Ties<'i> {
-    fn build(index: &'i Index) -> Self {
+    fn build(backend: &Backend, index: &'i Index) -> Self {
         let mut questions: BTreeMap<(String, String), Vec<&DecisionBody>> = BTreeMap::new();
         let mut reviews: BTreeMap<(String, String), Vec<&DecisionBody>> = BTreeMap::new();
+        let mut preds = BTreeMap::new();
         let all = decisions(index);
         for d in &all {
             for c in &d.basis {
@@ -122,11 +176,19 @@ impl<'i> Ties<'i> {
                     continue;
                 }
                 if questions::is_question(d) && is_attempt(target) {
-                    // The escalate names the attempt.
+                    // The escalate names the attempt. Any session may put
+                    // a provisional judgment before a person, so the review
+                    // counts every such question; only a person's verified
+                    // answer ends the wait. The tie is narrower: a raiser
+                    // speaks for its own run, and naming another session's
+                    // attempt doesn't make that session have attempted the
+                    // question.
                     let key = (target.session.id.clone(), target.id.clone());
-                    questions.entry(key.clone()).or_default().push(*d);
                     if is_provisional(target) {
-                        reviews.entry(key).or_default().push(*d);
+                        reviews.entry(key.clone()).or_default().push(*d);
+                    }
+                    if same_run(backend, &mut preds, &d.session.name, &target.session.name) {
+                        questions.entry(key).or_default().push(*d);
                     }
                 } else if is_attempt(d) && questions::is_question(target) {
                     // The attempt names the escalate.
@@ -225,7 +287,7 @@ fn review_with(backend: &Backend, index: &Index, ties: &Ties<'_>, body: &Decisio
 /// ended the wait; or `reversed`, with the winning reversal as `show`
 /// reports it.
 pub fn review(backend: &Backend, index: &Index, body: &DecisionBody) -> Value {
-    review_with(backend, index, &Ties::build(index), body)
+    review_with(backend, index, &Ties::build(backend, index), body)
 }
 
 /// Where an attempts read looks.
@@ -270,9 +332,10 @@ pub fn attempts(backend: &Backend, position: &Position<'_>, filters: &Filters) -
             origin::below(local, &read::local_sessions(backend), &run)
         }
     };
-    let ties = Ties::build(&index);
+    let ties = Ties::build(backend, &index);
     let mut seen = BTreeSet::new();
     let mut found: Vec<(&DecisionBody, &'static str)> = Vec::new();
+    let mut unreadable = Vec::new();
     for (session, entries) in index.sessions() {
         let relation = if run.contains(session) {
             "at"
@@ -282,7 +345,24 @@ pub fn attempts(backend: &Backend, position: &Position<'_>, filters: &Filters) -
             continue;
         };
         for e in entries {
-            let Entry::Decision(b) = e else { continue };
+            let b = match e {
+                Entry::Decision(b) => b,
+                Entry::Unreadable { .. } => {
+                    unreadable.push(e.to_json());
+                    continue;
+                }
+            };
+            if let Some(reason) = malformed(b) {
+                if seen.insert((b.session.id.clone(), b.id.clone())) {
+                    unreadable.push(json!({
+                        "session": b.session.name,
+                        "id": b.id,
+                        "status": "unreadable",
+                        "reason": reason,
+                    }));
+                }
+                continue;
+            }
             if !is_attempt(b) || !seen.insert((b.session.id.clone(), b.id.clone())) {
                 continue;
             }
@@ -330,7 +410,11 @@ pub fn attempts(backend: &Backend, position: &Position<'_>, filters: &Filters) -
             "run_mode": b.authority.run_mode,
             "time": b.time,
             "status": index.status(b),
-            "question": tied.first().map(|q| questions::identity(q)),
+            "question": filters
+                .question
+                .clone()
+                .or_else(|| tied.first().map(|q| questions::identity(q))),
+            "questions": tied.iter().map(|q| questions::identity(q)).collect::<Vec<_>>(),
         });
         if matches!(position, Position::At(_)) {
             e["relation"] = json!(relation);
@@ -346,6 +430,7 @@ pub fn attempts(backend: &Backend, position: &Position<'_>, filters: &Filters) -
         Position::At(_) => doc["at"] = json!(name),
     }
     doc["attempts"] = Value::Array(out);
+    doc["unreadable"] = Value::Array(unreadable);
     doc
 }
 

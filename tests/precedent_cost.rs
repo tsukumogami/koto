@@ -443,9 +443,10 @@ fn check(store: &Store, units: usize) -> Times {
         .iter()
         .filter(|e| !e["question"].is_null())
         .count();
-    // Each worker's undecided attempt, worker a's provisional (named by
-    // the owner's question) and the manager's attempt.
-    assert_eq!(tied, units * (WORKERS.len() + 2));
+    // Each worker's undecided attempt and the manager's attempt. The
+    // question the manager puts to the owner names worker a's provisional,
+    // which it reviews but does not tie: the raiser isn't in a's run.
+    assert_eq!(tied, units * (WORKERS.len() + 1));
 
     let (waiting, awaiting) = store.timed(&[
         "decisions",

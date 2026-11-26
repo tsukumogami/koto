@@ -764,12 +764,12 @@ An attempt is a `judgment` recorded with `--subject result=decided|undecided|pro
 Takes exactly one of `--in` (the session and the sessions it continues) and `--at` (the position, the sessions it continues and every session below it; each element adds `relation`, `at` or `below`). Both or neither exits 2. The filters keep exact matches and combine.
 
 ```json
-{"v":1,"in":"worker","attempts":[{"identity":"<session id>/000000000001","session":"worker","id":"000000000001","what":"...","state":"implement:1","result":"undecided","decider":{...},"run_mode":{...},"time":"...","status":"in-effect","question":null}]}
+{"v":1,"in":"worker","attempts":[{"identity":"<session id>/000000000001","session":"worker","id":"000000000001","what":"...","state":"implement:1","result":"undecided","decider":{...},"run_mode":{...},"time":"...","status":"in-effect","question":null,"questions":[]}],"unreadable":[]}
 ```
 
-`question` is the identity of the question the attempt is tied to through `--basis` (the `escalate` cites the attempt, or the attempt cites the `escalate`), or null. `--in manager --question <identity>` returning an empty array means `manager` recorded no attempt at that question. koto never refuses a pass-up for lack of an attempt; checking is the caller's job.
+`questions` lists every question the attempt is tied to through `--basis`, and `question` is the first (or null), or the one `--question` named. The attempt citing the `escalate` always ties; the `escalate` citing the attempt ties only when the attempt is in the raiser's own run (the raiser and the sessions it continues or that continue it), so a raiser can't make another session look as if it tried. `--in manager --question <identity>` returning an empty array means `manager` recorded no attempt at that question. koto never refuses a pass-up for lack of an attempt; checking is the caller's job.
 
-A provisional element carries `review`: `awaiting` (with the earliest question citing it, or null), `reviewed` (a question citing it has a person's answer that reads `verified`; carries the question and the answer), or `reversed` (with `reversed_by`). Only a verified person answer or a reversal ends the wait. `--awaiting-review` keeps the `awaiting` ones. `koto decisions show` prints the same `review`. The read uses only the local store and writes nothing.
+A provisional element carries `review`: `awaiting` (with the earliest question citing it, or null), `reviewed` (a question citing it has a person's answer that reads `verified`; carries the question and the answer), or `reversed` (with `reversed_by`). Only a verified person answer or a reversal ends the wait. `--awaiting-review` keeps the `awaiting` ones. `koto decisions show` prints the same `review`. `unreadable` lists entries the read couldn't use, including a decision whose stored `state` or `result` was edited into a value `record` would refuse; non-empty means the listing may be incomplete. The read uses only the local store and writes nothing, and `show` computes `review` from the same local reading.
 
 ---
 

@@ -1397,7 +1397,7 @@ pub enum DecisionsSubcommand {
     },
     /// List attempts to decide: judgments carrying a `result` subject, in
     /// one session's run (`--in`) or at and below a session or anchor
-    /// (`--at`), each with the question it is tied to and, for a
+    /// (`--at`), each with the questions it is tied to and, for a
     /// provisional one, its review. Takes exactly one of `--in` and
     /// `--at`. Reads this machine's store only and records nothing
     #[command(group(clap::ArgGroup::new("attempts_by").required(true).args(["in_session", "at"])))]

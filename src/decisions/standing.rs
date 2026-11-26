@@ -538,7 +538,16 @@ pub fn show(backend: &Backend, session: &str, id: &str) -> Option<Value> {
     out["id"] = json!(id);
     if let Entry::Decision(body) = entry {
         if super::attempts::is_provisional(body) {
-            out["review"] = super::attempts::review(backend, &index, body);
+            // The review comes from the local store, as `decisions
+            // attempts` reads it, so the two never disagree.
+            let local;
+            let reading = if matches!(backend, Backend::Cloud(_)) {
+                local = Index::scan(backend, false);
+                &local
+            } else {
+                &index
+            };
+            out["review"] = super::attempts::review(backend, reading, body);
         }
     }
     Some(out)
