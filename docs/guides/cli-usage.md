@@ -1750,7 +1750,7 @@ Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no
 An `escalate` may carry two optional subject fields beside `question`, `text`, `recipient` and `packet`:
 
 - `--subject need=<decision|credential|reserved-step>` says what the raiser needs. Any other value exits 2 on `subject.need`. A question with no `need` reads `decision` in the open reads. Its raiser can't settle a `credential` or `reserved-step` need.
-- `--subject label=<text>`, at most 128 bytes (a longer one exits 2 on `subject.label`), names the topic a settle compares: a question waiting on a person settles only from that person's answer to a question with the same label. [decisions precedent](#decisions-precedent) is the one read that selects by label. Every answer recorded to a labelled question, whatever its outcome, carries the question's `label` in its own subject; koto copies it from the stored question, and no flag sets it. A settle citing an answer whose question is gone from the store, because its raiser was removed, compares that copy.
+- `--subject label=<text>`, at most 128 bytes (a longer one exits 2 on `subject.label`), names the topic a settle compares: a question waiting on a person settles only from that person's answer to a question with the same label. [decisions precedent](#decisions-precedent) is the one read that selects by label. Every answer recorded to a labelled question, whatever its outcome, carries the question's `label` in its own subject; koto copies it from the stored question, and no flag sets it. A settle citing an answer whose question is gone from the store, because its raiser was removed, compares that copy. An answer recorded before koto copied labels has none, so once its raiser is removed it matches no `--label` and can't be a settle's basis.
 
 ### The limit of twenty
 
@@ -1788,7 +1788,7 @@ koto decisions history <session id>/<decision-id>
 
 The identity is the raiser's session id and the question's decision id, as `identity` in [decisions open](#decisions-open) gives it; a session's name in place of its id names no question. The command reads every session in the store, so it works from any directory.
 
-The output carries `question` (its id, `question`, `text`, `label`, `need`, `state`, `packet`, `content_stored` and the `recipient` it was raised with), `raiser` (name and id), `run_mode`, `successor` (the raiser's successor, or `null`), `status`, `open`, `addressee`, `addressees` and `answer`, the entry in effect with its session, id, outcome, text, decider, run mode, time and, for a person's answer, `reading`, or `null` while the question is open.
+The output carries `question` (its id, `question`, `text`, `label`, `need`, `state`, `packet`, `content_stored` and the `recipient` it was raised with), `raiser` (name and id), `run_mode`, `successor` (the session the raiser's supersede marker names, while that hop is confirmed, or `null`), `status`, `open`, `addressee`, `addressees` and `answer`, the entry in effect with its session, id, outcome, text, decider, run mode, time and, for a person's answer, `reading`, or `null` while the question is open.
 
 `entries` lists, each tagged by `entry`:
 
@@ -1796,7 +1796,7 @@ The output carries `question` (its id, `question`, `text`, `label`, `need`, `sta
 - `pass-up`, every `readdress` aimed at the question, with the recording session and `to`;
 - `answer`, every `answer` entry, whatever its outcome, with its session, decider, text and, for a person's answer, `reading`;
 - `citing`, every decision that names one of those answers in its `basis`, with its kind, outcome, decider and `cites`;
-- `unreadable`, every file in the question's aimed area of any session that doesn't read, with the session it sits in and the failed check in `detail`.
+- `unreadable`, every file in the question's aimed area of any session that doesn't read and is named as a decision id, with the session it sits in and the failed check in `detail`; a file named otherwise isn't listed.
 
 Pass-ups and answers carry `counted`, a `reason` when it is false, and, on answers, `governs`, with the values `decisions show` gives the same entry. An entry that doesn't count is listed and marked; an unreadable one never counts and never closes the question.
 

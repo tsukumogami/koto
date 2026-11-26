@@ -1012,7 +1012,9 @@ and `label` (at most 128 bytes). Both are optional subject fields; an entry with
 answer it records for it, whatever the outcome; the value is read from the stored question and no
 flag supplies it, and an answer to a question without one stores what it stored before. The copy is
 what lets a label outlive the raiser: a settle citing an answer whose question the store no longer
-holds compares the copy, where before it read `settle_basis`.
+holds compares the copy, where before it read `settle_basis`. An answer recorded before the copy
+existed has no label of its own, so once its raiser is gone it matches no `--label` and no settle
+accepts it.
 
 **The limit of twenty.** Before an `escalate` with a `person:` recipient, or a pass-up to a
 person, is written, koto counts the open questions (`is_open`) raised in the raiser's whole run
@@ -1072,7 +1074,10 @@ across the store, fenced ones included (`"answer"`, `"pass-up"`), each with `cou
 on answers, `governs` from `judge_entry`, the values `show` prints; every decision whose `basis`
 resolves (as `index.find`, recorded no later than the citing decision) to one of those answers
 (`"citing"`, with `cites`); and every file under `koto/aimed/<raiser id>/` in any session that
-doesn't read (`"unreadable"`, `counted` false, with the failed check in `detail`).
+doesn't read and is named as a decision id (`"unreadable"`, `counted` false, with the failed
+check in `detail`); a file named otherwise has no identifier to list it under and is left out.
+`successor` is the session the raiser's supersede marker names, while that hop is confirmed
+(`chain::run_successors`), or null.
 
 *The history's order.* The raise is first. The rest are sorted by (time, session name, identifier)
 and then emitted in that order, each held back until the entries it must follow are out: a pass-up

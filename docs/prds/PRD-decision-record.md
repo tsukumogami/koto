@@ -859,12 +859,14 @@ to an id-shaped value, and both say so.
   copies that `label` into the answer's subject. The value comes from the stored question and never
   from the caller; an answer to a question with no `label` stores exactly what it stored before this
   requirement. A raiser's settle (R77) citing an answer whose question the store no longer holds,
-  because that question's raiser was removed, compares the label copied onto the cited answer.
+  because that question's raiser was removed, compares the label copied onto the cited answer. An
+  answer recorded before koto copied labels carries none: once its raiser is removed, the precedent
+  read returns it only without `--label`, with a null `label`, and no settle accepts it as a basis.
 - **R82.** `koto decisions history <session id>/<decision id>` prints one question by its identity:
   the question as raised (identifier, question, text, `label`, `need`, `state`, the `packet` hash,
   whether content is stored for it, and the recipient it was raised with); the raiser's name and
-  session id, the run mode it was raised in and, when the raiser has been superseded, its
-  successor; the question's status and whether it is open; `addressee` and `addressees` as the open
+  session id, the run mode it was raised in and, when the raiser has been superseded, the
+  successor its supersede marker names, while that hop is confirmed; the question's status and whether it is open; `addressee` and `addressees` as the open
   reads print them; the answer in effect with its session, identifier, outcome, text, decider, run
   mode, time and, for a person's answer, its reading, or null while the question is open; and
   `entries`, every entry this machine's store holds about the question. The entries are the raise;
@@ -873,7 +875,8 @@ to an id-shaped value, and both say so.
   reading; each decision that cites one of the question's answers in its `basis`, with its session,
   identifier, kind, outcome, decider and the answers it cites; and each file in the question's
   aimed area of any session that doesn't read, as an `unreadable` entry with the session it sits
-  in. Every pass-up and answer carries `counted`, with its `reason` when false, and every answer
+  in, when the file is named as a decision identifier (one named otherwise isn't listed). Every
+  pass-up and answer carries `counted`, with its `reason` when false, and every answer
   carries `governs`, with the values `koto decisions show` gives the same entry. An entry that
   doesn't count is listed and marked, never left out, and an unreadable entry never counts and is
   never the answer in effect. Entries aimed at another question that reuses the decision id under
