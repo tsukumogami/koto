@@ -1689,7 +1689,7 @@ koto decisions open --at <session-or-anchor>
 {"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"addressee":{"typed":true,"kind":"person","handle":"owner"},"addressees":[{"typed":true,"kind":"person","handle":"owner"}],"need":"decision","time":"2026-11-26T14:35:45.564Z"}]}
 ```
 
-Every element carries `need` (see [needs and labels](#needs-and-labels)), `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress).
+Every element carries `need` (see [needs and labels](#needs-and-labels)), `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress). An element adds `state` when the question's `escalate` was raised with `--subject state=<state name>:<visit>` (see [decisions attempts](#decisions-attempts)) and omits it otherwise.
 
 `--person` lists the questions whose `addressee` is `person:<handle>`, so a question shows for a person only while it waits on that person. It follows no link: a question is listed whatever its session's parent, anchor or chain.
 
@@ -1766,6 +1766,48 @@ koto decisions content read <session id>/<decision-id>
 ```
 
 Raise the question first with its content's hash in the subject, `--subject packet=sha256:<hex>` (for example from `sha256sum`). The content is JSON, `{"question": "...", "options": [{"label": "..."}]}`, at most 16 KiB. `write` stores it once under `ctx/koto/packets/<decision-id>` in the raiser's session and prints `{"v":1,"session":...,"id":...,"question":"<identity>","packet":...,"bytes":...,"prompt_header":"#..."}`; it refuses content over the cap, content that doesn't hash to the `packet`, a question without one, and a second write. `read` takes the question's identity and prints the stored bytes unchanged, from any session or directory. `decisions show` and `list --format v1` return `prompt_header` beside every `escalate` that carries a `packet`. No `context` command writes or removes a key under `koto/packets/`.
+
+### decisions attempts
+
+Lists attempts: judgments a session recorded when it tried to decide something itself, with what it concluded. It also lists the provisional decisions an unattended run made on its own that are still waiting for a person to look at them.
+
+An attempt is a `judgment` recorded with `result`:
+
+```bash
+koto decisions record worker --kind judgment --outcome settled --subject what="Postgres or SQLite for the cache" --subject state=implement:1 --subject result=undecided --by session
+```
+
+- `result` -- `decided`, `undecided` or `provisional`. Any other value exits 2 naming `subject.result`. Only `judgment` takes it.
+- `state` -- `<state name>:<visit>`, the workflow state and visit the caller says it decided in. The name takes a session name's shape; the visit is a whole number of 1 or more with no sign and no leading zero. Anything else exits 2 naming `subject.state`. `judgment` and `escalate` take it. koto stores it as given and doesn't compare it with the session's workflow state, which the decision's own `state` still records.
+
+Either field on another kind exits 2, and a refusal writes nothing. `decisions show` and `list --format v1` return both in the subject, and `list --subject result=provisional` or `--subject state=implement:1` selects on them. A judgment with neither field isn't an attempt and prints as it always has. Neither field changes `koto next`, an exit code or what the open reads return.
+
+```bash
+koto decisions attempts --in <session> [--result <result>] [--state <state:visit>] [--question <identity>] [--awaiting-review]
+koto decisions attempts --at <session-or-anchor> [same filters]
+```
+
+```json
+{"v":1,"in":"worker","attempts":[{"identity":"20b56d45-.../000000000001","session":"worker","id":"000000000001","what":"Postgres or SQLite for the cache","state":"implement:1","result":"undecided","decider":{...},"run_mode":{"source":"observed","value":"unknown"},"time":"2026-11-26T20:27:18.291Z","status":"in-effect","question":null,"questions":[]}],"unreadable":[]}
+```
+
+It takes exactly one of `--in` and `--at`; both or neither is a usage error (exit 2). `--in` lists the attempts recorded in the session and in the sessions it continues through `--continues ... --supersede`. `--at` lists, once each, those recorded at the position, in the sessions it continues and in every session below it, with "below" meaning what it means for [decisions open](#decisions-open); each element adds `relation`, `at` or `below`, and the response names the position as `"at"` in place of `"in"`. A position naming no session or anchor exits 2 with field `in` or `at`.
+
+`questions` lists the identities of every question the attempt is tied to, ordered by time, session name and id, and `question` is the first of them (or null), or with `--question` the one asked for. An attempt is tied to a question through `basis`, either way round: the attempt was recorded with `--basis <raiser>:<question id>`, or the question's `escalate` was recorded with `--basis <session>:<attempt id>` naming an attempt in the raiser's own run (the raiser, the sessions it continues and those that continue it). An `escalate` naming another session's attempt doesn't tie it, so a raiser can't make another session appear to have tried its question. A cited name a later session reused doesn't count. So `--in manager --question <identity>` answers whether `manager` tried the question itself, and `--in worker --result undecided` shows each undecided attempt with the question it raised, or null when it raised none. koto never refuses an `escalate` or a `readdress` for lack of an attempt; checking for one before a pass-up is up to the caller.
+
+`--result`, `--state` and `--question` keep exact matches and combine; a `--result` outside the three or a `--question` that isn't `<session id>/<decision id>` exits 2 naming the field. Attempts are ordered by time, then session name, then id.
+
+A provisional judgment's element adds `review`, and `decisions show` prints the same `review` beside it:
+
+- `{"state":"awaiting","question":<identity or null>}` -- no person has reviewed it. `question` names the earliest open question whose `escalate` cites it in `--basis` and is in effect, raised in any session, or the earliest such question when none is open.
+- `{"state":"reviewed","question":"<identity>","answer":{"session":...,"id":...,"text":...,"decider":{...},"reading":"verified","run_mode":{...},"time":...}}` -- such a question's answer in effect (the one listed with `governs` true) is a person's answer that reads `verified` on this host.
+- `{"state":"reversed","reversed_by":{...}}` -- a reversal aimed at it is in effect; `reversed_by` is the winning reversal as `decisions show` reports it.
+
+A session's answer, a raiser's settle or withdrawal, an entry that doesn't count, a verified answer that another outranks, a withdrawn (reversed) question, a person's answer that doesn't read `verified` on this host, or a decision citing the judgment doesn't end the wait. `--awaiting-review` keeps only provisional judgments whose review is `awaiting`.
+
+`unreadable` lists every entry at the position the read couldn't use, each as `{"session","id","status":"unreadable","reason"}`: an entry no decision read can parse, and a `judgment` or `escalate` whose stored `state` or `result` the write would have refused (a body edited by hand), which isn't treated as an attempt, ties to no question or attempt and ends no wait. A non-empty `unreadable` means the listing may be incomplete.
+
+The read uses only this host's store: it takes no lock, pulls nothing, makes no bucket request under the cloud backend and writes nothing. `decisions show` takes a provisional judgment's `review` from the same local reading, so the two agree under the cloud backend. The one exception is a reversal: `show` prints the `status` it reads with the bucket, and its `review` reads `reversed` whenever that `status` does, even when the reversal is only in the bucket and the attempts read still shows `awaiting`. It is refused under `--workspace`.
 
 ### decider answer
 

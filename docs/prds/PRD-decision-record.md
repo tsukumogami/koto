@@ -215,9 +215,9 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `accept` of an intent or staged draft | where it lives (a koto request identifier, a repository path, or a forge issue), plus an optional link to the ticket or alert it came from |
   | `merge` | repository, pull request number, merged head commit |
   | `gate-pass` | workflow (koto session name), state, gate |
-  | `escalate` | a question identifier and text, and the recipient: `session:<name>`, `anchor:<name>`, `person:<handle>`, or, on an entry written before R49, an untyped value; optionally a `packet` (R69), a `label` and a `need` (R78) |
+  | `escalate` | a question identifier and text, and the recipient: `session:<name>`, `anchor:<name>`, `person:<handle>`, or, on an entry written before R49, an untyped value; optionally a `packet` (R69), a `label` and a `need` (R78), and a `state` (R80) |
   | `decline-escalation` | a question identifier and text |
-  | `judgment` | what was judged, as free text plus an optional pointer |
+  | `judgment` | what was judged, as free text plus an optional pointer; optionally `state` and `result` (R80) |
   | `verdict` | what was judged, at least one evidence pointer, and, for a change or a release, the repository and commit judged |
   | `reverse` | the session name and identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason |
@@ -831,6 +831,64 @@ to an id-shaped value, and both say so.
   any write by the run, as when twenty settles resting on one person's answer stop counting
   because that person answers the earlier question again.
 
+**Attempts and provisional decisions**
+
+- **R80.** A `judgment` may carry two more subject fields: `state`, written `<state name>:<visit>`,
+  and `result`, one of `decided`, `undecided` or `provisional`. An `escalate` may carry `state`
+  too. The state name takes the shape a session name takes and the visit is a whole number of 1
+  or more with no sign and no leading zero. `state` is the caller's value: koto stores it as
+  handed and never compares it with the workflow state the session is in, which R3 records
+  separately. Any other `result` exits 2 naming `subject.result`, a malformed `state` exits 2
+  naming `subject.state`, and either field on a kind that doesn't take it exits 2; each refusal
+  writes nothing.
+- **R81.** A `judgment` carrying `result` is an attempt. One carrying neither field, which every
+  judgment recorded before R80 is, is not: `show` and `list --format v1` print it with no new key,
+  byte for byte what they printed before, and no attempts read returns it. A judgment carrying
+  either field reports nothing on `koto next`, changes no exit code and is returned by no open
+  read. `list --subject result=<value>` and `--subject state=<value>` select on the fields through
+  the listing's existing subject filter.
+- **R82.** An attempt is tied to a question through `basis`, in either direction: the attempt
+  names the question's `escalate`, or the `escalate` names an attempt recorded in the raiser's own
+  run (the raiser, the sessions it continues and those that continue it). An `escalate` naming
+  another session's attempt doesn't tie it. A citation counts only when
+  the decision it names, read now, is of the right kind and was recorded no later than the
+  decision citing it, so a recreated session that reuses a name and identifier isn't taken for
+  the one cited. An attempt carries every tied question, ordered by time, session name and
+  identifier.
+- **R83.** `koto decisions attempts` takes exactly one of `--in <session>` and
+  `--at <session or anchor>`. `--in` returns the attempts recorded in the session's run: the
+  session and those it continues through a confirmed supersede. `--at` returns those recorded at
+  the position, in the sessions it continues and in every session below it, each once, with
+  `relation` reading `at` or `below`. Each element carries its identity, session, identifier,
+  `what`, `state`, `result`, decider, run mode, time, status, `questions` (every tied question's
+  identity) and `question` (the first of them or null, or the one `--question` named). The
+  response lists under `unreadable` every entry at the position the read couldn't use, including
+  a `judgment` or `escalate` whose stored `state` or `result` the write would refuse, which is not
+  an attempt, ties to no question or attempt and ends no wait. `--result`, `--state` and `--question <identity>` narrow to exact matches
+  and combine. Elements are ordered by time, then session name, then identifier. Both or neither
+  of `--in` and `--at`, a position naming nothing, a `--result` outside the three or a
+  `--question` that isn't an identity exits 2.
+- **R84.** A provisional judgment carries a `review`: `reversed`, with the winning reversal, once
+  a reversal aimed at it is in effect; else `reviewed`, with the question's identity and the
+  answer, once a question whose `escalate` is in effect and names the judgment in its `basis` is
+  governed (R74) by a person's answer that reads `verified` on this host; else `awaiting`, with
+  the identity of the earliest such question still open, else the earliest such question, or
+  null. The question may be raised in any session. Nothing else ends the wait: not a session's
+  answer, a settle, a withdrawal, an entry that doesn't count, a verified answer another
+  outranks, a withdrawn question, a person answer that doesn't read `verified` on this host, or
+  a decision citing the judgment. `--awaiting-review` returns only provisional judgments awaiting
+  review, and `show` prints the same `review`, read from the same local store, except that it reads `reversed` whenever the `status` in its response does. A review is matched by identity, so a review
+  question naming a removed session's judgment doesn't review a new judgment that reuses its name
+  and identifier.
+- **R85.** The attempts read uses only this machine's store. It takes no lock, pulls nothing,
+  makes no bucket request under the cloud backend and writes nothing. koto refuses nothing for
+  want of an attempt: an `escalate` or a `readdress` with no attempt behind it is recorded as
+  before, and enforcing an attempt before a pass-up is left to the caller.
+- **R86.** Over a store of 1,000 sessions in dispatcher chains four deep, holding 200 open
+  questions with attempts and provisional judgments in every chain, `attempts --at` a top
+  coordinator, with and without `--awaiting-review`, and `attempts --in` a session each finish in
+  under five seconds on a release build.
+
 ### Non-functional
 
 - **R32.** Decisions are immutable once written. Two sessions each recording 100 decisions at once
@@ -1242,6 +1300,33 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   second write is refused and the first bytes stay; content that doesn't hash to the `packet` is
   refused; `context add` under `koto/packets/` is refused; a read from another session prints the
   bytes written (R69, R70).
+- [ ] A judgment recorded with `state=implement:1` and each of the three `result` values exits 0
+  and `show` and `list --format v1` return both fields; `result=maybe`, a `state` with no visit or
+  a visit of `0`, `result` on an `escalate` and `state` on a `merge` each exit 2 naming the field
+  and leave the session's directory byte-identical (R80).
+- [ ] A judgment recorded with neither field prints byte-identical to the previous binary in
+  `show` and `list --format v1` and is returned by no attempts read; a judgment with either field
+  leaves `koto next` and every open read unchanged; `list --subject result=provisional` returns
+  exactly the provisional judgments (R81).
+- [ ] An `escalate` citing an attempt in its raiser's run and a judgment citing an `escalate`
+  each tie the attempt to that question, and `questions` lists every tied question; an `escalate`
+  citing another session's attempt ties nothing; an `escalate` in a recreated session that reuses the cited name and identifier
+  is not taken for the question (R82).
+- [ ] `attempts --in` returns the session's attempts and its confirmed predecessor's and none of
+  another session's; `attempts --at` returns those at and below the position once each with
+  `relation`, and none from a separate hierarchy; `--question` returns one element once the
+  session has an attempt tied to the question and an empty array before; both or neither of `--in`
+  and `--at` exits 2 (R83).
+- [ ] A provisional judgment reads `awaiting` until a question citing it is closed by a verified
+  person answer, then `reviewed` with the answer's text and decider; a session's answer, a
+  withdrawn question, an answer that doesn't read `verified` on this host or a citing judgment
+  leaves it `awaiting`; a reversal makes it `reversed`
+  and drops it from `--awaiting-review`; `show` prints the same review (R84).
+- [ ] Every session directory is byte-identical before and after each attempts read, a
+  `readdress` by a session with no attempt exits 0, and under the cloud backend the in-process
+  endpoint records no request from any attempts read (R85).
+- [ ] The generated store's three reads return the counts its generator intends and each finishes
+  in under five seconds on a release build (R86).
 
 **Which entries count and which is in effect**
 
