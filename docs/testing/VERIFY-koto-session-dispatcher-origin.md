@@ -1,6 +1,7 @@
 # Verification: where a session came from
 
-This records the reference-host check of the dispatcher-origin work: Issue 5
+This records the check of the dispatcher-origin work on the reference host,
+the maintainer's machine where the baseline runs in koto#716 were taken: Issue 5
 of `PLAN-koto-session-dispatcher-origin` (coordination pull request koto#687).
 It was run after koto v0.38.0 (Issues 1 to 3, koto#715) and Issue 4, the
 shirabe change that drops the manual dispatcher link step from worker briefs
@@ -51,7 +52,7 @@ on its workflow session, read before each worker was torn down:
 
 | Run | Anchor origin | Workflow session origin |
 |-----|---------------|-------------------------|
-| 1 | dispatched, `anchor-faaf6575-...` (anchor) | dispatched, `anchor-faaf6575-...` (anchor), via its anchor; coordinator run `...T041022Z` |
+| 1 | dispatched, `anchor-faaf6575-...` (anchor) | dispatched, `anchor-faaf6575-...` (anchor), via its anchor (its coordinator run was `...T041022Z`) |
 | 2 | dispatched, `anchor-de734f94-...` (anchor) | dispatched, coordinator run `...T051222Z` (workflow) |
 | 3 | dispatched, `anchor-de734f94-...` (anchor) | dispatched, coordinator run `...T051222Z` (workflow) |
 | 4 | dispatched, `anchor-9943f9ad-...` (anchor) | dispatched, coordinator run `...T063556Z` (workflow) |
@@ -82,6 +83,11 @@ link koto writes from a workflow session to the anchor that held it when it
 was opened, and reported the coordinator's anchor. That is the path the PLAN
 expected for every run.
 
+So the PLAN's checks conflict here. AC1 asks for the coordinator's anchor on
+the workflow session, Issue 4 keeps the `--dispatched-by` open for `/explore`
+workers, and Issue 2's precedence reports that link first. A worker that
+follows the `/explore` brief can't meet AC1's workflow-session half.
+
 ## AC3: no launcher
 
 **Result: not checked.** It needs a machine with koto and shirabe and no
@@ -108,7 +114,7 @@ that issued the calls. The PLAN's cost measure is (a), input plus output.
 koto#716 did. Applied to the three baseline transcripts, this count
 reproduces koto#716's call counts and token figures. The one difference is
 that koto#716 marks the refused open in baseline 2 as failed, and that tool
-result was not an error.
+result was not an error, so the table shows no failed call for baseline 2.
 
 Runs 1 to 3 are the AC7 runs, because they are the first three after the
 change. Runs 4 to 10 were taken for AC1.
@@ -116,7 +122,7 @@ change. Runs 4 to 10 were taken for AC1.
 | Run | koto calls | Failed | (a) | (b) |
 |-----|-----------|--------|-----|-----|
 | Baseline 1 | 8 | 0 | 8130 | 673288 |
-| Baseline 2 | 9 | 1 | 5632 | 832735 |
+| Baseline 2 | 9 | 0 | 5632 | 832735 |
 | Baseline 3 | 8 | 1 | 5701 | 751988 |
 | After 1 | 7 | 1 | 5919 | 687601 |
 | After 2 | 10 | 0 | 6430 | 1037913 |
@@ -132,8 +138,8 @@ reading, and also fail it compared run for run or by median (7 against 8).
 
 Run 1 counts as an after run here, although it dropped `--dispatched-by`
 from its open (see AC1). Leaving it out doesn't change the result. The ten
-after runs made 7, 10, 6, 9, 10, 8, 8, 8, 7 and 13 calls, and runs 2 to 4
-(10, 6, 9) don't match either. For this task the count isn't stable from run
+after runs made 7, 10, 6, 9, 10, 8, 8, 8, 7 and 13 calls, so runs 2 to 4
+(10, 6, 9) fail the same reading too. For this task the count isn't stable from run
 to run.
 
 The search fails in all ten transcripts. A case-insensitive search for
