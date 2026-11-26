@@ -11,6 +11,8 @@
 
 #[path = "support/koto_command.rs"]
 mod koto_command;
+#[path = "support/prompt_fixture.rs"]
+mod prompt_fixture;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +59,7 @@ Done.
 "#;
 
 struct Env {
+    _records: prompt_fixture::Records,
     _tmp: TempDir,
     root: PathBuf,
 }
@@ -96,7 +99,11 @@ impl Env {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         std::fs::write(root.join("work.md"), TEMPLATE).unwrap();
-        Env { _tmp: tmp, root }
+        Env {
+            _records: prompt_fixture::Records::new(),
+            _tmp: tmp,
+            root,
+        }
     }
 
     fn sessions(&self) -> PathBuf {
@@ -181,6 +188,95 @@ impl Env {
                 .unwrap()
                 .to_string(),
         }
+    }
+
+    /// Raise `question` in `name` to `recipient` with the content the
+    /// fixture `lines` shows at position 1 stored for it; returns the
+    /// escalation and the prompt header the content was given.
+    fn escalate_shown(
+        &self,
+        name: &str,
+        question: &str,
+        recipient: &str,
+        lines: &[Value],
+    ) -> (Rec, String) {
+        let (shown, labels) = prompt_fixture::shown(lines, 1);
+        let content = prompt_fixture::content(&shown, &labels);
+        let q = format!("question={question}");
+        let t = format!("text=what about {question}?");
+        let r = format!("recipient={recipient}");
+        let packet = format!("packet={}", prompt_fixture::packet(&content));
+        let out = self
+            .ok(&[
+                "decisions",
+                "record",
+                name,
+                "--kind",
+                "escalate",
+                "--outcome",
+                "escalated",
+                "--subject",
+                &q,
+                "--subject",
+                &t,
+                "--subject",
+                &r,
+                "--subject",
+                &packet,
+                "--by",
+                "session",
+            ])
+            .json();
+        let rec = Rec {
+            session: name.to_string(),
+            id: out["id"].as_str().unwrap().to_string(),
+            session_id: out["decision"]["session"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        };
+        let file = self.root.join(format!("content-{}-{}", name, rec.id));
+        std::fs::write(&file, &content).unwrap();
+        let written = self
+            .ok(&[
+                "decisions",
+                "content",
+                "write",
+                name,
+                &rec.id,
+                "--file",
+                file.to_str().unwrap(),
+            ])
+            .json();
+        let header = written["prompt_header"].as_str().unwrap().to_string();
+        (rec, header)
+    }
+
+    /// Record `person:owner`'s answer to `q` in `in_session` from the
+    /// fixture `lines`, installed for this thread's harness session with
+    /// `header` at position 1.
+    fn person_answer(&self, q: &Rec, in_session: &str, header: &str, lines: &[Value]) -> Out {
+        let harness = prompt_fixture::harness();
+        prompt_fixture::install(
+            &harness,
+            &prompt_fixture::render(lines, &harness, &[header]),
+        );
+        let pointer = format!("{harness}/{}/1", prompt_fixture::CALL);
+        self.run_env(
+            &[("CLAUDE_CODE_SESSION_ID", harness.as_str())],
+            &[
+                "decisions",
+                "answer",
+                &q.session,
+                &q.id,
+                "--in",
+                in_session,
+                "--by",
+                "person:owner",
+                "--prompt",
+                &pointer,
+            ],
+        )
     }
 
     fn readdress_run(&self, q: &Rec, in_session: &str, to: &str) -> Out {
@@ -354,7 +450,8 @@ fn chain(env: &Env) {
 fn the_walkthrough_passes_a_question_up_twice_and_answers_it() {
     let env = Env::new();
     chain(&env);
-    let q1 = env.escalate("worker", "q1", "session:manager");
+    let lines = prompt_fixture::lines("accepted");
+    let (q1, header) = env.escalate_shown("worker", "q1", "session:manager", &lines);
     let q2 = env.escalate("worker", "q2", "session:manager");
     env.escalate("other-worker", "q3", "session:other-lead");
 
@@ -452,8 +549,9 @@ fn the_walkthrough_passes_a_question_up_twice_and_answers_it() {
     assert_eq!(names(&env.at("other-lead")), vec!["q3"]);
     assert!(env.next("worker").get("questions").is_none());
 
-    // An answer closes it everywhere.
-    env.answer(&q1, "director", "SQLite");
+    // The owner's answer closes it everywhere.
+    let out = env.person_answer(&q1, "director", &header, &lines);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     assert!(env.open("owner").is_empty());
     for position in ["worker", "manager", "director"] {
         assert_eq!(names(&env.at(position)), vec!["q2"], "at {position}");
@@ -462,7 +560,10 @@ fn the_walkthrough_passes_a_question_up_twice_and_answers_it() {
     assert_eq!(reported.len(), 1, "{reported:?}");
     assert_eq!(reported[0]["identity"], q1.identity().as_str());
     assert_eq!(reported[0]["state"], "answered");
-    assert_eq!(reported[0]["answer"]["text"], "SQLite");
+    assert_eq!(
+        reported[0]["answer"]["text"],
+        prompt_fixture::answer_of(&lines, 1).as_str()
+    );
     assert_eq!(reported[0]["answer"]["session"], "director");
 
     // An answered question isn't passed up.

@@ -19,6 +19,14 @@ pub const MAX_REASON_BYTES: usize = 4 * 1024;
 /// The most `basis` and `evidence` entries one decision carries.
 pub const MAX_LIST_ENTRIES: usize = 64;
 
+/// The values an escalation's `need` subject field takes: an ordinary
+/// question (`decision`, the reading of an escalation with no `need`), or a
+/// need its raiser can't settle for itself.
+pub const NEEDS: [&str; 3] = ["decision", "credential", "reserved-step"];
+
+/// The largest `label` an escalation carries, in bytes.
+pub const MAX_LABEL_BYTES: usize = 128;
+
 /// The closed set of kinds and, for each, its closed set of outcomes (R1).
 pub const KINDS: [(&str, &[&str]); 11] = [
     ("accept", &["accepted", "rejected"]),
@@ -30,7 +38,7 @@ pub const KINDS: [(&str, &[&str]); 11] = [
     ("verdict", &["pass", "fail", "inconclusive"]),
     ("reverse", &["reversed"]),
     ("refused", &["refused"]),
-    ("answer", &["answered"]),
+    ("answer", &["answered", "settled", "withdrawn"]),
     ("readdress", &["passed"]),
 ];
 
@@ -265,7 +273,7 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
     }];
     const ESCALATE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text", "recipient"],
-        optional: &["packet"],
+        optional: &["packet", "label", "need"],
     }];
     const DECLINE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text"],
@@ -295,16 +303,18 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
         optional: &[],
     }];
     // The question answered, by its raising session's name and the
-    // escalation's id, and the answer's text.
+    // escalation's id, and the answer's text. A withdrawal carries a reason
+    // and may carry no text; `validate` asks for the text otherwise.
     const ANSWER: &[SubjectShape] = &[SubjectShape {
-        required: &["session", "id", "text"],
-        optional: &[],
+        required: &["session", "id"],
+        optional: &["text"],
     }];
     // The question passed up, by its raising session's name and the
-    // escalation's id, and the typed recipient it now waits on.
+    // escalation's id, and the typed recipient it now waits on, with the
+    // dispatcher the destination rule was judged against, when there was one.
     const READDRESS: &[SubjectShape] = &[SubjectShape {
         required: &["session", "id", "recipient"],
-        optional: &[],
+        optional: &["dispatcher"],
     }];
     match kind {
         "accept" => ACCEPT,
@@ -416,6 +426,22 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
         if let Some(r) = given.get("recipient").and_then(|v| v.first()) {
             check_recipient(r)?;
         }
+        if let Some(n) = given.get("need").and_then(|v| v.first()) {
+            if !NEEDS.contains(&n.as_str()) {
+                return Err(DecisionError::invalid(
+                    "subject.need",
+                    format!("need '{}' isn't one of {}", preview(n), NEEDS.join(", ")),
+                ));
+            }
+        }
+        if let Some(l) = given.get("label").and_then(|v| v.first()) {
+            if l.len() > MAX_LABEL_BYTES {
+                return Err(DecisionError::invalid(
+                    "subject.label",
+                    format!("subject field 'label' is longer than {MAX_LABEL_BYTES} bytes"),
+                ));
+            }
+        }
         if let Some(p) = given.get("packet").and_then(|v| v.first()) {
             if !super::packets::is_hash(p) {
                 return Err(DecisionError::invalid(
@@ -425,6 +451,12 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
                 ));
             }
         }
+    }
+    if req.kind == "answer" && req.outcome != "withdrawn" && !given.contains_key("text") {
+        return Err(DecisionError::invalid(
+            "subject.text",
+            format!("an '{}' answer needs its text", req.outcome),
+        ));
     }
     if req.kind == "verdict" && req.evidence.is_empty() {
         return Err(DecisionError::invalid(

@@ -154,7 +154,7 @@ impl Env {
         self.ok(&["init", name, "--template", template.to_str().unwrap()]);
     }
 
-    /// Raise a question to `person:owner` in the raiser with `content`
+    /// Raise a question to `session:answerer` in the raiser with `content`
     /// stored for it.
     fn raise(&self, content: &[u8]) -> Q {
         let packet = format!("packet={}", fx::packet(content));
@@ -172,7 +172,7 @@ impl Env {
                 "--subject",
                 "text=which way?",
                 "--subject",
-                "recipient=person:owner",
+                "recipient=session:answerer",
                 "--subject",
                 &packet,
                 "--by",

@@ -60,6 +60,12 @@ impl Entry {
     }
 }
 
+/// The session id the local state file of `session` names, read with no
+/// lock and no pull.
+pub fn local_session_id(backend: &Backend, session: &str) -> Option<String> {
+    session_id(backend, session, false)
+}
+
 /// The session id the state file of `session` names, read from the file
 /// without a lock or a pull; under the cloud backend with no local copy,
 /// from the bucket's state file.

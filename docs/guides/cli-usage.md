@@ -1678,7 +1678,7 @@ It fails closed. A marker koto can't read (a symlink, not a regular file, over 4
 
 ### decisions open
 
-Lists open questions across every session in this host's store, for a person or for a position. A question is an `escalate` decision with a typed recipient; it is open while it is in effect and no `answer` targets it. Open, and who a question waits on, are worked out each time the command runs, and the command records nothing. It takes exactly one of `--person` and `--at`; both or neither is a usage error (exit 2).
+Lists open questions across every session in this host's store, for a person or for a position. A question is an `escalate` decision with a typed recipient; it is open while it is in effect and no closing entry that counts targets it (see [decisions answer](#decisions-answer)). Open, and who a question waits on, are worked out each time the command runs, and the command records nothing. It takes exactly one of `--person` and `--at`; both or neither is a usage error (exit 2).
 
 ```bash
 koto decisions open --person <handle>
@@ -1686,10 +1686,10 @@ koto decisions open --at <session-or-anchor>
 ```
 
 ```json
-{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"addressee":{"typed":true,"kind":"person","handle":"owner"},"addressees":[{"typed":true,"kind":"person","handle":"owner"}],"time":"2026-11-26T14:35:45.564Z"}]}
+{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"addressee":{"typed":true,"kind":"person","handle":"owner"},"addressees":[{"typed":true,"kind":"person","handle":"owner"}],"need":"decision","time":"2026-11-26T14:35:45.564Z"}]}
 ```
 
-Every element carries `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress).
+Every element carries `need` (see [needs and labels](#needs-and-labels)), `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress).
 
 `--person` lists the questions whose `addressee` is `person:<handle>`, so a question shows for a person only while it waits on that person. It follows no link: a question is listed whatever its session's parent, anchor or chain.
 
@@ -1697,16 +1697,33 @@ Every element carries `recipient`, the recipient the question was raised with; `
 
 ### decisions answer
 
-Answers a question another session raised, recording an `answer` decision with outcome `answered` in the answering session.
+Answers a question another session raised, recording an `answer` decision with outcome `answered` in the answering session, or closes a question from the session that raised it, with outcome `withdrawn` or `settled`.
 
 ```bash
 koto decisions answer <raiser-session> <decision-id> --in <session> --text <text> [--by session] [decider flags]
 koto decisions answer <raiser-session> <decision-id> --in <session> --by person:<handle> --prompt <harness>/<call>/<position>
+koto decisions answer <raiser-session> <decision-id> --in <raiser-session> --outcome withdrawn --reason <why> --by session
+koto decisions answer <raiser-session> <decision-id> --in <raiser-session> --outcome settled --text <text> (--basis <session>:<id> | --evidence event:<session>:<seq>) --by session
 ```
+
+`--outcome` takes `answered` (the default), `withdrawn` or `settled`; any other value exits 2 on field `outcome`.
 
 The answer's target is the question's identity, the raiser's session id with the decision id, so it never answers a later session that reuses the name. It is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session, and nothing is written in the raiser's session. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","decision":{...}}` and exits 0. Once recorded, the question no longer lists in `decisions open`, and the raiser's `koto next` reports the answer in its `questions` array.
 
-Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), or when `--in` names the raiser. An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question, even after it has been passed up past the answering session; which answers count isn't built yet.
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), or when an `answered` answer's `--in` names the raiser. A session's answer is also refused when the question waits on a person (field `by`), when `--in` isn't the session or anchor the question waits on now nor a session continuing it (field `in`), and when the question is already closed (field `id`, naming the entry in effect as `<session>:<id>`). A person's accepted answer is taken whenever the question is in effect, closed or not, since it outranks what closed it. An answer, a settle and a withdrawal can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`.
+
+**Withdrawing and settling.** Only the session that raised the question, matched by session id, or a session continuing it through `--continues ... --supersede` records these, and only with `--by session`; anything else exits 2 (field `in` or `by`). Either is refused once the question is closed. A withdrawal needs `--reason` and may leave out `--text`. A settle needs `--text` and evidence:
+
+- For a question that waits on a person, the question needs a `label`, and `--basis` must name an accepted answer of that same person that reads `verified`, is the entry in effect on its own question, and answers a question with the same `label`. The message names what failed: no basis, a session's answer, an answer of another handle, a remote reading, an answer no longer in effect, a label that differs, or no label.
+- For a question that waits on a session or anchor, a `--basis` naming a decision that reads back, or an `--evidence event:<session>:<seq>` pointer.
+
+A `credential` or `reserved-step` need can't be settled (field `outcome`); it can be answered, passed up or withdrawn.
+
+**Which entries count.** An entry is judged each time it's read, against who the question waits on at that moment, and the stored status never changes. A person's verified answer counts whoever recorded it. Any other `answered` answer, including a person's answer that reads as a remote session's, counts only from the session or anchor the question waits on now, or a session continuing it, and never while the question waits on a person. A settle or withdrawal counts only under the rules above. Of the entries that count, a person's verified answer is in effect over any session's, whichever came first; between two person answers, the one the other doesn't cite in its `--basis` wins, then the later. With no person answer, the earliest counted entry is in effect.
+
+`decisions show` and `decisions list --format v1` add to every `answer` and `readdress` entry `counted` (`true` or `false`) and, when it's false, a `reason`: `not_addressee`, `waits_on_person`, `not_raiser`, `person_decider`, `no_reason`, `need_not_settleable`, `settle_basis`, `no_question`, `destination` or `skipped`. Every `answer` entry also carries `governs`, `true` on the one entry in effect. An entry that doesn't count is still listed and closes nothing.
+
+The raiser's `koto next` reports the entry in effect when it's an `answered` answer: if a person's answer later outranks a session's answer the run already cited, the question is reported again with the person's answer until the run cites that one. A question the run withdrew or settled itself isn't reported.
 
 **A person's answer.** `--by person:<handle>` needs `--prompt`, the evidence that the person was asked: the harness session that asked (it must be the one running the command, `CLAUDE_CODE_SESSION_ID`, and, when koto has recorded a harness session driving the answering session, that one), the id of its `AskUserQuestion` call, and the 1-based position of the question in that call. The question must carry a `packet` and its content must be stored (see [decisions content](#decisions-content)). The prompt must show the question with its `prompt_header` as the question's `header`, and the content's question text and option labels exactly, in order. koto reads the call and its result from the harness session's record under `.claude/projects/` in your account's home as the system's user database gives it (`HOME` doesn't move it, and a record whose real path is outside that folder is refused; a harness configured with `CLAUDE_CONFIG_DIR` keeps its records elsewhere, so a person's answer there always fails the `record` check) and records the person's reply from the result as the answer's text; `--text` isn't needed and is ignored. The entry stores the pointer with the mark `verified`, labelled `observed`, and the decider's handle labelled `handed`. The call and its result must be in the harness session's own conversation, not a subagent's, and the call must have been made no earlier than the question was raised. The reply's permission source must be exactly `user_temporary`, the value the harness records for a reply the person gave. One call position verifies one answer on a host: koto keeps a marker for each position used under the koto root, so a second answer citing it from any session is refused while the first is being written or once it is stored. A marker left by an answer that stopped before it was stored is taken over.
 
@@ -1724,7 +1741,20 @@ koto decisions readdress <raiser-session> <decision-id> --in <session> --to <rec
 
 `--to` is typed like an `escalate`'s recipient: `session:<name>`, `anchor:<name>` or `person:<handle>`. `--in` is the session recording the pass-up, and it has to be the raiser or the session or anchor the question waits on now, or a session that continues one of those through `--continues ... --supersede`; a superseded session is pointed at its successor. The entry's target is the question's identity, and it is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session and nowhere else. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","addressee":{...},"addressees":[...],"decision":{...}}` and exits 0. From then on `decisions open` shows the new `addressee`, `--person` follows it, and the raiser's `koto next` is unchanged: a pass-up reports nothing until an answer comes.
 
-Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` with field `id` when it isn't an `escalate`, its recipient is untyped, it doesn't read `in-effect` or it is already answered; with field `to` when `--to` has no type prefix, a bad name or handle, or names the current addressee; with field `in` when `--in` is neither the raiser nor the current addressee, nor a successor of either; and with field `by` for `--by person:<handle>`. `decisions record --kind readdress` is refused, and `decisions reverse` aimed at a pass-up is refused with `reverses_readdress`. Where a question may be passed, beyond who may pass it, isn't checked yet.
+**Where a question may go.** `--to` names a person, or the `--in` session's dispatcher as `koto session origin` reports it (for a successor with no dispatcher of its own, the dispatcher of the session it continues). A session with no dispatcher passes a question only to a person. The entry records the dispatcher's name in its subject as `dispatcher`, and the rule is judged from that recorded name, so changing the recorder's links later moves no question. A stored pass-up that breaks the rule, or one the history leaves out, lists with `counted` false and isn't in `addressees`.
+
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` with field `id` when it isn't an `escalate`, its recipient is untyped, it doesn't read `in-effect` or it is already closed; with field `to` when `--to` has no type prefix, a bad name or handle, names the current addressee, or names a session or anchor that isn't the recorder's dispatcher (the message names the one it would accept, or says there is none); with field `in` when `--in` is neither the raiser nor the current addressee, nor a successor of either; and with field `by` for `--by person:<handle>`. `decisions record --kind readdress` is refused, and `decisions reverse` aimed at a pass-up is refused with `reverses_readdress`.
+
+### Needs and labels
+
+An `escalate` may carry two optional subject fields beside `question`, `text`, `recipient` and `packet`:
+
+- `--subject need=<decision|credential|reserved-step>` says what the raiser needs. Any other value exits 2 on `subject.need`. A question with no `need` reads `decision` in the open reads. Its raiser can't settle a `credential` or `reserved-step` need.
+- `--subject label=<text>`, at most 128 bytes (a longer one exits 2 on `subject.label`), names the topic a settle compares: a question waiting on a person settles only from that person's answer to a question with the same label. No read selects by label.
+
+### The limit of twenty
+
+A session's run holds at most twenty open questions waiting on a person. An `escalate` with a `person:` recipient exits 2 on `subject.recipient`, naming the limit of twenty and writing nothing, while twenty questions raised in the session or the sessions it continues through `--continues ... --supersede` are open and wait on a person, whatever the handles. The count follows who each question waits on now: a question passed up to a person counts toward the session that raised it, one passed from a person to a session doesn't, and a closed or reversed question doesn't. An `escalate` to a session or anchor, and a pass-up to a person, are never refused by it. The count reads this host's store and isn't taken atomically with the write, so two `escalate` commands run at once at nineteen can both be recorded.
 
 ### decisions content
 

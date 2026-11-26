@@ -190,7 +190,7 @@ impl Index {
                 let Some(t) = &b.target else { continue };
                 let into = match b.kind.as_str() {
                     "reverse" => &mut reversals,
-                    "answer" if b.outcome == "answered" => &mut answers,
+                    "answer" => &mut answers,
                     "readdress" if b.outcome == "passed" => &mut readdresses,
                     _ => continue,
                 };
@@ -241,9 +241,12 @@ impl Index {
             .unwrap_or(&[])
     }
 
-    /// Every `answered` answer aimed at decision `id` of the session whose
-    /// id is `session_id`, wherever it was recorded, earliest first by
-    /// time, then the answering session's name, then id.
+    /// Every `answer` aimed at decision `id` of the session whose id is
+    /// `session_id`, whatever its outcome (`answered`, `settled` or
+    /// `withdrawn`) and wherever it was recorded, a copy held in several
+    /// sessions once per holder, earliest first by time, then the
+    /// recording session's name, then id. Whether each counts, and which
+    /// one is in effect, is [`super::questions::resolve`]'s to say.
     pub fn answers_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
         let mut out: Vec<&DecisionBody> = self
             .answers
@@ -351,6 +354,19 @@ impl Index {
                 out["reading"] = json!(super::prompt::REMOTE_READING);
                 out["decision"]["prompt"]["mark"] =
                     json!(super::decider::Sourced::observed(super::prompt::REMOTE));
+            }
+        }
+        if body.kind == "answer" || body.kind == "readdress" {
+            // Whether the entry counts toward its question, judged now
+            // against the question's current history; the stored status
+            // stays as it is.
+            let judged = super::questions::judge_entry(self, scope.backend, body);
+            out["counted"] = json!(judged.counted);
+            if let Some(r) = judged.reason {
+                out["reason"] = json!(r);
+            }
+            if let Some(g) = judged.governs {
+                out["governs"] = json!(g);
             }
         }
         if self.after_fence(body) {

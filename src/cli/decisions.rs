@@ -202,6 +202,53 @@ fn split_pairs(command: &str, field: &str, pairs: &[String]) -> Vec<(String, Str
         .collect()
 }
 
+/// Refuse an `escalate` to a person from `name` (whose session id is
+/// `session_id`) while the session, with the sessions it continues, holds
+/// the limit of open questions waiting on a person. The count is by the
+/// raising session's id, so a new session reusing a removed session's
+/// name starts at zero, and it follows the addressee each question has
+/// now. Nothing is written.
+fn check_person_limit(
+    backend: &Backend,
+    name: &str,
+    session_id: &str,
+    subject: &std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    use crate::decisions::body::Recipient;
+    use crate::decisions::questions;
+    let to_person = subject
+        .get("recipient")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|r| matches!(Recipient::parse(r), Recipient::Person(_)));
+    if !to_person {
+        return;
+    }
+    let mut raisers = std::collections::BTreeSet::new();
+    raisers.insert(session_id.to_string());
+    for p in chain::run_predecessors(backend, name) {
+        if let Some(id) = crate::decisions::read::local_session_id(backend, &p) {
+            raisers.insert(id);
+        }
+    }
+    let index = Index::scan(backend, false);
+    let runs = questions::Runs::new(backend);
+    let open = questions::open_to_person(&index, &runs, &raisers);
+    if open >= questions::PERSON_LIMIT {
+        refuse(
+            "decisions record",
+            &DecisionError::invalid(
+                "subject.recipient",
+                format!(
+                    "'{name}' holds {open} open questions waiting on a person, and the limit of \
+                     twenty ({}) is reached: one has to be answered, settled or withdrawn \
+                     before another is raised to a person",
+                    questions::PERSON_LIMIT
+                ),
+            ),
+        );
+    }
+}
+
 /// `koto decisions record <session> --kind <k> --outcome <o> ...`.
 pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<()> {
     const COMMAND: &str = "decisions record";
@@ -304,6 +351,10 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
     };
     let state = crate::engine::persistence::derive_state_from_log(&events).unwrap_or_default();
     let log_seq = events.last().map(|e| e.seq).unwrap_or(0);
+
+    if req.kind == "escalate" {
+        check_person_limit(backend, name, &header.session_id, &subject);
+    }
 
     // A reversal entered through this session may have lost since (R19).
     standing::settle(backend, name);
@@ -987,10 +1038,16 @@ pub struct AnswerArgs {
     /// never in the question's session
     #[arg(long = "in", value_name = "SESSION", required = true)]
     pub in_session: String,
-    /// The answer. A session's answer needs it; a person's answer takes
-    /// its text from the question prompt's result and ignores this
+    /// The answer. A session's answer and a settle need it; a person's
+    /// answer takes its text from the question prompt's result and ignores
+    /// this; a withdrawal may leave it out
     #[arg(long)]
     pub text: Option<String>,
+    /// answered (the default), or, recorded --in the question's raiser or a
+    /// session continuing it: withdrawn (needs --reason) or settled (needs
+    /// --basis or --evidence the question accepts)
+    #[arg(long, default_value = "answered")]
+    pub outcome: String,
     /// Who answered: session, or person:<handle> with --prompt
     #[arg(long)]
     pub by: Option<String>,
@@ -1046,7 +1103,15 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         );
     }
     let answerer = args.in_session.clone();
-    if answerer == name {
+    let outcome = args.outcome.clone();
+    let closing_own = outcome == "settled" || outcome == "withdrawn";
+    if !closing_own && outcome != "answered" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("outcome", "--outcome takes answered, settled or withdrawn"),
+        );
+    }
+    if !closing_own && answerer == name {
         refuse(
             COMMAND,
             &DecisionError::invalid(
@@ -1056,6 +1121,24 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         );
     }
     let person = args.by.as_deref().is_some_and(|b| b.starts_with("person:"));
+    if closing_own && person {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "by",
+                format!(
+                    "a question is {outcome} by its raising session, never by a person: pass \
+                     --by session"
+                ),
+            ),
+        );
+    }
+    if outcome == "withdrawn" && args.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("reason", "a withdrawal needs --reason saying why"),
+        );
+    }
     let pointer = match (&args.prompt, person) {
         (None, true) => refuse(
             COMMAND,
@@ -1083,28 +1166,39 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     // A person's answer text comes from the prompt's result, read once the
     // question is known; until then a placeholder passes the shape check.
     let given_text = match (&pointer, &args.text) {
-        (Some(_), _) => "-".to_string(),
-        (None, Some(t)) => t.clone(),
+        (Some(_), _) => Some("-".to_string()),
+        (None, Some(t)) => Some(t.clone()),
+        (None, None) if outcome == "withdrawn" => None,
+        (None, None) if outcome == "settled" => refuse(
+            COMMAND,
+            &DecisionError::invalid("text", "a settle needs --text"),
+        ),
         (None, None) => refuse(
             COMMAND,
             &DecisionError::invalid("text", "a session's answer needs --text"),
         ),
     };
+    let mut subject_pairs = vec![
+        ("session".to_string(), name.to_string()),
+        ("id".to_string(), id.to_string()),
+    ];
+    if let Some(t) = &given_text {
+        subject_pairs.push(("text".to_string(), t.clone()));
+    }
     let req = Request {
         kind: "answer".to_string(),
-        outcome: "answered".to_string(),
-        subject: vec![
-            ("session".to_string(), name.to_string()),
-            ("id".to_string(), id.to_string()),
-            ("text".to_string(), given_text.clone()),
-        ],
+        outcome: outcome.clone(),
+        subject: subject_pairs,
         basis: args.basis.clone(),
         evidence: args.evidence.clone(),
         reason: args.reason.clone(),
         tool_call: args.tool_call.clone(),
     };
     let mut subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
-    if given_text.len() > body::MAX_REASON_BYTES {
+    if given_text
+        .as_ref()
+        .is_some_and(|t| t.len() > body::MAX_REASON_BYTES)
+    {
         refuse(
             COMMAND,
             &DecisionError::invalid(
@@ -1187,7 +1281,8 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             ),
         );
     }
-    let status = Index::scan(backend, false).status(&question);
+    let index = Index::scan(backend, false);
+    let status = index.status(&question);
     if status != "in-effect" {
         refuse(
             COMMAND,
@@ -1200,6 +1295,9 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             ),
         );
     }
+    check_closing(
+        backend, &index, &question, &answerer, &outcome, person, &basis, &evidence,
+    );
     let target = Target {
         name: name.to_string(),
         id: question.session.id.clone(),
@@ -1331,7 +1429,7 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             state: stamp.state.clone(),
             log_seq: stamp.log_seq,
             kind: "answer".to_string(),
-            outcome: "answered".to_string(),
+            outcome: outcome.clone(),
             subject,
             decider: decider.clone(),
             authority,
@@ -1382,6 +1480,128 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         }))?
     );
     Ok(())
+}
+
+/// The checks `answer` makes against the question's resolution before
+/// anything is written: the same rule every read applies, so nothing is
+/// written that would read as not counted. A person's `answered` answer is
+/// taken whenever the question is in effect, since it outranks every
+/// session's entry; a session's needs the question open, waiting on a
+/// session or anchor, and the answerer to be that addressee or continue
+/// it; a settle or a withdrawal needs the question open and the answerer
+/// to be the raiser or continue it, and a settle the evidence its question
+/// accepts.
+#[allow(clippy::too_many_arguments)]
+fn check_closing(
+    backend: &Backend,
+    index: &Index,
+    question: &DecisionBody,
+    answerer: &str,
+    outcome: &str,
+    person: bool,
+    basis: &[crate::decisions::body::BasisRef],
+    evidence: &[serde_json::Value],
+) {
+    use crate::decisions::body::Recipient;
+    use crate::decisions::questions;
+    const COMMAND: &str = "decisions answer";
+    let (name, id) = (&question.session.name, &question.id);
+    let closing_own = outcome != "answered";
+    if !closing_own && person {
+        return;
+    }
+    let runs = questions::Runs::new(backend);
+    let resolution = questions::resolve(index, &runs, question);
+    let current = resolution
+        .current()
+        .cloned()
+        .expect("a question has a typed recipient");
+    let history = || questions::history_labels(index, &runs, question).join(" -> ");
+    if let Some(c) = resolution.in_effect {
+        let what = if closing_own {
+            format!("it isn't {outcome}")
+        } else {
+            "a session's answer to it closes nothing".to_string()
+        };
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' is already closed ({}): entry in effect {}:{}, \
+                     so {what}",
+                    c.outcome, c.session.name, c.id
+                ),
+            ),
+        );
+    }
+    if !closing_own {
+        if let Recipient::Person(h) = &current {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "by",
+                    format!(
+                        "decision {id} in '{name}' waits on person:{h}, and only a person's \
+                         answer closes it, never a session's ({})",
+                        history()
+                    ),
+                ),
+            );
+        }
+        if !questions::addressed_to(&runs, &current, answerer) {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "in",
+                    format!(
+                        "'{answerer}' isn't the question's addressee: a session's answer is \
+                         recorded by the session or anchor it waits on now, or a session \
+                         continuing it ({})",
+                        history()
+                    ),
+                ),
+            );
+        }
+        return;
+    }
+    let answerer_id = standing::stamp(backend, answerer)
+        .unwrap_or_else(|e| refuse(COMMAND, &e))
+        .session
+        .id;
+    if !questions::raised_by(&runs, question, answerer, &answerer_id) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "in",
+                format!(
+                    "a question is {outcome} only in the session that raised it or a session \
+                     continuing it; '{answerer}' is neither"
+                ),
+            ),
+        );
+    }
+    if outcome == "settled" {
+        if questions::unsettleable(question) {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "outcome",
+                    format!(
+                        "decision {id} in '{name}' is a {} need, which its raiser can't settle; \
+                         it can be answered, passed up or withdrawn",
+                        questions::need_of(question)
+                    ),
+                ),
+            );
+        }
+        let now = crate::engine::types::now_iso8601();
+        if let Err(m) =
+            questions::settle_basis(index, backend, question, &current, basis, evidence, &now)
+        {
+            refuse(COMMAND, &DecisionError::invalid("basis", m));
+        }
+    }
 }
 
 /// The flags `readdress` takes beyond the question's session and id.
@@ -1496,7 +1716,7 @@ pub fn handle_readdress(
         reason: args.reason.clone(),
         tool_call: args.tool_call.clone(),
     };
-    let subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let mut subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
     let basis = body::parse_basis(&req.basis).unwrap_or_else(|e| refuse(COMMAND, &e));
     let evidence = body::parse_evidence(&req.evidence).unwrap_or_else(|e| refuse(COMMAND, &e));
     require_session(backend, &recorder, COMMAND);
@@ -1579,17 +1799,22 @@ pub fn handle_readdress(
             ),
         );
     }
-    if !index.answers_of(&question.session.id, id).is_empty() {
+    let runs = questions::Runs::new(backend);
+    let resolution = questions::resolve(&index, &runs, &question);
+    if let Some(closing) = resolution.in_effect {
         refuse(
             COMMAND,
             &DecisionError::invalid(
                 "id",
-                format!("decision {id} in '{name}' is answered, and an answered question isn't passed up"),
+                format!(
+                    "decision {id} in '{name}' is already closed ({}): entry in effect {}:{}, \
+                     and a closed question isn't passed up",
+                    closing.outcome, closing.session.name, closing.id
+                ),
             ),
         );
     }
-    let runs = questions::Runs::new(backend);
-    let history = questions::addressees(&index, &runs, &question);
+    let history = resolution.history.clone();
     let current = history
         .last()
         .cloned()
@@ -1617,11 +1842,43 @@ pub fn handle_readdress(
             ),
         );
     }
+    let dispatcher = questions::dispatcher_for(backend, &recorder);
+    if !questions::destination_ok(&to, dispatcher.as_deref()) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "to",
+                match &dispatcher {
+                    Some(d) => format!(
+                        "a pass-up goes to a person or to the recording session's dispatcher: \
+                         '{recorder}' may pass a question to person:<handle> or session:{d}, \
+                         not '{}'",
+                        args.to
+                    ),
+                    None => format!(
+                        "a pass-up goes to a person or to the recording session's dispatcher: \
+                         '{recorder}' has no recorded dispatcher, so it may pass a question \
+                         only to person:<handle>, not '{}'",
+                        args.to
+                    ),
+                },
+            ),
+        );
+    }
     let target = Target {
         name: name.to_string(),
         id: question.session.id.clone(),
         decision: id.to_string(),
     };
+
+    // The dispatcher the destination was judged against, so a later read
+    // judges the entry from what it recorded.
+    if let Some(d) = &dispatcher {
+        subject.insert(
+            "dispatcher".to_string(),
+            serde_json::Value::String(d.clone()),
+        );
+    }
 
     standing::settle(backend, &recorder);
     let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));
