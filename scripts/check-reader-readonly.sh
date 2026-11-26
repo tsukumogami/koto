@@ -507,7 +507,8 @@ check() {
 
 # --- self-test ---------------------------------------------------------------
 
-# Copy what check reads into a fresh directory: the crate and the
+# Copy what check reads into a fresh directory: the crate, the other
+# workspace members (cargo tree loads every member's manifest) and the
 # workspace manifests are copied; koto's own sources, which no check reads
 # and no plant touches, are linked so cargo still finds its targets.
 fresh_copy() {
@@ -515,7 +516,8 @@ fresh_copy() {
   rm -rf "$dest"
   mkdir -p "$dest"
   cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "$dest/"
-  cp -R "$REPO_ROOT/$CRATE" "$REPO_ROOT/koto-stability-tests" "$dest/"
+  cp -R "$REPO_ROOT/$CRATE" "$REPO_ROOT/koto-stability-tests" \
+    "$REPO_ROOT/koto-session-list" "$dest/"
   [ -d "$REPO_ROOT/.cargo" ] && cp -R "$REPO_ROOT/.cargo" "$dest/"
   local linked
   for linked in src benches build.rs; do

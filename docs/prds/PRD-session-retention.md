@@ -391,7 +391,8 @@ names only in passing.
   the original and unique across repeated re-runs, which the replace's answer
   and the hierarchy query report (the format is the design's); the new run
   takes the original name. A
-  predecessor the rule lets go is replaced as today.
+  predecessor the rule lets go is replaced as today. A predecessor holding
+  what a question depends on is refused instead of moved (R39).
 - **R18. Explicit removal still removes, and says what it broke.**
   `koto session cleanup` and `koto cancel --cleanup` remove the named
   session as today. When the rule would have kept it, the output names every
@@ -588,20 +589,27 @@ effect for it, decided by the same test every open read uses.
   `open_question` and the open questions' identities. The hierarchy query
   names it as a keeper with those identities, and says when it isn't alive.
   `koto session prune` keeps it and its hierarchy under rule `h`, and
-  `koto workspace prune --root`, the same-name replace and the parent sweep
-  follow the same verdict; the sweep lists a child kept this way with the
-  reason `open_question`.
+  `koto workspace prune --root` and the parent sweep follow the same verdict;
+  the sweep lists a child kept this way with the reason `open_question`. The
+  same-name replace refuses such a session instead of moving it (R39).
 - **R37. An answer or pass-up joins its holder to the question's session.**
   An answer or pass-up stored aimed at a question is an edge between the
   session holding it and the session that raised the question, matched by
   that session's id, never its name. A reversal and an entry that can't be
   read are not edges. The hierarchy query shows the edge, naming whether it
   is an answer or a pass-up, and a session kept by it at its terminal tick
-  gives the reason `hierarchy`.
+  gives the reason `hierarchy`. A prune that can remove part of a component
+  (`koto workspace prune --root`, and `koto session prune` with
+  `--older-than` or `--execution-dir`) keeps a session holding the answer in
+  effect for a question, or a pass-up an open question's current addressee
+  rests on, while the question's raiser isn't removed in the same run, and
+  lists it with a detail naming the question; when both are removed in that
+  run, both go.
 - **R38. The terminal tick learns of questions without a second scan for a
   session holding none.** The tick checks for an open question after a
-  failure terminal and a pin and before the hierarchy, and reads the store
-  for it only when the session's own decisions hold a question; it reads
+  failure terminal and a pin and before the hierarchy, reads and parses the
+  session's own decisions, and reads the store for it only when they hold a
+  question; it reads
   the local store only, so under the cloud backend it makes no request for
   it. It learns of aimed answers and pass-ups, in both directions, in the
   pass R15 already makes. A session that holds no question and no aimed
@@ -618,7 +626,15 @@ effect for it, decided by the same test every open read uses.
   same way before the cancel is written. A pinned session is refused for its
   pin first, with or without `--force`. Holds are matched by identity: an
   answer that isn't the one in effect, an answer whose raiser is gone and a
-  pass-up of a question since answered hold nothing.
+  pass-up of a question since answered hold nothing. Both commands also
+  refuse without `--force`, with the same code, when the session's own
+  decisions can't be read or a question one of its aimed entries points at
+  can't be read, and the message names what couldn't be read.
+  `koto init <name> --replace-terminal` on a terminal predecessor that holds
+  any of the three, or whose decisions can't be read, exits 2 with code
+  `holds_question` and the same `questions` and `force_command`, and moves,
+  removes and writes nothing; `koto session cleanup <name> --force` followed
+  by the `init` is the way through.
 - **R40. A forced removal says what it orphaned.** `koto session cleanup
   <name> --force` removes a session R39 would refuse, exits 0, and prints
   `orphaned_questions`, one entry per question with its identity and what
@@ -1073,14 +1089,26 @@ with q1's decision id.
 - [ ] **Sweep, workspace prune and replace.** A terminal child holding an
   open question is listed in its parent's `kept_children` with reason
   `open_question`; `koto workspace prune --root` over its subtree keeps it
-  and lists it; a same-name replace of it moves it aside (R36).
+  and lists it. `koto init A --replace-terminal` on a terminal A holding q1
+  open exits 2 with code `holds_question` and `force_command`
+  `koto session cleanup A --force`, no `A_r<N>` exists afterwards, and A's
+  files are byte-identical; after that cleanup, the same `init` succeeds.
+  The same replace of a session holding the answer in effect, and of one
+  whose decisions directory can't be read, is refused the same way (R36,
+  R39).
 - [ ] **Aimed edge.** After `koto decisions answer A <id> --in B --text ...
   --by session`, B reaching its terminal step is kept with reason
   `hierarchy`, and `koto session hierarchy B --json` lists A among its
   members with a `joined_by` entry whose via is `answer aimed at its
   question`; a pass-up recorded in B instead shows `pass-up aimed at its
   question`. After A is removed by force and a new A with no question is
-  created, B's entry joins nothing to the new A (R37).
+  created, B's entry joins nothing to the new A. With A and B's hierarchy
+  released and B, holding the answer in effect, stopped earlier than A,
+  `koto session prune --apply --older-than <age>` with an age that selects B
+  and not A keeps B with a detail naming q1, and so does `--execution-dir`
+  when only B's execution directory matches and `koto workspace prune
+  --root` over a subtree holding B but not A; a run that selects both
+  removes both (R37).
 - [ ] **No second scan.** A session with no question and no aimed entry,
   ticked to a success terminal in the generated store R34 uses, is removed
   as before, and the R34 test passes with its bounds and fixtures unedited;
@@ -1095,7 +1123,10 @@ with q1's decision id.
   before the cancel is written. A pinned A is refused with code `pinned`,
   with and without `--force`. A second answer to an answered question, and
   an answer whose raiser was removed, are removed by a plain cleanup with
-  exit 0 (R39).
+  exit 0. A session whose decisions directory can't be read, and a holder
+  whose answer points at a question that can't be read in A, are refused
+  with `holds_question` and a message naming what couldn't be read, and are
+  removed with `--force` (R39).
 - [ ] **Forced removal.** `koto session cleanup B --force` exits 0, its
   output carries `orphaned_questions` naming q1's identity with `held:
   "answer"` beside `live_members`, stderr carries one warning, and

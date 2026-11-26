@@ -1381,12 +1381,13 @@ pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
 }
 
 /// What an explicit removal of `name` would orphan: the questions it holds
-/// something of (`crate::decisions::questions::holds_of`), read from the
-/// local store under `base` only, so the cloud backend makes no request.
+/// something of (`crate::decisions::questions::holds_of`), and whatever
+/// couldn't be read to tell, read from the local store under `base` only,
+/// so the cloud backend makes no request.
 pub(crate) fn question_holds(
     base: &std::path::Path,
     name: &str,
-) -> Vec<crate::decisions::questions::Hold> {
+) -> crate::decisions::questions::Orphans {
     crate::decisions::questions::orphans(
         &Backend::Local(crate::session::local::LocalBackend::with_base_dir(
             base.to_path_buf(),
@@ -1412,22 +1413,24 @@ pub(crate) fn orphaned_json(holds: &[crate::decisions::questions::Hold]) -> serd
     )
 }
 
-/// Refuse an explicit removal of `name` that would orphan `holds`: exit 2,
-/// code `holds_question`, nothing removed. The message names each question,
-/// what the session holds of it and what removing it loses, and the one
-/// command that removes it anyway. A pinned session is refused for its pin
-/// first, exactly as it was before questions were kept.
-pub(crate) fn refuse_holds(
-    backend: &dyn SessionBackend,
-    name: &str,
-    holds: &[crate::decisions::questions::Hold],
-) -> ! {
-    use crate::session::hierarchy::{display_text, sanitize};
-    if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
-        super::exit_with_error_code(refusal.to_json(), refusal.exit);
-    }
-    let shown = display_text(name);
-    let each: Vec<String> = holds
+/// The `decisions_unreadable` a refusal and a forced removal print: each
+/// thing that couldn't be read, sanitized.
+pub(crate) fn unreadable_json(orphans: &crate::decisions::questions::Orphans) -> serde_json::Value {
+    use crate::session::hierarchy::sanitize;
+    serde_json::json!(orphans
+        .unreadable
+        .iter()
+        .map(|u| sanitize(u))
+        .collect::<Vec<_>>())
+}
+
+/// Why an explicit removal of a session holding `orphans` is refused: each
+/// question, what the session holds of it and what removing it loses, then
+/// what couldn't be read, joined for a message.
+pub(crate) fn holds_reasons(orphans: &crate::decisions::questions::Orphans) -> String {
+    use crate::session::hierarchy::sanitize;
+    let mut each: Vec<String> = orphans
+        .holds
         .iter()
         .map(|h| {
             format!(
@@ -1437,34 +1440,93 @@ pub(crate) fn refuse_holds(
             )
         })
         .collect();
+    if !orphans.unreadable.is_empty() {
+        let shown: Vec<String> = orphans.unreadable.iter().map(|u| sanitize(u)).collect();
+        each.push(format!(
+            "decisions that could hold an open question, its answer or a pass-up can't be read, \
+             so koto can't tell what removing it loses: {}",
+            shown.join("; ")
+        ));
+    }
+    each.join("; ")
+}
+
+/// The `holds_question` error body for session `name` holding `orphans`,
+/// with `message`.
+pub(crate) fn holds_error(
+    name: &str,
+    orphans: &crate::decisions::questions::Orphans,
+    message: String,
+) -> serde_json::Map<String, serde_json::Value> {
+    use crate::session::hierarchy::{display_text, sanitize};
+    let mut err = serde_json::Map::new();
+    err.insert("code".into(), "holds_question".into());
+    err.insert("message".into(), message.into());
+    err.insert("session".into(), sanitize(name).into());
+    err.insert("questions".into(), orphaned_json(&orphans.holds));
+    if !orphans.unreadable.is_empty() {
+        err.insert("decisions_unreadable".into(), unreadable_json(orphans));
+    }
+    err.insert(
+        "force_command".into(),
+        format!("koto session cleanup {} --force", display_text(name)).into(),
+    );
+    err
+}
+
+/// Refuse an explicit removal of `name` that would orphan what `orphans`
+/// holds, or whose decisions couldn't be read to tell: exit 2, code
+/// `holds_question`, nothing removed. The message names each question,
+/// what the session holds of it and what removing it loses, what couldn't
+/// be read, and the one command that removes it anyway. A pinned session
+/// is refused for its pin first, exactly as it was before questions were
+/// kept.
+pub(crate) fn refuse_holds(
+    backend: &dyn SessionBackend,
+    name: &str,
+    orphans: &crate::decisions::questions::Orphans,
+) -> ! {
+    use crate::session::hierarchy::display_text;
+    if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
+        super::exit_with_error_code(refusal.to_json(), refusal.exit);
+    }
+    let shown = display_text(name);
     let message = format!(
         "session '{shown}' wasn't removed: {}. Answer, reverse or pass the question first, or \
          remove the session anyway with: koto session cleanup {shown} --force",
-        each.join("; ")
+        holds_reasons(orphans)
     );
     super::exit_with_error_code(
-        serde_json::json!({
-            "error": {
-                "code": "holds_question",
-                "message": message,
-                "session": sanitize(name),
-                "questions": orphaned_json(holds),
-                "force_command": format!("koto session cleanup {shown} --force"),
-            }
-        }),
+        serde_json::json!({ "error": holds_error(name, orphans, message) }),
         2,
     );
 }
 
-/// Warn on stderr that a forced removal of `name` orphaned `holds`.
-pub(crate) fn warn_orphaned(name: &str, holds: &[crate::decisions::questions::Hold]) {
+/// Warn on stderr that a forced removal of `name` orphaned what `orphans`
+/// holds.
+pub(crate) fn warn_orphaned(name: &str, orphans: &crate::decisions::questions::Orphans) {
     use crate::session::hierarchy::sanitize;
-    for h in holds {
+    for h in &orphans.holds {
         eprintln!(
             "warning: removed '{}' with --force; it {}, and the removal lost {}",
             sanitize(name),
             h.held.describe(&sanitize(&h.identity)),
             h.held.loss()
+        );
+    }
+}
+
+/// Warn on stderr, before a forced removal of `name` starts, about each
+/// thing `orphans` couldn't read: what it held there goes unchecked. Said
+/// first, since a removal that fails partway never reaches the report.
+pub(crate) fn warn_unreadable(name: &str, orphans: &crate::decisions::questions::Orphans) {
+    use crate::session::hierarchy::sanitize;
+    for u in &orphans.unreadable {
+        eprintln!(
+            "warning: removing '{}' with --force without checking what it holds, since this \
+             couldn't be read: {}",
+            sanitize(name),
+            sanitize(u)
         );
     }
 }

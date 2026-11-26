@@ -488,6 +488,7 @@ fn judge_subtree(
             }),
         }
     }
+    keep_question_holders(graph, &mut plan);
     for member in by_name {
         let Some(facts) = graph.facts(member) else {
             continue;
@@ -509,6 +510,55 @@ fn judge_subtree(
         });
     }
     plan
+}
+
+/// The members of `removing` kept because they hold the answer in effect
+/// for, or a pass-up resting under, a question whose raiser isn't removed
+/// with them (`crate::decisions::questions::kept_for_raisers`), with the
+/// detail each is kept with. Only a member holding an aimed answer or
+/// pass-up is read.
+pub(crate) fn question_holders_kept(
+    graph: &Graph,
+    removing: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, String> {
+    use crate::decisions::questions;
+    questions::kept_for_raisers(
+        &crate::session::Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+            graph.base().to_path_buf(),
+        )),
+        removing,
+        |name| graph.facts(name).is_some_and(|f| !f.aimed.is_empty()),
+    )
+    .into_iter()
+    .map(|(name, holds)| (name, questions::kept_for_raisers_text(&holds)))
+    .collect()
+}
+
+/// Move each member `plan` would remove that holds what an open question,
+/// or the answer closing one, rests on while the question's raiser stays,
+/// to the kept list: removing it alone would reopen the question or send
+/// it back to an earlier addressee. Like a pinned member it keeps nothing
+/// above it, beyond the holders resting on it.
+fn keep_question_holders(graph: &Graph, plan: &mut SubtreePlan) {
+    let removing = plan.remove.iter().map(|m| m.name.clone()).collect();
+    let kept = question_holders_kept(graph, &removing);
+    if kept.is_empty() {
+        return;
+    }
+    let mut remove = Vec::with_capacity(plan.remove.len());
+    for member in std::mem::take(&mut plan.remove) {
+        match kept.get(&member.name) {
+            Some(reason) => plan.kept.push(KeptMember {
+                name: member.name,
+                reason: reason.clone(),
+                hierarchy: None,
+                pin: Default::default(),
+                relation: Default::default(),
+            }),
+            None => remove.push(member),
+        }
+    }
+    plan.remove = remove;
 }
 
 /// Under the cloud backend, run the removal guard's bucket check for each
@@ -679,6 +729,17 @@ fn reclaim(
             None => cleared.push((member, lock, released)),
         }
     }
+    // A holder whose question's raiser is no longer going with it (skipped
+    // above) stays, as the plan would have kept it.
+    let going = cleared.iter().map(|(m, _, _)| m.name.clone()).collect();
+    let held = question_holders_kept(graph, &going);
+    cleared.retain(|(member, _, _)| match held.get(&member.name) {
+        Some(reason) => {
+            skip(&mut out, &mut left, &member.name, format!("now {reason}"));
+            false
+        }
+        None => true,
+    });
 
     for (member, lock, released) in cleared {
         let name = member.name.as_str();

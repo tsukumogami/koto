@@ -16,7 +16,7 @@ use crate::decisions::decider::{self, Flags, Observed};
 use crate::decisions::read::{Entry, Filters};
 use crate::decisions::standing::{self, reasons, Index};
 use crate::decisions::store::Area;
-use crate::decisions::{chain, codes, store, DecisionError, FORMAT_VERSION};
+use crate::decisions::{chain, codes, packets, prompt, store, DecisionError, FORMAT_VERSION};
 use crate::session::{Backend, SessionBackend};
 
 use super::{exit_with_error_code, EXIT_CALLER_ERROR, EXIT_INFRASTRUCTURE};
@@ -334,6 +334,7 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             compensating: None,
             replacement: None,
             refusal: None,
+            prompt: None,
         })
     })
     .unwrap_or_else(|e| refuse(COMMAND, &e));
@@ -935,6 +936,7 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
                 compensating,
                 replacement: args.replacement.clone(),
                 refusal: None,
+                prompt: None,
             })
         },
     )
@@ -985,12 +987,18 @@ pub struct AnswerArgs {
     /// never in the question's session
     #[arg(long = "in", value_name = "SESSION", required = true)]
     pub in_session: String,
-    /// The answer
-    #[arg(long, required = true)]
-    pub text: String,
-    /// Who answered: session. A person's answer can't be recorded yet
+    /// The answer. A session's answer needs it; a person's answer takes
+    /// its text from the question prompt's result and ignores this
+    #[arg(long)]
+    pub text: Option<String>,
+    /// Who answered: session, or person:<handle> with --prompt
     #[arg(long)]
     pub by: Option<String>,
+    /// The question prompt a person answered, as <harness session id>/<call
+    /// id>/<position>: the question-tool call in this harness session's
+    /// record that showed the question at that 1-based position
+    #[arg(long, value_name = "HARNESS/CALL/POSITION")]
+    pub prompt: Option<String>,
     /// The agent within the answering session that answered
     #[arg(long)]
     pub agent: Option<String>,
@@ -1047,31 +1055,56 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             ),
         );
     }
-    let person_refusal = || {
-        DecisionError::invalid(
-            "by",
-            "a person's answer can't be recorded yet: koto doesn't verify that the person \
-             gave it",
-        )
+    let person = args.by.as_deref().is_some_and(|b| b.starts_with("person:"));
+    let pointer = match (&args.prompt, person) {
+        (None, true) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "prompt",
+                "a person's answer needs the question-prompt evidence: pass --prompt <harness \
+                 session id>/<call id>/<position>, naming the question-tool call that showed \
+                 the question",
+            ),
+        ),
+        (Some(_), false) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "prompt",
+                "--prompt is a person's question-prompt evidence and goes with --by \
+                 person:<handle>; a session's answer never carries it",
+            ),
+        ),
+        (Some(p), true) => Some(
+            prompt::Pointer::parse(p)
+                .unwrap_or_else(|m| refuse(COMMAND, &DecisionError::invalid("prompt", m))),
+        ),
+        (None, false) => None,
     };
-    if args.by.as_deref().is_some_and(|b| b.starts_with("person:")) {
-        refuse(COMMAND, &person_refusal());
-    }
+    // A person's answer text comes from the prompt's result, read once the
+    // question is known; until then a placeholder passes the shape check.
+    let given_text = match (&pointer, &args.text) {
+        (Some(_), _) => "-".to_string(),
+        (None, Some(t)) => t.clone(),
+        (None, None) => refuse(
+            COMMAND,
+            &DecisionError::invalid("text", "a session's answer needs --text"),
+        ),
+    };
     let req = Request {
         kind: "answer".to_string(),
         outcome: "answered".to_string(),
         subject: vec![
             ("session".to_string(), name.to_string()),
             ("id".to_string(), id.to_string()),
-            ("text".to_string(), args.text.clone()),
+            ("text".to_string(), given_text.clone()),
         ],
         basis: args.basis.clone(),
         evidence: args.evidence.clone(),
         reason: args.reason.clone(),
         tool_call: args.tool_call.clone(),
     };
-    let subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
-    if args.text.len() > body::MAX_REASON_BYTES {
+    let mut subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
+    if given_text.len() > body::MAX_REASON_BYTES {
         refuse(
             COMMAND,
             &DecisionError::invalid(
@@ -1086,7 +1119,8 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
 
     let flags = Flags {
         by: args.by.clone(),
-        surface: None,
+        // A question prompt is shown in the harness's terminal.
+        surface: person.then(|| "terminal".to_string()),
         link: None,
         agent: args.agent.clone(),
         run_mode: args.run_mode.clone(),
@@ -1094,8 +1128,11 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     let observed = Observed::from_env(backend);
     let decider =
         decider::resolve(&answerer, &flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
-    if !matches!(decider, decider::Decider::Session { .. }) {
-        refuse(COMMAND, &person_refusal());
+    if matches!(decider, decider::Decider::Check { .. }) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("by", "an answer is given by a session or a person"),
+        );
     }
     let run_mode = decider::run_mode(&flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
 
@@ -1169,6 +1206,50 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         decision: id.to_string(),
     };
 
+    // A person's answer: check the prompt against the harness's record and
+    // take the answer text from the call's result.
+    let verified = pointer.as_ref().map(|pointer| {
+        let fail = |c: prompt::Check| -> ! { refuse(COMMAND, &c.error(&pointer.display())) };
+        let identity = crate::decisions::questions::identity(&question);
+        let expected = question_content(backend, &question)
+            .and_then(|bytes| prompt::Expected::from_content(&bytes, &identity, &question.time))
+            .unwrap_or_else(|c| fail(c));
+        let reused = Index::scan(backend, false)
+            .answers_of(&question.session.id, id)
+            .iter()
+            .any(|a| a.prompt.as_ref().is_some_and(|p| pointer.cites(p)));
+        if reused {
+            fail(prompt::Check::CallPositionReused);
+        }
+        let root = prompt::projects_root();
+        // The harness session koto last saw driving the answering session,
+        // when it saw one: the command's own must be the same.
+        let recorded = crate::run_journal::sidecar::read(&backend.session_dir(&answerer))
+            .and_then(|s| s.driver);
+        let text = prompt::verify(
+            root.as_deref(),
+            observed.harness.as_deref(),
+            recorded.as_deref(),
+            pointer,
+            &expected,
+        )
+        .unwrap_or_else(|c| fail(c));
+        if text.trim().is_empty() || text.len() > body::MAX_REASON_BYTES {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "text",
+                    format!(
+                        "the reply the question prompt returned is empty or larger than {} bytes",
+                        body::MAX_REASON_BYTES
+                    ),
+                ),
+            );
+        }
+        subject.insert("text".to_string(), serde_json::Value::String(text));
+        pointer.verified()
+    });
+
     standing::settle(backend, &answerer);
     let stamp = standing::stamp(backend, &answerer).unwrap_or_else(|e| refuse(COMMAND, &e));
     let authority = decider::authority(
@@ -1179,7 +1260,69 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         run_mode,
     );
     let chain = chain::snapshot(backend, &answerer);
-    let written = store::write_in(backend, &answerer, &Area::Aimed(target.id.clone()), |aid| {
+    let koto_home = crate::koto_home::koto_home();
+    // One use per call position on this host: a marker under the koto root,
+    // locked while this answer is written and freed if the write fails,
+    // serializes answers from different answering sessions. A marker left by
+    // a process that stopped before publishing is taken over when no stored
+    // answer on this host cites the position.
+    let mut marker = pointer.as_ref().map(|p| {
+        let cited = || {
+            Index::scan(backend, false)
+                .answers_of(&question.session.id, id)
+                .iter()
+                .any(|a| a.prompt.as_ref().is_some_and(|q| p.cites(q)))
+        };
+        let taken = koto_home
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+            .and_then(|home| prompt::take_use(home, p, cited));
+        match taken {
+            Ok(Some(m)) => m,
+            Ok(None) => refuse(
+                COMMAND,
+                &prompt::Check::CallPositionReused.error(&p.display()),
+            ),
+            Err(e) => refuse(
+                COMMAND,
+                &DecisionError {
+                    code: codes::PROMPT_UNVERIFIED,
+                    field: Some("prompt".to_string()),
+                    message: format!(
+                        "koto couldn't record on this host that an answer cites the \
+                         question-prompt evidence {}, so it can't rule out a second answer \
+                         citing it: {e}",
+                        p.display()
+                    ),
+                },
+            ),
+        }
+    });
+    // This host checked the prompt: note it outside the synced files,
+    // sealed to this host and this answer, so only this host's copy of the
+    // session reads the mark verified. The note goes in before the answer is
+    // published: a line naming no stored answer reads as nothing, while an
+    // answer published without its line would read remote here for good.
+    let session_dir = backend.session_dir(&answerer);
+    let mut note_error: Option<std::io::Error> = None;
+    let mut note = |body: &DecisionBody| -> Result<(), DecisionError> {
+        if body.prompt.is_some() {
+            note_error = koto_home
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("the koto root can't be resolved"))
+                .and_then(|home| prompt::note_verified_here(home, &session_dir, &answerer, body))
+                .err();
+        }
+        Ok(())
+    };
+    let build = |aid: &str| {
+        // Under the lock: a racing answer in this session that cites the
+        // same call position was published first.
+        if let Some(p) = &verified {
+            if cites_position(backend, &answerer, p) {
+                return Err(prompt::Check::CallPositionReused.error(&p.display()));
+            }
+        }
         Ok(DecisionBody {
             v: FORMAT_VERSION,
             id: aid.to_string(),
@@ -1203,9 +1346,29 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             compensating: None,
             replacement: None,
             refusal: None,
+            prompt: verified.clone(),
         })
-    })
-    .unwrap_or_else(|e| refuse(COMMAND, &e));
+    };
+    let written = store::write_in_with(
+        backend,
+        &answerer,
+        &Area::Aimed(target.id.clone()),
+        build,
+        &mut note,
+    )
+    .unwrap_or_else(|e| {
+        drop(marker.take());
+        refuse(COMMAND, &e)
+    });
+    if let Some(m) = marker.take() {
+        m.keep();
+    }
+    if let Some(e) = note_error {
+        eprintln!(
+            "warning: the answer is recorded, but this host couldn't note that it checked \
+             the prompt, so it reads as a remote session's answer here: {e}"
+        );
+    }
     ring_asker(backend, name);
 
     println!(
@@ -1224,7 +1387,9 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
 
 /// Ring the wake file of `asker`, a question's raiser, after an answer to
 /// it was recorded, and of the newest session continuing it when it was
-/// superseded (`crate::engine::wake_signal::ring_forwarded`). A wake
+/// superseded: `crate::engine::wake_signal::ring` for each, with the
+/// successor found by `crate::engine::supersede_chain::newest_member` in
+/// the sessions directory this command used. A wake
 /// carries no content: the asker's next tick reads the store. Ringing
 /// never fails the answer, which is already written: any refusal (no
 /// koto root, an unwritable wakes directory, a symlink, a directory or a
@@ -1520,6 +1685,7 @@ pub fn handle_readdress(
             compensating: None,
             replacement: None,
             refusal: None,
+            prompt: None,
         })
     })
     .unwrap_or_else(|e| refuse(COMMAND, &e));
@@ -1568,6 +1734,35 @@ pub fn handle_open_at(backend: &Backend, at: &str) -> Result<()> {
     Ok(())
 }
 
+/// The content stored for `question`: its `packet` subject's bytes from
+/// the raiser's `koto/packets/`, which must hash to that subject.
+fn question_content(backend: &Backend, question: &DecisionBody) -> Result<Vec<u8>, prompt::Check> {
+    let packet = question
+        .subject
+        .get("packet")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(prompt::Check::Content)?;
+    let bytes = packets::read(backend, &question.session.name, &question.id)
+        .ok()
+        .flatten()
+        .ok_or(prompt::Check::Content)?;
+    if packets::hash(&bytes) != packet {
+        return Err(prompt::Check::Content);
+    }
+    Ok(bytes)
+}
+
+/// Whether `session` already holds an answer citing `prompt`'s call
+/// position, read from its own areas.
+fn cites_position(backend: &Backend, session: &str, prompt: &prompt::Prompt) -> bool {
+    store::list_with(backend, session, false)
+        .found
+        .iter()
+        .filter_map(|f| f.bytes.as_ref().ok())
+        .filter_map(|b| DecisionBody::parse(b).ok())
+        .any(|b| b.prompt.as_ref().is_some_and(|p| p.same_position(prompt)))
+}
+
 /// `koto decisions open --person <handle>`: the questions open for a
 /// person, across every session in the local store. Takes no session.
 pub fn handle_open(backend: &Backend, person: &str) -> Result<()> {
@@ -1588,5 +1783,175 @@ pub fn handle_open(backend: &Backend, person: &str) -> Result<()> {
         "{}",
         serde_json::to_string(&crate::decisions::questions::open(backend, person))?
     );
+    Ok(())
+}
+
+/// `koto decisions content`'s actions.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum ContentAction {
+    /// Write a question's content once into its session's `koto/packets/`:
+    /// at most 16 KiB, hashing to the escalate's `packet` subject
+    Write {
+        /// The question's session name
+        name: String,
+        /// The escalate's decision id
+        id: String,
+        /// The file holding the content
+        #[arg(long, value_name = "PATH", required = true)]
+        file: std::path::PathBuf,
+    },
+    /// Print a question's content, byte for byte, by its identity
+    /// `<raiser's session id>/<decision id>`, from any session in the local
+    /// store. Records nothing
+    Read {
+        /// The question's identity
+        identity: String,
+    },
+}
+
+/// `koto decisions content write <session> <id> --file <path>`.
+pub fn handle_content_write(
+    backend: &Backend,
+    name: &str,
+    id: &str,
+    file: &std::path::Path,
+) -> Result<()> {
+    use std::io::Read;
+    const COMMAND: &str = "decisions content write";
+    if !crate::decisions::is_decision_id(id) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "'{id}' isn't a decision id: {} digits",
+                    crate::decisions::ID_WIDTH
+                ),
+            ),
+        );
+    }
+    require_session(backend, name, COMMAND);
+    let unreadable = |e: std::io::Error| -> ! {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("file", format!("the content file can't be read: {e}")),
+        )
+    };
+    let f = std::fs::File::open(file).unwrap_or_else(|e| unreadable(e));
+    let mut bytes = Vec::new();
+    f.take(packets::MAX_PACKET_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|e| unreadable(e));
+    if bytes.len() > packets::MAX_PACKET_BYTES {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "content",
+                format!(
+                    "the question content is larger than the 16 KiB cap ({} bytes)",
+                    packets::MAX_PACKET_BYTES
+                ),
+            ),
+        );
+    }
+    let entries = crate::decisions::read::read_session_with(backend, name, false);
+    let question = entries.iter().find_map(|e| match e {
+        Entry::Decision(b) if b.id == id => Some(b),
+        _ => None,
+    });
+    let Some(question) = question else {
+        refuse(
+            COMMAND,
+            &DecisionError::new(
+                codes::DECISION_NOT_FOUND,
+                format!("'{name}' holds no decision {id}"),
+            ),
+        );
+    };
+    let packet = match question
+        .subject
+        .get("packet")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(p) if question.kind == "escalate" => p.to_string(),
+        _ => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' isn't an 'escalate' carrying a 'packet', so it \
+                     takes no content"
+                ),
+            ),
+        ),
+    };
+    packets::write(backend, name, id, &packet, &bytes).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let identity = crate::decisions::questions::identity(question);
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "v": FORMAT_VERSION,
+            "session": name,
+            "id": id,
+            "question": identity,
+            "packet": packet,
+            "bytes": bytes.len(),
+            "prompt_header": prompt::tag(&identity),
+        }))?
+    );
+    Ok(())
+}
+
+/// `koto decisions content read <identity>`: the content's bytes on
+/// stdout, nothing added.
+pub fn handle_content_read(backend: &Backend, identity: &str) -> Result<()> {
+    use std::io::Write;
+    const COMMAND: &str = "decisions content read";
+    let shape = || -> ! {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "identity",
+                "a question's identity is <raiser's session id>/<decision id>",
+            ),
+        )
+    };
+    let Some((sid, did)) = identity.split_once('/') else {
+        shape()
+    };
+    if !store::is_target_id(sid) || !crate::decisions::is_decision_id(did) {
+        shape();
+    }
+    let index = Index::scan(backend, false);
+    let name = index.sessions().iter().find_map(|(name, entries)| {
+        entries.iter().find_map(|e| match e {
+            Entry::Decision(b) if b.session.id == sid && b.id == did => Some(name.clone()),
+            _ => None,
+        })
+    });
+    let not_found = || -> ! {
+        refuse(
+            COMMAND,
+            &DecisionError::new(
+                codes::DECISION_NOT_FOUND,
+                format!("no session in the local store holds content for question {identity}"),
+            ),
+        )
+    };
+    let Some(name) = name else { not_found() };
+    let bytes = match packets::read(backend, &name, did) {
+        Ok(Some(b)) => b,
+        Ok(None) => not_found(),
+        Err(reason) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "identity",
+                format!("the content of question {identity} {reason}"),
+            ),
+        ),
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(&bytes)?;
+    out.flush()?;
     Ok(())
 }

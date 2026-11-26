@@ -54,7 +54,7 @@ jobs:
           fallback: none
 
       # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
-      # Locally it is `bash scripts/run-tests.sh -p koto -p koto-session-reader`: the same nextest `ci`
+      # Locally it is `bash scripts/run-tests.sh -p koto -p koto-session-reader -p koto-session-list`: the same nextest `ci`
       # profile, without coverage or --all-features, falling back to a serial `cargo test` where
       # cargo-nextest isn't installed.
       # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
@@ -62,7 +62,7 @@ jobs:
       # Without -p, cargo runs only the root package, so koto-session-reader
       # is named beside koto and its tests count toward coverage.
       - name: Run tests with coverage
-        run: cargo llvm-cov nextest --locked --all-features --profile ci -p koto -p koto-session-reader --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --locked --all-features --profile ci -p koto -p koto-session-reader -p koto-session-list --lcov --output-path lcov.info
 
       # nextest doesn't run doctests; this runs any that are added.
       # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
@@ -293,7 +293,7 @@ jobs:
       # Each package is linted under its own clippy.toml, so koto-session-reader
       # gets its write ban here as well as in the Reader Write Guard job.
       - name: Run clippy
-        run: cargo clippy -p koto -p koto-session-reader --all-targets -- -D warnings
+        run: cargo clippy -p koto -p koto-session-reader -p koto-session-list --all-targets -- -D warnings
 
   decider-checks:
     # The decider must not pull an async HTTP stack or a second attohttpc
@@ -861,6 +861,68 @@ jobs:
       - name: Check no skill passes koto evidence inline
         run: bash scripts/check-inline-evidence_test.sh
 
+  session-list:
+    # koto-session-list reads koto's session store through
+    # koto-session-reader alone. On the release build this checks that its
+    # rows match koto dashboard's and its values koto context get's, that
+    # nothing in its build can reach storage or the network, and that a
+    # hundred of its reads on a cloud host change no file and send no
+    # request. tests/koto_session_list_test.rs says what each test proves.
+    name: Session List Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build koto and koto-session-list in release mode
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p koto -p koto-session-list
+          echo "SESSION_LIST_BIN=$GITHUB_WORKSPACE/target/release/koto-session-list" >> "$GITHUB_ENV"
+
+      # The same pattern run on koto must match, so a renamed crate or a
+      # changed cargo tree format can't turn the check into a pass. Each
+      # command's output is captured before it is searched, so a failing
+      # cargo tree or nm fails the step under `set -e` rather than handing
+      # grep an empty input that reads as a pass.
+      - name: Check the build graph has no storage, TLS, HTTP or terminal crate
+        run: |
+          set -euo pipefail
+          banned='^(rust-s3|rustls[^ ]*|attohttpc|http|url|ratatui|crossterm) '
+          list_tree="$(cargo tree --locked -p koto-session-list -e normal,build --prefix none)"
+          koto_tree="$(cargo tree --locked -p koto -e normal,build --prefix none)"
+          if grep -E "$banned" <<<"$list_tree"; then
+            echo "::error::koto-session-list's build graph holds the crates above"
+            exit 1
+          fi
+          if ! grep -qE "$banned" <<<"$koto_tree"; then
+            echo "::error::the pattern matched nothing in koto's own build graph"
+            exit 1
+          fi
+          echo "PASS: no storage, TLS, HTTP or terminal crate"
+
+      - name: Check the binary imports no network call
+        run: |
+          set -euo pipefail
+          imports() { nm -D --undefined-only "$1" | awk '{print $NF}' | sed 's/@.*//'; }
+          list_syms="$(imports target/release/koto-session-list)"
+          koto_syms="$(imports target/release/koto)"
+          if grep -xE 'connect|socket|getaddrinfo' <<<"$list_syms"; then
+            echo "::error::koto-session-list imports the calls above"
+            exit 1
+          fi
+          if ! grep -qxE 'connect|socket|getaddrinfo' <<<"$koto_syms"; then
+            echo "::error::the symbol check found no network call in koto itself"
+            exit 1
+          fi
+          echo "PASS: no connect, socket or getaddrinfo import"
+
+      - name: Run the parity and hundred-read tests
+        run: cargo test --locked --release --test koto_session_list_test -- --ignored
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
@@ -929,12 +991,14 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, tests, retention-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, reader-write-guard, reader-version, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, tests, retention-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, reader-write-guard, reader-version, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, session-list, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
       # The two suite jobs, tests and stability-tests, must be exactly
       # `success`: a cancelled or skipped suite run would otherwise pass.
+      # session-list is held to the same rule, since its parity and
+      # hundred-read tests run nowhere else.
       - name: Check results
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
@@ -958,6 +1022,7 @@ jobs:
              [ "${{ needs.pool-compat-v0-38-0.result }}" = "failure" ] || \
              [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
              [ "${{ needs.inline-evidence.result }}" = "failure" ] || \
+             [ "${{ needs.session-list.result }}" != "success" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then

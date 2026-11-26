@@ -26,7 +26,7 @@ commands below are listed without either prefix.
 ## Verification map
 
 - `src/**`, `tests/**`, `test/functional/fixtures/**`, `benches/**`, `koto-stability-tests/**`,
-  `koto-session-reader/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
+  `koto-session-reader/**`, `koto-session-list/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
   `scripts/run-tests.sh`, `.config/nextest.toml` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
@@ -99,13 +99,14 @@ that file's `nextest-version` is installed, and otherwise says so on stderr and 
 `cargo test --locked ... -- --test-threads=1`. CI's `tests` job also adds coverage and
 `--all-features`; locally the suite runs without either. Like CI, the test, doctest and clippy
 commands name `koto` and `koto-session-reader`, since cargo without `-p` runs only the root
-package; `run-tests.sh` given arguments skips the doctests, which have their own command.
+package, and the test and clippy commands name `koto-session-list` too, which has no library and
+so no doctests; `run-tests.sh` given arguments skips the doctests, which have their own command.
 
-- `bash scripts/run-tests.sh -p koto -p koto-session-reader`
+- `bash scripts/run-tests.sh -p koto -p koto-session-reader -p koto-session-list`
 - `cargo test --locked --doc -p koto -p koto-session-reader`
 - `bash scripts/run-tests.sh -p koto-stability-tests`
 - `cargo fmt --check`
-- `cargo clippy -p koto -p koto-session-reader --all-targets -- -D warnings`
+- `cargo clippy -p koto -p koto-session-reader -p koto-session-list --all-targets -- -D warnings`
 
 ### Build output
 

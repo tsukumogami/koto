@@ -82,6 +82,23 @@ fn session_id(backend: &Backend, session: &str, remote: bool) -> Option<String> 
     }
 }
 
+/// The session id `session`'s copy was imported from, as its
+/// `koto/imported-from` records it in this host's copy. A body carrying
+/// that id was carried by the import and reads as the session's own.
+fn imported_from_id(backend: &Backend, session: &str) -> Option<String> {
+    let path = backend
+        .session_dir(session)
+        .join("ctx")
+        .join(crate::session::hierarchy::IMPORTED_FROM_KEY);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let record: crate::session::hierarchy::ImportedFrom = serde_json::from_slice(&bytes).ok()?;
+    Some(record.from_session_id).filter(|id| !id.is_empty())
+}
+
 /// Every decision in `session`'s two areas, readable or not, after the
 /// integrity checks: a file whose name isn't a decision id, an id in both
 /// areas, a body that doesn't parse or whose own id, session name or
@@ -104,6 +121,7 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
         return vec![unreadable(None, problem)];
     }
     let own_id = session_id(backend, session, remote);
+    let imported_id = imported_from_id(backend, session);
 
     let mut seen_in: std::collections::BTreeMap<String, Vec<Area>> = Default::default();
     for f in &listing.found {
@@ -142,10 +160,12 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
                 if body.id != f.name {
                     return Err("the body's id isn't its file name".to_string());
                 }
-                if body.session.name != session {
+                // A body an import carried names the source session.
+                let carried = imported_id.as_deref() == Some(body.session.id.as_str());
+                if body.session.name != session && !carried {
                     return Err("the body names another session".to_string());
                 }
-                if own_id.as_deref().is_some_and(|id| id != body.session.id) {
+                if !carried && own_id.as_deref().is_some_and(|id| id != body.session.id) {
                     return Err("the body's session id isn't the session's".to_string());
                 }
                 match &f.area {
@@ -243,23 +263,26 @@ impl Filters {
 /// Sort entries by time, then session, then id; unreadable entries,
 /// which have no time, go last in session and id order.
 pub fn sort(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        let key = |e: &Entry| match e {
-            Entry::Decision(body) => (
-                0,
-                body.time.clone(),
-                body.session.name.clone(),
-                body.id.clone(),
-            ),
-            Entry::Unreadable { session, id, .. } => (
-                1,
-                String::new(),
-                session.clone(),
-                id.clone().unwrap_or_default(),
-            ),
-        };
-        key(a).cmp(&key(b))
-    });
+    entries.sort_by_key(sort_key);
+}
+
+/// The key [`sort`] orders entries by: readable ones first, by time, then
+/// the recording session's name, then id.
+pub fn sort_key(e: &Entry) -> (u8, String, String, String) {
+    match e {
+        Entry::Decision(body) => (
+            0,
+            body.time.clone(),
+            body.session.name.clone(),
+            body.id.clone(),
+        ),
+        Entry::Unreadable { session, id, .. } => (
+            1,
+            String::new(),
+            session.clone(),
+            id.clone().unwrap_or_default(),
+        ),
+    }
 }
 
 /// The sessions in the local store whose chain, walked now, includes

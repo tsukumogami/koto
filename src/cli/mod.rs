@@ -714,12 +714,16 @@ pub enum SessionCommand {
     /// question itself, the answer in effect for one, or a pass-up its
     /// current addressee rests on) is refused with exit 2, code
     /// `holds_question`, and nothing removed, unless `--force` is passed.
+    /// So is one whose own decisions can't be read, or that answered or
+    /// passed up a question whose session is here but can't be read: the
+    /// refusal lists them in `decisions_unreadable`.
     Cleanup {
         /// Session name
         name: String,
 
         /// Remove the session even when it holds an open question, its
-        /// answer or a pass-up. Prints `orphaned_questions` and warns on
+        /// answer or a pass-up, or its decisions can't be read. Prints
+        /// `orphaned_questions` (and `decisions_unreadable`) and warns on
         /// stderr for each. A pin still refuses it.
         #[arg(long)]
         force: bool,
@@ -1405,6 +1409,12 @@ pub enum DecisionsSubcommand {
         /// The session or anchor whose position to read
         #[arg(long, value_name = "SESSION_OR_ANCHOR")]
         at: Option<String>,
+    },
+    /// Write or read a question's content: the write-once bytes a person is
+    /// shown, in the raiser's `koto/packets/`
+    Content {
+        #[command(subcommand)]
+        action: decisions::ContentAction,
     },
 }
 
@@ -2664,20 +2674,22 @@ pub fn run(app: App) -> Result<()> {
                     ..
                 } => session::handle_list(&backend, execution_dir.as_deref(), state),
                 SessionCommand::Cleanup { name, force } => {
-                    // A session holding what an open question depends on is
-                    // refused before anything is stopped or removed.
+                    // A session holding what an open question depends on, or
+                    // whose decisions can't be read to tell, is refused before
+                    // anything is stopped or removed.
                     let holds = if crate::session::validate::validate_session_id(&name).is_ok() {
                         session::question_holds(backend.local_base_dir(), &name)
                     } else {
-                        Vec::new()
+                        Default::default()
                     };
-                    if !holds.is_empty() && !force {
+                    if holds.refuses() && !force {
                         session::refuse_holds(&backend, &name, &holds);
                     }
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
                     // And judge the hierarchy while the session is still in it.
                     let live = session::live_members(&backend, backend.local_base_dir(), &name);
+                    session::warn_unreadable(&name, &holds);
                     session::handle_cleanup(&backend, &name)?;
                     session::warn_live_members(&name, &live);
                     session::warn_orphaned(&name, &holds);
@@ -2687,8 +2699,11 @@ pub fn run(app: App) -> Result<()> {
                         "children": children,
                         "live_members": live.members,
                     });
-                    if !holds.is_empty() {
-                        out["orphaned_questions"] = session::orphaned_json(&holds);
+                    if !holds.holds.is_empty() {
+                        out["orphaned_questions"] = session::orphaned_json(&holds.holds);
+                    }
+                    if !holds.unreadable.is_empty() {
+                        out["decisions_unreadable"] = session::unreadable_json(&holds);
                     }
                     if let Some(e) = live.error {
                         out["live_members_error"] = serde_json::json!(e);
@@ -3291,6 +3306,16 @@ pub fn run(app: App) -> Result<()> {
                     (Some(person), _) => decisions::handle_open(&backend, &person),
                     (None, Some(at)) => decisions::handle_open_at(&backend, &at),
                     (None, None) => unreachable!("clap requires --person or --at"),
+                },
+                DecisionsSubcommand::Content { action } => match action {
+                    decisions::ContentAction::Write { name, id, file } => {
+                        refuse_if_unlocated(&backend, &name, "decisions content write");
+                        refuse_if_superseded(&backend, &name, "decisions content write");
+                        decisions::handle_content_write(&backend, &name, &id, &file)
+                    }
+                    decisions::ContentAction::Read { identity } => {
+                        decisions::handle_content_read(&backend, &identity)
+                    }
                 },
             }
         }
@@ -10388,8 +10413,9 @@ fn handle_cancel(
         }
         // So is one holding what an open question depends on: the message
         // names `koto session cleanup <name> --force`, which removes it.
+        // Or whose decisions can't be read to tell.
         let holds = session::question_holds(sessions_base, name);
-        if !holds.is_empty() {
+        if holds.refuses() {
             session::refuse_holds(backend, name, &holds);
         }
     }

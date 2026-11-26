@@ -1093,6 +1093,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "koto-session-list"
+version = "0.0.0"
+dependencies = [
+ "koto-session-reader",
+]
+
+[[package]]
 name = "koto-session-reader"
 version = "0.41.1-dev"
 dependencies = [

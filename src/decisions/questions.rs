@@ -398,20 +398,34 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
         let Some(answer) = answer_in_effect(&index, q) else {
             continue;
         };
+        let mut answer_json = json!({
+            "session": answer.session.name,
+            "id": answer.id,
+            "text": subject_str(answer, "text"),
+            "decider": answer.decider,
+            "run_mode": answer.authority.run_mode,
+            "time": answer.time,
+        });
+        if answer.prompt.is_some() {
+            // The same reading `show` and `list` give: verified only where
+            // this host's note in a holder's directory lists the answer.
+            let here = index
+                .holders(answer)
+                .iter()
+                .any(|h| super::standing::verified_in(backend, h, answer));
+            answer_json["reading"] = json!(if here {
+                super::prompt::VERIFIED
+            } else {
+                super::prompt::REMOTE_READING
+            });
+        }
         out.push(json!({
             "identity": identity(q),
             "session": q.session.name,
             "id": q.id,
             "question": subject_str(q, "question"),
             "state": "answered",
-            "answer": {
-                "session": answer.session.name,
-                "id": answer.id,
-                "text": subject_str(answer, "text"),
-                "decider": answer.decider,
-                "run_mode": answer.authority.run_mode,
-                "time": answer.time,
-            },
+            "answer": answer_json,
         }));
     }
     (!out.is_empty()).then_some(Value::Array(out))
@@ -465,6 +479,9 @@ impl Held {
 pub struct Hold {
     pub identity: String,
     pub held: Held,
+    /// The session directory that raised the question: the holder itself
+    /// for [`Held::Raised`].
+    pub raiser: String,
 }
 
 /// The readable decisions the scan read in session directory `session`.
@@ -516,13 +533,17 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
         .map(|identity| Hold {
             identity,
             held: Held::Raised,
+            raiser: session.to_string(),
         })
         .collect();
     for b in decisions_in(index, session) {
         let Some(t) = &b.target else { continue };
-        let held = match (b.kind.as_str(), b.outcome.as_str()) {
-            ("answer", "answered") => Held::Answer,
-            ("readdress", "passed") => Held::PassUp,
+        // By kind alone: whether the entry is the answer in effect, or a
+        // pass-up in the question's history, is the shared computation's
+        // to say.
+        let held = match b.kind.as_str() {
+            "answer" => Held::Answer,
+            "readdress" => Held::PassUp,
             _ => continue,
         };
         let Some(q) = question_of(index, &t.id, &t.decision) else {
@@ -544,6 +565,7 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
             out.push(Hold {
                 identity: identity(q),
                 held,
+                raiser: q.session.name.clone(),
             });
         }
     }
@@ -552,20 +574,22 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
     out
 }
 
+/// Whether `b` could make a hold [`holds_of`] counts: a question, or (with
+/// `aimed`) an answer or pass-up aimed at one.
+fn may_count(b: &DecisionBody, aimed: bool) -> bool {
+    is_question(b)
+        || (aimed && b.target.is_some() && matches!(b.kind.as_str(), "answer" | "readdress"))
+}
+
 /// Whether session `session`'s own decisions could hold anything
-/// [`holds_of`] counts: a question, or (with `aimed`) an answer or pass-up
-/// aimed at one. A session with neither never pays for a scan of the
-/// store.
+/// [`holds_of`] counts. A session with none never pays for a scan of the
+/// store. An unreadable entry counts as none here: the terminal tick keeps
+/// a session only for a question it can read.
 fn may_hold(backend: &Backend, session: &str, aimed: bool) -> bool {
     read::read_session_with(backend, session, false)
         .iter()
         .any(|e| match e {
-            Entry::Decision(b) => {
-                is_question(b)
-                    || (aimed
-                        && b.target.is_some()
-                        && matches!(b.kind.as_str(), "answer" | "readdress"))
-            }
+            Entry::Decision(b) => may_count(b, aimed),
             Entry::Unreadable { .. } => false,
         })
 }
@@ -579,17 +603,172 @@ pub fn raised_open_in(backend: &Backend, session: &str) -> Vec<String> {
     raised_open(&Index::scan(backend, false), session)
 }
 
+/// What an explicit removal of a session would orphan, and what couldn't
+/// be read to tell.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Orphans {
+    /// [`holds_of`] the session.
+    pub holds: Vec<Hold>,
+    /// What couldn't be read, one line each: the session's own decision
+    /// directory or files, and each question one of its aimed answers or
+    /// pass-ups points at that sits in a session in the store but can't be
+    /// read. Either could hide a hold, so an explicit removal is refused
+    /// for them as it is for a hold.
+    pub unreadable: Vec<String>,
+}
+
+impl Orphans {
+    /// Whether an explicit removal is refused without `--force`.
+    pub fn refuses(&self) -> bool {
+        !self.holds.is_empty() || !self.unreadable.is_empty()
+    }
+}
+
+/// One unreadable entry of `session`, as a line of [`Orphans::unreadable`].
+fn unreadable_line(session: &str, id: Option<&str>, reason: &str) -> String {
+    match id {
+        Some(id) => format!("decision {id} of '{session}': {reason}"),
+        None => format!("the decisions of '{session}': {reason}"),
+    }
+}
+
+/// The session in the store, other than `except`, whose state-file header
+/// names session id `session_id`.
+fn session_with_id(
+    backend: &Backend,
+    index: &Index,
+    session_id: &str,
+    except: &str,
+) -> Option<String> {
+    index.sessions().keys().find_map(|s| {
+        if s == except {
+            return None;
+        }
+        let path = crate::session::SessionBackend::session_dir(backend, s)
+            .join(crate::session::state_file_name(s));
+        let id = crate::session::links::LinkHints::from_state_file(&path).session_id;
+        (id.as_deref() == Some(session_id)).then(|| s.clone())
+    })
+}
+
 /// What an explicit removal of session `session` would orphan
-/// ([`holds_of`]), read from the local store only: empty, at the cost of a
-/// read of its own decisions, when it holds no question and no aimed
-/// answer or pass-up.
-pub fn orphans(backend: &Backend, session: &str) -> Vec<Hold> {
-    if !may_hold(backend, session, true) {
-        return Vec::new();
+/// ([`holds_of`]) and what couldn't be read to tell, from the local store
+/// only: nothing, at the cost of a read of its own decisions, when every
+/// entry of its own reads and none is a question or an aimed answer or
+/// pass-up.
+pub fn orphans(backend: &Backend, session: &str) -> Orphans {
+    let own = read::read_session_with(backend, session, false);
+    let mut out = Orphans {
+        unreadable: own
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Unreadable { id, reason, .. } => {
+                    Some(unreadable_line(session, id.as_deref(), reason))
+                }
+                Entry::Decision(_) => None,
+            })
+            .collect(),
+        ..Orphans::default()
+    };
+    let counts = own.iter().any(|e| match e {
+        Entry::Decision(b) => may_count(b, true),
+        Entry::Unreadable { .. } => false,
+    });
+    if !counts {
+        return out;
     }
     let index = Index::scan(backend, false);
     let runs = Runs::new(backend);
-    holds_of(&index, &runs, session)
+    out.holds = holds_of(&index, &runs, session);
+    // An aimed entry whose question can't be read, in the session the store
+    // holds under that question's session id, may rest on an open question.
+    for b in decisions_in(&index, session) {
+        let Some(t) = &b.target else { continue };
+        if !matches!(b.kind.as_str(), "answer" | "readdress")
+            || question_of(&index, &t.id, &t.decision).is_some()
+        {
+            continue;
+        }
+        let Some(raiser) = session_with_id(backend, &index, &t.id, session) else {
+            continue;
+        };
+        for e in index.sessions().get(&raiser).into_iter().flatten() {
+            if let Entry::Unreadable { id, reason, .. } = e {
+                if id.as_deref().is_none_or(|id| id == t.decision) {
+                    out.unreadable
+                        .push(unreadable_line(&raiser, id.as_deref(), reason));
+                }
+            }
+        }
+    }
+    out.unreadable.sort();
+    out.unreadable.dedup();
+    out
+}
+
+/// The members of `removing` a by-rule removal keeps for the questions they
+/// hold, each with the holds whose raiser isn't removed with it: a holder
+/// of the answer in effect or of a pass-up goes only with the raiser of
+/// that question ([`holds_of`]), and a member kept here keeps the holders
+/// that rest on it, to a fixed point. Asker and answerer removed together
+/// both go. `may_hold` says which members could hold anything (those with
+/// an aimed answer or pass-up); when none could, nothing is read. Read
+/// from the local store only.
+pub fn kept_for_raisers(
+    backend: &Backend,
+    removing: &BTreeSet<String>,
+    may_hold: impl Fn(&str) -> bool,
+) -> BTreeMap<String, Vec<Hold>> {
+    let holders: Vec<&String> = removing.iter().filter(|n| may_hold(n)).collect();
+    let mut kept: BTreeMap<String, Vec<Hold>> = BTreeMap::new();
+    if holders.is_empty() {
+        return kept;
+    }
+    let index = Index::scan(backend, false);
+    let runs = Runs::new(backend);
+    let holds: Vec<(&String, Vec<Hold>)> = holders
+        .into_iter()
+        .map(|h| (h, holds_of(&index, &runs, h)))
+        .filter(|(_, holds)| !holds.is_empty())
+        .collect();
+    loop {
+        let mut changed = false;
+        for (holder, held) in &holds {
+            if kept.contains_key(*holder) {
+                continue;
+            }
+            let apart: Vec<Hold> = held
+                .iter()
+                .filter(|h| !removing.contains(&h.raiser) || kept.contains_key(&h.raiser))
+                .cloned()
+                .collect();
+            if !apart.is_empty() {
+                kept.insert((*holder).clone(), apart);
+                changed = true;
+            }
+        }
+        if !changed {
+            return kept;
+        }
+    }
+}
+
+/// The detail a by-rule removal prints for a member [`kept_for_raisers`]
+/// keeps.
+pub fn kept_for_raisers_text(holds: &[Hold]) -> String {
+    use crate::session::hierarchy::sanitize;
+    let each: Vec<String> = holds
+        .iter()
+        .map(|h| {
+            format!(
+                "it {}, and its raiser {} isn't removed with it (removing it would lose {})",
+                h.held.describe(&sanitize(&h.identity)),
+                sanitize(&h.raiser),
+                h.held.loss()
+            )
+        })
+        .collect();
+    format!("kept: {}", each.join("; "))
 }
 
 /// The open questions each session directory in the local store raised,

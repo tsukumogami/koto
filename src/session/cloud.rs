@@ -4802,6 +4802,35 @@ fn staged_pin_records(ctx_dir: &Path) -> Vec<String> {
     out
 }
 
+/// The decision objects staged under `ctx_dir`, as context keys: every
+/// regular file below the decision areas and `koto/packets/`, sorted.
+fn staged_decision_records(ctx_dir: &Path) -> Vec<String> {
+    fn files_under(dir: &Path, key: &str, out: &mut Vec<String>) {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if meta.file_type().is_file() {
+            out.push(key.to_string());
+        } else if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    files_under(&entry.path(), &format!("{key}/{name}"), out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for area in crate::decisions::AREAS
+        .iter()
+        .chain(std::iter::once(&crate::decisions::PACKETS_AREA))
+    {
+        files_under(&ctx_dir.join(area), area, &mut out);
+    }
+    out.sort();
+    out
+}
+
 /// A manifest pulled from the bucket, as this host keeps it: whatever
 /// host-local keys it lists dropped, and this host's own (`kept`) put back.
 /// Bytes that don't parse as a manifest are kept as they are.
@@ -7362,7 +7391,8 @@ impl CloudBackend {
         // carried verbatim, an unreadable pin included (R25). They stay out
         // of the copy's manifest, as on every cloud copy (R20a), and
         // `push_staged` pushes each as its own object.
-        for (key, bytes) in self.source_pin_records(source)? {
+        let carried = self.source_decision_records(source)?;
+        for (key, bytes) in self.source_pin_records(source)?.into_iter().chain(carried) {
             let path = ctx_dir.join(&key);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
@@ -7478,7 +7508,11 @@ impl CloudBackend {
                 staged.join("ctx").join(key),
             ));
         }
-        for key in staged_pin_records(&staged.join("ctx")) {
+        let ctx_dir = staged.join("ctx");
+        for key in staged_pin_records(&ctx_dir)
+            .into_iter()
+            .chain(staged_decision_records(&ctx_dir))
+        {
             uploads.push((
                 format!("{}ctx/{}", prefix, key),
                 staged.join("ctx").join(&key),
@@ -7551,6 +7585,70 @@ impl CloudBackend {
                 .fetch_object(&obj.key)
                 .map_err(|e| source.unreadable(&what, &e))?
             {
+                records.push((key.to_string(), bytes));
+            }
+        }
+        Ok(records)
+    }
+
+    /// The source's decision objects an import carries, as `(key, bytes)`
+    /// with each key relative to `ctx/`: every object under the decision
+    /// areas whose body the source records as its own (its session id is
+    /// the source header's), and every question content file under
+    /// `koto/packets/`. They sit outside the manifest, like the pin, so
+    /// each area is listed and each object read on its own. The copy reads
+    /// a carried body as its own through `koto/imported-from`; a body the
+    /// source itself carried from an earlier import names another session
+    /// id and stays behind, as does anything past the size cap or with a
+    /// name that isn't a decision id (DESIGN-decision-record.md,
+    /// Decision 1).
+    fn source_decision_records(
+        &self,
+        source: &ImportSource,
+    ) -> Result<Vec<(String, Vec<u8>)>, ImportError> {
+        use crate::decisions::body::{DecisionBody, MAX_BODY_BYTES};
+        use crate::decisions::{is_decision_id, AREAS, MAX_AREA_ENTRIES, PACKETS_AREA};
+        let ctx = source.key("ctx/");
+        let own_id = source.log.header.session_id.as_str();
+        let mut records = Vec::new();
+        for area in AREAS.iter().chain(std::iter::once(&PACKETS_AREA)) {
+            let pages = self
+                .bucket
+                .list(format!("{ctx}{area}/"), None)
+                .map_err(|e| source.unreadable(&format!("its {area}/ area"), &e))?;
+            let objects: Vec<_> = pages.iter().flat_map(|p| p.contents.iter()).collect();
+            if objects.len() > MAX_AREA_ENTRIES {
+                return Err(source.unreadable(
+                    &format!("its {area}/ area"),
+                    &"it holds more objects than a session may",
+                ));
+            }
+            for obj in objects {
+                let Some(key) = obj.key.strip_prefix(&ctx) else {
+                    continue;
+                };
+                let name = key.rsplit('/').next().unwrap_or("");
+                if !is_decision_id(name)
+                    || obj.size > MAX_BODY_BYTES as u64
+                    || crate::session::validate::validate_context_key(key).is_err()
+                {
+                    continue;
+                }
+                let what = format!("context key {:?}", key);
+                let Some(bytes) = self
+                    .fetch_object(&obj.key)
+                    .map_err(|e| source.unreadable(&what, &e))?
+                else {
+                    continue;
+                };
+                if *area != PACKETS_AREA {
+                    let own = DecisionBody::parse(&bytes)
+                        .map(|b| b.session.id == own_id)
+                        .unwrap_or(false);
+                    if !own {
+                        continue;
+                    }
+                }
                 records.push((key.to_string(), bytes));
             }
         }

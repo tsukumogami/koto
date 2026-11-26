@@ -540,7 +540,9 @@ Wiring:
   still removes, by the rule, when a released replace removes a
   predecessor's descendants.
 - **Same-name replace.** Keep moves the predecessor aside (Decision 4) and
-  the answer carries its new name and reason; release replaces as today.
+  the answer carries its new name and reason; release replaces as today. A
+  predecessor holding what a question depends on is the exception: the
+  replace refuses it instead of moving it ("Questions" below).
 - **`koto workspace prune --root X`.** Each subtree member except X is
   judged with only the lineage between X and its direct children dropped;
   X is judged with every edge. That is the narrowest reading that lets the
@@ -595,15 +597,15 @@ reaches every one of them at once.
   aimed fact whose target id is a session in the store, with `Via::Aimed`.
 
 **What the terminal tick reads.** After the failure terminal and the pin,
-and before the edge test, the tick reads the session's own
-`koto/decisions/` directory. Only when that holds a question does it scan
+and before the edge test, the tick reads and parses the session's own
+decisions under `koto/decisions/`. Only when they hold a question does it scan
 the local store (never the bucket, under the cloud backend) and test each of
 the session's questions with `is_open`. A session it keeps that way answers
 `"retention": {"retained": true, "reason": "open_question",
 "open_questions": ["<session id>/<decision id>"]}`, with or without
 `--no-cleanup`, and its `kept_children` are listed as for `hierarchy`. A
-session that raised no question pays that one directory read and no store
-scan. `edge_of` then learns of aimed entries in the pass it already makes:
+session that raised no question pays the read and parse of its own decisions
+and no store scan. `edge_of` then learns of aimed entries in the pass it already makes:
 it collects the target ids of the session's own aimed answers and pass-ups
 and compares them with each other session's header id, which the pass
 already reads, and for each other session it looks up
@@ -623,11 +625,23 @@ question`. `koto session prune` lists a session kept that way under rule
 `h`, whose `detail` is that text: rule `a` stays the session's own life, so
 a stopped session holding an open question is kept with its hierarchy, not
 as alive. `koto workspace prune --root`, whose `--force` passes only its
-terminal-state gate, and `koto init --replace-terminal`, which moves the
-predecessor aside, follow the same verdict. The parent sweep keeps a
+terminal-state gate, follows the same verdict. The parent sweep keeps a
 terminal child that raised an open question, as it keeps a pinned one, with
 a `kept_children` entry of reason `open_question`, its `open_questions` and
 a detail naming them; like a pin it keeps nothing above the child.
+
+**Prunes that take part of a component.** A by-rule prune that can remove
+some members of a component and not others (`koto workspace prune --root`,
+which drops the lineage between the root and its children, and
+`koto session prune --older-than` and `--execution-dir`, whose filters pick
+candidates) could otherwise remove the holder of an answer or pass-up while
+leaving the question's raiser in the store. So each of them keeps a session
+holding the answer in effect for a question, or a pass-up an open question's
+current addressee rests on, whenever that question's raiser isn't removed
+in the same run, and lists it with a detail naming the question. When the
+raiser and the holder are both removed in that run, both go. The check is
+the identity match the cleanup refusal makes (below), applied to the run's
+removal set rather than to one session.
 
 **Explicit removal.** Where explicit removal always removed and reported
 what it broke, a removal that would orphan a question is now refused unless
@@ -652,6 +666,30 @@ in the store, and a pass-up of a question since answered hold nothing, so a
 raiser and its answerer can both be removed without force, raiser first.
 The refusal reads the session's own decisions first and scans the local
 store only when they hold a question or an aimed answer or pass-up.
+
+A refusal that can't tell is a refusal too. When the session's own
+decisions can't be read, or a question one of its aimed entries points at
+can't be read in the raiser's session, cleanup and `cancel --cleanup`
+refuse without `--force` with the same code and exit, and the message names
+what couldn't be read: the session's decisions, or the raiser and the
+question identity. `--force` removes it as above.
+
+`koto init <name> --replace-terminal` makes the same check on the terminal
+predecessor before it moves or removes anything. Where an unheld
+predecessor kept by the rule moves aside as `<name>_r<N>`, one that raised
+an open question, holds the answer in effect for one, or holds a pass-up an
+open question rests on, or whose decisions can't be read, is not moved: the
+replace exits 2 with code `holds_question` and the same `questions` and
+`force_command` as cleanup; nothing is moved, removed or written. The way
+out is `koto session cleanup <name> --force` and then the `init` again.
+
+**The cloud backend.** The refusal, the replace check and the prunes' hold
+read only the local store. A question's holds are found from the sessions
+present on this host, so a host that has the answerer locally but not the
+asker sees no hold: the answer's raiser isn't in its store, and the answer
+holds nothing there. Cleanup on that host deletes the local copy and the
+bucket copy as it always has. A host holding the asker locally refuses as
+described.
 
 `--force` removes the session and adds `orphaned_questions` (the same
 objects as `questions`) beside `live_members`, with one stderr warning per
@@ -1290,7 +1328,8 @@ questions reads `"reason": "open_question"` with `"open_questions"`.
 Cleanup and cancel: `"live_members": [{"name", "kind", "observed"}]`; a
 refusal for a held question exits 2 with code `holds_question`, and
 `cleanup --force` adds `"orphaned_questions": [{"question", "held"}]`.
-Replace: `"moved_to"`.
+Replace: `"moved_to"`, or, for a predecessor holding what a question
+depends on, the same `holds_question` refusal.
 Prune kept entries: rule `h` with a `hierarchy` object equal to the query's
 JSON.
 
@@ -1604,8 +1643,18 @@ store shared by mixed koto versions loses the guarantee.
   open question has no expiry. It goes once the question is answered,
   reversed or fenced, or when someone removes the raiser with
   `koto session cleanup --force`.
+- An answered question still joins its asker and its answerer, so both are
+  kept at their terminal ticks as one hierarchy until `koto session prune`
+  runs after the retention period. A host that answers many questions grows
+  until it prunes.
 - A person removing a session that holds what an open question depends on
-  now has to pass `--force`, where before the removal always went through.
+  now has to pass `--force`, where before the removal always went through,
+  and so does a same-name replace of such a session, which used to move it
+  aside. Holding the answer in effect counts for as long as the asker is in
+  the store.
+- Under the cloud backend the refusal reads only the local store, so a host
+  that has the answerer but not the asker removes the answerer, bucket copy
+  included, without asking.
 - Four existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.

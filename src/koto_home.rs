@@ -14,7 +14,9 @@
 //! `cargo clippy -D warnings` instead of quietly escaping `KOTO_HOME`. The
 //! lint can't see a read of the `HOME` variable itself; the two that exist
 //! are the cache fallback and Claude Code's own `~/.claude` directory,
-//! neither a koto root path.
+//! neither a koto root path. The harness record a person's answer cites is
+//! found from the account database's home for the effective user, not from
+//! `HOME`, in `decisions::prompt::account_home`.
 //!
 //! `KOTO_SESSIONS_BASE` keeps its meaning: it moves only the local backend's
 //! session directory, and wins over `<root>/sessions` when both are set

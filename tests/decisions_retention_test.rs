@@ -147,6 +147,11 @@ impl Env {
 
     /// Run koto with `envs` set and `input` on its stdin (none: empty).
     fn run_input(&self, envs: &[(&str, &str)], args: &[&str], input: Option<&str>) -> Out {
+        self.run_at(&self.root.join("ws"), envs, args, input)
+    }
+
+    /// [`Env::run_input`] from directory `cwd`.
+    fn run_at(&self, cwd: &Path, envs: &[(&str, &str)], args: &[&str], input: Option<&str>) -> Out {
         let mut cmd = koto_command::koto_std();
         for name in CLEARED_ENV {
             cmd.env_remove(name);
@@ -154,7 +159,7 @@ impl Env {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        cmd.current_dir(self.root.join("ws"));
+        cmd.current_dir(cwd);
         cmd.env("HOME", self.root.join("home"));
         cmd.env("KOTO_HOME", self.root.join("home"));
         cmd.env("KOTO_SESSIONS_BASE", self.sessions());
@@ -328,10 +333,65 @@ impl Env {
         self.run(&args)
     }
 
-    /// Every file under a session's directory with its bytes, lock files
-    /// aside.
-    fn snapshot(&self, name: &str) -> BTreeMap<PathBuf, Vec<u8>> {
-        snapshot_dir(&self.sessions().join(name))
+    /// Every file under the scratch root (the sessions directory, the koto
+    /// home, the workspace) with its bytes, lock files aside.
+    fn snapshot_all(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        snapshot_dir(&self.root)
+    }
+
+    /// [`Env::snapshot_all`] less session `removed`'s directory and the
+    /// wakes directory: what a forced removal of `removed` must leave
+    /// byte-identical.
+    fn snapshot_except(&self, removed: &str) -> BTreeMap<PathBuf, Vec<u8>> {
+        let gone = Path::new("sessions").join(removed);
+        let wakes = Path::new("home").join("wakes");
+        self.snapshot_all()
+            .into_iter()
+            .filter(|(p, _)| !p.starts_with(&gone) && !p.starts_with(&wakes))
+            .collect()
+    }
+
+    /// Make session `name`'s `ctx/koto/decisions` unreadable; `false`, with
+    /// the mode put back, when it can still be listed (the tests run as
+    /// root), so the caller skips.
+    fn lock_decisions(&self, name: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.decisions_dir(name);
+        assert!(dir.is_dir(), "{} has no decisions", name);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&dir).is_ok() {
+            self.unlock_decisions(name);
+            eprintln!("skipped: a mode-000 directory is still readable here (root?)");
+            return false;
+        }
+        true
+    }
+
+    fn unlock_decisions(&self, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            self.decisions_dir(name),
+            std::fs::Permissions::from_mode(0o755),
+        );
+    }
+
+    fn decisions_dir(&self, name: &str) -> PathBuf {
+        self.sessions().join(name).join("ctx/koto/decisions")
+    }
+
+    /// `koto init <name> --replace-terminal`.
+    fn replace(&self, name: &str) -> Out {
+        let template = self.template();
+        self.run_env(
+            &FAST,
+            &[
+                "init",
+                name,
+                "--template",
+                template.as_str(),
+                "--replace-terminal",
+            ],
+        )
     }
 
     fn aimed_files(&self, name: &str, target_id: &str) -> Vec<String> {
@@ -444,6 +504,55 @@ fn assert_holds_refusal(out: &Out, name: &str, holds: &[(&str, &str)]) {
         };
         assert!(message.contains(says), "{message}");
     }
+}
+
+/// Assert `out` is `koto init <name> --replace-terminal` refused with
+/// `holds_question` for `holds`, in the shape every `koto init` refusal
+/// has: `error` the text, `command: init`, `code` beside it.
+fn assert_replace_refusal(out: &Out, name: &str, holds: &[(&str, &str)]) {
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(v["code"], "holds_question", "{v}");
+    assert_eq!(v["command"], "init", "{v}");
+    assert_eq!(v["session"], name, "{v}");
+    let force = format!("koto session cleanup {name} --force");
+    assert_eq!(v["force_command"], force.as_str(), "{v}");
+    let message = v["error"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(message.contains(&force), "{message}");
+    assert!(message.contains("koto init again"), "{message}");
+    let expected: Vec<Value> = holds
+        .iter()
+        .map(|(q, held)| json!({"question": q, "held": held}))
+        .collect();
+    assert_eq!(v["questions"], Value::Array(expected), "{v}");
+    for (q, _) in holds {
+        assert!(message.contains(q), "{message}");
+    }
+}
+
+/// Assert `out` is the `holds_question` refusal of `name` for decisions
+/// that can't be read, the first of them in session `unreadable_in`.
+fn assert_unreadable_refusal(out: &Out, name: &str, unreadable_in: &str) {
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    let err = &out.json()["error"];
+    assert_eq!(err["code"], "holds_question", "{err}");
+    assert_eq!(err["session"], name);
+    assert_eq!(
+        err["force_command"],
+        format!("koto session cleanup {name} --force").as_str()
+    );
+    let listed = err["decisions_unreadable"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(!listed.is_empty(), "{err}");
+    let first = listed[0].as_str().unwrap();
+    assert!(
+        first.contains(&format!("'{unreadable_in}'")) && first.contains("can't be"),
+        "{first}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("can't be read"), "{message}");
+    assert!(message.contains(first), "{message}");
 }
 
 // ===== Kept at the terminal tick =====
@@ -699,32 +808,13 @@ fn a_hierarchy_holding_an_open_question_is_kept_by_every_prune() {
     }
     assert_eq!(identities(&env.open("owner")), vec![id.clone()]);
 
-    // A same-name replace moves the raiser aside rather than removing it.
-    let template = env.template();
-    let replaced = env
-        .ok_env(
-            &FAST,
-            &[
-                "init",
-                "raiser",
-                "--template",
-                template.as_str(),
-                "--replace-terminal",
-            ],
-        )
-        .json();
-    assert_eq!(replaced["outcome"], "replaced", "{replaced}");
-    let moved_to = replaced["moved_to"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{replaced}"));
-    assert!(
-        replaced["moved_reason"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("holds open question {id}")),
-        "{replaced}"
-    );
-    assert!(env.exists(moved_to) && env.exists("raiser") && env.exists("passer"));
+    // A same-name replace is refused: moving the raiser aside would rename
+    // it, and its question would stop reading.
+    let before = env.snapshot_all();
+    let out = env.replace("raiser");
+    assert_replace_refusal(&out, "raiser", &[(&id, "raised")]);
+    assert_eq!(env.snapshot_all(), before);
+    assert_eq!(identities(&env.open("owner")), vec![id.clone()]);
 }
 
 #[test]
@@ -794,18 +884,18 @@ fn cleanup_refuses_a_raiser_and_changes_nothing() {
     let env = Env::new();
     env.init("a", &[]);
     let q = env.escalate("a", "q1", "person:owner");
-    let before = env.snapshot("a");
+    let before = env.snapshot_all();
 
     let out = env.cleanup("a", &[]);
     assert_holds_refusal(&out, "a", &[(&q.identity(), "raised")]);
-    assert_eq!(env.snapshot("a"), before);
+    assert_eq!(env.snapshot_all(), before);
 
     // And after its terminal tick kept it.
     env.finish("a");
-    let before = env.snapshot("a");
+    let before = env.snapshot_all();
     let out = env.cleanup("a", &[]);
     assert_holds_refusal(&out, "a", &[(&q.identity(), "raised")]);
-    assert_eq!(env.snapshot("a"), before);
+    assert_eq!(env.snapshot_all(), before);
 }
 
 #[test]
@@ -815,19 +905,19 @@ fn cleanup_refuses_the_holder_of_the_answer_in_effect_or_a_resting_pass_up() {
     env.init("answerer", &[]);
     let answered = env.escalate("a", "q1", "person:owner");
     env.answer(&answered, "answerer", "yes");
-    let before = env.snapshot("answerer");
+    let before = env.snapshot_all();
     let out = env.cleanup("answerer", &[]);
     assert_holds_refusal(&out, "answerer", &[(&answered.identity(), "answer")]);
-    assert_eq!(env.snapshot("answerer"), before);
+    assert_eq!(env.snapshot_all(), before);
 
     env.init("r", &[]);
     env.init("passer", &[]);
     let passed = env.escalate("r", "q1", "session:passer");
     env.readdress(&passed, "passer", "person:owner");
-    let before = env.snapshot("passer");
+    let before = env.snapshot_all();
     let out = env.cleanup("passer", &[]);
     assert_holds_refusal(&out, "passer", &[(&passed.identity(), "pass_up")]);
-    assert_eq!(env.snapshot("passer"), before);
+    assert_eq!(env.snapshot_all(), before);
 }
 
 #[test]
@@ -849,10 +939,10 @@ fn cancel_cleanup_is_refused_before_the_cancel() {
         ("passer", passed.identity(), "pass_up"),
     ];
     for (name, identity, held) in &cases {
-        let before = env.snapshot(name);
+        let before = env.snapshot_all();
         let out = env.run(&["cancel", name, "--cleanup"]);
         assert_holds_refusal(&out, name, &[(identity, held)]);
-        assert_eq!(env.snapshot(name), before, "{name} changed");
+        assert_eq!(env.snapshot_all(), before, "the store changed for {name}");
         // Not cancelled: it still advances.
         let next = env.ok(&["next", name, "--no-cleanup"]).json();
         assert_eq!(next["state"], "work", "{name}: {next}");
@@ -934,8 +1024,10 @@ fn a_forced_removal_of_the_answer_reopens_the_question() {
     env.answer(&q, "b", "yes");
     assert!(env.open("owner").is_empty());
 
+    let before = env.snapshot_except("b");
     let out = env.cleanup("b", &["--force"]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(env.snapshot_except("b"), before);
     let v = out.json();
     assert_eq!(
         v["orphaned_questions"],
@@ -977,8 +1069,10 @@ fn a_forced_removal_of_a_pass_up_returns_the_question_to_its_earlier_addressee()
         json!([session("passer"), person("owner")])
     );
 
+    let before = env.snapshot_except("passer");
     let out = env.cleanup("passer", &["--force"]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(env.snapshot_except("passer"), before);
     assert_eq!(
         out.json()["orphaned_questions"],
         json!([{"question": q.identity(), "held": "pass_up"}])
@@ -1000,8 +1094,10 @@ fn a_forced_removal_of_the_raiser_leaves_the_aimed_entries_listed() {
     let q = env.escalate("a", "q1", "session:passer");
     env.readdress(&q, "passer", "person:owner");
 
+    let before = env.snapshot_except("a");
     let out = env.cleanup("a", &["--force"]);
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(env.snapshot_except("a"), before);
     assert_eq!(
         out.json()["orphaned_questions"],
         json!([{"question": q.identity(), "held": "raised"}])
@@ -1027,13 +1123,52 @@ fn a_pinned_session_is_refused_for_its_pin_with_or_without_force() {
     env.init("a", &[]);
     env.escalate("a", "q1", "person:owner");
     env.ok(&["session", "pin", "a", "--reason", "x"]);
-    let before = env.snapshot("a");
+    let before = env.snapshot_all();
     for extra in [&[][..], &["--force"][..]] {
         let out = env.cleanup("a", extra);
         assert_eq!(out.code, 2, "{extra:?}\n{}\n{}", out.stdout, out.stderr);
         assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
-        assert_eq!(env.snapshot("a"), before);
+        assert_eq!(env.snapshot_all(), before);
     }
+}
+
+#[test]
+fn a_pinned_holder_of_an_answer_or_a_pass_up_is_refused_for_its_pin_even_with_force() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("answerer", &[]);
+    env.init("r", &[]);
+    env.init("passer", &[]);
+    let answered = env.escalate("a", "q1", "person:owner");
+    env.answer(&answered, "answerer", "yes");
+    let passed = env.escalate("r", "q1", "session:passer");
+    env.readdress(&passed, "passer", "person:owner");
+    for name in ["answerer", "passer"] {
+        env.ok(&["session", "pin", name, "--reason", "x"]);
+    }
+
+    let before = env.snapshot_all();
+    for name in ["answerer", "passer"] {
+        for extra in [&[][..], &["--force"][..]] {
+            let out = env.cleanup(name, extra);
+            assert_eq!(
+                out.code, 2,
+                "{name} {extra:?}\n{}\n{}",
+                out.stdout, out.stderr
+            );
+            assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
+            assert_eq!(env.snapshot_all(), before, "{name} {extra:?}");
+        }
+        // `koto cancel --cleanup` too, before anything is cancelled.
+        let out = env.run(&["cancel", name, "--cleanup"]);
+        assert_eq!(out.code, 2, "{name}\n{}\n{}", out.stdout, out.stderr);
+        assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
+        assert_eq!(env.snapshot_all(), before, "{name} cancel");
+    }
+    assert!(env
+        .open("owner")
+        .iter()
+        .any(|q| q["identity"] == passed.identity().as_str()));
 }
 
 #[test]
@@ -1058,6 +1193,304 @@ fn cleanup_of_a_session_holding_no_question_prints_what_it_did_before() {
         );
         assert!(!env.exists("a"), "{extra:?}");
     }
+}
+
+#[test]
+fn force_leaves_children_hierarchy_members_and_the_raiser_byte_identical() {
+    let env = Env::new();
+    env.init("coord", &[]);
+    env.init("b", &["--dispatched-by", "coord"]);
+    env.init("child", &["--parent", "b"]);
+    env.init("a", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+
+    let before = env.snapshot_except("b");
+    let out = env.cleanup("b", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(
+        out.json()["orphaned_questions"],
+        json!([{"question": q.identity(), "held": "answer"}])
+    );
+    assert!(!env.exists("b"));
+    // The child, the dispatcher and the raiser: every byte as it was.
+    assert_eq!(env.snapshot_except("b"), before);
+    for name in ["coord", "child", "a"] {
+        assert!(env.exists(name), "{name} is gone");
+    }
+}
+
+// ===== Replacing a finished holder =====
+
+#[test]
+fn a_replace_over_a_finished_question_holder_is_refused_and_moves_nothing() {
+    let env = Env::new();
+    // A raiser, kept at its end for its open question.
+    env.init("a", &[]);
+    let raised = env.escalate("a", "q1", "person:owner");
+    assert_eq!(env.finish("a")["retention"]["reason"], "open_question");
+    // A pass-up holder, kept with the raiser's hierarchy.
+    env.init("r", &[]);
+    env.init("passer", &[]);
+    let passed = env.escalate("r", "q1", "session:passer");
+    env.readdress(&passed, "passer", "person:owner");
+    env.finish("passer");
+    // The holder of the answer in effect.
+    env.init("asker", &[]);
+    env.init("answerer", &[]);
+    let answered = env.escalate("asker", "q1", "person:owner");
+    env.answer(&answered, "answerer", "yes");
+    env.finish("answerer");
+
+    let cases = [
+        ("a", raised.identity(), "raised"),
+        ("passer", passed.identity(), "pass_up"),
+        ("answerer", answered.identity(), "answer"),
+    ];
+    for (name, identity, held) in &cases {
+        let before = env.snapshot_all();
+        let out = env.replace(name);
+        assert_replace_refusal(&out, name, &[(identity, held)]);
+        assert_eq!(env.snapshot_all(), before, "the store changed for {name}");
+        assert!(!env.exists(&format!("{name}_r1")), "{name} was moved aside");
+    }
+    // Each question reads as it did.
+    let open = identities(&env.open("owner"));
+    assert_eq!(open, vec![raised.identity(), passed.identity()]);
+    assert!(!env.listed_as_raised(&answered));
+
+    // The way out the message names: remove it with --force, then init.
+    env.ok(&["session", "cleanup", "a", "--force"]);
+    let out = env.replace("a");
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(out.json()["outcome"], "created");
+}
+
+// ===== By-rule prunes keep a holder whose raiser stays =====
+
+/// `a` asks a person, `b` answers; both end and the retention passes.
+fn answered_pair(env: &Env) -> Rec {
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+    env.finish_env(&FAST, "a");
+    env.finish_env(&FAST, "b");
+    settle();
+    q
+}
+
+/// Assert `detail` keeps a holder of `q`'s answer for its raiser `a`.
+fn assert_kept_for_raiser(detail: &str, q: &Rec) {
+    assert!(
+        detail.contains(&q.identity())
+            && detail.contains("holds the answer in effect")
+            && detail.contains("its raiser a isn't removed with it"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn workspace_prune_of_the_answerer_alone_keeps_it_while_the_asker_stays() {
+    let env = Env::new();
+    let q = answered_pair(&env);
+
+    let out = env.run_env(&FAST, &["workspace", "prune", "--root", "b", "--yes"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let report = out.last_json();
+    assert_eq!(report["removed"], json!([]), "{report:#}");
+    assert_eq!(report["pruned"], false, "{report:#}");
+    let kept = report["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "b")
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_kept_for_raiser(kept["reason"].as_str().unwrap(), &q);
+    assert!(env.exists("a") && env.exists("b"));
+    // The question is still answered.
+    assert!(env.open("owner").is_empty());
+    assert!(!env.listed_as_raised(&q));
+}
+
+#[test]
+fn workspace_prune_removes_asker_and_answerer_together() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &["--parent", "a"]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+    env.finish_env(&FAST, "b");
+    env.finish_env(&FAST, "a");
+    settle();
+
+    let out = env.run_env(&FAST, &["workspace", "prune", "--root", "a", "--yes"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let report = out.last_json();
+    let mut removed: Vec<String> = report["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect();
+    removed.sort();
+    assert_eq!(removed, vec!["a", "b"], "{report:#}");
+    assert!(!env.exists("a") && !env.exists("b"));
+}
+
+#[test]
+fn session_prune_older_than_keeps_an_answerer_whose_asker_is_too_young() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+    env.finish_env(&FAST, "b");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    env.finish_env(&FAST, "a");
+    settle();
+
+    // `b` stopped over four seconds ago, `a` about two.
+    let preview = env.prune(&["--older-than", "4s"]);
+    assert!(
+        preview["remove"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+    let kept = kept_entry(&preview, "b");
+    assert_eq!(kept["rule"], "h", "{kept}");
+    assert_kept_for_raiser(kept["detail"].as_str().unwrap(), &q);
+
+    let applied = env.prune(&["--older-than", "4s", "--apply"]);
+    assert_eq!(applied["removed"], json!([]), "{applied:#}");
+    assert!(env.exists("a") && env.exists("b"));
+    assert!(env.open("owner").is_empty());
+
+    // Both old enough: removed together.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let applied = env.prune(&["--older-than", "3s", "--apply"]);
+    assert_eq!(names_of(&applied["removed"]), vec!["a", "b"], "{applied:#}");
+    assert!(!env.exists("a") && !env.exists("b"));
+}
+
+#[test]
+fn session_prune_by_execution_dir_keeps_an_answerer_whose_asker_is_elsewhere() {
+    let env = Env::new();
+    let sub = env.root.join("ws").join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let sub_arg = sub.to_string_lossy().into_owned();
+    env.init("a", &[]);
+    env.init("b", &["--execution-dir", sub_arg.as_str()]);
+    let q = env.escalate("a", "q1", "person:owner");
+    env.answer(&q, "b", "yes");
+    env.finish_env(&FAST, "a");
+    let out = env.run_at(
+        &sub,
+        &FAST,
+        &["next", "b", "--with-data", r#"{"go":"go"}"#],
+        None,
+    );
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    settle();
+
+    let preview = env.prune(&["--execution-dir", sub_arg.as_str()]);
+    assert!(
+        preview["remove"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+    assert_kept_for_raiser(kept_entry(&preview, "b")["detail"].as_str().unwrap(), &q);
+    let applied = env.prune(&["--execution-dir", sub_arg.as_str(), "--apply"]);
+    assert_eq!(applied["removed"], json!([]), "{applied:#}");
+    assert!(env.exists("a") && env.exists("b"));
+    assert!(env.open("owner").is_empty());
+
+    // A directory holding both: removed together.
+    let ws = env.root.join("ws").to_string_lossy().into_owned();
+    let applied = env.prune(&["--execution-dir", ws.as_str(), "--apply"]);
+    assert_eq!(names_of(&applied["removed"]), vec!["a", "b"], "{applied:#}");
+    assert!(!env.exists("a") && !env.exists("b"));
+}
+
+// ===== Decisions that can't be read =====
+
+#[test]
+fn unreadable_decisions_refuse_cleanup_cancel_and_replace_and_remove_nothing() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.escalate("a", "q1", "person:owner");
+    // `d` answered `c`'s question; `c`'s decisions will be unreadable.
+    env.init("c", &[]);
+    env.init("d", &[]);
+    let cq = env.escalate("c", "q1", "person:owner");
+    env.answer(&cq, "d", "yes");
+
+    let before = env.snapshot_all();
+    if !env.lock_decisions("a") {
+        return;
+    }
+    let out = env.cleanup("a", &[]);
+    env.unlock_decisions("a");
+    assert_unreadable_refusal(&out, "a", "a");
+    assert_eq!(out.json()["error"]["questions"], json!([]));
+    assert_eq!(env.snapshot_all(), before);
+
+    assert!(env.lock_decisions("a"));
+    let out = env.run(&["cancel", "a", "--cleanup"]);
+    env.unlock_decisions("a");
+    assert_unreadable_refusal(&out, "a", "a");
+    assert_eq!(env.snapshot_all(), before);
+
+    // The answerer of a question whose session can't be read.
+    assert!(env.lock_decisions("c"));
+    let out = env.cleanup("d", &[]);
+    env.unlock_decisions("c");
+    assert_unreadable_refusal(&out, "d", "c");
+    assert_eq!(env.snapshot_all(), before);
+
+    // The replace of a finished session whose decisions can't be read.
+    assert_eq!(env.finish("a")["retention"]["reason"], "open_question");
+    let before = env.snapshot_all();
+    assert!(env.lock_decisions("a"));
+    let out = env.replace("a");
+    env.unlock_decisions("a");
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(v["code"], "holds_question", "{v}");
+    assert_eq!(v["command"], "init", "{v}");
+    assert!(
+        v["decisions_unreadable"][0]
+            .as_str()
+            .is_some_and(|u| u.contains("'a'")),
+        "{v}"
+    );
+    assert!(
+        v["error"].as_str().unwrap().contains("can't be read"),
+        "{v}"
+    );
+    assert_eq!(env.snapshot_all(), before);
+    assert!(!env.exists("a_r1"));
+}
+
+#[test]
+fn a_forced_cleanup_of_unreadable_decisions_warns_what_went_unchecked() {
+    let env = Env::new();
+    env.init("a", &[]);
+    env.escalate("a", "q1", "person:owner");
+    if !env.lock_decisions("a") {
+        return;
+    }
+    let out = env.cleanup("a", &["--force"]);
+    env.unlock_decisions("a");
+    // What follows is what koto did before questions were kept; only the
+    // warning, said before anything goes, is new.
+    assert!(
+        out.stderr
+            .contains("with --force without checking what it holds")
+            && out.stderr.contains("the decisions of 'a'"),
+        "{}\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert_ne!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
 }
 
 // ===== Cloud backend =====

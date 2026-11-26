@@ -106,6 +106,10 @@ pub struct DecisionBody {
     /// a race (R18, R19).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// The question prompt a person's `answer` was checked against, with
+    /// koto's verified mark (R62 to R68). Only a person's answer has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<super::prompt::Prompt>,
 }
 
 /// The decision a reversal is aimed at.
@@ -194,6 +198,18 @@ impl DecisionBody {
         {
             return Err("a pass-up's body lacks the question it passes up".to_string());
         }
+        if let Some(p) = &body.prompt {
+            let person = matches!(body.decider, super::decider::Decider::Person { .. });
+            if body.kind != "answer" || !person {
+                return Err("only a person's answer carries a question prompt".to_string());
+            }
+            if p.mark.value != super::prompt::VERIFIED
+                || p.mark.source != super::decider::Source::Observed
+                || p.position == 0
+            {
+                return Err("an answer's question prompt isn't one koto verified".to_string());
+            }
+        }
         Ok(body)
     }
 }
@@ -249,7 +265,7 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
     }];
     const ESCALATE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text", "recipient"],
-        optional: &[],
+        optional: &["packet"],
     }];
     const DECLINE: &[SubjectShape] = &[SubjectShape {
         required: &["question", "text"],
@@ -399,6 +415,15 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
     if req.kind == "escalate" {
         if let Some(r) = given.get("recipient").and_then(|v| v.first()) {
             check_recipient(r)?;
+        }
+        if let Some(p) = given.get("packet").and_then(|v| v.first()) {
+            if !super::packets::is_hash(p) {
+                return Err(DecisionError::invalid(
+                    "subject.packet",
+                    "subject field 'packet' is the question content's hash, sha256: and 64 \
+                     lowercase hex characters",
+                ));
+            }
         }
     }
     if req.kind == "verdict" && req.evidence.is_empty() {

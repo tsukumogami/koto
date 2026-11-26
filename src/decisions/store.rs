@@ -103,7 +103,7 @@ pub fn is_target_id(id: &str) -> bool {
 }
 
 /// The directory a context key's file sits at in `ctx_dir`.
-fn key_path(ctx_dir: &Path, key: &str) -> PathBuf {
+pub(crate) fn key_path(ctx_dir: &Path, key: &str) -> PathBuf {
     key.split('/').fold(ctx_dir.to_path_buf(), |p, c| p.join(c))
 }
 
@@ -342,6 +342,18 @@ pub fn write_in(
     write_area(backend, session, area, build, None)
 }
 
+/// [`write_in`], with `commit` run once the body is built and size-checked,
+/// before it is published.
+pub fn write_in_with(
+    backend: &Backend,
+    session: &str,
+    area: &Area,
+    build: impl FnOnce(&str) -> Result<DecisionBody, DecisionError>,
+    commit: Commit<'_>,
+) -> Result<DecisionBody, DecisionError> {
+    write_area(backend, session, area, build, Some(commit))
+}
+
 /// A step [`write_with`] runs inside the critical section once the body is
 /// built and size-checked, before the body is published: a gate-passing
 /// command appends its event here with the body embedded in it, so the
@@ -446,7 +458,7 @@ fn write_area(
 /// Publish `bytes` at `key`: under the cloud backend the bucket object
 /// first, with `If-None-Match: *`, so a refusal there leaves no local key,
 /// then the local file.
-fn publish_both(
+pub(crate) fn publish_both(
     backend: &Backend,
     session: &str,
     key: &str,
