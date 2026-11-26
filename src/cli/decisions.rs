@@ -232,6 +232,16 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             ),
         );
     }
+    if kind == "readdress" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "kind",
+                "a pass-up isn't recorded with `koto decisions record`: it is aimed at the \
+                 question it passes up, with `koto decisions readdress`",
+            ),
+        );
+    }
     let req = Request {
         kind,
         outcome: args.outcome.clone().unwrap_or_default(),
@@ -805,6 +815,12 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
             Some(target),
             None,
         ),
+        "readdress" => refuse_recorded(
+            reasons::REVERSES_READDRESS,
+            format!("decision {id} in '{name}' is a pass-up, and a pass-up isn't reversed"),
+            Some(target),
+            None,
+        ),
         "reverse" => refuse_recorded(
             reasons::REVERSES_REVERSAL,
             format!("decision {id} in '{name}' is a reversal, and a reversal isn't reversed"),
@@ -1201,6 +1217,327 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             "question": crate::decisions::questions::identity(&question),
             "decision": written,
         }))?
+    );
+    Ok(())
+}
+
+/// The flags `readdress` takes beyond the question's session and id.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ReaddressArgs {
+    /// The session the pass-up is recorded in: the question's raiser or
+    /// the session or anchor it waits on now
+    #[arg(long = "in", value_name = "SESSION", required = true)]
+    pub in_session: String,
+    /// The new recipient: session:<name>, anchor:<name> or person:<handle>
+    #[arg(long, required = true)]
+    pub to: String,
+    /// Who passed it up: session. A person's pass-up can't be recorded yet
+    #[arg(long)]
+    pub by: Option<String>,
+    /// The agent within the recording session that passed it up
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// The run mode: attended, unattended or unknown
+    #[arg(long = "run-mode")]
+    pub run_mode: Option<String>,
+    /// An earlier decision this one relies on, as <session>:<id> (repeatable)
+    #[arg(long)]
+    pub basis: Vec<String>,
+    /// An evidence pointer (repeatable); event:<session>:<seq> names a koto
+    /// session event
+    #[arg(long)]
+    pub evidence: Vec<String>,
+    /// Why
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// The harness's identifier for the tool call that recorded it
+    #[arg(long = "tool-call")]
+    pub tool_call: Option<String>,
+}
+
+/// `koto decisions readdress <session> <id> --in <session> --to <recipient>`:
+/// record a `readdress` that passes the question `id` raised in `name` to a
+/// new typed recipient, in the recording session's
+/// `koto/aimed/<raiser's session id>/`. The recording session is the raiser
+/// or the session or anchor the question waits on now. The question keeps
+/// its identity; every check runs before anything is written, and a refusal
+/// writes nothing anywhere.
+pub fn handle_readdress(
+    backend: &Backend,
+    name: &str,
+    id: &str,
+    args: ReaddressArgs,
+) -> Result<()> {
+    use crate::decisions::body::Recipient;
+    use crate::decisions::questions;
+    const COMMAND: &str = "decisions readdress";
+    if !crate::decisions::is_decision_id(id) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "'{id}' isn't a decision id: {} digits",
+                    crate::decisions::ID_WIDTH
+                ),
+            ),
+        );
+    }
+    if crate::discover::validate_workflow_name(name).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("session", "the question's session isn't a session name"),
+        );
+    }
+    let recorder = args.in_session.clone();
+    let person_refusal = || {
+        DecisionError::invalid(
+            "by",
+            "a person's pass-up can't be recorded yet: koto doesn't verify that the person \
+             made it",
+        )
+    };
+    if args.by.as_deref().is_some_and(|b| b.starts_with("person:")) {
+        refuse(COMMAND, &person_refusal());
+    }
+    let to = Recipient::parse(&args.to);
+    if matches!(to, Recipient::Untyped(_)) {
+        let has_kind = args
+            .to
+            .split_once(':')
+            .is_some_and(|(k, _)| body::RECIPIENT_KINDS.contains(&k));
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "to",
+                if has_kind {
+                    "--to needs a session name or a handle after its prefix".to_string()
+                } else {
+                    "--to takes a typed recipient: session:<name>, anchor:<name> or \
+                     person:<handle>"
+                        .to_string()
+                },
+            ),
+        );
+    }
+    let req = Request {
+        kind: "readdress".to_string(),
+        outcome: "passed".to_string(),
+        subject: vec![
+            ("session".to_string(), name.to_string()),
+            ("id".to_string(), id.to_string()),
+            ("recipient".to_string(), args.to.clone()),
+        ],
+        basis: args.basis.clone(),
+        evidence: args.evidence.clone(),
+        reason: args.reason.clone(),
+        tool_call: args.tool_call.clone(),
+    };
+    let subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let basis = body::parse_basis(&req.basis).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let evidence = body::parse_evidence(&req.evidence).unwrap_or_else(|e| refuse(COMMAND, &e));
+    require_session(backend, &recorder, COMMAND);
+
+    let flags = Flags {
+        by: args.by.clone(),
+        surface: None,
+        link: None,
+        agent: args.agent.clone(),
+        run_mode: args.run_mode.clone(),
+    };
+    let observed = Observed::from_env(backend);
+    let decider =
+        decider::resolve(&recorder, &flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
+    if !matches!(decider, decider::Decider::Session { .. }) {
+        refuse(COMMAND, &person_refusal());
+    }
+    let run_mode = decider::run_mode(&flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
+
+    // The question, read from the raiser's own copy with no lock and no
+    // pull: nothing in the raiser's session is touched.
+    let entries = crate::decisions::read::read_session_with(backend, name, false);
+    let found = entries.iter().find(|e| match e {
+        Entry::Decision(b) => b.id == id,
+        Entry::Unreadable { id: Some(i), .. } => i == id,
+        Entry::Unreadable { id: None, .. } => false,
+    });
+    let question = match found {
+        None => refuse(
+            COMMAND,
+            &DecisionError::new(
+                codes::DECISION_NOT_FOUND,
+                format!("'{name}' holds no decision {id}"),
+            ),
+        ),
+        Some(Entry::Unreadable { reason, .. }) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!("decision {id} in '{name}' can't be read: {reason}"),
+            ),
+        ),
+        Some(Entry::Decision(b)) => (**b).clone(),
+    };
+    if question.kind != "escalate" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' is a '{}', and only an 'escalate' is passed up",
+                    question.kind
+                ),
+            ),
+        );
+    }
+    if !questions::is_question(&question) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' has no typed recipient (session:, anchor: or \
+                     person:), so it isn't a question koto passes up"
+                ),
+            ),
+        );
+    }
+    let index = Index::scan(backend, false);
+    let status = index.status(&question);
+    if status != "in-effect" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' reads '{status}', and only a question in effect \
+                     is passed up"
+                ),
+            ),
+        );
+    }
+    if !index.answers_of(&question.session.id, id).is_empty() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!("decision {id} in '{name}' is answered, and an answered question isn't passed up"),
+            ),
+        );
+    }
+    let runs = questions::Runs::new(backend);
+    let history = questions::addressees(&index, &runs, &question);
+    let current = history
+        .last()
+        .cloned()
+        .expect("a question has a typed recipient");
+    let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));
+    if !questions::may_pass(&runs, &question, &current, &recorder, &stamp.session.id) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "in",
+                format!(
+                    "a pass-up is recorded by the question's raiser or by the session or anchor \
+                     it waits on now; '{recorder}' is neither ({})",
+                    questions::history_labels(&index, &runs, &question).join(" -> ")
+                ),
+            ),
+        );
+    }
+    if to == current {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "to",
+                format!("decision {id} in '{name}' already waits on '{}'", args.to),
+            ),
+        );
+    }
+    let target = Target {
+        name: name.to_string(),
+        id: question.session.id.clone(),
+        decision: id.to_string(),
+    };
+
+    standing::settle(backend, &recorder);
+    let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let authority = decider::authority(
+        backend,
+        &decider,
+        observed.anchor.as_deref(),
+        chain::dispatcher(backend, &recorder),
+        run_mode,
+    );
+    let chain = chain::snapshot(backend, &recorder);
+    let written = store::write_in(backend, &recorder, &Area::Aimed(target.id.clone()), |aid| {
+        Ok(DecisionBody {
+            v: FORMAT_VERSION,
+            id: aid.to_string(),
+            session: stamp.session.clone(),
+            time: crate::engine::types::now_iso8601(),
+            state: stamp.state.clone(),
+            log_seq: stamp.log_seq,
+            kind: "readdress".to_string(),
+            outcome: "passed".to_string(),
+            subject,
+            decider: decider.clone(),
+            authority,
+            chain,
+            basis,
+            evidence,
+            reason: req.reason.clone(),
+            tool_call: req.tool_call.clone(),
+            target: Some(target.clone()),
+            standing: None,
+            path: None,
+            compensating: None,
+            replacement: None,
+            refusal: None,
+        })
+    })
+    .unwrap_or_else(|e| refuse(COMMAND, &e));
+
+    let mut addressees: Vec<serde_json::Value> = history.iter().map(Recipient::to_json).collect();
+    addressees.push(to.to_json());
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "v": FORMAT_VERSION,
+            "session": recorder,
+            "id": written.id,
+            "status": "in-effect",
+            "question": questions::identity(&question),
+            "addressee": to.to_json(),
+            "addressees": addressees,
+            "decision": written,
+        }))?
+    );
+    Ok(())
+}
+
+/// `koto decisions open --at <session-or-anchor>`: the questions open at a
+/// position, across every session in the local store.
+pub fn handle_open_at(backend: &Backend, at: &str) -> Result<()> {
+    const COMMAND: &str = "decisions open";
+    if crate::discover::validate_workflow_name(at).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("at", "--at takes a session or anchor name"),
+        );
+    }
+    if !chain::session_present(backend, at) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "at",
+                format!("no session or anchor named '{at}' in the local store"),
+            ),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&crate::decisions::questions::open_at(backend, at))?
     );
     Ok(())
 }

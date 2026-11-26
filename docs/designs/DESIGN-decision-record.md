@@ -10,7 +10,7 @@ problem: |
 decision: |
   Each decision is one create-only key in a koto-reserved area of the session that made it:
   `koto/decisions/<id>`, or `koto/aimed/<target-session-id>/<id>` when it is a reversal, a
-  replacement or an answer aimed at another session's decision. Local writes use an atomic create-rename
+  replacement, an answer or a pass-up aimed at another session's decision. Local writes use an atomic create-rename
   under the session's manifest lock, which also allocates a dense 12-digit identifier; the bucket
   holds each decision as its own object put with `If-None-Match: *`. A live decider's `koto next`
   lists one near-empty directory per chain session to find what is aimed at it, skips the read
@@ -169,7 +169,8 @@ Two reserved areas in each session, plus one held empty:
   included.
 - `koto/aimed/<target-session-id>/<id>`: every decision aimed at another session's decision: each
   `reverse`, each replacement whose `basis` names a reversal (R22's clearing path), and each
-  `answer` to another session's question (R50, R51). The target is the original deciding session,
+  `answer` to another session's question (R50, R51), and each `readdress` that passes a question
+  up (R55, R56), the raiser's own pass-ups included. The target is the original deciding session,
   addressed by its header `session_id`.
 - `koto/packs/`: reserved, guarded and empty, so a bulk listing format can be added later without
   moving a key.
@@ -768,13 +769,15 @@ winner), plus the existing `session_migrated`.
 6. **Report.** `report` and `decider report` scan the store, or the hierarchy below a session, read
    decision keys and session events, and print.
 7. **Questions.** `open --person` and the `questions` report on `koto next` scan the local store and
-   compute open from the answers found; `answer` writes one key in the answering session's aimed
-   area (below).
+   compute open from the answers found; `answer` and `readdress` each write one key in the
+   recording session's aimed area, and `open --at` adds a downward walk over dispatcher links
+   (below).
 
 ### Questions and answers
 
-This is the first part of questions and answers (R49 to R54). It carries a question from its
-`escalate` to an answer and back to the asker; the rest of a question's life is not built yet.
+This is the first part of questions and answers (R49 to R61). It carries a question from its
+`escalate`, through any pass-ups, to an answer and back to the asker; the rest of a question's
+life is not built yet.
 
 **The typed recipient.** An `escalate`'s `subject.recipient` stays a string in the body, written
 `session:<name>`, `anchor:<name>` or `person:<handle>`. Recording checks the name with koto's
@@ -799,7 +802,7 @@ and a `reverse` aimed at one is refused with the reason `reverses_answer`.
 **Open, computed at read time.** The store index groups every `answer` with outcome `answered` by
 its target identity. A question is open when it is an `escalate` in effect and no answer targets
 its identity. `open --person` scans the local store (`Index::scan`, no chain walk) and lists the
-open questions whose recipient is that person, ordered by time, session name and identifier:
+open questions whose current addressee is that person (see the addressee history below), ordered by time, session name and identifier:
 
 ```json
 {"v": 1, "person": "owner", "questions": [{"identity": "<session id>/<id>", "session": "A",
@@ -832,12 +835,93 @@ under the cloud backend, and never blocks or changes the exit code. It runs on t
 directed path and on a terminal workflow. A response with nothing to report has no `questions`
 key and is byte-identical to one from an earlier binary.
 
-**Older binaries.** A binary older than this change doesn't know the `answer` kind, so it reads an
-answer entry as unreadable; it reads a typed recipient as the plain string it is stored as.
+**The pass-up.** `readdress` is a kind with the one outcome `passed` and the subject `session`
+(the asking session's name), `id` (the question's identifier) and `recipient` (the new recipient,
+typed as an `escalate`'s is). Its `target` is the question's identity, as an answer's is, and it is
+written to `koto/aimed/<asking session id>/<id>` in the session that passed the question up: the
+asking session's own aimed area when the raiser passes its own question, and otherwise the aimed
+area of the session or anchor the question waits on. Nothing is written anywhere else, and the
+`escalate` itself never changes, so the question keeps its identity and `show` prints it as raised.
+`koto decisions readdress` runs every check before it writes: the question must exist, be an
+`escalate` with a typed recipient, read `in-effect` and have no `answered` answer; `--to` must be
+typed and must differ from the current addressee; the decider must be a session; and the recording
+session must be the raiser, matched by the session id on the question so a later session reusing
+the name can't move it, or the session or anchor the current addressee names. A session stands for
+the sessions it continues through `--continues --supersede`, as it does for `open --at`: the
+raiser's successor and the current addressee's successor may each record a pass-up, and a
+superseded session is pointed at its successor before any check runs. A refusal exits 2
+with `decision_not_found` or `invalid_decision` and the field (`id`, `to`, `in` or `by`). A
+pass-up read back in `koto/decisions/` is unreadable, `record --kind readdress` is refused, and a
+`reverse` aimed at one is refused with the reason `reverses_readdress`.
 
-**Not yet covered.** A person's answer (koto refuses one until it can verify the person gave it),
-precedence between answers to one question, passing a question up, settling and withdrawing a
-question, and retention of questions and answers.
+**The addressee history.** The store index groups every `readdress` with outcome `passed` by its
+target identity, as it groups answers. When a read runs, a question's history starts with the
+recipient it was raised with. It is then built by causality, not by clock: the read repeatedly adds
+the first pass-up not yet added, in order of time, then the recording session's name, then
+identifier, that is valid against the history's last entry. A pass-up is valid when it was recorded
+by the raiser (by session id) or the raiser's successor, or by the session or anchor the last entry
+names (by name) or that one's successor, and names a typed recipient other than the last entry. The
+read stops when none is valid, and every entry left over is passed over. A pass-up whose recorded
+time sorts before the one it follows, because the host that wrote it had a clock behind the other's,
+is still added once the one it follows is. The write-time check applies the same rule, so the order
+only decides between two pass-ups that are both valid against the same addressee, which happens
+only when they were written at once; the earlier one wins and the history stays a single line.
+Nothing stores the history, so it is never out of date.
+
+Two consequences follow from choices made above. A recipient is `session:<name>`, so a session
+recreated under a removed session's name stands where the removed one stood and receives what was
+addressed to that name. A pass-up lives only in the session that recorded it, so removing that
+session reverts the question to its previous addressee; keeping such sessions is left to
+retention.
+
+**The read by position.** `open --at <name>` reads the same local scan as `open --person`. The
+position is the named session or anchor together with the predecessors it confirmed through
+`--continues --supersede`, so a coordinator's successor holds its predecessor's position. The walk
+downward builds, for every session in the local store, the names directly above it: the dispatcher
+`koto session origin` reports for it (from a `dispatched-by` link, or for an anchor from its
+`anchor_started` event) and, for a workflow session held by an anchor, that anchor, read from the
+`held-by` link directly so a held session that also has its own `dispatched-by` link is below
+both. A session held by an anchor therefore counts as at that anchor's position. Inverting that gives each name's
+children, and the walk goes down from the position through any number of links, keeping a set of
+names already seen so a loop of links ends. "Below" follows the session names the links carry, not
+the session ids recorded on them, the way `koto session origin` reports a dispatcher: a session
+recreated under a coordinator's name stands where the removed one stood. A question is returned
+when it was raised at the position, its current addressee names the position (a `session:` or
+`anchor:` recipient whose name is one of the position's names), or it was raised in a session
+below the position. Each question is returned once, with `relation` set to `both`, `raised`,
+`addressee` or `below`; `addressee` wins over `below`. A person recipient is never a position. The
+read requires exactly one of `--person` and `--at` (clap refuses both or neither with a usage
+error), refuses an `--at` name with no session directory, writes nothing, and under the cloud
+backend walks only the local copy, so it makes no network call.
+
+**The fields the open reads gained.** Every element of `open --person` and `open --at` carries
+`recipient` (as raised), `addressee` (the current one) and `addressees` (the whole history, first
+to last), each in the typed form above; `open --at` adds `relation` and prints `"at"` in place of
+`"person"`. `open --person` now matches on the current addressee instead of the recipient, so a
+question appears for a person only while it waits on that person. A pass-up adds nothing to
+`koto next`; an answer to a passed-up question is reported as any other.
+
+```json
+{"v": 1, "at": "director", "questions": [{"identity": "<session id>/<id>", "session": "worker",
+  "id": "000000000001", "question": "q1", "text": "...",
+  "recipient": {"typed": true, "kind": "session", "name": "manager"},
+  "addressee": {"typed": true, "kind": "session", "name": "director"},
+  "addressees": [{"typed": true, "kind": "session", "name": "manager"},
+                 {"typed": true, "kind": "session", "name": "director"}],
+  "time": "...", "relation": "addressee"}]}
+```
+
+**Older binaries.** A binary older than this change doesn't know the `answer` kind, so it reads an
+answer entry as unreadable; it reads a typed recipient as the plain string it is stored as. A
+binary older than the pass-up doesn't know the `readdress` kind either and reads a pass-up entry as
+unreadable; its `open --person` still matches the recipient as raised.
+
+**Not yet covered.** A person's answer (koto refuses one until it can verify the person gave it);
+which answers to one question count, and precedence between them, so for now any answer closes the
+question, even one from a session the question has moved away from; the rule on where a pass-up
+may go, beyond who may record one; the re-judging of every stored pass-up at read time, with an
+entry that breaks a rule marked as not counted; settling and withdrawing a question; and retention
+of questions and answers.
 
 ## Implementation Approach
 

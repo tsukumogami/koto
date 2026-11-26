@@ -61,6 +61,7 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
             DecisionsSubcommand::Record { .. }
             | DecisionsSubcommand::Reverse { .. }
             | DecisionsSubcommand::Answer { .. }
+            | DecisionsSubcommand::Readdress { .. }
             | DecisionsSubcommand::Open { .. }
             | DecisionsSubcommand::Chain { .. } => None,
         },
