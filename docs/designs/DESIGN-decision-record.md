@@ -795,8 +795,8 @@ reversals, so nothing is written in the asker's session and the answerer needs n
 it. `koto decisions answer` reads the question through the local store by the asking session's
 name, refuses with `decision_not_found` when it isn't there and with `invalid_decision` (field
 `id`) when it isn't an `escalate`, has an untyped recipient or doesn't read `in-effect`, and
-refuses an answer `--in` the asking session and one with `--by person:<handle>`, all before any
-write. A file in the asker's decision directory whose name isn't a decision id is passed over. An answer read back in `koto/decisions/` is unreadable,
+refuses an answer `--in` the asking session and a person's answer that fails the checks below,
+all before any write. A file in the asker's decision directory whose name isn't a decision id is passed over. An answer read back in `koto/decisions/` is unreadable,
 and a `reverse` aimed at one is refused with the reason `reverses_answer`.
 
 **Open, computed at read time.** The store index groups every `answer` with outcome `answered` by
@@ -809,7 +809,7 @@ open questions whose current addressee is that person (see the addressee history
   "id": "000000000001", "question": "q1", "text": "...", "recipient": {...}, "time": "..."}]}
 ```
 
-Until a person's answer and precedence exist, any answer closes its question; that rule is interim.
+Until precedence exists, any answer closes its question; that rule is interim.
 
 **The `questions` array on `koto next`.** After building its response, `koto next` reads the run
 (the session and the predecessors it confirmed through `--continues --supersede`) through the pure
@@ -916,12 +916,84 @@ answer entry as unreadable; it reads a typed recipient as the plain string it is
 binary older than the pass-up doesn't know the `readdress` kind either and reads a pass-up entry as
 unreadable; its `open --person` still matches the recipient as raised.
 
-**Not yet covered.** A person's answer (koto refuses one until it can verify the person gave it);
-which answers to one question count, and precedence between them, so for now any answer closes the
-question, even one from a session the question has moved away from; the rule on where a pass-up
-may go, beyond who may record one; the re-judging of every stored pass-up at read time, with an
-entry that breaks a rule marked as not counted; settling and withdrawing a question; and retention
-of questions and answers.
+**Not yet covered.** Which answers to one question count, and precedence between them, so for
+now any answer closes the question, even one from a session the question has moved away from;
+the rule on where a pass-up may go, beyond who may record one; the re-judging of every stored
+pass-up at read time, with an entry that breaks a rule marked as not counted; settling and
+withdrawing a question; and retention of questions and answers.
+
+### A person's answer and the question content area
+
+R55 to R64 let a person answer, on evidence koto checks itself rather than a caller's claim.
+
+**The content area.** `koto/packets/` is a fourth write-once area beside the three decision areas.
+It holds one file per question, named by the `escalate`'s id, with the bytes the person is shown:
+JSON with `question` and `options[].label`, at most 16 KiB, the decision body's own cap. The
+`escalate` names the content first, as `packet=sha256:<hex>` in its subject, so the stored record
+fixes what the content must be before any content exists; `koto decisions content write` refuses
+bytes that don't hash to it. Writes go through the same manifest lock and create-only publish as a
+decision file, and the guard that keeps context commands off the decision areas covers this one.
+It isn't in `AREAS`: nothing in it is a decision, so the decision readers never list it, but the
+cloud pull treats it as write-once and never overwrites a held copy.
+
+**Identity in the prompt.** A question's identity reaches the prompt in its `header`, the one
+short field the question tool shows for each question: `#` and the first 11 hex digits of the
+SHA-256 of `<asking session id>/<question id>`, 12 characters, inside the tool's header limit.
+koto compares it byte for byte. A hash keeps the session id out of the person's view and keeps the
+header short; 44 bits are enough to tell apart the questions one record could hold, and a
+collision would still have to pass the text and option checks.
+
+**Finding the record.** The pointer names a harness session; koto accepts only the one running
+the command (`CLAUDE_CODE_SESSION_ID`, R47) and looks one directory below
+`$HOME/.claude/projects/` for exactly one regular `<harness>.jsonl`, refusing symbolic links.
+Nothing else is searched, so a record can't be borrowed from another harness session or another
+home. Only lines containing the quoted call id are parsed, which bounds the work on a long record.
+
+**What koto reads.** `prompt::FIELDS_READ` lists every path koto reads from a record: from the
+call, the tool name, the call id, and each question's `question`, `header` and option `label`; from
+the result, the tool-use id, `is_error`, `toolUseResult.answers` and `permissionDecision`'s
+`decision` and `source`. A unit test walks each path through the committed fixtures, which keep
+the real record's structure with every text value replaced by a marker string, so a path the
+structure lacks fails the build. At run time a missing field fails the `shape` check rather than
+reading as absent: the trust rests on a format koto observes and doesn't own, and a change to it
+must refuse answers, not misread them.
+
+**Reuse.** One call position verifies one answer. The answering session's listing is scanned for
+an answer citing the same pointer before any check, and again inside the write lock, so two
+answers racing on one position leave one entry. The lock is the answering session's, so two
+different answering sessions citing one position at once aren't serialized; the PRD records that
+limit.
+
+**Created here or arrived.** The mark is stored as `verified`, `observed`, but the reading isn't
+taken from the stored bytes alone, since a pull or an import copies them unchanged. When an answer
+is recorded, koto appends `<session id> <decision id>` to `koto-verified-here` in the session's
+directory on this host, beside `ctx/` rather than in it, so no manifest lists it and no sync, pull
+or import carries it. A read shows `verified` only when the note lists the answer; anywhere else
+the mark reads `remote` and the reading "a remote session's answer". This is per answer rather than
+per session, so a session created here that pulls an answer recorded on another host reads that
+answer remote too.
+
+The cloud import now carries the decision areas and `koto/packets/`, as this design's Decision 1
+always meant it to: each area is listed in the source's bucket prefix, each object read and pushed
+to the copy's prefix beside the pin records, outside the manifest. Only bodies whose session id is
+the source header's travel, and the copy's reader accepts a body naming the session id its
+`koto/imported-from` records. A body the source itself carried from an earlier import stays behind,
+since `koto/imported-from` names one source, not the list Decision 1 describes. A note that can't be written leaves the answer reading remote: the failure
+errs toward less trust.
+
+**The refusal.** Every check failure is `prompt_unverified` on field `prompt`, naming the pointer
+and the check. No record text is echoed, since the record holds the person's whole conversation.
+
+#### Alternatives Considered
+
+- **The identity in the question text.** Rejected: it changes what the person reads and what the
+  byte comparison compares.
+- **A per-session created-here marker.** Rejected: it can't tell an answer recorded here from one
+  pulled into the same session, and a marker in `ctx/` would travel with the copy.
+- **Search every project's records for the call id.** Rejected: it lets one harness session cite
+  another's prompt, and its cost grows with the whole history.
+- **Trust the caller's `--text`.** Rejected: the answer text comes from the result, so a caller
+  can't put words in the person's mouth.
 
 ## Implementation Approach
 

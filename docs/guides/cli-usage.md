@@ -1701,11 +1701,18 @@ Answers a question another session raised, recording an `answer` decision with o
 
 ```bash
 koto decisions answer <raiser-session> <decision-id> --in <session> --text <text> [--by session] [decider flags]
+koto decisions answer <raiser-session> <decision-id> --in <session> --by person:<handle> --prompt <harness>/<call>/<position>
 ```
 
 The answer's target is the question's identity, the raiser's session id with the decision id, so it never answers a later session that reuses the name. It is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session, and nothing is written in the raiser's session. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","decision":{...}}` and exits 0. Once recorded, the question no longer lists in `decisions open`, and the raiser's `koto next` reports the answer in its `questions` array.
 
-Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), when `--in` names the raiser, or when the answer would be recorded for a person (`--by person:<handle>`: koto can't yet verify that the person gave it). An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question, even after it has been passed up past the answering session; a person's answer and which answers count aren't built yet.
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), or when `--in` names the raiser. An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question, even after it has been passed up past the answering session; which answers count isn't built yet.
+
+**A person's answer.** `--by person:<handle>` needs `--prompt`, the evidence that the person was asked: the harness session that asked (it must be the one running the command, `CLAUDE_CODE_SESSION_ID`), the id of its `AskUserQuestion` call, and the 1-based position of the question in that call. The question must carry a `packet` and its content must be stored (see [decisions content](#decisions-content)). The prompt must show the question with its `prompt_header` as the question's `header`, and the content's question text and option labels exactly, in order. koto reads the call and its result from the harness session's record under `~/.claude/projects/` and records the person's reply from the result as the answer's text; `--text` isn't needed and is ignored. The entry stores the pointer with the mark `verified`, labelled `observed`, and the decider's handle labelled `handed`. One call position verifies one answer.
+
+A read on the host that recorded the answer shows `"reading": "verified"`. A copy of the session brought to another host by a pull or an import shows the mark as `remote` and the reading `a remote session's answer`: the note of what a host verified stays on that host.
+
+A person's answer that fails a check exits 2 with code `prompt_unverified`, field `prompt`, and a message naming the pointer and the check: `session`, `record`, `call`, `tool`, `position`, `identity`, `question-text`, `options`, `result` (the call was denied or errored, or the reply didn't come from the person), `shape` (the record lacks a field koto reads), `call-position-reused` or `content`. No text from the record is printed. Without `--prompt`, a person's answer is refused with a message saying it needs the question-prompt evidence; `--prompt` with `--by session` is refused.
 
 ### decisions readdress
 
@@ -1718,6 +1725,17 @@ koto decisions readdress <raiser-session> <decision-id> --in <session> --to <rec
 `--to` is typed like an `escalate`'s recipient: `session:<name>`, `anchor:<name>` or `person:<handle>`. `--in` is the session recording the pass-up, and it has to be the raiser or the session or anchor the question waits on now, or a session that continues one of those through `--continues ... --supersede`; a superseded session is pointed at its successor. The entry's target is the question's identity, and it is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session and nowhere else. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","addressee":{...},"addressees":[...],"decision":{...}}` and exits 0. From then on `decisions open` shows the new `addressee`, `--person` follows it, and the raiser's `koto next` is unchanged: a pass-up reports nothing until an answer comes.
 
 Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` with field `id` when it isn't an `escalate`, its recipient is untyped, it doesn't read `in-effect` or it is already answered; with field `to` when `--to` has no type prefix, a bad name or handle, or names the current addressee; with field `in` when `--in` is neither the raiser nor the current addressee, nor a successor of either; and with field `by` for `--by person:<handle>`. `decisions record --kind readdress` is refused, and `decisions reverse` aimed at a pass-up is refused with `reverses_readdress`. Where a question may be passed, beyond who may pass it, isn't checked yet.
+
+### decisions content
+
+Stores and reads the content of a question raised to a person: the question text and option labels the prompt shows.
+
+```bash
+koto decisions content write <session> <decision-id> --file <path>
+koto decisions content read <session id>/<decision-id>
+```
+
+Raise the question first with its content's hash in the subject, `--subject packet=sha256:<hex>` (for example from `sha256sum`). The content is JSON, `{"question": "...", "options": [{"label": "..."}]}`, at most 16 KiB. `write` stores it once under `ctx/koto/packets/<decision-id>` in the raiser's session and prints `{"v":1,"session":...,"id":...,"question":"<identity>","packet":...,"bytes":...,"prompt_header":"#..."}`; it refuses content over the cap, content that doesn't hash to the `packet`, a question without one, and a second write. `read` takes the question's identity and prints the stored bytes unchanged, from any session or directory. `decisions show` and `list --format v1` return `prompt_header` beside every `escalate` that carries a `packet`. No `context` command writes or removes a key under `koto/packets/`.
 
 ### decider answer
 
