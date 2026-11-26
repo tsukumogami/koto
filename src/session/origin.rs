@@ -195,12 +195,12 @@ pub fn origin_of<S: OriginStore>(store: &S, name: &str) -> anyhow::Result<Origin
 }
 
 /// The sessions or anchors directly above `name`: the dispatcher its origin
-/// names when it reads `dispatched`, and the anchor the answer came through
-/// when that is another session (the anchor holding a workflow session).
-/// A session whose origin can't be read, or reads `none` or `unrecorded`
-/// with no holding anchor, has nothing above it. Names are the ones the
-/// links and events carry, so a session recreated under a dispatcher's
-/// name stands where the removed one stood.
+/// names when it reads `dispatched`, and every anchor its held-by links
+/// name, read directly so a held session that also has its own
+/// dispatched-by link is below both. A session whose origin can't be read,
+/// or reads `none` or `unrecorded` with no holding anchor, has nothing
+/// above it. Names are the ones the links and events carry, so a session
+/// recreated under a dispatcher's name stands where the removed one stood.
 pub fn above<S: OriginStore>(store: &S, name: &str) -> Vec<String> {
     let Ok(report) = origin_of(store, name) else {
         return Vec::new();
@@ -211,6 +211,13 @@ pub fn above<S: OriginStore>(store: &S, name: &str) -> Vec<String> {
     }
     if let Some(via) = report.via.filter(|v| v != name && !out.contains(v)) {
         out.push(via);
+    }
+    if let Ok(held_by) = links_of(store, name, LinkKind::HeldBy) {
+        for link in held_by {
+            if link.peer != name && !out.contains(&link.peer) {
+                out.push(link.peer);
+            }
+        }
     }
     out
 }

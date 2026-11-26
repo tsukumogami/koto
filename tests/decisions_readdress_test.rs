@@ -515,10 +515,18 @@ fn a_pass_up_is_refused_and_writes_nothing_when_its_target_is_wrong() {
     ]);
     let answered = env.escalate("worker", "q4", "session:manager");
     env.answer(&answered, "manager", "yes");
-    let elsewhere = env.escalate("other-worker", "q5", "session:other-lead");
+    // A decision id that worker doesn't hold: other-worker records until
+    // its id is past every one of worker's.
+    let worker_ids = [&q.id, &untyped.id, &judgment, &reversed.id, &answered.id];
+    let elsewhere = loop {
+        let r = env.escalate("other-worker", "q5", "session:other-lead");
+        if !worker_ids.contains(&&r.id) {
+            break r;
+        }
+    };
 
     let all0 = env.snapshot_all();
-    let mut wrong = vec![
+    let wrong = vec![
         Rec {
             id: "000000009999".to_string(),
             ..q.clone()
@@ -536,9 +544,6 @@ fn a_pass_up_is_refused_and_writes_nothing_when_its_target_is_wrong() {
             ..q.clone()
         },
     ];
-    if elsewhere.id == q.id {
-        wrong.pop();
-    }
     for target in &wrong {
         let out = env.readdress_run(target, "manager", "session:director");
         assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
@@ -742,4 +747,99 @@ fn open_takes_exactly_one_of_person_and_at_and_writes_nothing() {
     env.at("director");
     env.open("owner");
     assert_eq!(env.snapshot_all(), all0);
+}
+
+#[test]
+fn a_pass_up_stored_with_an_earlier_time_than_the_one_it_follows_still_applies() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.escalate("worker", "q1", "session:manager");
+    let first = env.readdress(&q, "manager", "session:director");
+    let second = env.readdress(&q, "director", "person:owner");
+    assert_eq!(second["addressee"], person("owner"));
+
+    // The director's clock was behind: its entry reads earlier than the
+    // manager's, though it could only have been written after it.
+    let path = env
+        .sessions()
+        .join("director/ctx/koto/aimed")
+        .join(&q.session_id)
+        .join(second["id"].as_str().unwrap());
+    let mut body: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let earlier = first["decision"]["time"]
+        .as_str()
+        .unwrap()
+        .replace("2026", "2025");
+    body["time"] = json!(earlier);
+    std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let qs = env.open("owner");
+    assert_eq!(names(&qs), vec!["q1"]);
+    assert_eq!(
+        qs[0]["addressees"],
+        json!([session("manager"), session("director"), person("owner")])
+    );
+    assert!(env.at("director").iter().all(|e| e["relation"] == "below"));
+}
+
+#[test]
+fn a_held_session_with_its_own_dispatcher_is_below_both() {
+    let env = Env::new();
+    let lead = env.open_anchor("5b3a4c1e-2d9f-4a77-83d4-e5f607182953", &[]);
+    env.init("boss", &[]);
+    env.init("x", &[]);
+    let held = [("KOTO_ANCHOR", lead.as_str())];
+    env.init_env(&held, "hd", &["--dispatched-by", "boss"]);
+    env.escalate("hd", "q1", "session:x");
+
+    for position in [lead.as_str(), "boss"] {
+        let qs = env.at(position);
+        assert_eq!(names(&qs), vec!["q1"], "{position}");
+        assert_eq!(qs[0]["relation"], "below", "{position}");
+    }
+}
+
+#[test]
+fn the_successor_of_the_addressee_passes_the_question_up() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.escalate("worker", "q1", "session:manager");
+    env.init("succ", &["--continues", "manager", "--supersede"]);
+    assert_eq!(find(&env.at("succ"), "q1")["relation"], "addressee");
+
+    let out = env.readdress_run(&q, "manager", "session:director");
+    assert_eq!(out.code, 2, "{}", out.stdout);
+    let entry = env.readdress(&q, "succ", "session:director");
+    assert_eq!(
+        entry["addressees"],
+        json!([session("manager"), session("director")])
+    );
+    assert_eq!(find(&env.at("director"), "q1")["relation"], "addressee");
+    assert_eq!(find(&env.at("succ"), "q1")["relation"], "below");
+}
+
+#[test]
+fn the_successor_of_the_raiser_passes_its_question_up() {
+    let env = Env::new();
+    chain(&env);
+    let q = env.escalate("worker", "q1", "session:manager");
+    env.init(
+        "worker2",
+        &[
+            "--continues",
+            "worker",
+            "--supersede",
+            "--dispatched-by",
+            "manager",
+        ],
+    );
+
+    let entry = env.readdress(&q, "worker2", "person:owner");
+    assert_eq!(
+        entry["addressees"],
+        json!([session("manager"), person("owner")])
+    );
+    let qs = env.open("owner");
+    assert_eq!(names(&qs), vec!["q1"]);
+    assert_eq!(qs[0]["identity"], q.identity().as_str());
 }

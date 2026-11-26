@@ -1425,14 +1425,14 @@ pub fn handle_readdress(
             ),
         );
     }
-    let history = questions::addressees(&index, &question);
+    let runs = questions::Runs::new(backend);
+    let history = questions::addressees(&index, &runs, &question);
     let current = history
         .last()
         .cloned()
         .expect("a question has a typed recipient");
     let stamp = standing::stamp(backend, &recorder).unwrap_or_else(|e| refuse(COMMAND, &e));
-    let by_raiser = stamp.session.id == question.session.id;
-    if !by_raiser && !questions::waits_on_session(&current, &recorder) {
+    if !questions::may_pass(&runs, &question, &current, &recorder, &stamp.session.id) {
         refuse(
             COMMAND,
             &DecisionError::invalid(
@@ -1440,7 +1440,7 @@ pub fn handle_readdress(
                 format!(
                     "a pass-up is recorded by the question's raiser or by the session or anchor \
                      it waits on now; '{recorder}' is neither ({})",
-                    questions::history_labels(&index, &question).join(" -> ")
+                    questions::history_labels(&index, &runs, &question).join(" -> ")
                 ),
             ),
         );

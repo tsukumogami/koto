@@ -18,6 +18,7 @@
 //! Both reads look only at the local store, the way [`Index::scan`] does
 //! with `remote` unset: no lock, no pull, no bucket listing, no write.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
@@ -91,41 +92,92 @@ fn cited_questions(backend: &Backend, decisions: &[&DecisionBody]) -> BTreeSet<(
     out
 }
 
+/// The names each session stands for: itself and the earlier members of
+/// its run (the sessions it continues through a confirmed succession),
+/// looked up once per session and kept for the rest of the read.
+pub struct Runs<'a> {
+    backend: &'a Backend,
+    cache: RefCell<BTreeMap<String, Vec<String>>>,
+}
+
+impl<'a> Runs<'a> {
+    pub fn new(backend: &'a Backend) -> Self {
+        Runs {
+            backend,
+            cache: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// `name` and every session it continues.
+    pub fn stands_for(&self, name: &str) -> Vec<String> {
+        if let Some(hit) = self.cache.borrow().get(name) {
+            return hit.clone();
+        }
+        let mut out = vec![name.to_string()];
+        out.extend(chain::run_predecessors(self.backend, name));
+        self.cache
+            .borrow_mut()
+            .insert(name.to_string(), out.clone());
+        out
+    }
+}
+
+/// Whether the session `recorder` (whose header id is `recorder_id`) may
+/// pass `question` up while it waits on `current`: the recorder is the
+/// raiser (by session id) or continues it, or it is, or continues, the
+/// session or anchor `current` names.
+pub fn may_pass(
+    runs: &Runs,
+    question: &DecisionBody,
+    current: &Recipient,
+    recorder: &str,
+    recorder_id: &str,
+) -> bool {
+    if recorder_id == question.session.id {
+        return true;
+    }
+    let stands = runs.stands_for(recorder);
+    // The question is read from the raiser's own directory, so the session
+    // now holding the raiser's name is the raiser.
+    stands[1..].contains(&question.session.name)
+        || stands.iter().any(|s| waits_on_session(current, s))
+}
+
 /// The recipients `question` has had, in order: the one it was raised
 /// with, then one per pass-up that moved it. The last is the one it waits
 /// on now. Computed every time it is read; nothing stores it.
 ///
-/// The pass-ups aimed at the question are taken earliest first (time, then
-/// the recording session's name, then id). Each one moves the question
-/// only when it was recorded by the raising session (matched by session
-/// id, so a later session reusing the name can't move it) or by the
-/// session or anchor the question waits on at that point, and names a
-/// typed recipient other than that one. `koto decisions readdress` refuses
-/// any other at write time, so a skipped entry can only come from two
-/// pass-ups written at once; the history stays a single line either way.
-pub fn addressees(index: &Index, question: &DecisionBody) -> Vec<Recipient> {
+/// The history is built by causality, not by clock: it repeatedly applies
+/// the earliest (time, then the recording session's name, then id) pass-up
+/// not yet applied that [`may_pass`] accepts against the current addressee
+/// and that names a typed recipient other than it, until none applies. A
+/// pass-up whose recorded time sorts before the one it depends on is still
+/// applied once that one is. The tie-break only decides between two
+/// pass-ups that are both valid against the same addressee, which can only
+/// happen when they were written at once; the later one is then skipped,
+/// so the history stays a single line.
+pub fn addressees(index: &Index, runs: &Runs, question: &DecisionBody) -> Vec<Recipient> {
     let Some(first) = recipient_of(question) else {
         return Vec::new();
     };
     let mut out = vec![first];
-    for r in index.readdresses_of(&question.session.id, &question.id) {
+    let mut pending = index.readdresses_of(&question.session.id, &question.id);
+    loop {
         let current = out.last().expect("the history starts with one recipient");
-        let by_raiser = r.session.id == question.session.id;
-        if !by_raiser && !waits_on_session(current, &r.session.name) {
-            continue;
-        }
-        let Some(to) = recipient_of(r) else { continue };
-        if matches!(to, Recipient::Untyped(_)) || &to == current {
-            continue;
-        }
-        out.push(to);
+        let next = pending.iter().position(|r| {
+            recipient_of(r).is_some_and(|to| !matches!(to, Recipient::Untyped(_)) && &to != current)
+                && may_pass(runs, question, current, &r.session.name, &r.session.id)
+        });
+        let Some(i) = next else { break };
+        let r = pending.remove(i);
+        out.push(recipient_of(r).expect("checked above"));
     }
     out
 }
 
 /// The addressee history as `<kind>:<name>` strings, for an error message.
-pub fn history_labels(index: &Index, question: &DecisionBody) -> Vec<String> {
-    addressees(index, question)
+pub fn history_labels(index: &Index, runs: &Runs, question: &DecisionBody) -> Vec<String> {
+    addressees(index, runs, question)
         .iter()
         .map(|r| match r {
             Recipient::Session(n) => format!("session:{n}"),
@@ -144,7 +196,7 @@ pub fn waits_on_session(recipient: &Recipient, name: &str) -> bool {
 /// The open questions in the local store: in-effect escalations with a
 /// typed recipient that no answer has closed, each with its addressee
 /// history, sorted by time, then the raising session's name, then id.
-fn open_questions(index: &Index) -> Vec<(&DecisionBody, Vec<Recipient>)> {
+fn open_questions<'i>(index: &'i Index, runs: &Runs) -> Vec<(&'i DecisionBody, Vec<Recipient>)> {
     let mut found: Vec<(&DecisionBody, Vec<Recipient>)> = index
         .sessions()
         .values()
@@ -155,7 +207,7 @@ fn open_questions(index: &Index) -> Vec<(&DecisionBody, Vec<Recipient>)> {
         })
         .filter(|b| is_question(b) && index.status(b) == "in-effect")
         .filter(|b| index.answers_of(&b.session.id, &b.id).is_empty())
-        .map(|b| (b, addressees(index, b)))
+        .map(|b| (b, addressees(index, runs, b)))
         .collect();
     found.sort_by(|(a, _), (b, _)| {
         (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
@@ -185,8 +237,9 @@ fn element(b: &DecisionBody, history: &[Recipient]) -> Value {
 /// whatever links its session has or lacks.
 pub fn open(backend: &Backend, person: &str) -> Value {
     let index = Index::scan(backend, false);
+    let runs = Runs::new(backend);
     let want = Recipient::Person(person.to_string());
-    let questions: Vec<Value> = open_questions(&index)
+    let questions: Vec<Value> = open_questions(&index, &runs)
         .iter()
         .filter(|(_, h)| h.last() == Some(&want))
         .map(|(b, h)| element(b, h))
@@ -224,7 +277,8 @@ pub fn open_at(backend: &Backend, position: &str) -> Value {
         Backend::Cloud(c) => c.local(),
     };
     let below = origin::below(local, &read::local_sessions(backend), &at);
-    let questions: Vec<Value> = open_questions(&index)
+    let runs = Runs::new(backend);
+    let questions: Vec<Value> = open_questions(&index, &runs)
         .iter()
         .filter_map(|(b, h)| {
             let raised = at.contains(&b.session.name);

@@ -846,28 +846,42 @@ area of the session or anchor the question waits on. Nothing is written anywhere
 `escalate` with a typed recipient, read `in-effect` and have no `answered` answer; `--to` must be
 typed and must differ from the current addressee; the decider must be a session; and the recording
 session must be the raiser, matched by the session id on the question so a later session reusing
-the name can't move it, or the session or anchor the current addressee names. A refusal exits 2
+the name can't move it, or the session or anchor the current addressee names. A session stands for
+the sessions it continues through `--continues --supersede`, as it does for `open --at`: the
+raiser's successor and the current addressee's successor may each record a pass-up, and a
+superseded session is pointed at its successor before any check runs. A refusal exits 2
 with `decision_not_found` or `invalid_decision` and the field (`id`, `to`, `in` or `by`). A
 pass-up read back in `koto/decisions/` is unreadable, `record --kind readdress` is refused, and a
 `reverse` aimed at one is refused with the reason `reverses_readdress`.
 
 **The addressee history.** The store index groups every `readdress` with outcome `passed` by its
 target identity, as it groups answers. When a read runs, a question's history starts with the
-recipient it was raised with. Its pass-ups are taken in order of time, then the recording session's
-name, then identifier, and each one is added when it was recorded by the raiser (by session id) or
-by the session or anchor the history's last entry names (by name), and names a typed recipient
-other than that last entry; any other entry is passed over. The current addressee is the last entry.
-The write-time check and this read apply the same rule, so a stored history only skips an entry when
-two pass-ups were written at once against the same addressee; the earlier one in the order wins and
-the history stays a single line. Nothing stores the history, so it is never out of date.
+recipient it was raised with. It is then built by causality, not by clock: the read repeatedly adds
+the first pass-up not yet added, in order of time, then the recording session's name, then
+identifier, that is valid against the history's last entry. A pass-up is valid when it was recorded
+by the raiser (by session id) or the raiser's successor, or by the session or anchor the last entry
+names (by name) or that one's successor, and names a typed recipient other than the last entry. The
+read stops when none is valid, and every entry left over is passed over. A pass-up whose recorded
+time sorts before the one it follows, because the host that wrote it had a clock behind the other's,
+is still added once the one it follows is. The write-time check applies the same rule, so the order
+only decides between two pass-ups that are both valid against the same addressee, which happens
+only when they were written at once; the earlier one wins and the history stays a single line.
+Nothing stores the history, so it is never out of date.
+
+Two consequences follow from choices made above. A recipient is `session:<name>`, so a session
+recreated under a removed session's name stands where the removed one stood and receives what was
+addressed to that name. A pass-up lives only in the session that recorded it, so removing that
+session reverts the question to its previous addressee; keeping such sessions is left to
+retention.
 
 **The read by position.** `open --at <name>` reads the same local scan as `open --person`. The
 position is the named session or anchor together with the predecessors it confirmed through
 `--continues --supersede`, so a coordinator's successor holds its predecessor's position. The walk
 downward builds, for every session in the local store, the names directly above it: the dispatcher
 `koto session origin` reports for it (from a `dispatched-by` link, or for an anchor from its
-`anchor_started` event) and, for a workflow session held by an anchor, that anchor. A session held
-by an anchor therefore counts as at that anchor's position. Inverting that gives each name's
+`anchor_started` event) and, for a workflow session held by an anchor, that anchor, read from the
+`held-by` link directly so a held session that also has its own `dispatched-by` link is below
+both. A session held by an anchor therefore counts as at that anchor's position. Inverting that gives each name's
 children, and the walk goes down from the position through any number of links, keeping a set of
 names already seen so a loop of links ends. "Below" follows the session names the links carry, not
 the session ids recorded on them, the way `koto session origin` reports a dispatcher: a session

@@ -632,13 +632,16 @@ to an id-shaped value, and both say so.
   asking session only when the asking session passed the question up itself.
 - **R57.** A pass-up is accepted only from the asking session, matched by the session id the
   question carries, or from the session or anchor the question waits on when the pass-up is
-  recorded; any other recording session is refused and nothing is written. Which recipients a
+  recorded, or from a session that continues one of those through a confirmed succession; any
+  other recording session is refused and nothing is written. Which recipients a
   pass-up may name beyond R55's checks is not settled by this requirement.
 - **R58.** A question's current addressee and its addressee history are computed when a read runs,
   and no file stores them. The history starts with the recipient the question was raised with and
   adds one entry for each pass-up of the question that R57 would accept against the history built
-  so far, taking pass-ups in order of time, then recording session name, then identifier. The
-  current addressee is the history's last entry.
+  so far, by causality rather than by clock: it repeatedly adds the first pass-up not yet added,
+  in order of time, then recording session name, then identifier, that R57 accepts against the
+  last entry, until none is accepted. A pass-up whose recorded time sorts before the one it
+  follows is still added. The current addressee is the history's last entry.
 - **R59.** Every entry of an open read carries `recipient`, the recipient the question was raised
   with; `addressee`, the current addressee; and `addressees`, the whole history in order, each
   typed as R49 prints a recipient.
@@ -646,7 +649,8 @@ to an id-shaped value, and both say so.
   store that was raised at the position, waits on it now, or was raised in a session below it,
   each exactly once. The position is the named session or anchor and the sessions it continues
   through a confirmed succession. A session is directly below the dispatcher `koto session origin`
-  reports for it and below the anchor holding it; "below" follows those links through any number of
+  reports for it and below the anchor holding it, both when it has both; "below" follows those
+  links through any number of
   steps. Each entry says in `relation` whether the position raised the question, is its current
   addressee, both, or neither and the question comes from below. The read takes exactly one of
   `--person` and `--at`, refuses an `--at` that names no session or anchor, writes nothing and
@@ -1010,7 +1014,13 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   is refused and a `reverse` aimed at a pass-up exits 2 (R55).
 - [ ] After `manager` has passed q1 to `director`, a second pass-up recorded in `manager`, or in a
   session that never was q1's addressee, exits 2 and writes nothing; one recorded in `director`
-  or in `worker` exits 0, and the one from `worker` is stored in `worker` (R56, R57).
+  or in `worker` exits 0, and the one from `worker` is stored in `worker`; a session created with
+  `--continues director --supersede`, or with `--continues worker --supersede`, may pass q1 up in
+  their place (R56, R57).
+- [ ] A pass-up whose stored time reads earlier than the pass-up it follows still moves the
+  question: after `manager` passes q1 to `director` and `director` passes it to `person:owner`,
+  with `director`'s entry dated before `manager`'s, `--person owner` returns q1 with all three
+  addressees (R58).
 - [ ] After q1 goes from `manager` to `director` and on to `person:owner`, every open read that
   returns it shows `addressee` as person `owner` and `addressees` as `session:manager`,
   `session:director`, `person:owner`, with `recipient` still `session:manager`; q2, raised beside
@@ -1020,7 +1030,8 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   a question from an unlinked session raised to `session:director` is returned by `--at director`
   until it is passed on, and never by `--at manager`; `--at` a session created with `--continues
   manager --supersede` returns what `--at manager` did; `--at` an anchor returns the questions of a
-  session it dispatched or holds, and so does `--at` the anchor that dispatched it (R60).
+  session it dispatched or holds, and so does `--at` the anchor that dispatched it; a session held
+  by an anchor and dispatched by another session is below both (R60).
 - [ ] `--person owner` returns q1 only once it waits on `owner`; a question raised to
   `person:someone-else` and passed by its raiser to `person:owner` is returned for `owner` and not
   for `someone-else`; `koto next worker` carries no `questions` key while q1 is passed up and
