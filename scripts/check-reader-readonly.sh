@@ -98,22 +98,21 @@ REQUIRED_TYPES=(
 ALLOWED_DEPS=(anyhow serde serde_json thiserror regex aho-corasick toml libc sha2 hex dirs)
 BANNED_CRATES=(rust-s3 rustls attohttpc http url ratatui crossterm tempfile fs2 fs4 fd-lock nix rustix)
 
-# Who may call open_plain, as <path under src/>:<function>. This is the
-# first phase's list: the three log readers, generate_session_id, and until
-# the template read moves to read_store_file, is_terminal_state and the
-# dashboard's template read in read_detail.
+# Who may call open_plain, as <path under src/>:<function>. Phase 5: the
+# three log readers koto's own commands use and generate_session_id. The
+# template reads in is_terminal_state and read_detail go through
+# read_store_file in Template mode.
 OPEN_PLAIN_CALLERS=(
   engine/persistence.rs:read_fence
   engine/persistence.rs:read_header_only
   engine/persistence.rs:read_log_inner
-  engine/persistence.rs:is_terminal_state
   engine/types.rs:generate_session_id
-  dashboard.rs:read_detail
 )
 # Names dashboard.rs and source.rs may not use. Phase 4: the scan reads
 # every state log through read_store_file and lists through the hardened
 # first-line read, so koto's plain log readers are out of both files.
-SCAN_FORBIDDEN=(read_events read_header read_header_only read_log)
+# Phase 5: the template read is hardened too, so open_plain is out of both.
+SCAN_FORBIDDEN=(read_events read_header read_header_only read_log open_plain)
 
 # --locked for a real run; the self-test swaps in --offline so a planted
 # dependency can update the copy's lock file from the local cache.
@@ -668,6 +667,10 @@ self_test() {
     append "$S/fs_read.rs" 'pub fn planted() {}'
   expect_fail "a plain log reader in the dashboard scan" "which the dashboard scan may not use in this phase" \
     append "$S/dashboard.rs" $'fn planted(p: &Path) {\n    let _ = crate::engine::persistence::read_events(p);\n}'
+  expect_fail "a plain open in the dashboard scan" "which the dashboard scan may not use in this phase" \
+    append "$S/dashboard.rs" $'fn planted(p: &Path) {\n    let _ = crate::fs_read::open_plain(p);\n}'
+  expect_fail "a plain open back in is_terminal_state" "calls open_plain from is_terminal_state, which may not call it in this phase" \
+    insert_after "$S/engine/persistence.rs" '^pub fn is_terminal_state[(]' '    let _ = crate::fs_read::open_plain(template_path);'
 
   if [ "$missed" -ne 0 ]; then
     echo "FAIL: self-test: a planted violation was not caught"

@@ -867,21 +867,23 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
         None => &events,
     };
 
-    // Load compiled template once (best-effort, None on any error).
+    // Load compiled template once (best-effort, None on any error),
+    // through the hardened template read, so a FIFO, a directory or a file
+    // over the cap leaves the detail without its template parts rather
+    // than blocking or reading without bound.
     // The state file's parent directory is the session dir, the
     // resolution base for a session-relative template_path.
     let session_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let compiled = derive_machine_state(&header, &events, session_dir).and_then(|ms| {
-        crate::fs_read::open_plain(&ms.template_path)
-            .and_then(|mut file| {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).map(|_| bytes)
-            })
-            .ok()
-            .and_then(|bytes| {
-                serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
-            })
+        crate::fs_read::read_store_file(
+            Path::new(&ms.template_path),
+            crate::source::TEMPLATE_READ_CAP,
+            crate::fs_read::ReadMode::Template,
+        )
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes).ok()
+        })
     });
 
     // Find the most recent GateEvaluated event (optional).

@@ -7,12 +7,13 @@
 //! - [`open_plain`] is a plain `File::open`, kept for the reads koto's own
 //!   commands make of their own session's log (the three log readers in
 //!   `engine::persistence`) and for `generate_session_id`'s read of
-//!   `/dev/urandom`. Until the template read moves to [`read_store_file`],
-//!   `is_terminal_state` and the dashboard's template read use it too.
-//!   `scripts/check-reader-readonly.sh` holds the list of allowed callers.
+//!   `/dev/urandom`. `scripts/check-reader-readonly.sh` holds the list of
+//!   allowed callers, and the dashboard scan may not call it at all.
 //! - [`read_store_file`] is the hardened read: it never blocks on a FIFO or
 //!   device, never reads past a cap, and in [`ReadMode::InStore`] refuses a
 //!   final-component symlink and a path that resolves outside the store.
+//!   `read_terminal_state` and the dashboard's detail read open a compiled
+//!   template with it in [`ReadMode::Template`].
 //! - [`read_store_first_line`] is the same hardened read stopping at the
 //!   first newline: what a listing needs of each state file's header.
 //!

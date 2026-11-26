@@ -97,6 +97,10 @@ pub const CONTEXT_VALUE_READ_CAP: u64 = 16 * 1024 * 1024;
 /// The most the layout marker may hold before `check_layout` refuses it.
 pub const LAYOUT_MARKER_READ_CAP: u64 = 64;
 
+/// The most a compiled template may hold before the terminal-state read and
+/// the dashboard's detail read refuse it.
+pub const TEMPLATE_READ_CAP: u64 = 32 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Finding the store
 // ---------------------------------------------------------------------------
