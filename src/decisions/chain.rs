@@ -516,6 +516,33 @@ pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
     Reach::No
 }
 
+/// The earlier members of `session`'s run: the predecessors its continues
+/// link names, then theirs, each kept only while the supersede hops from it
+/// reach `session` with every hop confirmed. Read from the link files and
+/// markers on disk, so it takes no lock, makes no network call and writes
+/// nothing; a session with no continues link costs one directory stat.
+pub fn run_predecessors(store: &dyn SessionBackend, session: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = session.to_string();
+    for _ in 0..MAX_SUPERSEDE_HOPS {
+        let Ok(peers) = peers(store, &at, LinkKind::Continues) else {
+            break;
+        };
+        let Some((pred, _)) = peers.into_iter().next() else {
+            break;
+        };
+        if pred == session || out.contains(&pred) {
+            break;
+        }
+        if !matches!(hops_to(store, &pred, session), Reach::Confirmed(_)) {
+            break;
+        }
+        out.push(pred.clone());
+        at = pred;
+    }
+    out
+}
+
 /// The sessions among `sessions` whose confirmed supersede hops reach
 /// `session`: the fenced predecessors it stands in for (R39). Only a
 /// session with a readable marker can be one, so a session with none

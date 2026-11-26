@@ -222,6 +222,16 @@ pub fn handle_record(backend: &Backend, name: &str, args: RecordArgs) -> Result<
             ),
         );
     }
+    if kind == "answer" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "kind",
+                "an answer isn't recorded with `koto decisions record`: it is aimed at the \
+                 question it answers, with `koto decisions answer`",
+            ),
+        );
+    }
     let req = Request {
         kind,
         outcome: args.outcome.clone().unwrap_or_default(),
@@ -789,6 +799,12 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
         decision: id.to_string(),
     };
     match original.kind.as_str() {
+        "answer" => refuse_recorded(
+            reasons::REVERSES_ANSWER,
+            format!("decision {id} in '{name}' is an answer, and an answer isn't reversed"),
+            Some(target),
+            None,
+        ),
         "reverse" => refuse_recorded(
             reasons::REVERSES_REVERSAL,
             format!("decision {id} in '{name}' is a reversal, and a reversal isn't reversed"),
@@ -942,6 +958,245 @@ pub fn handle_reverse(backend: &Backend, name: &str, id: &str, args: ReverseArgs
             "status": "in-effect",
             "decision": written,
         }))?
+    );
+    Ok(())
+}
+
+/// The flags `answer` takes beyond the question's session and id.
+#[derive(Args, Debug, Clone, Default)]
+pub struct AnswerArgs {
+    /// The session the answer is given in. The answer is recorded there,
+    /// never in the question's session
+    #[arg(long = "in", value_name = "SESSION", required = true)]
+    pub in_session: String,
+    /// The answer
+    #[arg(long, required = true)]
+    pub text: String,
+    /// Who answered: session. A person's answer can't be recorded yet
+    #[arg(long)]
+    pub by: Option<String>,
+    /// The agent within the answering session that answered
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// The run mode: attended, unattended or unknown
+    #[arg(long = "run-mode")]
+    pub run_mode: Option<String>,
+    /// An earlier decision this one relies on, as <session>:<id> (repeatable)
+    #[arg(long)]
+    pub basis: Vec<String>,
+    /// An evidence pointer (repeatable); event:<session>:<seq> names a koto
+    /// session event
+    #[arg(long)]
+    pub evidence: Vec<String>,
+    /// Why
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// The harness's identifier for the tool call that recorded it
+    #[arg(long = "tool-call")]
+    pub tool_call: Option<String>,
+}
+
+/// `koto decisions answer <session> <id> --in <session> --text <text>`:
+/// record an `answer` to the escalation `id` raised in `name`, in the
+/// answering session's `koto/aimed/<raiser's session id>/`. Every check
+/// runs before anything is written, and a refusal writes nothing in
+/// either session.
+pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) -> Result<()> {
+    const COMMAND: &str = "decisions answer";
+    if !crate::decisions::is_decision_id(id) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "'{id}' isn't a decision id: {} digits",
+                    crate::decisions::ID_WIDTH
+                ),
+            ),
+        );
+    }
+    if crate::discover::validate_workflow_name(name).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("session", "the question's session isn't a session name"),
+        );
+    }
+    let answerer = args.in_session.clone();
+    if answerer == name {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "in",
+                "an answer is recorded in the session it is given in, never in the asker's",
+            ),
+        );
+    }
+    let person_refusal = || {
+        DecisionError::invalid(
+            "by",
+            "a person's answer can't be recorded yet: koto doesn't verify that the person \
+             gave it",
+        )
+    };
+    if args.by.as_deref().is_some_and(|b| b.starts_with("person:")) {
+        refuse(COMMAND, &person_refusal());
+    }
+    let req = Request {
+        kind: "answer".to_string(),
+        outcome: "answered".to_string(),
+        subject: vec![
+            ("session".to_string(), name.to_string()),
+            ("id".to_string(), id.to_string()),
+            ("text".to_string(), args.text.clone()),
+        ],
+        basis: args.basis.clone(),
+        evidence: args.evidence.clone(),
+        reason: args.reason.clone(),
+        tool_call: args.tool_call.clone(),
+    };
+    let subject = body::validate(&req).unwrap_or_else(|e| refuse(COMMAND, &e));
+    if args.text.len() > body::MAX_REASON_BYTES {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "text",
+                format!("the answer is larger than {} bytes", body::MAX_REASON_BYTES),
+            ),
+        );
+    }
+    let basis = body::parse_basis(&req.basis).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let evidence = body::parse_evidence(&req.evidence).unwrap_or_else(|e| refuse(COMMAND, &e));
+    require_session(backend, &answerer, COMMAND);
+
+    let flags = Flags {
+        by: args.by.clone(),
+        surface: None,
+        link: None,
+        agent: args.agent.clone(),
+        run_mode: args.run_mode.clone(),
+    };
+    let observed = Observed::from_env(backend);
+    let decider =
+        decider::resolve(&answerer, &flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
+    if !matches!(decider, decider::Decider::Session { .. }) {
+        refuse(COMMAND, &person_refusal());
+    }
+    let run_mode = decider::run_mode(&flags, &observed).unwrap_or_else(|e| refuse(COMMAND, &e));
+
+    // The question, read from the asker's own copy with no lock and no
+    // pull: nothing in the asker's session is touched.
+    let entries = crate::decisions::read::read_session_with(backend, name, false);
+    let found = entries.iter().find(|e| match e {
+        Entry::Decision(b) => b.id == id,
+        Entry::Unreadable { id: Some(i), .. } => i == id,
+        Entry::Unreadable { id: None, .. } => true,
+    });
+    let question = match found {
+        None => refuse(
+            COMMAND,
+            &DecisionError::new(
+                codes::DECISION_NOT_FOUND,
+                format!("'{name}' holds no decision {id}"),
+            ),
+        ),
+        Some(Entry::Unreadable { reason, .. }) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!("decision {id} in '{name}' can't be read: {reason}"),
+            ),
+        ),
+        Some(Entry::Decision(b)) => (**b).clone(),
+    };
+    if question.kind != "escalate" {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "id",
+                format!(
+                    "decision {id} in '{name}' is a '{}', and only an 'escalate' is answered",
+                    question.kind
+                ),
+            ),
+        );
+    }
+    let target = Target {
+        name: name.to_string(),
+        id: question.session.id.clone(),
+        decision: id.to_string(),
+    };
+
+    standing::settle(backend, &answerer);
+    let stamp = standing::stamp(backend, &answerer).unwrap_or_else(|e| refuse(COMMAND, &e));
+    let authority = decider::authority(
+        backend,
+        &decider,
+        observed.anchor.as_deref(),
+        chain::dispatcher(backend, &answerer),
+        run_mode,
+    );
+    let chain = chain::snapshot(backend, &answerer);
+    let written = store::write_in(backend, &answerer, &Area::Aimed(target.id.clone()), |aid| {
+        Ok(DecisionBody {
+            v: FORMAT_VERSION,
+            id: aid.to_string(),
+            session: stamp.session.clone(),
+            time: crate::engine::types::now_iso8601(),
+            state: stamp.state.clone(),
+            log_seq: stamp.log_seq,
+            kind: "answer".to_string(),
+            outcome: "answered".to_string(),
+            subject,
+            decider: decider.clone(),
+            authority,
+            chain,
+            basis,
+            evidence,
+            reason: req.reason.clone(),
+            tool_call: req.tool_call.clone(),
+            target: Some(target.clone()),
+            standing: None,
+            path: None,
+            compensating: None,
+            replacement: None,
+            refusal: None,
+        })
+    })
+    .unwrap_or_else(|e| refuse(COMMAND, &e));
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "v": FORMAT_VERSION,
+            "session": answerer,
+            "id": written.id,
+            "status": "in-effect",
+            "question": crate::decisions::questions::identity(&question),
+            "decision": written,
+        }))?
+    );
+    Ok(())
+}
+
+/// `koto decisions open --person <handle>`: the questions open for a
+/// person, across every session in the local store. Takes no session.
+pub fn handle_open(backend: &Backend, person: &str) -> Result<()> {
+    const COMMAND: &str = "decisions open";
+    if decider::check_handle("person", person).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "person",
+                format!(
+                    "--person takes a handle of 1 to {} bytes with no control characters",
+                    decider::MAX_HANDLE_BYTES
+                ),
+            ),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&crate::decisions::questions::open(backend, person))?
     );
     Ok(())
 }

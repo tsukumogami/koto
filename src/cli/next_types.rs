@@ -1399,6 +1399,21 @@ pub fn attach_advisories(
     Ok(())
 }
 
+/// The key of the answered questions a `koto next` response reports.
+pub const QUESTIONS_KEY: &str = "questions";
+
+/// Attach the answered questions of the session's run, when there are
+/// any. A response with none carries no key, so it stays byte-identical
+/// to one from a binary that never reported questions.
+pub fn attach_questions(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    questions: Option<serde_json::Value>,
+) {
+    if let Some(q) = questions {
+        envelope.insert(QUESTIONS_KEY.to_string(), q);
+    }
+}
+
 /// Convert gate evaluation results into a list of blocking conditions.
 ///
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
