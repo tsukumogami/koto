@@ -709,9 +709,20 @@ pub enum SessionCommand {
     /// names every other live member of its hierarchy in `live_members`,
     /// and every later session continuing it that would have kept it in
     /// `relation_keepers`. A pin still refuses it.
+    ///
+    /// A session holding something an open question depends on (the open
+    /// question itself, the answer in effect for one, or a pass-up its
+    /// current addressee rests on) is refused with exit 2, code
+    /// `holds_question`, and nothing removed, unless `--force` is passed.
     Cleanup {
         /// Session name
         name: String,
+
+        /// Remove the session even when it holds an open question, its
+        /// answer or a pass-up. Prints `orphaned_questions` and warns on
+        /// stderr for each. A pin still refuses it.
+        #[arg(long)]
+        force: bool,
     },
     /// Preview, then remove, finished sessions as a set.
     ///
@@ -2652,19 +2663,33 @@ pub fn run(app: App) -> Result<()> {
                     state,
                     ..
                 } => session::handle_list(&backend, execution_dir.as_deref(), state),
-                SessionCommand::Cleanup { name } => {
+                SessionCommand::Cleanup { name, force } => {
+                    // A session holding what an open question depends on is
+                    // refused before anything is stopped or removed.
+                    let holds = if crate::session::validate::validate_session_id(&name).is_ok() {
+                        session::question_holds(backend.local_base_dir(), &name)
+                    } else {
+                        Vec::new()
+                    };
+                    if !holds.is_empty() && !force {
+                        session::refuse_holds(&backend, &name, &holds);
+                    }
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
                     // And judge the hierarchy while the session is still in it.
                     let live = session::live_members(&backend, backend.local_base_dir(), &name);
                     session::handle_cleanup(&backend, &name)?;
                     session::warn_live_members(&name, &live);
+                    session::warn_orphaned(&name, &holds);
                     let mut out = serde_json::json!({
                         "name": name,
                         "cleaned_up": true,
                         "children": children,
                         "live_members": live.members,
                     });
+                    if force {
+                        out["orphaned_questions"] = session::orphaned_json(&holds);
+                    }
                     if let Some(e) = live.error {
                         out["live_members_error"] = serde_json::json!(e);
                     }
@@ -5239,6 +5264,21 @@ fn terminal_retention(
         }
     }
     let session_dir = backend.session_dir(name);
+    // An open question the session raised keeps it before anything else
+    // is asked: read from the local store only, so the cloud backend makes
+    // no request for it, and only when the session recorded a question.
+    if let Some(base) = session_dir.parent() {
+        let open = crate::decisions::questions::raised_open_in(
+            &crate::session::Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+                base.to_path_buf(),
+            )),
+            name,
+        );
+        if !open.is_empty() {
+            OPEN_QUESTIONS.with(|q| *q.borrow_mut() = open);
+            return (Some(next_types::RetentionReason::OpenQuestion), guard);
+        }
+    }
     let has_edge = match session_dir.parent() {
         Some(base) => crate::session::hierarchy::edge_of(base, name),
         None => true,
@@ -5271,6 +5311,13 @@ fn terminal_retention(
 }
 
 thread_local! {
+    /// The open questions a session this tick keeps for them raised, from
+    /// [`terminal_retention`] to the report it prints.
+    static OPEN_QUESTIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// What the bucket said continues a session this tick keeps for it,
     /// from [`terminal_retention`] to the report it prints.
     static BUCKET_RELATION: std::cell::RefCell<Option<crate::session::hierarchy::RelationVerdict>> =
@@ -5293,9 +5340,15 @@ fn terminal_retention_report(
         Some(_) => guard.fields(),
         None => Default::default(),
     };
+    let open_questions = match reason {
+        Some(RetentionReason::OpenQuestion) => OPEN_QUESTIONS.with(|q| q.take()),
+        _ => Vec::new(),
+    };
     let kept_children = if matches!(
         reason,
-        Some(RetentionReason::Hierarchy | RetentionReason::Pinned)
+        Some(
+            RetentionReason::Hierarchy | RetentionReason::Pinned | RetentionReason::OpenQuestion
+        )
     ) {
         workspace::kept_children(backend, name, compiled)
     } else {
@@ -5309,6 +5362,7 @@ fn terminal_retention_report(
         reason,
         pin,
         relation,
+        open_questions,
         kept_children,
     }
 }
@@ -10333,6 +10387,12 @@ fn handle_cancel(
     if cleanup {
         if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
             exit_with_error_code(refusal.to_json(), refusal.exit);
+        }
+        // So is one holding what an open question depends on: the message
+        // names `koto session cleanup <name> --force`, which removes it.
+        let holds = session::question_holds(sessions_base, name);
+        if !holds.is_empty() {
+            session::refuse_holds(backend, name, &holds);
         }
     }
 

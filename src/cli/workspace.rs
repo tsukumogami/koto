@@ -1087,6 +1087,12 @@ impl DescendantVisitor for Sweep<'_> {
             self.pinned.push(kept);
             return true;
         }
+        // So does an open question it raised, and like a pinned child it
+        // keeps nothing above it.
+        if let Some(kept) = question_kept_child(backend, child) {
+            self.pinned.push(kept);
+            return true;
+        }
         // Its finished record first, so `koto status` can answer for it once
         // it is gone.
         #[cfg(unix)]
@@ -1244,6 +1250,34 @@ fn pinned_children_by_name(
             guard.keeps().then_some((n, guard))
         })
         .collect()
+}
+
+/// The `kept_children` entry for a child the sweep keeps because it raised
+/// a question that is still open (`crate::decisions::questions::is_open`):
+/// reason `open_question`, with the questions' identities. `None` for a
+/// child that raised none, at the cost of a read of its own decisions.
+fn question_kept_child(backend: &dyn SessionBackend, child: &str) -> Option<KeptChild> {
+    let base = backend.session_dir(child).parent()?.to_path_buf();
+    let open = crate::decisions::questions::raised_open_in(
+        &crate::session::Backend::Local(crate::session::local::LocalBackend::with_base_dir(base)),
+        child,
+    );
+    if open.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = open.iter().map(|q| hierarchy::sanitize(q)).collect();
+    let mut fields = serde_json::Map::new();
+    fields.insert("open_questions".to_string(), serde_json::json!(shown));
+    Some(KeptChild {
+        name: child.to_string(),
+        reason: super::next_types::RetentionReason::OpenQuestion.as_str(),
+        detail: format!(
+            "kept: it holds open question {}; it is kept until the question is answered, \
+             reversed or fenced",
+            shown.join(", ")
+        ),
+        pin: fields,
+    })
 }
 
 /// The `kept_children` entry for a child the pin guard keeps: reason

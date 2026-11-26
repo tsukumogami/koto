@@ -157,20 +157,33 @@ pub fn may_pass(
 /// happen when they were written at once; the later one is then skipped,
 /// so the history stays a single line.
 pub fn addressees(index: &Index, runs: &Runs, question: &DecisionBody) -> Vec<Recipient> {
+    history(index, runs, question)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// [`addressees`] with the pass-up that moved the question to each
+/// recipient: `None` for the first, which it was raised with.
+fn history<'i>(
+    index: &'i Index,
+    runs: &Runs,
+    question: &DecisionBody,
+) -> Vec<(Recipient, Option<&'i DecisionBody>)> {
     let Some(first) = recipient_of(question) else {
         return Vec::new();
     };
-    let mut out = vec![first];
+    let mut out = vec![(first, None)];
     let mut pending = index.readdresses_of(&question.session.id, &question.id);
     loop {
-        let current = out.last().expect("the history starts with one recipient");
+        let (current, _) = out.last().expect("the history starts with one recipient");
         let next = pending.iter().position(|r| {
             recipient_of(r).is_some_and(|to| !matches!(to, Recipient::Untyped(_)) && &to != current)
                 && may_pass(runs, question, current, &r.session.name, &r.session.id)
         });
         let Some(i) = next else { break };
         let r = pending.remove(i);
-        out.push(recipient_of(r).expect("checked above"));
+        out.push((recipient_of(r).expect("checked above"), Some(r)));
     }
     out
 }
@@ -193,6 +206,34 @@ pub fn waits_on_session(recipient: &Recipient, name: &str) -> bool {
     matches!(recipient, Recipient::Session(n) | Recipient::Anchor(n) if n == name)
 }
 
+/// Whether `b` is a question that still stands: an `escalate` with a
+/// typed recipient whose status is in effect (not reversed, not past a
+/// fence).
+fn stands(index: &Index, b: &DecisionBody) -> bool {
+    is_question(b) && index.status(b) == "in-effect"
+}
+
+/// The answer in effect for `question`: the earliest `answered` answer
+/// aimed at it, by time, then the answering session's name, then id.
+pub fn answer_in_effect<'i>(index: &'i Index, question: &DecisionBody) -> Option<&'i DecisionBody> {
+    index
+        .answers_of(&question.session.id, &question.id)
+        .into_iter()
+        .next()
+}
+
+/// Whether `b` is an open question: one that stands with no answer in
+/// effect.
+///
+/// This is koto's one test of open. The open reads, the terminal tick's
+/// retention, the retention engine's keepers and the cleanup refusal all
+/// come here (the last three through [`raised_open`] and [`holds_of`]), so
+/// a change to what counts as open, or to which answer is in effect,
+/// reaches every one of them at once.
+pub fn is_open(index: &Index, b: &DecisionBody) -> bool {
+    stands(index, b) && answer_in_effect(index, b).is_none()
+}
+
 /// The open questions in the local store: in-effect escalations with a
 /// typed recipient that no answer has closed, each with its addressee
 /// history, sorted by time, then the raising session's name, then id.
@@ -205,8 +246,7 @@ fn open_questions<'i>(index: &'i Index, runs: &Runs) -> Vec<(&'i DecisionBody, V
             Entry::Decision(b) => Some(&**b),
             Entry::Unreadable { .. } => None,
         })
-        .filter(|b| is_question(b) && index.status(b) == "in-effect")
-        .filter(|b| index.answers_of(&b.session.id, &b.id).is_empty())
+        .filter(|b| is_open(index, b))
         .map(|b| (b, addressees(index, runs, b)))
         .collect();
     found.sort_by(|(a, _), (b, _)| {
@@ -352,11 +392,10 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
     let index = Index::scan(backend, false);
     let mut out = Vec::new();
     for q in pending {
-        if index.status(q) != "in-effect" {
+        if !stands(&index, q) {
             continue;
         }
-        let answers = index.answers_of(&q.session.id, &q.id);
-        let Some(answer) = answers.first() else {
+        let Some(answer) = answer_in_effect(&index, q) else {
             continue;
         };
         out.push(json!({
@@ -376,4 +415,197 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
         }));
     }
     (!out.is_empty()).then_some(Value::Array(out))
+}
+
+/// What a session holds that an open question depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Held {
+    /// It raised the question, which is open.
+    Raised,
+    /// It holds the answer in effect for the question.
+    Answer,
+    /// It holds a pass-up the question's current addressee rests on.
+    PassUp,
+}
+
+impl Held {
+    /// The `held` value a refusal and `orphaned_questions` print.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Held::Raised => "raised",
+            Held::Answer => "answer",
+            Held::PassUp => "pass_up",
+        }
+    }
+
+    /// What removing the session loses for the question.
+    pub fn loss(self) -> &'static str {
+        match self {
+            Held::Raised => "the question itself: no open read returns it once its raiser is gone",
+            Held::Answer => "the answer in effect: the question reads open again",
+            Held::PassUp => "a pass-up: the question waits on the addressee it had before it",
+        }
+    }
+
+    /// What the session holds of question `identity`, for a refusal's
+    /// message: `it <describe>`.
+    pub fn describe(self, identity: &str) -> String {
+        match self {
+            Held::Raised => format!("raised the open question {identity}"),
+            Held::Answer => format!("holds the answer in effect for the question {identity}"),
+            Held::PassUp => format!(
+                "holds a pass-up that the current addressee of the question {identity} rests on"
+            ),
+        }
+    }
+}
+
+/// One question a session holds something of, by its identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Hold {
+    pub identity: String,
+    pub held: Held,
+}
+
+/// The readable decisions the scan read in session directory `session`.
+fn decisions_in<'i>(index: &'i Index, session: &str) -> impl Iterator<Item = &'i DecisionBody> {
+    index
+        .sessions()
+        .get(session)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| match e {
+            Entry::Decision(b) => Some(&**b),
+            Entry::Unreadable { .. } => None,
+        })
+}
+
+/// The question `id` raised in the session whose header id is
+/// `session_id`, when that session is in the store.
+fn question_of<'i>(index: &'i Index, session_id: &str, id: &str) -> Option<&'i DecisionBody> {
+    index
+        .sessions()
+        .values()
+        .flatten()
+        .find_map(|e| match e {
+            Entry::Decision(b) if b.session.id == session_id && b.id == id && is_question(b) => {
+                Some(&**b)
+            }
+            _ => None,
+        })
+}
+
+fn same_entry(a: &DecisionBody, b: &DecisionBody) -> bool {
+    a.session.id == b.session.id && a.id == b.id
+}
+
+/// The identities of the open questions raised in session directory
+/// `session`, in the order it recorded them.
+pub fn raised_open(index: &Index, session: &str) -> Vec<String> {
+    decisions_in(index, session)
+        .filter(|b| is_open(index, b))
+        .map(identity)
+        .collect()
+}
+
+/// Every question session directory `session` holds something of that its
+/// removal would lose: an open question it raised, the answer in effect
+/// for a question whose raiser is in the store, and a pass-up the current
+/// addressee of an open question rests on. Each is matched by identity,
+/// never by name, so an answer aimed at a removed session's id holds
+/// nothing once that session is gone, whatever now carries its name.
+pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
+    let mut out: Vec<Hold> = raised_open(index, session)
+        .into_iter()
+        .map(|identity| Hold {
+            identity,
+            held: Held::Raised,
+        })
+        .collect();
+    for b in decisions_in(index, session) {
+        let Some(t) = &b.target else { continue };
+        let held = match (b.kind.as_str(), b.outcome.as_str()) {
+            ("answer", "answered") => Held::Answer,
+            ("readdress", "passed") => Held::PassUp,
+            _ => continue,
+        };
+        let Some(q) = question_of(index, &t.id, &t.decision) else {
+            continue;
+        };
+        let holds = match held {
+            Held::Answer => {
+                stands(index, q) && answer_in_effect(index, q).is_some_and(|a| same_entry(a, b))
+            }
+            Held::PassUp => {
+                is_open(index, q)
+                    && history(index, runs, q)
+                        .iter()
+                        .any(|(_, r)| r.is_some_and(|r| same_entry(r, b)))
+            }
+            Held::Raised => false,
+        };
+        if holds {
+            out.push(Hold {
+                identity: identity(q),
+                held,
+            });
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether session `session`'s own decisions could hold anything
+/// [`holds_of`] counts: a question, or (with `aimed`) an answer or pass-up
+/// aimed at one. A session with neither never pays for a scan of the
+/// store.
+fn may_hold(backend: &Backend, session: &str, aimed: bool) -> bool {
+    read::read_session_with(backend, session, false)
+        .iter()
+        .any(|e| match e {
+            Entry::Decision(b) => {
+                is_question(b)
+                    || (aimed
+                        && b.target.is_some()
+                        && matches!(b.kind.as_str(), "answer" | "readdress"))
+            }
+            Entry::Unreadable { .. } => false,
+        })
+}
+
+/// The open questions session `session` raised, for its terminal tick:
+/// empty, at the cost of a read of its own decisions, when it raised none.
+pub fn raised_open_in(backend: &Backend, session: &str) -> Vec<String> {
+    if !may_hold(backend, session, false) {
+        return Vec::new();
+    }
+    raised_open(&Index::scan(backend, false), session)
+}
+
+/// What an explicit removal of session `session` would orphan
+/// ([`holds_of`]), read from the local store only: empty, at the cost of a
+/// read of its own decisions, when it holds no question and no aimed
+/// answer or pass-up.
+pub fn orphans(backend: &Backend, session: &str) -> Vec<Hold> {
+    if !may_hold(backend, session, true) {
+        return Vec::new();
+    }
+    let index = Index::scan(backend, false);
+    let runs = Runs::new(backend);
+    holds_of(&index, &runs, session)
+}
+
+/// The open questions each session directory in the local store raised,
+/// for the retention engine; sessions that raised none are left out.
+pub fn open_by_session(backend: &Backend) -> BTreeMap<String, Vec<String>> {
+    let index = Index::scan(backend, false);
+    index
+        .sessions()
+        .keys()
+        .filter_map(|s| {
+            let open = raised_open(&index, s);
+            (!open.is_empty()).then(|| (s.clone(), open))
+        })
+        .collect()
 }

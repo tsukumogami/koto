@@ -382,7 +382,10 @@ fn first_rule(
     }
     if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
         let hierarchy = Some(hierarchy::to_json(judgment, settings));
-        if let Some(own) = keepers.iter().find(|k| k.name == name) {
+        // Rule a is the session's own life; a member kept only for the
+        // open questions it holds is kept with its hierarchy (rule h),
+        // whose detail names them.
+        if let Some(own) = keepers.iter().find(|k| k.name == name && k.alive) {
             let detail = match own.kind {
                 MemberKind::KotoSession if session.seen.status == SessionStatus::Running => {
                     "the session is running".to_string()

@@ -1327,7 +1327,7 @@ pub(crate) fn live_members(
             let members = match &j.verdict {
                 Verdict::Keep { keepers, .. } => keepers
                     .iter()
-                    .filter(|k| k.name != name)
+                    .filter(|k| k.name != name && k.alive)
                     .map(|k| {
                         serde_json::json!({
                             "name": sanitize(&k.name),
@@ -1378,6 +1378,95 @@ pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
         sanitize(name),
         names.join(", ")
     );
+}
+
+/// What an explicit removal of `name` would orphan: the questions it holds
+/// something of (`crate::decisions::questions::holds_of`), read from the
+/// local store under `base` only, so the cloud backend makes no request.
+pub(crate) fn question_holds(
+    base: &std::path::Path,
+    name: &str,
+) -> Vec<crate::decisions::questions::Hold> {
+    crate::decisions::questions::orphans(
+        &Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+            base.to_path_buf(),
+        )),
+        name,
+    )
+}
+
+/// The `orphaned_questions` a forced removal prints: one object per
+/// question, its identity and what the removed session held of it.
+pub(crate) fn orphaned_json(holds: &[crate::decisions::questions::Hold]) -> serde_json::Value {
+    use crate::session::hierarchy::sanitize;
+    serde_json::Value::Array(
+        holds
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "question": sanitize(&h.identity),
+                    "held": h.held.as_str(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Refuse an explicit removal of `name` that would orphan `holds`: exit 2,
+/// code `holds_question`, nothing removed. The message names each question,
+/// what the session holds of it and what removing it loses, and the one
+/// command that removes it anyway. A pinned session is refused for its pin
+/// first, exactly as it was before questions were kept.
+pub(crate) fn refuse_holds(
+    backend: &dyn SessionBackend,
+    name: &str,
+    holds: &[crate::decisions::questions::Hold],
+) -> ! {
+    use crate::session::hierarchy::{display_text, sanitize};
+    if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
+        super::exit_with_error_code(refusal.to_json(), refusal.exit);
+    }
+    let shown = display_text(name);
+    let each: Vec<String> = holds
+        .iter()
+        .map(|h| {
+            format!(
+                "it {} (removing it loses {})",
+                h.held.describe(&sanitize(&h.identity)),
+                h.held.loss()
+            )
+        })
+        .collect();
+    let message = format!(
+        "session '{shown}' wasn't removed: {}. Answer, reverse or pass the question first, or \
+         remove the session anyway with: koto session cleanup {shown} --force",
+        each.join("; ")
+    );
+    super::exit_with_error_code(
+        serde_json::json!({
+            "error": {
+                "code": "holds_question",
+                "message": message,
+                "session": sanitize(name),
+                "questions": orphaned_json(holds),
+                "force_command": format!("koto session cleanup {shown} --force"),
+            }
+        }),
+        2,
+    );
+}
+
+/// Warn on stderr that a forced removal of `name` orphaned `holds`.
+pub(crate) fn warn_orphaned(name: &str, holds: &[crate::decisions::questions::Hold]) {
+    use crate::session::hierarchy::sanitize;
+    for h in holds {
+        eprintln!(
+            "warning: removed '{}' with --force; it {}, and the removal lost {}",
+            sanitize(name),
+            h.held.describe(&sanitize(&h.identity)),
+            h.held.loss()
+        );
+    }
 }
 
 /// Record a dispatched-by link to `dispatcher` in `session` after the

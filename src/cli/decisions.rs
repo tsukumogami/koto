@@ -1206,6 +1206,7 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         })
     })
     .unwrap_or_else(|e| refuse(COMMAND, &e));
+    ring_asker(name);
 
     println!(
         "{}",
@@ -1219,6 +1220,24 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         }))?
     );
     Ok(())
+}
+
+/// Ring the wake file of `asker`, a question's raiser, after an answer to
+/// it was recorded, and of the newest session continuing it when it was
+/// superseded (`crate::engine::wake_signal::ring_forwarded`). A wake
+/// carries no content: the asker's next tick reads the store. Ringing
+/// never fails the answer, which is already written: any refusal (no
+/// koto root, an unwritable wakes directory, a symlink, a directory or a
+/// FIFO at the path) is one warning on stderr, and the path is left as it
+/// was.
+fn ring_asker(asker: &str) {
+    let Some(root) = crate::koto_home::koto_home() else {
+        eprintln!("warning: no wake delivered to {asker:?}: the koto root can't be resolved");
+        return;
+    };
+    if let Err(e) = crate::engine::wake_signal::ring_forwarded(&root, asker) {
+        eprintln!("warning: could not deliver a wake to {asker:?}: {e}");
+    }
 }
 
 /// The flags `readdress` takes beyond the question's session and id.
