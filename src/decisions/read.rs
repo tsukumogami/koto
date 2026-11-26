@@ -150,19 +150,19 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
                 }
                 match &f.area {
                     Area::Aimed(target) => {
-                        if body.kind != "reverse" && body.kind != "answer" {
-                            return Err(
-                                "an aimed decision is neither a reversal nor an answer".to_string()
-                            );
-                        }
+                        let what = match body.kind.as_str() {
+                            "reverse" => "reversal",
+                            "answer" => "answer",
+                            "readdress" => "pass-up",
+                            _ => {
+                                return Err("an aimed decision is neither a reversal, an \
+                                            answer nor a pass-up"
+                                    .to_string())
+                            }
+                        };
                         if body.target.as_ref().is_none_or(|t| &t.id != target) {
                             return Err(format!(
-                                "the {}'s target isn't the session it is filed under",
-                                if body.kind == "answer" {
-                                    "answer"
-                                } else {
-                                    "reversal"
-                                }
+                                "the {what}'s target isn't the session it is filed under"
                             ));
                         }
                     }
@@ -171,6 +171,9 @@ pub fn read_session_with(backend: &Backend, session: &str, remote: bool) -> Vec<
                     }
                     Area::Decisions if body.kind == "answer" => {
                         return Err("an answer sits outside koto/aimed/".to_string());
+                    }
+                    Area::Decisions if body.kind == "readdress" => {
+                        return Err("a pass-up sits outside koto/aimed/".to_string());
                     }
                     Area::Decisions => {}
                 }

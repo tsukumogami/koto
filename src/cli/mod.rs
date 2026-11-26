@@ -1369,13 +1369,31 @@ pub enum DecisionsSubcommand {
         #[command(flatten)]
         answer: decisions::AnswerArgs,
     },
-    /// List the questions open for a person: in-effect escalations whose
-    /// recipient is `person:<handle>` and that no answer has closed, from
-    /// every session in the local store. Records nothing
+    /// Pass a question up to a new recipient, by its session name and id,
+    /// recording the pass-up in the session named by `--in`: the raiser or
+    /// the session the question waits on now. The question keeps its
+    /// identity, and nothing is written in any other session
+    Readdress {
+        /// The question's session name
+        name: String,
+        /// The escalation's decision id
+        id: String,
+        #[command(flatten)]
+        readdress: decisions::ReaddressArgs,
+    },
+    /// List open questions: in-effect escalations with a typed recipient
+    /// that no answer has closed, from every session in the local store.
+    /// `--person` lists the ones waiting on a person now; `--at` the ones
+    /// raised at, waiting on, or raised below a session or anchor. Takes
+    /// exactly one of the two. Records nothing
+    #[command(group(clap::ArgGroup::new("open_by").required(true).args(["person", "at"])))]
     Open {
         /// The person's handle
-        #[arg(long, required = true)]
-        person: String,
+        #[arg(long)]
+        person: Option<String>,
+        /// The session or anchor whose position to read
+        #[arg(long, value_name = "SESSION_OR_ANCHOR")]
+        at: Option<String>,
     },
 }
 
@@ -3234,7 +3252,21 @@ pub fn run(app: App) -> Result<()> {
                     refuse_if_superseded(&backend, &answerer, "decisions answer");
                     decisions::handle_answer(&backend, &name, &id, answer)
                 }
-                DecisionsSubcommand::Open { person } => decisions::handle_open(&backend, &person),
+                DecisionsSubcommand::Readdress {
+                    name,
+                    id,
+                    readdress,
+                } => {
+                    let recorder = readdress.in_session.clone();
+                    refuse_if_unlocated(&backend, &recorder, "decisions readdress");
+                    refuse_if_superseded(&backend, &recorder, "decisions readdress");
+                    decisions::handle_readdress(&backend, &name, &id, readdress)
+                }
+                DecisionsSubcommand::Open { person, at } => match (person, at) {
+                    (Some(person), _) => decisions::handle_open(&backend, &person),
+                    (None, Some(at)) => decisions::handle_open_at(&backend, &at),
+                    (None, None) => unreachable!("clap requires --person or --at"),
+                },
             }
         }
         Command::Overrides { subcommand } => {

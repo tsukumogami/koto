@@ -194,6 +194,55 @@ pub fn origin_of<S: OriginStore>(store: &S, name: &str) -> anyhow::Result<Origin
     })
 }
 
+/// The sessions or anchors directly above `name`: the dispatcher its origin
+/// names when it reads `dispatched`, and the anchor the answer came through
+/// when that is another session (the anchor holding a workflow session).
+/// A session whose origin can't be read, or reads `none` or `unrecorded`
+/// with no holding anchor, has nothing above it. Names are the ones the
+/// links and events carry, so a session recreated under a dispatcher's
+/// name stands where the removed one stood.
+pub fn above<S: OriginStore>(store: &S, name: &str) -> Vec<String> {
+    let Ok(report) = origin_of(store, name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Origin::Dispatched { dispatcher, .. } = &report.origin {
+        out.push(dispatcher.clone());
+    }
+    if let Some(via) = report.via.filter(|v| v != name && !out.contains(v)) {
+        out.push(via);
+    }
+    out
+}
+
+/// Every session among `sessions` that sits below one of `positions`
+/// through any number of [`above`] links, walked downward from the
+/// positions. The positions themselves are never in the result, even when
+/// a loop of links leads back to one.
+pub fn below<S: OriginStore>(
+    store: &S,
+    sessions: &[String],
+    positions: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for s in sessions {
+        for parent in above(store, s) {
+            children.entry(parent).or_default().push(s.clone());
+        }
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = positions.iter().cloned().collect();
+    while let Some(at) = queue.pop() {
+        for child in children.get(&at).into_iter().flatten() {
+            if !positions.contains(child) && seen.insert(child.clone()) {
+                queue.push(child.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// The peers `session`'s `kind` links name, in key order, from the store's
 /// listing alone. A key whose shape isn't `<kind>/<peer>` is skipped, as
 /// [`links::read_links`] skips it.

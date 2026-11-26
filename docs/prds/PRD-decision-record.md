@@ -203,6 +203,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `reverse` | overruling an earlier decision | `reversed` |
   | `refused` | a decision attempt koto refused | `refused` |
   | `answer` | answering a question an `escalate` raised (R50) | `answered` |
+  | `readdress` | passing a question an `escalate` raised up to a new recipient (R55) | `passed` |
 
 - **R2.** Every decision names its subject in a form a reader can resolve after the deciding
   session is gone:
@@ -221,6 +222,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `reverse` | the session name and identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason |
   | `answer` | the asking session's name, the question's identifier in that session, and the answer text |
+  | `readdress` | the asking session's name, the question's identifier in that session, and the new recipient, typed as R49 types an `escalate`'s |
 
   A command given a kind, outcome or subject these tables don't allow fails with an error naming
   the field and records nothing.
@@ -615,6 +617,44 @@ to an id-shaped value, and both say so.
   session that reuses the cited name and identifier is still reported. Reading it writes nothing, takes no lock, makes no network
   connection and never blocks or changes the exit code; a session with nothing to report carries
   no `questions` key, so its response is byte-identical to one from a binary that predates it.
+- **R55.** A `readdress` passes one question up to a new recipient. Its target is the question's
+  identity, as an answer's is (R50), and its subject carries the new recipient as `session:<name>`,
+  `anchor:<name>` or `person:<handle>`. The question keeps its identity: the `escalate` is
+  unchanged and no second one is written. koto refuses a pass-up whose question doesn't exist,
+  isn't an `escalate`, has an untyped recipient, doesn't read `in-effect` or already has an answer
+  with outcome `answered`; whose new recipient has no type prefix, has a prefix with a name or
+  handle koto doesn't accept, or is the recipient the question waits on now; and whose decider is a
+  person. Each refusal exits 2 and writes nothing. A pass-up is never reversed: a `reverse` aimed
+  at one is refused and recorded as `refused` (R18). `koto decisions record` doesn't take the
+  `readdress` kind; `koto decisions readdress` records it.
+- **R56.** A pass-up is recorded in the session that passed the question up, under the same
+  aimed area as its answers and reversals (R51), and in no other session. It is written in the
+  asking session only when the asking session passed the question up itself.
+- **R57.** A pass-up is accepted only from the asking session, matched by the session id the
+  question carries, or from the session or anchor the question waits on when the pass-up is
+  recorded; any other recording session is refused and nothing is written. Which recipients a
+  pass-up may name beyond R55's checks is not settled by this requirement.
+- **R58.** A question's current addressee and its addressee history are computed when a read runs,
+  and no file stores them. The history starts with the recipient the question was raised with and
+  adds one entry for each pass-up of the question that R57 would accept against the history built
+  so far, taking pass-ups in order of time, then recording session name, then identifier. The
+  current addressee is the history's last entry.
+- **R59.** Every entry of an open read carries `recipient`, the recipient the question was raised
+  with; `addressee`, the current addressee; and `addressees`, the whole history in order, each
+  typed as R49 prints a recipient.
+- **R60.** `koto decisions open --at <session-or-anchor>` lists every open question in this host's
+  store that was raised at the position, waits on it now, or was raised in a session below it,
+  each exactly once. The position is the named session or anchor and the sessions it continues
+  through a confirmed succession. A session is directly below the dispatcher `koto session origin`
+  reports for it and below the anchor holding it; "below" follows those links through any number of
+  steps. Each entry says in `relation` whether the position raised the question, is its current
+  addressee, both, or neither and the question comes from below. The read takes exactly one of
+  `--person` and `--at`, refuses an `--at` that names no session or anchor, writes nothing and
+  makes no network connection.
+- **R61.** `koto decisions open --person <handle>` follows the current addressee: it lists a
+  question while the question waits on that person, whoever the question was raised to, and stops
+  once it is passed on to someone else. A pass-up reports nothing on the asking session's
+  `koto next`; R54's report of an answer applies to a question that was passed up as to any other.
 
 ### Non-functional
 
@@ -956,6 +996,39 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   leaves both sessions byte-identical; once a decision in the run cites the answer, the response
   has no `questions` key (R54).
 
+**Passing a question up**
+
+- [ ] With `worker` dispatched by `manager` and `manager` by `director`, and q1 raised in `worker`
+  to `session:manager`, `koto decisions readdress worker <id> --in manager --to session:director
+  --by session` exits 0, prints an entry of kind `readdress` and outcome `passed` whose target is
+  q1's identity, writes one file under `manager`'s `ctx/koto/aimed/<worker's session id>/`, and
+  leaves `worker` and `director` byte-identical; `koto decisions show worker <id>` prints the same
+  entry before and after (R55, R56).
+- [ ] A pass-up aimed at a missing decision, at one that isn't an `escalate`, at an untyped,
+  reversed or answered `escalate`, with a `--to` that is untyped, badly named or the current
+  addressee, or with `--by person:<handle>` exits 2 and writes nothing; `record --kind readdress`
+  is refused and a `reverse` aimed at a pass-up exits 2 (R55).
+- [ ] After `manager` has passed q1 to `director`, a second pass-up recorded in `manager`, or in a
+  session that never was q1's addressee, exits 2 and writes nothing; one recorded in `director`
+  or in `worker` exits 0, and the one from `worker` is stored in `worker` (R56, R57).
+- [ ] After q1 goes from `manager` to `director` and on to `person:owner`, every open read that
+  returns it shows `addressee` as person `owner` and `addressees` as `session:manager`,
+  `session:director`, `person:owner`, with `recipient` still `session:manager`; q2, raised beside
+  it and never passed up, shows one addressee (R58, R59).
+- [ ] `koto decisions open --at manager` and `--at director` each return q1 exactly once before
+  and after both pass-ups, and neither returns a question raised in an unrelated pair of sessions;
+  a question from an unlinked session raised to `session:director` is returned by `--at director`
+  until it is passed on, and never by `--at manager`; `--at` a session created with `--continues
+  manager --supersede` returns what `--at manager` did; `--at` an anchor returns the questions of a
+  session it dispatched or holds, and so does `--at` the anchor that dispatched it (R60).
+- [ ] `--person owner` returns q1 only once it waits on `owner`; a question raised to
+  `person:someone-else` and passed by its raiser to `person:owner` is returned for `owner` and not
+  for `someone-else`; `koto next worker` carries no `questions` key while q1 is passed up and
+  unanswered, and reports the answer once `director` answers it (R61).
+- [ ] `koto decisions open` with both `--person` and `--at`, or with neither, or with `--at` naming
+  no session, exits 2; both reads leave every session byte-identical and, under the cloud backend,
+  make no request to the bucket (R60).
+
 ## Out of Scope
 
 - **On whose behalf a decision was made.** Naming the person a session acted for is a later
@@ -995,11 +1068,13 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
-- **The rest of a question's life.** R49 to R54 are the first part of questions and answers. A
-  person's answer, which needs koto to verify the person gave it, precedence between answers to
-  one question, passing a question up to the next recipient, settling and withdrawing a question,
-  and how long questions and answers are kept are not covered yet, so R53's rule that any answer
-  closes a question is interim.
+- **The rest of a question's life.** R49 to R61 are the first part of questions and answers. A
+  person's answer, which needs koto to verify the person gave it, which answers to one question
+  count and the precedence between them, the rule on where a pass-up may go (beyond R57's rule on
+  who may record one), the re-judging of every stored pass-up at read time with the ones that break
+  a rule marked as not counted, settling and withdrawing a question, and how long questions and
+  answers are kept are not covered yet, so R53's rule that any answer closes a question, including
+  one from a session the question has moved away from, is interim.
 
 ## Known Limitations
 

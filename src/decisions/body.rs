@@ -20,7 +20,7 @@ pub const MAX_REASON_BYTES: usize = 4 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 64;
 
 /// The closed set of kinds and, for each, its closed set of outcomes (R1).
-pub const KINDS: [(&str, &[&str]); 10] = [
+pub const KINDS: [(&str, &[&str]); 11] = [
     ("accept", &["accepted", "rejected"]),
     ("merge", &["merged"]),
     ("gate-pass", &["passed"]),
@@ -31,6 +31,7 @@ pub const KINDS: [(&str, &[&str]); 10] = [
     ("reverse", &["reversed"]),
     ("refused", &["refused"]),
     ("answer", &["answered"]),
+    ("readdress", &["passed"]),
 ];
 
 /// The outcomes `kind` allows, or `None` for a kind outside R1's set.
@@ -185,6 +186,14 @@ impl DecisionBody {
         {
             return Err("an answer's body lacks the question it answers".to_string());
         }
+        if body.kind == "readdress"
+            && body
+                .target
+                .as_ref()
+                .is_none_or(|t| !is_decision_id(&t.decision))
+        {
+            return Err("a pass-up's body lacks the question it passes up".to_string());
+        }
         Ok(body)
     }
 }
@@ -275,6 +284,12 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
         required: &["session", "id", "text"],
         optional: &[],
     }];
+    // The question passed up, by its raising session's name and the
+    // escalation's id, and the typed recipient it now waits on.
+    const READDRESS: &[SubjectShape] = &[SubjectShape {
+        required: &["session", "id", "recipient"],
+        optional: &[],
+    }];
     match kind {
         "accept" => ACCEPT,
         "merge" => MERGE,
@@ -286,6 +301,7 @@ fn shapes(kind: &str) -> &'static [SubjectShape] {
         "reverse" => REVERSE,
         "refused" => REFUSED,
         "answer" => ANSWER,
+        "readdress" => READDRESS,
         _ => &[],
     }
 }
@@ -545,6 +561,11 @@ pub fn validate_stored(
     if parsed.kind == "answer" {
         return Err(invalid(
             "an answer isn't stored in koto/decisions/".to_string(),
+        ));
+    }
+    if parsed.kind == "readdress" {
+        return Err(invalid(
+            "a pass-up isn't stored in koto/decisions/".to_string(),
         ));
     }
     let mut subject = Vec::new();

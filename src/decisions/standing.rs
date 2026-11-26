@@ -67,6 +67,8 @@ pub mod reasons {
     pub const SUPERSEDE_UNCONFIRMED: &str = "supersede_unconfirmed";
     /// The decision is an `answer`, which a reversal doesn't overrule.
     pub const REVERSES_ANSWER: &str = "reverses_answer";
+    /// The decision is a `readdress`, which a reversal doesn't overrule.
+    pub const REVERSES_READDRESS: &str = "reverses_readdress";
 }
 
 /// R19's order: time, then the reverser's session name, then id, then the
@@ -130,6 +132,7 @@ pub struct Index {
     sessions: BTreeMap<String, Vec<Entry>>,
     reversals: BTreeMap<(String, String), Vec<DecisionBody>>,
     answers: BTreeMap<(String, String), Vec<DecisionBody>>,
+    readdresses: BTreeMap<(String, String), Vec<DecisionBody>>,
     /// Each fenced session's `decisions_through`, by session name (R37).
     cutoffs: BTreeMap<String, Option<String>>,
 }
@@ -177,6 +180,7 @@ impl Index {
     ) -> Self {
         let mut reversals: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
         let mut answers: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
+        let mut readdresses: BTreeMap<(String, String), Vec<DecisionBody>> = BTreeMap::new();
         for entries in sessions.values() {
             for entry in entries {
                 let Entry::Decision(b) = entry else { continue };
@@ -187,6 +191,7 @@ impl Index {
                 let into = match b.kind.as_str() {
                     "reverse" => &mut reversals,
                     "answer" if b.outcome == "answered" => &mut answers,
+                    "readdress" if b.outcome == "passed" => &mut readdresses,
                     _ => continue,
                 };
                 into.entry((t.id.clone(), t.decision.clone()))
@@ -198,6 +203,7 @@ impl Index {
             sessions,
             reversals,
             answers,
+            readdresses,
             cutoffs,
         }
     }
@@ -241,6 +247,22 @@ impl Index {
     pub fn answers_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
         let mut out: Vec<&DecisionBody> = self
             .answers
+            .get(&(session_id.to_string(), id.to_string()))
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| {
+            (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id))
+        });
+        out
+    }
+
+    /// Every `passed` pass-up aimed at decision `id` of the session whose
+    /// id is `session_id`, wherever it was recorded, earliest first by
+    /// time, then the recording session's name, then id: the order the
+    /// addressee history is built in.
+    pub fn readdresses_of(&self, session_id: &str, id: &str) -> Vec<&DecisionBody> {
+        let mut out: Vec<&DecisionBody> = self
+            .readdresses
             .get(&(session_id.to_string(), id.to_string()))
             .map(|v| v.iter().collect())
             .unwrap_or_default();
@@ -294,7 +316,7 @@ impl Index {
             return out;
         };
         out["status"] = json!(self.status(body));
-        if body.kind == "escalate" {
+        if body.kind == "escalate" || body.kind == "readdress" {
             if let Some(r) = body.subject.get("recipient").and_then(Value::as_str) {
                 out["recipient"] = body::Recipient::parse(r).to_json();
             }

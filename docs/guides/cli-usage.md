@@ -1678,17 +1678,22 @@ It fails closed. A marker koto can't read (a symlink, not a regular file, over 4
 
 ### decisions open
 
-Lists the questions open for a person, across every session in this host's store. A question is an `escalate` decision whose recipient is `person:<handle>`; it is open while it is in effect and no `answer` targets it. Open is worked out each time the command runs, and the command records nothing.
+Lists open questions across every session in this host's store, for a person or for a position. A question is an `escalate` decision with a typed recipient; it is open while it is in effect and no `answer` targets it. Open, and who a question waits on, are worked out each time the command runs, and the command records nothing. It takes exactly one of `--person` and `--at`; both or neither is a usage error (exit 2).
 
 ```bash
 koto decisions open --person <handle>
+koto decisions open --at <session-or-anchor>
 ```
 
 ```json
-{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"time":"2026-11-26T14:35:45.564Z"}]}
+{"v":1,"person":"owner","questions":[{"identity":"58eabc99-.../000000000001","session":"A","id":"000000000001","question":"q1","text":"Postgres or SQLite for the cache?","recipient":{"typed":true,"kind":"person","handle":"owner"},"addressee":{"typed":true,"kind":"person","handle":"owner"},"addressees":[{"typed":true,"kind":"person","handle":"owner"}],"time":"2026-11-26T14:35:45.564Z"}]}
 ```
 
-It takes no session argument and follows no link: a question is listed whatever its session's parent, anchor or chain. Questions are ordered by time, then session name and id. An `escalate` recipient is typed as `session:<name>`, `anchor:<name>` or `person:<handle>`; `decisions show` and `decisions list --format v1` return it as `recipient` beside the stored decision, and a recipient recorded with none of the prefixes reads as `{"typed":false,"value":"<as stored>"}` and is never a person's question.
+Every element carries `recipient`, the recipient the question was raised with; `addressee`, the one it waits on now; and `addressees`, every recipient it has had in order, starting with the one it was raised with. The last two change only through [decisions readdress](#decisions-readdress).
+
+`--person` lists the questions whose `addressee` is `person:<handle>`, so a question shows for a person only while it waits on that person. It follows no link: a question is listed whatever its session's parent, anchor or chain.
+
+`--at` lists, once each, the open questions raised in the named session or anchor, waiting on it now, or raised in a session below it. The position includes the sessions it continues through `--continues ... --supersede`. A session is directly below the dispatcher `koto session origin` reports for it and below the anchor holding it, and "below" goes down any number of those links, matched by session name. Each element adds `relation`: `raised`, `addressee`, `both`, or `below` when the question only comes from a session below. The response names the position as `"at"` in place of `"person"`. An `--at` naming no session or anchor exits 2. Questions are ordered by time, then session name and id. An `escalate` recipient is typed as `session:<name>`, `anchor:<name>` or `person:<handle>`; `decisions show` and `decisions list --format v1` return it as `recipient` beside the stored decision, and a recipient recorded with none of the prefixes reads as `{"typed":false,"value":"<as stored>"}` and is never a person's question.
 
 ### decisions answer
 
@@ -1700,7 +1705,19 @@ koto decisions answer <raiser-session> <decision-id> --in <session> --text <text
 
 The answer's target is the question's identity, the raiser's session id with the decision id, so it never answers a later session that reuses the name. It is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session, and nothing is written in the raiser's session. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","decision":{...}}` and exits 0. Once recorded, the question no longer lists in `decisions open`, and the raiser's `koto next` reports the answer in its `questions` array.
 
-Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), when `--in` names the raiser, or when the answer would be recorded for a person (`--by person:<handle>`: koto can't yet verify that the person gave it). An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question; a person's answer, precedence between answers and passing a question up aren't built yet.
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision, `invalid_decision` when it isn't an `escalate`, when its recipient is untyped, when it doesn't read `in-effect` (a reversed question takes no answer), when `--in` names the raiser, or when the answer would be recorded for a person (`--by person:<handle>`: koto can't yet verify that the person gave it). An answer can't be reversed; `decisions reverse` aimed at one is refused with `reverses_answer`. For now any answer closes its question, even after it has been passed up past the answering session; a person's answer and which answers count aren't built yet.
+
+### decisions readdress
+
+Passes a question up to a new recipient, recording a `readdress` decision with outcome `passed`. The question keeps its identity: its `escalate` is unchanged, and `decisions show` prints it as raised.
+
+```bash
+koto decisions readdress <raiser-session> <decision-id> --in <session> --to <recipient> [--by session] [decider flags]
+```
+
+`--to` is typed like an `escalate`'s recipient: `session:<name>`, `anchor:<name>` or `person:<handle>`. `--in` is the session recording the pass-up, and it has to be the raiser or the session or anchor the question waits on now. The entry's target is the question's identity, and it is written under `ctx/koto/aimed/<raiser's session id>/` in the `--in` session and nowhere else. Prints `{"v":1,"session":...,"id":...,"status":"in-effect","question":"<identity>","addressee":{...},"addressees":[...],"decision":{...}}` and exits 0. From then on `decisions open` shows the new `addressee`, `--person` follows it, and the raiser's `koto next` is unchanged: a pass-up reports nothing until an answer comes.
+
+Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no such decision; `invalid_decision` with field `id` when it isn't an `escalate`, its recipient is untyped, it doesn't read `in-effect` or it is already answered; with field `to` when `--to` has no type prefix, a bad name or handle, or names the current addressee; with field `in` when `--in` is neither the raiser nor the current addressee; and with field `by` for `--by person:<handle>`. `decisions record --kind readdress` is refused, and `decisions reverse` aimed at a pass-up is refused with `reverses_readdress`. Where a question may be passed, beyond who may pass it, isn't checked yet.
 
 ### decider answer
 
