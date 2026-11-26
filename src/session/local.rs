@@ -1080,8 +1080,14 @@ impl ContextStore for LocalBackend {
             }
             let _ = fs::remove_file(&key_lock_path);
 
+            // A key the manifest doesn't list leaves it as it is. A deferred
+            // cloud removal takes this lock in a session with no ctx
+            // directory, creating one, and an empty manifest written here
+            // would go up over the bucket's at the next push.
             let mut manifest = self.read_manifest(session)?;
-            manifest.keys.remove(key);
+            if manifest.keys.remove(key).is_none() {
+                return Ok(());
+            }
             self.write_manifest(session, &manifest)
         })
     }
