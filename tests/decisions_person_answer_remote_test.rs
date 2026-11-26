@@ -285,7 +285,11 @@ fn an_imported_copy_reads_the_answer_as_a_remote_sessions_answer() {
         .exists());
 
     assert_remote(&second.ok(&ws_b, None, &["decisions", "show", ANSWERER, &answer.id]));
-    let listed = second.ok(&ws_b, None, &["decisions", "list", ANSWERER, "--format", "v1"]);
+    let listed = second.ok(
+        &ws_b,
+        None,
+        &["decisions", "list", ANSWERER, "--format", "v1"],
+    );
     let entry = listed["decisions"]
         .as_array()
         .unwrap()

@@ -958,9 +958,9 @@ structure lacks fails the build. At run time a missing field fails the `shape` c
 reading as absent: the trust rests on a format koto observes and doesn't own, and a change to it
 must refuse answers, not misread them.
 
-**Reuse.** One call position verifies one answer. The answering session's listing is scanned for
-an answer citing the same pointer before any check, and again inside the write lock, so two
-answers racing on one position leave one entry. The lock is the answering session's, so two
+**Reuse.** One call position verifies one answer. Every local answer to the question is scanned
+for one citing the same pointer before any check, and the answering session's listing again
+inside the write lock, so two answers racing on one position leave one entry. The lock is the answering session's, so two
 different answering sessions citing one position at once aren't serialized; the PRD records that
 limit.
 

@@ -1,5 +1,6 @@
 //! The question-prompt evidence behind a person's answer (PRD R55 to R61;
-//! DESIGN-decision-record.md, Decision 9).
+//! DESIGN-decision-record.md, "A person's answer and the question content
+//! area").
 //!
 //! A person's `answer` is recorded only when the harness's own record of
 //! the answering session holds a question-prompt call that showed the
@@ -442,6 +443,10 @@ pub fn verify(
         Some(Value::Object(m)) => m,
         _ => return Err(Check::Result),
     };
+    // The reply must be the person's: an accepted decision whose source is
+    // one of the user's own choices. Those sources share the `user` prefix
+    // (a hook or a rule names another), and the prefix rather than one
+    // observed value keeps a person's other replies from being refused.
     if decision.get("decision").and_then(Value::as_str) != Some("accept")
         || !decision
             .get("source")

@@ -1,5 +1,6 @@
 //! The question content area, `koto/packets/` (PRD R62 to R64;
-//! DESIGN-decision-record.md, Decision 9).
+//! DESIGN-decision-record.md, "A person's answer and the question content
+//! area").
 //!
 //! An escalate names its question in a short `text`; the content a person
 //! is shown, the full question and its option labels, can be longer. It is
