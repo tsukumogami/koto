@@ -102,6 +102,9 @@ jobs:
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
 
+      - name: Run the questions cost test in release mode
+        run: cargo test --locked --release --test questions_cost -- --nocapture
+
   pool-tick-cost:
     # Host resource pools' cost bound (PRD-host-resource-pools.md R28): the
     # median of 50 ticks on a state whose action names an undefined pool is

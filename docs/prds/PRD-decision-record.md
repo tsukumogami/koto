@@ -708,7 +708,8 @@ to an id-shaped value, and both say so.
   answered ones, `koto decisions open --person`, `koto decisions open --at` a top coordinator and the
   `questions` read on `koto next` each finish in under five seconds on a release build and return
   the counts the store was built with. The same holds with the store under the cloud test backend,
-  where none of the three reads makes a request to the bucket. On the same store, a terminal tick of
+  where neither open read makes a request to the bucket and the `questions` read adds none to the
+  sync every cloud tick makes. On the same store, a terminal tick of
   a session holding an open question, and a refused cleanup of it, each finish in under five seconds.
 
 ### Non-functional
@@ -1136,8 +1137,8 @@ an `escalate` A records with `recipient=person:owner`.
   raised in one session, its wake file is under 64 KiB (R67).
 - [ ] `cargo test --release --test questions_cost` builds the store R68 describes under a temporary
   directory and asserts the five-second bound and the counts for each read, on the local backend
-  and under the in-process cloud test endpoint, which records no request from any of the three
-  reads, and the bound for the terminal tick and the refused cleanup; a debug build checks the
+  and under the in-process cloud test endpoint, which records no request from either open read
+  and, for `koto next`, exactly the requests a session holding no question makes, and the bound for the terminal tick and the refused cleanup; a debug build checks the
   counts on a store a tenth the size and asserts no time. `cargo test --release --test
   retention_cost` passes with its bounds and fixtures unedited (R68).
 

@@ -969,15 +969,18 @@ directory, a store of 1,000 sessions in dispatcher chains at least three deep wi
 questions (to a person, to sessions, passed up once or twice) beside answered ones, and asserts
 that `open --person`, `open --at` a top coordinator and `koto next`'s `questions` read each finish
 under five seconds and return the intended counts, locally and under the in-process cloud test
-endpoint, which sees no request from any of them (R68). Measured on a release build:
+endpoint. The endpoint sees no request from either open read. A cloud `koto next` syncs its
+session as every tick does, and the test asserts that a session holding an answered question makes
+exactly the requests a session holding none makes, so the `questions` read adds none (R68).
+Measured on a release build on a 32-core Linux host:
 
 | Operation | Local | Cloud test backend |
 |-----------|-------|--------------------|
-| `koto decisions open --person owner` | `<TBD ms>` | `<TBD ms>` |
-| `koto decisions open --at <top coordinator>` | `<TBD ms>` | `<TBD ms>` |
-| `koto next` with an answered, uncited question | `<TBD ms>` | `<TBD ms>` |
-| terminal tick of a session holding an open question | `<TBD ms>` | |
-| refused `koto session cleanup` of that session | `<TBD ms>` | |
+| `koto decisions open --person owner` | 68 ms | 71 ms |
+| `koto decisions open --at <top coordinator>` | 107 ms | 105 ms |
+| `koto next` with an answered, uncited question | 111 ms | 121 ms |
+| terminal tick of a session holding an open question | 227 ms | not measured|
+| refused `koto session cleanup` of that session | 60 ms | not measured|
 
 **Older binaries.** A binary older than this change doesn't know the `answer` kind, so it reads an
 answer entry as unreadable; it reads a typed recipient as the plain string it is stored as. A

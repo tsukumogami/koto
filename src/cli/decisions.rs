@@ -1206,7 +1206,7 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         })
     })
     .unwrap_or_else(|e| refuse(COMMAND, &e));
-    ring_asker(name);
+    ring_asker(backend, name);
 
     println!(
         "{}",
@@ -1230,13 +1230,20 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
 /// koto root, an unwritable wakes directory, a symlink, a directory or a
 /// FIFO at the path) is one warning on stderr, and the path is left as it
 /// was.
-fn ring_asker(asker: &str) {
+fn ring_asker(backend: &Backend, asker: &str) {
+    use crate::engine::wake_signal::ring;
     let Some(root) = crate::koto_home::koto_home() else {
         eprintln!("warning: no wake delivered to {asker:?}: the koto root can't be resolved");
         return;
     };
-    if let Err(e) = crate::engine::wake_signal::ring_forwarded(&root, asker) {
-        eprintln!("warning: could not deliver a wake to {asker:?}: {e}");
+    // The succession is read from the sessions directory this command
+    // used, wherever it sits, so a moved sessions base still reaches the
+    // newest session continuing the asker.
+    let newest = crate::engine::supersede_chain::newest_member(backend.local_base_dir(), asker);
+    for session in std::iter::once(asker.to_string()).chain(newest) {
+        if let Err(e) = ring(&root, &session) {
+            eprintln!("warning: could not deliver a wake to {session:?}: {e}");
+        }
     }
 }
 
