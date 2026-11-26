@@ -2839,7 +2839,9 @@ impl CloudBackend {
     /// so from then on it is a bare file the sync doesn't track (R20a). A
     /// copy with neither file costs two `stat` calls and no request; a
     /// failed upload warns, keeps the entry and the session stays kept from
-    /// the local pin until a later push carries it.
+    /// the local pin until a later push carries it. A record the bucket
+    /// holds whose entry couldn't be dropped, because the manifest stayed
+    /// busy, warns that only the entry is kept.
     fn carry_pin_records(&self, id: &str) {
         let ctx = self.local.session_dir(id).join("ctx");
         if !ctx.join(crate::session::pin::PIN_KEY).exists()
@@ -2848,7 +2850,16 @@ impl CloudBackend {
             return;
         }
         if let Err(e) = crate::session::pin::carry_indexed(self, id) {
-            eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}");
+            if e.downcast_ref::<crate::session::pin::CarryManifestBusy>()
+                .is_some()
+            {
+                eprintln!(
+                    "warning: cloud sync: the pin of '{id}' is in the bucket, and only its \
+                     index entry is kept: {e:#}"
+                );
+            } else {
+                eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}");
+            }
         }
     }
 
@@ -3846,15 +3857,25 @@ impl CloudBackend {
         self.push_state_after_write(id)
     }
 
-    /// [`SessionBackend::add_context_locked`] with the wait for the local
-    /// log's append lock bounded by `wait`.
+    /// [`SessionBackend::add_context_locked`] with the wait for the session's
+    /// manifest lock and then the local log's append lock bounded by `wait`
+    /// in all.
     ///
-    /// The lock is taken once, before the pull, and passed to the pull's
-    /// replacement of the local log and to the append, so neither takes it
-    /// again; it is released before the push. Everything between runs under
-    /// it, the pull's requests and the store's upload included: a header
-    /// rewrite or another process's pull waits for it, for at most its own
-    /// bounded wait, and comes back busy if the bucket is slow.
+    /// The manifest lock comes first, as it does for every context write,
+    /// and is held to the end; the store write inside runs under it rather
+    /// than taking it again. A manifest lock still held elsewhere once
+    /// `wait` has passed is
+    /// [`StateLogBusy`](crate::engine::persistence::StateLogBusy), with
+    /// nothing stored. A session with no local directory takes no manifest
+    /// lock, whose file would create it, and fails at the pull or the
+    /// header read, having created nothing.
+    ///
+    /// The append lock is taken once, before the pull, and passed to the
+    /// pull's replacement of the local log and to the append, so neither
+    /// takes it again; it is released before the push. Everything between
+    /// runs under it, the pull's requests and the store's upload included: a
+    /// header rewrite or another process's pull waits for it, for at most
+    /// its own bounded wait, and comes back busy if the bucket is slow.
     ///
     /// The batch lock, where a step takes it (the pull's flush of an open
     /// batch, the store write or the append inside a tick or write window),
@@ -3870,9 +3891,34 @@ impl CloudBackend {
         timestamp: &str,
         wait: std::time::Duration,
     ) -> anyhow::Result<()> {
-        // Before the lock and the pull, as `read_header` checks it, so a
+        // Before the locks and the pull, as `read_header` checks it, so a
         // migrated session's local directory gains nothing.
         self.check_not_migrated(id)?;
+        if !self.local.session_dir(id).is_dir() {
+            return self.add_context_steps(id, store_write, event, timestamp, wait);
+        }
+        let started = std::time::Instant::now();
+        let locked = self.local.with_manifest_lock_within(id, wait, || {
+            let remaining = wait.saturating_sub(started.elapsed());
+            self.add_context_steps(id, store_write, event, timestamp, remaining)
+        })?;
+        locked.ok_or_else(|| {
+            let waited = started.elapsed();
+            crate::engine::persistence::StateLogBusy::new(self.local.state_path(id), waited).into()
+        })
+    }
+
+    /// The steps of [`CloudBackend::add_context_locked_within`] under the
+    /// local log's append lock, waited for at most `wait`: the pull, the
+    /// header check, the store write and the append.
+    fn add_context_steps(
+        &self,
+        id: &str,
+        store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+        event: &crate::engine::types::EventPayload,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<()> {
         let held = crate::engine::persistence::hold_log_lock(&self.local.state_path(id), wait)?;
         self.sync_pull_state_held(id, Some(&held))?;
         let header = self.local.read_header(id)?;
@@ -5516,9 +5562,15 @@ impl CloudBackend {
         // Inside a tick on this session, or a write window on it: record the
         // key, then write it, and leave the push to the tick or the window's
         // `koto session flush`. Recorded first, so a write that stops
-        // half way is still one the flush looks at.
-        if self.defers(session) {
-            if let Some((journal, lock)) = self.open_batch(session)? {
+        // half way is still one the flush looks at. The manifest lock is
+        // taken before the batch lock, the order every context write takes
+        // them in, and the local write runs under it. A session with no
+        // local directory opens no batch, so it takes no lock here either.
+        if self.defers(session) && self.local.session_dir(session).is_dir() {
+            let batched = self.local.with_manifest_lock(session, || {
+                let Some((journal, lock)) = self.open_batch(session)? else {
+                    return Ok(false);
+                };
                 journal.record(
                     &lock,
                     &batch::Op::Add {
@@ -5526,6 +5578,9 @@ impl CloudBackend {
                     },
                 )?;
                 write()?;
+                Ok(true)
+            })?;
+            if batched {
                 return Ok(KeyPush::Batched);
             }
         }
@@ -5977,7 +6032,10 @@ impl ContextStore for CloudBackend {
             }
         };
         if self.defers(session) {
-            if let Some((journal, lock)) = self.open_batch(session)? {
+            let record_and_remove = || -> anyhow::Result<bool> {
+                let Some((journal, lock)) = self.open_batch(session)? else {
+                    return Ok(false);
+                };
                 journal.record(
                     &lock,
                     &batch::Op::Remove {
@@ -5986,6 +6044,18 @@ impl ContextStore for CloudBackend {
                 )?;
                 self.local.remove(session, key)?;
                 forget_owed();
+                Ok(true)
+            };
+            // The manifest lock before the batch lock, the order every
+            // context write takes them in; the local removal runs under it.
+            // A session with no ctx directory has no manifest to update, and
+            // taking the lock would create the directory.
+            let batched = if self.local.ctx_path(session).is_dir() {
+                self.local.with_manifest_lock(session, record_and_remove)?
+            } else {
+                record_and_remove()?
+            };
+            if batched {
                 return Ok(());
             }
         }

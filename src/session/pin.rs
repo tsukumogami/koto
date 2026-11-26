@@ -74,6 +74,33 @@ pub const RELEASE_PIN: &str = "release-pin";
 /// How long [`pin`] and [`unpin`] wait for the session's lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
+/// How long [`carry_indexed`] waits for the session's manifest lock to drop
+/// a carried record's entry. A flush carries holding the batch lock, and a
+/// pull holding the append lock, and both come after the manifest lock, so
+/// the wait is bounded: a busy manifest leaves the record indexed for the
+/// next push to carry.
+const CARRY_MANIFEST_WAIT: Duration = Duration::from_secs(2);
+
+/// [`carry_indexed`] found the bucket holding record `key` but couldn't
+/// drop its index entry within [`CARRY_MANIFEST_WAIT`]: the record is in
+/// the bucket, and only the entry stays for the next push to drop.
+#[derive(Debug)]
+pub(crate) struct CarryManifestBusy {
+    pub(crate) key: String,
+}
+
+impl std::fmt::Display for CarryManifestBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the session's manifest is busy, so '{}' stays indexed and is carried on the next push",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for CarryManifestBusy {}
+
 /// A readable pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pin {
@@ -624,9 +651,18 @@ pub(crate) fn carry_indexed(
                     }
                 })
                 .and_then(|()| {
-                    local.update_manifest_locked(name, |m| {
-                        m.keys.remove(key);
-                    })
+                    let updated =
+                        local.update_manifest_locked_within(name, CARRY_MANIFEST_WAIT, |m| {
+                            m.keys.remove(key);
+                        })?;
+                    if updated {
+                        Ok(())
+                    } else {
+                        Err(CarryManifestBusy {
+                            key: key.to_string(),
+                        }
+                        .into())
+                    }
                 }),
             // Nothing to upload: an unreadable record stays as this host
             // reads it, indexed, and keeps the session from here.
