@@ -22,6 +22,8 @@
 
 #[path = "support/golden_store.rs"]
 mod golden_store;
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 
