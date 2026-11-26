@@ -591,8 +591,8 @@ to an id-shaped value, and both say so.
   session's id with the question's identifier, never the session's name alone, so a later session
   that reuses the name is not answered by it. koto refuses an answer whose question doesn't exist,
   isn't an `escalate`, has an untyped recipient or doesn't read `in-effect` (a reversed question
-  takes no answer), an answer given in the asking session itself, and an answer whose decider is
-  a person, which koto can't yet verify; each refusal exits 2 and writes nothing. An
+  takes no answer), an answer given in the asking session itself, and a person's answer that fails
+  R62 to R67; each refusal exits 2 and writes nothing. An
   answer is never reversed: a `reverse` aimed at one is refused and recorded as `refused` (R18).
   `koto decisions record` doesn't take the `answer` kind; `koto decisions answer` records it.
 - **R51.** An answer is recorded in the session it is given in, beside the reversals that session
@@ -659,6 +659,81 @@ to an id-shaped value, and both say so.
   question while the question waits on that person, whoever the question was raised to, and stops
   once it is passed on to someone else. A pass-up reports nothing on the asking session's
   `koto next`; R54's report of an answer applies to a question that was passed up as to any other.
+
+**A person's answer**
+
+- **R62.** A person's answer (`--by person:<handle>`) is recorded only with evidence that the
+  person was asked: `--prompt <harness>/<call>/<position>`, naming a harness session, a call in
+  that session's record of its question prompts, and the 1-based position of the question within
+  that call. Without `--prompt`, a person's answer is refused with a message saying it needs the
+  question-prompt evidence. A session's answer (`--by session`) takes no `--prompt` and is refused
+  with one. A question can take a person's answer only when its `escalate` carries a `packet`
+  (R69) and its content is stored.
+- **R63.** koto finds the record from the harness session alone: the named harness session must
+  be the one running the command, as `CLAUDE_CODE_SESSION_ID` reports it (R47), and, when koto has
+  recorded a harness session driving the answering koto session (at its creation or on a later
+  command), the same one. Exactly one regular file named `<harness>.jsonl`, not itself a symbolic
+  link, must sit one directory below `.claude/projects/` in the effective user's home as the
+  account database gives it, never `$HOME`, and its canonical path must lie under the root's
+  canonical path (a symbolic link to `.claude` itself is followed). `CLAUDE_CONFIG_DIR` isn't read.
+  The harness session id is an unauthenticated value from the environment: any process running as
+  the user can set it. The driver binding catches a mismatch where a driver is recorded; it narrows
+  nothing against a deliberate forger, who picks `--in`, can use a session created without the
+  harness variable (which records no driver) and can delete the sidecar that holds it.
+- **R64.** The call must be the harness's question tool, `AskUserQuestion`; the position must
+  name one of its questions; and that question's `header` must be the question's prompt header,
+  `#` followed by the first 11 hexadecimal digits of the SHA-256 of `<asking session id>/<question
+  id>`, compared byte for byte. `koto decisions show` and `list --format v1` return the header as
+  `prompt_header` on every `escalate` that carries a `packet`.
+- **R65.** The question text and the option labels the call showed equal the stored content's
+  `question` and `options[].label`, byte for byte and in order: no trimming, no case folding and no
+  Unicode normalization. An option dropped, added or moved fails.
+- **R66.** The call's result must be the person's reply: not an error, with a permission decision
+  of `accept` whose source is exactly one the captured records show for a reply the user gave
+  (`user_temporary`), and an answer for the question's text. The call and its result must both be
+  lines of the harness session's own conversation, not a side conversation's (`sidechain`), and
+  the call must have been made no earlier than the question was raised (`time`). The answer's text
+  is the result's answer for that question, whatever `--text` the caller passed. Only lines that
+  contain the call id are parsed. A record whose call or result lacks a field koto reads, holds two
+  questions with the same text, holds the call or its result on more than one line, puts the result
+  before the call, has a line holding the call id that isn't valid JSON, or has a line over 16 MiB
+  or more than 1 GiB in all fails with the `shape` check, so a change in the harness's record
+  format refuses answers instead of misreading them.
+- **R67.** One position of one call verifies one answer on a host. Before writing, an answer takes
+  a marker under the koto root named for the harness session, call and position, locked while it
+  writes and freed if the write fails; a second answer citing the same position, from any
+  answering session on the host, is refused while the marker is locked or a stored answer on the
+  host cites the position, so of two answers racing on one position exactly one is recorded. A
+  marker left by a process that stopped before publishing, with no stored answer citing it, is
+  taken over.
+- **R68.** A verified answer stores the pointer and a mark, `verified`, labelled `observed`; no
+  caller input produces it. The answering host keeps a note of each answer it verified in the
+  answering session's directory, outside its context, which no sync, pull or import carries,
+  written before the answer is published. Each note line is sealed: a SHA-256 over a host identity
+  koto keeps under its root (created once, published whole, never synced or imported, and not used
+  when its group or others may write it), the session directory's name and the SHA-256 of the
+  stored answer. A read
+  shows the answer as `verified` only when the note in the directory it read the answer from holds
+  that answer's sealed line. Anywhere else (a copy brought by a pull or an import, on this host or
+  another, a session directory copied by hand to another koto root, a line written for another
+  body) a read shows the mark as `remote` and the reading "a remote session's answer". `show`,
+  `list --format v1` and the `questions` on `koto next` all give that reading; `koto context get`
+  prints the stored body, whose mark is not the reading. Reading never opens the harness record, so
+  a record removed later doesn't change the reading. `koto session import` carries the decision
+  areas and the content area, every body the source recorded itself byte for byte, and the copy
+  reads a carried body as its own.
+- **R69.** An `escalate` may carry `packet=sha256:<64 lowercase hex digits>`, the hash of the
+  question's content. `koto decisions content write <session> <id> --file <path>` stores that
+  content once under the asking session's `koto/packets/<id>`: at most 16 KiB, refused when its
+  hash isn't the `packet`, when the question carries none, or when content is already stored. No
+  context command writes or removes a key under `koto/packets/`.
+- **R70.** `koto decisions content read <session id>/<question id>` prints the stored content
+  byte for byte, from any session or directory.
+- **R71.** Every refusal of a person's answer exits 2 with code `prompt_unverified`, field
+  `prompt`, and a message naming the pointer and the check that failed (`session`, `record`,
+  `call`, `tool`, `position`, `identity`, `question-text`, `options`, `result`, `sidechain`,
+  `time`, `shape`, `call-position-reused` or `content`). No text from the record appears in koto's
+  output.
 
 ### Non-functional
 
@@ -986,8 +1061,8 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   B's `ctx/koto/aimed/<A's session id>/` and leaves every file in A byte-identical; afterwards the
   question is no longer open (R50, R51, R53).
 - [ ] An answer aimed at a missing decision, at a decision that isn't an `escalate`, at an
-  untyped or reversed `escalate`, from the asking session, or with `--by person:<handle>` exits 2
-  and writes nothing in either session (R50).
+  untyped or reversed `escalate`, from the asking session, or with `--by person:<handle>` and no
+  `--prompt` exits 2 and writes nothing in either session (R50, R62).
 - [ ] After the answering session is removed and a new session of the same name answers another
   question with the same answer identifier, the asker's earlier citation doesn't end the report of
   the new answer (R54).
@@ -1040,6 +1115,38 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   no session, exits 2; both reads leave every session byte-identical and, under the cloud backend,
   make no request to the bucket (R60).
 
+**A person's answer**
+
+- [ ] With a record copied in structure from a real accepted question prompt, a person's answer
+  citing it is recorded with the result's answer text even when `--text` says otherwise, shows
+  `verified` labelled `observed` and a decider handle labelled `handed`, and each of three
+  positions in one call verifies its own answer once (R62, R66, R68).
+- [ ] A missing call, a call to another tool, another question's header, a position outside the
+  call, a denied call, a permission source outside the allow-list (`userSettings`, `user_abort`),
+  a call or result in a side conversation, a call made before the question was raised, a call in
+  another harness session's record, a record under a redirected `HOME`, and a harness session
+  other than the one koto recorded for the answering session each exit 2 with the check named,
+  write nothing, and print no record text (R63, R64, R66, R71).
+- [ ] A shown question text with one byte changed, with trailing whitespace or in another Unicode
+  normalization, and labels with one byte changed, in another case, dropped, added or swapped,
+  each fail (R65).
+- [ ] A renamed field in the call, a missing field in the result, a result with no answer for the
+  question, an invalid JSON line holding the call id, a result before its call, a call id on two
+  lines and a line over 16 MiB each fail with `shape` (R66).
+- [ ] A second answer citing a used position fails with `call-position-reused` and leaves the
+  first unchanged; of two answers started together on one position, from one answering session
+  or from two, twenty times over, exactly one is recorded each time (R67).
+- [ ] On the recording host the answer reads `verified` after its session syncs and after the
+  record is removed; a pulled copy on another host, holding the same bytes, reads "a remote
+  session's answer" with mark `remote`; an imported copy, on another host or under a new name on
+  the recording host, never reads it `verified`; nor does the sessions directory copied with its
+  note to another koto root, or a hand-written body named by a note line, bare or carrying a real
+  line's seal; the `questions` on `koto next` give the same reading (R68).
+- [ ] Content of exactly 16 KiB is stored and 16 KiB plus one byte is refused naming the cap; a
+  second write is refused and the first bytes stay; content that doesn't hash to the `packet` is
+  refused; `context add` under `koto/packets/` is refused; a read from another session prints the
+  bytes written (R69, R70).
+
 ## Out of Scope
 
 - **On whose behalf a decision was made.** Naming the person a session acted for is a later
@@ -1079,9 +1186,8 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
-- **The rest of a question's life.** R49 to R61 are the first part of questions and answers. A
-  person's answer, which needs koto to verify the person gave it, which answers to one question
-  count and the precedence between them, the rule on where a pass-up may go (beyond R57's rule on
+- **The rest of a question's life.** R49 to R71 are the first parts of questions and answers.
+  Which answers to one question count and the precedence between them, the rule on where a pass-up may go (beyond R57's rule on
   who may record one), the re-judging of every stored pass-up at read time with the ones that break
   a rule marked as not counted, settling and withdrawing a question, and how long questions and
   answers are kept are not covered yet, so R53's rule that any answer closes a question, including
@@ -1117,6 +1223,25 @@ terminal`. Then `koto init S --continues P --supersede` fences P.
   deciding session that names a person can clear a block a person's reversal through that same
   session caused (R22). The replacement names the decider it claimed, so the claim is visible, as
   any other forged person decision is.
+- A person's answer is verified against the harness's own record of its question prompts, a file
+  format koto observes and doesn't own. The `shape` check refuses a record whose format changed,
+  but anything running as the operator can write a record that passes, in the account's own
+  `.claude/projects`, and can set `CLAUDE_CODE_SESSION_ID`; the evidence shows the prompt happened
+  as recorded, not that no one wrote the record.
+- The verified reading protects against a session mistaking a relayed or typed remark for an
+  answered prompt, and against copies that arrive by import or pull. It is not protection against a
+  process running as the same user that sets out to forge: reading the koto root's `host-id` is
+  enough to seal a hand-written answer that was never prompted, with no harness record at all. A
+  copy of the whole koto root, `host-id` included, on another machine still reads verified, and so
+  does a session directory restored in place.
+- A harness configured with `CLAUDE_CONFIG_DIR` keeps its records outside `~/.claude/projects`,
+  so a person's answer there always fails the `record` check. koto doesn't honour the variable,
+  since any process can set it.
+- R67's marker is per host. Two hosts answering from copies of one harness record aren't
+  serialized. Once the session holding the answer that used a position is removed from the host, no
+  stored answer cites it and the position can verify another answer.
+- `koto session import` carries the decisions its source recorded itself, not the ones the source
+  carried from an earlier import: a copy of a copy holds only its immediate source's own decisions.
 
 ## Decisions and Trade-offs
 
