@@ -1166,6 +1166,8 @@ koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
 
+It works from any directory on the host that holds the session's copy, and it doesn't first push a batch a failed push left open: `--keep local` uploads that batch's writes with the rest of the session, and `--keep remote` drops them.
+
 `--keep local` uploads every context key the bucket doesn't hold as this host has it, then the manifest, the state file and `version.json`. A key whose upload the bucket doesn't confirm stays out of the manifest, and the command exits non-zero naming it after the rest went up. Run it again once the bucket answers.
 
 `--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
