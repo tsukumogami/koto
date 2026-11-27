@@ -77,6 +77,13 @@ fn call_budget() -> Duration {
     TEST_CALL_BUDGET.with(|b| b.get())
 }
 
+/// Give this thread's flushes a call budget other than the real one, until
+/// the next [`reset_for_test`].
+#[cfg(test)]
+pub(crate) fn set_call_budget_for_test(budget: Duration) {
+    TEST_CALL_BUDGET.with(|b| b.set(budget));
+}
+
 /// One queued record: its line as it will be sent, and the session it
 /// belongs to, for the count if it is dropped.
 struct Queued {
@@ -311,7 +318,7 @@ mod tests {
         /// the host is at starting the stub.
         fn unhurried() -> Self {
             let f = Fixture::new();
-            TEST_CALL_BUDGET.with(|b| b.set(Duration::from_secs(120)));
+            set_call_budget_for_test(Duration::from_secs(120));
             f
         }
 

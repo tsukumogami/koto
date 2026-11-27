@@ -464,6 +464,13 @@ pub fn run_shell_command(
     timeout_secs: u32,
     env: &CommandEnv,
 ) -> CommandOutput {
+    // Send the session records queued so far before anything else, so what
+    // led up to the command is out even if the command runs long. The
+    // command's time limit is measured from the spawn below, after the
+    // flush has returned, so no flush ever sits inside it. With nothing
+    // queued, or no sink, this returns at once.
+    crate::telemetry::flush();
+
     let timeout = if timeout_secs == 0 {
         Duration::from_secs(DEFAULT_TIMEOUT_SECS)
     } else {

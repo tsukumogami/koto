@@ -499,6 +499,9 @@ impl<'a> CliCheckEvaluator<'a> {
             if let Some(hold) = self.try_lock() {
                 return Some(hold);
             }
+            // About to wait on another tick's lock: send what is queued
+            // first. Every poll after the first finds the queue empty.
+            crate::telemetry::flush();
             let now = Instant::now();
             if now >= deadline {
                 return None;
@@ -922,6 +925,9 @@ impl<'a> CliCheckEvaluator<'a> {
         let mut c = Consulted::unsent(CheckOutcome::Unanswered(UnansweredReason::ProviderError));
         while c.attempts < MAX_ATTEMPTS {
             c.attempts += 1;
+            // Queued session records go out before the provider is called,
+            // and before the clock starts. A retry finds the queue empty.
+            crate::telemetry::flush();
             let started = Instant::now();
             let answer = self.decider.decide(request);
             c.latency_ms += started.elapsed().as_millis() as u64;
@@ -1493,6 +1499,99 @@ mod tests {
         );
         let hashes = declaration_hashes(&BTreeMap::from([("comments".to_string(), gate.clone())]));
         evaluator.evaluate("comments", gate, &hashes["comments"])
+    }
+
+    /// A provider that fails every call with an error koto retries. Its
+    /// first call queues records, as if something had been journaled, and
+    /// every call notes how many records the sink had received by then.
+    #[cfg(unix)]
+    struct QueuesThenFails {
+        sink: Arc<crate::telemetry::sink_fixture::SinkFixture>,
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[cfg(unix)]
+    impl Decider for QueuesThenFails {
+        fn provider(&self) -> &str {
+            "test"
+        }
+
+        fn decide(
+            &self,
+            _req: &DecisionRequest,
+        ) -> Result<DecisionResponse, crate::decider::types::DeciderError> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(self.sink.received());
+            if seen.len() == 1 {
+                self.sink.queue(3);
+            }
+            Err(crate::decider::types::DeciderError::new(
+                crate::decider::types::ErrorClass::Connect,
+                "no provider in this test",
+            ))
+        }
+    }
+
+    /// Flush point: a decider check sends what is queued before each
+    /// provider call. The gate's own command runs first and flushes an
+    /// empty queue, so the records the first provider call queues can only
+    /// reach the sink through the flush inside the retry loop, and the
+    /// second call finds them already there.
+    #[cfg(unix)]
+    #[test]
+    fn decider_flush_precedes_provider_call() {
+        // The sink goes in after the session exists, so nothing the setup
+        // journals is queued.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let sink = Arc::new(crate::telemetry::sink_fixture::SinkFixture::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate = check_gate(&[("r", CheckMode::Veto)]);
+        let env = CommandEnv::inherit();
+        let evaluator = CliCheckEvaluator::new(
+            &backend,
+            "wf",
+            Box::new(QueuesThenFails {
+                sink: Arc::clone(&sink),
+                seen: Arc::clone(&seen),
+            }),
+            GlobalMode::Auto,
+            SettingOrigin::Default,
+            ConsultBudget::new(),
+            tmp.path(),
+            &env,
+        );
+        let hashes = declaration_hashes(&BTreeMap::from([("comments".to_string(), gate.clone())]));
+        evaluator.evaluate("comments", &gate, &hashes["comments"]);
+        assert_eq!(*seen.lock().unwrap(), vec![0, 3]);
+    }
+
+    /// Flush point: a tick about to wait on another tick's lock sends what
+    /// is queued first. The evaluator's lock wait is zero here, so the loop
+    /// gives up without sleeping, and the records can only have gone out
+    /// between the failed try and the sleep it never reached.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_poll_sends_queued_records_before_it_sleeps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let sink = crate::telemetry::sink_fixture::SinkFixture::new();
+        let held = try_decider_lock(&backend.session_dir("wf")).expect("the lock is free");
+        let env = CommandEnv::inherit();
+        let evaluator = CliCheckEvaluator::new(
+            &backend,
+            "wf",
+            Box::new(Shared(Arc::new(ScriptedDecider::new()))),
+            GlobalMode::Auto,
+            SettingOrigin::Default,
+            ConsultBudget::new(),
+            tmp.path(),
+            &env,
+        );
+        sink.queue(2);
+        assert!(evaluator.lock_waiting().is_none(), "the lock is held");
+        assert_eq!(sink.received(), 2);
+        drop(held);
     }
 
     #[test]

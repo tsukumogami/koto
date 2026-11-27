@@ -1419,11 +1419,26 @@ sending, and a store with no journal still sends.
 
 ### When records are sent
 
-Records are queued in the koto process and sent when it exits, however it
-exits. One flush sends everything queued under a single deadline, and adds
-at most 3.0 seconds to the command. A call still running at the deadline is
-ended by killing the sink's process group. Nothing about the sink changes a
-command's output or exit status, and koto prints no warning about it.
+Records are queued in the koto process and sent at fixed points, so a long
+command doesn't hold them until it ends:
+
+- before koto starts the command of a gate or a default action;
+- before it calls a decider;
+- before it waits: between a polling gate's or a polling action's runs,
+  in each wait of `koto request`, and while waiting on another tick's
+  decider lock;
+- on the terminal tick, after the `terminal` record and before the session
+  directory can be removed;
+- when the process exits, however it exits.
+
+A point with nothing queued makes no call. One flush sends everything
+queued under a single deadline, and takes at most 3.0 seconds. A call
+still running at the deadline is ended by killing the sink's process
+group, and that stops later calls for the process (see below), so a sink
+that hangs delays a command by one deadline, not one per point. The flush
+before a command runs before the command's time limit starts, so the sink
+never eats into it. Nothing about the sink changes a command's output or
+exit status, and koto prints no warning about it.
 
 After one call exits 3, has to be killed or can't be started, the process
 makes no more calls and counts every later record as dropped. After an

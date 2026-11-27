@@ -119,9 +119,9 @@ fn exit_helper_flushes_queued_records() {
     assert_ne!(bad.code, Some(0), "{}", bad.stdout);
     assert_eq!(stub.call_count(), 2, "an empty queue made a call");
 
-    // The terminal tick ends the process from inside the command, through
-    // the exit helper, after removing the session. Its records, the
-    // `terminal` among them, are sent on that exit.
+    // The terminal tick sends its records, the `terminal` among them,
+    // before it removes the session, and then ends the process from inside
+    // the command, through the exit helper, with nothing left to send.
     let done = run(&home, &["next", "wf", "--with-data", r#"{"go":"other"}"#]);
     assert!(done.stdout.contains("\"done\""), "{}", done.stdout);
     let calls = stub.calls();

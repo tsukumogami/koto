@@ -2366,6 +2366,9 @@ where
             };
         }
 
+        // Before the interval's wait: send the session records queued so
+        // far.
+        crate::telemetry::flush();
         // Sleep for the interval, but check shutdown more frequently.
         let sleep_end = Instant::now() + Duration::from_secs(u64::from(polling.interval_secs));
         while Instant::now() < sleep_end {
@@ -5198,6 +5201,12 @@ fn finish_terminal_tick(
         );
         defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     }
+
+    // The terminal record and the parent's notice are journaled. Send the
+    // queued session records now, while the session directory still
+    // exists: what follows may remove it, and a record dropped after that
+    // would have nowhere of its own to be counted.
+    crate::telemetry::flush();
 
     // Step 6.
     if !remove {
@@ -12943,5 +12952,58 @@ Done.
         assert_eq!(written.removed_by, "terminal");
         assert_eq!(written.session_id.as_deref(), Some("id-order"));
         assert_eq!(written.result.unwrap()["summary"], "completed at done");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod flush_point_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Flush point: the polling default action sends what is queued before
+    /// each interval's wait. The gate check queues records after the
+    /// command has run, and raises the shutdown flag, so the loop ends from
+    /// inside its wait without running the command a second time. The
+    /// records can only have gone out between the gate check and the wait.
+    #[test]
+    fn a_polling_action_sends_queued_records_before_its_interval_wait() {
+        let sink = crate::telemetry::sink_fixture::SinkFixture::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = crate::action::CommandEnv::inherit();
+        let polling = crate::template::types::PollingConfig {
+            interval_secs: 30,
+            timeout_secs: 600,
+        };
+        let gate: crate::template::types::Gate =
+            serde_json::from_value(serde_json::json!({"type": "command", "command": "true"}))
+                .unwrap();
+        let gates = BTreeMap::from([("g".to_string(), gate)]);
+        let shutdown = AtomicBool::new(false);
+        let checks = std::cell::Cell::new(0);
+        let check = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            checks.set(checks.get() + 1);
+            sink.queue(2);
+            shutdown.store(true, Ordering::Relaxed);
+            BTreeMap::from([(
+                "g".to_string(),
+                crate::gate::StructuredGateResult {
+                    outcome: crate::gate::GateOutcome::Failed,
+                    ..Default::default()
+                },
+            )])
+        };
+        let output = execute_with_polling(
+            "true",
+            tmp.path(),
+            &env,
+            &polling,
+            &gates,
+            &check,
+            &shutdown,
+        );
+        assert_eq!(output.exit_code, -1, "the wait was interrupted");
+        assert_eq!(checks.get(), 1, "the command ran once");
+        assert_eq!(sink.received(), 2);
     }
 }
