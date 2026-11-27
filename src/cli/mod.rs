@@ -1537,6 +1537,15 @@ fn context_write_exit_code(e: &anyhow::Error) -> i32 {
     }
 }
 
+/// Send the session records this process queued and hasn't sent yet to the
+/// event sink, when one is installed. `main` registers this as its first
+/// exit hook, so it runs last, after every other hook has journaled what it
+/// had to: a command that exits with records still queued sends them on
+/// its way out.
+pub fn flush_session_records() {
+    crate::telemetry::flush();
+}
+
 /// Print a JSON error and exit with the given code.
 fn exit_with_error(error: serde_json::Value) -> ! {
     exit_with_error_code(error, 1)

@@ -1369,6 +1369,81 @@ With no positions recorded, the retention bound alone decides. A reader that
 records no position and stays away longer than the bound misses the files
 removed in the meantime.
 
+## Sent copy
+
+koto can also hand each record to an event sink as it is written: a
+separate program a host may install. With none installed, nothing below
+happens: koto looks for the program once per process and does no more.
+
+The sink is the file `event-sink` in `.local/libexec/fleet` under the home
+directory. koto runs it only when it is a regular file, not a symlink,
+that the current user owns, with an execute bit and no write bit for group
+or others, and when every directory from it up to `/` is owned by the user
+or by root and writable by nobody else. A file that fails any of these is
+never run, and nothing says so. Setting `FLEET_EVENT_SINK=off` in the
+environment turns sending off; koto reads no other value of that variable,
+and no variable can point it at another program.
+
+koto calls the sink as `event-sink send --scope koto-journal`, with one
+record per line on stdin and at most 200 records a call. It reads the exit
+status and nothing else: 0 is posted, 4 is posted with some records
+invalid, 2 means sending is off, 3 means the records were dropped, and 1 or
+any other code is a failed call. The sink runs from `/`, with no stdout or
+stderr, and with an environment cleared to `HOME`, `PATH`, `TMPDIR`,
+`LANG`, `LC_ALL`, `LC_CTYPE`, `CLAUDE_CODE_SESSION_ID`, `NIWA_DISPATCH_ID`
+and `NIWA_WORKSPACE`, each only when it is set.
+
+### What the copy carries
+
+The sink gets the records the journal gets, with the same kinds, fields and
+values, in the same order. The copy is the journal's line with up to three
+fields added at its end, which the journal's own line never carries:
+
+| Field | On | Value |
+|-------|----|-------|
+| `koto.run.template.name` | every kind | The template name of the run's root session, when it has one. |
+| `koto.run.template.hash` | every kind | The template hash of the run's root session, when it has one. |
+| `koto.check.outcome` | `check_rule` | The outcome of the `check_evaluated` the rule belongs to. In the journal only the `check_evaluated` carries it. |
+
+A run's template is its root session's: a child session's records name the
+template the run was started as, not the child's own.
+`koto session identity` prints the same two values. Each is left out when
+it can't be resolved.
+
+A `context_reads` record is never sent. A copy longer than the line cap
+isn't sent either, and is counted as dropped.
+
+The journal and the sent copy are independent. Turning the journal off (see
+[Turning the journal off](#turning-the-journal-off)) doesn't stop the
+sending, and a store with no journal still sends.
+
+### When records are sent
+
+Records are queued in the koto process and sent when it exits, however it
+exits. One flush sends everything queued under a single deadline, and adds
+at most 3.0 seconds to the command. A call still running at the deadline is
+ended by killing the sink's process group. Nothing about the sink changes a
+command's output or exit status, and koto prints no warning about it.
+
+After one call exits 3, has to be killed or can't be started, the process
+makes no more calls and counts every later record as dropped. After an
+exit 2 it makes no more calls and counts nothing. A call that exits 1, or
+with a code outside the list above, loses its own records, which are
+counted as dropped, and the calls after it go on.
+
+A call is started only when at least 2.0 seconds are left before the
+flush's deadline. Records a flush has no time left to send are counted as
+dropped without a call being made, and the next flush sends as usual.
+
+### Dropped records
+
+A record that was queued and not delivered is counted against its session,
+in `telemetry.json` in the session directory: `{"dropped": N}`. The file is
+replaced by rename, mode 0600, under a lock held on `telemetry.lock` beside
+it. Both go when the session directory goes. They are koto's own
+bookkeeping and stay on the host: cloud sync and `koto session import`
+don't carry them.
+
 ## Reading the journal
 
 - Read line by line. Skip any line that doesn't parse as JSON: it's a
