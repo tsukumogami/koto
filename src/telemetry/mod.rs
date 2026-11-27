@@ -554,6 +554,7 @@ pub(crate) fn reset_for_test() {
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
     TEST_BATCHES.with(|c| c.set((0, 0)));
     TEST_LOCK_WAIT.with(|c| c.set(JOURNAL_LOCK_WAIT));
+    JOURNAL_ENABLED.with(|e| e.set(true));
 }
 
 /// Lower (or restore) this thread's line cap.
@@ -590,6 +591,47 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// or power loss before then can lose them.
 fn write(root: &Path, records: &[Record]) {
     write_within(root, records, journal_lock_wait())
+}
+
+/// The `[run_journal]` table of user config, resolved once per process and
+/// shared by the write path and the rotation settings. A config that can't
+/// be read leaves the defaults: the journal on, rotation off.
+#[cfg(not(test))]
+pub(crate) fn journal_config() -> &'static crate::config::RunJournalConfig {
+    static CONFIG: std::sync::OnceLock<crate::config::RunJournalConfig> =
+        std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        crate::config::resolve::load_config()
+            .map(|c| c.run_journal)
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the journal is written at all: `run_journal.enabled`, on unless
+/// user config turns it off. Off, every batch is dropped before the journal
+/// file, its lock or its directory is touched, and nothing is warned about.
+/// The records are still built and the session sidecars still kept, so
+/// turning the journal off changes no other file.
+#[cfg(not(test))]
+fn journal_enabled() -> bool {
+    journal_config().enabled
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's `run_journal.enabled`, on unless a test turns it off.
+    static JOURNAL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+fn journal_enabled() -> bool {
+    JOURNAL_ENABLED.with(|e| e.get())
+}
+
+/// Turn this thread's journal on or off, as `run_journal.enabled` would.
+#[cfg(test)]
+pub(crate) fn set_journal_enabled_for_test(enabled: bool) {
+    JOURNAL_ENABLED.with(|e| e.set(enabled));
 }
 
 /// How long a journal write waits for the journal's lock before its batch
@@ -641,8 +683,12 @@ fn journal_lock_wait() -> std::time::Duration {
 /// all once an earlier write in this process has given up on it. A lock
 /// still held after that is a failed write: one warning, and the batch is
 /// skipped.
+///
+/// With the journal turned off ([`journal_enabled`]) the batch is dropped
+/// here, before anything is opened: every journal write comes through this
+/// function, so this is the one place the setting is read.
 fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration) {
-    if records.is_empty() {
+    if records.is_empty() || !journal_enabled() {
         return;
     }
     let path = root.join(JOURNAL_FILE);

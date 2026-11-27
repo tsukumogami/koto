@@ -823,11 +823,15 @@ fn merge_check_window(target: &mut KotoConfig, source: &LoadedConfig) {
 
 /// Apply the `[run_journal]` keys a config file sets. Called for the user
 /// layer only: the journal lives beside the user's session store, so a
-/// project file in a cloned repository must not turn rotation on or shorten
-/// retention for it (`koto config set` refuses these keys without `--user`).
+/// project file in a cloned repository must not turn it off, turn rotation
+/// on or shorten retention for it (`koto config set` refuses these keys
+/// without `--user`).
 fn merge_run_journal(target: &mut KotoConfig, source: &LoadedConfig) {
     for key in &source.run_journal_keys {
         match key.as_str() {
+            "enabled" => {
+                target.run_journal.enabled = source.config.run_journal.enabled;
+            }
             "rotate_bytes" => {
                 target.run_journal.rotate_bytes = source.config.run_journal.rotate_bytes;
             }
@@ -1501,6 +1505,38 @@ mod tests {
         assert_eq!(config.run_journal.rotate_bytes, 4096);
         assert_eq!(config.run_journal.retain_days, 3);
         assert_eq!(config.run_journal.reader_stale_days, 90);
+    }
+
+    #[test]
+    fn test_run_journal_enabled_applies_from_the_user_layer_only() {
+        let tmp = TempDir::new().unwrap();
+        let off = tmp.path().join("off.toml");
+        fs::write(&off, "[run_journal]\nenabled = false\n").unwrap();
+        let other = tmp.path().join("other.toml");
+        fs::write(&other, "[run_journal]\nretain_days = 5\n").unwrap();
+
+        // A project file that turns the journal off changes nothing: the
+        // project layer goes through merge_config only.
+        let mut config = KotoConfig::default();
+        merge_config(
+            &mut config,
+            &load_config_file(&off, "project config").unwrap(),
+        );
+        assert!(config.run_journal.enabled);
+
+        // The same file as the user layer turns it off.
+        let user_layer = load_config_file(&off, "user config").unwrap();
+        merge_config(&mut config, &user_layer);
+        merge_run_journal(&mut config, &user_layer);
+        assert!(!config.run_journal.enabled);
+
+        // A user file that names another [run_journal] key and not this
+        // one leaves it as it was, on or off.
+        let mut config = KotoConfig::default();
+        let user_layer = load_config_file(&other, "user config").unwrap();
+        merge_run_journal(&mut config, &user_layer);
+        assert!(config.run_journal.enabled);
+        assert_eq!(config.run_journal.retain_days, 5);
     }
 
     #[test]
