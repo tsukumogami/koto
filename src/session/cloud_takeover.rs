@@ -788,6 +788,7 @@ fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
         {
