@@ -846,3 +846,43 @@ fn a_signal_waker_rings_the_requesters_wake_file() {
     assert_eq!(outcome.wakes_invoked, 1);
     assert_ne!(read_cursor(root, &coord).unwrap(), WakeCursor::empty());
 }
+
+// ----- A batch can fail after its append ------------------------------------
+
+/// A batch appends its `RequesterWoken` before anything else it does, so a
+/// batch that fails later (here, a requester id that isn't a valid session
+/// id) leaves its event on the coordinator's log while the pass returns an
+/// error. A `koto next` that runs the pass after reading the log has to read
+/// it again on an error too, not only when the pass reports emissions.
+#[test]
+fn a_batch_that_fails_after_its_append_leaves_the_event_on_the_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    sessions_dir(root);
+
+    let coord_path = write_session_with_header(root, "coord", None);
+    write_session_with_header(root, "coord.child-a", Some("not a session id"));
+    let dispatched_ts = format_rfc3339_millis(now_minus(60));
+    append_child_dispatched_event(&coord_path, "coord.child-a", "coord", &dispatched_ts);
+    append_terminal_index_for(root, "coord.child-a");
+    let (_, before) = read_events(&coord_path).unwrap();
+
+    let waker = RecordingWaker::default();
+    let result = wake_candidates_pass(
+        root,
+        &sessions_dir(root),
+        &coord_path,
+        &waker,
+        Duration::from_secs(600),
+        SystemTime::now(),
+    );
+
+    assert!(result.is_err(), "the invalid requester id must fail the pass");
+    let (_, after) = read_events(&coord_path).unwrap();
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "the failed batch's RequesterWoken must already be on the log"
+    );
+    assert_eq!(waker.count(), 0, "no wake is delivered for the failed batch");
+}

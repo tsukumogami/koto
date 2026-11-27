@@ -10716,6 +10716,25 @@ fn handle_cancel(
 mod tests {
     use super::*;
 
+    /// The tick reads its log before the wake pass, so it has to read it
+    /// again whenever the pass may have appended: when it reports emissions,
+    /// and when it fails, since a batch appends before the steps that can
+    /// fail it.
+    #[test]
+    fn a_wake_pass_that_fails_rereads_the_log() {
+        let outcome = |events_emitted| crate::engine::wake::WakeEmissionOutcome {
+            events_emitted,
+            wakes_invoked: 0,
+            sidecars_released: 0,
+            recoveries_fired: 0,
+        };
+        assert!(!wake_pass_needs_reread(&Ok(outcome(0))));
+        assert!(wake_pass_needs_reread(&Ok(outcome(2))));
+        assert!(wake_pass_needs_reread(&Err(anyhow::anyhow!(
+            "append RequesterWoken, then fail"
+        ))));
+    }
+
     /// The empty capture map, for a fixture whose gates reference no capture.
     ///
     /// `first_unset_capture` returns `None` immediately on an empty map, so a
