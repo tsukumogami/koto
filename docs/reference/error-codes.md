@@ -261,6 +261,35 @@ Reinitialize the workflow to pick up the new template.
 
 ---
 
+### session rebind
+
+A plain `koto session rebind` refuses a missing target directory, a file, or an unknown session on stderr with exit 1, and `background_run_in_flight` (exit 2) while a `background: true` run of the session is in flight. `koto session rebind <name> --whole` adds the refusals below. They come in this order, each before anything is written, and print the structured shape on stdout:
+
+```json
+{"error":{"code":"session_busy","message":"session 'deploy' is busy: a tick of it still held /home/dev/.koto/sessions/deploy/tick.lock after 10 s; nothing was written. Run `koto session rebind deploy --whole` again once the tick returns, or give --wait more seconds"},"command":"session rebind"}
+```
+
+| Code | Exit | Meaning |
+|------|:----:|---------|
+| `nested_invocation` | 2 | The move ran inside a command the session's own tick is running: this process inherited `KOTO_TICK_SESSION` naming the session. The tick holds the session's `tick.lock` until the command returns, so the move would wait on the tick that waits on it. Run it once the tick has returned. A marker naming another session doesn't refuse. |
+| `no_anchor` | 2 | The move hands the session to the anchor `KOTO_ANCHOR` names, and there's none: the variable is unset, names the session itself, or names something that isn't an anchor on this machine (a workflow session, or no session). Run it from the agent session taking the session over. |
+| `session_busy` | 1 | A tick still held `tick.lock` when `--wait` ran out (10 seconds by default; `--wait 0` asks once). Transient: run it again once the tick returns, or with a longer `--wait`. A session ticked back to back can keep refusing, since moves get no priority over ticks. |
+| `rebind_cross_host` | 2 | Cloud backend only: the bucket's `version.json` for the session was last uploaded by another machine. The message names both machines and `koto session import`, which is how a session moves between machines. |
+| `background_run_in_flight` | 2 | A `background: true` run of the session is in flight on this machine; the error adds `run_id`. Keep ticking until its result is delivered, or cancel it, then move. |
+
+`--workspace` refuses first, with `workspace_read_only`, and `session_migrated` keeps its flat shape. A move stopped part way by a crash or a failed write exits non-zero; running the same command again finishes it.
+
+**`session_rebound`** is the fence a rebind leaves behind, and it reaches other commands, not only rebind. Every message starts `session_rebound:` and names the anchor the session is bound to now; nothing was written. `koto next` reports it as the structured code above, exit 2. Other verbs fail non-zero with it on stderr. It fires in these cases:
+
+- **Plain rebind, cloud backend.** A write ran from the exact anchor a rebind retired (its bucket prefix is a retired anchor's and not the current one's), or from a command whose latest read of the session came before the rebind.
+- **After a `--whole` move, either backend.** Once the header records `origin.whole_epoch`, a write is refused when the process's first read of the session came before the move, wherever it runs and even if it read the session again afterwards. It's also refused when the process runs under a retired anchor and its directory is either outside the current anchor, or inside it but under a retired anchor deeper than the current one. A directory under no retired anchor passes the directory rule, and so does a process whose working directory can't be read (it was removed, say): with no directory there's nothing to compare. The read rule still applies to it. The process that made the move passes its own fence, even in the directory it retired, until a later move raises `whole_epoch` again.
+- **A push the bucket is ahead of.** Under the cloud backend, a push whose bucket copy records a higher `anchor_epoch`, or retired the anchor the pushed header names, is refused rather than replaced, and so is `koto session resolve --keep local` over such a copy. This covers a refused conditional PUT, a bucket that answers conditional writes `501` (read from the bucket's header just before an unconditional PUT, which leaves a small window), and a flush that meets the `version.json` a `--whole` move uploaded.
+- **A `--whole` move overtaken.** A rebind elsewhere moved the session past the epoch the move read before its commit landed.
+
+Stop writing from the old place. If this process owns the session now, run the command again from the directory the message names; otherwise the session has a new holder and this process is done with it.
+
+---
+
 ### context add and context remove
 
 **Workflow not found (exit code 2)** -- the session has no state log, so there is nothing to append the event to. That covers a name that was never initialized, a session removed by terminal cleanup, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. Nothing is written, not even the context content:

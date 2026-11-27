@@ -43,16 +43,17 @@ The question was whether to exclude cross-host ticks with a cloud-side lease, or
 
 - No shipped flow puts two hosts with the same canonical workspace path on one bucket and hands runs between them. If one does, cross-host takeover is real and this should be revisited for a lease.
 - The buckets in use support conditional writes. On a bucket that doesn't, nothing orders two hosts, with or without a lease.
-- `version.json` records the machine that last pushed, and the move reads it on the path it already takes.
+- `version.json` names the machine that last uploaded it. Tick flushes and context writes upload it; a plain state push doesn't, so a host whose only writes were cancel, rewind or plain rebind leaves no trace there. Rebind read none of it before this decision; the move now makes one listing and one GET for it.
 
 ## Decision
 
 **Cross-host takeover is out of scope for `rebind --whole`, enforced, with fence-only hardening for the race that slips past.**
 
-1. `rebind --whole` refuses when `version.json` shows that the session's last push came from another machine. The refusal names `koto session import`, whose stop-the-source contract already covers a cross-host handover.
-2. Sometimes a push is refused because the bucket's header carries a higher anchor epoch than the pushed copy, or retires the pushing prefix. That push answers `session_rebound` instead of `session conflict`, naming the move. It's the same shape as the existing superseded refusal, and the fetch after the refused PUT already happens, so it adds no request.
-3. `koto session resolve --keep local` refuses to overwrite a bucket copy whose anchor epoch is higher than the local one.
-4. The move's commit point, the move event plus the header rewrite, is pushed remote-first. It builds the bytes, PUTs them conditionally on the version it pulled under `tick.lock`, and adopts them locally only after the bucket confirms, as the supersede fence does. A lost race then writes nothing anywhere, and a re-run finishes.
+1. `rebind --whole` reads the bucket's `version.json` under `tick.lock`, after its pull and before its commit, and refuses `rebind_cross_host` (exit 2), writing nothing, when another machine uploaded it last. The refusal names `koto session import`, whose stop-the-source contract already covers a cross-host handover. After its commit, the move uploads `version.json` with a version above both the one it read and this host's, under this machine's id, so a host that pushed before the move and flushes after it meets a version conflict before any of its writes go up.
+2. A push whose copy the bucket has moved past answers `session_rebound` instead of `session conflict`, naming the move. The comparison is between headers of the same session: the bucket's `anchor_epoch` is above the pushed one, or the bucket's header retired the anchor the pushed copy names and its epoch is at least the pushed one. A header with a different session id is left to the ordinary conflict. A `--whole` move raises `anchor_epoch` and sets `whole_epoch` to it, so the move it records is the one named. It's the same shape as the existing superseded refusal. On a refused conditional PUT (412) the fetch after it already happens, so that path adds no request. On a bucket without conditional writes (501) the push reads the bucket's header with a ranged GET first and refuses when the bucket is ahead, then PUTs with no condition; that narrows the window and doesn't close it, since a move landing between the GET and the PUT is still written over. A batch flush that meets a version conflict reads the header the same way and reports the move when there was one.
+3. `koto session resolve --keep local` refuses `session_rebound` rather than overwrite a bucket copy that the comparison in point 2 finds ahead of the local one: a higher anchor epoch, or the local anchor retired at an epoch no lower.
+4. The move's commit point, the move event plus the header rewrite, is pushed remote-first. It builds the bytes, PUTs them conditionally on the ETag of the copy it pulled under `tick.lock`, and adopts them locally only after the bucket confirms, as the supersede fence does. On a bucket without conditional writes it GETs the state file and compares ETags first, then PUTs with no condition, with the same narrow window as point 2. A lost race then writes nothing anywhere, and a re-run finishes. On either backend a crash can still tear the commit between the move event and the header; a re-run finds the move event without its header and finishes the header without logging a second event.
+5. A session with no `origin` has no anchor to fence. The move still records the new directory and logs the move event without an `epoch`, and its later parts log epoch 0. Nothing in the output marks the difference; a reader tells from the event.
 
 ## Rationale
 
@@ -80,8 +81,10 @@ Folded into the chosen option. Without the refusal, an unsupported cross-host ta
 
 ## Consequences
 
-Cross-host takeover becomes an explicit non-goal of `rebind --whole`, refused wherever the move can see it. A tick on a second host that straddles a move still runs its gates and actions, which no host-local lock can hold off. Its log writes are refused with a reason that names the move, and following koto's advice can no longer undo the move. Some of that host's context writes may still land in the window before the move's first context write.
+Cross-host takeover becomes an explicit non-goal of `rebind --whole`, refused wherever the move can see it. It can't see a host whose only writes were cancel, rewind or plain rebind, because those don't upload `version.json`; that host stays part of the cross-host residual. A tick on a second host that straddles a move still runs its gates and actions, which no host-local lock can hold off. Its log writes are refused with a reason that names the move, and following koto's advice can no longer undo the move. Some of that host's context writes may still land in the window before the move's first context write.
 
 The rebind tick exclusion ADR's cross-host residual narrows to this unsupported shape but doesn't disappear. Together with that ADR's other residuals (older builds, writers outside a tick, commands that outlive their tick, a tick that never stops, a move into a subdirectory), the "never in between" ask is still not fully solved in every deployment.
+
+Every host that touches a session moved with `--whole` needs this release or later. An older build that rewrites the session header drops `whole_epoch`, and a stale process of the new build then passes the whole-binding rule.
 
 The restart-replaces-run close carries the same cross-host residual, and the same scope statement covers it: a run replaced across hosts is a handover for import, not for `--replaces`.
