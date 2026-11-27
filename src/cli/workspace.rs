@@ -296,7 +296,7 @@ pub fn handle_prune(
         })
     );
     if !failed.is_empty() {
-        std::process::exit(3);
+        crate::exit::exit(3);
     }
 
     Ok(())

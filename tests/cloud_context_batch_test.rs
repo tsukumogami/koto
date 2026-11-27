@@ -317,6 +317,64 @@ fn tick_requests(s3: &FakeS3, script: &str) -> Vec<String> {
     requests
 }
 
+/// Whether a file the test made read-only can still be written, which is
+/// so for root: a commit the test means to fail would succeed.
+fn running_as_root() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = tempfile::TempDir::new().unwrap();
+    let ro = probe.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let writable = std::fs::write(ro.join("x"), "x").is_ok();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+    writable
+}
+
+/// A tick that ends in an error exit still pushes what its action
+/// deferred. The action adds a key, which waits in the tick's batch, and
+/// then makes the state file read-only, so the tick's own commit fails and
+/// `koto next` exits non-zero through its error path. The flush is an exit
+/// hook, so it runs on that path as it does on a normal return (the other
+/// tests here), and the bucket holds the key.
+#[test]
+fn a_tick_that_exits_with_an_error_still_pushes_its_batch() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        eprintln!("skipped: root can write a read-only state file");
+        return;
+    }
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let state = h.session_dir().join(format!("koto-{NAME}.state.jsonl"));
+    h.init(&format!(
+        "set -e\nprintf one | koto context add {NAME} one.md\nchmod 400 '{}'",
+        state.display()
+    ));
+    assert!(s3.object(&h.key("ctx/one.md")).is_none());
+
+    let out = h.next();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_ne!(
+        out.code,
+        Some(0),
+        "the commit should fail: {}",
+        out.describe()
+    );
+    assert_ne!(
+        out.code,
+        Some(101),
+        "an error exit, not a panic: {}",
+        out.describe()
+    );
+    assert_eq!(
+        s3.object(&h.key("ctx/one.md")).as_deref(),
+        Some(&b"one"[..]),
+        "the error exit skipped the flush: {}",
+        out.describe()
+    );
+    assert_remote_consistent(&s3, &h);
+}
+
 /// A context write inside an action costs the bucket a fixed, small number
 /// of requests, and the batch is flushed once: one manifest PUT, one
 /// `version.json` PUT and one batch-open marker for the whole action,

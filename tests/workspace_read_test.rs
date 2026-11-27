@@ -375,6 +375,27 @@ fn a_missing_session_or_workspace_is_not_found() {
     assert_eq!(writes(&f.s3), Vec::<String>::new());
 }
 
+/// A read that fails after the session was fetched, so with its scratch
+/// directory already in place, removes it on the way out: `read` asserts
+/// the run's `TMPDIR` is empty. The removal is an exit hook, so the error
+/// exit runs it as the normal return and the `context exists` exit do.
+#[test]
+fn a_read_that_fails_after_fetching_leaves_no_scratch() {
+    let f = fixture();
+    f.s3.clear_requests();
+    let run = read(&f.b, &f.a.prefix(), &["context", "get", NAME, "absent.md"]);
+    assert_ne!(run.code, Some(0), "{}", run.describe());
+    assert_ne!(run.code, Some(101), "{}", run.describe());
+    // The session was read, so the failure came after the scratch
+    // directory existed.
+    assert!(
+        f.s3.requests().iter().any(|r| r.method == "GET"),
+        "the read fetched nothing before it failed: {}",
+        run.describe()
+    );
+    assert_eq!(writes(&f.s3), Vec::<String>::new());
+}
+
 /// A bucket that can't be listed is unreadable, exit 3, never an empty
 /// workspace or a missing session.
 #[test]

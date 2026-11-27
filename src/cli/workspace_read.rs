@@ -24,7 +24,7 @@ use anyhow::Result;
 
 use super::{
     context, exit_with_error_code, handle_decisions_list, handle_status, overrides, Command,
-    ContextCommand, DecisionsSubcommand, EXIT_CALLER_ERROR, EXIT_FLUSH,
+    ContextCommand, DecisionsSubcommand, EXIT_CALLER_ERROR,
 };
 use crate::session::cloud::workspace_read::{
     WorkspaceId, WorkspaceReadError, WorkspaceReadErrorCode, WorkspaceReader,
@@ -213,18 +213,13 @@ fn serve(
     refused: Option<&anyhow::Error>,
 ) -> Result<()> {
     // The scratch directory goes however the command exits: on return when
-    // `_scratch` drops, and on `exit_with_error_code`'s way out through the
-    // exit flush. Only `koto next` sets that flush otherwise, and it never
-    // gets here; a read verb that set it first would leave scratch behind,
-    // so that is refused loudly rather than ignored.
+    // `_scratch` drops, and on any exit through `crate::exit::exit` by this
+    // hook. Removing a directory that is already gone is not an error worth
+    // reporting, so both may run.
     let scratch_path = reader.scratch_dir().to_path_buf();
-    let set = EXIT_FLUSH.set(Box::new(move || {
+    crate::exit::register(move || {
         let _ = std::fs::remove_dir_all(&scratch_path);
-    }));
-    assert!(
-        set.is_ok(),
-        "the exit flush was already set, so a --workspace read couldn't remove its scratch"
-    );
+    });
     let located = reader.locate(name).and_then(|()| {
         if verb == "status" {
             reader.fetch_template(name)
@@ -246,10 +241,9 @@ fn serve(
             _ => exit_with_read_error(verb, &e),
         }
     }
-    // `scratch` owns the directory `backend` keeps its copies in, so it
-    // must outlive `backend`: it is dropped last, or by hand before
-    // `process::exit` below.
-    let (cloud, scratch) = reader.into_parts();
+    // `_scratch` owns the directory `backend` keeps its copies in, so it
+    // must outlive `backend`: it is dropped last.
+    let (cloud, _scratch) = reader.into_parts();
     let backend = Backend::Cloud(cloud);
     // A session imported into another workspace refuses here, exit 2, as
     // it does without `--workspace`, naming where it went, when the reader
@@ -309,12 +303,9 @@ fn serve(
                             );
                         }
                     };
-                    // `process::exit` runs no destructor and not the exit
-                    // flush, which only `exit_with_error_code` runs, so the
-                    // scratch directory is removed here by hand.
-                    drop(backend);
-                    drop(scratch);
-                    std::process::exit(code);
+                    // An exit runs no destructor; the exit hook registered
+                    // above removes the scratch directory.
+                    crate::exit::exit(code);
                 }
                 ContextCommand::List { session, prefix } => {
                     if let Err(e) =
