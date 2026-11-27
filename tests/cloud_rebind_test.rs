@@ -1676,7 +1676,15 @@ Done.
         let second = m.dir("second");
         let new = m.dir("new");
         m.init(&parent, &[], NAME, &[]);
-        m.init(&first, &[], "child", &["--parent", NAME]);
+        // A child adopts its parent's directory unless told otherwise, so it
+        // is bound to `first` explicitly: the move must retire both
+        // directories the child itself recorded.
+        m.init(
+            &first,
+            &[],
+            "child",
+            &["--parent", NAME, "--execution-dir", s(&first)],
+        );
         let child_key = state_key(&prefix_of(&first), "child");
         let parent_key = state_key(&prefix_of(&parent), NAME);
         m.ok(
