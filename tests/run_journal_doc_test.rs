@@ -252,9 +252,13 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
         }
     }
     let listed: BTreeSet<&String> = by_kind.values().flatten().collect();
+    // A field only the sent copy carries is described in its own section
+    // and belongs to no kind's journal line.
+    let sent_only = sent_copy_fields(&text);
     for literal in source_literals()
         .iter()
         .filter(|l| l.starts_with("koto.") && !l.ends_with(".id"))
+        .filter(|l| !sent_only.contains(*l))
     {
         assert!(
             listed.contains(literal),
@@ -337,6 +341,63 @@ fn every_attribute_name_in_the_reference_is_in_the_koto_namespace() {
             );
         }
     }
+}
+
+/// The fields the reference says only the sent copy carries: the first
+/// cell of each row of the table under `### What the copy carries`.
+fn sent_copy_fields(text: &str) -> BTreeSet<String> {
+    let section = text
+        .split("### What the copy carries")
+        .nth(1)
+        .expect("the reference has a section on what the sent copy carries");
+    let row = Regex::new(r"^\| `(koto\.[a-z_.]+)` \|").unwrap();
+    section
+        .lines()
+        .skip_while(|l| !l.starts_with('|'))
+        .take_while(|l| l.starts_with('|'))
+        .filter_map(|l| row.captures(l).map(|c| c[1].to_string()))
+        .collect()
+}
+
+/// The sent copy's section lists exactly the fields koto adds to it, and
+/// each is one the module writes. The two template fields appear in no
+/// kind's row of the kinds table, since no journal line carries them.
+#[test]
+fn the_sent_copy_fields_are_the_ones_koto_adds() {
+    let text = reference();
+    let fields = sent_copy_fields(&text);
+    assert_eq!(
+        fields,
+        [
+            "koto.check.outcome",
+            "koto.run.template.hash",
+            "koto.run.template.name"
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>(),
+        "the reference's sent-copy table"
+    );
+    let literals = source_literals();
+    for field in &fields {
+        assert!(
+            literals.contains(field),
+            "{REFERENCE} says the sent copy carries `{field}`, which {SOURCE_DIR} never writes"
+        );
+    }
+    let by_kind = documented_kind_fields(&text);
+    for field in ["koto.run.template.name", "koto.run.template.hash"] {
+        for (kind, listed) in &by_kind {
+            assert!(
+                !listed.contains(field),
+                "the kinds table lists {field} for {kind}, but no journal line carries it"
+            );
+        }
+    }
+    // The journal's `check_rule` doesn't carry the outcome; its
+    // `check_evaluated` does.
+    assert!(!by_kind["check_rule"].contains("koto.check.outcome"));
+    assert!(by_kind["check_evaluated"].contains("koto.check.outcome"));
 }
 
 #[test]

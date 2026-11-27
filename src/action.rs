@@ -371,7 +371,7 @@ const GROUP_EXIT_WAIT: Duration = Duration::from_secs(5);
 /// that window. A zombie still counts as present until it is reaped, which
 /// happens as soon as it is orphaned to init; the bound keeps a host that
 /// never reaps from holding the tick.
-fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
+pub(crate) fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {
         // SAFETY: signal 0 only checks that the group exists.
