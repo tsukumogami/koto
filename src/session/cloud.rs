@@ -4823,10 +4823,25 @@ impl CloudBackend {
                         .to_string(),
                 },
             },
-            ChildResolution::AcceptedLocal => match self.push_local_state_bytes(id) {
-                Ok(()) => ChildResolution::AcceptedLocal,
+            // The same check `resolve --keep local` makes for the parent: a
+            // child a rebind moved past this host's copy isn't the other side
+            // of a conflict, and pushing this host's copy over it would undo
+            // the move. Refused before anything is written. Like the parent's,
+            // it reads the bucket's header once and then writes without a
+            // condition, so a move landing between the two is still
+            // written over.
+            ChildResolution::AcceptedLocal => match self.child_rebound(id) {
                 Err(e) => ChildResolution::Errored {
-                    message: format!("failed to push local state: {}", e),
+                    message: format!("failed to read the bucket's header: {:#}", e),
+                },
+                Ok(Some(rebound)) => ChildResolution::Errored {
+                    message: rebound.to_string(),
+                },
+                Ok(None) => match self.push_local_state_bytes(id) {
+                    Ok(()) => ChildResolution::AcceptedLocal,
+                    Err(e) => ChildResolution::Errored {
+                        message: format!("failed to push local state: {}", e),
+                    },
                 },
             },
         }
@@ -4840,6 +4855,22 @@ impl CloudBackend {
         let path = dir.join(state_file_name(id));
         std::fs::write(&path, bytes)?;
         Ok(())
+    }
+
+    /// [`rebound_refusal`] of this host's copy of child `id` against the
+    /// bucket's header, read with one ranged GET: the refusal when a rebind
+    /// moved the bucket's copy past this host's, `None` when it didn't or
+    /// either copy is missing. A header that can't be read is an error, so
+    /// the child is reported errored rather than pushed unchecked.
+    fn child_rebound(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::session::rebind_fence::SessionRebound>> {
+        let Some(remote) = self.remote_header_bytes(&self.state_key(id))? else {
+            return Ok(None);
+        };
+        let local = self.read_local_state_bytes(id).unwrap_or_default();
+        Ok(rebound_refusal(id, &local, &remote))
     }
 
     /// PUT the local state file to S3. Unlike `sync_push_state` this
