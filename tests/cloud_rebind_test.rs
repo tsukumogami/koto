@@ -2017,6 +2017,35 @@ Done.
             );
             mv
         }
+
+        /// [`Moving::unrecorded`] with `execution_dir` dropped too, from
+        /// this host's copy and the bucket's: the session's home then comes
+        /// from `origin.anchor`, the old directory, and the move logs no
+        /// `from`.
+        fn unanchored() -> Self {
+            let mv = Moving::unrecorded();
+            let path = mv.m.state_path(NAME);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (first, rest) = text.split_once('\n').unwrap();
+            let mut header: Value = serde_json::from_str(first).unwrap();
+            assert_eq!(
+                header["origin"]["anchor"],
+                s(&mv.old),
+                "setup: origin.anchor isn't the old directory: {header}"
+            );
+            assert!(
+                header
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_dir")
+                    .is_some(),
+                "setup: the header records no execution_dir: {header}"
+            );
+            let text = format!("{}\n{}", serde_json::to_string(&header).unwrap(), rest);
+            std::fs::write(&path, &text).unwrap();
+            mv.s3.put(&mv.state_key(), text.as_bytes());
+            mv
+        }
     }
 
     /// koto#739: `koto session rebind --whole` read the session's home
@@ -2089,6 +2118,44 @@ Done.
             failed.is_empty(),
             "points after which the re-run left the context behind: {failed:?}"
         );
+    }
+
+    /// The test above at `after-version`, the last point before the carry,
+    /// on a session whose header had no `execution_dir` before the move, so
+    /// its home came from `origin.anchor` and the logged move's `from` is
+    /// empty: run again, the move must still carry the context from the old
+    /// home to the new one.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_after_its_commit_carries_the_context_of_a_session_with_no_execution_dir(
+    ) {
+        let mv = Moving::unanchored();
+        let new_prefix = prefix_of(&mv.new);
+        assert_ne!(
+            new_prefix, mv.prefix,
+            "setup: the two directories share a prefix"
+        );
+
+        let stopped = mv.mover(&mv.new, &[(FAULT_ENV, "after-version")], &[]);
+        assert!(
+            !stopped.ok(),
+            "the stopped move exited 0: {}",
+            stopped.describe()
+        );
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "run again: {}", run.describe());
+
+        for (key, value) in [("notes.md", "notes"), ("carried.md", "carried")] {
+            let object = session_key(&new_prefix, NAME, &format!("ctx/{key}"));
+            assert_eq!(
+                mv.s3.object(&object).as_deref(),
+                Some(value.as_bytes()),
+                "context key '{key}' from before the move isn't at the new home {object}; keys \
+                 under it: {:?}; the stopped move: {}; run again: {}",
+                mv.s3.keys_under(&format!("{new_prefix}/{NAME}/")),
+                stopped.describe(),
+                run.describe()
+            );
+        }
     }
 
     /// The move of the test above, stopped at `after-version`, the last
