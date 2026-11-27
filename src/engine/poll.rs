@@ -275,7 +275,7 @@ mod tests {
     }
 
     /// Flush point: a polling gate's wait sends what is queued before it
-    /// sleeps. The gate isn't due for 30 seconds. A second thread raises
+    /// sleeps. The gate isn't due for an hour. A second thread raises
     /// the shutdown flag once the sink has the records, which ends the wait
     /// from inside its sleep, so the gate never runs again and the records
     /// can only have gone out before that sleep began. A flush placed after
@@ -289,9 +289,9 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "command", "command": "true"}))
                 .unwrap();
         gate.poll = Some(PollSpec {
-            interval_secs: 30,
-            timeout_secs: 600,
-            hold_secs: 60,
+            interval_secs: 3600,
+            timeout_secs: 86_400,
+            hold_secs: 7200,
             pending_exit_code: 75,
         });
         let gates = BTreeMap::from([("ci".to_string(), gate)]);
@@ -312,7 +312,7 @@ mod tests {
         sink.queue(2);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let give_up = std::time::Instant::now() + Duration::from_secs(20);
+                let give_up = std::time::Instant::now() + Duration::from_secs(300);
                 while sink.received() < 2 && std::time::Instant::now() < give_up {
                     std::thread::sleep(Duration::from_millis(20));
                 }

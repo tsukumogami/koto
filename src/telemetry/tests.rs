@@ -1980,6 +1980,11 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
     let bound = Duration::from_millis(200);
     set_lock_wait_for_test(bound);
     let holder = hold_journal_lock(&journal);
+    // Each write reports how long it took and the lock wait it was
+    // allowed. Whether a write may wait is read from the allowance, never
+    // from the clock: on a slow host a write that doesn't wait can still
+    // take longer than one that does.
+    take_lock_waits_for_test();
     let next = || {
         let started = Instant::now();
         response(
@@ -1991,14 +1996,19 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
             "d",
             None,
         );
-        started.elapsed()
+        (started.elapsed(), take_lock_waits_for_test())
     };
 
-    let first = next();
+    let (first, allowed) = next();
     assert!(first >= bound, "{first:?}");
+    assert_eq!(allowed, vec![bound]);
     assert!(gave_up());
-    let second = next();
-    assert!(second < bound / 4, "{second:?}");
+    let (_, allowed) = next();
+    assert_eq!(
+        allowed,
+        vec![Duration::ZERO],
+        "the second write may not wait"
+    );
     drop(holder);
 
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
@@ -2010,8 +2020,8 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
     );
 
     // The lock is free: the single try takes it, and clears the state.
-    let third = next();
-    assert!(third < bound / 4, "{third:?}");
+    let (_, allowed) = next();
+    assert_eq!(allowed, vec![Duration::ZERO]);
     assert_eq!(response_records(&f.journal()).len(), 1);
     assert_eq!(warnings_for_test().len(), 1);
     assert!(!gave_up());
@@ -2029,6 +2039,9 @@ fn a_write_that_takes_the_lock_restores_the_full_wait() {
     let journal = f.home.join(JOURNAL_FILE);
     let bound = Duration::from_millis(150);
     set_lock_wait_for_test(bound);
+    // As in the test above, whether a write may wait is read from the lock
+    // wait it was allowed, not from how long it took.
+    take_lock_waits_for_test();
     let next = || {
         let started = Instant::now();
         response(
@@ -2040,33 +2053,40 @@ fn a_write_that_takes_the_lock_restores_the_full_wait() {
             "d",
             None,
         );
-        started.elapsed()
+        (started.elapsed(), take_lock_waits_for_test())
     };
 
     // A stall: the write gives up at its bound.
     let holder = hold_journal_lock(&journal);
-    let stalled = next();
+    let (stalled, allowed) = next();
     drop(holder);
     assert!(stalled >= bound, "{stalled:?}");
+    assert_eq!(allowed, vec![bound]);
     assert!(gave_up());
 
-    // The stall passes: a write takes the lock and clears the state.
-    let free = next();
-    assert!(free < bound / 2, "{free:?}");
+    // The stall passes: a write takes the lock on its one try and clears
+    // the state.
+    let (_, allowed) = next();
+    assert_eq!(allowed, vec![Duration::ZERO]);
     assert!(!gave_up());
     assert_eq!(response_records(&f.journal()).len(), 1);
 
-    // The next contended write waits its full bound again, and gets the
-    // lock once it is released within that bound.
+    // The next contended write is allowed its full bound again, and gets
+    // the lock once it is released within that bound. The bound here is
+    // long, so a host that is slow to run the releasing thread can't turn
+    // a wait that should succeed into one that runs out.
+    let long = Duration::from_secs(60);
+    set_lock_wait_for_test(long);
     let holder = hold_journal_lock(&journal);
+    let pause = Duration::from_millis(50);
     let release = std::thread::spawn(move || {
-        std::thread::sleep(bound / 3);
+        std::thread::sleep(pause);
         drop(holder);
     });
-    let contended = next();
+    let (contended, allowed) = next();
     release.join().unwrap();
-    assert!(contended >= bound / 3, "{contended:?}");
-    assert!(contended < bound * 2, "{contended:?}");
+    assert_eq!(allowed, vec![long], "the full wait is back");
+    assert!(contended >= pause, "{contended:?}");
     assert_eq!(response_records(&f.journal()).len(), 2);
     assert!(!gave_up());
     // The one warning, from the stall.

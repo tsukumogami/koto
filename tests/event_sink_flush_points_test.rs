@@ -133,9 +133,10 @@ fn action_flush_precedes_gate_spawn() {
     koto(&home, &["init", "wf", "--template", "template.md"]);
     let after_init = stub.call_count();
     assert_eq!(after_init, 1);
-    // The call the tick makes before the gate takes two seconds. A flush
-    // inside the command's time limit would show up in the gate's duration.
-    stub.sleeps(&["0", "2", "0"]);
+    // The call the tick makes before the gate sleeps for half a second. A
+    // flush inside the command's time limit would show up in the gate's
+    // duration.
+    stub.sleeps(&["0", "0.5", "0"]);
     koto(
         &home,
         &[
@@ -173,14 +174,30 @@ fn action_flush_precedes_gate_spawn() {
         "the flush sent something other than what led up to the gate"
     );
 
-    // The command's time limit opened after the flush returned: the gate
-    // took nothing like the two seconds the sink's call did.
+    // The command's time limit opened after the flush returned: the gate's
+    // recorded duration is shorter than the sink's call took. The call's
+    // own length is measured, from the time the stub noted when it started
+    // to the time it wrote its last file, so a slow host stretches both
+    // sides of the comparison and not one. A flush inside the timer would
+    // make the gate's duration the longer of the two whatever the host.
     let gate = journal
         .iter()
         .find(|r| r.get("koto.check.duration_ms").is_some())
         .unwrap_or_else(|| panic!("no gate record in {:?}", kinds(&journal)));
     let took = gate["koto.check.duration_ms"].as_u64().unwrap();
-    assert!(took < 2000, "the gate's {took} ms includes the flush");
+    let ended = std::fs::metadata(ctl.join("calls").join(after_init.to_string()).join("done"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let call_ms = ((ended - calls[after_init].at) * 1000.0) as u64;
+    assert!(call_ms >= 500, "the sink's call took {call_ms} ms");
+    assert!(
+        took < call_ms,
+        "the gate's {took} ms includes the flush's {call_ms} ms"
+    );
 
     // Across the session the sink got exactly what the journal holds.
     assert_eq!(kinds(&sent(&stub.calls())), kinds(&journal));
