@@ -526,6 +526,12 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     Ok(AppendOutcome::Written { seq: next_seq })
 }
 
+// Lock order. A process holding more than one of a session's locks takes
+// them in this order, never the reverse: the state-file lock a batch tick
+// holds, `environment.lock` or `decider.lock`, the context manifest lock
+// (`ctx/manifest.lock`), the append lock below, then `cloud-batch.lock`. A
+// lock held for a whole tick, if one is added, goes before all of them.
+
 /// File name of the per-log append lock, a sidecar in the log's directory.
 /// It holds no data.
 pub const APPEND_LOCK_FILE: &str = "append.lock";
@@ -658,6 +664,15 @@ impl std::fmt::Display for StateLogBusy {
 }
 
 impl std::error::Error for StateLogBusy {}
+
+impl StateLogBusy {
+    /// The log at `path` stayed busy for `waited`: for a writer whose wait
+    /// ran out on a lock it takes before the append lock, as
+    /// `koto context add` takes the session's manifest lock.
+    pub(crate) fn new(path: std::path::PathBuf, waited: std::time::Duration) -> Self {
+        StateLogBusy { path, waited }
+    }
+}
 
 /// The [`StateLogBusy`] `e` failed with, whatever context was added to it.
 pub fn state_log_busy(e: &anyhow::Error) -> Option<&StateLogBusy> {
