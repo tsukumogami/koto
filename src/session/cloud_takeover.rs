@@ -371,7 +371,8 @@ impl CloudBackend {
         };
         // A tick of the source holds its tick.lock shared for as long as it
         // runs, the commands it is running included: probed first, in the
-        // order every holder takes it before the state file's lock.
+        // order every holder takes it before the state file's lock, and
+        // created when an older build left the session without one.
         let tick_lock = self
             .local
             .session_dir(name)
@@ -773,10 +774,11 @@ enum TryLock {
     Io(std::io::Error),
 }
 
-/// [`try_flock`] on a session's `tick.lock`, which is never created here
-/// (a session made before the lock existed has none, and no tick of it can
-/// be running under one) and never followed through a link. `None` when the
-/// file isn't there.
+/// [`try_flock`] on a session's `tick.lock`, never followed through a link.
+/// A session made before the lock existed has none, so the file is created
+/// here and held: a tick that starts while the import runs then waits on
+/// it, as it would on one an earlier tick made. The directory is never
+/// created; `None` when it isn't there.
 fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     #[cfg(unix)]
     {
@@ -784,6 +786,8 @@ fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
         use std::os::unix::io::AsRawFd;
         let file = match std::fs::OpenOptions::new()
             .read(true)
+            .write(true)
+            .create(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
         {
