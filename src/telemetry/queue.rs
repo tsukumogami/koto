@@ -77,6 +77,26 @@ fn call_budget() -> Duration {
     TEST_CALL_BUDGET.with(|b| b.get())
 }
 
+// How much of a flush's budget a test says each call used up, on top of
+// the time it really took. A test that needs a call to leave too little
+// time for the next one sets this and a long budget, so the outcome is
+// decided by the numbers it chose and not by how fast the host ran the
+// stub.
+#[cfg(test)]
+thread_local! {
+    static TEST_CALL_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+#[cfg(test)]
+fn call_cost() -> Duration {
+    TEST_CALL_COST.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+fn call_cost() -> Duration {
+    Duration::ZERO
+}
+
 /// One queued record: its line as it will be sent, and the session it
 /// belongs to, for the count if it is dropped.
 struct Queued {
@@ -245,10 +265,12 @@ pub fn flush() {
     };
 
     let deadline = Instant::now() + call_budget();
+    // Zero outside tests.
+    let mut charged = Duration::ZERO;
     let mut rest = items.as_slice();
     while !rest.is_empty() {
         let (chunk, after) = rest.split_at(rest.len().min(CHUNK));
-        if deadline.saturating_duration_since(Instant::now()) < MIN_CALL {
+        if deadline.saturating_duration_since(Instant::now() + charged) < MIN_CALL {
             // Too late to give a call its full time: this chunk and the
             // ones after it are dropped with no call, and the breaker is
             // left alone.
@@ -256,7 +278,9 @@ pub fn flush() {
             break;
         }
         let lines: Vec<&str> = chunk.iter().map(|q| q.line.as_str()).collect();
-        match sink::send(&sink, &lines, 0, deadline) {
+        let outcome = sink::send(&sink, &lines, 0, deadline);
+        charged += call_cost();
+        match outcome {
             Outcome::Posted | Outcome::PostedSomeInvalid => {}
             Outcome::Usage => drops.add_all(chunk),
             Outcome::Off => {
@@ -288,6 +312,7 @@ pub(crate) fn reset_for_test() {
     with_queue(|q| *q = Queue::default());
     set_breaker(Breaker::Open);
     TEST_CALL_BUDGET.with(|b| b.set(CALL_BUDGET));
+    TEST_CALL_COST.with(|c| c.set(Duration::ZERO));
 }
 
 #[cfg(test)]
@@ -315,10 +340,25 @@ mod tests {
             f
         }
 
-        /// A fixture with the real call budget. The tests that use it run
-        /// with every core to themselves under the CI test runner
-        /// (`.config/nextest.toml`), since they depend on the stub starting
-        /// promptly.
+        /// A fixture whose first call can take several seconds and still
+        /// leave time for a second, for the one test that needs a call to
+        /// be killed at the deadline.
+        fn with_budget(budget: Duration) -> Self {
+            let f = Fixture::new();
+            TEST_CALL_BUDGET.with(|b| b.set(budget));
+            f
+        }
+
+        /// A fixture where each call is charged `cost` of a long budget,
+        /// whatever time it really took.
+        fn charging(budget: Duration, cost: Duration) -> Self {
+            let f = Fixture::with_budget(budget);
+            TEST_CALL_COST.with(|c| c.set(cost));
+            f
+        }
+
+        /// A fixture with the real call budget, for a test that makes one
+        /// call or none.
         fn new() -> Self {
             reset_for_test();
             let tmp = tempfile::tempdir().unwrap();
@@ -381,15 +421,11 @@ mod tests {
 
     #[test]
     fn chunks_200_200_50() {
-        let f = Fixture::new();
+        // About the chunking, not the deadline: the budget is long, so a
+        // slow host can't make a later chunk late.
+        let f = Fixture::unhurried();
         f.queue(&f.a, 0, 450);
-        let started = Instant::now();
         flush();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
         let calls = f.stub.calls();
         assert_eq!(f.sizes(), vec![200, 200, 50]);
         for call in &calls {
@@ -419,15 +455,19 @@ mod tests {
 
     #[test]
     fn deadline_drops_unreached_chunk() {
-        let f = Fixture::new();
-        // The second call sleeps past the call deadline.
-        f.stub.sleeps(&["0", "30"]);
+        // The deadline is real here, since the test is that a call is
+        // killed at it. The budget is 8 s and not the real 2.85 s so that
+        // the first call can take up to 6 s on a slow host and still leave
+        // the second its 2.0 s.
+        let budget = Duration::from_secs(8);
+        let f = Fixture::with_budget(budget);
+        // The second call sleeps far past the deadline.
+        f.stub.sleeps(&["0", "300"]);
         f.queue(&f.a, 0, 450);
         let started = Instant::now();
         flush();
         let took = started.elapsed();
-        assert!(took < Duration::from_secs(3), "the flush took {took:?}");
-        assert!(took >= CALL_BUDGET, "the call was ended early: {took:?}");
+        assert!(took >= budget, "the call was ended early: {took:?}");
         // Two calls were made; the third chunk never was.
         let calls = f.stub.calls();
         assert_eq!(f.sizes(), vec![200, 200]);
@@ -440,19 +480,13 @@ mod tests {
 
     #[test]
     fn late_chunk_dropped_breaker_stays_open() {
-        let f = Fixture::new();
-        // Two healthy calls that together leave under 2.0 s for a third:
-        // the second alone takes 0.9 s of the 2.85 s. The first is as quick
-        // as the host allows, so the second starts with time to spare.
-        f.stub.sleeps(&["0", "0.9", "0"]);
+        // Two healthy calls that together leave under 2.0 s for a third.
+        // The times are charged, not slept: of a 600 s budget each call is
+        // charged 299.5 s, so one call leaves 300.5 s and two leave 1 s,
+        // and the host would have to stall for minutes to change either.
+        let f = Fixture::charging(Duration::from_secs(600), Duration::from_millis(299_500));
         f.queue(&f.a, 0, 450);
-        let started = Instant::now();
         flush();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
         let calls = f.stub.calls();
         assert_eq!(f.sizes(), vec![200, 200]);
         // Neither call was killed.
@@ -460,7 +494,7 @@ mod tests {
         // Only the third chunk is counted, and the breaker is open.
         assert_eq!(carry::peek(&f.a), 50);
         assert_eq!(breaker(), Breaker::Open);
-        // The next flush sends.
+        // The next flush sends: it has a budget of its own.
         f.queue(&f.a, 450, 5);
         flush();
         assert_eq!(f.sizes(), vec![200, 200, 5]);
