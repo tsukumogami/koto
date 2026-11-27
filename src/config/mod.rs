@@ -403,7 +403,8 @@ fn default_request_leg_cap() -> u32 {
     256
 }
 
-/// Run journal rotation and retention (`src/telemetry/rotate.rs`).
+/// The `[run_journal]` table: whether the run journal is written at all,
+/// and its rotation and retention (`src/telemetry/rotate.rs`).
 ///
 /// Rotation is off by default: with `rotate_bytes` at 0 the journal is
 /// never moved, whatever its size. A non-zero bound makes the append that

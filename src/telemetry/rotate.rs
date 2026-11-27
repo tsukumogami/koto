@@ -32,7 +32,9 @@ pub(crate) const READERS_DIR: &str = "_run_journal.readers";
 /// The largest position file koto reads.
 const MAX_POSITION_BYTES: u64 = 4096;
 
-/// The three run-journal settings, resolved from user config.
+/// The rotation and retention settings: the three `[run_journal]` keys
+/// rotation reads, resolved from user config. The table's fourth key,
+/// `enabled`, is read by the write path, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settings {
     /// 0 turns rotation off.

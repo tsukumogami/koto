@@ -683,6 +683,10 @@ fn journal_lock_wait() -> std::time::Duration {
 /// all once an earlier write in this process has given up on it. A lock
 /// still held after that is a failed write: one warning, and the batch is
 /// skipped.
+///
+/// With the journal turned off ([`journal_enabled`]) the batch is dropped
+/// here, before anything is opened: every journal write comes through this
+/// function, so this is the one place the setting is read.
 fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration) {
     if records.is_empty() || !journal_enabled() {
         return;
