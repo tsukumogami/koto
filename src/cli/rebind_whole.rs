@@ -78,7 +78,7 @@ fn crash_at(point: &str) {
     }
     if std::env::var(FAULT_ENV).as_deref() == Ok(point) {
         eprintln!("{}: stopping at {}", FAULT_ENV, point);
-        std::process::exit(86);
+        crate::exit::crash(86);
     }
 }
 
