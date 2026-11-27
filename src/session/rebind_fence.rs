@@ -144,7 +144,8 @@ pub fn check(
 /// whole-binding move (`origin.whole_epoch` above `0`). A header without one
 /// passes: the plain rebind's fence is [`check`]'s alone.
 ///
-/// Refused when the process read a lower epoch than the header's, or when
+/// Refused when the process read an epoch below the header's
+/// `whole_epoch` (it read the session before the move), or when
 /// `cwd` is under a retired anchor and either isn't under the current anchor
 /// or is under a retired anchor deeper (more path components) than the
 /// current one. So after a move up into a parent the old directory is
@@ -164,7 +165,10 @@ pub fn check_whole(
         anchor: fence.anchor.as_ref().map(|a| a.display().to_string()),
         from_retired,
     };
-    if seen_epoch.is_some_and(|seen| seen < fence.epoch) {
+    // Measured against the move's epoch, not the anchor's: a plain rebind
+    // after the move (run from a gate, say) bumps only `anchor_epoch`, and
+    // the tick that read the session after the move must keep writing.
+    if seen_epoch.is_some_and(|seen| seen < fence.whole_epoch) {
         return Err(refuse(false));
     }
     let Some(cwd) = cwd else {

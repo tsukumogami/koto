@@ -1607,6 +1607,75 @@ Done.
     }
 
     #[test]
+    fn a_second_process_in_the_old_directory_is_refused_while_the_cloud_mover_finishes_from_there()
+    {
+        // The mover runs from the directory it retires; another process
+        // there is refused while the move's later parts are still to run.
+        let mv = Moving::new();
+        let hold = mv.m.root.join("hold");
+        let envs = [
+            ("KOTO_ANCHOR", mv.new_anchor.as_str()),
+            ("XDG_CONFIG_HOME", s(&mv.xdg_new)),
+            ("KOTO_WORKFLOWS_DIR", s(&mv.wf_new)),
+            ("KOTO_TEST_REBIND_HOLD", s(&hold)),
+            ("KOTO_TEST_REBIND_HOLD_AT", "after-held-by"),
+        ];
+        let args = ["session", "rebind", NAME, "--whole", "--to", s(&mv.new)];
+        let mut mover =
+            mv.m.cmd(&mv.old, &envs, &args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+        let started = std::time::Instant::now();
+        let bound = std::time::Duration::from_secs(60);
+        while !hold.exists() {
+            if mover.try_wait().unwrap().is_some() {
+                let out = mover.wait_with_output().unwrap();
+                panic!(
+                    "the move exited before its hold point: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            if started.elapsed() > bound {
+                let _ = mover.kill();
+                panic!("the move didn't reach its hold point within {bound:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(header_of(&mv.remote())["origin"]["whole_epoch"], 1);
+        assert_eq!(count(&mv.remote(), "environment_rerecorded"), 0);
+
+        let before = snapshot(&mv.s3, &format!("{}/{NAME}/", mv.prefix));
+        let run = mv.m.add(&mv.old, NAME, "late.md", "late");
+        assert_rebound(&run, "a write from the old directory during the move");
+        assert_eq!(
+            snapshot(&mv.s3, &format!("{}/{NAME}/", mv.prefix)),
+            before,
+            "the refused write reached the bucket"
+        );
+
+        std::fs::remove_file(&hold).unwrap();
+        while mover.try_wait().unwrap().is_none() {
+            if started.elapsed() > bound {
+                let _ = mover.kill();
+                panic!("the move didn't finish within {bound:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = mover.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "rebind --whole --to: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        mv.assert_moved("after the move");
+        let run = mv.m.add(&mv.old, NAME, "late.md", "late");
+        assert_rebound(&run, "a write from the old directory after the move");
+    }
+
+    #[test]
     fn a_cloud_whole_rebind_refuses_when_another_machine_pushed_last() {
         let mv = Moving::new();
         let mut version = mv.version();

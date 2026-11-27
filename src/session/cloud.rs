@@ -1636,12 +1636,33 @@ impl CloudBackend {
     }
 
     /// Record `header`'s rebind epoch as the one this process read of `id`.
+    ///
+    /// Two records, for the two rules: the plain rebind's prefix rule takes
+    /// the epoch of the latest read (each read pulls first, so a pull that
+    /// brought a plain rebind's header refreshes it), and the whole-binding
+    /// rule takes the first one this process read (`fence_state`), so a
+    /// process that read the session before a move and pulled the moved
+    /// header afterwards is still refused.
     fn note_epoch_read(&self, id: &str, header: &crate::engine::types::StateFileHeader) {
         let epoch = header.origin.as_ref().map_or(0, |o| o.anchor_epoch);
         self.epochs_read
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string(), epoch);
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        crate::session::fence_state::note_read(&path, epoch);
+    }
+
+    /// Record `epoch` as the one this process holds of `id` on both records,
+    /// after a whole-binding move committed it (`fence_state::note_mover`),
+    /// so the move's own later writes pass the fence it raised.
+    pub(crate) fn note_mover(&self, id: &str, epoch: u64) {
+        self.epochs_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), epoch);
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        crate::session::fence_state::note_mover(&path, epoch);
     }
 
     /// Refuse a write of `id` that a rebind fenced off: the session was
@@ -1649,7 +1670,7 @@ impl CloudBackend {
     /// anchor a rebind retired (`crate::session::rebind_fence`), by its
     /// prefix and, once a whole-binding move recorded `whole_epoch`, by its
     /// path. Asked of the local header line, before anything is written.
-    fn check_fence(&self, id: &str) -> anyhow::Result<()> {
+    pub(crate) fn check_fence(&self, id: &str) -> anyhow::Result<()> {
         if self.probes.read_only {
             return Ok(());
         }
@@ -1663,15 +1684,20 @@ impl CloudBackend {
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
             .copied();
-        crate::session::rebind_fence::check(id, &line, &self.prefix, seen)?;
+        if let Err(refused) = crate::session::rebind_fence::check(id, &line, &self.prefix, seen) {
+            // The prefix rule is the plain rebind's path rule, by prefix: the
+            // process making the whole-binding move the header records is let
+            // past it as `fence_state::check` lets it past the path rule, so
+            // a move run from the directory it retires finishes its parts.
+            // Its epoch half still applies.
+            if !(refused.from_retired && crate::session::fence_state::is_mover(&path, &line)) {
+                return Err(refused.into());
+            }
+        }
         // A whole-binding move adds the path rule, from this process's
-        // directory, with this backend's own read epoch.
-        crate::session::rebind_fence::check_whole(
-            id,
-            &line,
-            crate::session::fence_state::cwd().as_deref(),
-            seen,
-        )?;
+        // directory, measured against the first epoch this process read
+        // (`note_epoch_read`), the same record the local backend uses.
+        crate::session::fence_state::check(id, &path, &line)?;
         Ok(())
     }
 
@@ -1840,10 +1866,16 @@ impl CloudBackend {
     /// session the local guard refuses (an import of it is pending, or it is
     /// the other side of a same-host import): the tick refuses it before
     /// touching it.
+    ///
+    /// Only the id [`CloudBackend::mint_tick`] gave this process is written.
+    /// With none minted for `id` nothing is: a fresh id made here would be
+    /// one the tick's own earlier reads never used, so its commands would
+    /// take reads the tick already made as another tick's.
     pub fn begin_tick(&self, id: &str) {
         if self.local_guard(id).is_ok() {
-            let tick = minted_tick(id).unwrap_or_else(sync_stamp::new_tick_id);
-            sync_stamp::write_tick_id(&self.local.session_dir(id), &tick);
+            if let Some(tick) = minted_tick(id) {
+                sync_stamp::write_tick_id(&self.local.session_dir(id), &tick);
+            }
         }
     }
 
@@ -2050,11 +2082,15 @@ impl CloudBackend {
         self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         let indexed = self.ensure_indexed(id)?;
         // A copy the session's successor fenced refuses the push as
-        // `session_superseded`, not as a conflict to resolve.
+        // `session_superseded`, not as a conflict to resolve, and one a
+        // rebind moved past the pushed header refuses it as
+        // `session_rebound`.
         let refused = |remote: &[u8]| {
-            supersede::superseded_refusal(id, data, remote).unwrap_or_else(|| {
-                state_log::conflict(id, &key, "the push was refused", data, remote)
-            })
+            supersede::superseded_refusal(id, data, remote)
+                .or_else(|| rebound_refusal(id, data, remote).map(anyhow::Error::new))
+                .unwrap_or_else(|| {
+                    state_log::conflict(id, &key, "the push was refused", data, remote)
+                })
         };
         let stamped = self.stamp(id).and_then(|s| s.state_etag);
         let mut sent = self.put_state_if(&key, data, stamped.as_deref());
@@ -2069,6 +2105,16 @@ impl CloudBackend {
                  of session '{}' couldn't check that its copy hadn't moved",
                 id
             );
+            // The bucket's header is read first, and a copy a rebind moved
+            // past the pushed one is refused rather than written over. That
+            // narrows the window and doesn't close it: on a bucket without
+            // conditional writes, a move landing between this ranged GET and
+            // the unconditional PUT below is still written over.
+            if let Some(remote) = self.remote_header_bytes(&key)? {
+                if let Some(rebound) = rebound_refusal(id, data, &remote) {
+                    return Err(anyhow::Error::new(rebound));
+                }
+            }
             sent = self.bucket.put_object(&key, data);
         }
         if sent.as_ref().is_err_and(is_precondition_failed) {
@@ -2080,7 +2126,12 @@ impl CloudBackend {
                 // session's copy under the name (a re-created session) is
                 // replaced too, as every push did before, but only under
                 // this directory's own prefix: a home found any other way
-                // never has another workspace's session written over.
+                // never has another workspace's session written over. A copy
+                // a rebind moved past the pushed header is never replaced,
+                // whatever its events (`rebound_refusal`).
+                if rebound_refusal(id, data, remote).is_some() {
+                    return Err(refused(remote));
+                }
                 let replaces = match state_log::compare(data, remote) {
                     state_log::LogOrder::Same
                     | state_log::LogOrder::LocalExtends
@@ -2208,6 +2259,137 @@ impl CloudBackend {
                 }
             ),
         }
+    }
+
+    /// The start of the state file at `key`, enough to hold its header line,
+    /// read with one ranged GET (the read [`CloudBackend::confirm_home_copy`]
+    /// makes); `None` when the bucket holds no object there.
+    fn remote_header_bytes(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let response = match self
+            .bucket
+            .get_object_range(key, 0, Some(DELETE_HEADER_BYTES))
+        {
+            Ok(response) => response,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => anyhow::bail!(
+                "cloud sync: reading the header of {} failed: {}",
+                key,
+                without_url_userinfo(&e.to_string())
+            ),
+        };
+        match response.status_code() {
+            200 | 206 => Ok(Some(response.bytes().to_vec())),
+            404 => Ok(None),
+            status => anyhow::bail!(
+                "cloud sync: reading the header of {} answered {}",
+                key,
+                status
+            ),
+        }
+    }
+
+    /// [`rebound_refusal`] of this host's copy of `id` against the bucket's
+    /// header, for a refusal that has already decided not to write: the
+    /// rebind that explains it, when there was one. A header that can't be
+    /// read explains nothing, and the caller's own refusal stands.
+    fn rebound_in_bucket(&self, id: &str) -> Option<crate::session::rebind_fence::SessionRebound> {
+        let local = self.read_local_state_bytes(id)?;
+        let remote = self.remote_header_bytes(&self.state_key(id)).ok()??;
+        rebound_refusal(id, &local, &remote)
+    }
+
+    /// The first half of a whole-binding move's commit
+    /// (`koto session rebind --whole`): PUT `moved`, the session's log with
+    /// the move's event and header, over the copy this host last pulled,
+    /// and nothing else. Conditional on the stamp's ETag, so a copy that
+    /// moved since the pull is never written over: that is
+    /// [`MovedPut::Lost`], with the probe dropped so a pull asks again. A
+    /// bucket without conditional writes is asked for the copy's ETag
+    /// first, and a copy that moved is lost the same way. The local copy is
+    /// left as it is for [`CloudBackend::adopt_moved_state`].
+    pub(crate) fn put_moved_state(&self, id: &str, moved: &[u8]) -> anyhow::Result<MovedPut> {
+        let key = self.state_key(id);
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
+        let indexed = self.ensure_indexed(id)?;
+        let stamped = self.stamp(id).and_then(|s| s.state_etag);
+        let mut sent = self.put_state_if(&key, moved, stamped.as_deref());
+        if sent
+            .as_ref()
+            .is_err_and(|e| matches!(e, S3Error::HttpFailWithBody(501, _)))
+        {
+            // As narrow as `put_state`'s fallback: a write landing between
+            // this read and the PUT is still written over.
+            let current = self.fetch_state_with_etag(&key)?.map(|(_, etag)| etag);
+            if current.as_deref().filter(|e| !e.is_empty()) != stamped.as_deref() {
+                self.forget_probe(id);
+                return Ok(MovedPut::Lost);
+            }
+            sent = self.bucket.put_object(&key, moved);
+        }
+        match sent {
+            Ok(response) => {
+                self.forget_probe(id);
+                Ok(MovedPut::Taken {
+                    etag: response_etag(&response),
+                    indexed,
+                })
+            }
+            Err(e) if is_precondition_failed(&e) => {
+                self.forget_probe(id);
+                Ok(MovedPut::Lost)
+            }
+            Err(e) => Err(e).with_context(|| format!("S3 PUT failed for key: {}", key)),
+        }
+    }
+
+    /// The second half of a whole-binding move's commit, once the bucket
+    /// took `moved` under `etag`: the local log becomes those bytes, under
+    /// its append lock, and is stamped as synced, so this host's copy is
+    /// the bucket's. The bucket is the commit point, so the local file is
+    /// replaced whatever it holds now: an append that landed here since the
+    /// move read it was made at the epoch the move retired, and its push is
+    /// refused as `session_rebound`.
+    pub(crate) fn adopt_moved_state(
+        &self,
+        id: &str,
+        moved: &[u8],
+        put: &MovedPut,
+    ) -> anyhow::Result<()> {
+        let MovedPut::Taken { etag, indexed } = put else {
+            anyhow::bail!("internal error: the bucket didn't take the moved copy of '{id}'");
+        };
+        let path = self.local.state_path(id);
+        crate::engine::persistence::with_log_replace_lock(
+            &path,
+            crate::engine::persistence::LOG_REPLACE_LOCK_WAIT,
+            || crate::engine::persistence::replace_log_bytes(&path, moved),
+        )?;
+        self.record_synced(id, etag.as_deref(), moved, *indexed);
+        self.put_summary(id, moved, etag.as_deref());
+        Ok(())
+    }
+
+    /// The bucket's `version.json` of `id`, for a whole-binding move's check
+    /// that this host pushed the session last: `None` when there is none.
+    pub(crate) fn remote_version(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::session::version::SessionVersion>> {
+        self.read_remote_version(id)
+    }
+
+    /// After a whole-binding move: `version.json` one above both the
+    /// version the move read in the bucket (`before`) and this host's, as
+    /// this machine's, here and in the bucket. A host that pushed before the
+    /// move and flushes after it then meets a version conflict before any of
+    /// its writes go up (`flush_batch`), which it reports as the move.
+    pub(crate) fn push_moved_version(&self, id: &str, before: Option<u64>) -> anyhow::Result<()> {
+        let mut version = self.load_or_create_local_version(id)?;
+        version.version = version.version.max(before.unwrap_or(0)) + 1;
+        version.last_sync_base = version.version;
+        version.machine_id = crate::session::version::get_or_create_machine_id()?;
+        version.save(&self.local_version_path(id))?;
+        self.push_version(id)
     }
 
     /// PUT `id`'s state file whatever the bucket holds, and stamp it: for a
@@ -4032,6 +4214,14 @@ impl CloudBackend {
         match self.strict_push_state(id) {
             Err(e) if e.to_string().starts_with("session conflict:") => Err(e),
             Err(e) if crate::engine::persistence::session_superseded(&e).is_some() => Err(e),
+            // The copy a rebind elsewhere moved: this write must not read
+            // as synced either.
+            Err(e)
+                if e.downcast_ref::<crate::session::rebind_fence::SessionRebound>()
+                    .is_some() =>
+            {
+                Err(e)
+            }
             Err(e) if is_hard_sync_error(&e) => {
                 eprintln!("error: cloud sync: {:#}", e);
                 Ok(())
@@ -4245,6 +4435,13 @@ impl CloudBackend {
             remote_machine,
         } = check_sync(&local, remote.as_ref())
         {
+            // A whole-binding move elsewhere uploads `version.json` with its
+            // commit, so a host that pushed before the move meets this
+            // conflict on its next flush. The bucket's header, read once on
+            // this path only, says when a rebind is what moved the version.
+            if let Some(rebound) = self.rebound_in_bucket(id) {
+                return Err(anyhow::Error::new(rebound));
+            }
             anyhow::bail!(
                 "{}",
                 conflict_message(
@@ -4415,6 +4612,15 @@ impl CloudBackend {
 
         match keep {
             "local" => {
+                // A copy a rebind moved past this host's isn't the other side
+                // of a conflict to settle: forcing this host's copy over it
+                // would undo the move. Refused before anything is written.
+                if let Some(remote) = self.remote_header_bytes(&self.state_key(id))? {
+                    let local = self.read_local_state_bytes(id).unwrap_or_default();
+                    if let Some(rebound) = rebound_refusal(id, &local, &remote) {
+                        return Err(anyhow::Error::new(rebound));
+                    }
+                }
                 // Force-upload entire local session to S3.
                 new_version.save(&local_path)?;
                 self.force_push_session(id)?;
@@ -8867,7 +9073,67 @@ fn each_in_parallel<T: Sync, R: Send>(
 /// this one's. Everything else (an unreachable bucket, a refused request)
 /// leaves the local write standing and the push for later.
 fn is_hard_sync_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<SessionMigrated>().is_some() || e.to_string().starts_with("session conflict:")
+    e.downcast_ref::<SessionMigrated>().is_some()
+        || e.downcast_ref::<crate::session::rebind_fence::SessionRebound>()
+            .is_some()
+        || e.to_string().starts_with("session conflict:")
+}
+
+/// What the bucket said to the first half of a whole-binding move's commit
+/// ([`CloudBackend::put_moved_state`]).
+pub(crate) enum MovedPut {
+    /// The bucket holds the moved copy, under `etag`; `indexed` is what
+    /// [`CloudBackend::ensure_indexed`] said, for the stamp.
+    Taken { etag: Option<String>, indexed: bool },
+    /// The bucket's copy moved since this host pulled it, and the PUT wrote
+    /// nothing.
+    Lost,
+}
+
+/// The refusal of a write of `id`'s log `pushed` over the bucket's copy
+/// `remote` (whose first line is all that is read of either), when a
+/// rebind elsewhere moved the copy past the one this host holds: the
+/// bucket's header records a higher `anchor_epoch`, or retired the anchor
+/// the pushed header names at an epoch no lower. Two copies whose headers
+/// record different `session_id`s are two sessions under one name, which
+/// no rebind relates. A header with no origin records epoch 0 and nothing
+/// retired, so a session no rebind touched is never refused here.
+fn rebound_refusal(
+    id: &str,
+    pushed: &[u8],
+    remote: &[u8],
+) -> Option<crate::session::rebind_fence::SessionRebound> {
+    use crate::session::rebind_fence::{Fence, SessionRebound};
+    let header = |bytes: &[u8]| -> Vec<u8> {
+        bytes
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default()
+            .to_vec()
+    };
+    let (ours, theirs) = (header(pushed), header(remote));
+    let ids = (
+        header_session_id(&ours).filter(|s| !s.is_empty()),
+        header_session_id(&theirs).filter(|s| !s.is_empty()),
+    );
+    if let (Some(a), Some(b)) = &ids {
+        if a != b {
+            return None;
+        }
+    }
+    let ours = Fence::of_header_line(&String::from_utf8_lossy(&ours));
+    let theirs = Fence::of_header_line(&String::from_utf8_lossy(&theirs));
+    let retired = ours.anchor.as_ref().is_some_and(|anchor| {
+        theirs.anchor.as_ref() != Some(anchor) && theirs.retired.contains(anchor)
+    });
+    if theirs.epoch > ours.epoch || (retired && theirs.epoch >= ours.epoch) {
+        return Some(SessionRebound {
+            name: id.to_string(),
+            anchor: theirs.anchor.map(|a| a.display().to_string()),
+            from_retired: false,
+        });
+    }
+    None
 }
 
 /// Whether `key` is the migration marker of the session whose objects live
@@ -9427,6 +9693,78 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         backend.begin_tick(id);
         assert_eq!(sync_stamp::tick_id(&session_dir), None);
+    }
+
+    /// A backend running under the prefix of directory `workspace`, and the
+    /// path of session `id`'s log in it, its directory created.
+    fn fenced_session(base: &Path, workspace: &str, id: &str) -> (CloudBackend, PathBuf) {
+        let mut backend = test_cloud_backend(base);
+        backend.prefix = crate::session::local::prefix_for_workspace(Path::new(workspace)).unwrap();
+        let dir = backend.local.session_dir(id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(state_file_name(id));
+        (backend, path)
+    }
+
+    /// A header moved whole from /ws/old to /ws/new at `epoch`.
+    fn whole_moved_line(id: &str, epoch: u64) -> String {
+        format!(
+            r#"{{"workflow":"{id}","template_hash":"h","created_at":"t","execution_dir":"/ws/new","origin":{{"anchor":"/ws/new","store":{{"kind":"cloud","base":"/s"}},"anchor_epoch":{epoch},"whole_epoch":{epoch},"retired_anchors":["/ws/old"]}}}}"#
+        )
+    }
+
+    fn write_line(path: &Path, line: &str) {
+        fs::write(path, format!("{line}\n")).unwrap();
+    }
+
+    fn rebound(r: anyhow::Result<()>) -> crate::session::rebind_fence::SessionRebound {
+        r.unwrap_err()
+            .downcast::<crate::session::rebind_fence::SessionRebound>()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_epoch_refusal_reaches_the_cloud_movers_own_process_once_another_move_raises_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "whole-mover-moved-on";
+        let (backend, path) = fenced_session(dir.path(), "/ws/old", id);
+        write_line(&path, &whole_moved_line(id, 1));
+        let header: StateFileHeader = serde_json::from_str(&whole_moved_line(id, 1)).unwrap();
+        backend.note_epoch_read(id, &header);
+        write_line(&path, &whole_moved_line(id, 2));
+        backend.note_mover(id, 2);
+        let check = || {
+            crate::session::fence_state::with_cwd(Path::new("/ws/old"), || backend.check_fence(id))
+        };
+        // The mover, run from the directory it retired, passes both the
+        // prefix rule and the path rule at the epoch it wrote.
+        assert!(check().is_ok());
+        // Another process moved the session on: the epoch refusal reaches
+        // the mover, and the lift doesn't let it past.
+        write_line(&path, &whole_moved_line(id, 3));
+        assert!(!rebound(check()).from_retired);
+    }
+
+    #[test]
+    fn a_cloud_lift_taken_before_a_commit_that_never_lands_ends_with_its_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "whole-lift-dropped";
+        let (backend, path) = fenced_session(dir.path(), "/ws/old", id);
+        let line = whole_moved_line(id, 2);
+        write_line(&path, &line);
+        let header: StateFileHeader = serde_json::from_str(&line).unwrap();
+        backend.note_epoch_read(id, &header);
+        let check = || {
+            crate::session::fence_state::with_cwd(Path::new("/ws/old"), || backend.check_fence(id))
+        };
+        assert!(rebound(check()).from_retired);
+
+        let lift = crate::session::fence_state::note_taking_over(&path, 2);
+        assert!(check().is_ok());
+        // The commit failed or was refused: the process goes on with
+        // neither rule lifted.
+        drop(lift);
+        assert!(rebound(check()).from_retired);
     }
 
     /// Helper: write a minimal state file header into a session directory.

@@ -97,9 +97,47 @@ pub fn nested_invocation_message(enclosing: &str, requested: &str) -> String {
     )
 }
 
+/// Refuse `command` on `session` from inside a command that `session`'s own
+/// tick is running: the message to refuse with, when [`TICK_SESSION_ENV`]
+/// names `session`.
+///
+/// For a verb that takes `session`'s `tick.lock` exclusive, such as a
+/// whole-binding move. The enclosing tick holds that lock shared until the
+/// command returns, so the verb would wait for a tick that waits for it,
+/// and then report that the session is busy rather than what is wrong. A
+/// marker naming another session doesn't refuse: that tick holds no lock
+/// of this one.
+pub fn refuse_if_own_tick(session: &str, command: &str) -> Result<(), String> {
+    own_tick_refusal(enclosing_tick().as_deref(), session, command)
+}
+
+/// [`refuse_if_own_tick`] against the marker value `marker`, so a test
+/// needn't set the process-wide variable its neighbours read.
+fn own_tick_refusal(marker: Option<&str>, session: &str, command: &str) -> Result<(), String> {
+    if marker != Some(session) {
+        return Ok(());
+    }
+    Err(format!(
+        "koto {command} cannot run on session '{session}' inside a command that session's own \
+         tick is running: this process inherited {TICK_SESSION_ENV}={session}, and the tick \
+         holds the session until the command returns. Run it outside the tick, once the tick \
+         has returned. If that tick has already exited and this process outlived it, clear \
+         the marker first: {TICK_SESSION_ENV}= koto {command} ..."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuse_if_own_tick_refuses_only_the_tick_s_own_session() {
+        let msg = own_tick_refusal(Some("wf"), "wf", "session rebind").unwrap_err();
+        assert!(msg.contains("'wf'"), "{msg}");
+        assert!(msg.contains(TICK_SESSION_ENV), "{msg}");
+        assert!(own_tick_refusal(Some("other"), "wf", "session rebind").is_ok());
+        assert!(own_tick_refusal(None, "wf", "session rebind").is_ok());
+    }
 
     #[test]
     fn the_message_names_both_sessions() {

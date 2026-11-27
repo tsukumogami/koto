@@ -46,6 +46,8 @@ const OK: &str = r#"{"verdict":"ok"}"#;
 const WAIT_ENV: &str = "KOTO_TEST_TICK_WAIT_MS";
 const FAULT_ENV: &str = "KOTO_TEST_REBIND_FAULT";
 const HOLD_ENV: &str = "KOTO_TEST_REBIND_HOLD";
+/// Moves `KOTO_TEST_REBIND_HOLD`'s wait to one of [`FAULT_POINTS`].
+const HOLD_AT_ENV: &str = "KOTO_TEST_REBIND_HOLD_AT";
 const TICK_LOCK: &str = "tick.lock";
 const LOCATION: &str = "workflows/publish-location";
 const EXPLICIT: &str = "workflows/publish-explicit";
@@ -1571,4 +1573,57 @@ fn a_plain_rebind_after_a_whole_rebind_still_fences_the_retired_anchor() {
     // a/b is the current anchor, deeper than the retired a: stored.
     let out = host.add_at(&b, NAME);
     assert_stored(&host, NAME, &out, &b);
+}
+
+#[test]
+fn a_second_process_in_the_retired_directory_is_refused_while_the_mover_finishes_from_there() {
+    // The mover runs from the directory it retires, so its own later parts
+    // pass the path rule. Any other process there is still refused, while
+    // the move is half done and after it finished.
+    let held = Held::new();
+    let log = held.log();
+    let hold = held.host.root.join("hold");
+
+    let mut cmd = held.host.whole_at(&held.old, NAME, &held.new_anchor);
+    cmd.args(["--to", s(&held.new)])
+        .env("CLAUDE_CODE_SESSION_ID", "sess-two")
+        .env("XDG_CONFIG_HOME", &held.xdg_two)
+        .env(HOLD_ENV, &hold)
+        .env(HOLD_AT_ENV, "after-held-by");
+    let started = Instant::now();
+    let mut mover = spawn(cmd);
+    while !hold.exists() {
+        if mover.try_wait().unwrap().is_some() {
+            let out = finish(mover, started);
+            panic!(
+                "the move exited before it reached its hold point: {}",
+                out.describe()
+            );
+        }
+        assert!(
+            started.elapsed() < START_BOUND,
+            "the move didn't reach its hold point within {START_BOUND:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let h = header(&log);
+    assert_eq!(
+        h["origin"]["whole_epoch"], 1,
+        "the move hasn't committed: {h}"
+    );
+    assert!(
+        payloads(&log, "environment_rerecorded").is_empty(),
+        "the move ran past its hold point"
+    );
+
+    let out = held.host.add_at(&held.old, NAME);
+    assert_fenced(&held.host, NAME, &out, &held.old);
+
+    std::fs::remove_file(&hold).unwrap();
+    let out = finish(mover, started);
+    assert_eq!(out.code, Some(0), "rebind --whole --to: {}", out.describe());
+    held.assert_moved("after the move");
+
+    let out = held.host.add_at(&held.old, NAME);
+    assert_fenced(&held.host, NAME, &out, &held.old);
 }

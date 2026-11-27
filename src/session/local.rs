@@ -472,7 +472,11 @@ impl SessionBackend for LocalBackend {
                 // empty now so a tick never has to add it to the session's
                 // directory. Only after the state file landed: an init that
                 // collided leaves nothing behind. Best-effort, as a tick
-                // creates it when it's missing.
+                // creates it when it's missing. Opened as every taker opens
+                // it, so a link planted at its name isn't followed.
+                #[cfg(unix)]
+                let _ = crate::session::tick_lock::open(&session_dir);
+                #[cfg(not(unix))]
                 let _ = fs::OpenOptions::new()
                     .write(true)
                     .create(true)
