@@ -65,6 +65,9 @@ pub struct Fence {
     pub retired: Vec<PathBuf>,
     /// The current anchor: `execution_dir`, else `origin.anchor`.
     pub anchor: Option<PathBuf>,
+    /// `origin.whole_epoch`, `0` when absent: the epoch the last
+    /// whole-binding move wrote, which turns on [`check_whole`].
+    pub whole_epoch: u64,
 }
 
 impl Fence {
@@ -96,6 +99,10 @@ impl Fence {
                 })
                 .unwrap_or_default(),
             anchor: path("/execution_dir").or_else(|| path("/origin/anchor")),
+            whole_epoch: header
+                .pointer("/origin/whole_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
         }
     }
 }
@@ -125,6 +132,54 @@ pub fn check(
             .retired
             .iter()
             .any(|r| prefix_of(r).as_deref() == Some(prefix))
+    {
+        return Err(refuse(true));
+    }
+    Ok(())
+}
+
+/// Refuse a write of `name`, on either backend, from a process running in
+/// `cwd` (canonical; `None` when it couldn't be read) that read the session
+/// at `seen_epoch`, when the local header line `line` records a
+/// whole-binding move (`origin.whole_epoch` above `0`). A header without one
+/// passes: the plain rebind's fence is [`check`]'s alone.
+///
+/// Refused when the process read a lower epoch than the header's, or when
+/// `cwd` is under a retired anchor and either isn't under the current anchor
+/// or is under a retired anchor deeper (more path components) than the
+/// current one. So after a move up into a parent the old directory is
+/// fenced, and after a move down into a subdirectory the new one is not.
+pub fn check_whole(
+    name: &str,
+    line: &str,
+    cwd: Option<&Path>,
+    seen_epoch: Option<u64>,
+) -> Result<(), SessionRebound> {
+    let fence = Fence::of_header_line(line);
+    if fence.whole_epoch == 0 {
+        return Ok(());
+    }
+    let refuse = |from_retired| SessionRebound {
+        name: name.to_string(),
+        anchor: fence.anchor.as_ref().map(|a| a.display().to_string()),
+        from_retired,
+    };
+    if seen_epoch.is_some_and(|seen| seen < fence.epoch) {
+        return Err(refuse(false));
+    }
+    let Some(cwd) = cwd else {
+        return Ok(());
+    };
+    let depth = |p: &Path| p.components().count();
+    let current = fence
+        .anchor
+        .as_deref()
+        .filter(|a| cwd.starts_with(a))
+        .map(depth);
+    if fence
+        .retired
+        .iter()
+        .any(|r| cwd.starts_with(r) && current.is_none_or(|c| depth(r) > c))
     {
         return Err(refuse(true));
     }
@@ -253,6 +308,7 @@ mod tests {
             },
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
+            whole_epoch: 0,
         };
         advance(&mut origin, Some(Path::new("/a")), Path::new("/b"));
         assert_eq!(origin.anchor_epoch, 1);

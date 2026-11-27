@@ -458,11 +458,21 @@ pub fn save_manifest(dir: &Path, bytes: &[u8]) {
 /// it, which every command the tick runs reads. Best-effort: with no id, a
 /// command probes as it would outside a tick.
 pub fn begin_tick(dir: &Path) {
+    write_tick_id(dir, &new_tick_id());
+}
+
+/// A new tick id: this process's id and the time, unique per tick.
+pub fn new_tick_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let id = format!("{}-{}", std::process::id(), nanos);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+/// Write `id` as the id of the tick running the session whose directory is
+/// `dir`. Best-effort, as [`begin_tick`].
+pub fn write_tick_id(dir: &Path, id: &str) {
     write_replacing(dir, TICK_FILE, id.as_bytes());
 }
 

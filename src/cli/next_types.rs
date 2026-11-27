@@ -1017,7 +1017,7 @@ pub struct NextError {
     pub details: Vec<ErrorDetail>,
 }
 
-/// The twelve error codes for `koto next` domain errors.
+/// The error codes for `koto next` domain errors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextErrorCode {
@@ -1068,6 +1068,11 @@ pub enum NextErrorCode {
     /// writes nothing more to it. Caller error: continue in the newest
     /// session the message names.
     SessionSuperseded,
+    /// A whole-binding move fenced the session off from this tick: the tick
+    /// runs from under an anchor the move retired, deeper than the current
+    /// anchor it is also under. Nothing was written. Caller error: run from
+    /// the anchor the message names.
+    SessionRebound,
     /// A `--to` past a gate that hasn't passed named no decider with
     /// `--by`, and neither a harness session identifier nor an anchor
     /// establishes one (decision record, R24). Nothing was appended; a
@@ -1100,6 +1105,7 @@ impl NextErrorCode {
             NextErrorCode::NestedInvocation => 2,
             NextErrorCode::SessionMigrated => 2,
             NextErrorCode::SessionSuperseded => 2,
+            NextErrorCode::SessionRebound => 2,
             NextErrorCode::DeciderMissing => 2,
             NextErrorCode::InvalidDecision => 2,
             NextErrorCode::TemplateError => 3,

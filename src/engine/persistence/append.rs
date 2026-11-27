@@ -203,6 +203,7 @@ fn append_under_lock<H: LogHeader>(
     // Checked on the bytes read under the lock, so no write slips in after
     // a fence another process just appended.
     refuse_if_fenced(path, &tail.content, payload)?;
+    refuse_if_rebound(path, &tail.content, payload)?;
 
     let event = Event {
         seq: tail.next_seq,
@@ -470,6 +471,7 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // under the lock taken above.
     let tail = prepare_append::<H>(path)?;
     refuse_if_fenced(path, &tail.content, payload)?;
+    refuse_if_rebound(path, &tail.content, payload)?;
     let next_seq = tail.next_seq;
 
     // Scan for a prior event with the same hash. A malformed line in the
@@ -1054,6 +1056,20 @@ fn refuse_if_fenced(path: &Path, content: &str, payload: &EventPayload) -> anyho
         .into()),
         None => Ok(()),
     }
+}
+
+/// Refuse appending `payload` to a log whose header (the first line of
+/// `content`, read under the append lock) records a whole-binding move that
+/// fences this process off (`crate::session::fence_state::check`). A
+/// `context_read` passes, as it does [`refuse_if_fenced`]: it records a
+/// read, and reads of a session keep working wherever they run from.
+fn refuse_if_rebound(path: &Path, content: &str, payload: &EventPayload) -> anyhow::Result<()> {
+    if matches!(payload, EventPayload::ContextRead { .. }) {
+        return Ok(());
+    }
+    let line = content.lines().next().unwrap_or_default();
+    crate::session::fence_state::check(&extract_session_id_from_path(path), path, line)?;
+    Ok(())
 }
 
 /// What [`append_supersede_fence`] did.

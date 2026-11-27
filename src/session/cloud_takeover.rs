@@ -63,6 +63,7 @@ pub(super) struct Verified {
 /// Locks held on the source's local copy from the checks through the
 /// exchange. The files stay open, so the locks move with the directory.
 struct HeldLocks {
+    _tick: Option<std::fs::File>,
     _state: SessionLock,
     _manifest: Option<std::fs::File>,
 }
@@ -368,6 +369,23 @@ impl CloudBackend {
                 ),
             )
         };
+        // A tick of the source holds its tick.lock shared for as long as it
+        // runs, the commands it is running included: probed first, in the
+        // order every holder takes it before the state file's lock.
+        let tick_lock = self
+            .local
+            .session_dir(name)
+            .join(crate::session::TICK_LOCK_FILE);
+        let tick = match try_tick_lock(&tick_lock) {
+            Ok(file) => file,
+            Err(TryLock::Held) => return Err(running()),
+            Err(TryLock::Io(e)) => {
+                return Err(ImportError::new(
+                    PushFailed,
+                    format!("could not lock {}: {}", tick_lock.display(), e),
+                ))
+            }
+        };
         let state = match self.local.lock_state_file(name) {
             Ok(lock) => lock,
             Err(SessionError::Locked { .. }) => return Err(running()),
@@ -394,6 +412,7 @@ impl CloudBackend {
             }
         };
         Ok(HeldLocks {
+            _tick: tick,
             _state: state,
             _manifest: manifest,
         })
@@ -757,6 +776,42 @@ enum TryLock {
 /// Take an exclusive flock on `path` without waiting, creating the file
 /// so a writer that arrives later waits on it too. A missing directory
 /// means no one holds it: `Ok(None)`.
+/// [`try_flock`] on a session's `tick.lock`, which is never created here
+/// (a session made before the lock existed has none, and no tick of it can
+/// be running under one) and never followed through a link. `None` when the
+/// file isn't there.
+fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(TryLock::Io(e)),
+        };
+        // SAFETY: the fd belongs to `file`, which outlives the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(TryLock::Held);
+            }
+            return Err(TryLock::Io(err));
+        }
+        Ok(Some(file))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 fn try_flock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     let file = match std::fs::OpenOptions::new()
         .read(true)

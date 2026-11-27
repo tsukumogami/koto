@@ -260,20 +260,58 @@ pub(crate) fn lock_exclusive(
     wait: Option<std::time::Duration>,
     started: std::time::Instant,
 ) -> Result<()> {
-    use std::time::{Duration, Instant};
+    lock_polled(
+        fd,
+        libc::LOCK_EX,
+        wait,
+        started,
+        std::time::Duration::from_millis(5),
+    )
+}
+
+/// [`lock_exclusive`] for a shared `flock`, tried every 50 ms: the lock a
+/// `koto next` holds on its session's `tick.lock` for the whole tick, which
+/// any number of ticks share and a whole-binding move or an import takes
+/// exclusive.
+#[cfg(unix)]
+pub(crate) fn lock_shared(
+    fd: std::os::unix::io::RawFd,
+    wait: Option<std::time::Duration>,
+    started: std::time::Instant,
+) -> Result<()> {
+    lock_polled(
+        fd,
+        libc::LOCK_SH,
+        wait,
+        started,
+        std::time::Duration::from_millis(50),
+    )
+}
+
+/// Take `flock` operation `op` (`LOCK_EX` or `LOCK_SH`) on `fd`, blocking
+/// when `wait` is `None`, otherwise tried every `step` until `wait` has
+/// passed since `started`, and always at least once.
+#[cfg(unix)]
+fn lock_polled(
+    fd: std::os::unix::io::RawFd,
+    op: libc::c_int,
+    wait: Option<std::time::Duration>,
+    started: std::time::Instant,
+    step: std::time::Duration,
+) -> Result<()> {
+    use std::time::Instant;
     // SAFETY (each call below): flock on a descriptor borrowed for the
     // call; it neither closes nor retains it. The lock is released when the
     // caller's file closes.
     let Some(wait) = wait else {
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(fd, op) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         return Ok(());
     };
-    const STEP: Duration = Duration::from_millis(5);
     let deadline = started + wait;
     loop {
-        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unsafe { libc::flock(fd, op | libc::LOCK_NB) } == 0 {
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
@@ -288,7 +326,7 @@ pub(crate) fn lock_exclusive(
             }
             .into());
         }
-        std::thread::sleep(STEP.min(deadline - now));
+        std::thread::sleep(step.min(deadline - now));
     }
 }
 

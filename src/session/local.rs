@@ -374,12 +374,16 @@ impl SessionBackend for LocalBackend {
 
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
         let path = self.base_dir.join(id).join(state_file_name(id));
-        persistence::read_events(&path)
+        let read = persistence::read_events(&path)?;
+        note_epoch_read(&path, &read.0);
+        Ok(read)
     }
 
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
         let path = self.base_dir.join(id).join(state_file_name(id));
-        persistence::read_header(&path)
+        let header = persistence::read_header(&path)?;
+        note_epoch_read(&path, &header);
+        Ok(header)
     }
 
     fn init_state_file(
@@ -464,6 +468,16 @@ impl SessionBackend for LocalBackend {
 
         match atomic_create_rename(&tmp_path, &target) {
             Ok(()) => {
+                // The lock every tick of the session holds shared, created
+                // empty now so a tick never has to add it to the session's
+                // directory. Only after the state file landed: an init that
+                // collided leaves nothing behind. Best-effort, as a tick
+                // creates it when it's missing.
+                let _ = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(session_dir.join(crate::session::TICK_LOCK_FILE));
                 // The session now exists: journal its creation and initial
                 // state (best-effort, never fails the init).
                 crate::run_journal::after_init(
@@ -982,6 +996,9 @@ impl LocalBackend {
         // creates the ctx directory it lives in), then the key's lock, the
         // content file and the manifest entry.
         self.with_manifest_lock(session, || {
+            // A whole-binding move's fence, asked under the lock every
+            // context write takes and before the content file.
+            crate::session::fence_state::check_log(session, &self.state_path(session))?;
             // Parent dirs for hierarchical keys.
             if let Some(parent) = content_path.parent() {
                 fs::create_dir_all(parent)
@@ -1073,6 +1090,7 @@ impl ContextStore for LocalBackend {
         // The manifest lock first, as every context write takes it, then
         // the content file, the per-key lock file and the manifest entry.
         self.with_manifest_lock(session, || {
+            crate::session::fence_state::check_log(session, &self.state_path(session))?;
             if content_path.exists() {
                 fs::remove_file(&content_path).with_context(|| {
                     format!("failed to remove content file: {}", content_path.display())
@@ -1207,6 +1225,14 @@ impl ManifestLock {
             file: None,
         }
     }
+}
+
+/// Record `header`'s rebind epoch as the one this process read of the log
+/// at `path`, for the whole-binding fence (`crate::session::fence_state`).
+/// Only the first read of a log counts.
+fn note_epoch_read(path: &Path, header: &StateFileHeader) {
+    let epoch = header.origin.as_ref().map_or(0, |o| o.anchor_epoch);
+    crate::session::fence_state::note_read(path, epoch);
 }
 
 /// Derive a repo-id from a working directory path.

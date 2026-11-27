@@ -5,6 +5,7 @@ pub mod context;
 pub mod context_log;
 pub mod continues_bucket;
 pub mod duration;
+pub mod fence_state;
 pub mod finished;
 pub mod hierarchy;
 pub mod import_links;
@@ -505,6 +506,12 @@ pub struct SessionLock {
 }
 
 pub use koto_session_reader::session::{state_file_name, SessionInfo};
+
+/// The lock file in a session's directory that every top-level `koto next`
+/// of the session holds shared for the whole tick, and that a same-host
+/// import probes exclusive: a held lock means a tick is in flight. Created
+/// empty with the session's state file; never removed by a tick.
+pub const TICK_LOCK_FILE: &str = "tick.lock";
 
 /// Abstraction over where session artifacts are stored.
 ///
@@ -1045,6 +1052,15 @@ impl Backend {
     pub fn begin_tick(&self, id: &str) {
         if let Backend::Cloud(b) = self {
             b.begin_tick(id);
+        }
+    }
+
+    /// Pick the id [`Backend::begin_tick`] will write for a tick of `id`,
+    /// writing nothing: the tick's reads use it before the tick is past its
+    /// refusals and writes it.
+    pub fn mint_tick(&self, id: &str) {
+        if let Backend::Cloud(b) = self {
+            b.mint_tick(id);
         }
     }
 

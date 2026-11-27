@@ -243,6 +243,14 @@ pub struct SessionOrigin {
     /// one of them takes it off the list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_anchors: Vec<PathBuf>,
+    /// The `anchor_epoch` the last whole-binding move wrote, `0` (and
+    /// omitted) for a session no such move has touched. While it is above
+    /// `0`, every write of the session on either backend refuses with
+    /// `session_rebound` when the writer read a lower epoch, or when it runs
+    /// from under a retired anchor that is deeper than the current anchor it
+    /// is also under. A session without it keeps the plain rebind's fence.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub whole_epoch: u64,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
