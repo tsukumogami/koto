@@ -1438,7 +1438,9 @@ fn remove_member(
                 }
             })?;
         }
-        std::fs::remove_dir_all(base.join(name))
+        let dir = base.join(name);
+        crate::telemetry::before_session_removal(&dir);
+        std::fs::remove_dir_all(&dir)
             .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))
     })?;
     match removal {

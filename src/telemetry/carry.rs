@@ -26,11 +26,35 @@
 //! `dropped` is a non-negative integer reads as 0, and the next write
 //! replaces it. A count above [`MAX_COUNT`] is clamped.
 //!
-//! Neither file is session state. Cloud sync and `koto session import`
-//! carry the state log, version, template and context files only.
+//! ## Carrying a count out
+//!
+//! A count leaves with the first call of a flush: the flush takes each
+//! queued session's count, writing 0 back under the lock, and passes the
+//! sum to the sink as `--carry N`. Because the take is one locked
+//! read-and-zero, two processes flushing for the same session can never
+//! both carry the same count. If that one call isn't posted, the taken
+//! counts are given back.
+//!
+//! Giving back is what the sink's contract asks for after a refusal or a
+//! kill, and it has one consequence: a sink that had already acted on a
+//! call koto then killed will see that carry again from the next flush.
+//! koto itself never hands one count to two calls.
+//!
+//! A session directory can be removed while it still holds a count: the
+//! terminal tick removes it, and so does a prune. Just before that, the
+//! count moves to `_telemetry_orphans.json` in the directory that holds the
+//! store's session directories, under `_telemetry_orphans.lock`. Every
+//! flush takes the orphan count of each store its records belong to,
+//! alongside the sessions' own.
+//!
+//! None of these files is session state. Cloud sync and
+//! `koto session import` carry the state log, version, template and context
+//! files only.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -40,6 +64,13 @@ pub(crate) const COUNT_FILE: &str = "telemetry.json";
 
 /// The lock's file name inside a session directory.
 pub(crate) const LOCK_FILE: &str = "telemetry.lock";
+
+/// The orphan count's file name, in the directory that holds a store's
+/// session directories. Session listings skip it: they read directories.
+pub(crate) const ORPHAN_FILE: &str = "_telemetry_orphans.json";
+
+/// The orphan count's lock, beside it.
+pub(crate) const ORPHAN_LOCK_FILE: &str = "_telemetry_orphans.lock";
 
 /// The longest a change waits for the lock.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_millis(50);
@@ -106,22 +137,46 @@ fn take_attempts() -> Vec<(Duration, Instant)> {
     ATTEMPTS.with(|a| std::mem::take(&mut *a.borrow_mut()))
 }
 
-/// The held lock of one session's count. Dropping it releases the lock;
-/// the lock file stays.
+/// Which count a change is made to: a session's own, in its directory, or a
+/// store's orphans, in the directory that holds the session directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Session,
+    Orphans,
+}
+
+impl Place {
+    fn count_file(self) -> &'static str {
+        match self {
+            Place::Session => COUNT_FILE,
+            Place::Orphans => ORPHAN_FILE,
+        }
+    }
+
+    fn lock_file(self) -> &'static str {
+        match self {
+            Place::Session => LOCK_FILE,
+            Place::Orphans => ORPHAN_LOCK_FILE,
+        }
+    }
+}
+
+/// The held lock of one count. Dropping it releases the lock; the lock file
+/// stays.
 struct Lock {
     _file: std::fs::File,
 }
 
 impl Lock {
-    /// Take `dir`'s lock, waiting until [`LOCK_WAIT`] has passed since
-    /// `started` (not at all once a wait has run out in this process).
-    /// `None` when the directory is gone, the lock file can't be opened, or
-    /// the wait ran out.
+    /// Take the lock of the count at `place` in `dir`, waiting until
+    /// [`LOCK_WAIT`] has passed since `started` (not at all once a wait has
+    /// run out in this process). `None` when the directory is gone, the
+    /// lock file can't be opened, or the wait ran out.
     ///
-    /// A caller that changes several sessions' counts in one go passes the
-    /// same `started` for each, so [`LOCK_WAIT`] bounds them all together
-    /// and not one by one. The lock is always tried once.
-    fn acquire(dir: &Path, started: Instant) -> Option<Lock> {
+    /// A caller that changes several counts in one go passes the same
+    /// `started` for each, so [`LOCK_WAIT`] bounds them all together and
+    /// not one by one. The lock is always tried once.
+    fn acquire(dir: &Path, place: Place, started: Instant) -> Option<Lock> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
         let file = std::fs::OpenOptions::new()
@@ -130,7 +185,7 @@ impl Lock {
             .write(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir.join(LOCK_FILE))
+            .open(dir.join(place.lock_file()))
             .ok()?;
         let wait = if gave_up() { Duration::ZERO } else { LOCK_WAIT };
         note_attempt(wait, started);
@@ -147,21 +202,22 @@ impl Lock {
     }
 }
 
+#[cfg(test)]
 fn count_path(dir: &Path) -> PathBuf {
     dir.join(COUNT_FILE)
 }
 
-/// The count `dir` holds, 0 for anything that isn't a well-formed count
-/// file. Never follows a symlink and never reads a large file.
-fn read(dir: &Path) -> u64 {
-    let path = count_path(dir);
-    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+/// The count the file at `path` holds, 0 for anything that isn't a
+/// well-formed count file. Never follows a symlink and never reads a large
+/// file.
+fn read_at(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };
     if !meta.file_type().is_file() || meta.len() > MAX_FILE_BYTES {
         return 0;
     }
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return 0;
     };
     serde_json::from_slice::<Value>(&bytes)
@@ -173,8 +229,15 @@ fn read(dir: &Path) -> u64 {
         .map_or(0, |n| n.min(MAX_COUNT))
 }
 
-/// Replace `dir`'s count with `count`, by temporary file and rename.
-fn write(dir: &Path, count: u64) -> std::io::Result<()> {
+/// The count of the session in `dir`.
+#[cfg(test)]
+fn read(dir: &Path) -> u64 {
+    read_at(&count_path(dir))
+}
+
+/// Replace the count at `place` in `dir` with `count`, by temporary file
+/// and rename.
+fn write_at(dir: &Path, place: Place, count: u64) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&serde_json::json!({ "dropped": count.min(MAX_COUNT) }))
         .map_err(std::io::Error::other)?;
     // tempfile creates the file 0600 on unix.
@@ -183,8 +246,50 @@ fn write(dir: &Path, count: u64) -> std::io::Result<()> {
         .suffix(".tmp")
         .tempfile_in(dir)?;
     tmp.write_all(&bytes)?;
-    tmp.persist(count_path(dir)).map_err(|e| e.error)?;
+    tmp.persist(dir.join(place.count_file()))
+        .map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Add `n` to the count at `place` in `dir`, under its lock.
+fn add_at(dir: &Path, place: Place, n: u64, started: Instant) -> bool {
+    if n == 0 {
+        return true;
+    }
+    let Some(_lock) = Lock::acquire(dir, place, started) else {
+        return false;
+    };
+    let total = read_at(&dir.join(place.count_file()))
+        .saturating_add(n)
+        .min(MAX_COUNT);
+    write_at(dir, place, total).is_ok()
+}
+
+/// Take the count at `place` in `dir`: read it and write 0 back, under its
+/// lock, so no other process can take the same count. Returns what was
+/// taken, 0 when there was nothing or the lock couldn't be had in time (the
+/// count then stays for a later take).
+///
+/// A directory with no count file is left alone: nothing is read, and no
+/// lock file is created, so a host that never drops a record never gains
+/// one. A count added in the instant after that check is found by the next
+/// take.
+fn take_at(dir: &Path, place: Place, started: Instant) -> u64 {
+    let path = dir.join(place.count_file());
+    if std::fs::symlink_metadata(&path).is_err() {
+        return 0;
+    }
+    let Some(_lock) = Lock::acquire(dir, place, started) else {
+        return 0;
+    };
+    let count = read_at(&path);
+    // A count that reads as 0 may be a malformed file: writing 0 heals it.
+    // Only a count that was written back as 0 is handed out, so a failed
+    // write can never lead to the same count being carried twice.
+    if write_at(dir, place, 0).is_err() {
+        return 0;
+    }
+    count
 }
 
 /// Add `n` dropped records to the count of the session in `dir`, waiting
@@ -198,14 +303,66 @@ fn write(dir: &Path, count: u64) -> std::io::Result<()> {
 /// can't be taken in time, or a write that fails loses the `n`, which is
 /// the failure this count tolerates. Returns whether the count was written.
 pub(crate) fn add_within(dir: &Path, n: u64, started: Instant) -> bool {
+    add_at(dir, Place::Session, n, started)
+}
+
+/// Take the count of the session in `dir` for a carry: it is zeroed under
+/// the session's lock and returned. See [`take_at`] for what a 0 means.
+pub(crate) fn take(dir: &Path, started: Instant) -> u64 {
+    take_at(dir, Place::Session, started)
+}
+
+/// Take the orphan count of the store whose session directories live in
+/// `base`: the drops of sessions that were removed before their count went
+/// out.
+pub(crate) fn take_orphans(base: &Path, started: Instant) -> u64 {
+    take_at(base, Place::Orphans, started)
+}
+
+/// Give back `n` that was taken from the session in `dir` and not
+/// delivered. When the session directory has gone in the meantime, the
+/// count goes to its store's orphans instead, so it isn't lost with the
+/// directory.
+pub(crate) fn give_back(dir: &Path, n: u64, started: Instant) -> bool {
     if n == 0 {
         return true;
     }
-    let Some(_lock) = Lock::acquire(dir, started) else {
-        return false;
-    };
-    let total = read(dir).saturating_add(n).min(MAX_COUNT);
-    write(dir, total).is_ok()
+    if dir.is_dir() {
+        return add_at(dir, Place::Session, n, started);
+    }
+    match dir.parent() {
+        Some(base) => give_back_orphans(base, n, started),
+        None => false,
+    }
+}
+
+/// Give back `n` that was taken from the orphans of the store in `base`.
+pub(crate) fn give_back_orphans(base: &Path, n: u64, started: Instant) -> bool {
+    base.is_dir() && add_at(base, Place::Orphans, n, started)
+}
+
+/// Move the count of the session in `dir` to its store's orphans. Called
+/// just before a session directory is removed, so the drops of a session
+/// that finished while the sink was failing still go out with a later
+/// flush from any session of the same store.
+///
+/// A session with no count file costs one `lstat` and nothing else.
+/// Best-effort like every change here: a lock that can't be had in time
+/// leaves the count to go with the directory.
+///
+/// The move happens before the removal, not after, since afterwards there
+/// is nothing to read. If the removal then fails, the session keeps its
+/// directory and its count is already with the orphans: it still goes out,
+/// once, with the next flush of the store.
+pub(crate) fn orphan(dir: &Path) {
+    let started = Instant::now();
+    let n = take(dir, started);
+    if n == 0 {
+        return;
+    }
+    if let Some(base) = dir.parent() {
+        add_at(base, Place::Orphans, n, started);
+    }
 }
 
 /// [`add_within`] with a wait of its own.
@@ -219,6 +376,12 @@ pub(crate) fn add(dir: &Path, n: u64) -> bool {
 #[cfg(test)]
 pub(crate) fn peek(dir: &Path) -> u64 {
     read(dir)
+}
+
+/// The orphan count of the store in `base`, read without the lock.
+#[cfg(test)]
+pub(crate) fn peek_orphans(base: &Path) -> u64 {
+    read_at(&base.join(ORPHAN_FILE))
 }
 
 #[cfg(test)]
@@ -351,6 +514,113 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join(LOCK_FILE)).unwrap();
         assert!(!add(&dir, 1), "a lock that is a symlink was followed");
         assert!(!count_path(&dir).exists());
+    }
+
+    #[test]
+    fn take_zeroes_the_count_and_hands_it_out_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Instant::now;
+        assert!(add(tmp.path(), 7));
+        assert_eq!(take(tmp.path(), now()), 7);
+        assert_eq!(raw(tmp.path()), r#"{"dropped":0}"#);
+        // A second take finds nothing: the count went out once.
+        assert_eq!(take(tmp.path(), now()), 0);
+        assert!(add(tmp.path(), 2));
+        assert_eq!(take(tmp.path(), now()), 2);
+    }
+
+    #[test]
+    fn take_leaves_a_directory_with_no_count_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(take(tmp.path(), Instant::now()), 0);
+        assert_eq!(take_orphans(tmp.path(), Instant::now()), 0);
+        orphan(&tmp.path().join("no-such-session"));
+        // No lock file, no count file: a host that never drops a record
+        // gains nothing in its session directories.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn take_heals_a_malformed_count_and_carries_nothing_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(count_path(tmp.path()), "not json").unwrap();
+        assert_eq!(take(tmp.path(), Instant::now()), 0);
+        assert_eq!(raw(tmp.path()), r#"{"dropped":0}"#);
+    }
+
+    #[test]
+    fn a_held_lock_makes_a_take_skip_and_leaves_the_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _holder = hold(tmp.path());
+        // `hold` wrote 1.
+        assert_eq!(take(tmp.path(), Instant::now()), 0);
+        assert_eq!(read(tmp.path()), 1, "a skipped take changed the count");
+    }
+
+    #[test]
+    fn orphan_moves_a_sessions_count_to_its_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        assert!(add(&a, 4));
+        assert!(add(&b, 3));
+
+        orphan(&a);
+        assert_eq!(read(&a), 0);
+        assert_eq!(peek_orphans(base), 4);
+        // A second session's count adds to the same orphan count.
+        orphan(&b);
+        assert_eq!(peek_orphans(base), 7);
+        // Nothing left to move: the orphan count is unchanged.
+        orphan(&a);
+        assert_eq!(peek_orphans(base), 7);
+
+        // The orphan files are owner-only, and the lock holds no data.
+        for name in [ORPHAN_FILE, ORPHAN_LOCK_FILE] {
+            let mode = std::fs::metadata(base.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name}");
+        }
+        assert_eq!(
+            std::fs::metadata(base.join(ORPHAN_LOCK_FILE))
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // The orphans are taken once, like a session's count.
+        assert_eq!(take_orphans(base, Instant::now()), 7);
+        assert_eq!(take_orphans(base, Instant::now()), 0);
+    }
+
+    #[test]
+    fn give_back_returns_a_count_to_its_session_or_to_the_orphans_once_it_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let a = base.join("a");
+        std::fs::create_dir(&a).unwrap();
+        assert!(add(&a, 2));
+        let taken = take(&a, Instant::now());
+        assert!(give_back(&a, taken, Instant::now()));
+        assert_eq!(read(&a), 2);
+
+        // The session is removed between the take and the give-back.
+        let taken = take(&a, Instant::now());
+        std::fs::remove_dir_all(&a).unwrap();
+        assert!(give_back(&a, taken, Instant::now()));
+        assert!(!a.exists(), "the give-back recreated the session directory");
+        assert_eq!(peek_orphans(base), 2);
+
+        assert!(give_back_orphans(base, 5, Instant::now()));
+        assert_eq!(peek_orphans(base), 7);
+        // A store that is gone takes nothing back.
+        assert!(!give_back_orphans(&base.join("gone"), 1, Instant::now()));
     }
 
     /// Take the lock of the session in `dir`, as another process would.

@@ -311,10 +311,11 @@
 //! Every hook hands its records to `emit`, which also queues a stamped
 //! copy of each for an event sink, an optional program at a fixed path
 //! under the user's home. `queue` holds the copies and sends them, `sink`
-//! finds the program and makes one call, and `carry` counts the records
-//! that were dropped, in `telemetry.json` in the session directory. With no
-//! sink installed none of it runs past one cached check. The journal's
-//! bytes are the same either way.
+//! finds the program and makes one call, and `carry` keeps the count of
+//! records that were dropped, in `telemetry.json` in the session directory,
+//! and hands it to a later flush to send out. With no sink installed none
+//! of it runs past one cached check. The journal's bytes are the same
+//! either way.
 
 #[cfg(unix)]
 mod carry;
@@ -343,6 +344,18 @@ mod queue {
 }
 
 pub use queue::flush;
+
+/// Called just before a session directory is removed, with that directory:
+/// moves the session's count of undelivered records to its store's orphan
+/// count, so it still goes out with a later flush (see `carry`). A session
+/// with no such count costs one `lstat`.
+#[cfg(unix)]
+pub(crate) fn before_session_removal(session_dir: &Path) {
+    carry::orphan(session_dir);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn before_session_removal(_session_dir: &Path) {}
 
 // The stub sink the sender's unit tests install, shared with the
 // integration tests. Declared in this file so the path is read from this
