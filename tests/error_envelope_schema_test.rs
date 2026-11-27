@@ -458,6 +458,16 @@ fn session_superseded_is_coded_and_classed_as_a_caller_error() {
     assert_eq!(NextErrorCode::SessionSuperseded.exit_code(), 2);
 }
 
+/// A tick from under an anchor a whole-binding move retired refuses under its
+/// own code, in the caller-error class with the anchor mismatch: the caller
+/// runs from the anchor the message names.
+#[test]
+fn session_rebound_is_coded_and_classed_as_a_caller_error() {
+    let code = serde_json::to_value(NextErrorCode::SessionRebound).unwrap();
+    assert_eq!(code, "session_rebound");
+    assert_eq!(NextErrorCode::SessionRebound.exit_code(), 2);
+}
+
 /// Every registered code lands in the envelope under `error.code` as a bare
 /// string, with no `command` key riding along -- the code identifies the
 /// condition, so there is nothing to string-match.

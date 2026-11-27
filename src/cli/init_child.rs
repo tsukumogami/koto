@@ -672,6 +672,7 @@ pub(crate) fn origin_record(
         store: backend.store_identity()?,
         anchor_epoch: 0,
         retired_anchors: Vec::new(),
+        whole_epoch: 0,
     })
 }
 

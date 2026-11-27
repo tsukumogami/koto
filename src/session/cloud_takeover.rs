@@ -63,6 +63,7 @@ pub(super) struct Verified {
 /// Locks held on the source's local copy from the checks through the
 /// exchange. The files stay open, so the locks move with the directory.
 struct HeldLocks {
+    _tick: Option<std::fs::File>,
     _state: SessionLock,
     _manifest: Option<std::fs::File>,
 }
@@ -368,6 +369,24 @@ impl CloudBackend {
                 ),
             )
         };
+        // A tick of the source holds its tick.lock shared for as long as it
+        // runs, the commands it is running included: probed first, in the
+        // order every holder takes it before the state file's lock, and
+        // created when an older build left the session without one.
+        let tick_lock = self
+            .local
+            .session_dir(name)
+            .join(crate::session::TICK_LOCK_FILE);
+        let tick = match try_tick_lock(&tick_lock) {
+            Ok(file) => file,
+            Err(TryLock::Held) => return Err(running()),
+            Err(TryLock::Io(e)) => {
+                return Err(ImportError::new(
+                    PushFailed,
+                    format!("could not lock {}: {}", tick_lock.display(), e),
+                ))
+            }
+        };
         let state = match self.local.lock_state_file(name) {
             Ok(lock) => lock,
             Err(SessionError::Locked { .. }) => return Err(running()),
@@ -394,6 +413,7 @@ impl CloudBackend {
             }
         };
         Ok(HeldLocks {
+            _tick: tick,
             _state: state,
             _manifest: manifest,
         })
@@ -754,6 +774,46 @@ enum TryLock {
     Io(std::io::Error),
 }
 
+/// [`try_flock`] on a session's `tick.lock`, never followed through a link.
+/// A session made before the lock existed has none, so the file is created
+/// here and held: a tick that starts while the import runs then waits on
+/// it, as it would on one an earlier tick made. The directory is never
+/// created; `None` when it isn't there.
+fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(TryLock::Io(e)),
+        };
+        // SAFETY: the fd belongs to `file`, which outlives the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(TryLock::Held);
+            }
+            return Err(TryLock::Io(err));
+        }
+        Ok(Some(file))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 /// Take an exclusive flock on `path` without waiting, creating the file
 /// so a writer that arrives later waits on it too. A missing directory
 /// means no one holds it: `Ok(None)`.
@@ -783,4 +843,58 @@ fn try_flock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
         }
     }
     Ok(Some(file))
+}
+
+#[cfg(all(test, unix))]
+mod tick_probe_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// A session made before `tick.lock` existed has none until its next
+    /// tick creates one. The probe creates it and holds it, so a tick that
+    /// starts while the import runs waits on the lock, instead of finding
+    /// no file and running with only the state-file lock between it and the
+    /// import.
+    #[test]
+    fn the_probe_creates_and_holds_a_missing_tick_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::session::TICK_LOCK_FILE);
+        assert!(!path.exists());
+
+        let held = match try_tick_lock(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => panic!("the probe must create a missing tick.lock"),
+            Err(_) => panic!("the probe must not fail on a missing tick.lock"),
+        };
+        assert!(path.exists(), "tick.lock must be left in the directory");
+
+        // A tick's shared take, as `lock_shared` makes it, can't get in.
+        let tick = std::fs::File::open(&path).unwrap();
+        // SAFETY: the fd belongs to `tick`, which outlives the call.
+        let ret = unsafe { libc::flock(tick.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_ne!(ret, 0, "a tick must wait while the probe holds the lock");
+        drop(held);
+    }
+
+    /// The directory is never created: a session with no local directory
+    /// has nothing a tick could be holding.
+    #[test]
+    fn the_probe_leaves_a_missing_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("no-such-session");
+        let path = gone.join(crate::session::TICK_LOCK_FILE);
+        assert!(matches!(try_tick_lock(&path), Ok(None)));
+        assert!(!gone.exists());
+    }
+
+    /// A planted link is never followed.
+    #[test]
+    fn the_probe_does_not_follow_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        let path = dir.path().join(crate::session::TICK_LOCK_FILE);
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        assert!(matches!(try_tick_lock(&path), Err(TryLock::Io(_))));
+        assert!(!elsewhere.exists(), "nothing is created through the link");
+    }
 }

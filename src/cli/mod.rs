@@ -1700,6 +1700,119 @@ fn refuse_next_if_superseded(backend: &dyn SessionBackend, session: &str) {
     }
 }
 
+/// How long `koto next` waits to take its session's `tick.lock` shared
+/// before it refuses with `concurrent_access`.
+const TICK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The wait a debug build reads from the environment in place of
+/// [`TICK_LOCK_WAIT`], in milliseconds, so the binary's tests can hold the
+/// lock past the bound without waiting 30 seconds. Release builds don't read
+/// it, so it is not a setting.
+#[cfg(all(not(test), debug_assertions))]
+const TICK_WAIT_TEST_ENV: &str = "KOTO_TEST_TICK_WAIT_MS";
+
+/// The bound [`hold_tick_lock`] waits within.
+fn tick_lock_wait() -> std::time::Duration {
+    #[cfg(all(not(test), debug_assertions))]
+    if let Some(ms) = std::env::var(TICK_WAIT_TEST_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    TICK_LOCK_WAIT
+}
+
+/// Whether a tick has to read its log again after the wake pass, which runs
+/// after the tick's first read: when the pass reports emissions, and when it
+/// fails, since a batch appends its event before the steps that can fail it
+/// and an error carries no count of what already landed.
+#[cfg(any(unix, test))]
+fn wake_pass_needs_reread(pass: &anyhow::Result<crate::engine::wake::WakeEmissionOutcome>) -> bool {
+    match pass {
+        Ok(outcome) => outcome.events_emitted > 0,
+        Err(_) => true,
+    }
+}
+
+/// Take `name`'s `tick.lock` shared and hold it until this process exits,
+/// the exit flush included, so a command that takes it exclusive (an
+/// import's probe, a whole-binding move) waits for the tick to finish, and a
+/// tick that starts while one holds it waits for that command. Past
+/// [`tick_lock_wait`] the tick refuses with `concurrent_access`, having
+/// written nothing.
+///
+/// The lock file is created in the session's directory when it is missing,
+/// but the directory never is: a session with no local directory yet (a
+/// cloud session the tick's first read pulls) takes no lock here, and is
+/// offered it again once the read has created it. A lock that can't be
+/// opened or taken for any other reason leaves the tick running as it did
+/// before the lock existed. Taken once per process; later calls do nothing.
+#[cfg(unix)]
+fn hold_tick_lock(backend: &Backend, name: &str) {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+    if HELD.get().is_some() || crate::discover::validate_workflow_name(name).is_err() {
+        return;
+    }
+    let dir = backend.session_dir(name);
+    let path = dir.join(crate::session::TICK_LOCK_FILE);
+    let wait = tick_lock_wait();
+    let started = std::time::Instant::now();
+    loop {
+        if !dir.is_dir() {
+            return;
+        }
+        // O_NOFOLLOW: a link planted at the lock's name is not followed to
+        // create or lock a file elsewhere.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        else {
+            return;
+        };
+        match crate::engine::jsonl_append::lock_shared(file.as_raw_fd(), Some(wait), started) {
+            Ok(()) => {}
+            Err(e) if crate::engine::jsonl_append::lock_timeout(&e).is_some() => {
+                let err = NextError {
+                    code: NextErrorCode::ConcurrentAccess,
+                    message: format!(
+                        "session '{}' is held by another koto command (a move or an import of \
+                         it), which still held {} after {} ms; nothing was written. Run \
+                         `koto next {}` again once that command finishes",
+                        name,
+                        path.display(),
+                        wait.as_millis(),
+                        name,
+                    ),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+            Err(_) => return,
+        }
+        // A same-host import can swap the directory while this waits: the
+        // lock is then on the old copy's file. Take the one there now, in
+        // what is left of the same wait.
+        let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+        let now = std::fs::symlink_metadata(&path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()));
+        if held.is_some() && held == now {
+            let _ = HELD.set(file);
+            return;
+        }
+    }
+}
+
 /// Report a command's failure on stderr and return its exit code: 2, with
 /// the refusal's own text, for a write a superseded session's log refused
 /// (`session_superseded`), and 1 with the error's text for anything else.
@@ -2541,6 +2654,19 @@ pub fn run(app: App) -> Result<()> {
             // Leaked so the exit flush can reach it from any exit path,
             // `std::process::exit` included. One per process, which ends.
             let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
+            // A top-level tick holds its session's tick.lock shared from
+            // here to exit, so every read and write below runs under it. Not
+            // a nested tick or a background action's tick of its own
+            // session, which `handle_next` refuses: their enclosing tick
+            // holds it.
+            let top_level = crate::engine::reentrancy::enclosing_tick().is_none();
+            #[cfg(unix)]
+            if top_level
+                && std::env::var(crate::engine::background::BACKGROUND_OF_ENV).as_deref()
+                    != Ok(name.as_str())
+            {
+                hold_tick_lock(backend, &name);
+            }
             // A superseded session is refused before anything below writes
             // to it or anywhere else: the anchor's held-by link, the tick's
             // own log appends.
@@ -2555,20 +2681,13 @@ pub fn run(app: App) -> Result<()> {
                     );
                 }
             }));
-            // The running agent session holds what it ticks: a held-by
-            // link to `KOTO_ANCHOR`, when that names an anchor. Not from a
-            // nested tick, which `handle_next` refuses before it touches
-            // anything, and not on an anchor or close session, which it
-            // refuses too (`anchor::hold` writes nothing into one). With
-            // `KOTO_ANCHOR` unset this reads nothing at all.
-            if crate::engine::reentrancy::enclosing_tick().is_none() {
-                session_anchor::hold_from_env(backend, &name, "next");
-                // A new id for this tick, which its commands' reads of other
-                // sessions are fresh for (`crate::session::sync_stamp`).
-                backend.begin_tick(&name);
-                // A back-reference its continues relation still owes goes
-                // up before the tick pushes anything.
-                backend.ensure_backref(&name);
+            // A new id for this tick, which its own reads and its commands'
+            // reads of other sessions are fresh for
+            // (`crate::session::sync_stamp`). Picked here, before the tick's
+            // first read, and written once `handle_next` is past the
+            // execution anchor check, with the tick's other startup writes.
+            if top_level {
+                backend.mint_tick(&name);
             }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(
@@ -6422,56 +6541,6 @@ fn handle_next(
                 );
             }
         }
-
-        // Issue 15: wake-candidates pass + age-and-activity recovery.
-        // Walks the coordinator's own session log for ChildDispatched
-        // events whose corresponding child reached terminal AND has no
-        // matching RequesterWoken yet; emits a RequesterWoken event
-        // covering each batch, runs the 3-point fsync sequence, invokes
-        // the substrate-wake primitive (a SignalWaker ringing the
-        // requester's wake file), and unlinks the child's claim
-        // sidecar. The pass is O(open-dispatches), not O(workspace).
-        //
-        // Order: cursor GC → compact-recovery → maybe-compact →
-        // wake-candidates. Wake runs BEFORE the discovery scan (which
-        // happens later in the function) so a terminal child's wake
-        // emission and its parent's directive build observe consistent
-        // state.
-        let coord_state_path = koto_root
-            .join("sessions")
-            .join(&name)
-            .join(crate::session::state_file_name(&name));
-        if coord_state_path.exists() {
-            let sessions_dir = koto_root.join("sessions");
-            let stale_dispatch_timeout =
-                std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
-            let waker = crate::engine::wake::SignalWaker {
-                koto_root: koto_root.clone(),
-            };
-            match crate::engine::wake::wake_candidates_pass(
-                &koto_root,
-                &sessions_dir,
-                &coord_state_path,
-                &waker,
-                stale_dispatch_timeout,
-                std::time::SystemTime::now(),
-            ) {
-                Ok(outcome) => {
-                    if outcome.events_emitted > 0 || outcome.recoveries_fired > 0 {
-                        eprintln!(
-                            "info: wake-candidates pass — {} event(s), {} wake(s), {} sidecar(s) released, {} recoveries",
-                            outcome.events_emitted,
-                            outcome.wakes_invoked,
-                            outcome.sidecars_released,
-                            outcome.recoveries_fired,
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("warning: wake-candidates pass failed: {}", e);
-                }
-            }
-        }
     }
 
     // 1. Mutual exclusivity check
@@ -6527,7 +6596,7 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
 
-    let (mut header, events) = match backend.read_events(&name) {
+    let (mut header, mut events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
             // A session imported elsewhere is refused by the backend before
@@ -6551,17 +6620,10 @@ fn handle_next(
         }
     };
 
-    // A gate-passing command that stopped between its event and its
-    // decision's key left the decision embedded in the event: publish it
-    // now (decision record, R24). Only a missing key takes the lock.
-    if crate::decisions::store::needs_repair(backend, &name, &events) {
-        if let Err(e) = crate::decisions::store::repair(backend, &name) {
-            eprintln!(
-                "warning: the decisions embedded in the log of '{}' couldn't be repaired: {}",
-                name, e.message
-            );
-        }
-    }
+    // A cloud session this host had no directory for has one now that the
+    // read pulled it: its tick takes the lock before anything writes.
+    #[cfg(unix)]
+    hold_tick_lock(backend, &name);
 
     if events.is_empty() {
         let ne = NextError {
@@ -6699,6 +6761,124 @@ fn handle_next(
             exit_with_error_code(json, err.code.exit_code());
         }
     };
+
+    // A whole-binding move fences the anchors it retired by path: a tick
+    // run from under one that's deeper than the current anchor it's also
+    // under (the old directory, after a move up into a parent) is refused
+    // here, under tick.lock and before any write. A tick from a sibling of
+    // the current anchor met the mismatch above.
+    if header.origin.as_ref().is_some_and(|o| o.whole_epoch > 0) {
+        let state_path = backend
+            .session_dir(&name)
+            .join(crate::session::state_file_name(&name));
+        let line = serde_json::to_string(&header).unwrap_or_default();
+        if let Err(refused) = crate::session::fence_state::check(&name, &state_path, &line) {
+            let err = NextError {
+                code: NextErrorCode::SessionRebound,
+                message: refused.to_string(),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
+
+    // The tick is past its refusals of where it runs: its startup writes
+    // go here, so a tick refused above wrote none of them.
+    //
+    // The running agent session holds what it ticks: a held-by link to
+    // `KOTO_ANCHOR`, when that names an anchor (`anchor::hold` writes
+    // nothing into an anchor or close session, which were refused above).
+    // With `KOTO_ANCHOR` unset this reads nothing at all.
+    session_anchor::hold_from_env(backend, &name, "next");
+    // The id minted for this tick, written for its commands.
+    backend.begin_tick(&name);
+    // A back-reference its continues relation still owes goes up before
+    // the tick pushes anything.
+    backend.ensure_backref(&name);
+
+    // Issue 15: wake-candidates pass + age-and-activity recovery.
+    // Walks the coordinator's own session log for ChildDispatched
+    // events whose corresponding child reached terminal AND has no
+    // matching RequesterWoken yet; emits a RequesterWoken event
+    // covering each batch, runs the 3-point fsync sequence, invokes
+    // the substrate-wake primitive (a SignalWaker ringing the
+    // requester's wake file), and unlinks the child's claim
+    // sidecar. The pass is O(open-dispatches), not O(workspace).
+    //
+    // It runs after cursor GC, compact-recovery and maybe-compact, and
+    // after the execution anchor check, so a refused tick wakes nothing.
+    // Wake runs BEFORE the discovery scan (which happens later in the
+    // function) so a terminal child's wake emission and its parent's
+    // directive build observe consistent state; the log is read again when
+    // the pass may have appended to it (see `wake_pass_needs_reread`).
+    if let Some(koto_root) = crate::koto_home::koto_home() {
+        let coord_state_path = koto_root
+            .join("sessions")
+            .join(&name)
+            .join(crate::session::state_file_name(&name));
+        if coord_state_path.exists() {
+            let sessions_dir = koto_root.join("sessions");
+            let stale_dispatch_timeout =
+                std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
+            let waker = crate::engine::wake::SignalWaker {
+                koto_root: koto_root.clone(),
+            };
+            let pass = crate::engine::wake::wake_candidates_pass(
+                &koto_root,
+                &sessions_dir,
+                &coord_state_path,
+                &waker,
+                stale_dispatch_timeout,
+                std::time::SystemTime::now(),
+            );
+            match &pass {
+                Ok(outcome) => {
+                    if outcome.events_emitted > 0 || outcome.recoveries_fired > 0 {
+                        eprintln!(
+                            "info: wake-candidates pass — {} event(s), {} wake(s), {} sidecar(s) released, {} recoveries",
+                            outcome.events_emitted,
+                            outcome.wakes_invoked,
+                            outcome.sidecars_released,
+                            outcome.recoveries_fired,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: wake-candidates pass failed: {}", e);
+                }
+            }
+            if wake_pass_needs_reread(&pass) {
+                match backend.read_events(&name) {
+                    Ok((_, reread)) => events = reread,
+                    Err(err) => {
+                        let ne = NextError {
+                            code: NextErrorCode::PersistenceError,
+                            message: err.to_string(),
+                            details: vec![],
+                        };
+                        let json = serde_json::json!({"error": ne});
+                        exit_with_error_code(json, ne.code.exit_code());
+                    }
+                }
+            }
+        }
+    }
+
+    // A gate-passing command that stopped between its event and its
+    // decision's key left the decision embedded in the event: publish it
+    // now (decision record, R24). Only a missing key takes the lock.
+    // It runs here, after the anchor and whole-binding checks, because the
+    // repair writes the session's context: a tick those checks refuse must
+    // leave nothing behind, so a refused tick no longer repairs.
+    if crate::decisions::store::needs_repair(backend, &name, &events) {
+        if let Err(e) = crate::decisions::store::repair(backend, &name) {
+            eprintln!(
+                "warning: the decisions embedded in the log of '{}' couldn't be repaired: {}",
+                name, e.message
+            );
+        }
+    }
 
     // Issue 13: epoch fence on CHILD-log writes. The fence applies
     // ONLY to `--with-data` writes against a child workflow's log
@@ -10671,6 +10851,25 @@ fn handle_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tick reads its log before the wake pass, so it has to read it
+    /// again whenever the pass may have appended: when it reports emissions,
+    /// and when it fails, since a batch appends before the steps that can
+    /// fail it.
+    #[test]
+    fn a_wake_pass_that_fails_rereads_the_log() {
+        let outcome = |events_emitted| crate::engine::wake::WakeEmissionOutcome {
+            events_emitted,
+            wakes_invoked: 0,
+            sidecars_released: 0,
+            recoveries_fired: 0,
+        };
+        assert!(!wake_pass_needs_reread(&Ok(outcome(0))));
+        assert!(wake_pass_needs_reread(&Ok(outcome(2))));
+        assert!(wake_pass_needs_reread(&Err(anyhow::anyhow!(
+            "append RequesterWoken, then fail"
+        ))));
+    }
 
     /// The empty capture map, for a fixture whose gates reference no capture.
     ///

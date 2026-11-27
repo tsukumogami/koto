@@ -96,13 +96,13 @@ Domain errors use this shape:
 }
 ```
 
-The `details` array is empty when the error isn't field-specific. The thirteen error codes:
+The `details` array is empty when the error isn't field-specific. The fourteen error codes:
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
 | `gate_blocked` | 1 | One or more command gates failed or timed out, or `koto next --to` was refused because the edge to its target depends on an `overridable: false` gate whose current result doesn't satisfy that edge (the message and `details` name the gate; nothing is appended). Transient -- may resolve on retry. |
 | `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
-| `concurrent_access` | 1 | Another `koto next` invocation is already running on this workflow. Transient -- wait and retry. |
+| `concurrent_access` | 1 | Another koto command holds the session's `tick.lock` exclusive (a move or an import of the session), and still held it when the tick's 30-second wait ran out. Nothing was written. Transient -- wait and retry. Two `koto next` calls on one session share the lock and don't refuse each other. |
 | `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |
 | `precondition_failed` | 2 | A logical precondition wasn't met: `--with-data` and `--to` used together, `--to` targets an invalid state, or the state has no `accepts` block. |
 | `terminal_state` | 2 | Evidence was submitted to a terminal state. The workflow is already done. |
@@ -113,6 +113,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 | `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
 | `capture_unset` | 3 | A state's instruction text, or a field of one of its gates, reads a `capture_stdout_as` name that no state delivered on this run. That includes a non-overridable gate `koto next --to` evaluates. The message names the value and the state that produces it. |
 | `nested_invocation` | 2 | The tick was started from inside a command koto is running. Take the `koto next` call out of the command. |
+| `session_rebound` | 2 | A whole-binding move fenced the session off from this tick: the tick ran from under an anchor the move retired, deeper than the current anchor it is also under. Nothing was written. Run `koto next` from the anchor the message names. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
 
@@ -122,7 +123,7 @@ Exit code 1 means transient -- the agent can retry without changing its behavior
 |:---------:|----------|------|
 | 0 | Success | Normal response (any variant) |
 | 1 | Transient | `gate_blocked`, `integration_unavailable`, engine I/O errors |
-| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch`, `nested_invocation` |
+| 2 | Caller error | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized`, `execution_anchor_mismatch`, `nested_invocation`, `session_rebound` |
 | 3 | Infrastructure | Corrupt state file, template hash mismatch, template parse failure, `execution_anchor_unresolvable`, `capture_unset` |
 
 #### Execution anchoring

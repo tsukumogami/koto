@@ -430,6 +430,8 @@ where
         .ok_or_else(|| anyhow!("state file {} is empty", path.display()))?;
     let header: StateFileHeader = serde_json::from_str(header_line)
         .with_context(|| format!("failed to parse header from {}", path.display()))?;
+    // A whole-binding move's fence, asked of the header read under the lock.
+    crate::session::fence_state::check(&header.workflow, path, header_line)?;
     let new_header = mutate(header);
     let mut content = serde_json::to_string(&new_header).context("serialize header")?;
     content.push('\n');

@@ -1646,8 +1646,9 @@ impl CloudBackend {
 
     /// Refuse a write of `id` that a rebind fenced off: the session was
     /// rebound after this process read it, or this command runs from an
-    /// anchor a rebind retired (`crate::session::rebind_fence`). Asked of
-    /// the local header line, before anything is written.
+    /// anchor a rebind retired (`crate::session::rebind_fence`), by its
+    /// prefix and, once a whole-binding move recorded `whole_epoch`, by its
+    /// path. Asked of the local header line, before anything is written.
     fn check_fence(&self, id: &str) -> anyhow::Result<()> {
         if self.probes.read_only {
             return Ok(());
@@ -1663,6 +1664,14 @@ impl CloudBackend {
             .get(id)
             .copied();
         crate::session::rebind_fence::check(id, &line, &self.prefix, seen)?;
+        // A whole-binding move adds the path rule, from this process's
+        // directory, with this backend's own read epoch.
+        crate::session::rebind_fence::check_whole(
+            id,
+            &line,
+            crate::session::fence_state::cwd().as_deref(),
+            seen,
+        )?;
         Ok(())
     }
 
@@ -1833,8 +1842,19 @@ impl CloudBackend {
     /// touching it.
     pub fn begin_tick(&self, id: &str) {
         if self.local_guard(id).is_ok() {
-            sync_stamp::begin_tick(&self.local.session_dir(id));
+            let tick = minted_tick(id).unwrap_or_else(sync_stamp::new_tick_id);
+            sync_stamp::write_tick_id(&self.local.session_dir(id), &tick);
         }
+    }
+
+    /// Give the tick of `id` this process is about to run its id, without
+    /// writing it: the tick's own reads use it from here on
+    /// ([`CloudBackend::current_tick`]), and [`CloudBackend::begin_tick`]
+    /// writes it for the tick's commands once the tick is past its
+    /// refusals, so a refused tick leaves no `cloud-tick.id`.
+    pub fn mint_tick(&self, id: &str) {
+        *MINTED_TICK.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((id.to_string(), sync_stamp::new_tick_id()));
     }
 
     /// Drop this process's probe of `id`, and the check this host's other
@@ -1871,7 +1891,7 @@ impl CloudBackend {
     /// session's directory; `None` outside a tick.
     fn current_tick(&self) -> Option<String> {
         let tick = self.enclosing_tick()?;
-        sync_stamp::tick_id(&self.local.session_dir(&tick))
+        minted_tick(&tick).or_else(|| sync_stamp::tick_id(&self.local.session_dir(&tick)))
     }
 
     /// Whether the current tick already checked `id` against the bucket and
@@ -7582,6 +7602,7 @@ impl CloudBackend {
             store,
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
+            whole_epoch: 0,
         });
         header.command_environment = Some(crate::engine::command_env::record_from_process(false).0);
 
@@ -8909,6 +8930,20 @@ fn header_anchor(state: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The tick this process runs, and its id, once `koto next` minted it
+/// ([`CloudBackend::mint_tick`]).
+static MINTED_TICK: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// The id this process minted for its tick of `session`, if it did.
+fn minted_tick(session: &str) -> Option<String> {
+    MINTED_TICK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(s, _)| s == session)
+        .map(|(_, id)| id.clone())
+}
+
 /// The first line of the file at `path`, without reading the rest: a state
 /// log can run to megabytes and only its header is wanted.
 fn first_line(path: &Path) -> Option<String> {
@@ -9262,6 +9297,7 @@ pub(crate) mod test_support {
                 },
                 anchor_epoch: 0,
                 retired_anchors: Vec::new(),
+                whole_epoch: 0,
             }),
             execution_dir,
             session_id: String::new(),

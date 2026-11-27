@@ -547,7 +547,7 @@ All errors use a structured JSON format with `code`, `message`, and `details` fi
 | 2 | `invalid_submission`, `precondition_failed`, `terminal_state`, `workflow_not_initialized` | Change your approach |
 | 3 | `template_error`, `persistence_error` | Report to user |
 
-`template_error` covers structural template problems: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, unknown state. `persistence_error` covers disk I/O failures. `concurrent_access` means another `koto next` is already running on this workflow -- wait and retry.
+`template_error` covers structural template problems: cycle detected, chain limit reached, ambiguous transition, dead-end state, unresolvable transition, unknown state. `persistence_error` covers disk I/O failures. `concurrent_access` means another koto command (a move or an import of the session) held the session's `tick.lock` for the whole of the tick's 30-second wait -- wait and retry. Ticks of one session share that lock, so two `koto next` calls never refuse each other with it.
 
 ### rewind
 

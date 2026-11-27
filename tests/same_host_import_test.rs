@@ -1820,3 +1820,167 @@ fn an_import_refuses_an_anchor_close_session() {
         .is_empty());
     assert!(!h.sessions().join("s-b").exists());
 }
+
+/// A template whose first state's gate notes that it started, in
+/// `gate_dir/started`, then waits for `gate_dir/release`, so a tick of it
+/// stays running until the test writes that file.
+fn paused_template(gate_dir: &Path) -> String {
+    let dir = gate_dir.display();
+    format!(
+        r#"---
+name: paused
+version: "1.0"
+initial_state: hold
+states:
+  hold:
+    gates:
+      release:
+        type: command
+        command: 'touch {dir}/started; while [ ! -f {dir}/release ]; do sleep 0.05; done'
+        timeout: 60
+    transitions:
+      - target: work
+        when:
+          gates.release.exit_code: 0
+  work:
+    accepts:
+      choice:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: done
+        when:
+          choice: go
+  done:
+    terminal: true
+---
+
+## hold
+
+Wait for the release file.
+
+## work
+
+Decide.
+
+## done
+
+Done.
+"#
+    )
+}
+
+/// A `koto next` of [`NAME`] in workspace A, paused in the gate of
+/// [`paused_template`]. Dropping it releases the gate and kills the tick
+/// if it is still running, so a failed assertion leaves nothing behind.
+struct PausedTick {
+    child: Option<std::process::Child>,
+    release: PathBuf,
+}
+
+impl PausedTick {
+    /// Start the tick with the environment [`Host::cmd`] gives, and wait
+    /// until it is inside the gate.
+    fn start(h: &Host, gate_dir: &Path) -> Self {
+        let mut cmd = koto_command::koto_std();
+        for k in CLEARED {
+            cmd.env_remove(k);
+        }
+        cmd.current_dir(&h.a)
+            .env("HOME", &h.home)
+            .env("XDG_CACHE_HOME", &h.cache)
+            .env("KOTO_SESSION_BACKEND", "cloud")
+            .env("KOTO_SESSION_CLOUD_ENDPOINT", &h.endpoint)
+            .env("KOTO_SESSION_CLOUD_BUCKET", BUCKET)
+            .env("KOTO_SESSION_CLOUD_REGION", "us-east-1")
+            .env("KOTO_SESSION_CLOUD_PATH_STYLE", "true")
+            .env("KOTO_SESSION_CLOUD_ACCESS_KEY", "test-access-key")
+            .env("KOTO_SESSION_CLOUD_SECRET_KEY", "test-secret-key")
+            .args(["next", NAME])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut tick = PausedTick {
+            child: Some(cmd.spawn().unwrap()),
+            release: gate_dir.join("release"),
+        };
+        let started = std::time::Instant::now();
+        while !gate_dir.join("started").exists() {
+            let exited = tick.child.as_mut().unwrap().try_wait().unwrap().is_some();
+            if exited {
+                let out = tick.finish();
+                panic!(
+                    "the tick exited before its gate held it: {}",
+                    out.describe()
+                );
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the tick didn't reach its gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        tick
+    }
+
+    /// Let the gate pass and wait for the tick, killed after a minute.
+    fn finish(mut self) -> Out {
+        std::fs::write(&self.release, b"").unwrap();
+        let mut child = self.child.take().unwrap();
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let o = child.wait_with_output().unwrap();
+        Out {
+            code: o.status.code(),
+            raw: o.stdout.clone(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    }
+}
+
+impl Drop for PausedTick {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"");
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn an_import_refuses_import_source_running_while_a_tick_holds_the_source() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let gate = h.home.join("gate");
+    std::fs::create_dir_all(&gate).unwrap();
+    std::fs::write(h.a.join("paused.md"), paused_template(&gate)).unwrap();
+    let out = h.koto(&h.a, &["init", NAME, "--template", "paused.md"], &[]);
+    assert!(out.ok(), "init: {}", out.describe());
+
+    // The tick holds the source's tick.lock shared while it runs its gate,
+    // and no other lock the import probes.
+    let tick = PausedTick::start(&h, &gate);
+    let before = snapshot(&h, &s3);
+    let out = h.import_from_a(&[]);
+    assert_refused(&out, "import_source_running");
+    assert_source_untouched(&h, &s3, &before, "a running tick");
+
+    let ticked = tick.finish();
+    assert!(ticked.ok(), "the paused tick: {}", ticked.describe());
+    assert_eq!(ticked.json()["state"], "work", "{}", ticked.describe());
+
+    // Once the tick has exited nothing holds the source, and the import
+    // goes ahead.
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "import after the tick: {}", out.describe());
+    assert_eq!(out.json()["imported"], true, "{}", out.describe());
+}
