@@ -331,6 +331,77 @@ fn a_child_without_a_cache_resolves_while_its_root_is_here_and_omits_otherwise()
     assert_eq!(id["koto.run.id"], root["session_id"]);
 }
 
+/// A child whose sidecar caches a run id and no run template, as one
+/// created before the template was cached, gets the template stored by its
+/// next record while its root is on this host. After that it answers
+/// without the root.
+#[test]
+fn an_older_childs_sidecar_gains_the_run_template_on_its_next_record() {
+    let env = Env::new();
+    env.ok(&["init", "root", "--template", "root.md"]);
+    env.ok(&[
+        "init",
+        "root.kid",
+        "--template",
+        "child.md",
+        "--parent",
+        "root",
+    ]);
+    let root = env.header("root");
+    let sidecar = env.session_dir("root.kid").join("run-journal.json");
+    let mut cached: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    let fields = cached.as_object_mut().unwrap();
+    fields.remove("run_template_name");
+    fields.remove("run_template_hash");
+    std::fs::write(&sidecar, cached.to_string()).unwrap();
+
+    // Any command that journals a record for the child: here, the tick
+    // that takes it to its terminal state, kept with --no-cleanup.
+    env.ok(&[
+        "next",
+        "root.kid",
+        "--with-data",
+        r#"{"go":"yes"}"#,
+        "--no-cleanup",
+    ]);
+    let cached: Value = serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(cached["run_template_name"], "identity-root", "{cached}");
+    assert_eq!(cached["run_template_hash"], root["template_hash"]);
+
+    std::fs::remove_dir_all(env.session_dir("root")).unwrap();
+    let id = env.identity("root.kid");
+    assert_eq!(id["koto.run.template.name"], "identity-root");
+    assert_eq!(id["koto.run.template.hash"], root["template_hash"]);
+}
+
+/// A cached template isn't used when the sidecar's run id contradicts the
+/// run id the header records.
+#[test]
+fn a_cached_template_for_another_run_is_not_printed() {
+    let env = Env::new();
+    env.ok(&["init", "root", "--template", "root.md"]);
+    env.ok(&[
+        "init",
+        "root.kid",
+        "--template",
+        "child.md",
+        "--parent",
+        "root",
+    ]);
+    let root = env.header("root");
+    let sidecar = env.session_dir("root.kid").join("run-journal.json");
+    std::fs::write(
+        &sidecar,
+        r#"{"run_id":"another-run","driver":null,"run_template_name":"stale","run_template_hash":"abcd"}"#,
+    )
+    .unwrap();
+    let id = env.identity("root.kid");
+    // The template comes from the walk to the real root, not the cache.
+    assert_eq!(id["koto.run.template.name"], "identity-root", "{id}");
+    assert_eq!(id["koto.run.template.hash"], root["template_hash"]);
+}
+
 #[test]
 fn missing_session_exits_2() {
     let env = Env::new();

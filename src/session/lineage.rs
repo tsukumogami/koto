@@ -160,8 +160,11 @@ impl RunTemplate {
 ///
 /// A root answers from its own header. A child answers from the two fields
 /// its sidecar caches, and when they are empty from [`found_run_template`].
-/// Nothing is written here; [`found_run_template`] is what the callers that
-/// keep the sidecar store.
+/// A cached template is used only when the sidecar's run id doesn't
+/// contradict the run id the header records, so a header that was re-rooted
+/// by hand never keeps printing another run's template. Nothing is written
+/// here; [`found_run_template`] is what the callers that keep the sidecar
+/// store.
 pub(crate) fn run_template(
     backend: &dyn SessionBackend,
     name: &str,
@@ -170,7 +173,13 @@ pub(crate) fn run_template(
     if header.parent_workflow.is_none() {
         return RunTemplate::of(header);
     }
+    // The run id the header alone states, when it states one.
+    let recorded = from_header_alone(header).flatten();
     let cached = sidecar::read(&backend.session_dir(name))
+        .filter(|s| match (&recorded, &s.run_id) {
+            (Some(recorded), Some(cached)) => recorded == cached,
+            _ => true,
+        })
         .map(|s| RunTemplate {
             name: s.run_template_name,
             hash: s.run_template_hash,

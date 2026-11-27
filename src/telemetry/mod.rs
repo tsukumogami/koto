@@ -1766,34 +1766,39 @@ fn cached_run_id(
     session_dir: &Path,
     header: &StateFileHeader,
 ) -> Option<String> {
-    let cached = sidecar::read(session_dir);
-    if let Some(run_id) = cached.as_ref().and_then(|c| c.run_id.clone()) {
-        return Some(run_id);
+    let cached = sidecar::read(session_dir).unwrap_or_default();
+    let is_child = header.parent_workflow.is_some();
+    let has_template = cached.run_template_name.is_some() || cached.run_template_hash.is_some();
+    if cached.run_id.is_some() && (has_template || !is_child) {
+        return cached.run_id;
     }
-    let run_id = lineage::run_id(backend, header);
-    if run_id.is_some() {
-        // The sidecar is being written anyway, so a child whose run
-        // template isn't cached yet gets it in the same write.
-        let (cached_template, driver) = match cached {
-            Some(c) => (
-                lineage::RunTemplate {
-                    name: c.run_template_name,
-                    hash: c.run_template_hash,
-                },
-                c.driver,
-            ),
-            None => (lineage::RunTemplate::default(), None),
-        };
-        let template = if cached_template.is_empty() {
-            child_run_template(backend, header)
-        } else {
-            cached_template
-        };
+    // Something is missing: the run id, or a child's run template (a child
+    // created before the template was cached, or whose sidecar was lost).
+    // Both are looked up again and stored when the lookup finds more than
+    // the sidecar holds, so the next record needs no walk. A child whose
+    // ancestors are gone from this host finds nothing and is looked up
+    // again by its next record; that lookup ends at the first missing
+    // header.
+    let run_id = cached
+        .run_id
+        .clone()
+        .or_else(|| lineage::run_id(backend, header));
+    let template = if has_template {
+        lineage::RunTemplate {
+            name: cached.run_template_name.clone(),
+            hash: cached.run_template_hash.clone(),
+        }
+    } else {
+        child_run_template(backend, header)
+    };
+    let found_more =
+        (cached.run_id.is_none() && run_id.is_some()) || (!has_template && !template.is_empty());
+    if found_more {
         let _ = sidecar::write(
             session_dir,
             &sidecar::Sidecar {
                 run_id: run_id.clone(),
-                driver,
+                driver: cached.driver,
                 run_template_name: template.name,
                 run_template_hash: template.hash,
             },
