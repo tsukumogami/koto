@@ -9,6 +9,9 @@
 //! (backslash-newline) and collapsing runs of whitespace, case-insensitive,
 //! so a phrase wrapped across lines still matches.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
