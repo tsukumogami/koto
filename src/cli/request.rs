@@ -1022,7 +1022,7 @@ pub fn handle(args: RequestGroupArgs, command: RequestCommand) -> ! {
     match run(command) {
         Ok(rendered) => {
             println!("{rendered}");
-            std::process::exit(0);
+            crate::exit::exit(0);
         }
         Err(e) => e.emit(),
     }

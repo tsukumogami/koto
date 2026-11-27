@@ -1043,7 +1043,7 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
         }))?
     );
     if !outcome.failed.is_empty() {
-        std::process::exit(EXIT_REMOVAL_FAILED);
+        crate::exit::exit(EXIT_REMOVAL_FAILED);
     }
     Ok(())
 }

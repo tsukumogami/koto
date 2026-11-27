@@ -426,7 +426,7 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
             serde_json::json!({"target": m.target.as_str(), "workspace": m.workspace.as_str()}),
         );
         println!("{}", serde_json::Value::Object(out));
-        std::process::exit(0);
+        crate::exit::exit(0);
     }
 
     let mut keys = Vec::with_capacity(snap.keys.len());
@@ -487,7 +487,7 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
     out.insert("unlistedKeys".into(), (snap.unlisted_keys as u64).into());
 
     println!("{}", serde_json::Value::Object(out));
-    std::process::exit(0);
+    crate::exit::exit(0);
 }
 
 /// Entry point called from the CLI dispatch in `src/cli/mod.rs`.

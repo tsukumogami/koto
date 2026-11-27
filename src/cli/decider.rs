@@ -83,7 +83,7 @@ pub struct ReportArgs {
 /// Print `msg` on stderr and exit with `code`. Nothing reaches stdout.
 fn fail(code: i32, msg: impl std::fmt::Display) -> ! {
     eprintln!("koto decider report: {}", msg);
-    std::process::exit(code);
+    crate::exit::exit(code);
 }
 
 pub fn handle(cmd: DeciderCommand) -> anyhow::Result<()> {

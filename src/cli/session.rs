@@ -980,7 +980,7 @@ pub fn handle_needed(path: &str) -> Result<()> {
         Answer::Undecided(_) => eprintln!("{}", answer.line()),
         _ => println!("{}", answer.line()),
     }
-    std::process::exit(answer.exit_code());
+    crate::exit::exit(answer.exit_code());
 }
 
 /// The sessions directory `koto session needed` reads, resolved the way
@@ -1244,7 +1244,7 @@ pub fn handle_list_pinned(backend: &Backend, json: bool) -> Result<()> {
                 error.as_str()
             );
         }
-        std::process::exit(super::EXIT_INFRASTRUCTURE);
+        crate::exit::exit(super::EXIT_INFRASTRUCTURE);
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
