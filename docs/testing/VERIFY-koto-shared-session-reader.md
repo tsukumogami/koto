@@ -326,7 +326,8 @@ would look the same. The copy's manifest covers writes only for runs without
 the cloud variables and only under the store root, so a write made only under
 cloud configuration, and swallowed when denied, is covered by neither run.
 The Clause 3 rerun section at the end of this record repeats the hundred reads
-on the live, cloud-configured store and lists the bucket objects of the sessions they read.
+on the live, cloud-configured store and lists the bucket objects of the ten
+sessions in scope.
 
 ### Last: clause 2's values against `koto context get`
 
@@ -436,12 +437,15 @@ bucket's objects before and after. It ran on 2026-11-27 between 13:47Z and
 variables, the backend and five `KOTO_SESSION_CLOUD_*` ones, checked by name
 only.
 
-This section stands on its own. Its blocks ran in one fresh bash shell, not
-the first walk's setup shell, and read the live store, not the clone. The
-setup's note that the sandboxed runs were the only live-store runs, and the
-summary's clause 3 row, describe the first walk and are left as they were. The
-shell starts with a scratch directory, and the functions under "The two
-listings" below are defined in it before any listing runs:
+This section stands on its own. It doesn't use the first walk's setup shell or
+its clone, and it reads the live store. The setup's note that the sandboxed
+runs were the only live-store runs, and the summary's clause 3 row, describe
+the first walk and are left as they were. Every block here ran in bash, each
+in its own `bash -c`, and every block that lists or runs began with
+`source $S/lib.sh; source $S/listings.sh`. `lib.sh` sets `S` to the scratch
+directory below and defines `awsls`, and `listings.sh` defines `bucketscope`
+and `localscope`, all as given under "The two listings". The scratch directory
+was made once:
 
 ```bash
 S=$(mktemp -d); mkdir -p "$S/out" "$S/awshome" "$S/copy/sessions" "$S/copy/home"
@@ -497,11 +501,14 @@ wc -l < $S/headers.tsv   # 9489
 
 Of 9,489 readable headers, 46 trees have four or more sessions, and 32 of them
 are terminal throughout. The root is `execute-mirror-repair`, a plan run with
-nine children (ten sessions), and the key is `impl_base`. Clause 2's root wasn't
-reused. It was cancelled at `plan_completion`, so it lists as needs-you-stalled,
+nine children (ten sessions), and the key is `impl_base`. Clause 2's root,
+`execute-skill-regression-detection`, wasn't reused: it was cancelled at
+`plan_completion`, so it lists as needs-you-stalled,
 not done. The ids are taken by name, the root and every id that starts with
 `execute-mirror-repair.`, and they are the same ten the tree script groups
-under the root by parent links (checked by comparing the two lists). Quiet
+under the root by parent links. That was checked by running the tree script's
+`top` on every id and comparing the ids whose top is the root with
+`root.ids`, which printed `10 10 True`. Quiet
 time came from each session's last event and its newest file, run from
 `~/.koto/sessions`:
 
@@ -599,8 +606,8 @@ env -i PATH=/usr/bin:/bin:/opt/homebrew/bin HOME="$S/awshome" AWS_CONFIG_FILE=/d
 wc -l < $S/top.prefixes; grep -cE "^[0-9a-f]{16}/$" $S/top.prefixes   # 5546, 5545
 ```
 
-That is 5,545 workspace prefixes and `koto-names/`. Then a first listing and a
-control, each in its own bash:
+That is 5,545 workspace prefixes and `koto-names/`. Then a first listing, and
+a control in a second `bash -c`, shown here as one block:
 
 ```bash
 date -u +%FT%TZ                                         # 13:51:21Z
@@ -610,6 +617,7 @@ bucketscope $S/bucket.control; localscope $S/local.control
 cmp $S/bucket.before $S/bucket.control && echo bucket identical
 cmp $S/local.before $S/local.control && echo local identical
 cut -f4 $S/bucket.before | sort | tail -1               # newest last-modified time
+cut -d'|' -f2 $S/local.before | sort | uniq -c          # 45 Directory, 569 Regular File
 ```
 
 The scope covers 20 prefixes: each session's name-index prefix and its home.
@@ -649,10 +657,9 @@ done
 echo "runs $i, nonzero exits $fails, stderr lines $(wc -l < "$O/live.err"), lsof samples $samples, samples with an inet file $hits, stop: ${stop:-none}"
 ```
 
-The loop was saved as `$S/loop.sh`. It ran in a new bash, which sourced the
-listing functions first (saved as `$S/lib.sh` and `$S/listings.sh`) and took
-fresh before listings right before the loop. The 15,348 below is the loop's
-last line:
+The loop was saved as `$S/loop.sh` and run by this one `bash -c`, which took
+fresh before listings right before it. The table's sample count comes from the
+loop's final `echo`:
 
 ```bash
 source $S/lib.sh; source $S/listings.sh
@@ -669,7 +676,8 @@ wc -l < $S/aws.err; wc -c < $O/lsof.out
 ```
 
 Both printed "same as 13:51Z". The before listings started at 13:54:57Z and
-the after listings ended at 14:02:28Z. The loop's end time, 14:02:19Z, is after its last check.
+the after listings ended at 14:02:28Z. The loop's end time, 14:02:19Z,
+includes its run-100 check, so the last run ended before then.
 
 | Measure | Result |
 |---------|--------|
@@ -717,7 +725,7 @@ holding a known socket, so its sensitivity is inferred, not measured. Clause
 TLS or cloud storage crate, and its binary imports no `connect`, `socket` or
 `getaddrinfo`.
 
-**Reading.** Shown for the sessions the runs read (measured); nothing pushed
+**Reading.** Shown for the ten sessions in scope (measured); nothing pushed
 elsewhere in the bucket is inferred. A hundred unsandboxed reads from current
 main, on the live store of a host using koto's cloud storage with writes and
 network allowed, left those sessions' bucket objects and local entries
