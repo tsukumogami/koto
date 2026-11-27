@@ -207,10 +207,13 @@ impl Drops {
         }
     }
 
-    /// Write each session's count beside it.
+    /// Write each session's count beside it. The sessions share one lock
+    /// wait between them, so a flush that drops records of many sessions
+    /// spends no longer here than one that drops records of one.
     fn write(self) {
+        let started = Instant::now();
         for (dir, n) in self.0 {
-            carry::add(&dir, n);
+            carry::add_within(&dir, n, started);
         }
     }
 }
@@ -438,8 +441,10 @@ mod tests {
     #[test]
     fn late_chunk_dropped_breaker_stays_open() {
         let f = Fixture::new();
-        // Two healthy calls that together leave under 2.0 s for a third.
-        f.stub.sleeps(&["0.45", "0.45", "0"]);
+        // Two healthy calls that together leave under 2.0 s for a third:
+        // the second alone takes 0.9 s of the 2.85 s. The first is as quick
+        // as the host allows, so the second starts with time to spare.
+        f.stub.sleeps(&["0", "0.9", "0"]);
         f.queue(&f.a, 0, 450);
         let started = Instant::now();
         flush();

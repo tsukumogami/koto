@@ -83,10 +83,15 @@ struct Lock {
 }
 
 impl Lock {
-    /// Take `dir`'s lock, waiting at most [`LOCK_WAIT`] (not at all once a
-    /// wait has run out in this process). `None` when the directory is
-    /// gone, the lock file can't be opened, or the wait ran out.
-    fn acquire(dir: &Path) -> Option<Lock> {
+    /// Take `dir`'s lock, waiting until [`LOCK_WAIT`] has passed since
+    /// `started` (not at all once a wait has run out in this process).
+    /// `None` when the directory is gone, the lock file can't be opened, or
+    /// the wait ran out.
+    ///
+    /// A caller that changes several sessions' counts in one go passes the
+    /// same `started` for each, so [`LOCK_WAIT`] bounds them all together
+    /// and not one by one. The lock is always tried once.
+    fn acquire(dir: &Path, started: Instant) -> Option<Lock> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
         let file = std::fs::OpenOptions::new()
@@ -98,11 +103,7 @@ impl Lock {
             .open(dir.join(LOCK_FILE))
             .ok()?;
         let wait = if gave_up() { Duration::ZERO } else { LOCK_WAIT };
-        match crate::engine::jsonl_append::lock_exclusive(
-            file.as_raw_fd(),
-            Some(wait),
-            Instant::now(),
-        ) {
+        match crate::engine::jsonl_append::lock_exclusive(file.as_raw_fd(), Some(wait), started) {
             Ok(()) => {
                 set_gave_up(false);
                 Some(Lock { _file: file })
@@ -155,20 +156,31 @@ fn write(dir: &Path, count: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Add `n` dropped records to the count of the session in `dir`.
+/// Add `n` dropped records to the count of the session in `dir`, waiting
+/// for its lock only until [`LOCK_WAIT`] has passed since `started`.
+///
+/// A flush that counts drops for several sessions passes one `started` for
+/// all of them, so the waits can't add up past the one [`LOCK_WAIT`] the
+/// flush's time bound allows.
 ///
 /// Best-effort and silent: a session directory that is gone, a lock that
 /// can't be taken in time, or a write that fails loses the `n`, which is
 /// the failure this count tolerates. Returns whether the count was written.
-pub(crate) fn add(dir: &Path, n: u64) -> bool {
+pub(crate) fn add_within(dir: &Path, n: u64, started: Instant) -> bool {
     if n == 0 {
         return true;
     }
-    let Some(_lock) = Lock::acquire(dir) else {
+    let Some(_lock) = Lock::acquire(dir, started) else {
         return false;
     };
     let total = read(dir).saturating_add(n).min(MAX_COUNT);
     write(dir, total).is_ok()
+}
+
+/// [`add_within`] with a wait of its own.
+#[cfg(test)]
+pub(crate) fn add(dir: &Path, n: u64) -> bool {
+    add_within(dir, n, Instant::now())
 }
 
 /// The count of the session in `dir`, read without the lock: for a test or
@@ -308,6 +320,42 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join(LOCK_FILE)).unwrap();
         assert!(!add(&dir, 1), "a lock that is a symlink was followed");
         assert!(!count_path(&dir).exists());
+    }
+
+    /// Take the lock of the session in `dir`, as another process would.
+    fn hold(dir: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+        assert!(add(dir, 1));
+        let holder = std::fs::File::open(dir.join(LOCK_FILE)).unwrap();
+        // Blocking, for the reason given in the test below.
+        // SAFETY: the descriptor belongs to `holder`, which outlives the call.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        holder
+    }
+
+    #[test]
+    fn several_sessions_in_one_go_share_one_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs: Vec<PathBuf> = (0..6)
+            .map(|i| {
+                let dir = tmp.path().join(format!("s{i}"));
+                std::fs::create_dir(&dir).unwrap();
+                dir
+            })
+            .collect();
+        // Every other session's lock is held, so a wait that restarted for
+        // each session would cost three waits: a timeout, then a success
+        // that lets the next one wait again.
+        let _held: Vec<std::fs::File> = dirs.iter().step_by(2).map(|d| hold(d)).collect();
+        let started = Instant::now();
+        let written: Vec<bool> = dirs.iter().map(|d| add_within(d, 4, started)).collect();
+        let took = started.elapsed();
+        assert_eq!(written, vec![false, true, false, true, false, true]);
+        assert!(took >= LOCK_WAIT, "{took:?}");
+        assert!(took < LOCK_WAIT * 2, "the waits added up: {took:?}");
+        // The held sessions kept the 1 `hold` wrote; the free ones gained 4.
+        let counts: Vec<u64> = dirs.iter().map(|d| read(d)).collect();
+        assert_eq!(counts, vec![1, 4, 1, 4, 1, 4]);
     }
 
     #[test]
