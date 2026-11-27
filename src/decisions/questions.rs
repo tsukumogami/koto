@@ -77,6 +77,11 @@ pub mod reasons {
     /// An entry whose question isn't in the local store, or isn't a
     /// question.
     pub const NO_QUESTION: &str = "no_question";
+    /// A verified person answer the store reads as in effect on a question
+    /// it no longer holds ([`super::gone_question_answer`]). It is the one
+    /// reason an entry carries while it counts: it says the question it
+    /// counts toward is gone.
+    pub const QUESTION_GONE: &str = "question_gone";
     /// An entry written in a fenced session after its fence: it reads
     /// `refused` and counts toward nothing.
     pub const AFTER_FENCE: &str = "after_fence";
@@ -95,7 +100,7 @@ pub fn identity(body: &DecisionBody) -> String {
     format!("{}/{}", body.session.id, body.id)
 }
 
-fn subject_str<'a>(body: &'a DecisionBody, field: &str) -> Option<&'a str> {
+pub(crate) fn subject_str<'a>(body: &'a DecisionBody, field: &str) -> Option<&'a str> {
     body.subject.get(field).and_then(Value::as_str)
 }
 
@@ -140,11 +145,11 @@ pub fn person_handle(body: &DecisionBody) -> Option<&str> {
     }
 }
 
-fn same(a: &DecisionBody, b: &DecisionBody) -> bool {
+pub(crate) fn same(a: &DecisionBody, b: &DecisionBody) -> bool {
     a.session.id == b.session.id && a.id == b.id
 }
 
-fn order_key(b: &DecisionBody) -> (&str, &str, &str) {
+pub(crate) fn order_key(b: &DecisionBody) -> (&str, &str, &str) {
     (&b.time, &b.session.name, &b.id)
 }
 
@@ -352,11 +357,6 @@ pub fn verified_person(index: &Index, backend: &Backend, answer: &DecisionBody) 
 /// several are uncited, and the later of all of them when every one is
 /// cited.
 fn person_winner<'i>(persons: &[&'i DecisionBody]) -> Option<&'i DecisionBody> {
-    let cites = |by: &DecisionBody, p: &DecisionBody| {
-        by.basis
-            .iter()
-            .any(|c| c.id == p.id && c.session == p.session.name)
-    };
     let uncited: Vec<&'i DecisionBody> = persons
         .iter()
         .copied()
@@ -386,6 +386,46 @@ pub fn person_in_effect<'i>(
     person_winner(&persons)
 }
 
+/// The verified person answer in effect on the question whose identity is
+/// `(raiser's session id, question id)`, read for a question the local
+/// store no longer holds because its raiser was removed.
+///
+/// A raiser's settles and withdrawals sat in the raiser's own area and went
+/// with it, and a verified person answer wins over any session's answer, so
+/// the person answer in effect ([`person_in_effect`]) is the answer in
+/// effect, the same one the raiser's presence would give, unless a
+/// reversal of the question is stored anywhere this store reads (one
+/// recorded `--in` another session), which withdraws every answer to it.
+///
+/// Replacement is decided by [`person_in_effect`] on both paths: an answer
+/// is replaced only by a later `answered` person answer to the same
+/// question that reads verified here and cites it. A citing entry of any
+/// other kind, a session's answer, or a person answer that reads as a
+/// remote session's changes nothing.
+///
+/// What this can't see: a reversal recorded in the raiser itself went with
+/// the raiser, and a replacing answer whose session was forced out (retention
+/// keeps a session holding a verified person answer otherwise) leaves the
+/// one it replaced looking in effect.
+pub fn gone_question_answer<'i>(
+    index: &'i Index,
+    backend: &Backend,
+    session_id: &str,
+    id: &str,
+) -> Option<&'i DecisionBody> {
+    if index.winner_of(session_id, id).is_some() {
+        return None;
+    }
+    person_in_effect(index, backend, session_id, id)
+}
+
+/// Whether `by` names `p` in its `basis`.
+fn cites(by: &DecisionBody, p: &DecisionBody) -> bool {
+    by.basis
+        .iter()
+        .any(|c| c.id == p.id && c.session == p.session.name)
+}
+
 /// The question `target` names, as the local store holds it: read from
 /// the raiser's directory when its session id matches, else from any copy
 /// carrying that identity.
@@ -406,7 +446,9 @@ pub fn question_of<'i>(index: &'i Index, target: &Target) -> Option<&'i Decision
 ///
 /// A question that waits on `person:<h>` now is settled only from a basis
 /// naming a verified answer of `<h>`'s that is in effect on another
-/// question carrying the same `label`. One that waits on a session or
+/// question carrying the same `label`; when the store no longer holds that
+/// question (its raiser was removed), the label koto copied onto the
+/// answer stands in for the question's. One that waits on a session or
 /// anchor is settled from a basis naming a decision that reads back and
 /// is neither the question itself nor an entry aimed at it, or an `event`
 /// evidence pointer. A cited person answer stands only while the question
@@ -511,24 +553,36 @@ pub fn settle_basis(
             why.push(format!("{named} answers no question"));
             continue;
         };
-        if person_in_effect(index, backend, &t.id, &t.decision).is_none_or(|w| !same(w, a)) {
+        let held = question_of(index, t);
+        let in_effect = match held {
+            Some(_) => person_in_effect(index, backend, &t.id, &t.decision),
+            None => gone_question_answer(index, backend, &t.id, &t.decision),
+        };
+        if in_effect.is_none_or(|w| !same(w, a)) {
             why.push(format!(
                 "{named} isn't the answer in effect on its own question"
             ));
             continue;
         }
-        let Some(answered) = question_of(index, t) else {
-            why.push(format!("{named} answers a question this host doesn't hold"));
-            continue;
+        // A question removed with its raiser stands on the label koto
+        // copied onto its answer. A reversal of it recorded in another
+        // session, or an answer citing this one as replaced, still
+        // withdraws it (`gone_question_answer`); one recorded in the raiser
+        // went with the raiser.
+        let answered_label = match held {
+            Some(answered) => {
+                let status = index.status(answered);
+                if status != "in-effect" {
+                    why.push(format!(
+                        "{named} answers a question that reads '{status}', not in effect"
+                    ));
+                    continue;
+                }
+                label_of(answered)
+            }
+            None => subject_str(a, "label"),
         };
-        let status = index.status(answered);
-        if status != "in-effect" {
-            why.push(format!(
-                "{named} answers a question that reads '{status}', not in effect"
-            ));
-            continue;
-        }
-        match label_of(answered) {
+        match answered_label {
             Some(l) if l == own_label => return Ok(()),
             Some(l) => why.push(format!(
                 "{named} answers a question labelled '{l}', not '{own_label}'"
@@ -742,17 +796,58 @@ pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> Ent
         reason: Some(reasons::NO_QUESTION),
         governs: answer.then_some(false),
     };
-    let Some(question) = body.target.as_ref().and_then(|t| question_of(index, t)) else {
+    let Some(target) = body.target.as_ref() else {
         return lost;
+    };
+    let Some(question) = question_of(index, target) else {
+        // The question went with its raiser. The answer the precedent read
+        // and a settle take as in effect reads that way here too, and a
+        // verified person answer it replaced still counts without
+        // governing, as it did while the raiser was there.
+        let Some(w) = answer
+            .then(|| gone_question_answer(index, backend, &target.id, &target.decision))
+            .flatten()
+        else {
+            return lost;
+        };
+        let governs = same(w, body);
+        return if governs || verified_person(index, backend, body) {
+            EntryJudgment {
+                counted: true,
+                reason: Some(reasons::QUESTION_GONE),
+                governs: Some(governs),
+            }
+        } else {
+            lost
+        };
     };
     if !is_question(question) {
         return lost;
     }
     let runs = Runs::new(backend);
-    let r = resolve(index, &runs, question);
+    judge_resolved(index, body, &resolve(index, &runs, question))
+}
+
+/// [`judge_entry`] for an entry aimed at a question whose resolution the
+/// caller already holds, so a read judging every entry about one question
+/// resolves it once rather than once per entry. `r` must be the question's
+/// resolution against the same `index`.
+pub(crate) fn judge_resolved(index: &Index, body: &DecisionBody, r: &Resolution) -> EntryJudgment {
+    let answer = body.kind == "answer";
+    if index.after_fence(body) {
+        return EntryJudgment {
+            counted: false,
+            reason: Some(reasons::AFTER_FENCE),
+            governs: answer.then_some(false),
+        };
+    }
     if answer {
         let Some(j) = r.closing.iter().find(|j| same(j.entry, body)) else {
-            return lost;
+            return EntryJudgment {
+                counted: false,
+                reason: Some(reasons::NO_QUESTION),
+                governs: Some(false),
+            };
         };
         return EntryJudgment {
             counted: j.counted,
@@ -780,7 +875,7 @@ pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> Ent
     }
 }
 
-fn decisions(index: &Index) -> impl Iterator<Item = &DecisionBody> {
+pub(crate) fn decisions(index: &Index) -> impl Iterator<Item = &DecisionBody> {
     index.sessions().values().flatten().filter_map(|e| match e {
         Entry::Decision(b) => Some(&**b),
         Entry::Unreadable { .. } => None,
@@ -1033,7 +1128,7 @@ pub fn open_at(backend: &Backend, position: &str) -> Value {
 /// the cited decision: it counts only when it was recorded no later than
 /// the decision citing it. A later session that reuses the name, and an
 /// id, therefore never stands in for the decision that was cited.
-fn cited(index: &Index, decisions: &[&DecisionBody]) -> BTreeSet<(String, String)> {
+pub(crate) fn cited(index: &Index, decisions: &[&DecisionBody]) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     for d in decisions {
         for c in &d.basis {

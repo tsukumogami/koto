@@ -1315,6 +1315,16 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
             ),
         );
     }
+    // The question's label rides on every answer recorded for it, copied
+    // from the question and never from the caller, so the precedent read
+    // still has it once the raiser is gone. A question with no label adds
+    // nothing.
+    if let Some(l) = crate::decisions::questions::label_of(&question) {
+        subject.insert(
+            "label".to_string(),
+            serde_json::Value::String(l.to_string()),
+        );
+    }
     let index = Index::scan(backend, false);
     let status = index.status(&question);
     if status != "in-effect" {
@@ -1332,6 +1342,42 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
     check_closing(
         backend, &index, &question, &answerer, &outcome, person, &basis, &evidence,
     );
+    // A person's answer to a question that already has a verified person
+    // answer in effect replaces it, and says so in its `basis`: a person
+    // answer cited by another of the question's answers is never the one in
+    // effect, so the replaced answer stays replaced for as long as this one
+    // is readable, whatever the two answers' times.
+    let mut basis = basis;
+    if person && outcome == "answered" {
+        if let Some(prev) =
+            crate::decisions::questions::person_in_effect(&index, backend, &question.session.id, id)
+        {
+            let cited = basis
+                .iter()
+                .any(|c| c.session == prev.session.name && c.id == prev.id);
+            if !cited {
+                if basis.len() >= body::MAX_LIST_ENTRIES {
+                    refuse(
+                        COMMAND,
+                        &DecisionError::invalid(
+                            "basis",
+                            format!(
+                                "this answer replaces {}:{} and cites it, so it takes at most {} \
+                                 more --basis entries",
+                                prev.session.name,
+                                prev.id,
+                                body::MAX_LIST_ENTRIES - 1
+                            ),
+                        ),
+                    );
+                }
+                basis.push(BasisRef {
+                    session: prev.session.name.clone(),
+                    id: prev.id.clone(),
+                });
+            }
+        }
+    }
     let target = Target {
         name: name.to_string(),
         id: question.session.id.clone(),
@@ -2111,6 +2157,108 @@ pub fn handle_open(backend: &Backend, person: &str) -> Result<()> {
         "{}",
         serde_json::to_string(&crate::decisions::questions::open(backend, person))?
     );
+    Ok(())
+}
+
+/// `koto decisions precedent --person <handle> --chain <session-or-anchor>
+/// [--label <text>]`: the verified person answers in effect in a chain.
+pub fn handle_precedent(
+    backend: &Backend,
+    person: &str,
+    at: &str,
+    label: Option<&str>,
+) -> Result<()> {
+    const COMMAND: &str = "decisions precedent";
+    if decider::check_handle("person", person).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "person",
+                format!(
+                    "--person takes a handle of 1 to {} bytes with no control characters",
+                    decider::MAX_HANDLE_BYTES
+                ),
+            ),
+        );
+    }
+    if crate::discover::validate_workflow_name(at).is_err() {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid("chain", "--chain takes a session or anchor name"),
+        );
+    }
+    if !chain::session_present(backend, at) {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "chain",
+                format!("no session or anchor named '{at}' in the local store"),
+            ),
+        );
+    }
+    if let Some(l) = label {
+        if l.is_empty() || l.len() > body::MAX_LABEL_BYTES {
+            refuse(
+                COMMAND,
+                &DecisionError::invalid(
+                    "label",
+                    format!(
+                        "--label takes a question label of 1 to {} bytes",
+                        body::MAX_LABEL_BYTES
+                    ),
+                ),
+            );
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&crate::decisions::precedent::precedent(
+            backend, person, at, label
+        ))?
+    );
+    Ok(())
+}
+
+/// `koto decisions history <session id>/<decision id>`: one question's
+/// history, by its identity.
+pub fn handle_history(backend: &Backend, identity: &str) -> Result<()> {
+    use crate::decisions::history::{self, Refusal};
+    const COMMAND: &str = "decisions history";
+    let shape = || -> ! {
+        refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "identity",
+                "a question's identity is <raiser's session id>/<decision id>",
+            ),
+        )
+    };
+    let Some((sid, did)) = identity.split_once('/') else {
+        shape()
+    };
+    if !store::is_target_id(sid) || !crate::decisions::is_decision_id(did) {
+        shape();
+    }
+    match history::history(backend, sid, did) {
+        Ok(doc) => println!("{}", serde_json::to_string(&doc)?),
+        Err(Refusal::NotFound) => refuse(
+            COMMAND,
+            &DecisionError::new(
+                codes::DECISION_NOT_FOUND,
+                format!("no session in the local store holds question {identity}"),
+            ),
+        ),
+        Err(Refusal::NotQuestion(kind)) => refuse(
+            COMMAND,
+            &DecisionError::invalid(
+                "identity",
+                format!(
+                    "decision {identity} is a '{kind}' with no typed recipient, or not an \
+                     'escalate', so it isn't a question"
+                ),
+            ),
+        ),
+    }
     Ok(())
 }
 

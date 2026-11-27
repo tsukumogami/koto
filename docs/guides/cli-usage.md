@@ -1762,7 +1762,7 @@ A `credential` or `reserved-step` need can't be settled (field `outcome`); it ca
 
 **Which entries count.** An entry is judged each time it's read, against who the question waits on at that moment, and the stored status never changes. A person's verified answer counts whoever recorded it. Any other `answered` answer, including a person's answer that reads as a remote session's, counts only from the session or anchor the question waits on now, or a session continuing it, and never while the question waits on a person. A settle or withdrawal counts only under the rules above. Of the entries that count, a person's verified answer is in effect over any session's, whichever came first; between two person answers, the one the other doesn't cite in its `--basis` wins, then the later. With no person answer, the earliest counted entry is in effect.
 
-`decisions show` and `decisions list --format v1` add to every `answer` and `readdress` entry `counted` (`true` or `false`) and, when it's false, a `reason`: `not_addressee`, `waits_on_person`, `not_raiser`, `person_decider`, `no_reason`, `need_not_settleable`, `settle_basis`, `no_question`, `after_fence` (written in a fenced session after its fence), `destination` or `skipped`. `reason` is always a code: an unreadable entry lists `reason: integrity` and the failed check in `detail`. Every `answer` entry also carries `governs`, `true` on the one entry in effect. An entry that doesn't count is still listed and closes nothing.
+`decisions show` and `decisions list --format v1` add to every `answer` and `readdress` entry `counted` (`true` or `false`) and, when it's false, a `reason`: `not_addressee`, `waits_on_person`, `not_raiser`, `person_decider`, `no_reason`, `need_not_settleable`, `settle_basis`, `no_question`, `after_fence` (written in a fenced session after its fence), `destination` or `skipped`. `reason` is always a code: an unreadable entry lists `reason: integrity` and the failed check in `detail`. Every `answer` entry also carries `governs`, `true` on the one entry in effect. An entry that doesn't count is still listed and closes nothing. One reason comes with `counted: true`: `question_gone`, on a person's answer that reads `verified` here and whose question left the store with its raiser, when no stored reversal of the question and no readable answer replacing it says otherwise. It governs, and it is the answer [decisions precedent](#decisions-precedent) lists for that question. Any other answer to a question that's gone reads `no_question`.
 
 The raiser's `koto next` reports the entry in effect when it's an `answered` answer: if a person's answer later outranks a session's answer the run already cited, the question is reported again with the person's answer until the run cites that one. A question the run withdrew or settled itself isn't reported.
 
@@ -1795,11 +1795,66 @@ Refusals exit 2 and write nothing: `decision_not_found` when the raiser holds no
 An `escalate` may carry two optional subject fields beside `question`, `text`, `recipient` and `packet`:
 
 - `--subject need=<decision|credential|reserved-step>` says what the raiser needs. Any other value exits 2 on `subject.need`. A question with no `need` reads `decision` in the open reads. Its raiser can't settle a `credential` or `reserved-step` need.
-- `--subject label=<text>`, at most 128 bytes (a longer one exits 2 on `subject.label`), names the topic a settle compares: a question waiting on a person settles only from that person's answer to a question with the same label. No read selects by label.
+- `--subject label=<text>`, at most 128 bytes (a longer one exits 2 on `subject.label`), names the topic a settle compares: a question waiting on a person settles only from that person's answer to a question with the same label. [decisions precedent](#decisions-precedent) is the one read that selects by label. Every answer recorded to a labelled question, whatever its outcome, carries the question's `label` in its own subject; koto copies it from the stored question, and no flag sets it. A settle citing an answer whose question is gone from the store, because its raiser was removed, compares that copy. An answer recorded before koto copied labels has none, so once its raiser is removed it matches no `--label` and can't be a settle's basis.
 
 ### The limit of twenty
 
 No write adds a twenty-first open question waiting on a person to a session's run: the session, the sessions it continues and the sessions that continue it through `--continues ... --supersede`. While twenty questions raised in that run are open and wait on a person, whatever the handles, an `escalate` with a `person:` recipient exits 2 on `subject.recipient`, and `decisions readdress` of one of those sessions' questions to a person exits 2 on `to`, whoever records it; both name the limit of twenty and write nothing. A question that already waits on a person can still pass to another person, and an `escalate` or pass-up to a session or anchor is never refused by the limit. The count follows who each question waits on now: one passed from a person to a session doesn't count, and a closed or reversed question doesn't. On one host the count and the write are serialized per run, by a lock under the koto root, so commands run at once can't pass twenty; a command waits at most five seconds for the lock, then exits 2 naming it and writes nothing. An addressee refused at the limit is told the raiser's session and what it can do: answer the question, pass it to its dispatcher if it has one, or leave it waiting until the raiser's run closes one. The count reads this host's store, so commands on two hosts aren't serialized; and since a read never refuses, questions can reopen past twenty without a write, as when settles resting on one person's answer stop counting because that person answers the earlier question again.
+
+### decisions precedent
+
+Lists the answers a person gave that are in effect in a chain, so a session about to raise or pass up a question can see whether that person already settled the topic.
+
+```bash
+koto decisions precedent --person <handle> --chain <session-or-anchor> [--label <text>]
+```
+
+```json
+{"v":1,"person":"owner","chain":"worker","label":"cache","answers":[{"identity":"58eabc99-.../000000000001","label":"cache","session":"director","id":"000000000002","text":"SQLite","time":"2026-11-26T14:40:02.118Z","decider":{"kind":"person","handle":{"source":"handed","value":"owner"}},"reading":"verified","cited":false,"below":false}]}
+```
+
+The chain is every session and anchor in this host's store connected to `--chain` through the links [decisions open](#decisions-open) `--at` follows, up or down, together with the sessions each of them continues through `--continues ... --supersede` and the sessions that continue them: the raiser's siblings, the coordinators above it, their predecessors and their successors all share one chain, and a successor with no dispatcher of its own shares its predecessor's chain in both directions. An answer is in the chain when the session it was recorded in is, or when its question's raiser is still in the store and is.
+
+An answer is listed only when it is the entry in effect on its question, has outcome `answered`, was given by `person:<handle>`, and reads `verified` on this host. A session's answer, a settle, a withdrawal, an answer to a reversed question, an answer that another answer has replaced, and a person's answer that reads as a remote session's (after a pull or an import) are never listed. Every answer listed for a label is one a settle of a question with that label, waiting on that person, accepts as its `--basis`.
+
+A person's answer to a question that already has a verified person answer in effect names that answer in its own `basis`; koto adds it, so the answer takes one `--basis` fewer than the limit of 64. An answer is replaced when a later `answered` person answer to the same question that reads `verified` here names it in its `basis`, whichever handle gave the later one; the later answer is then its own handle's precedent, and a question waiting on the first handle can't settle on it. A session's answer, or a person's answer that reads as a remote session's, replaces nothing even when it names the answer.
+
+Once the raiser is removed the question goes with it, and what the rest of the store holds decides. Replacement is decided the same way as while the raiser was there. A reversal of the question recorded in another session still withdraws its answer, but a reversal recorded in the raiser went with the raiser. An answer that replaced another stays readable while the session it was recorded in is, and koto keeps a session holding a person's answer that reads `verified` here: `koto session cleanup` refuses to remove it without `--force`. Once that session has been forced out as well as the raiser removed, nothing left says the first answer was replaced, and it is listed again.
+
+`--label` compares bytes: no case folding, trimming or Unicode normalization. Without it every answer of the person in the chain is listed, each with its question's `label` or `null`. The label comes from the question while the store holds it, and from the copy on the answer once it doesn't, so an answer outlives the session that asked.
+
+`cited` is true when a decision in the `--chain` session's run (it and the sessions it continues) names the answer in its `basis`; `below` is true when the answer was recorded in that run or below it. Answers come in order of time, then session name, then id.
+
+Refusals exit 2 and write nothing: a `--chain` naming no session or anchor in the store, a `--person` handle koto doesn't accept, and a `--label` that is empty or over 128 bytes. `--person` and `--chain` are both required.
+
+### decisions history
+
+Prints one question by its identity: as raised, where it stands now, and every entry this host's store holds about it.
+
+```bash
+koto decisions history <session id>/<decision-id>
+```
+
+The identity is the raiser's session id and the question's decision id, as `identity` in [decisions open](#decisions-open) gives it; a session's name in place of its id names no question. The command reads every session in the store, so it works from any directory.
+
+The output carries `question` (its id, `question`, `text`, `label`, `need`, `state`, `packet`, `content_stored` and the `recipient` it was raised with), `raiser` (name and id), `run_mode`, `successor` (the session the raiser's supersede marker names, while that hop is confirmed, or `null`), `status`, `open`, `addressee`, `addressees` and `answer`, the entry in effect with its session, id, outcome, text, decider, run mode, time and, for a person's answer, `reading`, or `null` while the question is open.
+
+`entries` lists, each tagged by `entry`:
+
+- `attempt`, every attempt tied to the question the way [decisions attempts](#decisions-attempts) ties them (its escalate names an attempt in the raiser's own run, or the attempt names the escalate), with its session, `what`, `state`, `result`, decider and `status`;
+- `raise`;
+- `pass-up`, every `readdress` aimed at the question, with the recording session, `recipient`, and `attempts`, the session and id of each tied attempt recorded no later than it;
+- `answer`, every `answer` entry, whatever its outcome, with its session, decider, text and, for a person's answer, `reading`;
+- `citing`, every decision that names one of those answers in its `basis`, with its kind, outcome, decider and `cites`;
+- `unreadable`, every file that doesn't read and is named as a decision id in the aimed area, of any session, for the raiser's session id, with the session it sits in and the failed check in `detail`; a file named otherwise isn't listed. That area is kept per raiser, not per question, so such a file is listed in the history of every question that raiser asked.
+
+Pass-ups and answers carry `counted`, a `reason` when it is false, and, on answers, `governs`, with the values `decisions show` gives the same entry. An entry that doesn't count is listed and marked; an unreadable one never counts and never closes the question.
+
+An attempt the question's escalate names was made before the question and lists ahead of the raise. After the raise, entries come by time, then session name, then id, except that a pass-up never lists before the pass-up it followed or an attempt it names, and a citing decision never lists before the answer it cites, whatever their stored times. A citing decision that is also a tied attempt is listed once, as an attempt. Unreadable entries have no time and come last.
+
+Refusals exit 2 and write nothing: `invalid_decision` on `identity` when the argument isn't `<session id>/<decision-id>`, `decision_not_found` naming the identity when no session holds it, and `invalid_decision` when the decision isn't an `escalate` or its recipient is untyped.
+
+Neither read takes a lock, pulls, sends a request to a bucket or writes anything, under the local backend or the cloud backend's local copy; `--workspace` is refused on both.
 
 ### decisions content
 

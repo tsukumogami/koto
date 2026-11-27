@@ -57,14 +57,16 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
             DecisionsSubcommand::Show { name, .. } => Some(("decisions show", name)),
             // `chain` walks this host's copies of the sessions on the
             // chain, which a scratch read of one session can't give it,
-            // and `open`, `attempts` and `content read` read every session
-            // in the local store.
+            // and `open`, `attempts`, `precedent`, `history` and
+            // `content read` read every session in the local store.
             DecisionsSubcommand::Record { .. }
             | DecisionsSubcommand::Reverse { .. }
             | DecisionsSubcommand::Answer { .. }
             | DecisionsSubcommand::Readdress { .. }
             | DecisionsSubcommand::Open { .. }
             | DecisionsSubcommand::Attempts { .. }
+            | DecisionsSubcommand::Precedent { .. }
+            | DecisionsSubcommand::History { .. }
             | DecisionsSubcommand::Content { .. }
             | DecisionsSubcommand::Chain { .. } => None,
         },

@@ -221,7 +221,7 @@ decision records has to match the driver id koto hands a gate, so a gate can che
   | `verdict` | what was judged, at least one evidence pointer, and, for a change or a release, the repository and commit judged |
   | `reverse` | the session name and identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason |
-  | `answer` | the asking session's name, the question's identifier in that session, and the answer text, which a `withdrawn` answer may leave out |
+  | `answer` | the asking session's name, the question's identifier in that session, and the answer text, which a `withdrawn` answer may leave out; when the question carries a `label`, that `label`, which koto copies from the question and no caller supplies (R95) |
   | `readdress` | the asking session's name, the question's identifier in that session, and the new recipient, typed as R49 types an `escalate`'s; when the recording session has a dispatcher, that dispatcher's name (R75) |
 
   A command given a kind, outcome or subject these tables don't allow fails with an error naming
@@ -809,7 +809,7 @@ to an id-shaped value, and both say so.
   `open --at` carries `need`, reading `decision` for a question raised with `need=decision` or
   with no `need`, including one stored before this requirement. A need is listed, passed up and
   answered like any question, and its raiser can withdraw it but can't settle a `credential` or
-  `reserved-step` need. No read selects by `label`.
+  `reserved-step` need. Only the precedent read (R94) selects by `label`.
 - **R79.** No write adds a twenty-first open question waiting on a person to a session's run.
   The run is the session, the sessions it continues and the sessions that continue it through a
   confirmed succession, and its count is of the questions raised in any of them, matched by
@@ -981,6 +981,98 @@ say; R87 to R93 only keep the sessions those rules depend on and ring the asker.
   where neither open read makes a request to the bucket and the `questions` read adds none to the
   sync every cloud tick makes. On the same store, a terminal tick of
   a session holding an open question, and a refused cleanup of it, each finish in under five seconds.
+
+**Precedent and one question's history**
+
+- **R94.** `koto decisions precedent --person <handle> --chain <session-or-anchor> [--label <text>]`
+  prints the answers a person gave that are in effect in a chain. The chain of the named session or
+  anchor is every session and anchor this machine's store holds that is connected to it through the
+  links `koto decisions open --at` follows, in either direction, together with the sessions each of
+  them continues and the sessions continuing each of them through a confirmed succession, and
+  whatever those connect to in turn; a session linked to no other has a chain of itself and its run. An answer belongs to the
+  chain when the session it was given in is in the chain, or when the session that raised its
+  question is still in the store and is in the chain. An element is returned for each question whose
+  entry in effect (R74) is an `answered` answer of that handle that R68 reads as verified: a
+  session's answer, a settle, a withdrawal and a person's answer read as a remote session's are
+  never returned, and a raiser's settle is never precedent in its own right. When the store no
+  longer holds the question, because its raiser was removed, the element is the verified person
+  answer in effect on it by the same rule as while the raiser is there: a later `answered` person
+  answer to the same question that reads verified here and names it in its `basis` replaces it, and
+  a reversal of the question stored in any session withdraws it. A citing entry of any other kind,
+  or a person answer that reads as a remote session's, changes nothing. A reversal recorded in the
+  raiser goes with the raiser. Retention keeps the session holding a replacing person answer that
+  reads verified (R88) and refuses its removal without `--force` (R89, R90); once that session has been
+  forced out too, nothing readable says the earlier answer was replaced, so the read returns it.
+  With `--label`, only
+  answers whose question's `label` equals it byte for byte are returned (no case folding, trimming
+  or Unicode normalization); without it, every answer of that person in effect in the chain is,
+  each with its `label` or null. The label is the question's while the store holds the question, and
+  otherwise the one copied onto the answer (R95). Each element carries the question's identity, the
+  `label`, the answer's session, identifier, text, time, decider and the `verified` reading;
+  `cited`, true when a decision in the run of the named session (it and the sessions it continues)
+  cites the answer in its `basis`, resolved as the `questions` on `koto next` resolve a citation;
+  and `below`, true when the answer was given in that run or below it as `koto decisions open --at`
+  defines below. Elements come in order of the answer's time, then the answering session's name,
+  then identifier. Every answer the read returns for a label and a person is one R77 accepts as the
+  basis of a settle of a question with that label waiting on that person.
+- **R95.** When koto records an `answer` of any outcome to a question that carries a `label`, it
+  copies that `label` into the answer's subject. The value comes from the stored question and never
+  from the caller; an answer to a question with no `label` stores exactly what it stored before this
+  requirement. A raiser's settle (R77) citing an answer whose question the store no longer holds,
+  because that question's raiser was removed, compares the label copied onto the cited answer. An
+  answer recorded before koto copied labels carries none: once its raiser is removed, the precedent
+  read returns it only without `--label`, with a null `label`, and no settle accepts it as a basis.
+  When koto records a person's `answered` answer to a question that already has a verified person
+  answer in effect, it adds that answer to the new answer's `basis`. A person answer is replaced
+  when a later `answered` person answer to the same question that reads verified here names it in
+  its `basis`, whichever handle gave the later one: the replaced answer is then neither the owner's
+  precedent nor a basis a settle accepts, and the later one is its own handle's precedent. `koto
+  decisions show` reads a question the store no longer holds the way it read it while the raiser
+  was there, with reason `question_gone`: the answer the precedent read returns as counted and
+  governing, and a verified person answer it replaced as counted and not governing.
+- **R96.** `koto decisions history <session id>/<decision id>` prints one question by its identity:
+  the question as raised (identifier, question, text, `label`, `need`, `state`, the `packet` hash,
+  whether content is stored for it, and the recipient it was raised with); the raiser's name and
+  session id, the run mode it was raised in and, when the raiser has been superseded, the
+  successor its supersede marker names, while that hop is confirmed; the question's status and whether it is open; `addressee` and `addressees` as the open
+  reads print them; the answer in effect with its session, identifier, outcome, text, decider, run
+  mode, time and, for a person's answer, its reading, or null while the question is open; and
+  `entries`, every entry this machine's store holds about the question. The entries are the raise;
+  every attempt (R80) tied to the question as R82 ties it, with its session, `what`, `state`,
+  `result`, decider and status; every pass-up, with the session that recorded it, the recipient it
+  names and the tied attempts recorded no later than it; every `answer`
+  entry, whatever its outcome, with its session, decider, text and, for a person's answer, its
+  reading; each decision that cites one of the question's answers in its `basis`, with its session,
+  identifier, kind, outcome, decider and the answers it cites; and each file that doesn't read in
+  the aimed area, of any session, for the raiser's session id, as an `unreadable` entry with the
+  session it sits in, when the file is named as a decision identifier (one named otherwise isn't
+  listed). That area is the raiser's, not the question's, so such a file is listed in the history
+  of every question the raiser asked. Every
+  pass-up and answer carries `counted`, with its `reason` when false, and every answer
+  carries `governs`, with the values `koto decisions show` gives the same entry. An entry that
+  doesn't count is listed and marked, never left out, and an unreadable entry never counts and is
+  never the answer in effect. Entries aimed at another question that reuses the decision id under
+  a new session of the same name are never listed.
+- **R97.** The history's entries are in causal order. An attempt the question's `escalate` names
+  comes before the raise; then the raise. The rest are ordered by time, then recording session
+  name, then identifier, except that a pass-up in the addressee history never comes before the
+  pass-up it follows there or a tied attempt it names, and a citing decision never comes before
+  the entry it cites, whatever their stored times. Unreadable entries carry no time and come last.
+- **R98.** `koto decisions precedent` exits 2, writing nothing, when `--chain` names no session or
+  anchor in the store, when `--person` or `--chain` is missing, when the handle isn't one R8
+  accepts, or when `--label` is empty or longer than 128 bytes. `koto decisions history` exits 2
+  with `decision_not_found` and a message naming the identity as given when no session of the store
+  holds that session id with that decision id, with `invalid_decision` when the decision isn't an
+  `escalate` or has an untyped recipient, and when the argument isn't `<session id>/<decision id>`;
+  a session's name in place of its id names no question.
+- **R99.** Both reads use only this machine's store: no lock, no pull, no bucket request, and no
+  write, so every session directory is byte-identical before and after either. On a store of 1,000
+  sessions in dispatcher chains at least three deep, holding 200 open questions, at least 50
+  questions closed by a person's verified answer over several labels and questions closed by a
+  session's answer, each completes in under five seconds on a release build, under the local
+  backend and as the cloud backend's local copy, and the history of one question with 500 entries
+  aimed at it completes in under five seconds on a release build.
+
 
 ### Non-functional
 
@@ -1581,6 +1673,71 @@ an `escalate` A records with `recipient=session:B`, so B's answer counts (R72).
   counts on a store a tenth the size and asserts no time. `cargo test --release --test
   retention_cost` passes with its bounds and fixtures unedited (R93).
 
+**Precedent and one question's history**
+
+- [ ] With q1 raised in `worker` with `label=cache`, passed up to `person:owner` and answered by
+  the owner in `director`, `koto decisions precedent --person owner --chain <c> --label cache`
+  returns one element, carrying q1's identity, `cache`, `director`, the answer's identifier, text,
+  time, person decider and `verified`, for `<c>` each of `worker`, its sibling `worker2`, `manager`,
+  `director` and a successor of `worker` or `manager`; while q1 is open, for `--person
+  someone-else` and from an unrelated chain it returns none; an answer given outside the raiser's
+  chain is found from the raiser's chain, and an anchor or an unlinked session as `--chain` returns
+  only the answers given in or raised in its chain (R94).
+- [ ] With `manager-next` continuing `manager` and dispatching `worker3`, an answer to `worker3`'s
+  question is returned for `--chain` each of `worker3`, `manager-next`, `manager`, `worker`,
+  `worker2` and `director`, and q1's answer for each of them too (R94).
+- [ ] After q1 is reversed in `director` and `worker` is removed, `--chain worker2 --label cache`
+  returns nothing and a settle of a new `cache` question citing the answer exits 2; after the owner
+  answers q1 again in `manager`, the new answer's `basis` names the first, only the new answer is
+  returned with `worker` removed, and the first stays refused as a settle's basis; with both
+  `worker` removed and the replacing session forced out, the first answer is returned again (R94,
+  R95).
+- [ ] With `worker` removed, `koto decisions show` of the answer precedent returns reads `counted`
+  and `governs` true with reason `question_gone`, and a reversed one reads `no_question` (R95).
+- [ ] `--label Cache`, `cach`, `"cache "` and a label differing from another only in Unicode
+  normalization return none; `--label ""` exits 2; with no `--label` every answer of the person in
+  the chain comes back with its `label`, null for a question raised without one; a question in
+  effect closed by a session's answer, a settle or a withdrawal yields nothing, of two person
+  answers only the one in effect is returned, an answer read as a remote session's (after an
+  import here or on another host, or a pull) is absent while `show` gives its reading, and every
+  answer returned is accepted as a settle's basis while one no longer in effect is refused (R94).
+- [ ] A `judgment` in `manager` citing the owner's answer reads `cited` true for `--chain manager`
+  and false for `--chain director`, and the answer reads `below` true only from `director`; several
+  answers come back by time and two runs print byte-identical output (R94).
+- [ ] An answer to a question with a `label` shows that `label` in its own subject in
+  `koto decisions show` for every outcome, and an answer to one without stores no `label`; after
+  `worker` is removed with `koto session cleanup`, `--chain manager --label cache` still returns
+  q1's answer with its identity and `cache`, and after a new `worker` raises a question reusing
+  q1's decision id with `label=queue`, `--label queue` returns nothing while `--label cache` still
+  returns the earlier answer under the removed session's id (R94, R95).
+- [ ] `koto decisions history <worker's id>/<q1 id>`, from any directory, exits 0 with the question
+  as raised, the raiser, `open` false, `addressees` `manager`, `director`, `owner`, the owner's
+  answer in effect, and entries in order: the raise, the two pass-ups, the owner's answer with
+  `counted` and `governs` true and `verified`, and a settle of another question citing it; an open
+  question's `answer` is null, and a superseded raiser names its successor (R96).
+- [ ] A second pass-up stored a year before the first still lists after it; a citing decision
+  stored at the answer's time from a session whose name sorts first lists after the answer; a
+  stored answer from a session that isn't the addressee lists with `counted` false and
+  `not_addressee` while `open` reads true; a file that doesn't parse in `manager`'s aimed area for
+  q1 lists last as `unreadable` in `manager` with `counted` false and leaves every other entry and
+  the answer in effect unchanged (R96, R97).
+- [ ] An attempt the escalate names lists before the raise; an attempt in another session citing
+  the question lists after it and before the pass-up recorded later, whose `attempts` names both;
+  an attempt naming neither isn't listed, nor is another session's attempt the escalate names (R96,
+  R97).
+- [ ] After `worker` is removed and a new `worker` reuses q1's decision id, the new identity's
+  history holds only its raise and the old identity exits 2 with `decision_not_found`; an id the
+  session doesn't hold exits 2 naming the identity, a pass-up's identity and an untyped `escalate`
+  exit 2 with `invalid_decision`, and a name in place of the id, a missing part or an extra one
+  exits 2; `precedent` with a `--chain` naming no session, without `--person` or without `--chain`
+  exits 2 (R98).
+- [ ] Neither read changes any file under the sessions directory, lock files aside; on the
+  generated store of R99 each read returns the count it was built to return in under five seconds
+  on a release build, and read as the cloud backend's local copy it makes no request of the
+  in-process endpoint; the history of a question with 500 answers aimed at it reads in under five
+  seconds on a release build (R99).
+
+
 ## Out of Scope
 
 - **On whose behalf a decision was made.** Naming the person a session acted for is a later
@@ -1623,10 +1780,11 @@ an `escalate` A records with `recipient=session:B`, so B's answer counts (R72).
   harness keeps them; R30 points at them.
 - **Authenticating identities.** Identities are attribution, not authorization; the labels say how
   far each can be trusted.
-- **The rest of a question's life.** R49 to R93 cover raising, passing up, answering, settling
-  and withdrawing a question, keeping the sessions an open question depends on, and waking its
-  asker. A read that selects earlier answers by `label`, and one question's whole history as a read
-  of its own, are not covered yet.
+- **The rest of a question's life.** R49 to R99 cover raising, passing up, answering, settling
+  and withdrawing a question, keeping the sessions an open question depends on, waking its
+  asker, the precedent read and one question's history.
+- **Requiring an attempt before a pass-up.** koto refuses no pass-up and no `escalate` for want
+  of an earlier attempt at the question; a caller that requires one enforces it (R85).
 
 ## Known Limitations
 

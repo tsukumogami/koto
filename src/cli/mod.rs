@@ -1412,6 +1412,30 @@ pub enum DecisionsSubcommand {
         #[arg(long, value_name = "SESSION_OR_ANCHOR")]
         at: Option<String>,
     },
+    /// List the verified person answers of `--person` in effect in the
+    /// chain of `--chain`: every session and anchor linked to it as
+    /// `open --at` follows links, in either direction, with the sessions
+    /// each continues. `--label` keeps the answers whose question carries
+    /// exactly that label. Reads the local store only; records nothing
+    Precedent {
+        /// The person's handle
+        #[arg(long, required = true)]
+        person: String,
+        /// The session or anchor whose chain to read
+        #[arg(long, value_name = "SESSION_OR_ANCHOR", required = true)]
+        chain: String,
+        /// The question label to match, byte for byte
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Print one question's history by its identity `<raiser's session
+    /// id>/<decision id>`: the question as raised, where it stands, and
+    /// every entry about it in causal order. Reads the local store only;
+    /// records nothing
+    History {
+        /// The question's identity
+        identity: String,
+    },
     /// List attempts to decide: judgments carrying a `result` subject, in
     /// one session's run (`--in`) or at and below a session or anchor
     /// (`--at`), each with the questions it is tied to and, for a
@@ -3331,6 +3355,14 @@ pub fn run(app: App) -> Result<()> {
                     (None, Some(at)) => decisions::handle_open_at(&backend, &at),
                     (None, None) => unreachable!("clap requires --person or --at"),
                 },
+                DecisionsSubcommand::Precedent {
+                    person,
+                    chain,
+                    label,
+                } => decisions::handle_precedent(&backend, &person, &chain, label.as_deref()),
+                DecisionsSubcommand::History { identity } => {
+                    decisions::handle_history(&backend, &identity)
+                }
                 DecisionsSubcommand::Attempts { args } => {
                     decisions::handle_attempts(&backend, &args)
                 }
