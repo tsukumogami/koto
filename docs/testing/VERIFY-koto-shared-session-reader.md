@@ -35,7 +35,7 @@ milestone.
   cc9479be (Step 2, koto#742), and its `koto dashboard` already has `--once`
   and `--all`, so no other pre-split commit was needed. The tag and the
   version strings come from this, run in the koto checkout after the setup
-  below:
+  below, with a `cd "$O"` back before clause 1:
 
   ```bash
   git tag --no-contains cc9479be --sort=-v:refname | head -1   # v0.39.0
@@ -68,12 +68,17 @@ B=<directory holding the release binaries>
 C=$(mktemp -d); cp -cR ~/.koto "$C/root"; O=$C/out; mkdir -p "$O"; cd "$O"
 find "$C/root" | wc -l                                          # entries
 find "$C/root/sessions" -mindepth 1 -maxdepth 1 -type d | wc -l  # session directories
+# names only, never values: the cloud variables this session sets (6), and
+# the sections and keys in the clone's config.toml ([decider] mode, [machine] id)
+env | cut -d= -f1 | grep -c '^KOTO_SESSION_'
+grep -oE '^\[[^]]+\]|^[A-Za-z_]+' "$C/root/config.toml"
 PRE=$B/koto-22bc3a7e OLD=$B/koto-865e5ce4 MAIN=$B/koto-90aeaaae
 LIST=$B/koto-session-list-90aeaaae
 run() { env -i PATH=/usr/bin:/bin HOME="$C/home" KOTO_HOME="$C/root" XDG_CACHE_HOME="$C/home/cache" "$@"; }
 ```
 
-`koto dashboard --once` prints ten tab-separated columns: 1 id, 2 state,
+`koto dashboard --once` prints ten tab-separated columns (verified by reading
+`src/cli/`): 1 id, 2 state,
 3 elapsed, 4 status, 5 intent, 6 template, 7 idle, 8 liveness, 9 machine and
 10 workspace. Columns 3 and 7 are durations measured from the clock when the
 binary runs. `koto-session-list once` prints columns 1 to 8 of the same rows
@@ -193,8 +198,8 @@ that ends clause 3.
   value it exits 0 and prints the row's value, 9 of 9. On the row without one
   it fails and the row's value is empty. No row mismatches.
 
-`koto context get` records the read, so it ran on the clone after every other
-run, clause 3's included.
+`koto context get` records the read (verified by reading `src/cli/context.rs`),
+so it ran on the clone after every other run, clause 3's included.
 
 ### Dependencies and CI
 
@@ -298,7 +303,8 @@ exited 0; under it, it exited 1 with empty stderr. The control stays on loopback
 the profile itself refuses a connect, separately from anything on the host
 that filters outbound traffic.
 
-**How "nothing pushed" was checked.** The program shows no way to push: its
+**How "nothing pushed" was checked.** The program shows no way to push
+(inferred from what follows): its
 dependency tree holds none of the nine cloud storage, TLS, HTTP and terminal
 crates the pattern finds in `koto`'s, and its binary imports no `connect`, `socket` or `getaddrinfo`
 (clause 2). The sandboxed runs also ran
@@ -412,5 +418,5 @@ step; that is inferred, not run.
 |--------|--------------------|
 | 1. Dashboard before and after | Shown: same sessions, states and liveness classes in both views; only the two clock columns differ |
 | 2. The minimal program | Shown: rows equal the dashboard's in both views, `list` agrees with the dashboard and with `koto context get`, none of the nine crates `koto`'s tree matches and no `connect`, `socket` or `getaddrinfo` import |
-| 3. A hundred reads change nothing | Partly shown: a hundred runs left a copy of the store identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
+| 3. A hundred reads change nothing | Partly shown: a hundred runs left a copy of the store's manifest identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
 | 4. shirabe installs without a koto build step | Not shown: the install needs no koto build step, but shirabe doesn't take koto-session-reader yet |
