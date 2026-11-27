@@ -56,7 +56,10 @@ milestone.
   The only runs against the live store are clause 3's hundred sandboxed runs.
   The clone was left in place when the runs ended, for a later cleanup.
 
-The setup below ran once, in one shell, before clause 1. Every later block runs
+Every block ran in bash, not zsh: several rely on bash splitting an unquoted
+variable into words (`set -- $p`, `"$LIST" $a`, `$E claude ...`), which zsh
+doesn't do. The setup below ran once, in one bash shell, before clause 1.
+Every later block runs
 in that shell, on the same clone, in the order the record gives them, and reads
 the earlier blocks' outputs and variables. `B` is the directory the release binaries were copied to:
 
@@ -312,7 +315,7 @@ verified by reading and by the sandbox, not by a bucket count. A hundred runs on
 cloud host's store left every entry unchanged in type, size and modification
 time. A hundred runs on the live store, with the cloud environment set, all
 exited 0 with empty stderr while writes and network were denied, so none of
-them failed for lack of either. A denied write the program swallowed silently
+them failed for lack of either (inferred from the exit codes and stderr). A denied write the program swallowed silently
 would look the same. The copy's manifest covers writes only for runs without
 the cloud variables and only under the store root, so a write made only under
 cloud configuration, and swallowed when denied, is covered by neither run.
@@ -386,7 +389,7 @@ file -b "$X"; $E "$X" --version
 **Does shirabe take koto-session-reader?** No. Nothing in the installed plugin
 tree names `koto-session-reader` or `koto_session_reader` (0 files), and the
 `shirabe` crate's direct dependencies (verified by reading
-`crates/shirabe/Cargo.toml` on shirabe's main: clap,
+`crates/shirabe/Cargo.toml` at shirabe's 74ce25e9: clap,
 saphyr, shirabe-validate, serde_json, sha2, regex, rustix, getrandom) don't
 include it. The roadmap leaves this open: "how shirabe takes the dependency and
 how the two release schedules are tied". The design puts it out of scope too
