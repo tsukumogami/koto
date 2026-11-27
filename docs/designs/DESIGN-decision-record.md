@@ -1188,7 +1188,9 @@ identifier). The output is `{"v", "person", "chain", "label", "answers": [{"iden
 *A replaced answer.* A person answer outranks an earlier one by time, which a removed session can
 undo, so the replacement is also written down: when `koto decisions answer` records a person's
 answer to a question that already has a verified person answer in effect, it adds that answer to
-the new one's `basis` (the new answer then takes at most 63 `--basis` entries of its own). A
+the new one's `basis` (the new answer then takes at most 63 `--basis` entries of its own).
+Replacement goes by that citation, which koto adds itself, not by comparing times; time only
+orders verified person answers that none of the others cites. A
 person answer is replaced when a later `answered` person answer to the same question that reads
 verified here cites it (`person_winner`, over the answers `verified_person` admits), whichever
 handle gave it. A session's answer, a withdrawal or a person answer read as a remote session's

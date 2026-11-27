@@ -870,19 +870,40 @@ fn readings(env: &Env, first: (&str, &str), second: (&str, &str), tag: &str) -> 
 /// A session's answer to `q` citing `first`, planted in `manager`'s aimed
 /// area as an import would leave it; its id.
 fn plant_session_citation(env: &Env, q: &Q, first: &str) -> String {
+    // The session, decider and authority come from the pass-up `manager`
+    // recorded itself, so the planted entries parse as a session's.
     let dir = env.aimed("manager", q, "x");
     let dir = dir.parent().unwrap();
     let existing = std::fs::read_dir(dir).unwrap().next().unwrap().unwrap();
     let holder: Value = serde_json::from_slice(&std::fs::read(existing.path()).unwrap()).unwrap();
-    let id = "000000999001".to_string();
-    let mut body = env.stored("director", q, first);
-    body["id"] = Value::from(id.as_str());
-    body["session"] = holder["session"].clone();
-    body["decider"] = serde_json::json!({"kind": "session"});
-    body.as_object_mut().unwrap().remove("prompt");
-    body["basis"] = serde_json::json!([{"session": "director", "id": first}]);
-    env.plant("manager", q, &id, &body);
-    id
+    assert_eq!(holder["decider"]["kind"], "session", "{holder}");
+    let mut planted = Vec::new();
+    for (id, outcome) in [("000000999001", "answered"), ("000000999002", "withdrawn")] {
+        let mut body = env.stored("director", q, first);
+        body["id"] = Value::from(id);
+        for key in ["session", "decider", "authority"] {
+            match holder.get(key) {
+                Some(v) => body[key] = v.clone(),
+                None => {
+                    body.as_object_mut().unwrap().remove(key);
+                }
+            }
+        }
+        body["outcome"] = Value::from(outcome);
+        if outcome == "withdrawn" {
+            body["reason"] = Value::from("not needed");
+        }
+        body.as_object_mut().unwrap().remove("prompt");
+        body["basis"] = serde_json::json!([{"session": "director", "id": first}]);
+        env.plant("manager", q, id, &body);
+        // Read back as a decision, not as an unreadable file.
+        let shown = env.show("manager", id);
+        assert_eq!(shown["decision"]["kind"], "answer", "{shown}");
+        assert_eq!(shown["decision"]["outcome"], outcome, "{shown}");
+        assert_eq!(shown["decision"]["decider"]["kind"], "session", "{shown}");
+        planted.push(id.to_string());
+    }
+    planted.remove(0)
 }
 
 #[test]
