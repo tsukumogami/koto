@@ -14,11 +14,12 @@ pub use koto_session_reader::findings;
 pub mod gate;
 pub(crate) mod host_env;
 pub(crate) mod koto_home;
+pub(crate) mod names;
 pub mod pool;
 pub use koto_session_reader::redact;
-pub(crate) mod run_journal;
 pub mod session;
 pub mod session_view;
+pub(crate) mod telemetry;
 pub mod template;
 pub mod workflows_surface;
 

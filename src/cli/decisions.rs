@@ -1402,8 +1402,8 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         let root = prompt::projects_root();
         // The harness session koto last saw driving the answering session,
         // when it saw one: the command's own must be the same.
-        let recorded = crate::run_journal::sidecar::read(&backend.session_dir(&answerer))
-            .and_then(|s| s.driver);
+        let recorded =
+            crate::telemetry::sidecar::read(&backend.session_dir(&answerer)).and_then(|s| s.driver);
         let text = prompt::verify(
             root.as_deref(),
             observed.harness.as_deref(),

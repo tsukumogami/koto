@@ -185,7 +185,7 @@ pub(super) fn anchor_read(
         .or_else(|| {
             header
                 .as_ref()
-                .and_then(|h| super::run_id::run_id(backend, h))
+                .and_then(|h| crate::session::lineage::run_id(backend, h))
         });
     let access = access.as_deref().unwrap_or(DEFAULT_ACCESS);
     let mut record = Record::new("context_reads", read, session_id, run_id.as_deref())

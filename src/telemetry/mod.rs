@@ -312,7 +312,6 @@ mod fixture;
 mod pairing;
 #[cfg(unix)]
 pub(crate) mod rotate;
-mod run_id;
 pub(crate) mod sidecar;
 
 use std::path::Path;
@@ -321,10 +320,11 @@ use serde_json::Value;
 
 use crate::engine::persistence::CommitInfo;
 use crate::engine::types::{now_iso8601, CheckEventFields, Event, EventPayload, StateFileHeader};
+use crate::names::{digest, is_id, is_name, name_or_digest};
+use crate::session::lineage;
 use crate::session::SessionBackend;
 
 pub(crate) use driver::driver;
-pub(crate) use run_id::child_lineage;
 
 /// The journal's file name inside the koto home.
 pub(crate) const JOURNAL_FILE: &str = "_run_journal.jsonl";
@@ -335,57 +335,6 @@ pub(crate) const MAX_LINE_BYTES: usize = 4096;
 
 /// The line format's version, the `v` every record carries.
 const FORMAT_VERSION: u64 = 1;
-
-/// The longest id or name, in bytes. Both shapes are ASCII-only, so this
-/// is also the character limit.
-const MAX_VALUE_BYTES: usize = 128;
-
-/// Whether `value` has the id shape: 1 to 128 characters from
-/// `A-Z a-z 0-9 . _ : -`.
-pub(crate) fn is_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_VALUE_BYTES
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
-}
-
-/// Whether `value` has the name shape: 1 to 128 characters from
-/// `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`, so an absolute
-/// path can't pass as a template or state name.
-pub(crate) fn is_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_VALUE_BYTES
-        && !value.starts_with('/')
-        && !value.starts_with('~')
-        && value.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'@' | b'-')
-        })
-}
-
-/// `value` when it has the name shape, otherwise `sha256:` and the first 32
-/// lowercase hex characters of the SHA-256 of its UTF-8 bytes. Used for
-/// rule ids and decider criterion ids, which koto doesn't restrict to the
-/// name shape: the same id gives the same value
-/// in every session, and the result always has the name shape, so an odd
-/// id keeps its identity without its text reaching the journal.
-pub(crate) fn name_or_digest(value: &str) -> String {
-    if is_name(value) {
-        return value.to_string();
-    }
-    digest(value)
-}
-
-/// `sha256:` and the first 32 lowercase hex characters of the SHA-256 of
-/// `value`'s UTF-8 bytes, whatever its shape: how [`name_or_digest`] writes
-/// an odd id, and how a unit's key, and a document or section an extraction
-/// printed, are always written, so nothing an extraction printed reaches the
-/// journal. The result has the id shape.
-pub(crate) fn digest(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hex = hex::encode(Sha256::digest(value.as_bytes()));
-    format!("sha256:{}", &hex[..32])
-}
 
 /// The record kinds that describe a session's identity and progress. A
 /// batch holding one is flushed to disk; the kinds relayed from check,
@@ -1821,7 +1770,7 @@ fn cached_run_id(
     if let Some(run_id) = cached.as_ref().and_then(|c| c.run_id.clone()) {
         return Some(run_id);
     }
-    let run_id = run_id::run_id(backend, header);
+    let run_id = lineage::run_id(backend, header);
     if run_id.is_some() {
         let _ = sidecar::write(
             session_dir,
@@ -1877,7 +1826,7 @@ pub(crate) fn after_init(
     let Some(root) = journal_root else {
         return;
     };
-    let run_id = run_id::run_id(backend, header);
+    let run_id = lineage::run_id(backend, header);
     let driver = driver();
     let mut records = vec![session_started(
         session,
@@ -2179,7 +2128,7 @@ pub(crate) fn response(
     }
     let run_id = sidecar::read(&session_dir)
         .and_then(|c| c.run_id)
-        .or_else(|| run_id::run_id(backend, &header));
+        .or_else(|| lineage::run_id(backend, &header));
     let relay = Relay {
         session,
         session_id: &header.session_id,

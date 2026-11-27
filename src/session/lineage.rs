@@ -23,14 +23,14 @@ use crate::engine::types::StateFileHeader;
 use crate::session::validate::validate_session_id;
 use crate::session::{state_file_name, SessionBackend};
 
-use super::sidecar;
+use crate::telemetry::sidecar;
 
 /// How far the parent-name walk goes before giving up. Far deeper than any
 /// real hierarchy; it only stops a cycle in hand-edited headers.
 const MAX_WALK: usize = 64;
 
 fn id(value: &str) -> Option<String> {
-    if super::is_id(value) {
+    if crate::names::is_id(value) {
         Some(value.to_string())
     } else {
         None

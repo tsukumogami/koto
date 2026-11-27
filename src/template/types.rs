@@ -62,7 +62,7 @@ impl ValidateVocabulary for ReviewVocabulary {
             }
             let mut seen = std::collections::BTreeSet::new();
             for name in names {
-                if !crate::run_journal::is_name(name) {
+                if !crate::names::is_name(name) {
                     return Err(format!(
                         "review_vocabulary.{}: {:?} must be 1 to 128 characters from \
                          A-Z a-z 0-9 . _ : / @ -, not starting with / or ~",
@@ -1240,7 +1240,7 @@ impl ValidateSteps for CompiledTemplate {
                     state_name, i, RULE_ID_MAX_BYTES, rule.rule_id
                 ));
             }
-            if !crate::run_journal::is_name(&rule.check) {
+            if !crate::names::is_name(&rule.check) {
                 return Err(format!(
                     "E-DIRECTIVE-RULE-CHECK: state {:?}: directive_rules entry {}: \
                      check {:?} is not a check name; use 1 to 128 letters, digits and . _ : / @ -, \

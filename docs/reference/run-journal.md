@@ -1130,7 +1130,7 @@ through a symlink into `/tmp` isn't a fixture unless the recorded path
 itself is under a temporary root.
 
 The rules are embedded in koto as data, in
-`src/run_journal/fixture_rules.json`.
+`src/telemetry/fixture_rules.json`.
 
 ## Failures
 
