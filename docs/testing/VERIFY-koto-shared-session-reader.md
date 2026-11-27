@@ -325,6 +325,7 @@ them failed for lack of either (inferred from the exit codes and stderr). A deni
 would look the same. The copy's manifest covers writes only for runs without
 the cloud variables and only under the store root, so a write made only under
 cloud configuration, and swallowed when denied, is covered by neither run.
+The Clause 3 rerun section at the end of this record repeats the hundred reads on the live, cloud-configured store and counts the bucket.
 
 ### Last: clause 2's values against `koto context get`
 
@@ -420,3 +421,250 @@ step; that is inferred, not run.
 | 2. The minimal program | Shown: rows equal the dashboard's in both views, `list` agrees with the dashboard and with `koto context get`, none of the nine crates `koto`'s tree matches and no `connect`, `socket` or `getaddrinfo` import |
 | 3. A hundred reads change nothing | Partly shown: a hundred runs left a copy of the store's manifest identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
 | 4. shirabe installs without a koto build step | Not shown: the install needs no koto build step, but shirabe doesn't take koto-session-reader yet |
+
+## Clause 3 rerun: a hundred reads on the live cloud store
+
+> The same reviewer compares the session store before and after a hundred reads by that program, on a host using koto's cloud storage, and finds it unchanged, with nothing pushed.
+
+The walk above ran its hundred unsandboxed reads on a copy without the cloud
+variables, and its live-store runs under a sandbox, so "nothing pushed" wasn't
+counted. This rerun reads the live `~/.koto` in this session's environment,
+cloud variables included, with writes and network allowed, and lists the
+bucket's objects before and after. It ran on 2026-11-27 between 13:47Z and
+14:03Z on the same macOS arm64 host. The environment sets six `KOTO_SESSION_*`
+variables, the backend and five `KOTO_SESSION_CLOUD_*` ones, checked by name
+only.
+
+### Binary
+
+There was one release build of `koto-session-list` from koto main at 3112838c,
+in a fresh tree exported with `git archive` into a `mktemp -d` scratch directory
+`S`. It exited 0 in 18.5 s:
+
+```bash
+mkdir -p $S/build; git archive 3112838c | tar -x -C $S/build
+cd $S/build && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$PWD/target cargo build --release --locked -p koto-session-list
+```
+
+### Picking a root nothing else writes
+
+Other live sessions write this host's bucket and `~/.koto` all the time, so a
+diff of the whole store or the whole bucket would differ for reasons that
+aren't the program's. Both comparisons are scoped to one finished tree instead.
+Each session's id and parent come from the first line of its state file (the
+header's `workflow` and `parent_workflow` fields), and `_terminal_index.jsonl`
+names the terminal ones. A tree is grouped by following each parent up to its
+top:
+
+```bash
+cd ~/.koto/sessions
+for f in */*.state.jsonl; do head -1 "$f"; done 2>/dev/null |
+  jq -r 'select(.workflow) | [.workflow, (.parent_workflow // "")] | @tsv' > $S/headers.tsv
+jq -r '.session_id' ~/.koto/_terminal_index.jsonl | sort -u > $S/terminal.ids
+python3 -I - "$S" <<'PY'
+import sys,collections
+S=sys.argv[1]
+t=set(open(S+'/terminal.ids').read().split())
+par={}
+for l in open(S+'/headers.tsv'):
+    p=l.rstrip('\n').split('\t'); par[p[0]]=p[1]
+def top(x):
+    seen=set()
+    while par.get(x) and par[x] in par and x not in seen: seen.add(x); x=par[x]
+    return x
+g=collections.defaultdict(list)
+for s in par: g[top(s)].append(s)
+out=[(len(m),r) for r,m in g.items() if len(m)>=4 and all(x in t for x in m)]
+for n,r in sorted(out,reverse=True)[:15]: print(n,r)
+print("trees>=4:", sum(1 for m in g.values() if len(m)>=4), "all-terminal:", len(out))
+PY
+```
+
+Of 9,489 readable headers, 46 trees have four or more sessions, and 32 of them
+are terminal throughout. The root is `execute-mirror-repair`, a plan run with
+nine children (ten sessions), and the key is `impl_base`. Clause 2's root wasn't
+reused. It was cancelled at `plan_completion`, so it lists as needs-you-stalled,
+not done. Quiet time came from each session's last event and its newest file,
+in bash from `~/.koto/sessions`:
+
+```bash
+ids=$(awk -F'\t' -v r=execute-mirror-repair '$1==r || index($1, r".")==1' $S/headers.tsv | cut -f1)
+for d in $ids; do tail -1 $d/*.state.jsonl | jq -r .timestamp; done | sort | tail -1
+for d in $ids; do find $d -type f -exec stat -f '%m' {} +; done | sort -n | tail -1
+echo "$ids" > $S/root.ids
+```
+
+Across the ten, the newest event is from 2026-11-19T18:25Z and the newest file
+from 2026-11-20T12:25Z, a week before the runs. `list` ran once on a scratch
+copy of the ten directories (`cp -cR` into `$S/copy/sessions`), so the live
+store saw no run before the hundred. It printed ten rows, all with liveness
+`done`, and nine carry a value for the key:
+
+```bash
+env -i PATH=/usr/bin:/bin HOME=$S/copy/home KOTO_SESSIONS_BASE=$S/copy/sessions \
+  "$S/build/target/release/koto-session-list" list --root execute-mirror-repair --key impl_base
+```
+
+### The two listings
+
+Where a session's bytes live in the bucket was verified by reading
+`src/session/cloud.rs` and `src/session/name_index.rs`. Every key of a
+session is under its home, the 16-hex-digit workspace prefix its local header
+records as `origin.store.prefix`, followed by the session's id. The name index
+holds one key per prefix that has the session, under `koto-names/` and the
+id. Locally, a session is its own directory under `~/.koto/sessions`.
+
+The bucket listing is read-only. It uses the AWS CLI already on the host
+(`aws-cli/2.31.18`), and calls `list-objects-v2` and nothing else. The
+credentials, endpoint, region and bucket are passed from the
+`KOTO_SESSION_CLOUD_*` variables by name under `env -i`, with a scratch `HOME`
+and no config or credentials file. No value was printed or written anywhere.
+The listing's stderr went to a scratch file, which stayed empty throughout.
+
+```bash
+awsls() {
+  env -i PATH=/usr/bin:/bin:/opt/homebrew/bin HOME="$S/awshome" \
+    AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_PAGER= \
+    AWS_ACCESS_KEY_ID="$KOTO_SESSION_CLOUD_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$KOTO_SESSION_CLOUD_SECRET_KEY" \
+    AWS_DEFAULT_REGION="$KOTO_SESSION_CLOUD_REGION" \
+    aws --endpoint-url "$KOTO_SESSION_CLOUD_ENDPOINT" s3api list-objects-v2 \
+      --bucket "$KOTO_SESSION_CLOUD_BUCKET" --prefix "$1" \
+      --query 'Contents[].[Key,Size,ETag,LastModified]' --output text \
+      2>> "$S/aws.err" | grep -v '^None$' | LC_ALL=C sort
+  return "${PIPESTATUS[0]}"
+}
+# every object under koto-names/<id>/, <home>/<id>/, and <p>/<id>/ for each
+# prefix <p> the id's koto-names entries name: key, size, ETag, last modified
+bucketscope() {
+  local out=$1 id home p bad=0 n=0
+  : > "$out"
+  : > "$S/scope.prefixes"
+  while IFS= read -r id; do
+    home=$(head -1 ~/.koto/sessions/"$id"/*.state.jsonl | jq -r '.origin.store.prefix // empty')
+    awsls "koto-names/$id/" > "$S/names.tmp" || bad=$((bad+1))
+    cat "$S/names.tmp" >> "$out"
+    { [ -n "$home" ] && echo "$home"; cut -f1 "$S/names.tmp" | awk -F/ '{print $3}'; } | LC_ALL=C sort -u |
+      while IFS= read -r p; do echo "$p/$id/"; done >> "$S/scope.prefixes"
+    echo "koto-names/$id/" >> "$S/scope.prefixes"
+  done < "$S/root.ids"
+  while IFS= read -r p; do
+    case $p in koto-names/*) continue;; esac
+    awsls "$p" >> "$out" || bad=$((bad+1))
+  done < "$S/scope.prefixes"
+  rm -f "$S/names.tmp"
+  LC_ALL=C sort -o "$out" "$out"
+  echo "prefixes $(wc -l < "$S/scope.prefixes" | tr -d ' '), failed listings $bad, objects $(wc -l < "$out" | tr -d ' ')"
+}
+# path, type, size and modification time (ns) of every entry under
+# ~/.koto/sessions/<id>/ for each id
+localscope() {
+  local out=$1
+  (cd ~/.koto/sessions && while IFS= read -r id; do find "$id" -exec stat -f '%N|%HT|%z|%Fm' {} +; done < "$S/root.ids") | LC_ALL=C sort > "$out"
+  echo "entries $(wc -l < "$out" | tr -d ' ')"
+}
+```
+
+The scope covers 20 prefixes: each session's name-index prefix and its home.
+No session's name index named any prefix but its home. A first listing at
+13:51:21Z and a control 26 s later were identical on both sides. The newest
+object's last-modified time was 2026-11-19T18:25:47Z.
+
+### The hundred runs
+
+The loop ran in bash, in this session's environment, with no sandbox. Each run
+starts in the background, and `lsof` polls its pid for internet sockets until
+it exits. Every tenth run, both scopes are listed again. The loop stops at once
+on an internet socket or on any listing difference:
+
+```bash
+LIST=$S/build/target/release/koto-session-list
+ROOT=execute-mirror-repair KEY=impl_base
+O=$S/out; : > "$O/live.err"; : > "$O/lsof.out"
+fails=0 samples=0 hits=0 stop=""
+for i in $(seq 100); do
+  case $((i % 3)) in 1) a="once";; 2) a="once --all";; 0) a="list --root $ROOT --key $KEY";; esac
+  "$LIST" $a > /dev/null 2>> "$O/live.err" & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    samples=$((samples+1))
+    lsof -nP -a -p "$pid" -i >> "$O/lsof.out" 2>/dev/null && hits=$((hits+1))
+  done
+  wait "$pid" || fails=$((fails+1))
+  [ "$hits" -gt 0 ] && { stop="network at run $i"; break; }
+  if [ $((i % 10)) -eq 0 ]; then
+    localscope "$O/local.$i" > /dev/null; bucketscope "$O/bucket.$i" > /dev/null
+    cmp -s "$S/local.before" "$O/local.$i" || { stop="local change by run $i"; break; }
+    cmp -s "$S/bucket.before" "$O/bucket.$i" || { stop="bucket change by run $i"; break; }
+  fi
+done
+echo "runs $i, nonzero exits $fails, stderr lines $(wc -l < "$O/live.err"), lsof samples $samples, samples with an inet file $hits, stop: ${stop:-none}"
+```
+
+The loop was saved as `$S/loop.sh` and driven like this, with fresh before
+listings taken right before it:
+
+```bash
+bucketscope $S/bucket.before; localscope $S/local.before
+source $S/loop.sh
+localscope $S/local.after; bucketscope $S/bucket.after
+cmp $S/local.before $S/local.after && echo "local identical"
+cmp $S/bucket.before $S/bucket.after && echo "bucket identical"
+wc -l < $S/aws.err; wc -c < $O/lsof.out
+```
+
+| Measure | Result |
+|---------|--------|
+| Runs | 100 (34 `once`, 33 `once --all`, 33 `list`), 13:55:06Z to 14:02:19Z |
+| Nonzero exits | 0 |
+| stderr | 0 lines |
+| Bucket scope, before (13:54:57Z) and after (14:02:28Z) | 278 objects over 20 prefixes, 0 failed listings; identical by `cmp` (key, size, ETag, last modified) |
+| Local scope, before and after | 614 entries (45 directories, 569 files); identical by `cmp` (path, type, size, modification time to the nanosecond) |
+| The ten checks, one every tenth run | each identical to the before listings on both sides; the loop never stopped |
+| `lsof` samples of the program's pid | 15,348, none showing an internet socket; `lsof.out` 0 bytes |
+
+### What the scope sees and what it doesn't
+
+The scope covers every key koto itself writes for these ten sessions. A push of
+a session goes under its home prefix, which the local header names, and an
+index entry goes under its name-index prefix (verified by reading the two files
+above). Locally, a session's state, context and cloud bookkeeping all sit in
+its own directory. Every run reads these sessions: `once --all` and `list`
+print them, and `once` scans the store and leaves them out as receded
+(verified by reading `koto-session-list/src/main.rs`). A write or push by any
+run to the sessions it read would change a key, size, ETag or modification
+time in the scope, and none did (measured). The sessions had been quiet for a
+week, so a change in the scope during those seven minutes would have pointed at
+the program, not another session (inferred from that quiet time, and from the
+before, control and ten interim listings agreeing).
+
+The scope doesn't see:
+
+- the store's other sessions, which the `once` runs also read. A write to one
+  of them would be lost among the live sessions' own writes.
+- `~/.koto` outside these ten directories (`config.toml`, the top-level
+  indexes and journals), which other sessions write.
+- the bucket's other workspace prefixes (5,545 in all at 13:51Z) and other
+  name-index entries. An object put under a prefix no index names for these
+  sessions wouldn't show.
+- a request that reads the bucket without writing to it, which no object
+  listing records.
+
+The network observation covers part of that. `lsof -i` sees the internet
+sockets the program's own process holds when a sample is taken. It can miss a
+socket opened and closed between two samples, or one held by another process,
+and it doesn't list Unix sockets. The sampler wasn't tested against a process
+holding a known socket, so its sensitivity is inferred, not measured. Clause
+2's checks still stand beside it: the program's dependency tree has no HTTP,
+TLS or cloud storage crate, and its binary imports no `connect`, `socket` or
+`getaddrinfo`.
+
+**Reading.** Shown on the scope (measured); nothing pushed outside it is
+inferred. A hundred unsandboxed reads by `koto-session-list` from current main
+ran on the live store of a host using koto's cloud storage, with the cloud
+variables set and writes and network allowed. Every run exited 0 with empty
+stderr. The runs left the ten sessions' 278 bucket objects and 614 local
+entries unchanged, by count and by content: the same keys, sizes, ETags and
+modification times. None of the 15,348 samples of the program's process showed
+an internet socket. That nothing was pushed anywhere else in the bucket is
+inferred from the sampling, within the limits above, and from clause 2's
+dependency and symbol checks. The whole bucket wasn't diffed.
