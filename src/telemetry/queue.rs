@@ -325,6 +325,7 @@ pub fn flush() {
     // call is known to have been delivered.
     let mut taken = Some(Taken::take(&items, Instant::now()));
     let mut carry = taken.as_ref().map_or(0, Taken::total);
+    let mut first_call = true;
     let mut rest = items.as_slice();
     while !rest.is_empty() {
         let (chunk, after) = rest.split_at(rest.len().min(CHUNK));
@@ -336,12 +337,18 @@ pub fn flush() {
             break;
         }
         let lines: Vec<&str> = chunk.iter().map(|q| q.line.as_str()).collect();
+        // Only the first call carries, and whether the carry was delivered
+        // is decided by that call alone: a later chunk that is posted says
+        // nothing about a carry it didn't have.
+        let carrying = std::mem::take(&mut first_call);
         let outcome = sink::send(&sink, &lines, carry, deadline);
-        // Only the first call carries. Whether the carry was delivered is
-        // decided by that call alone.
         carry = 0;
         match outcome {
-            Outcome::Posted | Outcome::PostedSomeInvalid => taken = None,
+            Outcome::Posted | Outcome::PostedSomeInvalid => {
+                if carrying {
+                    taken = None;
+                }
+            }
             Outcome::Usage => drops.add_all(chunk),
             Outcome::Off => {
                 // Sending is off: stop, and count nothing, not even what
@@ -686,6 +693,45 @@ mod tests {
         assert_eq!(f.stub.calls()[0].carry(), Some(7));
         assert_eq!(carry::peek(&f.a), 7);
         assert_eq!(breaker(), Breaker::StoppedSilent);
+    }
+
+    #[test]
+    fn a_carry_whose_call_failed_comes_back_even_when_a_later_chunk_is_posted() {
+        let f = Fixture::unhurried();
+        // The first call, the one that carries, fails with exit 1; the
+        // flush goes on and the second chunk is posted.
+        f.stub.exit_codes(&[1, 0]);
+        assert!(carry::add(&f.a, 7));
+        f.queue(&f.a, 0, 250);
+        flush();
+        let calls = f.stub.calls();
+        assert_eq!(f.sizes(), vec![200, 50]);
+        assert_eq!(calls[0].carry(), Some(7));
+        assert_eq!(calls[1].carry(), None);
+        // The 7 were not delivered, so they are back, with the failed
+        // chunk's 200 records; the posted chunk adds nothing.
+        assert_eq!(carry::peek(&f.a), 7 + 200);
+        assert_eq!(breaker(), Breaker::Open);
+        // The next flush carries them.
+        f.queue(&f.a, 250, 1);
+        flush();
+        assert_eq!(f.stub.calls()[2].carry(), Some(207));
+        assert_eq!(carry::peek(&f.a), 0);
+    }
+
+    #[test]
+    fn a_carry_delivered_by_the_first_call_stays_out_when_a_later_chunk_fails() {
+        let f = Fixture::unhurried();
+        f.stub.exit_codes(&[0, 3]);
+        assert!(carry::add(&f.a, 7));
+        f.queue(&f.a, 0, 250);
+        flush();
+        assert_eq!(f.sizes(), vec![200, 50]);
+        assert_eq!(f.stub.calls()[0].carry(), Some(7));
+        // The 7 went out with the first call. Only the refused second
+        // chunk's records are counted; the carry is not given back.
+        assert_eq!(carry::peek(&f.a), 50);
+        assert_eq!(breaker(), Breaker::StoppedCounting);
     }
 
     #[test]
