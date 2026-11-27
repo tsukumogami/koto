@@ -1682,6 +1682,18 @@ fn tick_lock_wait() -> std::time::Duration {
     TICK_LOCK_WAIT
 }
 
+/// Whether a tick has to read its log again after the wake pass, which runs
+/// after the tick's first read: when the pass reports emissions, and when it
+/// fails, since a batch appends its event before the steps that can fail it
+/// and an error carries no count of what already landed.
+#[cfg(any(unix, test))]
+fn wake_pass_needs_reread(pass: &anyhow::Result<crate::engine::wake::WakeEmissionOutcome>) -> bool {
+    match pass {
+        Ok(outcome) => outcome.events_emitted > 0,
+        Err(_) => true,
+    }
+}
+
 /// Take `name`'s `tick.lock` shared and hold it until this process exits,
 /// the exit flush included, so a command that takes it exclusive (an
 /// import's probe, a whole-binding move) waits for the tick to finish, and a
@@ -6683,7 +6695,7 @@ fn handle_next(
     // Wake runs BEFORE the discovery scan (which happens later in the
     // function) so a terminal child's wake emission and its parent's
     // directive build observe consistent state; the log is read again when
-    // the pass appended to it.
+    // the pass may have appended to it (see `wake_pass_needs_reread`).
     if let Some(koto_root) = crate::koto_home::koto_home() {
         let coord_state_path = koto_root
             .join("sessions")
@@ -6696,14 +6708,15 @@ fn handle_next(
             let waker = crate::engine::wake::SignalWaker {
                 koto_root: koto_root.clone(),
             };
-            match crate::engine::wake::wake_candidates_pass(
+            let pass = crate::engine::wake::wake_candidates_pass(
                 &koto_root,
                 &sessions_dir,
                 &coord_state_path,
                 &waker,
                 stale_dispatch_timeout,
                 std::time::SystemTime::now(),
-            ) {
+            );
+            match &pass {
                 Ok(outcome) => {
                     if outcome.events_emitted > 0 || outcome.recoveries_fired > 0 {
                         eprintln!(
@@ -6714,23 +6727,23 @@ fn handle_next(
                             outcome.recoveries_fired,
                         );
                     }
-                    if outcome.events_emitted > 0 {
-                        match backend.read_events(&name) {
-                            Ok((_, reread)) => events = reread,
-                            Err(err) => {
-                                let ne = NextError {
-                                    code: NextErrorCode::PersistenceError,
-                                    message: err.to_string(),
-                                    details: vec![],
-                                };
-                                let json = serde_json::json!({"error": ne});
-                                exit_with_error_code(json, ne.code.exit_code());
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     eprintln!("warning: wake-candidates pass failed: {}", e);
+                }
+            }
+            if wake_pass_needs_reread(&pass) {
+                match backend.read_events(&name) {
+                    Ok((_, reread)) => events = reread,
+                    Err(err) => {
+                        let ne = NextError {
+                            code: NextErrorCode::PersistenceError,
+                            message: err.to_string(),
+                            details: vec![],
+                        };
+                        let json = serde_json::json!({"error": ne});
+                        exit_with_error_code(json, ne.code.exit_code());
+                    }
                 }
             }
         }

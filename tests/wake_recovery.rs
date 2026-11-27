@@ -877,12 +877,19 @@ fn a_batch_that_fails_after_its_append_leaves_the_event_on_the_log() {
         SystemTime::now(),
     );
 
-    assert!(result.is_err(), "the invalid requester id must fail the pass");
+    assert!(
+        result.is_err(),
+        "the invalid requester id must fail the pass"
+    );
     let (_, after) = read_events(&coord_path).unwrap();
     assert_eq!(
         after.len(),
         before.len() + 1,
         "the failed batch's RequesterWoken must already be on the log"
     );
-    assert_eq!(waker.count(), 0, "no wake is delivered for the failed batch");
+    assert_eq!(
+        waker.count(),
+        0,
+        "no wake is delivered for the failed batch"
+    );
 }
