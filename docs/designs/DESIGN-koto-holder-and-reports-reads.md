@@ -34,6 +34,7 @@ rationale: |
   Taking the name from the hook keeps niwa out of the read and leaves the agent
   writing nothing; one walk shared by the verbs and the library stops the two
   from drifting apart.
+upstream: docs/briefs/BRIEF-koto-holder-and-reports-reads.md
 ---
 
 # DESIGN: Holder and Direct-Report Reads Without a Store Scan
