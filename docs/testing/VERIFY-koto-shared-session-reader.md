@@ -15,7 +15,8 @@ milestone.
 ## Host, binaries and store
 
 - macOS on arm64, run on 2026-11-27 between 05:40Z and 06:30Z. The host's koto
-  is 0.41.0 on the cloud session backend. No koto release carries Steps 5 or
+  is 0.41.0 on the cloud session backend, which this session's environment
+  selects through `KOTO_SESSION_*` variables. No koto release carries Steps 5 or
   6, so every binary below was built from source, one build at a time, with
   `CARGO_INCREMENTAL=0 cargo build --release --locked -p koto` at 22bc3a7e and
   at 865e5ce4, and `CARGO_INCREMENTAL=0 cargo build --release --locked -p koto
@@ -31,14 +32,19 @@ milestone.
   | `LIST` | 90aeaaae | (no version command) | `koto-session-list` from current main |
 
   v0.39.0 is the newest tag that doesn't contain the split's first commit,
-  cc9479be (Step 2, koto#742): `git tag --no-contains cc9479be
-  --sort=-v:refname | head -1` prints `v0.39.0`. Its `koto dashboard` already has `--once`
-  and `--all`, so no other pre-split commit was needed.
+  cc9479be (Step 2, koto#742), and its `koto dashboard` already has `--once`
+  and `--all`, so no other pre-split commit was needed. The tag and the
+  version strings come from this, run in the koto checkout after the setup
+  below:
+
+  ```bash
+  git tag --no-contains cc9479be --sort=-v:refname | head -1   # v0.39.0
+  for b in "$PRE" "$OLD" "$MAIN"; do "$b" version; done
+  ```
 
 - The store is one APFS clone of the host's `~/.koto`, made with
   `cp -cR ~/.koto "$C/root"` into a fresh `mktemp -d` directory: 1,279,399
-  entries and 9,535 session directories, 4.2G apparent size, and 0.27 GiB of
-  actual disk. The host's `config.toml` names no session backend, so a run with
+  entries and 9,534 session directories. The host's `config.toml` names no session backend, so a run with
   no `KOTO_SESSION_*` variable reads the clone as a local store. Every run on
   the clone goes through koto#778's runner, which starts the binary with an
   empty environment:
@@ -50,15 +56,15 @@ milestone.
   The only runs against the live store are clause 3's hundred sandboxed runs.
   The clone was left in place when the runs ended, for a later cleanup.
 
-The setup below ran once, in one shell, before clause 1; every later block runs
+The setup below ran once, in one shell, before clause 1. Every later block runs
 in that shell, on the same clone, in the order the record gives them, and reads
-the earlier blocks' outputs and variables. `B` is the directory the release
-binaries were copied to:
+the earlier blocks' outputs and variables. `B` is the directory the release binaries were copied to:
 
 ```bash
 B=<directory holding the release binaries>
 C=$(mktemp -d); cp -cR ~/.koto "$C/root"; O=$C/out; mkdir -p "$O"; cd "$O"
-find "$C/root" | wc -l          # 1,279,399 entries
+find "$C/root" | wc -l                                          # entries
+find "$C/root/sessions" -mindepth 1 -maxdepth 1 -type d | wc -l  # session directories
 PRE=$B/koto-22bc3a7e OLD=$B/koto-865e5ce4 MAIN=$B/koto-90aeaaae
 LIST=$B/koto-session-list-90aeaaae
 run() { env -i PATH=/usr/bin:/bin HOME="$C/home" KOTO_HOME="$C/root" XDG_CACHE_HOME="$C/home/cache" "$@"; }
@@ -172,35 +178,27 @@ while IFS= read -r line; do
   [ "$(printf '%s' "$d" | cut -f8)" = "$(printf '%s' "$line" | cut -f4)" ] && lv=$((lv+1))
 done < listroot
 echo "state $st, liveness $lv"
-# Last, each row's value against koto context get, with tabs, carriage
-# returns and newlines read as spaces:
-vm=0 em=0 other=0
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | cut -f1); val=$(printf '%s' "$line" | cut -f5)
-  got=$(run "$MAIN" context get "$id" "$KEY" 2>/dev/null; echo "rc=$?")
-  rc=${got##*rc=}; flat=$(printf '%s' "${got%rc=*}" | tr '\t\r\n' '   ')
-  if [ "$rc" = 0 ] && [ "$flat" = "$val" ]; then vm=$((vm+1))
-  elif [ "$rc" != 0 ] && [ -z "$val" ]; then em=$((em+1))
-  else other=$((other+1)); fi
-done < listroot
-echo "value matches $vm, absent and empty $em, mismatches $other"
 ```
+
+Each row's value was then checked against `koto context get`, in the block
+that ends clause 3.
 
 - `list` exited 0 with empty stderr and printed 10 rows of 5 fields, the root
   first. 9 rows carry a value.
 - State matches the dashboard on 10 of 10 rows, and liveness on 10 of 10.
-- `koto context get`: on the 9 rows with a value it exits 0 and prints the
-  row's value, 9 of 9. On the row without one it fails and the row's value
-  is empty. No row mismatches.
+- `koto context get` (the block at the end of clause 3): on the 9 rows with a
+  value it exits 0 and prints the row's value, 9 of 9. On the row without one
+  it fails and the row's value is empty. No row mismatches.
 
 `koto context get` records the read, so it ran on the clone after every other
 run, clause 3's included.
 
 ### Dependencies and CI
 
-Run from the koto checkout at 90aeaaae:
+In the setup shell, from the koto checkout at 90aeaaae:
 
 ```bash
+cd <koto checkout at 90aeaaae>
 PAT='^(rust-s3|rustls[^ ]*|attohttpc|http|url|ratatui|crossterm) '
 tree() { cargo tree --offline --locked -p "$1" -e normal,build --prefix none; }
 tree koto-session-list | wc -l
@@ -208,6 +206,7 @@ tree koto-session-list | grep -cE "$PAT"
 tree koto | grep -oE "$PAT" | sort -u
 nm -u "$LIST" | grep -cwE '_(connect|socket|getaddrinfo)'
 nm -u "$MAIN" | grep -owE '_(connect|socket|getaddrinfo)' | sort -u
+cd "$O"
 ```
 
 The tree of `koto-session-list` has 67 lines and the pattern matches none of
@@ -218,10 +217,16 @@ ratatui, rust-s3, rustls, rustls-pki-types, rustls-webpki and url. `nm -u` on
 
 In CI, validate.yml's Session List Checks job runs both checks on the release
 build, then the ignored parity and hundred-read tests (verified by reading the
-workflow). At current main's head,
-90aeaaae, validate run 45943973811 (job 140324341367) hadn't started when this
-record was written, so it gives no result here. At koto#778's merge, f6c8e275,
-the job passed in validate run 45878295232 (job 140110880850).
+workflow). At current main's head, 90aeaaae, validate run 45943973811 (job
+140324341367) was still queued when this record was written, so it gives no
+result here. At koto#778's merge, f6c8e275, the job passed in validate run
+45878295232 (job 140110880850):
+
+```bash
+gh run view 45943973811 --repo tsukumogami/koto --json status,conclusion
+gh run view 45878295232 --repo tsukumogami/koto --json headSha,jobs \
+  --jq '.headSha, (.jobs[] | select(.databaseId == 140110880850) | .name + " " + .conclusion)'
+```
 
 **Reading.** Shown (measured). The program built from current main reports the
 dashboard's rows on a real store in both views, equal on every column that
@@ -250,14 +255,14 @@ for i in $(seq 100); do
 done
 echo "nonzero exits $fails"; wc -lc < "$O/sb.err"
 manifest() { (cd "$C/root" && find . -exec stat -f '%N|%HT|%z|%Fm' {} + | LC_ALL=C sort); }
-manifest > before
+manifest > before; wc -l < before
 fails=0
 for i in $(seq 100); do
   case $((i % 3)) in 1) a="once";; 2) a="once --all";; 0) a="list --root $ROOT --key $KEY";; esac
   run "$LIST" $a > /dev/null 2>> "$O/un.err" || fails=$((fails+1))
 done
 manifest > after
-echo "nonzero exits $fails"; wc -l < "$O/un.err"; cmp before after
+echo "nonzero exits $fails"; wc -l < "$O/un.err"; cmp before after && echo identical
 ```
 
 The sandboxed runs read the live store with this session's environment, cloud
@@ -275,6 +280,7 @@ started outside the sandbox:
 
 ```bash
 sandbox-exec -p "$SB" /usr/bin/touch "$O/sb-probe"; echo "sandboxed touch: exit $?"
+test -e "$O/sb-probe" && echo "probe file present" || echo "probe file absent"
 P=$((20000 + RANDOM % 20000))
 /usr/bin/nc -l 127.0.0.1 "$P" > /dev/null 2>&1 & L=$!; sleep 1
 /usr/bin/nc -z -G 3 127.0.0.1 "$P"; echo "unsandboxed: exit $?"
@@ -290,8 +296,8 @@ the profile itself refuses a connect, separately from anything on the host
 that filters outbound traffic.
 
 **How "nothing pushed" was checked.** The program shows no way to push: its
-dependency tree holds none of the nine crates `koto`'s cloud storage, TLS and
-HTTP come from, and its binary imports no `connect`, `socket` or `getaddrinfo`
+dependency tree holds none of the nine cloud storage, TLS, HTTP and terminal
+crates the pattern finds in `koto`'s, and its binary imports no `connect`, `socket` or `getaddrinfo`
 (clause 2). The sandboxed runs also ran
 with network access denied; a push attempt there would have failed the run or
 written to stderr (inferred), and none did. The unsandboxed runs had no
@@ -311,6 +317,29 @@ would look the same. The copy's manifest covers writes only for runs without
 the cloud variables and only under the store root, so a write made only under
 cloud configuration, and swallowed when denied, is covered by neither run.
 
+### Last: clause 2's values against `koto context get`
+
+`koto context get` records the read in the clone, so this ran after every
+other run on it, clause 3's manifest included. Each `list` row's value is
+compared with what `koto context get` prints, with tabs, carriage returns and
+newlines read as spaces:
+
+```bash
+vm=0 em=0 other=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | cut -f1); val=$(printf '%s' "$line" | cut -f5)
+  got=$(run "$MAIN" context get "$id" "$KEY" 2>/dev/null; echo "rc=$?")
+  rc=${got##*rc=}; flat=$(printf '%s' "${got%rc=*}" | tr '\t\r\n' '   ')
+  if [ "$rc" = 0 ] && [ "$flat" = "$val" ]; then vm=$((vm+1))
+  elif [ "$rc" != 0 ] && [ -z "$val" ]; then em=$((em+1))
+  else other=$((other+1)); fi
+done < listroot
+echo "value matches $vm, absent and empty $em, mismatches $other"
+```
+
+It printed `value matches 9, absent and empty 1, mismatches 0`; clause 2
+gives the reading.
+
 ## Clause 4: shirabe installs without a koto build step
 
 > A user installs shirabe the documented way on a clean machine and it installs without a separate koto build step.
@@ -324,9 +353,10 @@ none, and neither does `$HOME/.local/bin`, checked by name):
 ```bash
 S4=$(mktemp -d); mkdir -p "$S4/home" "$S4/proj"; cd "$S4/proj"
 E="env -i HOME=$S4/home PATH=/usr/bin:/bin:$HOME/.local/bin SHELL=/bin/zsh TMPDIR=$TMPDIR"
-$E claude plugin marketplace add "tsukumogami/shirabe" --scope user
-$E claude plugin install shirabe@shirabe --scope project
-$E ~/.tsuku/bin/tsuku install tsukumogami/shirabe
+ls /usr/bin /bin "$HOME/.local/bin" | grep -cxE 'cargo|rustc|rustup|koto'   # 0
+$E claude plugin marketplace add "tsukumogami/shirabe" --scope user; echo "exit $?"
+$E claude plugin install shirabe@shirabe --scope project; echo "exit $?"
+$E ~/.tsuku/bin/tsuku install tsukumogami/shirabe; echo "exit $?"
 # what the installs left in the scratch home
 P=$S4/home/.claude/plugins/cache/shirabe/shirabe/0.56.4-dev
 find "$P" -type f | wc -l; du -sh "$P"
@@ -355,7 +385,8 @@ file -b "$X"; $E "$X" --version
 
 **Does shirabe take koto-session-reader?** No. Nothing in the installed plugin
 tree names `koto-session-reader` or `koto_session_reader` (0 files), and the
-`shirabe` crate's dependencies (`crates/shirabe/Cargo.toml` on main: clap,
+`shirabe` crate's direct dependencies (verified by reading
+`crates/shirabe/Cargo.toml` on shirabe's main: clap,
 saphyr, shirabe-validate, serde_json, sha2, regex, rustix, getrandom) don't
 include it. The roadmap leaves this open: "how shirabe takes the dependency and
 how the two release schedules are tied". The design puts it out of scope too
