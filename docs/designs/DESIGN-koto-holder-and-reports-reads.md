@@ -35,9 +35,10 @@ reading every session on the host:
   predecessor's log. Walking backward from the newest member is a read per
   hop. Walking forward, or finding the members of a seat from its name, isn't:
   `koto session hierarchy` computes `successors` by listing every session and
-  reading each one's links (tsukumogami/koto#662). The only forward pointer
-  koto writes is the cloud back-reference under the predecessor's
-  `ctx/koto/continued-by/`, which no read verb uses for a walk.
+  reading each one's links (tsukumogami/koto#662). Apart from that fence and
+  its `koto/superseded-by` marker, the only forward pointer koto writes is
+  the cloud back-reference under the predecessor's `ctx/koto/continued-by/`,
+  which no read verb uses for a walk.
 - **A seat's direct reports.** Given a seat, the seats dispatched from it.
   A dispatched session records `koto/links/dispatched-by/<DISPATCHER>` in its
   own context, so finding every session that names a given dispatcher means
@@ -80,19 +81,870 @@ linked successor instead of rebinding (tsukumogami/shirabe#1738, #1739,
 
 ## Considered Options
 
-Not written yet: a later /design phase replaces this line.
+Six questions shape the design. The first three settle what koto records: at
+succession, at dispatch, and when an assistant session starts. The fourth
+settles how a caller reads it. The last two are choices the architecture makes
+that could have gone another way. None of the first four has been confirmed by
+the owner yet, so each lists the assumptions it rests on.
+
+### Decision 1: What koto records at succession and on a rebind
+
+A holder history needs, for each holder, who came before and after it, when it
+held the seat, and which assistant session drove it, read in time that follows
+the chain from any member or from the seat name, on both backends.
+
+Half of it exists. Every successor holds one `koto/links/continues/<P>` naming
+its predecessor by name and session id, with the predecessor's bucket prefix,
+the holder's own id and an `at` time (`write_continues` in
+`src/session/links.rs`), so walking backward is one read per hop. A
+`--supersede` also fences the predecessor with
+`session_superseded {by, by_session_id, actor, at}` and writes the create-only
+`koto/superseded-by` marker (`src/cli/init_supersede.rs`).
+
+Walking forward is the gap. On the cloud the successor PUTs
+`<Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>`, and the bucket never holds a
+relation whose pointer wasn't confirmed (`src/session/continues_bucket.rs`), so
+one LIST of a member's `ctx/koto/` returns its relation and its successors'
+pointers. Locally a plain `--continues` leaves nothing in the predecessor and
+`ensure_backref` does nothing, so `koto session hierarchy` and the terminal
+tick's `relation_probe` scan the store. Some successions record no relation at
+all: `--replace-terminal` moves the old holder to `<name>_r<N>` with no link
+(`src/cli/move_aside.rs`), and a coordinator carry writes none before
+shirabe#1740. A rebind, one koto session driven by several assistant sessions
+in turn, leaves only held-by links (one per anchor, and only when `KOTO_ANCHOR`
+is set), the host-local run journal, and an
+`execution_anchor_rebound {from?, to}` with no actor (koto#664).
+
+Key assumptions:
+
+- Every process writing to one local store runs this release or later, the rule
+  the continues design already sets for shared buckets. If not, a pointer an
+  old build skipped reads as "no successor" until the successor's next tick
+  under a new build repairs it.
+- Coordinator members are named `coordinate-<SLUG>-<YYYYMMDD>T<HHMMSS>Z` and
+  root seat members `<name>` and `<name>_r<N>`; worker seats resolve through
+  the parent's Holdings row, which shirabe reads.
+- A local directory listing that compares names and opens no file stays near
+  constant against several thousand sessions. That's estimated, not measured.
+- `CLAUDE_CODE_SESSION_ID` is set in the sessions that drive koto. Where it
+  isn't, the driver reads as unknown.
+
+#### Chosen: A local mirror of the continued-by back-reference, read name-first and walked both ways, with times and end reasons derived and the driver recorded on a rebind
+
+The successor's own `koto init --continues` (with or without `--supersede`) or
+`koto session link --continues` also writes a pointer on the local backend. The
+local branch of `record_continues` (`src/cli/session.rs`) writes the regular
+file `<sessions>/<P>/ctx/koto/continued-by/<Sp>/<S>`, with the cloud pointer's
+key shape and body. It's written by temp file and rename, with no lock, no
+manifest entry and no event in P, and only when P's state file and `ctx/`
+exist, so it never recreates a removed predecessor. It sits outside
+`koto/links/`, so no scan reads it as a hierarchy edge and no push carries it.
+The first such write creates `<sessions>/.continued-by-since`; for a
+predecessor created after that stamp, a missing pointer proves it has no
+successor.
+
+An owed pointer is repaired at the `ensure_backref` hook every tick already
+runs, whose local branch gains the write under its own owed mark. It never
+reuses `.continues-pointer`: the key is byte-identical to the cloud one, so
+after a switch to the cloud `owed_pointer` would take the local file for a
+confirmed bucket pointer. A removed successor drops its pointer, and a renamed
+one (move-aside, relocate) rewrites it, as the cloud code does. The read trusts
+only the successor's own relation, matched by session id. The cloud side gets
+nothing new.
+
+On a rebind, `execution_anchor_rebound` gains `actor` in the `SupersedeActor`
+shape `{claude_session, host, user}`, inside the append `koto session rebind`
+already makes. And `koto next` appends one `driver_changed {driver, anchor?}`
+to the session's own log when `CLAUDE_CODE_SESSION_ID` differs from the last
+driver that log records. The baseline is the synced log, not the host-local
+sidecar, so a second host agrees. Held-by links stay as they are.
+
+The read uses only facts: a name-prefix listing for members, verified hops both
+ways, and order from links, not clocks. Members with no link between them
+(`_r<N>` reopens, carry gaps) come back as separate stretches for shirabe to
+order. Times come from relation and fence `at` values and each member's stop
+instant (`inventory::status_of`), and the end reason is derived, never
+recorded.
+
+Only a forward record gives chain-length reads from any member locally; without
+one koto#662 stays a scan. Mirroring the cloud's verified back-reference reuses
+its key, body, verification and removal rules, and a lost pointer can make a
+read slower or mark it incomplete, never wrong. The stamp replaces a backfill:
+older history still reads backward from the newest member, so the existing seat
+with over 80 holders reads in full. The name-first entry is the only path
+across successions with no relation. The actor closes koto#664 in an existing
+append, and `driver_changed` covers rebound seats until shirabe#1738 and #1739
+land, where held-by alone misses drivers when `KOTO_ANCHOR` is unset and loses
+one that comes back.
+
+#### Alternatives Considered
+
+**A per-chain index keyed by the chain root.** Every successor writes
+`chain/<Sp>/<S>/<P>` under the root, so one listing returns the chain. Rejected
+because the root becomes a shared cross-prefix write target on every
+succession, with its own credential, repair, removal and rename rules, and an
+index written only at succession misses the move-aside and carry joins. A
+name-first read gets the same parallel latency writing nothing.
+
+**The successor recorded through the predecessor's context store**, as a
+`koto/links/continued-by/<S>` link with a manifest entry and an event. Rejected
+because fenced logs refuse appends, an event races a live predecessor's ticks,
+the cloud form is a conditional pull and push of another workspace's state
+(about 6 requests), and every build reads a `koto/links/` key as an undirected
+hierarchy edge.
+
+**Existing facts only, read backward from the newest member found by name.**
+Kept as the floor, rejected as the whole answer: it fails "from any member"
+locally for chains outside a seat and leaves koto#662 and `relation_probe` as
+scans. One reviewer held that the pointer could wait for koto#662. It ships now
+because the read is asked of every member, and it costs one small file write
+inside a call already made.
+
+### Decision 2: What koto records at dispatch, and which dispatcher identity keys it
+
+koto writes `koto/links/dispatched-by/<D>` only in the child, through
+`write_link_via`, so listing a dispatcher's children reads every session
+(koto#666). The link is written by the child's `koto init --dispatched-by` (via
+`init`), `koto session link` (via `link`), the request-leg bind naming
+`requested_by` (via `leg`), and the anchor open (via `anchor`), which links
+anchor to anchor under the start hook's five-second watchdog. On the cloud each
+link write is already pushed at about 5-7 serial requests.
+
+Two facts decide the identity. shirabe's seat reader seats a worker only
+through a workflow-level dispatched-by naming a coordinate run whose Holdings
+row matches it (shirabe's DESIGN-coordinator-seat-and-role), and a coordinator
+seat's holders are workflow sessions. And the main dispatch paths already carry
+that link: coordinate's `dispatch-worker.sh` opens a request leg for /scope,
+/execute, /deliver and /work-on, and /explore, /decision, /coordinate and
+/release workers open with `--dispatched-by <run>`. Only the planning skills,
+/work-on given a PLAN, and holdings moved off their leg lack one, and shirabe
+already makes those root seats. The continues design (Decision 4 there) settled
+the same question for successors with an object beside the predecessor, outside
+the manifest, trusted only through the holder's own relation.
+
+Key assumptions:
+
+- A coordinator and its workers normally share a host, so the child reads D's
+  prefix (`CloudBackend::home_prefix`) and session id without a request. If
+  not, the dispatch pays one `koto-names/<D>/` listing.
+- Workers keep running koto commands after they link, so an owed pointer is
+  retried within seconds. A child that dies right after a failed PUT stays
+  missing.
+- Credentials that may write `ctx/koto/continued-by/` under another prefix may
+  also write `ctx/koto/dispatched/` there. If not, the PUT gets a 403, the link
+  still lands, and the pointer stays owed with a warning.
+- Retention releases a dispatcher only with its whole component, children
+  included, and shirabe keeps its root-seat rule for unlinked workers.
+
+#### Chosen: A back-reference pointer under the dispatching workflow session, on both backends, verified against the child's own link
+
+The record is keyed by the dispatching workflow session, the peer of the
+child's workflow-level link. koto writes it wherever it writes such a link: in
+`record_dispatched_by_via`, which serves every init path and the leg bind, and
+in `handle_link`. Nothing is written at anchor open. The child's link body
+gains `holder_session_id`, the child's own id, with `v` still 1.
+
+Locally, the child's process writes `<sessions>/<D>/ctx/koto/dispatched/<C>`
+create-only by temp file and rename, the way the supersede marker is published:
+never through D's context store, no lock on D, no manifest entry. On the cloud
+it writes `<Dp>/<D>/ctx/koto/dispatched/<Cp>/<C>` by a direct checked
+cross-prefix PUT, the `continued-by` shape, which a pull copies into D's local
+cache. The body is `{"v":1,"holder_session_id":"<C id>"}`, under the reserved
+`koto/` prefix that `koto context add` and `remove` can't reach.
+
+Pointer first, then link. If the pointer fails, the link is written and pushed
+anyway (a dispatched-by link is a retention edge, so it's never held back the
+way a continues relation is), an owed mark goes in C's directory, and an ensure
+step beside `ensure_backref` retries on C's next command. An orphan pointer
+left by a failure between the two is dropped by verification. The child drops
+its pointer on removal, and the cloud delete, migrate and relocate filters and
+import staging carry `dispatched/` as they do `continued-by/`.
+
+The read accepts a candidate C only when C's own `koto/links/dispatched-by/<H>`
+exists, its `session_id` equals H's (by name and `at` window when an older body
+has none) and its `holder_session_id` equals the pointer's; past a per-holder
+cap a holder reads `unverifiable`.
+
+It's the only option that meets every constraint at once: it rides a call
+already made, once per dispatched worker; one key shape serves both backends;
+D's manifest, lock and log are untouched; the edge stays under D's access
+rules; and a forged pointer can cost a read but never add a report.
+
+#### Alternatives Considered
+
+**An index key appended through the dispatcher's context store.** Rejected
+because every child's write takes D's manifest lock, pulls D's log, appends
+`context_added` and pushes: 5-7 more serial requests on D's prefix per child,
+busy-lock failures against a ticking coordinator, and races between workers.
+The continues design rejected the same shape.
+
+**Reading the host-local request logs** (`requested_by`, `RequestLegBound`).
+Rejected because they never replicate, finding one requester's requests scans
+every request on the host, and they cover only leg dispatch. Kept as a possible
+same-host backfill source.
+
+**A store-wide index keyed by dispatcher name**
+(`koto-names/_dispatched/<D>/<Cp>/<C>`), read for a whole coordinator seat in
+one prefix listing. Rejected because every pushing host must list
+`koto-names/`, exposing every workspace's dispatch graph bucket-wide; entries
+are never removed and have no completeness without an audit; and the local form
+reads every dispatcher's entries on the host.
+
+**Keying by the dispatcher's anchor**, written at anchor open or in `hold()`,
+to cover workers with only an anchor-to-anchor link. Rejected because legs
+already give the main workers a workflow-level link and the rest are root seats
+by shirabe's rule; it adds a write to a hook already over budget,
+over-attributes when one assistant session holds several workflow sessions,
+picks up `-sN` anchor successors, and takes three or four reads to verify.
+Worth reconsidering only if shirabe's seat rule moves to `koto session origin`.
+
+### Decision 3: How the assistant session's name reaches koto
+
+koto keeps no assistant session name (koto#663); readers have been cutting one
+out of `execution_dir`, which ties the display to one workspace manager's
+layout. Every holder resolves to an assistant session through its held-by link,
+written by `hold()` on the agent's `koto init` and `koto next`. The anchor it
+names (`anchor-<id>`, successors `-s<n>`) is opened by the koto-skills
+SessionStart hook (`plugins/koto-skills/hooks/session-start.sh`), which parses
+its payload with jq, hands every harness fact to koto as a flag, and appends an
+`anchor_started` on every open.
+
+Claude Code exports no name variable, but its SessionStart hook input carries
+`session_title`, the session's custom title or nothing (confirmed in the
+2.1.332 binary), which the hook drops today. A background job's name is also in
+`$CLAUDE_JOB_DIR/state.json`, read by shirabe's `dc_claude_name`, but that file
+exists only for jobs and is undocumented. No hook fires on a rename.
+
+Key assumptions:
+
+- A named job's title is set before its startup SessionStart: in 40 of 40 job
+  transcripts checked, the title line came first. No live payload was captured;
+  if wrong, the name lands at the job's first resume, compact or clear.
+- `session_title` stays in the payload. If it goes, anchors record no name and
+  readers show the id. Nothing fails.
+- The recorded name is the title Claude Code shows, which won't always match a
+  job's `state.json` `name`.
+
+#### Chosen: The hook forwards the payload's session_title, and koto records it as an optional harness_name on every anchor_started
+
+`session-start.sh` adds `.session_title` to the jq read it already makes. When
+the value is a non-empty string, it cuts it to 256 bytes on a UTF-8 boundary
+with its existing `cut_bytes` and passes `--harness-name=<value>` to the
+`koto session anchor open` it already runs. No new call, no new dependency, no
+change to the watchdog, nothing on stderr. An older koto that refuses the flag
+exits 2 with no `anchor=` line, and the hook reopens without it, the fallback
+it already uses for `--record-authority` and `--dispatched-by`.
+
+`OpenRequest` and `AnchorStarted` gain `harness_name: Option<String>`, skipped
+when absent. koto never refuses an open over the value: it replaces control and
+format characters (newlines, escapes, bidi controls) with U+FFFD, trims
+whitespace and keeps at most 128 characters; an empty result records nothing.
+The field goes on every `anchor_started`, so each SessionStart (startup,
+resume, compact, clear) records the title current then.
+
+A reader follows the holder's held-by link to its anchor family
+(`-s2, -s3, ...` by exact name) and shows the newest recorded `harness_name`
+beside the assistant session id; a rename with no later SessionStart is never
+seen. A family with no `harness_name` (koto predates it, or the session had no
+title) shows the id with `"name": null, "name_recorded": false`. A session with
+no held-by link falls back to a supersede fence's `actor.claude_session` when
+it has one, and is otherwise unknown. The reader never substitutes an
+`execution_dir` basename, a branch, anything from niwa, or the host-local run
+journal.
+
+It's the only option that names interactive sessions as well as jobs, because
+the title arrives in the payload every SessionStart hook gets. The name comes
+from the assistant alone, so a machine with no niwa names every holder that has
+a title. The write rides the hook's own call, and koto core stays
+harness-agnostic, the pattern the dispatcher-origin design set for keeping an
+assistant-session fact once on the anchor.
+
+#### Alternatives Considered
+
+**koto reads `$CLAUDE_JOB_DIR/state.json` in `anchor open`.** Rejected because
+it names only jobs, couples koto core to an undocumented file, and reads a host
+variable where every other harness fact arrives as a flag.
+
+**The hook reads that file and passes the flag.** Rejected because it's still
+job-only and undocumented, and duplicates the payload. It isn't kept as a
+fallback, so a holder's name means one thing.
+
+**The dispatcher passes the name at `koto init`.** Rejected because root seats
+and interactive sessions have no dispatcher, a niwa-supplied name breaks the
+no-niwa rule, resume and rebind never pass through init, and the
+dispatcher-origin design rejected putting assistant-session facts on every
+workflow session.
+
+**The name in each held-by link body, exported into the agent's shells.**
+Rejected because it adds writes to the agent's own calls, freezes the name at
+the first hold, and carries free text through a variable any process can set.
+
+**A separate event written only when the name changes.** Rejected because
+detecting a change means reading the anchor log inside the hook's five-second
+budget to save a few bytes.
+
+### Decision 4: The read surface for a seat's holder history and direct reports
+
+shirabe's `seat-read.sh` is a shell script that reaches koto only through
+verbs, with its own exits (1 unreadable or a cycle, 3 past the hop cap). A
+fleet view reads through the koto-session-reader crate, which has no network
+and a CI guard against writing, so it reads the local store or the cloud
+backend's local mirror, never the bucket (DESIGN-koto-shared-session-reader).
+`docs/STABILITY.md` promises that crate's listing, log and context reads, not
+`koto/links/*`, link bodies or pointer areas. Existing caps are mixed:
+`links::MAX_SUPERSEDE_HOPS` is 64, used by `links::newest_member`,
+`closes_a_loop` and the decisions chain behind `run_predecessors`, which runs
+inside loops; `supersede_chain::MAX_CHAIN_HOPS` and shirabe's resolver cap are
+1024. `session origin` and `session hierarchy` exit 2 for both a missing and a
+malformed name.
+
+Key assumptions:
+
+- The fleet view is a Rust program reading its own host's store; for another
+  host's latest writes it calls the verbs with `--json`.
+- A per-verb exit 4 for an unknown name is acceptable (`session prune` already
+  gives 4 its own meaning).
+- shirabe filters prefix matches by its own name rule and orders unlinked
+  stretches.
+
+#### Chosen: Both, with one implementation: the crate owns the walk, three new koto verbs call it over a bucket-backed source, and the 64-hop cap is left alone
+
+A new module, `koto_session_reader::chain`, holds the walk, hop verification,
+the derivation of times, end reasons and drivers, and the output types, generic
+over a read-only `ChainSource` trait. The crate implements it for
+`LocalDirSource` through its hardened capped read with no new dependency, so
+the write guard still passes; koto implements it in `src/` over the bucket.
+koto gains `koto session names --prefix`, `koto session chain` and
+`koto session reports`, which take names, never a seat, and print sessions,
+links, times and drivers, never a role. A seat read is three calls:
+`names --prefix`, `chain <those names>`, `reports <newest> --chain`. An unknown
+name exits 4 after one `stat` or one LIST. `koto session chain` is the command
+koto#662 asks for.
+
+One `chain::MAX_CHAIN_HOPS = 1024`, imported by `engine::supersede_chain`, caps
+each stretch; at the cap the stretch says `stop: "hop_cap"` and exits 0, never
+truncating silently. `links::MAX_SUPERSEDE_HOPS = 64` stays, because its
+decision-chain callers run inside loops. STABILITY.md promises what the crate
+reads and the verbs' JSON at `v: 1`.
+
+A shell script can't link a crate and the crate can't reach the bucket, so
+neither surface alone works. With the walk behind a source trait, "both" isn't
+two copies, the reason the shared-reader design moved the dashboard's logic
+instead of copying it. Holdings, roles and the current-holder choice stay in
+shirabe, and new verbs leave every output an agent reads untouched.
+
+#### Alternatives Considered
+
+**koto verbs only.** Rejected because the fleet view would pay a process start
+and store setup per seat on each refresh, and any later crate-side link read
+would re-derive the walk with no promised layout.
+
+**Crate calls only.** Rejected because `seat-read.sh` can't call them without
+shirabe shipping a binary, and the crate can't answer from the bucket, which
+fails "both backends" on any host that isn't the writer.
+
+**Extending `session hierarchy`, `decisions chain` or `session origin`.**
+Rejected because it grows output agents and scripts already read, and
+`hierarchy` is a retention judge built on a scan while `decisions chain` is
+scoped to decisions under the 64-hop cap.
+
+**A generic edge walker** (`koto session links --kind --direction`). Rejected
+because every caller would redo verification, ordering, times and end reasons,
+and would drift on what "ended" means.
+
+**Raising `MAX_SUPERSEDE_HOPS` to 1024 everywhere now.** Rejected because the
+decision-chain callers run it inside loops, so their cost grows with the square
+of chain length.
+
+### Decision 5: How the generic walk gets parallel reads from the bucket
+
+The cloud costs in Decision 4 assume a round of reads goes out together. The
+walk lives in a crate with no async runtime and no network, behind a trait
+whose calls each read one thing, and koto's S3 client is the synchronous
+rust-s3 build, fanned out with `std::thread::scope` in `src/session/cloud.rs`.
+
+#### Chosen: A prefetch hint on the trait, served by a per-call cache in koto's source
+
+`ChainSource` gains `prefetch(&self, round: &[Want])` with a no-op default. The
+walk proceeds in rounds and names each round's reads first. `LocalDirSource`
+ignores the hint; koto's bucket source fans the round out over
+`std::thread::scope` into a cache that lives for one verb call, then serves the
+single-item calls from it. A source that ignores the hint gives the same
+answer, sequentially.
+
+#### Alternatives Considered
+
+**An async trait** would add an async runtime to the crate's allowlist for
+one consumer whose client is synchronous. **Batch-only trait methods** double
+every method, give the local source nothing, and force the walk into batches
+throughout. **koto pre-reading every member's `ctx/koto/`** means koto knows
+which reads the walk makes, and the two drift the first time the walk changes.
+
+### Decision 6: How a reader tells "dispatched nothing" from "dispatched before the record"
+
+A holder created before `dispatched/` existed must read `predates_record`, and
+a worker that dispatched nothing must read as having no reports. On the cloud,
+continued-by needs no such test because the bucket has never held a relation
+without its pointer, but every dispatched-by link before this release was
+pushed with none.
+
+#### Chosen: A since-stamp per store, written by the first dispatched pointer
+
+The first local `dispatched/` write creates `<sessions>/.dispatched-since`
+create-only, as `.continued-by-since` is. On the cloud, a host's first pointer
+PUT also writes `koto-names/_dispatched-since` with a conditional create that
+loses harmlessly to an earlier writer, and the host notes it has done so. A
+holder created before the stamp, or in a store with none, reads
+`predates_record`; one after it with an empty area reads `recorded` with
+`reports: []`.
+
+#### Alternatives Considered
+
+**A header field written at every `koto init`** adds a write to every
+session the agent opens rather than to dispatches, and says nothing about
+whether the children ran a build that writes pointers. **No distinction**
+makes an old holder read as having no reports, a wrong answer the seat
+definition decision would act on.
 
 ## Decision Outcome
 
-Not written yet: a later /design phase replaces this line.
+koto adds two pointer areas beside sessions, a field in the dispatched-by link,
+two event fields, one new event, and three read verbs over a walk in the shared
+reader crate. Every new record extends a fact koto already writes at a moment
+it already writes it, and every pointer is a hint checked against the
+successor's or child's own link, so none can put a wrong session in an answer.
+
+The decisions meet in the walk. Decision 1 gives the chain a forward edge on
+both backends plus a name-prefix entry; Decision 2 hangs reports off each
+holder the chain returns; Decision 3 names each holder through the held-by link
+the chain already follows for drivers; Decision 4 puts that walk in
+`koto_session_reader::chain` for both `seat-read.sh` and a fleet view; and
+Decisions 5 and 6 keep the cloud read parallel and an old holder's silence from
+reading as "no reports". The seat stays in shirabe: it turns a seat name into a
+prefix, takes the newest member of the newest stretch as the current holder,
+and maps reports to seats through Holdings.
 
 ## Solution Architecture
 
-Not written yet: a later /design phase replaces this line.
+### Overview
+
+```
+writes (koto, inside existing calls)
+  successor: koto init --continues | koto session link --continues
+      local -> <sessions>/<P>/ctx/koto/continued-by/<Sp>/<S>  (new)
+               <sessions>/.continued-by-since                  (first write)
+      cloud -> <Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>        (unchanged)
+  child: koto init --dispatched-by | koto session link | leg bind
+      local -> <sessions>/<D>/ctx/koto/dispatched/<C>          (new)
+               <sessions>/.dispatched-since                    (first write)
+      cloud -> <Dp>/<D>/ctx/koto/dispatched/<Cp>/<C>          (new)
+               koto-names/_dispatched-since                    (first per host)
+      both  -> dispatched-by link body gains holder_session_id
+  koto session rebind -> execution_anchor_rebound.actor
+  koto next           -> driver_changed (only when the driver changed)
+  SessionStart hook   -> koto session anchor open --harness-name
+                      -> anchor_started.harness_name
+
+reads
+  koto session names | chain | reports --+
+  fleet view (Rust)  ---------------------+--> koto_session_reader::chain
+                                                 |-- LocalDirSource (crate)
+                                                 +-- BucketChainSource (koto)
+```
+
+### Components
+
+- **`koto_session_reader::chain`** (new). The walk, verification, derivation,
+  output types, `ChainSource`, its `LocalDirSource` implementation over
+  `fs_read::read_store_file`, and the layout names the writers import
+  (`CONTINUED_BY_AREA`, `DISPATCHED_AREA`, `CONTINUED_BY_SINCE`,
+  `DISPATCHED_SINCE`, `MAX_CHAIN_HOPS`).
+- **`BucketChainSource`** (new, `src/session/chain_source.rs`). `ChainSource`
+  over exact-name GETs, `ctx/koto/` and `koto/links/<kind>/` LISTs and
+  `koto-names/<prefix>` listings, with the prefetch cache.
+- **Read verbs** (new, `src/cli/session_chain.rs`). Argument checks, source
+  choice, JSON and text rendering, the exit mapping.
+- **Succession writer.** `record_continues` and `ensure_backref` gain local
+  branches; removal, move-aside and relocate drop or rewrite the pointer.
+- **Dispatch writer.** `record_dispatched_by_via` and `handle_link` write the
+  pointer; `LinkBody` carries `holder_session_id`; `deletable_keys`,
+  `delete_remote_session_checked`, `delete_migrated_source`, the relocate carry
+  and import staging handle `dispatched/`.
+- **Driver and name records.** `koto session rebind`, the `koto next` path in
+  `src/cli/mod.rs`, `--harness-name` with `OpenRequest` and `AnchorStarted`,
+  and the hook.
+
+### Key Interfaces
+
+#### The three verbs
+
+```
+koto session names --prefix <P> [--json]
+koto session chain <NAME>... [--no-drivers] [--json]
+koto session reports <NAME> [--chain] [--json]
+```
+
+`names` lists sessions whose names start with P, sorted, reading no header; on
+the cloud `complete` reflects `koto-names/_complete`.
+
+```json
+{"v": 1, "prefix": "coordinate-foo-", "store": "bucket", "complete": true,
+ "names": ["coordinate-foo-20261101T090000Z", "coordinate-foo-20261103T141522Z"]}
+```
+
+`chain` walks each named member both ways and places each member once.
+`joined_by` is `continues`, `supersede` or null; `end.kind` is `superseded`,
+`continued`, `finished`, `failed`, `cancelled`, `moved_aside` or `unknown`;
+`newest` marks a stretch's last member; `stop` is null, `hop_cap`, `broken_hop`
+or `pointers_predate_record`; a driver's `source` is `held_by`,
+`driver_changed`, `rebind` or `fence`. `--no-drivers` skips anchor reads.
+
+```json
+{"v": 1, "store": "local", "stretches": [{"complete": true, "stop": null, "members": [
+  {"name": "coordinate-foo-20261101T090000Z", "session_id": "...", "joined_by": null,
+   "started_at": "2026-11-01T09:00:00Z", "ended_at": "2026-11-03T14:15:22Z",
+   "end": {"kind": "superseded", "actor": {"claude_session": "...", "host": "...", "user": "..."}},
+   "newest": false,
+   "drivers": [{"assistant_session": "8f2c...", "name": "foo coordinator",
+                "name_recorded": true, "from": "2026-11-01T09:00:02Z", "source": "held_by"}]},
+  {"name": "coordinate-foo-20261103T141522Z", "session_id": "...", "joined_by": "supersede",
+   "started_at": "2026-11-03T14:15:22Z", "ended_at": null, "end": null, "newest": true,
+   "drivers": [{"assistant_session": "c41a...", "name": null, "name_recorded": false,
+                "from": "2026-11-03T14:15:30Z", "source": "held_by"}]}]}]}
+```
+
+The text form prints one line per member: name, start, end or `now`, end kind,
+and the driver's name or `<id> (no name recorded)`.
+
+`reports` lists `ctx/koto/dispatched/` under NAME, or under every member of its
+chain with `--chain`, and prints only verified children. A holder's `state` is
+`recorded`, `predates_record`, `unverifiable` or `removed`.
+
+```json
+{"v": 1, "session": "coordinate-foo-20261103T141522Z", "store": "bucket", "complete": true,
+ "holders": [{"name": "coordinate-foo-20261103T141522Z", "session_id": "...", "state": "recorded",
+   "reports": [{"name": "work-on-bar-20261103T150102Z", "session_id": "...",
+                "at": "2026-11-03T15:01:02Z", "via": "leg"}]}]}
+```
+
+| Exit | Meaning, all three verbs |
+|------|--------------------------|
+| 0 | Printed, including a `hop_cap` stop and a known session with `reports: []` |
+| 2 | Malformed name or prefix, or bad usage |
+| 3 | The store, its layout marker or the bucket can't be read |
+| 4 | Unknown name: any `chain` or `reports` argument with no session, or a `names` prefix nothing matches |
+
+Exit 4 prints `{"error", "command", "unknown": [...]}` on stderr, the shape
+`session origin` uses, naming every miss. On a bucket whose name index isn't
+declared complete, a `names` miss adds `"index_complete": false` and says the
+miss isn't proof.
+
+#### The crate module
+
+```rust
+// koto_session_reader::chain
+pub const MAX_CHAIN_HOPS: usize = 1024;
+pub enum LinkKind { Continues, DispatchedBy, HeldBy }
+pub enum PointerArea { ContinuedBy, Dispatched }
+pub enum StoreKind { Local, LocalMirror, Bucket }
+
+pub struct LinkRecord { pub session: String, pub session_id: Option<String>,
+    pub at: Option<String>, pub prefix: Option<String>,
+    pub holder_session_id: Option<String>, pub via: Option<String> }
+pub struct Pointer { pub holder: String, pub prefix: Option<String>, pub holder_session_id: String }
+pub struct PointerListing { pub pointers: Vec<Pointer>, pub superseded_by: Option<SupersedeMarker> }
+
+pub trait ChainSource {
+    fn store(&self) -> StoreKind;
+    fn header(&self, name: &str) -> Result<Option<StateFileHeader>, ReadError>;
+    fn link(&self, name: &str, kind: LinkKind, peer: &str) -> Result<Option<LinkRecord>, ReadError>;
+    fn link_peers(&self, name: &str, kind: LinkKind) -> Result<Vec<String>, ReadError>;
+    fn pointers(&self, name: &str, area: PointerArea) -> Result<PointerListing, ReadError>;
+    fn events(&self, name: &str) -> Result<Vec<Event>, ReadError>;
+    fn names_with_prefix(&self, prefix: &str) -> Result<NameListing, ReadError>;
+    fn stamp(&self, area: PointerArea) -> Result<Option<String>, ReadError>; // Decision 6
+    fn prefetch(&self, _round: &[Want]) {}                                   // Decision 5
+}
+
+pub fn names_with_prefix(src: &dyn ChainSource, prefix: &str) -> Result<NameListing, ReadError>;
+pub fn holder_chain(src: &dyn ChainSource, names: &[String], opts: ChainOptions)
+    -> Result<ChainRead, ReadError>;            // ChainOptions { drivers: bool }
+pub fn reports(src: &dyn ChainSource, name: &str, scope: ReportScope)
+    -> Result<ReportsRead, ReadError>;          // ReportScope::{Session, Chain}
+
+pub enum ReadError {
+    UnknownName(Vec<String>),                   // exit 4
+    InvalidName,                                // exit 2
+    Unreadable { category: String, path: String }, // exit 3
+}
+```
+
+`pointers` returns one listing of a member's `ctx/koto/`, with the
+`koto/superseded-by` marker when present, so "superseded by whom and when"
+costs one small read. It accepts a one-segment `<C>` (the local backend's
+`dispatched/`) and a two-segment `<Cp>/<C>` (the cloud shape, which a pull
+copies into a cloud host's mirror). A result read from a mirror says
+`"store": "local_mirror"` and can trail another host's write.
+
+#### The pointers, stamps and link field
+
+| Record | Local backend | Cloud bucket | Body |
+|--------|---------------|--------------|------|
+| Successor pointer | `<sessions>/<P>/ctx/koto/continued-by/<Sp>/<S>` (new) | `<Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>` (unchanged) | `{"v":1,"holder_session_id":"<S id>"}` |
+| Dispatched pointer | `<sessions>/<D>/ctx/koto/dispatched/<C>` | `<Dp>/<D>/ctx/koto/dispatched/<Cp>/<C>` | `{"v":1,"holder_session_id":"<C id>"}` |
+| Successor stamp | `<sessions>/.continued-by-since` | not needed | `{"v":1,"at":"<RFC 3339>"}` |
+| Dispatched stamp | `<sessions>/.dispatched-since` | `koto-names/_dispatched-since` | `{"v":1,"at":"<RFC 3339>"}` |
+
+None is in a manifest or under `koto/links/`. Local pointers are never pushed;
+a store that moves to the cloud owes its cloud pointers until each session's
+first cloud write. The dispatched-by link body gains one field:
+`{"v":1, "session", "session_id", "workspace", "at", "via", "holder_session_id": "<child id>"}`.
+
+#### The event changes
+
+All are additive under STABILITY.md's `EventPayload` rules: optional fields
+skipped when absent, and one new variant older readers take through the
+catch-all.
+
+```json
+"execution_anchor_rebound": {"from": "...", "to": "...",
+  "actor": {"claude_session": "8f2c...", "host": "build-01", "user": "dev"}}
+"driver_changed":           {"driver": "c41a...", "anchor": "anchor-c41a..."}
+"anchor_started":           {"harness_session": "c41a...", "harness_name": "foo coordinator", "...": "unchanged"}
+```
+
+`driver_changed.anchor` is present when `KOTO_ANCHOR` was set. `harness_name`
+is stored already cleaned.
+
+### Data Flow
+
+**At succession.** S's `koto init --continues P` writes its own relation as
+today. Locally, `record_continues` checks that P's state file and `ctx/` exist,
+writes the pointer in P by rename, and creates `.continued-by-since` if
+missing; on failure S gets an owed mark that its next tick's `ensure_backref`
+clears by writing the pointer. A `--supersede` writes the fence and marker as
+today. The cloud path is unchanged.
+
+**At dispatch.** The child's linking call resolves D's id and prefix from D's
+header on the host (or, on the cloud and only when that header isn't local, one
+`koto-names/<D>/` listing), writes the pointer under D, creates the stamp if
+needed, then writes the link with `holder_session_id`.
+
+**At anchor open.** The hook reads `.session_title`, cuts it, and passes
+`--harness-name`; koto cleans it onto the `anchor_started` it appends.
+
+**At rebind and next.** `koto session rebind` adds `actor` to its append.
+`koto next`, having read the log to derive state, compares
+`CLAUDE_CODE_SESSION_ID` with the log's last `driver_changed` and appends one
+only when they differ. An unset variable appends nothing.
+
+**How a chain read walks.** Round 1 reads each named member's header and
+`ctx/koto/` listing. Each hop backward (the member's continues link) or forward
+(a pointer, marker or fence) is accepted only when the other side's own record
+carries the matching session id. A member with no forward hop is its stretch's
+newest, and the stretch stops with `pointers_predate_record` if that member
+predates `.continued-by-since`, `hop_cap` at 1024 hops, or `broken_hop` at a
+missing or mismatched peer. Drivers come from held-by peers, `driver_changed`
+and rebind actors, names from each anchor family.
+
+**How a reports read walks.** For each holder in scope, list `dispatched/`,
+read each candidate's own `dispatched-by/<holder>` link, and keep it when the
+id checks pass. A holder before the stamp reads `predates_record`, one past the
+cap `unverifiable`, one gone from the store `removed`.
+
+### Read cost
+
+n is the holders in the seat's history, r its direct reports, a the anchors
+(assistant sessions) across those holders, m the names matching a prefix, and D
+the entries in the local sessions directory.
+
+| Read | Local store | Cloud bucket |
+|------|-------------|--------------|
+| `names --prefix` | one `readdir` comparing D names, no file opened | ceil(m/1000) LISTs of `koto-names/<P>` + 1 GET of `_complete` |
+| `chain`, one member named, `--no-drivers` | about 3 small file reads per holder + 1 log read: O(n) | 2-3 requests per holder, sequential: 2n-3n (160-240 at 80 holders) |
+| `chain`, every member named | O(n) | the same requests in about 3 parallel rounds |
+| drivers on top | 1 log read per holder + 1 anchor-family read per anchor: O(n + a) | n + a GETs in parallel |
+| `reports --chain` | the chain walk + n listings + r link reads: O(n + r) | n LISTs + r GETs of at most 4 KiB, in parallel |
+| unknown name | 1 `stat` | 1 LIST of `koto-names/<name>/` (cap 256) |
+
+Neither read depends on store size. `chain` and `reports` open or request
+nothing that belongs to a session outside the seat's history and its reports,
+and no cloud term grows with the bucket. The only place the store shows is the
+local name-first entry: one `readdir` compares D names and opens nothing,
+estimated to stay near constant at several thousand entries (Phase 7 measures
+it). A chain read started from a known member skips it.
+
+#### Today's cost, measured
+
+Read on 2026-11-27 with koto 0.42.0 on the cloud backend, read-only commands
+only, on a host whose local sessions directory held 9,565 session directories.
+
+| Read | Command | Result |
+|------|---------|--------|
+| Every session | `/usr/bin/time -p koto session list` | real 0.67 s; 9,496 rows (the local list merged with the bucket's delimiter listing) |
+| Newest member of a 107-member coordinator seat | `/usr/bin/time -p koto session hierarchy <name> --json` | real 5.78, 6.03, 3.37 s; prints the one-hop predecessor only |
+| A live 39-member manager seat | `/usr/bin/time -p koto session hierarchy <name> --json` | real 3.78, 3.19, 3.14 s; one undirected component of 193 sessions: 25 seat members and 48 sessions with a dispatched-by link to a member, mixed with anchors, closes and held-by peers |
+
+Each `hierarchy` call reads every session's header and `ctx/koto/` entries
+(`Graph::scan`). Derived, not measured: the 107-member seat's history today is
+one call per hop, about 107 calls at 3-6 s, roughly 6 to 11 minutes, each call
+reading all ~9.5k sessions. Its reports take one 3-4 s call whose output the
+caller filters down from 193 mixed sessions.
+
+### The owner's constraint
+
+Status comes from koto, agents write nothing new, and their koto calls cost
+what they did:
+
+- **Local successor pointer and stamp.** Written by koto in the successor's
+  `koto init --continues` or `koto session link --continues`, a call already
+  made: one small file per succession, plus the stamp once per store.
+- **Owed-pointer repairs**, successor and dispatched. Written by koto at the
+  ensure step every tick already runs, only while a mark says one is owed.
+  Otherwise the cost is one `stat` of the mark.
+- **Rebind actor.** A field in the append `koto session rebind` already makes.
+  No extra write.
+- **`driver_changed`.** Appended by koto inside `koto next` only on a real
+  driver change, the same change the run journal already detects in that call
+  for its `driver_seen`. It compares against the log the call already read, so
+  it adds no read: one append on a session's first tick after the release, then
+  one per real change.
+- **Dispatched pointer and link field.** Written by koto in the child's
+  `koto init --dispatched-by`, `koto session link` or leg bind: one local file
+  or one PUT per dispatched worker, never per tick. The `koto-names/<D>/`
+  lookup happens only on the cloud when D's header isn't on the host; the
+  bucket stamp is one conditional PUT per host, once.
+- **`harness_name`.** Read from the SessionStart payload and passed by the
+  koto-skills hook to the `anchor open` it already runs.
+- **Output.** The three verbs are new; `koto init`, `koto next`, `koto status`
+  and every other output an agent reads gain no field.
+
+Every write is by koto inside a call already made, by the hook, or by the
+launcher. A machine with no niwa names every holder: the name comes from the
+assistant's own SessionStart payload through the hook, and no read uses an
+`execution_dir` basename or a niwa attribute. A holder whose session has no
+title shows its id marked "no name recorded", with or without niwa.
+
+### What the seat definition decision reads
+
+| Fact | Where koto records it | Read through | Cost |
+|------|-----------------------|--------------|------|
+| Seat name | Nowhere; it's the members' name prefix | `names --prefix` / `names_with_prefix` | one name-only `readdir`; ceil(m/1000) LISTs + 1 GET |
+| Succession links | `koto/links/continues/<P>` in each successor; `continued-by/` pointers, fence and marker in each predecessor | `chain` / `holder_chain` | O(n) |
+| Dispatcher | `koto/links/dispatched-by/<D>` in the holder | `koto session origin` (unchanged) or `chain` | one listing |
+| Direct reports | `dispatched/` pointers under each holder, verified against each child's link | `reports --chain` / `reports` | O(n + r) |
+| Holder's assistant session id | `koto/links/held-by/<anchor>`, `driver_changed`, the rebind actor, the fence actor | `chain` drivers | O(n + a) |
+| Holder's assistant session name | `anchor_started.harness_name` in the anchor family | `chain` drivers | one family read per anchor, within O(n + a) |
+| Holder times, current holder | Derived from relation and fence `at` and each member's stop instant; `newest` marks a stretch's last member | `chain` | within O(n); shirabe takes the newest stretch's newest member |
+
+None needs a scan.
+
+### Open items, answered or deferred
+
+| Open item | Answer or carrier |
+|-----------|-------------------|
+| Read verbs, library calls, or both | Both, one implementation (Decision 4) |
+| What koto records at succession (koto#664) | A local `continued-by` pointer and stamp, the rebind actor, and `driver_changed` (Decision 1) |
+| What koto records at dispatch (koto#666) | A `dispatched/` pointer under the dispatching workflow session, `holder_session_id` in the link, and a stamp (Decisions 2 and 6) |
+| How the assistant session name reaches koto (koto#663) | The hook passes the payload's `session_title` as `--harness-name`; koto records it on `anchor_started` (Decision 3) |
+| Whether koto#662's chain command is this read | Yes: `koto session chain` is it, and closes koto#662 |
+| A holder from before the name was recorded | Its assistant session id, `"name_recorded": false`, text `<id> (no name recorded)` |
+| Whether a reason a holder ended is recorded | No; it's derived from facts, never recorded |
+| The hop limit | New walks share `MAX_CHAIN_HOPS = 1024` with an explicit `hop_cap` stop. The `links::MAX_SUPERSEDE_HOPS` (64) callers `newest_member` and `closes_a_loop`: proposed follow-on, no issue filed yet |
+| Successors as new linked sessions | shirabe#1738, #1739, #1740; `driver_changed` covers rebound seats until then |
+| Backfill for dispatches and successions before the release | Proposed follow-on, no issue filed yet; until then those read as `predates_record` or `pointers_predate_record` |
+| A workflow-level dispatched-by for every worker | Proposed shirabe follow-on, no issue filed yet; until then those workers read as nobody's reports |
 
 ## Implementation Approach
 
-Not written yet: a later /design phase replaces this line.
+This design changes no code itself. Each phase is one koto pull request.
+Records come first, because each day they aren't written is history that later
+reads as "predates the record". Phase 1 also creates the crate module that
+holds the layout names, so every writer imports its key from the place
+STABILITY.md will promise. Phases 2 and 4 depend on nothing else.
+
+### Phase 1: The chain module's names and the local successor pointer
+
+Deliverables:
+- `koto_session_reader::chain` with the layout constants and
+  `MAX_CHAIN_HOPS = 1024`, imported by `engine::supersede_chain`.
+- Local branches of `record_continues` and `ensure_backref`, the stamp, the
+  local owed mark, and drop or rewrite on removal, move-aside and relocate,
+  with tests for a missing predecessor, a forced failure and a backend switch.
+
+### Phase 2: Driver records
+
+Deliverables:
+- `execution_anchor_rebound.actor`, the `driver_changed` variant and its
+  append, with tests for no change, an unset id, A to B to A, and a second host
+  reading the synced log.
+
+### Phase 3: The dispatched pointer
+
+Needs Phase 1. Deliverables:
+- `holder_session_id` on dispatched-by bodies; the pointer in
+  `record_dispatched_by_via` and `handle_link` on both backends; the owed mark,
+  ensure step and stamps.
+- Delete, migrate, relocate and import handling of `dispatched/`, and
+  `ctx/koto/dispatched/` in the bucket permission statement in
+  `docs/guides/session-retention.md`.
+
+### Phase 4: The assistant session name
+
+Deliverables:
+- `--harness-name`, `OpenRequest.harness_name`, `AnchorStarted.harness_name`
+  and the cleaning rule; the hook change, with `session-start.test.sh` pinning
+  `session_title` from a captured payload and covering the older-koto fallback;
+  the flag in the koto-user command reference.
+
+### Phase 5: The walk in the crate
+
+Needs Phases 1-4 for fixtures. Deliverables:
+- `ChainSource`, `LocalDirSource`'s implementation, `names_with_prefix`,
+  `holder_chain`, `reports`, `ReadError` and the output types, tested on a
+  1,100-member chain, a 107-holder seat with `_r<N>` and carry gaps, a manager
+  with three workers and one forged pointer, a worker with no reports, holders
+  before each stamp, and an unnamed holder.
+- STABILITY.md's store read surface: link keys and fields, both pointer areas,
+  both stamps and the event fields, pinned by the layout literals test.
+
+### Phase 6: The verbs and the bucket source
+
+Needs Phase 5. Deliverables:
+- `BucketChainSource` with the prefetch cache, and the three verbs with their
+  JSON, text and exits; STABILITY.md's CLI output section at `v: 1` and
+  `docs/guides/cli-usage.md`. koto#662 closes.
+
+### Phase 7: The evidence run
+
+After a release with Phases 1-6, the evidence Milestone 4 of
+ROADMAP-shirabe-status-breadcrumbs asks for, on a store of several thousand
+sessions: an 80-plus-holder seat in order with names and the current one
+marked; a manager with three workers returning exactly those, and a worker's
+seat returning none; both about as fast after several thousand unrelated
+sessions are added; a host with no niwa naming every titled holder; an unknown
+seat exiting 4 at once. The run also times the local `names --prefix` listing.
+
+### Follow-on work
+
+Proposed, no issue filed yet:
+
+- **koto: shared cap for the 64-hop O(n) walks.** `links::newest_member` and
+  `closes_a_loop` take `MAX_CHAIN_HOPS`; the decision-chain callers stay at 64.
+- **koto: backfill for records from before the release.** A same-host pass
+  writing pointers from children's dispatched-by links, successors' relations
+  and the request logs, each verified as a live write would be.
+- **shirabe: a workflow-level `--dispatched-by` in every worker brief**
+  (planning skills, /work-on given a PLAN, holdings moved off their leg), and
+  the flag folded into the opener's `koto init` in place of a separate
+  `koto session link` and its 5-7 cloud requests.
+- **koto: `session hierarchy` successors and `relation_probe` read pointers**
+  instead of scanning, for predecessors created after the stamp.
+
+Only if evidence asks for them: a local mirror of `koto-names/`, a
+UserPromptSubmit capture for renames between starts, shirabe's `dc_claude_name`
+reading koto's record, and an anchor-keyed dispatch record if shirabe's seat
+rule moves to `koto session origin`.
 
 ## Security Considerations
 
@@ -100,4 +952,51 @@ Not written yet: a later /design phase replaces this line.
 
 ## Consequences
 
-Not written yet: a later /design phase replaces this line.
+### Positive
+
+- A seat's holder history reads in O(n) and its reports in O(n + r) on both
+  backends, from shell or Rust, where the 107-member seat takes an estimated 6
+  to 11 minutes of store scans today.
+- An unknown name exits 4 after one `stat` or LIST, and a walk at the cap says
+  so.
+- Every holder is named from the assistant itself, with no niwa and no
+  directory parsing; an old or untitled holder is an explicit state.
+- A rebound session's drivers live in its own synced log; koto#662, #663, #664
+  and #666 close.
+- A forged or stale pointer can cost a read but can't add a successor or a
+  report.
+
+### Negative
+
+- STABILITY.md now promises the link layout, pointer areas and stamps, so they
+  change only additively.
+- Each dispatched worker's linking call on the cloud pays one more request, two
+  on the cross-host path.
+- Records from before the release read as "predates", and earlier driver
+  changes aren't recorded.
+- An owed pointer reads missing until the child's next command, and for good if
+  it never runs one; a local removal of a past holder loses its pointers.
+- Workers launched without a workflow-level dispatched-by read as nobody's
+  reports.
+- A rename is seen only at the next SessionStart, and the name rests on a
+  Claude Code payload field that isn't a koto contract.
+- A cloud read from one old member is sequential; a fleet view's crate reads
+  trail other hosts under the cloud backend.
+- `newest_member` and `closes_a_loop` stay wrong past 64 hops until their
+  follow-on.
+
+### Mitigations
+
+- The additive rule already governs the read surface, and the layout literals
+  test fails CI on a rename.
+- The extra PUT rides the call that already pushes the link, never a tick.
+- Both "predates" states are explicit, and the proposed backfill covers
+  same-host history.
+- The ensure step retries on every later command, and a removed holder reads
+  `removed`, not empty.
+- The proposed shirabe follow-on gives those briefs a workflow-level link.
+- The hook test pins `session_title`; if it disappears, the display falls back
+  to the id, never an error.
+- Naming every member up front makes the cloud read about 3 parallel rounds,
+  and each result says which store it came from.
+- The new reads don't use the 64-hop cap, and its follow-on is named.
