@@ -444,6 +444,21 @@ to the session's own log when `CLAUDE_CODE_SESSION_ID` differs from the last
 driver that log records. The baseline is the synced log, not the host-local
 sidecar, so a second host agrees. Held-by links stay as they are.
 
+A rebind changes a holder's driver, not the holder: the koto session is the
+holder, and its drivers are listed oldest first by each one's `from`. A held-by
+link is never released, so it means "this anchor drove the session from `at`",
+not "this anchor drives it now". Take a workflow session that one worker stops
+driving, a second worker rebinds to its own worktree and resumes, and the
+first worker's workspace is then removed. The session keeps both held-by
+links. The reader shows the first anchor as an earlier driver of that same
+holder, ending where the next driver begins, and the second as its current
+driver; it shows the stale anchor neither as a separate holder nor as the
+current one. The rebind's `actor` and `at` and the second worker's
+`driver_changed` pin the moment of the change; without them, as for a rebind
+before this release, the order of the two links' `at` values still puts the
+stale anchor first. That the first workspace no longer exists changes nothing,
+since the reader never reads a workspace or an `execution_dir`.
+
 The read uses only facts: a name-prefix listing for members, verified hops both
 ways, and order from links, not clocks. Members with no link between them
 (`_r<N>` reopens, carry gaps) come back as separate stretches for shirabe to
