@@ -1427,7 +1427,13 @@ command's output or exit status, and koto prints no warning about it.
 
 After one call exits 3, has to be killed or can't be started, the process
 makes no more calls and counts every later record as dropped. After an
-exit 2 it makes no more calls and counts nothing.
+exit 2 it makes no more calls and counts nothing. A call that exits 1, or
+with a code outside the list above, loses its own records, which are
+counted as dropped, and the calls after it go on.
+
+A call is started only when at least 2.0 seconds are left before the
+flush's deadline. Records a flush has no time left to send are counted as
+dropped without a call being made, and the next flush sends as usual.
 
 ### Dropped records
 

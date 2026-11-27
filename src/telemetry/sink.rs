@@ -28,6 +28,12 @@
 //! directory, no stdout or stderr, and an environment cleared to a short
 //! allowlist, so a credential in the user's shell never reaches it. A call
 //! that outlives its deadline is ended by killing that group and no other.
+//!
+//! A chunk can be larger than a pipe buffer, so stdin is fed by a thread of
+//! its own while the calling thread watches the deadline. That thread is
+//! joined only once it has finished. After an on-time exit it is given a
+//! moment; after a kill, or if a child the sink left behind still holds the
+//! pipe, it is left parked, which costs nothing and ends with the process.
 
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -95,8 +101,10 @@ pub(crate) enum Outcome {
     Dropped,
     /// Exit 4: posted, with some records invalid.
     PostedSomeInvalid,
-    /// Exit 1, any other code, or a death by a signal koto didn't send: the
-    /// call failed in a way the contract gives no meaning to.
+    /// Exit 1, the contract's usage error, and with it any other code or a
+    /// death by a signal koto didn't send: the call failed in a way the
+    /// contract gives no further meaning to. Named for the one case the
+    /// contract does name.
     Usage,
     /// The call outlived its deadline and its group was killed, or koto
     /// couldn't wait on it.

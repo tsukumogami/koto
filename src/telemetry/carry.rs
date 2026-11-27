@@ -15,6 +15,12 @@
 //! a count that can't be locked is not written. Losing a count that way is
 //! acceptable; counting one twice is not.
 //!
+//! The wait is bounded twice over. A caller that writes several sessions'
+//! counts in one go gives them one start time, so [`LOCK_WAIT`] covers them
+//! all together. And once a wait has run out anywhere in the process, later
+//! changes try their lock once and don't wait, until one is taken again: a
+//! holder that has stalled costs the process one wait, not one per change.
+//!
 //! The file is read defensively. It sits in the user's home, so one that
 //! isn't a regular file, is too large, or doesn't parse as an object whose
 //! `dropped` is a non-negative integer reads as 0, and the next write
