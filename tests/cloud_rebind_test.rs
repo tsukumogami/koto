@@ -2021,8 +2021,8 @@ Done.
 
         /// [`Moving::unrecorded`] with `execution_dir` dropped too, from
         /// this host's copy and the bucket's: the session's home then comes
-        /// from `origin.anchor`, the old directory, and the move logs no
-        /// `from`.
+        /// from `origin.anchor`, the old directory, which the move logs as
+        /// its `from`.
         fn unanchored() -> Self {
             let mv = Moving::unrecorded();
             let path = mv.m.state_path(NAME);
@@ -2124,8 +2124,8 @@ Done.
     /// The test above at `after-version`, the last point before the carry,
     /// on a session whose header had no `execution_dir` before the move, so
     /// its home came from `origin.anchor` and the logged move's `from` is
-    /// empty: run again, the move must still carry the context from the old
-    /// home to the new one.
+    /// that anchor: run again, the move must still carry the context from
+    /// the old home to the new one.
     #[test]
     fn a_cloud_whole_rebind_stopped_after_its_commit_carries_the_context_of_a_session_with_no_execution_dir(
     ) {

@@ -2208,8 +2208,9 @@ The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
 
 `koto session rebind --whole` writes the same event type with two more fields,
-so a reader that knows only `from` and `to` still reads the move as the anchor
-change it is:
+`whole` and `epoch`, and fills `from` from the session's anchor when it recorded
+no directory, so a reader that knows only `from` and `to` still reads the move as
+the anchor change it is:
 
 ```json
 {

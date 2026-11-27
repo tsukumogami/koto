@@ -285,6 +285,10 @@ fn move_cloud(
         EventPayload::ExecutionAnchorReboundWhole(w) if w.epoch == epoch => Some(w.from.clone()),
         _ => None,
     });
+    // One that logged no `from` names no home before, which the carry treats as moved.
+    if let (Commit::Done, Some(None)) = (&commit, &logged_from) {
+        home_before = None;
+    }
     if let (Commit::Done, Some(Some(from))) = (&commit, logged_from) {
         home_before = cloud.home_prefix_from(name, &from).ok().map(|h| h.prefix);
     }

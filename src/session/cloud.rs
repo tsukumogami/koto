@@ -6124,10 +6124,7 @@ impl CloudBackend {
                 .collect(),
             Err(e) => {
                 let e = without_url_userinfo(&e.to_string());
-                missed(
-                    &held,
-                    &format!("listing its objects there failed: {e}; rerun to carry it"),
-                );
+                missed(&held, &format!("listing its objects there failed: {e}"));
                 return;
             }
         };
