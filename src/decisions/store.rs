@@ -370,7 +370,7 @@ const FAULT_ENV: &str = "KOTO_TEST_DECISION_FAULT";
 fn crash_at(point: &str) {
     if cfg!(debug_assertions) && std::env::var(FAULT_ENV).as_deref() == Ok(point) {
         eprintln!("{FAULT_ENV}: stopping at {point}");
-        std::process::exit(86);
+        crate::exit::crash(86);
     }
 }
 

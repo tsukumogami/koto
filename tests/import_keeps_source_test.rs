@@ -1302,6 +1302,116 @@ fn every_write_verb_still_refuses_on_a_same_host_migrated_source() {
     assert_writes_refused(&w, &w.a, &w.a2);
 }
 
+/// `read` with `KOTO_ANCHOR` naming `anchor`.
+fn read_with_anchor(host: &Host, anchor: &str, args: &[&str]) -> Run {
+    let tmp = reads_tmp(host);
+    let output = cmd(host)
+        .env("TMPDIR", &tmp)
+        .env("KOTO_ANCHOR", anchor)
+        .args(args)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+        serde_json::from_str(last).unwrap_or(Value::Null)
+    });
+    Run {
+        code: output.status.code(),
+        stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        json,
+    }
+}
+
+/// The source's workspace, `host` on it, holding a live anchor: a whole
+/// rebind of the source refuses with `session_migrated`, exit 2, naming
+/// the copy and its workspace, with and without `--wait 0`, and changes
+/// neither the source nor the copy in the bucket or on this host. The
+/// move's `tick.lock` and a tick's `cloud-tick.id` are host-local
+/// bookkeeping and are left out of the comparison.
+fn assert_whole_rebind_refused(w: &World, host: &Host, copy_host: &Host) {
+    let opened = ok(
+        host,
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "h-whole",
+            "--source",
+            "startup",
+        ],
+    );
+    let anchor = opened
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("anchor="))
+        .expect("anchor open printed no anchor line")
+        .to_string();
+    let comparable = |u: Untouched| -> Untouched {
+        Untouched {
+            bucket: u.bucket,
+            local: u
+                .local
+                .into_iter()
+                .map(|mut files| {
+                    files.remove("cloud-tick.id");
+                    files.remove("tick.lock");
+                    files
+                })
+                .collect(),
+        }
+    };
+    let before = comparable(w.untouched(copy_host, "v2"));
+    w.s3.clear_requests();
+    let mut wrong = Vec::new();
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["session", "rebind", "v2", "--whole"],
+        vec!["session", "rebind", "v2", "--whole", "--wait", "0"],
+    ];
+    for argv in cases {
+        let r = read_with_anchor(host, &anchor, &argv);
+        let all = format!("{}{}", r.stdout, r.stderr);
+        let refused = r.code == Some(2)
+            && all.contains("session_migrated")
+            && all.contains("'v2'")
+            && all.contains(&copy_host.ws_str());
+        if !refused {
+            wrong.push(format!(
+                "{} (want exit 2): {}",
+                argv.join(" "),
+                r.describe()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let after = comparable(w.untouched(copy_host, "v2"));
+    assert_eq!(after.bucket, before.bucket, "the bucket changed");
+    assert_eq!(after.local, before.local, "a local copy changed");
+    assert_no_bucket_writes(&w.s3, "a refused whole rebind");
+}
+
+#[test]
+fn a_whole_rebind_still_refuses_on_a_migrated_source() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.b, &w.s3);
+    w.init(&w.a, "other", &[]);
+    w.source_and_moved_copy(&w.b);
+    assert_whole_rebind_refused(&w, &w.a, &w.b);
+}
+
+#[test]
+fn a_whole_rebind_still_refuses_on_a_same_host_migrated_source() {
+    let w = World::new();
+    assert_scratch(&w.root, &w.a, &w.s3);
+    assert_scratch(&w.root, &w.a2, &w.s3);
+    w.init(&w.a, "other", &[]);
+    w.source_and_moved_copy(&w.a2);
+    assert_whole_rebind_refused(&w, &w.a, &w.a2);
+}
+
 // ---------------------------------------------------------------------
 // A source whose own back-reference is owed
 // ---------------------------------------------------------------------

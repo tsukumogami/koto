@@ -355,9 +355,18 @@ credential:
 `reason` is `not-absolute` or `credential`. A child that copied its parent's record has nothing to
 report, so its response carries no `environment` object.
 
-**The record can't be changed.** No command rewrites it, because a command that could would be the
-same bypass with an extra step. To run a session's commands with different values, start a new
-session: `koto cancel --cleanup <name>`, then `koto init` again.
+**One command replaces the record: `koto session rebind --whole`.** No tick, attach or other
+verb rewrites it, because a command that could would be the same bypass with an extra step. The
+exception is a takeover. When an agent session picks up a run another one drove,
+`koto session rebind <name> --whole`, run from the new agent session (whose `KOTO_ANCHOR` names
+its anchor), moves the whole binding to it, the command environment included. It records `PATH`, `HOME` and
+`XDG_CONFIG_HOME` from its own process exactly as `koto init` does, keeps the legacy flag as it
+was, and logs the new record in an `environment_rerecorded` event, with the dropped `PATH`
+entries and the names of the variables that changed, before it writes the header. A session with
+no record yet is left for its next tick to adopt one. The same holder running the move again from
+a shell with different values records those. See [session rebind](cli-usage.md#session-rebind)
+for the rest of what the move does. Outside a takeover, to run a session's commands with
+different values, start a new session: `koto cancel --cleanup <name>`, then `koto init` again.
 
 #### Opting out for this release: `--legacy-environment`
 
@@ -381,7 +390,7 @@ appends one `environment_adopted` event and prefixes that response's `directive`
 notice:
 
 ```
-[koto] Session 'demo' had no recorded command environment; its commands now run with PATH=/home/dev/.cargo/bin:/usr/bin:/bin, HOME=/home/dev, XDG_CONFIG_HOME=(unset). Dropped PATH entries that resolve relative to the working directory: node_modules/.bin. Other variables reach them only when koto's default list or the template's pass_env names them. The record can't be changed; start a new session to run with a different one.
+[koto] Session 'demo' had no recorded command environment; its commands now run with PATH=/home/dev/.cargo/bin:/usr/bin:/bin, HOME=/home/dev, XDG_CONFIG_HOME=(unset). Dropped PATH entries that resolve relative to the working directory: node_modules/.bin. Other variables reach them only when koto's default list or the template's pass_env names them. The record stays until `koto session rebind demo --whole`, run by an agent session taking the session over, records that session's values; otherwise start a new session to run with a different one.
 ```
 
 The next tick finds the record and takes the ordinary path.
@@ -400,7 +409,7 @@ stderr), the response's `directive` opens with a note. It names what failed, the
 or, when nothing is missing, the `PATH` the command ran under, and the remedy:
 
 ```
-[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. The record can't be changed; to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
+[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. Only `koto session rebind demo --whole`, run by an agent session taking the session over, records new values; otherwise, to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
 ```
 
 A failing action is named as `the default action of state '<state>'`. Stale values with nothing
@@ -444,8 +453,10 @@ purpose, who is usually also the one who created it.
 | Writing a binary into a user-writable directory on the recorded `PATH`, or editing `~/.gitconfig` under the recorded `HOME` in place | -- | Not served: that's file tampering |
 | Editing the session header or log | -- | Not served |
 
-What you get is this: a session's `PATH`, `HOME` and `XDG_CONFIG_HOME` can't change after
-creation, and shell and git or gh configuration injection names never reach its commands. It
+What you get is this: a session's `PATH`, `HOME` and `XDG_CONFIG_HOME` stay as recorded at
+creation unless an agent session takes the run over with `koto session rebind <name> --whole`,
+which records its own values and logs `environment_rerecorded`. Shell and git or gh configuration
+injection names never reach its commands. It
 doesn't promise that an agent which also creates the session can't widen it. In this release
 that agent can pass `--legacy-environment`. Process attributes other than the environment, such as
 the umask and resource limits, are still inherited. The design document for this change,
@@ -974,6 +985,11 @@ This is the only verb that changes an anchor, and the move lands in the log as a
 on, so a rebind is auditable rather than silent. Rebinding to the directory the session is
 already bound to writes nothing and reports `"rebound": false`. It works on any session,
 including one created by another session, and rebinding a child doesn't move its parent.
+
+When a run changes hands between agent sessions rather than directories, `--whole` moves the
+anchor along with the session's held-by links, its `/workflows` publish location and its
+recorded command environment, and fences off every process that read the session before the
+move. See [session rebind](cli-usage.md#session-rebind).
 
 Both refusals name it, but the repairs still differ: the mismatch refusal can also be repaired by
 just running from the anchor, while the unresolvable one leaves rebinding as the only way out

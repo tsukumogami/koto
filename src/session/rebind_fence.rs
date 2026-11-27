@@ -144,7 +144,8 @@ pub fn check(
 /// whole-binding move (`origin.whole_epoch` above `0`). A header without one
 /// passes: the plain rebind's fence is [`check`]'s alone.
 ///
-/// Refused when the process read a lower epoch than the header's, or when
+/// Refused when the process read an epoch below the header's
+/// `whole_epoch` (it read the session before the move), or when
 /// `cwd` is under a retired anchor and either isn't under the current anchor
 /// or is under a retired anchor deeper (more path components) than the
 /// current one. So after a move up into a parent the old directory is
@@ -164,7 +165,10 @@ pub fn check_whole(
         anchor: fence.anchor.as_ref().map(|a| a.display().to_string()),
         from_retired,
     };
-    if seen_epoch.is_some_and(|seen| seen < fence.epoch) {
+    // Measured against the move's epoch, not the anchor's: a plain rebind
+    // after the move (run from a gate, say) bumps only `anchor_epoch`, and
+    // the tick that read the session after the move must keep writing.
+    if seen_epoch.is_some_and(|seen| seen < fence.whole_epoch) {
         return Err(refuse(false));
     }
     let Some(cwd) = cwd else {
@@ -294,6 +298,21 @@ mod tests {
         assert!(at("/ws/a/b/c").is_ok());
         assert!(at("/ws/a/c").unwrap_err().from_retired);
         assert!(check_whole("wf", down, None, None).is_ok());
+    }
+
+    #[test]
+    fn a_plain_rebind_after_a_whole_move_leaves_reads_since_the_move_their_epoch() {
+        // A whole move to /ws/a recorded epoch 3; a plain rebind (from a
+        // gate, say) then moved the anchor to /ws/a/b, epoch 4. A read taken
+        // after the whole move is still current; one from before it isn't.
+        let line = r#"{"execution_dir":"/ws/a/b","origin":{"anchor":"/ws/a/b","store":{"kind":"local","base":"/s"},"anchor_epoch":4,"whole_epoch":3,"retired_anchors":["/ws/a","/ws/old"]}}"#;
+        let at = |cwd: &str, seen| check_whole("wf", line, Some(Path::new(cwd)), seen);
+        assert!(at("/ws/a/b", Some(3)).is_ok());
+        assert!(at("/ws/a/b/c", Some(4)).is_ok());
+        assert!(at("/elsewhere", Some(3)).is_ok());
+        assert!(!at("/ws/a/b", Some(2)).unwrap_err().from_retired);
+        // The plain rebind's retired anchor still refuses by path.
+        assert!(at("/ws/a/c", Some(3)).unwrap_err().from_retired);
     }
 
     #[test]

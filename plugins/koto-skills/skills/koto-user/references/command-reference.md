@@ -26,7 +26,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session cleanup` | Runner — primary |
 | `koto session prune` | Runner and operator — removing finished sessions in bulk |
 | `koto session recover` | Operator — one-time migration recovery |
-| `koto session rebind` | Runner — after a checkout moves |
+| `koto session rebind` | Runner — after a checkout moves; with `--whole`, an agent session taking a run over |
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg; or a session that carries on another's work, naming it with `--continues` |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
@@ -111,7 +111,7 @@ Under the cloud backend `<pred>` usually lives under another workspace's prefix 
 **Notes:**
 - `--var` values are validated against an allowlist because a substituted `{{KEY}}` can land in a gate command (run via `sh -c`), an agent instruction, a context key, or a `context-matches` regex. Allowed characters: letters, digits, `. _ - /`, `:`, `@`, `+`, and spaces. This covers structured data values such as Gmail filters (`newer_than:90d`, `from:user@example.com`), names with spaces (a calendar title), and paths or versions carrying a `+` (a directory such as `workspace+instance`, a `1.2.0+build` version). Shell metacharacters -- `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines -- are **rejected** so a value cannot inject a command. A space is allowed but is not shell-quoted for you: when a value may contain spaces, quote the reference in the template (e.g. `--calendar "{{CALENDAR}}"`) so it stays a single argument. An empty value (an optional variable left unset, or one with an empty default) is safe unquoted: `--flag {{VAR}}` renders `--flag ''` rather than dropping the token, so the next flag isn't consumed as the value.
 - Reserved variable names `SESSION_DIR` and `SESSION_NAME` cannot be declared in templates. They are injected automatically. A state's `capture_stdout_as` name is also reserved against them, and against every other state's capture name — the compiler rejects a collision.
-- The session also records the **environment its commands run with**: `PATH` (empty and relative entries dropped), `HOME` and `XDG_CONFIG_HOME` from the `koto init` process, plus koto's default list of names read live on each tick. When recording drops a `PATH` entry or leaves a value unset (relative, or containing a token's or proxy URL's value), the output adds `"environment": {"dropped_path_entries": [...], "unset": [{"variable", "reason"}]}`. A child copies its parent's record. The record can't be changed; see `error-handling.md#command-environment-notes`.
+- The session also records the **environment its commands run with**: `PATH` (empty and relative entries dropped), `HOME` and `XDG_CONFIG_HOME` from the `koto init` process, plus koto's default list of names read live on each tick. When recording drops a `PATH` entry or leaves a value unset (relative, or containing a token's or proxy URL's value), the output adds `"environment": {"dropped_path_entries": [...], "unset": [{"variable", "reason"}]}`. A child copies its parent's record. Only `koto session rebind <name> --whole` replaces the record afterwards (it records the caller's values and logs `environment_rerecorded`); see `error-handling.md#command-environment-notes`.
 - The session records an **execution anchor** at init: the canonical directory `koto init` ran in, or `--execution-dir` when given. Every later `koto next` must run there or beneath it, and every gate and action of an accepted tick runs at the anchor itself. A child created with `--parent` copies the parent's recorded anchor rather than taking the spawning process's directory, which keeps a whole workflow tree pointed at one checkout. See the `koto next` section below.
 - If a `--template` source uses legacy-mode gates (no `gates.*` when-clause routing), `koto init` emits a warning to **stderr** and still succeeds. The `--from-stdin` path is strict: a legacy gate is **rejected**, naming the offending state and gate.
 - `--from-stdin` writes both the compiled artifact and the human-readable source into the session directory (the source under a fixed filename), so the workflow survives global cache eviction and the authored definition stays recoverable for audit. Do not embed secrets in the definition; reference `$VAR` / files read at gate-evaluation time instead. A `$VAR` a command reads reaches it only when the name is on koto's default list (which includes `GH_TOKEN` and `GITHUB_TOKEN`) or declared in the definition's `pass_env:` list; its value is read live and never written to the session.
@@ -932,6 +932,7 @@ Exits non-zero only when a move was attempted and failed. Those sessions stay in
 
 ```
 koto session rebind <name> [--to <dir>]
+koto session rebind <name> --whole [--wait <secs>] [--to <dir>]
 ```
 
 Moves a session's execution anchor — the directory every tick runs its gates and actions in, and the one `koto next` refuses from anywhere outside. Use it when a checkout genuinely moved. `--to` defaults to the directory you run the command in, so the usual repair is to stand in the new checkout and run `koto session rebind <name>`.
@@ -959,6 +960,47 @@ A rebind fences the old anchor: it raises `origin.anchor_epoch` and lists the ol
 Which refusal you are repairing matters. On the same host, `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
 
 `rebind` is for a checkout that moved on one host. A session that has to continue on another machine, or in another workspace, is moved with `koto session import`, not rebound.
+
+### Taking a session over: `--whole [--wait <secs>]`
+
+`--whole` is for an agent session picking up a run another agent session drove. Run it from the new agent session, whose shells carry its `KOTO_ANCHOR`. One call moves the whole binding to the caller, under the session's `tick.lock` held exclusive:
+
+- the execution directory and origin anchor, as above, plus `origin.whole_epoch` set to the new `anchor_epoch`;
+- the held-by links: the caller's anchor becomes the only one;
+- the stored `/workflows` publish location, which is dropped, so the next commit publishes to `KOTO_WORKFLOWS_DIR` or the caller's Claude Code session folder;
+- the recorded command environment, replaced with the caller's `PATH`, `HOME` and `XDG_CONFIG_HOME` (a session with no record yet is left to adopt one on its next tick).
+
+```json
+{"name":"deploy","rebound":true,"from":"/home/dev/repo","to":"/home/dev/work/repo","whole":true,"waited":false,
+ "held_by":{"added":"anchor-9a07","removed":["anchor-1f3c"]},
+ "publish_location":{"dropped":true},
+ "environment":{"rerecorded":true,"changed":["XDG_CONFIG_HOME"]}}
+```
+
+| Field | Meaning |
+|---|---|
+| `rebound` | `true` when this call committed the move. `false` on a re-run that found it committed. |
+| `whole` | Always `true`. |
+| `waited` | `true` when a tick held `tick.lock` on the first try and the move waited for it. |
+| `held_by` | `added`: the caller's anchor, or `null` when the link was already there. `removed`: the other anchors whose links went, sorted. |
+| `publish_location` | `dropped`: whether a stored location was removed. |
+| `environment` | `rerecorded`: whether the record was replaced. `changed`: the variables whose recorded value changed, by name. |
+
+Each part is logged before it's made: `execution_anchor_rebound` with `whole: true` and `epoch`, then `held_by_rebound`, `publish_location_dropped` and `environment_rerecorded`. A move stopped part way finishes when you run the same command again, with no part made twice. Run again after a complete move, it changes nothing (`rebound: false`, `added: null`, `removed: []`, `dropped: false`, `rerecorded: false`) unless your environment differs from the record.
+
+`--wait <secs>` (10 by default, only with `--whole`) bounds the wait for a tick in flight, retried every 50 ms; `--wait 0` refuses at once. Moves get no priority over ticks, so a session ticked back to back can keep the move out until `--wait` runs out; run it again.
+
+Refusals print `{"error": {"code", "message"}, "command": "session rebind"}` on stdout and write nothing:
+
+| Code | Exit | When | What to do |
+|---|---|---|---|
+| `nested_invocation` | 2 | Run from inside a command the session's own tick is running | Run it once that tick has returned |
+| `no_anchor` | 2 | `KOTO_ANCHOR` is unset, names this session, or doesn't name an anchor on this machine | Run it from the agent session taking the session over |
+| `background_run_in_flight` | 2 | A `background: true` run of the session is in flight (`run_id` names it) | Keep ticking until the run's result lands, or cancel it, then move |
+| `session_busy` | 1 | A tick still held `tick.lock` when `--wait` ran out | Retry, or give `--wait` more seconds |
+| `rebind_cross_host` | 2 | Cloud backend: another machine uploaded the session's `version.json` last | Don't move it here; take it over with `koto session import`, then move the copy |
+
+A move that a rebind elsewhere overtook fails on stderr with `session_rebound:`, exit 1. Once a move has landed, every process that read the session before it, and every process under a retired anchor that is outside the new one or deeper than it, is refused with `session_rebound` on both backends; the move's own process isn't. Every host that touches a session moved this way needs this koto release or later: an older koto that rewrites the header drops `whole_epoch`, and the fence goes with it.
 
 ---
 
@@ -1181,7 +1223,7 @@ It works from any directory on the host that holds the session's copy, and it do
 | `auto` | Apply the strict-prefix rule per child: if one side is a byte-prefix of the other, the longer side wins. Divergent logs surface as a `conflict` entry and the command exits non-zero so the caller runs `koto session resolve <child>` on each flagged child. |
 | `skip` | Leave child state files untouched. The parent reconciles alone. |
 | `accept-remote` | Unconditionally overwrite local child state with remote. |
-| `accept-local` | Unconditionally overwrite remote child state with local. |
+| `accept-local` | Overwrite remote child state with local, unless a rebind moved the remote child past the local copy: that child is reported `errored` with a `session_rebound` message and left as it is. |
 
 Response shape (cloud backend only — `sync_status` and `machine_id` are elided under the local backend, which rejects the command anyway):
 

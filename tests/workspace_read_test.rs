@@ -375,6 +375,27 @@ fn a_missing_session_or_workspace_is_not_found() {
     assert_eq!(writes(&f.s3), Vec::<String>::new());
 }
 
+/// A read that fails after the session was fetched, so with its scratch
+/// directory already in place, removes it on the way out: `read` asserts
+/// the run's `TMPDIR` is empty. The removal is an exit hook, so the error
+/// exit runs it as the normal return and the `context exists` exit do.
+#[test]
+fn a_read_that_fails_after_fetching_leaves_no_scratch() {
+    let f = fixture();
+    f.s3.clear_requests();
+    let run = read(&f.b, &f.a.prefix(), &["context", "get", NAME, "absent.md"]);
+    assert_ne!(run.code, Some(0), "{}", run.describe());
+    assert_ne!(run.code, Some(101), "{}", run.describe());
+    // The session was read, so the failure came after the scratch
+    // directory existed.
+    assert!(
+        f.s3.requests().iter().any(|r| r.method == "GET"),
+        "the read fetched nothing before it failed: {}",
+        run.describe()
+    );
+    assert_eq!(writes(&f.s3), Vec::<String>::new());
+}
+
 /// A bucket that can't be listed is unreadable, exit 3, never an empty
 /// workspace or a missing session.
 #[test]
@@ -683,4 +704,50 @@ fn a_workspace_that_names_nothing_or_a_local_backend_is_refused() {
     let json: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json["code"], "workspace_needs_cloud", "{json}");
+}
+
+/// A whole rebind is a write: it refuses `--workspace` with
+/// `workspace_read_only`, exit 2, before any request, whatever its other
+/// arguments, and before the anchor check that would refuse it here for
+/// running without `KOTO_ANCHOR`.
+#[test]
+fn a_whole_rebind_refuses_workspace() {
+    let f = fixture();
+    let before = objects(&f.s3);
+    f.s3.clear_requests();
+    let b_ws = f.b.ws_str();
+    let refused: Vec<Vec<&str>> = vec![
+        vec!["session", "rebind", NAME, "--whole"],
+        vec!["session", "rebind", NAME, "--whole", "--wait", "0"],
+        vec!["session", "rebind", NAME, "--whole", "--to", &b_ws],
+    ];
+    for args in refused {
+        let run = read(&f.b, &f.a.prefix(), &args);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+        assert_eq!(
+            run.json["code"],
+            "workspace_read_only",
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+        assert!(
+            run.json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("--workspace")),
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+    }
+    assert!(f.s3.requests().is_empty(), "a refused verb made requests");
+    assert_eq!(objects(&f.s3), before);
+    let status = f.a.koto(&["status", NAME]);
+    assert_eq!(status.json["current_state"], "done");
 }

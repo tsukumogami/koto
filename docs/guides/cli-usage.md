@@ -102,7 +102,7 @@ When recording drops a `PATH` entry, or leaves a value unset because it was rela
 {"name":"my-workflow","state":"assess","environment":{"dropped_path_entries":["node_modules/.bin"],"unset":[]}}
 ```
 
-The record can't be changed. If a tool moves off the recorded `PATH`, or you need different values, start a new session: `koto cancel --cleanup <name>`, then `koto init` again. When a gate or action fails and a recorded value no longer exists, or the command wasn't found, the `koto next` response's `directive` opens with a note naming the gate or action, the missing values, and that remedy.
+One command changes the record once it's there: `koto session rebind <name> --whole`, run by the agent session taking the session over, records a new one from its own process and logs `environment_rerecorded` (see [session rebind](#session-rebind)). Otherwise, if a tool moves off the recorded `PATH`, or you need different values, start a new session: `koto cancel --cleanup <name>`, then `koto init` again. When a gate or action fails and a recorded value no longer exists, or the command wasn't found, the `koto next` response's `directive` opens with a note naming the gate or action, the missing values, and that remedy.
 
 - `--legacy-environment` -- Run this session's commands with the caller's whole environment, plus `KOTO_TICK_SESSION`, as koto did before it recorded one. It's recorded in the session at creation, children copy it, and no later command can set or clear it, so it has no effect when `--attach-live` attaches to an existing session. It's refused with `--parent`, since a child takes its parent's record. **Temporary:** it will be removed in the next release, once the test harnesses of shirabe (a workflow skills plugin built on koto) have migrated off it. Declare what your commands need in the template's `pass_env:` instead.
 
@@ -977,6 +977,59 @@ For a workflow session, a dispatched-by link of its own comes first, with `via` 
 
 The command reads through the configured store backend, as `koto status` does, and writes nothing to it. Under the cloud backend it may refresh this host's copy of what it reads, as every read does, but it never pushes to the bucket: where `koto context get` would push this host's newer copy of a key, this command leaves it. A malformed name or a name with no session exits 2; a read that fails otherwise exits 3, a held-by anchor whose log is there but can't be read included, so a store that can't be read is never reported as a lost dispatcher.
 
+#### session rebind
+
+Moves a session's binding to a directory on this host.
+
+```bash
+koto session rebind <name> [--to <dir>]
+koto session rebind <name> --whole [--wait <secs>] [--to <dir>]
+```
+
+`--to` defaults to the directory you run the command from. The target is canonicalized, and one that names nothing or names a file is refused with nothing changed.
+
+Without `--whole`, it moves the execution anchor alone, for a checkout that moved. The header's `execution_dir` and `origin.anchor` become the target, `origin.anchor_epoch` goes up by one, the old anchor joins `origin.retired_anchors`, and an `execution_anchor_rebound` event records `from` and `to`. The koto-user command reference gives its output, and the [cloud sync guide](cloud-sync-setup.md#rebinding-a-session-on-this-host) covers what it does under the cloud backend.
+
+**Taking a session over: `--whole`.** A run picked up by another agent session needs more than a new directory. `--whole` moves everything that ties the session to the agent session that ran it before, in one call, and hands it to the caller: the agent session whose anchor `KOTO_ANCHOR` names (see [session anchor](#session-anchor)).
+
+- **The execution directory and origin anchor**, as a plain rebind moves them, plus `origin.whole_epoch`, set to the new `anchor_epoch`. That turns on the fence described below.
+- **The held-by links.** The caller's anchor becomes the session's only held-by link: koto adds `koto/links/held-by/<caller's anchor>` when it's missing and removes every other one. That includes a link to an agent session that's still open in an unrelated directory, and it's deliberate: `--whole` hands the session to the caller, and the fence refuses any process that read the session before the move, so a holder left in place would keep the session counted as held (by retention, among others) by an agent that can no longer write to it.
+- **The publish location.** The stored `/workflows` location (`workflows/publish-location`, and `workflows/publish-explicit` when `koto workflows publish` set it) is dropped, so the next commit resolves it afresh: `KOTO_WORKFLOWS_DIR` when that's set, otherwise the folder of the Claude Code session driving the tick. The move itself renders nothing. The old folder's file keeps its last state and stops changing.
+- **The command environment.** The session's recorded `PATH`, `HOME` and `XDG_CONFIG_HOME` are replaced with the caller's, recorded the way `koto init` records them, so later gates and actions run with the new holder's values. The legacy flag stays as it was. A session with no record yet is left alone, and its next tick adopts one.
+
+Each part is logged by its own event before it's made, in this order: `execution_anchor_rebound` (with `whole: true` and the `epoch` the move committed), `held_by_rebound`, `publish_location_dropped` (only when a location was stored) and `environment_rerecorded`. A part with nothing to change logs nothing. The [session feed](../reference/session-feed.md) gives each event's fields.
+
+```json
+{"name":"deploy","rebound":true,"from":"/home/dev/repo","to":"/home/dev/work/repo","whole":true,"waited":false,
+ "held_by":{"added":"anchor-9a07","removed":["anchor-1f3c"]},
+ "publish_location":{"dropped":true},
+ "environment":{"rerecorded":true,"changed":["XDG_CONFIG_HOME"]}}
+```
+
+`waited` is `true` when a tick held the session's lock on the first try. `held_by.added` is the caller's anchor, or `null` when the link was already there; `removed` lists the other anchors, sorted. `environment.changed` names the variables whose recorded value changed, never their values.
+
+The move holds the session's `tick.lock` exclusive from before its first read to its last write. A tick in flight holds that lock shared, so the move waits for it, asking again every 50 ms for up to `--wait` seconds (10 by default). `--wait 0` asks once. There's no writer preference: a move that back-to-back ticks keep out refuses `session_busy` like any other, and you run it again. A tick that arrives during the move waits for it (up to its own 30 seconds) and then meets the moved header. From the old anchor that's `execution_anchor_mismatch`, or `session_rebound` when the old directory lies inside the new anchor and under a retired one deeper than it. `--wait` is accepted only with `--whole`.
+
+Once a move has written `whole_epoch`, writes to the session are fenced on both backends. A process that first read the session before the move is refused with `session_rebound` wherever it runs, even if it reads the session again afterwards. A process running under a retired anchor is refused too, when its directory is outside the current anchor or under a retired anchor deeper than the current one. So after a move up into a parent directory the old directory is fenced, and after a move down into a subdirectory the new one isn't. A process whose working directory can't be read has nothing to compare, so the directory rule passes it; the read rule still applies. The process making the move passes its own fence, even when it runs from the directory it retired, until another move raises the epoch again.
+
+A move stopped part way, by a crash or a failed write, finishes when you run the same command again, and no part happens twice: each event carries the move's epoch, and a re-run makes only the parts its move hasn't logged as done. A crash between the move's event and its header rewrite is finished from the event, without a second one. Run again after a complete move, it changes nothing and prints `rebound: false`, `added: null`, `removed: []`, `dropped: false`, `rerecorded: false` and `changed: []`, unless the caller's environment differs from the record, which it records again. It works on a child (only the child moves), on a finished child, and when every directory the session recorded is gone. A session with no origin record is moved and logged, but has nothing to fence: its `execution_anchor_rebound` carries no `epoch`, and the other parts log `epoch: 0`.
+
+Refusals print `{"error": {"code", "message"}, "command": "session rebind"}` on stdout and write nothing:
+
+| Code | Exit | When |
+|------|:----:|------|
+| `nested_invocation` | 2 | The command ran inside a command the session's own tick is running (`KOTO_TICK_SESSION` names the session). That tick holds the lock the move needs until the command returns. Run the move once the tick has returned. |
+| `no_anchor` | 2 | `KOTO_ANCHOR` is unset, names this session, or names something that isn't an anchor on this machine. Run it from the agent session taking the session over. |
+| `background_run_in_flight` | 2 | A `background: true` run of the session is still in flight; the body adds `run_id`. Let the run finish, or cancel it, then move. |
+| `session_busy` | 1 | A tick still held `tick.lock` when `--wait` ran out. Run it again once the tick returns, or with a longer `--wait`. |
+| `rebind_cross_host` | 2 | Cloud backend: the bucket's `version.json` was last written by another machine. A move here would fence that host off without its knowing. Move the session with `koto session import`, then move the copy it makes. |
+
+`--workspace` refuses with `workspace_read_only` before any of these, `session_migrated` and the plain rebind's refusals keep their shapes, and an unknown session name exits 1 on stderr. A move that loses to a rebind made elsewhere after it read the session exits 1 with a message on stderr starting `session_rebound:`.
+
+Under the cloud backend the move pulls the session under `tick.lock` and creates the session's directory first when this host has no copy yet. It refuses `rebind_cross_host` after the pull, from the bucket's `version.json`. Its commit, the move event and the new header, is PUT to the bucket first, conditional on the copy it pulled, and adopted here only once the bucket took it. If the bucket's copy moved in between, nothing is written anywhere and a re-run starts from the newer copy. After the parts, it uploads `version.json` one version above the one it read, as this machine's, so a host that pushed before the move refuses its next flush with `session_rebound`. The context then moves to the session's new home when the move changed it, as a plain rebind carries it.
+
+**Older builds.** An older koto doesn't know `whole_epoch`. If one rewrites the header of a session moved with `--whole`, on any host, the field is dropped, and a stale process of the new build then passes the whole-binding fence. Every host that touches such a session needs this release or later.
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
@@ -1642,7 +1695,7 @@ koto session resolve <name> --keep remote
   - `auto` (default) — apply the strict-prefix rule to each child's state file. When one side is a byte-exact prefix of the other, the longer side wins; any other divergence surfaces as a conflict that needs its own `koto session resolve <child>`.
   - `skip` — leave child state files untouched.
   - `accept-remote` — overwrite local child state with remote.
-  - `accept-local` — overwrite remote child state with local.
+  - `accept-local` — overwrite remote child state with local. A child a rebind moved past this host's copy is reported `errored` with a `session_rebound` message and left as it is.
 
 After resolving, normal operations resume.
 
