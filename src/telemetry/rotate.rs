@@ -32,7 +32,9 @@ pub(crate) const READERS_DIR: &str = "_run_journal.readers";
 /// The largest position file koto reads.
 const MAX_POSITION_BYTES: u64 = 4096;
 
-/// The three run-journal settings, resolved from user config.
+/// The rotation and retention settings: the three `[run_journal]` keys
+/// rotation reads, resolved from user config. The table's fourth key,
+/// `enabled`, is read by the write path, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settings {
     /// 0 turns rotation off.
@@ -52,19 +54,17 @@ impl Default for Settings {
     }
 }
 
-/// The settings, read from config once per process. A config that can't be
-/// read leaves the defaults, so rotation stays off.
+/// The settings, from the `[run_journal]` table the journal resolves once
+/// per process (`super::journal_config`). A config that can't be read
+/// leaves the defaults, so rotation stays off.
 #[cfg(not(test))]
 fn settings() -> Settings {
-    static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
-    *SETTINGS.get_or_init(|| match crate::config::resolve::load_config() {
-        Ok(c) => Settings {
-            rotate_bytes: c.run_journal.rotate_bytes,
-            retain_days: c.run_journal.retain_days,
-            reader_stale_days: c.run_journal.reader_stale_days,
-        },
-        Err(_) => Settings::default(),
-    })
+    let c = super::journal_config();
+    Settings {
+        rotate_bytes: c.rotate_bytes,
+        retain_days: c.retain_days,
+        reader_stale_days: c.reader_stale_days,
+    }
 }
 
 /// Print a rotation warning on stderr.
