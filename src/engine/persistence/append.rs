@@ -1063,7 +1063,16 @@ fn refuse_if_fenced(path: &Path, content: &str, payload: &EventPayload) -> anyho
 /// fences this process off (`crate::session::fence_state::check`). A
 /// `context_read` passes, as it does [`refuse_if_fenced`]: it records a
 /// read, and reads of a session keep working wherever they run from.
-fn refuse_if_rebound(path: &Path, content: &str, payload: &EventPayload) -> anyhow::Result<()> {
+///
+/// Only `content`'s first line is read; `path` names the log whose first
+/// read this process recorded, and is never opened. The cloud backend asks
+/// it of the bucket's copy of a run it closes, as [`append_close`] asks it
+/// of a local log.
+pub(crate) fn refuse_if_rebound(
+    path: &Path,
+    content: &str,
+    payload: &EventPayload,
+) -> anyhow::Result<()> {
     if matches!(payload, EventPayload::ContextRead { .. }) {
         return Ok(());
     }
@@ -1291,8 +1300,9 @@ fn tear_close(path: &Path, buf: &str) -> ! {
 
 /// The events [`append_close`] owes the log whose bytes are `content`, in
 /// the order they go in: the side events, the cancel unless the run already
-/// stands cancelled, then `fence` unless the log holds it.
-fn close_payloads(
+/// stands cancelled, then `fence` unless the log holds it. The cloud
+/// backend works out the lines it puts in a bucket copy with it too.
+pub(crate) fn close_payloads(
     content: &str,
     close: &Close,
     fence: &SupersedeFence,

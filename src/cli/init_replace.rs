@@ -40,6 +40,14 @@
 //! repairs a NEW an interrupted `koto init --replaces` left without its
 //! key. A NEW whose key names another run is refused `session_exists`. Its
 //! refusals print the nested envelope `koto session rebind` prints.
+//!
+//! Under the cloud backend OLD's checks and its close are made against the
+//! bucket's copy of it, pulled from its home prefix. Every line the close
+//! owes that copy goes up in one PUT conditional on the copy pulled, with no
+//! unconditional fallback, and this host's copy then takes the same close,
+//! worked out against its own bytes when it holds events the bucket's lacks.
+//! A PUT the bucket refuses is `fence_unavailable`, exit 3, with nothing of
+//! the close written in either copy; running the command again finishes.
 
 use std::path::Path;
 use std::time::Duration;
@@ -53,8 +61,8 @@ use crate::engine::persistence::{
     CloseOutcome, SupersedeFence, FENCE_LOCK_WAIT, REPLACE_FAULT_ENV,
 };
 use crate::engine::types::{generate_session_id, now_iso8601, Event, SessionKind, StateFileHeader};
+use crate::session::cloud::{CloudBackend, CloudClose, PulledState};
 use crate::session::context::ContextStore;
-use crate::session::local::LocalBackend;
 use crate::session::tick_lock::{take_exclusive, TakeError};
 use crate::session::{Backend, SessionBackend};
 
@@ -361,19 +369,6 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
             serde_json::Value::Null,
         );
     }
-    let local = match backend {
-        Backend::Local(local) => local,
-        Backend::Cloud(_) => refuse(
-            front,
-            "invalid_usage",
-            format!(
-                "{p}: the cloud backend can't close a replaced run in this release; nothing \
-                 was written"
-            ),
-            super::EXIT_CALLER_ERROR,
-            serde_json::Value::Null,
-        ),
-    };
     if !backend.exists(old) {
         refuse(
             front,
@@ -383,12 +378,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
             serde_json::Value::Null,
         );
     }
-    let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
-        failed(
-            front,
-            format!("{p}: could not read '{old}''s log: {e:#}; nothing was written"),
-        )
-    });
+    let (old_header, old_events) = read_old(backend, front, old);
     if old_header.session_kind() != SessionKind::Ordinary {
         refuse(
             front,
@@ -487,20 +477,48 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         precheck_new(args);
     }
 
-    // 2. OLD's tick lock.
+    // 2. OLD's tick lock. Under the cloud backend this host may hold no
+    // copy of OLD yet, and the lock lives in its local directory.
     let dir = backend.session_dir(old);
+    if backend.as_cloud().is_some() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            failed(
+                front,
+                format!(
+                    "{p}: '{old}''s directory for its tick.lock couldn't be made: {e}; nothing \
+                     was written"
+                ),
+            );
+        }
+    }
     let (tick_lock, waited) = take_tick_lock(old, &dir, job);
     let tick_in_flight = tick_lock.is_none();
     crash_at("after-lock");
 
     // 3. Stop OLD's runner, from its log as it stands under the lock.
-    let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
-        failed(
-            front,
-            format!("{p}: could not read '{old}''s log: {e:#}; nothing was written"),
-        )
-    });
-    let side_events = super::stop_session_pool_work(backend, old, &old_events);
+    if let Some(cloud) = backend.as_cloud() {
+        // Writes a stopped tick left on this host go up first, so the
+        // bucket's copy holds them before the close is put on it.
+        if let Err(e) = cloud.flush_interrupted_batch(old) {
+            failed(
+                front,
+                format!(
+                    "{p}: the writes this host holds for '{old}' couldn't be pushed to the \
+                     bucket: {e:#}; '{old}' wasn't closed"
+                ),
+            );
+        }
+    }
+    let (old_header, old_events) = read_old(backend, front, old);
+    // The runner to stop is this host's: under the cloud backend this
+    // host's copy of OLD records what it started, whatever the bucket's
+    // copy holds.
+    let here = backend
+        .as_cloud()
+        .and_then(|_| backend.read_events_local(old).ok())
+        .map(|(_, events)| events);
+    let stop_from = here.as_deref().unwrap_or(old_events.as_slice());
+    let side_events = super::stop_session_pool_work(backend, old, stop_from);
     let cancel = owes_cancel(backend, old, &old_header, &old_events);
 
     // 4. Create NEW, unless it exists, and record what it replaces.
@@ -569,10 +587,10 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         cancel,
         fence,
     };
-    wrote |= close_old(backend, front, local, old, name, &close, &at);
+    wrote |= close_old(backend, front, old, name, &close, &at);
     if tick_in_flight {
         // The tick in flight may have started a runner since the first stop.
-        let (_, events) = backend.read_events(old).unwrap_or_else(|e| {
+        let (_, events) = read_here(backend, old).unwrap_or_else(|e| {
             failed(
                 front,
                 format!(
@@ -588,7 +606,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
                 cancel: false,
                 fence: close.fence.clone(),
             };
-            wrote |= close_old(backend, front, local, old, name, &again, &now_iso8601());
+            wrote |= close_old(backend, front, old, name, &again, &now_iso8601());
         }
     }
     drop(tick_lock);
@@ -596,8 +614,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
 
     // 6. The leg, best-effort.
     if cancel {
-        if let Some(state) = backend
-            .read_events(old)
+        if let Some(state) = read_here(backend, old)
             .ok()
             .and_then(|(_, events)| derive_state_from_log(&events))
         {
@@ -703,31 +720,159 @@ fn take_tick_lock(old: &str, dir: &Path, job: &Replace<'_>) -> (Option<std::fs::
     }
 }
 
-/// Write `close` to OLD's log, refusing as the outcome says. Returns
-/// whether anything was written.
-fn close_old(
+/// OLD's header and events, as the checks and the close read them: its
+/// log, or under the cloud backend the bucket's copy, pulled from its home
+/// prefix. Refuses, with nothing written, when they can't be read.
+fn read_old(backend: &Backend, front: Front, old: &str) -> (StateFileHeader, Vec<Event>) {
+    let p = front.prefix();
+    let Some(cloud) = backend.as_cloud() else {
+        return backend.read_events(old).unwrap_or_else(|e| {
+            failed(
+                front,
+                format!("{p}: could not read '{old}''s log: {e:#}; nothing was written"),
+            )
+        });
+    };
+    let pulled = pull_old(cloud, front, old, "nothing was written");
+    (pulled.header, pulled.events)
+}
+
+/// OLD's events as this host's copy holds them, for what this host does
+/// about its own runner and leg. Under the cloud backend that is the local
+/// copy, read without a pull, since a pull refuses a copy holding events
+/// the bucket's lacks; the bucket's copy when this host holds none.
+fn read_here(backend: &Backend, old: &str) -> Result<(StateFileHeader, Vec<Event>)> {
+    match backend.as_cloud() {
+        Some(_) => backend
+            .read_events_local(old)
+            .or_else(|_| backend.read_events(old)),
+        None => backend.read_events(old),
+    }
+}
+
+/// The bucket's copy of OLD, pulled from the prefix this host's copy
+/// records as its home, else from this workspace's own. A prefix holding
+/// none refuses `fence_unavailable`, a copy that can't be read
+/// `persistence_error`, and a fence in it naming a session koto refuses
+/// `invalid_fence`, each before anything is built from it; `after` says
+/// what was written by then.
+fn pull_old(cloud: &CloudBackend, front: Front, old: &str, after: &str) -> PulledState {
+    let p = front.prefix();
+    let prefix = cloud
+        .home_prefix(old)
+        .map(|home| home.prefix)
+        .unwrap_or_else(|_| cloud.workspace_prefix().to_string());
+    let pulled = match cloud.pull_for_fence(&prefix, old) {
+        Ok(Some(pulled)) => pulled,
+        Ok(None) => refuse(
+            front,
+            "fence_unavailable",
+            format!(
+                "{p}: the bucket holds no state of '{old}' under its workspace prefix, so it \
+                 can't be closed there; {after}"
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+        Err(e) => failed(
+            front,
+            format!("{p}: could not pull '{old}''s state from the bucket: {e:#}; {after}"),
+        ),
+    };
+    if let Err(e) = pulled.fence() {
+        refuse(
+            front,
+            "invalid_fence",
+            format!("{p}: '{old}''s log in the bucket can't be trusted: {e:#}; {after}"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    pulled
+}
+
+/// What a refusal of a close says was left behind, once NEW exists.
+fn left_as_is(front: Front, old: &str, name: &str) -> String {
+    match front {
+        Front::Init => format!(
+            "'{name}' was created and is left as it is, and '{old}' wasn't closed. Remove \
+             '{name}' with `koto cancel {name} --cleanup` if it isn't wanted"
+        ),
+        Front::Session => format!("'{name}' is left as it is, and '{old}' wasn't closed"),
+    }
+}
+
+/// Write `close` to OLD's copy in the bucket and then to this host's, as
+/// [`CloudBackend::push_close`] does, on a copy pulled just now, refusing
+/// as the outcome says. Returns whether anything was written.
+fn close_in_bucket(
     backend: &Backend,
+    cloud: &CloudBackend,
     front: Front,
-    local: &LocalBackend,
     old: &str,
     name: &str,
     close: &Close,
     at: &str,
 ) -> bool {
     let p = front.prefix();
+    let after = format!("'{old}' wasn't closed, and '{name}' exists");
+    let pulled = pull_old(cloud, front, old, &after);
+    match cloud.push_close(&pulled, close, at) {
+        CloudClose::Closed { wrote } => wrote,
+        CloudClose::FencedByOther(other) => refuse_fenced(
+            backend,
+            front,
+            old,
+            name,
+            &other,
+            &left_as_is(front, old, name),
+        ),
+        CloudClose::Rebound(rebound) => refuse(
+            front,
+            "session_rebound",
+            format!("{p}: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        ),
+        CloudClose::Unavailable(reason) => refuse(
+            front,
+            "fence_unavailable",
+            format!(
+                "{p}: '{old}' couldn't be closed in the bucket: {reason}. Nothing of the close \
+                 was written, so '{old}' is still open, and '{name}' exists. Run the command \
+                 again"
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+/// Write `close` to OLD's log, refusing as the outcome says. Returns
+/// whether anything was written. Under the cloud backend the close goes to
+/// the bucket's copy first ([`close_in_bucket`]).
+fn close_old(
+    backend: &Backend,
+    front: Front,
+    old: &str,
+    name: &str,
+    close: &Close,
+    at: &str,
+) -> bool {
+    let p = front.prefix();
+    let local = match backend {
+        Backend::Local(local) => local,
+        Backend::Cloud(cloud) => {
+            return close_in_bucket(backend, cloud, front, old, name, close, at)
+        }
+    };
     match local.append_close(old, close, at, FENCE_LOCK_WAIT) {
         Ok(CloseOutcome::Closed {
             commits,
             torn_backup,
         }) => !commits.is_empty() || torn_backup.is_some(),
         Ok(CloseOutcome::FencedByOther(other)) => {
-            let after = match front {
-                Front::Init => format!(
-                    "'{name}' was created and is left as it is, and '{old}' wasn't closed. Remove \
-                     '{name}' with `koto cancel {name} --cleanup` if it isn't wanted"
-                ),
-                Front::Session => format!("'{name}' is left as it is, and '{old}' wasn't closed"),
-            };
+            let after = left_as_is(front, old, name);
             refuse_fenced(backend, front, old, name, &other, &after)
         }
         Ok(CloseOutcome::Unavailable) => refuse(

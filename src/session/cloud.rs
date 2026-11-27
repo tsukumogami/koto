@@ -7029,7 +7029,8 @@ mod continues;
 #[path = "cloud_supersede.rs"]
 mod supersede;
 pub(crate) use supersede::{
-    check_fence_names, BucketReadFailed, CarryEntry, CarrySourceError, CloudFence, PulledState,
+    check_fence_names, BucketReadFailed, CarryEntry, CarrySourceError, CloudClose, CloudFence,
+    PulledState,
 };
 
 impl CloudBackend {
