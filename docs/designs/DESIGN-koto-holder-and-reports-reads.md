@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Draft
+status: Proposed
 problem: |
   A reader that wants a seat's past and present holders, or the seats that
   report to it, can only get them from koto today by reading every session in
@@ -8,13 +8,39 @@ problem: |
   the newer or lower session's side. The cost grows with the store, not with
   the seat, and the holder of a session is recorded as an assistant session
   id with no name.
+decision: |
+  koto writes a back-reference beside each record it already writes on the
+  newer side: a local copy of the cloud's continued-by pointer at succession,
+  and a dispatched pointer under the dispatching workflow session at dispatch,
+  on both backends, each written by koto inside a call the agent already
+  makes and trusted only after the reader checks the successor's or child's
+  own link. A rebind records its actor, koto next appends driver_changed on a
+  real driver change, and the koto-skills SessionStart hook passes the
+  assistant's session title for koto to keep as harness_name on
+  anchor_started. Since-stamps tell an old holder from one that dispatched
+  nothing. The walk lives in koto_session_reader::chain behind a read-only
+  ChainSource, and three verbs, koto session names, chain and reports, serve
+  it with one 1024-hop cap and an exit 4 for an unknown name.
+rationale: |
+  Only a record on the older or dispatching side makes a read follow the seat
+  instead of the store, and mirroring the pointer the cloud already verifies
+  reuses its key, body and removal rules instead of inventing a new index. An
+  index in the dispatcher's context store, a store-wide index, the host-local
+  request logs, and keying reports by anchor were rejected: the first takes
+  the dispatcher's manifest lock on every child's write, the second exposes
+  every workspace's dispatch graph and is never cleaned, the third never
+  leaves the host, and the fourth over-attributes reports when one assistant
+  session holds several workflow sessions.
+  Taking the name from the hook keeps niwa out of the read and leaves the agent
+  writing nothing; one walk shared by the verbs and the library stops the two
+  from drifting apart.
 ---
 
 # DESIGN: Holder and Direct-Report Reads Without a Store Scan
 
 ## Status
 
-Draft
+Proposed
 
 ## Context and Problem Statement
 
