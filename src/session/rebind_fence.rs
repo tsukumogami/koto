@@ -195,6 +195,53 @@ mod tests {
     }
 
     #[test]
+    fn a_header_without_whole_epoch_keeps_the_prefix_rule() {
+        // A plain rebind's header: an epoch and retired anchors, no
+        // whole_epoch. The path rule adds nothing to it, from any directory.
+        let line = r#"{"execution_dir":"/ws/new","origin":{"anchor":"/ws/new","store":{"kind":"local","base":"/s"},"anchor_epoch":2,"retired_anchors":["/ws/old","/ws/new/sub"]}}"#;
+        assert_eq!(Fence::of_header_line(line).whole_epoch, 0);
+        for cwd in ["/ws/old", "/ws/old/deeper", "/ws/new/sub", "/elsewhere"] {
+            for seen in [None, Some(0), Some(2)] {
+                assert!(
+                    check_whole("wf", line, Some(Path::new(cwd)), seen).is_ok(),
+                    "{cwd} {seen:?}"
+                );
+            }
+        }
+        // The prefix rule is as it was: a retired anchor refuses by its own
+        // prefix, and a directory below it has a prefix of its own.
+        assert!(
+            check("wf", line, &prefix("/ws/old"), None)
+                .unwrap_err()
+                .from_retired
+        );
+        assert!(check("wf", line, &prefix("/ws/old/deeper"), None).is_ok());
+    }
+
+    #[test]
+    fn a_whole_fenced_header_refuses_a_stale_read_and_a_deeper_retired_anchor() {
+        // Moved up from /ws/a/b to /ws/a, after an earlier move away from
+        // /ws/old.
+        let up = r#"{"execution_dir":"/ws/a","origin":{"anchor":"/ws/a","store":{"kind":"local","base":"/s"},"anchor_epoch":3,"whole_epoch":3,"retired_anchors":["/ws/a/b","/ws/old"]}}"#;
+        let at = |cwd: &str, seen| check_whole("wf", up, Some(Path::new(cwd)), seen);
+        assert!(at("/ws/a", Some(3)).is_ok());
+        assert!(at("/ws/a/c", None).is_ok());
+        assert!(at("/elsewhere", None).is_ok());
+        assert!(!at("/ws/a", Some(2)).unwrap_err().from_retired);
+        assert!(at("/ws/a/b", None).unwrap_err().from_retired);
+        assert!(at("/ws/a/b/c", None).unwrap_err().from_retired);
+        assert!(at("/ws/old/x", None).unwrap_err().from_retired);
+
+        // Moved down from /ws/a into /ws/a/b: inside the new anchor the old
+        // parent no longer decides, beside it it still does.
+        let down = r#"{"execution_dir":"/ws/a/b","origin":{"anchor":"/ws/a/b","store":{"kind":"local","base":"/s"},"anchor_epoch":1,"whole_epoch":1,"retired_anchors":["/ws/a"]}}"#;
+        let at = |cwd: &str| check_whole("wf", down, Some(Path::new(cwd)), None);
+        assert!(at("/ws/a/b/c").is_ok());
+        assert!(at("/ws/a/c").unwrap_err().from_retired);
+        assert!(check_whole("wf", down, None, None).is_ok());
+    }
+
+    #[test]
     fn advance_retires_the_old_anchor_and_reinstates_the_target() {
         let mut origin = crate::engine::types::SessionOrigin {
             anchor: "/a".into(),

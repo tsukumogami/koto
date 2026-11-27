@@ -1332,4 +1332,66 @@ mod tests {
             FenceOutcome::Fenced { .. }
         ));
     }
+
+    /// Give the log at `path` the header a whole move from `old` to `new`
+    /// leaves: `new` the anchor, `old` retired, `whole_epoch` set.
+    fn whole_fenced(path: &Path, old: &Path, new: &Path) {
+        let content = std::fs::read_to_string(path).unwrap();
+        let (first, rest) = content.split_once('\n').unwrap();
+        let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+        header["execution_dir"] = serde_json::json!(new);
+        header["origin"] = serde_json::json!({
+            "anchor": new,
+            "store": {"kind": "local", "base": path.parent().unwrap().parent().unwrap()},
+            "anchor_epoch": 1,
+            "whole_epoch": 1,
+            "retired_anchors": [old],
+        });
+        std::fs::write(path, format!("{header}\n{rest}")).unwrap();
+    }
+
+    /// The wake pass appends `requester_woken` to its own log by path, with
+    /// no backend in between (`crate::engine::wake`). The fence a whole move
+    /// puts up refuses it all the same from under the retired anchor, and
+    /// lets it through from the current one.
+    #[test]
+    fn the_wake_pass_append_is_refused_from_under_a_retired_anchor() {
+        let dir = TempDir::new().unwrap();
+        let path = fenceable_log(dir.path());
+        let old = dir.path().join("ws").join("old");
+        let new = dir.path().join("ws").join("new");
+        whole_fenced(&path, &old, &new);
+        let before = std::fs::read(&path).unwrap();
+
+        let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
+        fields.insert("kind".into(), serde_json::json!("RequesterWoken"));
+        fields.insert("child_session_ids".into(), serde_json::json!(["p.a"]));
+        fields.insert("child_dispatch_epochs".into(), serde_json::json!([0]));
+        fields.insert("requested_by".into(), serde_json::json!("p"));
+        let woken = EventPayload::EvidenceSubmitted {
+            state: "request_store.wake".to_string(),
+            fields,
+            submitter_cwd: None,
+            source: None,
+            exported_fields: None,
+        };
+
+        let err = crate::session::fence_state::with_cwd(&old.join("sub"), || {
+            append_event(&path, &woken, "2026-01-01T00:00:01Z")
+        })
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|c| c.is::<crate::session::rebind_fence::SessionRebound>()),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("session_rebound"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+
+        let seq = crate::session::fence_state::with_cwd(&new, || {
+            append_event(&path, &woken, "2026-01-01T00:00:01Z")
+        })
+        .unwrap();
+        assert_eq!(seq, 2);
+    }
 }
