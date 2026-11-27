@@ -149,6 +149,8 @@ pub(super) fn handle(
             super::EXIT_CALLER_ERROR,
         );
     }
+    // Only a migrated session is refused here, as `refuse_if_migrated` does for the other
+    // writes: any other error of the check is met again by the move's own reads below.
     if let Err(e) = backend.check_not_migrated_to_write(name) {
         if e.is::<crate::session::SessionMigrated>() {
             super::exit_with_error_code(
@@ -280,12 +282,18 @@ fn move_cloud(
         (Commit::Done, e) => e,
         (_, e) => e.map(|e| e + 1),
     };
-    // Run again past the commit, the header is moved: the logged `from` gives the home before.
+    // The home the context is carried from. Before the commit it's the home read above. Once the
+    // commit landed (a run again after a stop), the header is already moved, so that read gives
+    // the new home, and the move's own event at this epoch says where it came from:
+    // - no event at this epoch: the move isn't committed, and the home read above stands;
+    // - an event with no `from` (the session recorded no directory and no anchor): the home
+    //   before is unknown, which the carry treats as moved, so it carries;
+    // - an event with a `from`: the home before is worked out from that directory.
+    // The invariant: a committed move never takes the new home for the home before.
     let logged_from = events.iter().rev().find_map(|e| match &e.payload {
         EventPayload::ExecutionAnchorReboundWhole(w) if w.epoch == epoch => Some(w.from.clone()),
         _ => None,
     });
-    // One that logged no `from` names no home before, which the carry treats as moved.
     if let (Commit::Done, Some(None)) = (&commit, &logged_from) {
         home_before = None;
     }
@@ -974,6 +982,9 @@ fn rerecord_environment(
         .into_iter()
         .map(str::to_string)
         .collect();
+    // Keyed on the record as well as the epoch, unlike the held-by and publish events: a run
+    // again from a shell with another environment writes that record, so it logs a second
+    // event saying so, and the log names every record the header held.
     let logged = since.iter().any(|e| {
         matches!(&e.payload, EventPayload::EnvironmentRerecorded(r)
             if r.epoch == epoch && r.environment == record)
