@@ -10,6 +10,30 @@ to `0.9.x`).
 
 ### Compatibility
 
+- **Older releases misread a run another run replaced
+  ([koto#739](https://github.com/tsukumogami/koto/issues/739)).**
+  `koto init NEW --replaces OLD` and `koto session replace OLD --by NEW`
+  close OLD with a `workflow_cancelled` carrying `replaced_by` and a
+  `session_superseded` fence carrying `replaced: true`. Both fields are
+  additive, so every release that knows the supersede fence still refuses
+  writes to OLD, but releases before this one read the close in five ways
+  this one doesn't. The one that fails open comes first:
+  `koto init OLD --replace-terminal` on an older release takes OLD's cancel
+  for a finished run and starts a fresh, unfenced run under OLD's name,
+  beside NEW. It doesn't revive OLD's log. This release refuses it with
+  `session_replaced`. Second, a stale `koto init NEW --continues OLD
+  --supersede` on an older release is taken for an interrupted supersede
+  and turns the restart into a confirmed supersede; OLD still isn't
+  revived. Third, the decision chain reads the fence as an unconfirmed
+  supersede hop, so where OLD's chain is broken a reversal from NEW of one
+  of OLD's decisions is accepted as `asserted` there and refused here; with
+  a complete chain only the reason code differs. Fourth, the wake ring
+  rings NEW for requests that name OLD, which costs one stray re-poll.
+  Fifth, stale-wake recovery reads NEW's log time for requests that name
+  OLD, which is harmless. `koto status` also differs: an older release
+  reads OLD in the kept-cancelled shape, `is_terminal: false` with no
+  `status` and no `replaced_by`. Every host that touches a replaced run
+  should run this release or later.
 - **A missing name's lookup that can't finish exits 3 with
   `session_lookup_failed`
   ([koto#638](https://github.com/tsukumogami/koto/issues/638),

@@ -58,6 +58,7 @@ The `error` text for duplicate and unknown keys, and for an allowlist failure, i
 | `origin_mismatch` | `--attach-live` found a session from another worktree, session store or bucket, or one with no origin record. A session the local store started is not refused under the cloud backend from the same anchor and sessions directory: it is uploaded and adopted. Use another session name, or run the command from the directory the session belongs to (against its own session store when only the store differs); a session with no origin record can also be finished with the koto version that started it. | `recorded`, `requested` |
 | `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
 | `replace_held_live` | `--replace-terminal` found a finished session the retention rule keeps, so it would move aside, but a descendant in its subtree is still running, waits to promote its result to a request leg, or can't be read. | `live` |
+| `session_replaced` | `--replace-terminal` named a session another run replaced (`koto init --replaces` or `koto session replace`; its log holds a fence marked `replaced`). It reads finished, but a fresh run under its name would stand beside its replacement, so nothing is judged, moved or removed. Continue in the session `newest` names. Under `--koto-leg` the leg records `session-replaced`. | `replaced_by`, `newest` |
 
 `--replace-terminal` can also fail after its checks, with exit 1:
 
@@ -70,6 +71,38 @@ Under `--koto-leg`, the leg checks `koto request attach` makes refuse with the s
 ```json
 {"error":"variable \"INTENT_FLAG\" is fixed for this session: recorded \"stop\", requested \"continue\"","command":"init","code":"var_mismatch","var":"INTENT_FLAG","recorded":"stop","requested":"continue"}
 ```
+
+**Superseding a replaced run (exit code 2)** — `koto init <succ> --continues <pred> --supersede` refuses a `<pred>` whose log holds a fence marked `replaced`, whichever session that fence names, `<succ>` included: the run was closed, not continued, so no supersede can take it over or finish on it. Code `session_replaced`, with `replaced_by`, `newest` and `actor` beside it, and nothing written. A plain supersede fence naming another session still refuses `superseded_by`.
+
+**Replacing a run (`--replaces`)** — `koto init <new> --template <path> --replaces <old> [--wait <secs> | --abandon-tick]` (see [Replacing a run](../guides/cli-usage.md#replacing-a-run)) refuses in the flat `init` envelope, each extra field beside `code`:
+
+```json
+{"error":"session 'deploy' is busy: a tick of it is in flight, and it still held /home/dev/.koto/sessions/deploy/tick.lock after 10 s; nothing was written. Stopping that tick's `koto next` frees the lock; then run the command again, or give --wait more seconds, or pass --abandon-tick to close 'deploy' without it","command":"init","code":"session_busy","details":{"waited_for_ms":10004}}
+```
+
+The rows down to `session_busy` are the checks made before `<old>`'s `tick.lock` is taken, and none of them writes anything. The rows after it come at the close, once `<new>` exists; under the cloud backend `invalid_fence`, `fence_unavailable` and `persistence_error` can also come from the checks' own read of the bucket's copy of `<old>`, with nothing written. A `--wait` given with `--abandon-tick`, or either one without `--replaces`, is a usage error clap reports itself, exit 2.
+
+| Code | Exit | When | Extra fields |
+|------|:----:|------|--------------|
+| `invalid_usage` | 2 | `--replaces` with `--continues`, `--supersede`, `--carry`, `--expect-state`, `--parent`, `--from-stdin`, `--vars-file`, `--attach-live`, `--replace-terminal` or `--koto-leg`; no `--template`; a name that fails the session-name rule; or `<old>` is koto's record of an agent session, not a run. | |
+| `self` | 2 | `<new>` and `<old>` are the same name. | |
+| `nested_invocation` | 2 | The command ran inside a command `<old>`'s own tick is running (`KOTO_TICK_SESSION` names `<old>`), or inside one of `<old>`'s background actions (`KOTO_BACKGROUND_OF` names it). Refused under `--abandon-tick` too. | |
+| `session_not_found` | 2 | No session is named `<old>`. | |
+| `superseded_by` | 2 | `<old>` is already superseded by another session through a plain `--supersede`. | `superseded_by`, `newest`, `actor` |
+| `session_replaced` | 2 | `<old>` is already replaced by another session, or plainly superseded by `<new>`: a plain fence naming `<new>` isn't this command's close, so it can't finish it. | `replaced_by` (`superseded_by` for the plain fence), `newest`, `actor` |
+| `session_exists` | 2 | `<new>` exists and no earlier run of this command opened it: it holds no `koto/replaces` key naming `<old>`. Pick another name, or remove it with `koto cancel <new> --cleanup` and run the command again. | |
+| `template_not_found`, `template_compile_failed` | 1 | The template doesn't resolve or doesn't compile. | |
+| `invalid_var`, `duplicate_var`, `unknown_var` | 2 | A variable is refused, as above. | as above |
+| `session_busy` | 1 | A tick of `<old>` still held its `tick.lock` when `--wait` ran out (10 seconds by default; `--wait 0` asks once). Transient: run it again once the tick returns, give `--wait` more seconds, or pass `--abandon-tick`. | `details.waited_for_ms` |
+| `invalid_fence` | 2 | Cloud backend: the bucket's copy of `<old>` holds a fence naming a session or session id koto doesn't accept. | |
+| `superseded_by`, `session_replaced` | 2 | Another session fenced `<old>` between the checks and the close. `<new>` exists and is left as it is; `<old>` wasn't closed. Remove `<new>` with `koto cancel <new> --cleanup` if it isn't wanted. | as above |
+| `session_rebound` | 2 | `<old>`'s whole binding was moved (`koto session rebind --whole`) since this process read it, so the close is refused with nothing of it written. `<new>` exists and is left as it is. Under the cloud backend the bucket's copy is checked the same way; a plain rebind doesn't trip it, and when this host holds no copy of `<old>` only the retired-directory rule applies. | |
+| `fence_unavailable` | 3 | `<old>`'s log stayed locked by another writer for 10 seconds, or, under the cloud backend, the bucket holds no copy of `<old>` under its prefix, or it refused or failed the close's conditional PUT. Nothing of the close was written; `<new>` may exist. Run the command again. | |
+| `persistence_error` | 3 | A read or write failed. When `<new>`'s `koto/replaces` key couldn't be written after `<new>` was created, `<old>` is still open: remove `<new>` with `koto cancel <new> --cleanup` and run the command again. | |
+
+`--abandon-tick` never refuses `session_busy`. It asks for `<old>`'s `tick.lock` once: when the lock is free, it takes it and closes `<old>` under it, reporting `"tick_in_flight": false`; when a tick holds it, it closes `<old>` without it and reports `"tick_in_flight": true`, and the fence refuses that tick's later writes.
+
+A run stopped after `<new>` was created and before its `koto/replaces` key was written leaves a `<new>` that the same command refuses with `session_exists`, since nothing says this command opened it. `koto session replace <old> --by <new>` writes the key and finishes the close; removing `<new>` with `koto cancel <new> --cleanup` and running `koto init --replaces` again works too. A run stopped at any later point finishes when the same command runs again.
 
 ---
 
@@ -288,6 +321,37 @@ A plain `koto session rebind` refuses a missing target directory, a file, or an 
 - **A first `--whole` move from a retired directory, cloud backend.** A session that has never been moved with `--whole` is refused when the move runs from a directory an earlier plain rebind retired, because the plain rebind's directory rule still applies there. The local backend doesn't refuse this. Run the first `--whole` from the directory the session is bound to now, or from a fresh directory.
 
 Stop writing from the old place. If this process owns the session now, run the command again from the directory the message names; otherwise the session has a new holder and this process is done with it.
+
+---
+
+### session replace
+
+`koto session replace <old> --by <new> [--wait <secs> | --abandon-tick]` makes the close `koto init --replaces` makes, for a `<new>` that already exists (see [session replace](../guides/cli-usage.md#session-replace)). It refuses on stdout in the nested shape `koto session rebind --whole` uses, and every extra field goes inside `error`, next to `code` and `message`:
+
+```json
+{"error":{"code":"session_busy","message":"session 'deploy' is busy: a tick of it is in flight, and it still held /home/dev/.koto/sessions/deploy/tick.lock after 10 s; nothing was written. Stopping that tick's `koto next` frees the lock; then run the command again, or give --wait more seconds, or pass --abandon-tick to close 'deploy' without it","details":{"waited_for_ms":10004}},"command":"session replace"}
+{"error":{"code":"session_replaced","message":"session replace: session 'deploy' is already replaced by 'deploy-r3'; nothing was written. Continue in 'deploy-r3'","replaced_by":"deploy-r3","newest":"deploy-r3","actor":{"host":"build-1","user":"dev"}},"command":"session replace"}
+```
+
+The rows down to `session_busy` are the checks made before `<old>`'s `tick.lock` is taken, and none of them writes anything:
+
+| Code | Exit | When | Extra fields in `error` |
+|------|:----:|------|-------------------------|
+| `invalid_usage` | 2 | A name fails the session-name rule, or `<old>` or `<new>` is koto's record of an agent session, not a run. | |
+| `self` | 2 | `<old>` and `<new>` are the same name. | |
+| `nested_invocation` | 2 | The command ran inside a command `<old>`'s own tick is running (`KOTO_TICK_SESSION`), or inside one of `<old>`'s background actions (`KOTO_BACKGROUND_OF`). Refused under `--abandon-tick` too. | |
+| `session_not_found` | 2 | No session is named `<old>`, or none is named `<new>`. This command doesn't create `<new>`; `koto init <new> --template <path> --replaces <old>` creates it and closes `<old>` in one step. | |
+| `superseded_by` | 2 | `<old>` is already superseded by another session through a plain `--supersede`. | `superseded_by`, `newest`, `actor` |
+| `session_replaced` | 2 | `<old>` is already replaced by another session, or plainly superseded by `<new>`. | `replaced_by` (`superseded_by` for a plain fence naming `<new>`), `newest`, `actor` |
+| `session_exists` | 2 | `<new>`'s `koto/replaces` key names a run other than `<old>`, so it can't replace `<old>` too. | |
+| `session_busy` | 1 | A tick of `<old>` still held its `tick.lock` when `--wait` ran out (10 seconds by default; `--wait 0` asks once). Transient: run it again once the tick returns, give `--wait` more seconds, or pass `--abandon-tick`. | `details.waited_for_ms` |
+| `invalid_fence` | 2 | Cloud backend: the bucket's copy of `<old>` holds a fence naming a session or session id koto doesn't accept. | |
+| `superseded_by`, `session_replaced` | 2 | Another session fenced `<old>` between the checks and the close; `<old>` wasn't closed and `<new>` is left as it is. | as above |
+| `session_rebound` | 2 | `<old>`'s whole binding was moved (`koto session rebind --whole`) since this process read it, so the close is refused with nothing of it written. Under the cloud backend the bucket's copy is checked the same way; a plain rebind doesn't trip it, and when this host holds no copy of `<old>` only the retired-directory rule applies. | |
+| `fence_unavailable` | 3 | `<old>`'s log stayed locked by another writer for 10 seconds, or, under the cloud backend, the bucket holds no copy of `<old>` under its prefix, or it refused or failed the close's conditional PUT. Nothing of the close was written. Run the command again. | |
+| `persistence_error` | 3 | A read or write failed, including `<new>`'s `koto/replaces` key; `<old>` is still open. Run the command again. | |
+
+Under the cloud backend `invalid_fence`, `fence_unavailable` and `persistence_error` can also come from the checks' own read of the bucket's copy of `<old>`, before the lock, with nothing written. `--abandon-tick` never refuses `session_busy`: it asks for the lock once, takes it when it's free and reports `"tick_in_flight": false`, and otherwise closes `<old>` without it and reports `"tick_in_flight": true`. A close stopped part way finishes when the same command runs again, and a re-run that finds it made reports `"outcome": "unchanged"`.
 
 ---
 
