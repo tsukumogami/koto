@@ -1223,7 +1223,7 @@ It works from any directory on the host that holds the session's copy, and it do
 | `auto` | Apply the strict-prefix rule per child: if one side is a byte-prefix of the other, the longer side wins. Divergent logs surface as a `conflict` entry and the command exits non-zero so the caller runs `koto session resolve <child>` on each flagged child. |
 | `skip` | Leave child state files untouched. The parent reconciles alone. |
 | `accept-remote` | Unconditionally overwrite local child state with remote. |
-| `accept-local` | Unconditionally overwrite remote child state with local. |
+| `accept-local` | Overwrite remote child state with local, unless a rebind moved the remote child past the local copy: that child is reported `errored` with a `session_rebound` message and left as it is. |
 
 Response shape (cloud backend only — `sync_status` and `machine_id` are elided under the local backend, which rejects the command anyway):
 

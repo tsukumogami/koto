@@ -993,7 +993,7 @@ Without `--whole`, it moves the execution anchor alone, for a checkout that move
 **Taking a session over: `--whole`.** A run picked up by another agent session needs more than a new directory. `--whole` moves everything that ties the session to the agent session that ran it before, in one call, and hands it to the caller: the agent session whose anchor `KOTO_ANCHOR` names (see [session anchor](#session-anchor)).
 
 - **The execution directory and origin anchor**, as a plain rebind moves them, plus `origin.whole_epoch`, set to the new `anchor_epoch`. That turns on the fence described below.
-- **The held-by links.** The caller's anchor becomes the session's only held-by link: koto adds `koto/links/held-by/<caller's anchor>` when it's missing and removes every other one.
+- **The held-by links.** The caller's anchor becomes the session's only held-by link: koto adds `koto/links/held-by/<caller's anchor>` when it's missing and removes every other one. That includes a link to an agent session that's still open in an unrelated directory, and it's deliberate: `--whole` hands the session to the caller, and the fence refuses any process that read the session before the move, so a holder left in place would keep the session counted as held (by retention, among others) by an agent that can no longer write to it.
 - **The publish location.** The stored `/workflows` location (`workflows/publish-location`, and `workflows/publish-explicit` when `koto workflows publish` set it) is dropped, so the next commit resolves it afresh: `KOTO_WORKFLOWS_DIR` when that's set, otherwise the folder of the Claude Code session driving the tick. The move itself renders nothing. The old folder's file keeps its last state and stops changing.
 - **The command environment.** The session's recorded `PATH`, `HOME` and `XDG_CONFIG_HOME` are replaced with the caller's, recorded the way `koto init` records them, so later gates and actions run with the new holder's values. The legacy flag stays as it was. A session with no record yet is left alone, and its next tick adopts one.
 
@@ -1695,7 +1695,7 @@ koto session resolve <name> --keep remote
   - `auto` (default) — apply the strict-prefix rule to each child's state file. When one side is a byte-exact prefix of the other, the longer side wins; any other divergence surfaces as a conflict that needs its own `koto session resolve <child>`.
   - `skip` — leave child state files untouched.
   - `accept-remote` — overwrite local child state with remote.
-  - `accept-local` — overwrite remote child state with local.
+  - `accept-local` — overwrite remote child state with local. A child a rebind moved past this host's copy is reported `errored` with a `session_rebound` message and left as it is.
 
 After resolving, normal operations resume.
 
