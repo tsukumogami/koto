@@ -1015,6 +1015,8 @@ mod tests {
                 &EventPayload::WorkflowCancelled {
                     state: "implement".to_string(),
                     reason: "operator".to_string(),
+                    replaced_by: None,
+                    replaced_by_session_id: None,
                 },
                 "2026-01-01T00:02:00Z",
             )

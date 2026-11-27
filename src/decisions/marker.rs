@@ -244,6 +244,7 @@ mod tests {
                 user: Some("u".to_string()),
             },
             at: "2026-01-01T00:00:00Z".to_string(),
+            replaced: false,
         }
     }
 

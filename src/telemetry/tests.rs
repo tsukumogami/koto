@@ -227,6 +227,8 @@ fn commits_map_to_records_and_other_payloads_write_nothing() {
         &EventPayload::WorkflowCancelled {
             state: "b".into(),
             reason: "PLANTED-REASON".into(),
+            replaced_by: None,
+            replaced_by_session_id: None,
         },
         &ts,
     )
@@ -4085,6 +4087,8 @@ fn cancelled(state: &str) -> EventPayload {
     EventPayload::WorkflowCancelled {
         state: state.into(),
         reason: "PLANTED-REASON".into(),
+        replaced_by: None,
+        replaced_by_session_id: None,
     }
 }
 

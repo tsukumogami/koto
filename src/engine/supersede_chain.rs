@@ -128,6 +128,7 @@ mod tests {
                 by_session_id: by_session_id.to_string(),
                 actor: SupersedeActor::default(),
                 at: "2026-01-01T00:00:00Z".to_string(),
+                replaced: false,
             },
             idempotency_hash: None,
         };

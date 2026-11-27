@@ -60,6 +60,9 @@ pub struct SupersedeFence {
     pub actor: SupersedeActor,
     /// When the fence was appended.
     pub at: String,
+    /// True when `by` replaced the session rather than continuing it: the
+    /// same close cancelled it. False on a plain supersede fence.
+    pub replaced: bool,
 }
 
 impl SupersedeFence {
@@ -71,11 +74,13 @@ impl SupersedeFence {
                 by_session_id,
                 actor,
                 at,
+                replaced,
             } => Some(SupersedeFence {
                 by: by.clone(),
                 by_session_id: by_session_id.clone(),
                 actor: actor.clone(),
                 at: at.clone(),
+                replaced: *replaced,
             }),
             _ => None,
         }
@@ -88,6 +93,7 @@ impl SupersedeFence {
             by_session_id: self.by_session_id.clone(),
             actor: self.actor.clone(),
             at: self.at.clone(),
+            replaced: self.replaced,
         }
     }
 }
@@ -2607,6 +2613,8 @@ mod tests {
                 EventPayload::WorkflowCancelled {
                     state: "gather".to_string(),
                     reason: "test".to_string(),
+                    replaced_by: None,
+                    replaced_by_session_id: None,
                 },
             ),
         ];

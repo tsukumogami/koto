@@ -20,6 +20,10 @@ mod append;
 
 #[cfg(debug_assertions)]
 pub(crate) use append::held_state_locks;
+pub(crate) use append::{
+    append_close, append_event_tracked, append_event_tracked_held, hold_log_lock_blocking, Close,
+    CloseOutcome, CommitInfo,
+};
 pub use append::{
     append_event, append_event_idempotent, append_event_idempotent_in, append_event_in,
     append_header, append_header_line, append_supersede_fence, fsync_wake_preconditions,
@@ -27,9 +31,6 @@ pub use append::{
     state_log_busy, with_held_log_lock, with_log_replace_lock, AppendOutcome, FenceOutcome,
     HeldLogLock, SessionSupersededError, StateLogBusy, APPEND_LOCK_FILE, FENCE_LOCK_WAIT,
     LOG_REPLACE_LOCK_WAIT,
-};
-pub(crate) use append::{
-    append_event_tracked, append_event_tracked_held, hold_log_lock_blocking, CommitInfo,
 };
 #[cfg(all(test, unix))]
 pub(crate) use append::{hold_append_lock, hold_append_lock_for};
@@ -1168,6 +1169,7 @@ mod tests {
                 user: Some("dev".to_string()),
             },
             at: "2026-01-01T00:00:00Z".to_string(),
+            replaced: false,
         }
     }
 

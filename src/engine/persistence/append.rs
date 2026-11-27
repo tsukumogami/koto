@@ -1123,6 +1123,256 @@ pub fn append_supersede_fence(
     Ok(FenceOutcome::Fenced { seq: tail.next_seq })
 }
 
+/// What [`append_close`] closes a replaced run's log with.
+// Built and read by `koto init --replaces`, which lands in a later change.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Close {
+    /// Events owed ahead of the cancel, in order: a stopped runner's settle
+    /// events and `pool_released` for each pool queue left. The caller works
+    /// them out from the log; they are written as given.
+    pub side_events: Vec<EventPayload>,
+    /// Whether the run is owed a cancel. False for a run already in a
+    /// terminal state, which gets the fence only.
+    pub cancel: bool,
+    /// The fence naming the replacement. It is written with `replaced`
+    /// set, whatever this copy holds.
+    pub fence: SupersedeFence,
+}
+
+/// What [`append_close`] did.
+// Read by `koto init --replaces`, which lands in a later change.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CloseOutcome {
+    /// Every line owed went in, in one write. `commits` holds each event
+    /// written with what its commit read, in order, for the after-commit
+    /// steps; it is empty when nothing was owed. `torn_backup` is where the
+    /// log was kept before a torn last line was trimmed.
+    Closed {
+        commits: Vec<(EventPayload, CommitInfo)>,
+        torn_backup: Option<std::path::PathBuf>,
+    },
+    /// The log holds a fence other than this close's own replaced fence.
+    /// Nothing was written.
+    FencedByOther(SupersedeFence),
+    /// The append lock was still held elsewhere when the wait ran out.
+    /// Nothing was written.
+    Unavailable,
+}
+
+/// Close the replaced run whose log is at `path`: append the events
+/// `close` owes, the cancel and the replaced fence in one write and one
+/// sync, under the log's append lock, waited for at most `wait`. The caller
+/// holds the run's manifest lock and runs the after-commit steps for each of
+/// the returned commits once it has released it.
+///
+/// What is owed is worked out from the bytes read under the lock, so a
+/// re-run writes only what an earlier, interrupted one didn't. The cancel
+/// is skipped when the last event that set where the run stands is already
+/// a cancel; a cancel that a rewind followed doesn't count. The fence is
+/// skipped when the log already holds it. The close may write past its own
+/// replaced fence, never past any other.
+///
+/// A last line with no newline that doesn't parse is a write cut short. It
+/// is trimmed, with the log as it was kept beside it as
+/// `<log>.seq<N>-torn.bak`, and the close is written in its place. A last
+/// line that ends in a newline and doesn't parse is refused, with nothing
+/// written.
+pub(crate) fn append_close(
+    path: &Path,
+    close: &Close,
+    timestamp: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<CloseOutcome> {
+    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
+        return Ok(CloseOutcome::Unavailable);
+    };
+    let (tail, torn) = prepare_close(path)?;
+    let fence = SupersedeFence {
+        replaced: true,
+        ..close.fence.clone()
+    };
+    if let Some(existing) = superseded_by_in_log(&tail.content) {
+        let ours = existing.replaced
+            && existing.by == fence.by
+            && existing.by_session_id == fence.by_session_id;
+        if !ours {
+            return Ok(CloseOutcome::FencedByOther(existing));
+        }
+    }
+    refuse_if_rebound(path, &tail.content, &fence.to_payload())?;
+    let payloads = close_payloads(&tail.content, close, &fence)?;
+    if payloads.is_empty() && torn.is_none() {
+        return Ok(CloseOutcome::Closed {
+            commits: Vec::new(),
+            torn_backup: None,
+        });
+    }
+
+    let mut buf = String::new();
+    if tail.unterminated {
+        buf.push('\n');
+    }
+    let mut commits = Vec::with_capacity(payloads.len());
+    let mut prior_log = tail.content;
+    for (i, payload) in payloads.into_iter().enumerate() {
+        let event = Event {
+            seq: tail.next_seq + i as u64,
+            timestamp: timestamp.to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let line = serde_json::to_string(&event)
+            .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
+        buf.push_str(&line);
+        buf.push('\n');
+        // The first line follows the newline an unterminated log was owed.
+        let sep = if i == 0 && tail.unterminated {
+            "\n"
+        } else {
+            ""
+        };
+        let next_prior = format!("{prior_log}{sep}{line}\n");
+        commits.push((
+            event.payload,
+            CommitInfo {
+                seq: event.seq,
+                prior_log,
+            },
+        ));
+        prior_log = next_prior;
+    }
+
+    let torn_backup = match torn {
+        Some(torn) => {
+            let backup = write_backup(path, &torn.log, tail.next_seq, "torn")?;
+            rewrite_tail(path, torn.offset, &buf, "torn")?;
+            eprintln!(
+                "warning: the last line of {} was cut short partway through a write; trimmed \
+                 it. The log as it was is kept at {}",
+                path.display(),
+                backup.display()
+            );
+            Some(backup)
+        }
+        None => {
+            append_bytes(path, &buf)?;
+            None
+        }
+    };
+    Ok(CloseOutcome::Closed {
+        commits,
+        torn_backup,
+    })
+}
+
+/// The events [`append_close`] owes the log whose bytes are `content`, in
+/// the order they go in: the side events, the cancel unless the run already
+/// stands cancelled, then `fence` unless the log holds it.
+fn close_payloads(
+    content: &str,
+    close: &Close,
+    fence: &SupersedeFence,
+) -> anyhow::Result<Vec<EventPayload>> {
+    let (_, events) = parse_state_log(content.as_bytes())?;
+    let mut out = close.side_events.clone();
+    let stands_cancelled = crate::session::inventory::last_standing_event(&events)
+        .is_some_and(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+    if close.cancel && !stands_cancelled {
+        let state = derive_state_from_log(&events).ok_or_else(|| {
+            EngineError::StateFileCorrupted(
+                "cannot derive the current state, so the run was not closed".to_string(),
+            )
+        })?;
+        out.push(EventPayload::WorkflowCancelled {
+            state,
+            reason: format!("replaced by {}", fence.by),
+            replaced_by: Some(fence.by.clone()),
+            replaced_by_session_id: Some(fence.by_session_id.clone()),
+        });
+    }
+    if superseded_by_in_log(content).is_none() {
+        out.push(fence.to_payload());
+    }
+    Ok(out)
+}
+
+/// A last line [`prepare_close`] will trim: it starts at byte `offset` of
+/// `log`, the log's bytes as read.
+struct TornTail {
+    offset: usize,
+    log: String,
+}
+
+/// [`prepare_append`] for [`append_close`]: the same read, header check
+/// and merged-line split, except that a torn last line is not refused. It
+/// comes back as the log's bytes without that line, with where the line
+/// starts, and nothing is written for it yet.
+fn prepare_close(path: &Path) -> anyhow::Result<(AppendTail, Option<TornTail>)> {
+    let content = read_for_append(path)?;
+    let refused = plan_append::<StateFileHeader>(&content, path).err();
+    let Some(err) = refused else {
+        return Ok((tail_for_append::<StateFileHeader>(path, content)?, None));
+    };
+    let Some(offset) = torn_tail_offset(&content) else {
+        return Err(err);
+    };
+    let next_seq = match plan_append::<StateFileHeader>(&content[..offset], path) {
+        Ok(AppendPlan {
+            next_seq,
+            merged: None,
+            ..
+        }) => next_seq,
+        _ => return Err(err),
+    };
+    let tail = AppendTail {
+        next_seq,
+        content: content[..offset].to_string(),
+        unterminated: false,
+    };
+    Ok((
+        tail,
+        Some(TornTail {
+            offset,
+            log: content,
+        }),
+    ))
+}
+
+/// Where the last line of `content` starts when it is a write cut short:
+/// it has no newline, it isn't the header, and it doesn't parse, as one
+/// value or as several written together.
+fn torn_tail_offset(content: &str) -> Option<usize> {
+    if content.ends_with('\n') {
+        return None;
+    }
+    let offset = content.rfind('\n')? + 1;
+    let line = content[offset..].trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut values = serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>();
+    if values.all(|v| v.is_ok()) {
+        return None;
+    }
+    Some(offset)
+}
+
+/// Append `bytes` to the log at `path` in one write, and sync it.
+fn append_bytes(path: &Path, bytes: &str) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    file.write_all(bytes.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write events to {}: {}", path.display(), e))?;
+    file.sync_data()
+        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+    Ok(())
+}
+
 /// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
 /// is released when the returned `File` is dropped.
 ///
@@ -1348,23 +1598,29 @@ struct AppendTail {
 /// Merged events whose seqs don't follow, or whose line before can't be
 /// read, are refused and left as they are.
 fn prepare_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
-                path.display()
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "failed to read state file {}: {}",
-                path.display(),
-                e
-            ))
-        }
-    };
+    let content = read_for_append(path)?;
+    tail_for_append::<H>(path, content)
+}
 
+/// The read [`prepare_append`] starts with: the log's bytes, or an error
+/// naming a log that doesn't exist.
+fn read_for_append(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
+            path.display()
+        )),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to read state file {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// The rest of [`prepare_append`], on the bytes it read.
+fn tail_for_append<H: LogHeader>(path: &Path, content: String) -> anyhow::Result<AppendTail> {
     let AppendPlan {
         next_seq,
         unterminated,
@@ -1423,8 +1679,8 @@ fn split_merged_last_line(
     }
 
     let first_seq = pieces[0].1.seq;
-    let backup = write_backup(path, content, first_seq)?;
-    rewrite_tail(path, offset, &tail)?;
+    let backup = write_backup(path, content, first_seq, "merged")?;
+    rewrite_tail(path, offset, &tail, "merged")?;
     let mut split = String::with_capacity(offset + tail.len());
     split.push_str(&content[..offset]);
     split.push_str(&tail);
@@ -1441,9 +1697,15 @@ fn split_merged_last_line(
     Ok(split)
 }
 
-/// Write `content` to a new file beside `log`, named for `first_seq`, and
-/// sync it. Never overwrites: a name already taken gets a numeric suffix.
-fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std::path::PathBuf> {
+/// Write `content` to a new file beside `log`, named for `first_seq` and
+/// the repair it is kept for (`kind`: `merged` or `torn`), and sync it.
+/// Never overwrites: a name already taken gets a numeric suffix.
+fn write_backup(
+    log: &Path,
+    content: &str,
+    first_seq: u64,
+    kind: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     let name = log
         .file_name()
         .and_then(|n| n.to_str())
@@ -1454,7 +1716,7 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
         } else {
             format!(".{n}")
         };
-        let backup = log.with_file_name(format!("{name}.seq{first_seq}-merged{suffix}.bak"));
+        let backup = log.with_file_name(format!("{name}.seq{first_seq}-{kind}{suffix}.bak"));
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -1466,11 +1728,16 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
+                let repair = if kind == "torn" {
+                    "trimming a torn last line"
+                } else {
+                    "splitting a merged line"
+                };
                 return Err(anyhow::anyhow!(
-                    "failed to create backup {} before splitting a merged line: {}",
+                    "failed to create backup {} before {repair}: {}",
                     backup.display(),
                     e
-                ))
+                ));
             }
         };
         file.write_all(content.as_bytes())
@@ -1487,8 +1754,9 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
 
 /// Write `tail` over the file at `path` from byte `offset` on, in one write,
 /// cut the file to end where `tail` does, and sync it. The file keeps its
-/// inode, mode and every byte before `offset`.
-fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
+/// inode, mode and every byte before `offset`. `kind` (`merged` or `torn`)
+/// names the repair in the error.
+fn rewrite_tail(path: &Path, offset: usize, tail: &str, kind: &str) -> anyhow::Result<()> {
     use std::io::{Seek, SeekFrom};
     let mut file = OpenOptions::new()
         .write(true)
@@ -1499,7 +1767,14 @@ fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
         .and_then(|_| file.write_all(tail.as_bytes()))
         .and_then(|()| file.set_len(end))
         .and_then(|()| file.sync_data())
-        .map_err(|e| anyhow::anyhow!("failed to split the last line of {}: {}", path.display(), e))
+        .map_err(|e| {
+            let what = if kind == "torn" {
+                "trim the torn last line"
+            } else {
+                "split the last line"
+            };
+            anyhow::anyhow!("failed to {what} of {}: {}", path.display(), e)
+        })
 }
 
 #[cfg(test)]

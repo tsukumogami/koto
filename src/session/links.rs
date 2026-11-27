@@ -1143,6 +1143,7 @@ mod tests {
             by_session_id: format!("id-{by}"),
             actor: Default::default(),
             at: "2026-01-01T00:00:00Z".to_string(),
+            replaced: false,
         };
         crate::engine::persistence::append_supersede_fence(
             &path,

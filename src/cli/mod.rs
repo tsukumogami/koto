@@ -10792,6 +10792,8 @@ fn handle_cancel(
     let payload = EventPayload::WorkflowCancelled {
         state: current_state.clone(),
         reason: "cancelled by user".to_string(),
+        replaced_by: None,
+        replaced_by_session_id: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({

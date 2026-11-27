@@ -177,7 +177,7 @@ fn cancelled_last(events: &[Event]) -> bool {
 
 /// The last event that is a cancel, a transition, a directed transition
 /// or a rewind: the one that last set where the session stands.
-fn last_standing_event(events: &[Event]) -> Option<&Event> {
+pub(crate) fn last_standing_event(events: &[Event]) -> Option<&Event> {
     events.iter().rev().find(|e| {
         matches!(
             e.payload,
@@ -255,6 +255,8 @@ mod tests {
         let cancel = || EventPayload::WorkflowCancelled {
             state: "start".to_string(),
             reason: "test".to_string(),
+            replaced_by: None,
+            replaced_by_session_id: None,
         };
         let rewind = || EventPayload::Rewound {
             from: "start".to_string(),
@@ -280,6 +282,8 @@ mod tests {
         let cancel = || EventPayload::WorkflowCancelled {
             state: "work".to_string(),
             reason: "test".to_string(),
+            replaced_by: None,
+            replaced_by_session_id: None,
         };
         let read = || EventPayload::ContextRead {
             key: "k".to_string(),

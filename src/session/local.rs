@@ -149,6 +149,36 @@ impl LocalBackend {
         Ok(commit)
     }
 
+    /// Close `id`'s log as a replaced run with [`persistence::append_close`],
+    /// under `id`'s manifest lock and then its append lock, each waited for
+    /// at most `wait`, in the order a decision writer takes them. The
+    /// after-commit steps run once per event written, after both locks are
+    /// released. A manifest lock still held once `wait` has passed is
+    /// [`persistence::CloseOutcome::Unavailable`], with nothing written.
+    // Its caller, `koto init --replaces`, lands in a later change.
+    #[allow(dead_code)]
+    pub(crate) fn append_close(
+        &self,
+        id: &str,
+        close: &persistence::Close,
+        timestamp: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<persistence::CloseOutcome> {
+        let path = self.state_path(id);
+        let locked = self.with_manifest_lock_within(id, wait, || {
+            persistence::append_close(&path, close, timestamp, wait)
+        })?;
+        let Some(outcome) = locked else {
+            return Ok(persistence::CloseOutcome::Unavailable);
+        };
+        if let persistence::CloseOutcome::Closed { commits, .. } = &outcome {
+            for (payload, commit) in commits {
+                self.after_commit(id, payload, commit);
+            }
+        }
+        Ok(outcome)
+    }
+
     /// [`SessionBackend::add_context_locked`] with the wait for `id`'s
     /// manifest lock and then its append lock bounded by `wait` in all.
     ///

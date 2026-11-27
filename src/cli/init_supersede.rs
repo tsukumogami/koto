@@ -555,6 +555,7 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
                 by_session_id: generate_session_id(),
                 actor: actor(),
                 at: now_iso8601(),
+                replaced: false,
             };
             let (fence, through) = match &pulled {
                 Some(pulled) => fence_in_bucket(backend, pred, pulled, &fence),
