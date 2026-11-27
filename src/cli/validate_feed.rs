@@ -504,6 +504,52 @@ Body text.
         }
     }
 
+    /// The lines the close of a replaced run writes (`koto init --replaces`,
+    /// `koto session replace`): a `workflow_cancelled` naming the new run
+    /// and a `session_superseded` fence marked `replaced`, beside a plain
+    /// fence without the flag, validate clean. Each malformed variant is
+    /// rejected, which only a spec that declares the fields can do: the
+    /// validator skips an undeclared event type and an undeclared field.
+    #[test]
+    fn shipped_spec_accepts_the_replace_close_events() {
+        let log = write_temp(&format!(
+            "{}\n{}\n{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":5,"timestamp":"2024-01-01T00:00:04Z","type":"workflow_cancelled","payload":{"state":"work","reason":"replaced by deploy-r2","replaced_by":"deploy-r2","replaced_by_session_id":"9f2e"}}"#,
+            r#"{"seq":6,"timestamp":"2024-01-01T00:00:04Z","type":"session_superseded","payload":{"by":"deploy-r2","by_session_id":"9f2e","actor":{"host":"build-1","user":"dev"},"at":"2024-01-01T00:00:04Z","replaced":true}}"#,
+            r#"{"seq":7,"timestamp":"2024-01-01T00:00:05Z","type":"session_superseded","payload":{"by":"coord-2","by_session_id":"a1b2","actor":{},"at":"2024-01-01T00:00:05Z"}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+
+        for (what, malformed) in [
+            (
+                "a session_superseded without `by`",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"session_superseded","payload":{"by_session_id":"9f2e","actor":{},"at":"2024-01-01T00:00:00Z","replaced":true}}"#,
+            ),
+            (
+                "a session_superseded whose `replaced` is a string",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2024-01-01T00:00:00Z","replaced":"yes"}}"#,
+            ),
+            (
+                "a workflow_cancelled whose `replaced_by` is a number",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"replaced by s","replaced_by":7}}"#,
+            ),
+            (
+                "a workflow_cancelled whose `replaced_by_session_id` is a number",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"replaced by s","replaced_by":"s","replaced_by_session_id":7}}"#,
+            ),
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(
+                result.is_err(),
+                "{what} validated clean: the shipped spec doesn't declare the fields a \
+                 replace writes"
+            );
+        }
+    }
+
     /// The four `koto review record` events: a well-formed line of each
     /// validates clean, and one missing a required field or carrying a value
     /// outside its closed set is rejected, so the contract declares them
