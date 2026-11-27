@@ -28,12 +28,17 @@
 //!
 //! ## Carrying a count out
 //!
-//! A count leaves with the next successful call: a flush takes each queued
-//! session's count, writing 0 back under the lock, and passes the sum to
-//! the sink as `--carry N`. Because the take is one locked read-and-zero,
-//! two processes flushing for the same session can never both carry the
-//! same count. If the call that carried it isn't delivered, the taken
+//! A count leaves with the first call of a flush: the flush takes each
+//! queued session's count, writing 0 back under the lock, and passes the
+//! sum to the sink as `--carry N`. Because the take is one locked
+//! read-and-zero, two processes flushing for the same session can never
+//! both carry the same count. If that one call isn't posted, the taken
 //! counts are given back.
+//!
+//! Giving back is what the sink's contract asks for after a refusal or a
+//! kill, and it has one consequence: a sink that had already acted on a
+//! call koto then killed will see that carry again from the next flush.
+//! koto itself never hands one count to two calls.
 //!
 //! A session directory can be removed while it still holds a count: the
 //! terminal tick removes it, and so does a prune. Just before that, the
@@ -319,6 +324,11 @@ pub(crate) fn give_back_orphans(base: &Path, n: u64, started: Instant) -> bool {
 /// A session with no count file costs one `lstat` and nothing else.
 /// Best-effort like every change here: a lock that can't be had in time
 /// leaves the count to go with the directory.
+///
+/// The move happens before the removal, not after, since afterwards there
+/// is nothing to read. If the removal then fails, the session keeps its
+/// directory and its count is already with the orphans: it still goes out,
+/// once, with the next flush of the store.
 pub(crate) fn orphan(dir: &Path) {
     let started = Instant::now();
     let n = take(dir, started);

@@ -42,12 +42,14 @@
 //! ## Drop counts and the carry
 //!
 //! Drop counts go to each record's session directory (see `carry`). They
-//! leave with the next call that is delivered: before its first call a
-//! flush takes the count of every session it has records for, and the
-//! orphan count of their stores, and passes the sum as `--carry N`. Only
-//! the first call of a flush carries. A carry that wasn't delivered (the
-//! call was refused, failed, was killed, or the sink said sending is off)
-//! is given back, so the next flush carries it again.
+//! leave with the first call of a later flush: before that call a flush
+//! takes the count of every session it has records for, and the orphan
+//! count of their stores, and passes the sum as `--carry N`. Only the first
+//! call of a flush carries, and its outcome alone decides what happens to
+//! what was taken. Posted, the counts stay out. Anything else (the call was
+//! refused, failed, was killed, or the sink said sending is off) and they
+//! are given back, whatever the flush's later calls do, so the next flush
+//! carries them again.
 
 use std::collections::BTreeMap;
 use std::path::Path;
