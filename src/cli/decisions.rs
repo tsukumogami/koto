@@ -1501,6 +1501,12 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
              the prompt, so it reads as a remote session's answer here: {e}"
         );
     }
+    // Only an answer rings the raiser's wake: a settle or a withdrawal is
+    // recorded by the raiser (or a session continuing it), which has
+    // nothing to be woken for.
+    if outcome == "answered" {
+        ring_asker(backend, name);
+    }
 
     println!(
         "{}",
@@ -1514,6 +1520,33 @@ pub fn handle_answer(backend: &Backend, name: &str, id: &str, args: AnswerArgs) 
         }))?
     );
     Ok(())
+}
+
+/// Ring the wake file of `asker`, a question's raiser, after an answer to
+/// it was recorded, and of the newest session continuing it when it was
+/// superseded: `crate::engine::wake_signal::ring` for each, with the
+/// successor found by `crate::engine::supersede_chain::newest_member` in
+/// the sessions directory this command used. A wake
+/// carries no content: the asker's next tick reads the store. Ringing
+/// never fails the answer, which is already written: any refusal (no
+/// koto root, an unwritable wakes directory, a symlink, a directory or a
+/// FIFO at the path) is one warning on stderr, and the path is left as it
+/// was.
+fn ring_asker(backend: &Backend, asker: &str) {
+    use crate::engine::wake_signal::ring;
+    let Some(root) = crate::koto_home::koto_home() else {
+        eprintln!("warning: no wake delivered to {asker:?}: the koto root can't be resolved");
+        return;
+    };
+    // The succession is read from the sessions directory this command
+    // used, wherever it sits, so a moved sessions base still reaches the
+    // newest session continuing the asker.
+    let newest = crate::engine::supersede_chain::newest_member(backend.local_base_dir(), asker);
+    for session in std::iter::once(asker.to_string()).chain(newest) {
+        if let Err(e) = ring(&root, &session) {
+            eprintln!("warning: could not deliver a wake to {session:?}: {e}");
+        }
+    }
 }
 
 /// The checks `answer` makes against the question's resolution before

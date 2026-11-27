@@ -518,9 +518,21 @@ agents encounter today for any state that uses `integration:`.
   `koto session unpin`), `{"retained": true, "reason": "bucket_unchecked"}`
   with `bucket_unchecked.error` (cloud backend only: the bucket couldn't be
   checked for a pin, so the session wasn't removed), `{"retained": true,
+  "reason": "open_question", "open_questions": ["<session id>/<decision id>"]}`
+  (the session raised a question that is still open, which keeps it with no
+  expiry until the question is answered, reversed or fenced; `koto decisions
+  open` still returns it, and a later `koto next` on the ended session carries
+  the answer in `questions`), `{"retained": true, "reason": "person_answer",
+  "answered_questions": ["<session id>/<decision id>"]}` (the session holds a
+  person's answer that reads `verified` on this host, which keeps it with no
+  expiry whether or not the question is open or its raiser still exists, so
+  the person isn't asked again; no prune removes it, and only `koto session
+  cleanup <name> --force` does; a session's answer, or a person's answer
+  reading remote, isn't kept this way), `{"retained": true,
   "reason": "hierarchy"}` (the session has a
-  link or lineage: a dispatcher, a koto parent, a `chain/parent`, or another
-  session naming it; kept with or without `--no-cleanup` until `koto session
+  link or lineage: a dispatcher, a koto parent, a `chain/parent`, another
+  session naming it, or an answer or pass-up aimed at a question in another
+  session in the store, either way round; kept with or without `--no-cleanup` until `koto session
   prune` finds its hierarchy released; a session a later session continues
   adds `relation_keepers`, each `{keeper, standing, path}`, naming the later
   sessions whose standing keeps it, which under the cloud backend may be
@@ -529,8 +541,10 @@ agents encounter today for any state that uses `integration:`.
   "no_cleanup"}` (a lone session kept because the tick passed `--no-cleanup`). A
   parent kept for `hierarchy` also carries `kept_children`, beside `retention`:
   each terminal child it would once have removed, as `{"name", "reason",
-  "detail"}`, with `detail` naming the links and lineage that keep it. The field
-  is absent when there is none. A kept session can still be read with `koto status`
+  "detail"}`, with `detail` naming the links and lineage that keep it; a child
+  kept for an open question or a person's verified answer reads
+  `open_question` or `person_answer` and carries `open_questions` or
+  `answered_questions`. The field is absent when there is none. A kept session can still be read with `koto status`
   and `koto context get`, rewound with `koto rewind`, and retried by its parent's
   `retry_failed`; ticking it again returns `done` with the same `result`. Keeping a
   session never withholds its result: the parent's gate and a bound request leg get

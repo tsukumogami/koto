@@ -591,15 +591,20 @@ pub(crate) fn run(backend: &Backend, args: &InitArgs<'_>, entry: &EntryFlags) ->
         entry.attach_live,
         entry.replace_terminal,
     ) {
-        (Some(_), _, true) => create(
-            backend,
-            args,
-            entry,
-            &mut cache,
-            &compiled,
-            &hash,
-            Some(existing),
-        ),
+        (Some(_), _, true) => {
+            // Before the old run is judged, moved aside or removed: moving
+            // it renames it, and its decisions, which name it, stop reading.
+            refuse_question_holder(backend, entry, name);
+            create(
+                backend,
+                args,
+                entry,
+                &mut cache,
+                &compiled,
+                &hash,
+                Some(existing),
+            )
+        }
         (Some(state), _, false) => refuse(
             entry,
             Refusal::new(
@@ -634,6 +639,36 @@ fn spawn_kind_code(kind: &SpawnErrorKind) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "init_failed".to_string())
+}
+
+/// Refuse `--replace-terminal` over finished session `name` when it holds
+/// what an open question depends on (the open question itself, the answer
+/// in effect for one, or a pass-up its current addressee rests on), or when
+/// its decisions can't be read to tell: code `holds_question`, exit 2,
+/// nothing judged, moved or removed. Either way the replace would lose it:
+/// moving the session aside renames it, and its decisions, which name the
+/// session, stop reading; removing it loses them outright. Read from the
+/// local store only, so the cloud backend makes no request for it.
+fn refuse_question_holder(backend: &Backend, entry: &EntryFlags, name: &str) {
+    use crate::session::hierarchy::display_text;
+    let orphans = super::session::question_holds(backend.local_base_dir(), name);
+    if !orphans.refuses() {
+        return;
+    }
+    let message = format!(
+        "finished session '{}' wasn't replaced: {}. {}, then run koto init again",
+        display_text(name),
+        super::session::holds_reasons(&orphans),
+        super::session::holds_way_out(name, &orphans, "remove the session")
+    );
+    let mut r = Refusal::new(Some("holds_question"), message.clone(), 2);
+    for (k, v) in super::session::holds_error(name, &orphans, message) {
+        // `error` stays the text, as every refusal of `koto init` prints it.
+        if k != "message" {
+            r = r.with_field(&k, v);
+        }
+    }
+    refuse(entry, r);
 }
 
 /// What a replace does with the finished session it finds.

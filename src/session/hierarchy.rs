@@ -58,7 +58,9 @@ mod tests;
 
 use std::path::Path;
 
-pub use facts::{ContinuesFact, ImportedFrom, LinkFact, SessionFacts, IMPORTED_FROM_KEY};
+pub use facts::{
+    AimedFact, ContinuesFact, ImportedFrom, LinkFact, SessionFacts, IMPORTED_FROM_KEY,
+};
 pub use graph::{Directed, Edge, Graph, Scope, Via};
 pub use judge::{
     CloseKind, Judge, Judgment, Keeper, Member, MemberKind, ReleaseInstant, Retention, Unreadable,
@@ -166,6 +168,26 @@ pub fn relation_probe(base: &Path, name: &str) -> bool {
     false
 }
 
+/// Whether the session in `dir` holds an answer or pass-up aimed at the
+/// session whose header id is `id`: a readable `answer` or `readdress`
+/// under `ctx/koto/aimed/<id>/`. A directory there that can't be listed
+/// answers yes, which only keeps.
+fn aimed_here(dir: &Path, id: &str) -> bool {
+    if !crate::decisions::store::is_target_id(id) {
+        return false;
+    }
+    let aimed = dir.join("ctx").join("koto").join("aimed").join(id);
+    let files = match std::fs::read_dir(&aimed) {
+        Ok(files) => files,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) if aimed.symlink_metadata().is_ok_and(|m| !m.is_dir()) => return false,
+        Err(_) => return true,
+    };
+    files
+        .flatten()
+        .any(|f| facts::aimed_kind(&f.path()).is_some())
+}
+
 /// Whether session `name` under `base` has any edge at all: a link of its
 /// own, a `parent_workflow`, a `chain/parent`, or another session naming it
 /// through lineage, a link or a `chain/parent`.
@@ -217,6 +239,14 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
     if let Some(from) = &own.imported_from {
         probes.push(from.from_session.as_str());
     }
+    // The header ids this session's own answers and pass-ups are aimed at:
+    // each joins it to the session holding that id, found in this pass.
+    let aimed_at: std::collections::BTreeSet<&str> = own
+        .aimed
+        .iter()
+        .map(|a| a.target_id.as_str())
+        .filter(|t| own.session_id.as_deref() != Some(*t))
+        .collect();
     for other in &names {
         if other == name {
             continue;
@@ -229,8 +259,18 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
                         return true;
                     }
                 }
+                if aimed_at.contains(header.session_id.as_str()) {
+                    return true;
+                }
             }
             Err(_) => return true,
+        }
+        // An answer or pass-up another session holds aimed at this one's
+        // id joins the two: one lookup of `koto/aimed/<id>/` per session.
+        if let Some(id) = &own.session_id {
+            if aimed_here(&dir, id) {
+                return true;
+            }
         }
         // Every kind directory, known or not: the graph counts a link of a
         // kind this koto doesn't know as an edge too.
