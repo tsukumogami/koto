@@ -6739,6 +6739,9 @@ fn handle_next(
     // A gate-passing command that stopped between its event and its
     // decision's key left the decision embedded in the event: publish it
     // now (decision record, R24). Only a missing key takes the lock.
+    // It runs here, after the anchor and whole-binding checks, because the
+    // repair writes the session's context: a tick those checks refuse must
+    // leave nothing behind, so a refused tick no longer repairs.
     if crate::decisions::store::needs_repair(backend, &name, &events) {
         if let Err(e) = crate::decisions::store::repair(backend, &name) {
             eprintln!(

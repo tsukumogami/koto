@@ -773,9 +773,6 @@ enum TryLock {
     Io(std::io::Error),
 }
 
-/// Take an exclusive flock on `path` without waiting, creating the file
-/// so a writer that arrives later waits on it too. A missing directory
-/// means no one holds it: `Ok(None)`.
 /// [`try_flock`] on a session's `tick.lock`, which is never created here
 /// (a session made before the lock existed has none, and no tick of it can
 /// be running under one) and never followed through a link. `None` when the
@@ -812,6 +809,9 @@ fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     }
 }
 
+/// Take an exclusive flock on `path` without waiting, creating the file
+/// so a writer that arrives later waits on it too. A missing directory
+/// means no one holds it: `Ok(None)`.
 fn try_flock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
