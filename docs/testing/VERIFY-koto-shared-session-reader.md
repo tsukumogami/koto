@@ -60,7 +60,9 @@ for v in "" --all; do
   run "$MAIN" dashboard --once $v > main$v 2> main$v.err
   run "$PRE"  dashboard --once $v > pre2$v 2> pre2$v.err
 done
-# compared: cut -f1,2,4,5,6,8 of each, cut -f1,2,4,5,6,8,9,10, stderr, and full rows
+# each exit code was recorded; then, for the three outputs of a view:
+# cmp on cut -f1,2,4,5,6,8 (the columns that don't read the clock),
+# cmp on cut -f9,10, cmp on the .err files, and diff on the full rows
 ```
 
 | View | Rows (PRE, MAIN, PRE again) | Exit | Columns 1, 2, 4, 5, 6, 8 | Columns 9, 10 | stderr | Full rows that differ |
@@ -95,10 +97,12 @@ koto#778's run 1, with main before koto#778 as `OLD`:
 
 ```bash
 for v in "" --all; do
-  run "$OLD"  dashboard --once $v | cut -f1,2,4,5,6,8 > old$v
-  run "$MAIN" dashboard --once $v | cut -f1,2,4,5,6,8 > main$v
-  run "$LIST" once $v             | cut -f1,2,4,5,6,8 > list$v
-  cmp old$v main$v && cmp main$v list$v && echo identical
+  run "$OLD"  dashboard --once $v > old$v  2> old$v.err;  echo "exit $?"
+  run "$MAIN" dashboard --once $v > main$v 2> main$v.err; echo "exit $?"
+  run "$LIST" once $v             > list$v 2> list$v.err; echo "exit $?"
+  for f in old main list; do cut -f1,2,4,5,6,8 $f$v > $f$v.cut; done
+  cmp old$v.cut main$v.cut && cmp main$v.cut list$v.cut && echo identical
+  wc -l old$v.err main$v.err list$v.err
 done
 ```
 
@@ -116,7 +120,8 @@ were picked from `koto workflows` and `koto context list` on the clone.
 ```bash
 ROOT=execute-skill-regression-detection KEY=impl_base
 run "$LIST" list --root "$ROOT" --key "$KEY" > listroot
-# each row's state and liveness against columns 2 and 8 of MAIN's --once --all row;
+# list's fields are id, parent, state, liveness, value; fields 3 and 4 of each
+# row against columns 2 and 8 of MAIN's --once --all row for the same id;
 # then, last, each row's value against: run "$MAIN" context get <id> "$KEY",
 # with tabs, carriage returns and newlines read as spaces
 ```
@@ -146,9 +151,9 @@ rustls-webpki and url. The second prints 0, where `nm -u "$MAIN"` lists
 
 In CI, validate.yml's Session List Checks job runs both checks on the release
 build, then the ignored parity and hundred-read tests. At current main's head,
-90aeaaae, it is validate run 45943973811 (job 140324341367), which was still
-queued when this record was written. At koto#778's merge, f6c8e275, the job
-passed in validate run 45878295232 (job 140110880850).
+90aeaaae, validate run 45943973811 (job 140324341367) hadn't started when this
+record was written, so it gives no result here. At koto#778's merge, f6c8e275,
+the job passed in validate run 45878295232 (job 140110880850).
 
 **Reading.** Shown (measured). The program built from current main reports the
 dashboard's rows on a real store in both views, and on main before koto#778 and
@@ -168,14 +173,21 @@ the clone. Each loop cycles `once`, `once --all` and `list --root "$ROOT" --key
 
 ```bash
 SB='(version 1)(allow default)(deny file-write*)(deny network*)'
+fails=0
 for i in $(seq 100); do
   case $((i % 3)) in 1) a="once";; 2) a="once --all";; 0) a="list --root $ROOT --key $KEY";; esac
-  sandbox-exec -p "$SB" "$LIST" $a > /dev/null 2>> "$O/sb.err"
+  sandbox-exec -p "$SB" "$LIST" $a > /dev/null 2>> "$O/sb.err" || fails=$((fails+1))
 done
+echo "nonzero exits $fails"; wc -lc < "$O/sb.err"
 manifest() { (cd "$C/root" && find . -exec stat -f '%N|%HT|%z|%Fm' {} + | LC_ALL=C sort); }
 manifest > before
-for i in $(seq 100); do ...; run "$LIST" $a > /dev/null 2>> "$O/un.err"; done
-manifest > after; cmp before after
+fails=0
+for i in $(seq 100); do
+  case $((i % 3)) in 1) a="once";; 2) a="once --all";; 0) a="list --root $ROOT --key $KEY";; esac
+  run "$LIST" $a > /dev/null 2>> "$O/un.err" || fails=$((fails+1))
+done
+manifest > after
+echo "nonzero exits $fails"; wc -l < "$O/un.err"; cmp before after
 ```
 
 The sandboxed runs read the live store with this session's environment, cloud
@@ -187,14 +199,18 @@ host.
 | 100 sandboxed | live `~/.koto` | 0 (every run exited 0) | 0 lines, 0 bytes | not compared: other sessions write the live store; the sandbox denied this program every write |
 | 100 unsandboxed | the clone | 0 (every run exited 0) | 0 lines | manifest of 1,279,399 entries (path, type, size, modification time to the nanosecond) identical before and after |
 
-Under the same profile, `touch` on a scratch path was denied and `curl` to
-github.com was denied, so the profile does deny writes and network.
+The profile was checked against controls. Under it, `touch` on a scratch path
+was denied. For network, a listener was started on 127.0.0.1 outside the
+sandbox, and the same `nc -z 127.0.0.1 <port>` connect was run twice: without
+the sandbox it exited 0, and under the profile it exited 1. The control stays
+on loopback, so no request left the host; it shows the profile itself refuses
+a connect, separately from anything on the host that filters outbound traffic.
 
 **How "nothing pushed" was checked.** The program has no way to push: its
 dependency tree holds no storage, TLS or HTTP crate and its binary imports no
 `connect`, `socket` or `getaddrinfo` (clause 2). The sandboxed runs also ran
-with network access denied, and a push attempt there would have failed the run
-or written to stderr. The unsandboxed runs had no `KOTO_SESSION_*` variable,
+with network access denied; a push attempt there would have failed the run or
+written to stderr (inferred), and none did. The unsandboxed runs had no `KOTO_SESSION_*` variable,
 so no bucket was named to them. The bucket itself wasn't read: this walk
 makes no request to it, and CI's hundred-read test, which counts FakeS3
 requests, is the check that measures zero requests directly.
@@ -202,8 +218,10 @@ requests, is the check that measures zero requests directly.
 **Reading.** Shown on a copy (measured); "nothing pushed" verified by reading
 and by the sandbox, not by a bucket count. A hundred runs on a copy of a real
 cloud host's store left every entry unchanged. A hundred runs on the live store,
-with the cloud environment set, all succeeded with no write or network access
-allowed, so none of them needed either.
+with the cloud environment set, all exited 0 with empty stderr while writes and
+network were denied, so none of them failed for lack of either. A denied write
+the program swallowed silently would look the same; the copy's unchanged
+manifest is the check that covers writes.
 
 ## Clause 4: shirabe installs without a koto build step
 
@@ -212,7 +230,8 @@ allowed, so none of them needed either.
 shirabe's README (tsukumogami/shirabe main, 74ce25e9) documents two installs:
 the plugin, through Claude Code's marketplace, and the `shirabe` binary, through
 tsuku or `install.sh`. Both were followed in a scratch home under `$TMPDIR`,
-with a `PATH` holding no cargo, rustc or koto:
+with a `PATH` holding no cargo, rustc or koto (`/usr/bin` and `/bin` hold
+none, and neither does `$HOME/.local/bin`, checked by name):
 
 ```bash
 S4=$(mktemp -d); mkdir -p "$S4/home" "$S4/proj"; cd "$S4/proj"
@@ -233,10 +252,11 @@ $E ~/.tsuku/bin/tsuku install tsukumogami/shirabe
 - `install.sh` wasn't run. The documented form pipes `curl` into `bash`, and
   this host's network gate refuses `curl` commands, so the README's tsuku
   route stood in for it. The script, read from main, downloads a released
-  binary and its checksums and builds nothing.
+  binary and its checksums and builds nothing (verified by reading).
 - koto itself isn't part of either install. The README lists koto 0.33.0 or
   later as a requirement of the koto-backed skills, which `tsuku install`
-  provides as a released binary; it wasn't installed in the scratch home.
+  provides as a released binary (verified by reading); it wasn't installed in
+  the scratch home.
 
 **Does shirabe take koto-session-reader?** No. Nothing in the installed plugin
 tree names `koto-session-reader` or `koto_session_reader` (0 files), and the
@@ -262,5 +282,5 @@ step; that is inferred, not run.
 |--------|--------------------|
 | 1. Dashboard before and after | Shown: same sessions, states and liveness classes in both views; only the two clock columns differ |
 | 2. The minimal program | Shown: rows equal the dashboard's in both views, `list` agrees with the dashboard and with `koto context get`, no cloud, TLS or HTTP crate and no socket import |
-| 3. A hundred reads change nothing | Shown: a hundred runs left a copy of the store identical and a hundred sandboxed runs on the live store needed no write or network access |
+| 3. A hundred reads change nothing | Shown on a copy: a hundred runs left a copy of the store identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
 | 4. shirabe installs without a koto build step | Not shown: the install needs no koto build step, but shirabe doesn't take koto-session-reader yet |
