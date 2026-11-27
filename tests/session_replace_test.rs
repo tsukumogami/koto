@@ -1190,3 +1190,283 @@ fn session_replace_refuses_a_new_run_whose_key_names_another_run() {
     assert!(payloads(&host.log(NAME), "session_superseded").is_empty());
     assert!(payloads(&host.log(NAME), "workflow_cancelled").is_empty());
 }
+
+/// `koto status name`'s JSON, asserting exit 0.
+fn status(host: &Host, name: &str) -> Value {
+    let out = expect_ok(host.koto(&["status", name]), &format!("status {name}"));
+    out.json()
+}
+
+/// The member `name` of `of`'s hierarchy, from `koto session hierarchy
+/// --json`.
+fn hierarchy_member(host: &Host, of: &str, name: &str) -> Value {
+    let out = expect_ok(
+        host.koto(&["session", "hierarchy", of, "--json"]),
+        &format!("session hierarchy {of}"),
+    );
+    let json = out.json();
+    json["members"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no members: {}", out.describe()))
+        .iter()
+        .find(|m| m["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} isn't a member: {}", out.describe()))
+}
+
+#[test]
+fn init_replaces_closes_the_old_run_and_status_and_hierarchy_read_it_cancelled() {
+    let host = Host::new();
+    let old = host.dir("old");
+    host.init_at(&old, NAME);
+    let before = status(&host, NAME);
+    assert_eq!(before["is_terminal"], false, "{before}");
+    assert!(before.get("status").is_none(), "{before}");
+    assert!(before.get("replaced_by").is_none(), "{before}");
+
+    expect_ok(host.replace(NAME, &[]), "init --replaces");
+    assert_closed(&host, NAME, true, "init --replaces");
+
+    // OLD reads finished and cancelled, and names the run that replaced it.
+    let json = status(&host, NAME);
+    assert_eq!(json["name"], NAME, "{json}");
+    assert_eq!(json["current_state"], "start", "{json}");
+    assert_eq!(json["is_terminal"], true, "{json}");
+    assert_eq!(json["status"], "cancelled", "{json}");
+    assert_eq!(json["replaced_by"], NEW, "{json}");
+    let member = hierarchy_member(&host, NAME, NAME);
+    assert_eq!(member["alive"], false, "{member}");
+    assert_eq!(member["close_kind"], "cancelled", "{member}");
+
+    // NEW is a fresh run that replaced nothing it reads as.
+    let json = status(&host, NEW);
+    assert_eq!(json["is_terminal"], false, "{json}");
+    assert!(json.get("status").is_none(), "{json}");
+    assert!(json.get("replaced_by").is_none(), "{json}");
+    let member = hierarchy_member(&host, NEW, NEW);
+    assert_eq!(member["alive"], true, "{member}");
+
+    // A run cancelled and kept, which nothing replaced, reads as it did.
+    host.init_at(&host.ws, "kept");
+    expect_ok(host.koto(&["cancel", "kept"]), "cancel kept");
+    let json = status(&host, "kept");
+    assert_eq!(json["is_terminal"], false, "{json}");
+    assert!(json.get("status").is_none(), "{json}");
+    assert!(json.get("replaced_by").is_none(), "{json}");
+
+    // A finished run that was replaced keeps its finished shape and names
+    // the run that replaced it.
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    expect_ok(host.koto(&["next", NAME, "--with-data", GO]), "next go");
+    expect_ok(
+        host.koto(&["next", NAME, "--with-data", OK, "--no-cleanup"]),
+        "next ok",
+    );
+    let finished = status(&host, NAME);
+    expect_ok(host.replace(NAME, &[]), "init --replaces a finished run");
+    assert_closed(&host, NAME, false, "a finished run");
+    let json = status(&host, NAME);
+    assert_eq!(json["current_state"], "done", "{json}");
+    assert_eq!(json["is_terminal"], true, "{json}");
+    assert_eq!(json["result"], finished["result"], "{json}");
+    assert!(json.get("status").is_none(), "{json}");
+    assert_eq!(json["replaced_by"], NEW, "{json}");
+    let member = hierarchy_member(&host, NAME, NAME);
+    assert_eq!(member["alive"], false, "{member}");
+    assert_eq!(member["close_kind"], "terminal", "{member}");
+}
+
+#[test]
+fn a_replaced_run_refuses_rewind_cancel_next_and_supersede() {
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    expect_ok(host.koto(&["next", NAME, "--with-data", GO]), "next go");
+    expect_ok(host.replace(NAME, &[]), "init --replaces");
+    let log = host.log(NAME);
+    let old_log = std::fs::read(&log).unwrap();
+    let new_before = files(&host.session_dir(NEW));
+    let template = host.template();
+    let unchanged = |what: &str| {
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            old_log,
+            "{what} wrote to the old run"
+        );
+        assert_eq!(
+            files(&host.session_dir(NEW)),
+            new_before,
+            "{what} changed NEW"
+        );
+    };
+    // The refusal says the run was replaced, not superseded, and where to
+    // go on.
+    let says_replaced = |message: &str, what: &str| {
+        assert!(
+            message.contains(&format!("session '{NAME}' was replaced by '{NEW}'")),
+            "{what}: {message}"
+        );
+        assert!(
+            message.contains(&format!("continue in '{NEW}'")),
+            "{what}: {message}"
+        );
+    };
+
+    for verb in ["rewind", "cancel"] {
+        let out = run(host.koto(&[verb, NAME]));
+        assert_eq!(out.code, Some(2), "{verb}: {}", out.describe());
+        let json = out.json();
+        assert_eq!(json["code"], "session_superseded", "{verb}: {json}");
+        assert_eq!(json["command"], verb, "{verb}: {json}");
+        assert_eq!(json["superseded_by"], NEW, "{verb}: {json}");
+        assert_eq!(json["newest"], NEW, "{verb}: {json}");
+        says_replaced(json["error"].as_str().unwrap_or_default(), verb);
+        unchanged(verb);
+    }
+
+    let out = run(host.koto(&["next", NAME, "--with-data", OK]));
+    assert_eq!(out.code, Some(2), "next: {}", out.describe());
+    let json = out.json();
+    assert_eq!(json["error"]["code"], "session_superseded", "next: {json}");
+    assert_eq!(json["newest"], NEW, "next: {json}");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    says_replaced(message, "next");
+    unchanged("next");
+
+    // A supersede of OLD by another session is refused as replaced.
+    let out = run(host.koto(&[
+        "init",
+        "succ",
+        "--template",
+        &template,
+        "--continues",
+        NAME,
+        "--supersede",
+    ]));
+    assert_refused(&out, 2, "session_replaced");
+    assert_eq!(out.json()["replaced_by"], NEW, "{}", out.describe());
+    assert_eq!(out.json()["newest"], NEW, "{}", out.describe());
+    assert!(
+        !host.session_dir("succ").exists(),
+        "the refused supersede created its successor"
+    );
+    unchanged("a supersede by another session");
+
+    // So is a stale supersede naming NEW: the replace's fence is no earlier
+    // run of it, so it can't be finished into a confirmed supersede.
+    let out = run(host.koto(&[
+        "init",
+        NEW,
+        "--template",
+        &template,
+        "--continues",
+        NAME,
+        "--supersede",
+    ]));
+    assert_refused(&out, 2, "session_replaced");
+    assert_eq!(out.json()["replaced_by"], NEW, "{}", out.describe());
+    unchanged("a supersede naming NEW");
+    let marker = host.session_dir(NAME).join("ctx/koto/superseded-by");
+    assert!(
+        !marker.exists(),
+        "the refused supersede wrote OLD's supersede marker"
+    );
+    assert_closed(&host, NAME, true, "after the refusals");
+}
+
+/// `koto init NAME --template T --replace-terminal`, from the workspace.
+fn replace_terminal(host: &Host) -> Command {
+    let t = host.template();
+    host.koto(&["init", NAME, "--template", &t, "--replace-terminal"])
+}
+
+#[test]
+fn replace_terminal_refuses_a_name_whose_log_holds_a_replaced_fence() {
+    // A run the replace cancelled.
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    expect_ok(host.replace(NAME, &[]), "init --replaces");
+    let before = files(&host.sessions());
+
+    let out = run(replace_terminal(&host));
+
+    assert_refused(&out, 2, "session_replaced");
+    assert_eq!(out.json()["replaced_by"], NEW, "{}", out.describe());
+    assert_eq!(out.json()["newest"], NEW, "{}", out.describe());
+    assert_eq!(
+        files(&host.sessions()),
+        before,
+        "the refused --replace-terminal wrote something"
+    );
+    assert_closed(&host, NAME, true, "after the refusal");
+
+    // A run that had finished before the replace.
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    expect_ok(host.koto(&["next", NAME, "--with-data", GO]), "next go");
+    expect_ok(
+        host.koto(&["next", NAME, "--with-data", OK, "--no-cleanup"]),
+        "next ok",
+    );
+    expect_ok(host.replace(NAME, &[]), "init --replaces a finished run");
+    let before = files(&host.sessions());
+
+    let out = run(replace_terminal(&host));
+
+    assert_refused(&out, 2, "session_replaced");
+    assert_eq!(out.json()["replaced_by"], NEW, "{}", out.describe());
+    assert_eq!(
+        files(&host.sessions()),
+        before,
+        "the refused --replace-terminal wrote something"
+    );
+    assert_closed(&host, NAME, false, "a finished run, after the refusal");
+}
+
+#[test]
+fn a_replaced_child_its_parent_removed_still_reads_replaced_by_from_its_record() {
+    let host = Host::new();
+    host.init_at(&host.ws, "parent");
+    let t = host.template();
+    expect_ok(
+        host.koto(&["init", NAME, "--template", &t, "--parent", "parent"]),
+        "setup: init child",
+    );
+    expect_ok(host.replace(NAME, &[]), "init --replaces the child");
+    assert_closed(&host, NAME, true, "a child");
+
+    // The parent finishes and is kept; once the retention passes, a
+    // --replace-terminal of it releases the old run and removes its kept
+    // children with it, the replaced one among them.
+    expect_ok(host.koto(&["next", "parent", "--with-data", GO]), "next go");
+    expect_ok(
+        host.koto(&["next", "parent", "--with-data", OK, "--no-cleanup"]),
+        "next ok",
+    );
+    std::thread::sleep(Duration::from_millis(1300));
+    let mut cmd = host.koto(&["init", "parent", "--template", &t, "--replace-terminal"]);
+    cmd.env("KOTO_RETENTION_KEEP", "1s");
+    let out = expect_ok(cmd, "init parent --replace-terminal");
+    assert!(out.json().get("moved_to").is_none(), "{}", out.describe());
+    assert!(
+        !host.session_dir(NAME).exists(),
+        "the parent's sweep kept the replaced child"
+    );
+    assert!(host.session_dir(NEW).exists(), "the sweep removed NEW");
+
+    // Its status comes from the record the sweep wrote, and still names
+    // the run that replaced it, which is the newest run of the work.
+    let json = status(&host, NAME);
+    assert_eq!(json["removed"], true, "{json}");
+    assert_eq!(json["is_terminal"], true, "{json}");
+    assert_eq!(json["status"], "cancelled", "{json}");
+    assert_eq!(json["current_state"], "start", "{json}");
+    assert_eq!(json["replaced_by"], NEW, "{json}");
+    let path = host.sessions().join(format!(".finished/{NAME}.json"));
+    let record: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(record["removed_by"], "parent", "{record}");
+    assert_eq!(record["replaced_by"], NEW, "{record}");
+
+    let json = status(&host, NEW);
+    assert!(json.get("replaced_by").is_none(), "{json}");
+}

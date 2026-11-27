@@ -1170,6 +1170,58 @@ mod tests {
         assert_eq!(newest_member(&b, "c"), None);
     }
 
+    /// Close `session` for `by` with the fence a replace writes: one marked
+    /// `replaced`.
+    fn replaced_fence(b: &LocalBackend, session: &str, by: &str) {
+        let path = b
+            .session_dir(session)
+            .join(crate::session::state_file_name(session));
+        let fence = crate::engine::persistence::SupersedeFence {
+            by: by.to_string(),
+            by_session_id: format!("id-{by}"),
+            actor: Default::default(),
+            at: "2026-01-01T00:00:00Z".to_string(),
+            replaced: true,
+        };
+        crate::engine::persistence::append_supersede_fence(
+            &path,
+            &fence,
+            "2026-01-01T00:00:00Z",
+            crate::engine::persistence::FENCE_LOCK_WAIT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn links_newest_member_follows_a_replaced_fence() {
+        // The refusal chain names where a closed run's work goes on, so a
+        // replaced fence is followed, unlike the wake ring's walk.
+        let (_tmp, b) = backend();
+        for name in ["a", "b", "c"] {
+            make_session(&b, name, &format!("id-{name}"), None);
+        }
+        replaced_fence(&b, "a", "b");
+        let got = newest_member(&b, "a").unwrap();
+        assert_eq!(got.fence.by, "b");
+        assert!(got.fence.replaced);
+        assert_eq!(got.newest, "b");
+
+        // On past a supersede of the run that replaced it, and through a
+        // replaced member further on.
+        fence(&b, "b", "c");
+        assert_eq!(newest_member(&b, "a").unwrap().newest, "c");
+        let (_tmp, b) = backend();
+        for name in ["a", "b", "c"] {
+            make_session(&b, name, &format!("id-{name}"), None);
+        }
+        fence(&b, "a", "b");
+        replaced_fence(&b, "b", "c");
+        let got = newest_member(&b, "a").unwrap();
+        assert_eq!(got.fence.by, "b");
+        assert!(!got.fence.replaced);
+        assert_eq!(got.newest, "c");
+    }
+
     #[test]
     fn newest_member_stops_at_a_cycle_a_bad_name_or_a_missing_session() {
         let (_tmp, b) = backend();
