@@ -1772,15 +1772,47 @@ fn cached_run_id(
     }
     let run_id = lineage::run_id(backend, header);
     if run_id.is_some() {
+        // The sidecar is being written anyway, so a child whose run
+        // template isn't cached yet gets it in the same write.
+        let (cached_template, driver) = match cached {
+            Some(c) => (
+                lineage::RunTemplate {
+                    name: c.run_template_name,
+                    hash: c.run_template_hash,
+                },
+                c.driver,
+            ),
+            None => (lineage::RunTemplate::default(), None),
+        };
+        let template = if cached_template.is_empty() {
+            child_run_template(backend, header)
+        } else {
+            cached_template
+        };
         let _ = sidecar::write(
             session_dir,
             &sidecar::Sidecar {
                 run_id: run_id.clone(),
-                driver: cached.and_then(|c| c.driver),
+                driver,
+                run_template_name: template.name,
+                run_template_hash: template.hash,
             },
         );
     }
     run_id
+}
+
+/// The run template a child's sidecar caches: what its ancestors on this
+/// host give (see `lineage::found_run_template`). A root caches none, since
+/// its own header answers, so its sidecar keeps the bytes it always had.
+fn child_run_template(
+    backend: &dyn SessionBackend,
+    header: &StateFileHeader,
+) -> lineage::RunTemplate {
+    if header.parent_workflow.is_none() {
+        return lineage::RunTemplate::default();
+    }
+    lineage::found_run_template(backend, header)
 }
 
 /// The session's header: the first line of the log `commit` read under its
@@ -1814,7 +1846,9 @@ fn changed_driver(session_dir: &Path) -> Option<String> {
 /// Journal a session that `init_state_file` has just committed:
 /// `session_started`, then a `state_entered` for each state its initial
 /// events enter. Writes the session's sidecar with its run id and creation
-/// driver. `journal_root` is the store's journal home; `None` writes
+/// driver and, for a child, its run's template: this is when the parent is
+/// on this host, so it is read from the parent's header or the parent's own
+/// sidecar. `journal_root` is the store's journal home; `None` writes
 /// nothing.
 pub(crate) fn after_init(
     journal_root: Option<&Path>,
@@ -1840,9 +1874,15 @@ pub(crate) fn after_init(
             .iter()
             .filter_map(|e| record_for(&e.payload, session, header, run_id.as_deref())),
     );
+    let template = child_run_template(backend, header);
     let _ = sidecar::write(
         &backend.session_dir(session),
-        &sidecar::Sidecar { run_id, driver },
+        &sidecar::Sidecar {
+            run_id,
+            driver,
+            run_template_name: template.name,
+            run_template_hash: template.hash,
+        },
     );
     write(root, &records);
 }
@@ -1970,11 +2010,15 @@ pub(crate) fn after_commit(
     // it. A write that failed (and warned) is not retried: the cache moves
     // either way, as every journal write is best-effort.
     if new_driver.is_some() {
+        // Only the driver moves: a cached run template stays.
+        let cached = sidecar::read(&session_dir).unwrap_or_default();
         let _ = sidecar::write(
             &session_dir,
             &sidecar::Sidecar {
                 run_id,
                 driver: new_driver,
+                run_template_name: cached.run_template_name,
+                run_template_hash: cached.run_template_hash,
             },
         );
     }
@@ -2190,9 +2234,15 @@ pub(crate) fn imported(
             .name("koto.state", Some(state)),
         );
     }
+    // An imported session is its own run, so its header answers for the
+    // run template and the sidecar caches none.
     let _ = sidecar::write(
         &backend.session_dir(session),
-        &sidecar::Sidecar { run_id, driver },
+        &sidecar::Sidecar {
+            run_id,
+            driver,
+            ..sidecar::Sidecar::default()
+        },
     );
     write(root, &records);
 }

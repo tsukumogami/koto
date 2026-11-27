@@ -978,6 +978,31 @@ pub enum SessionCommand {
         json: bool,
     },
 
+    /// Print a session's identity: its id, its run's id and its run's
+    /// template.
+    ///
+    /// With `--json`, one JSON object whose keys are the attribute names
+    /// the session's records carry: `koto.session.id`, `koto.run.id`,
+    /// `koto.run.template.name` and `koto.run.template.hash`. A run is a
+    /// root session and every session spawned under it; its id and its
+    /// template are the root's. A value that can't be resolved (a child
+    /// whose ancestors are gone from this host, a template with no name) is
+    /// left out, never guessed. Without `--json`, the same pairs as
+    /// `key=value` lines.
+    ///
+    /// Reads this host's session store only and writes nothing. Exits 0
+    /// when the session exists, even with keys left out; 2 for an invalid
+    /// name or a session this host doesn't hold; 3 when the session's
+    /// header can't be read.
+    Identity {
+        /// The session whose identity to print
+        name: String,
+
+        /// Print one JSON object instead of `key=value` lines
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show which session dispatched a session, as JSON.
     ///
     /// Prints `{"session", "via", "origin"}`. `origin.state` is
@@ -2984,6 +3009,9 @@ pub fn run(app: App) -> Result<()> {
                 }
                 SessionCommand::Hierarchy { name, json } => {
                     session::handle_hierarchy(&backend, &name, json)
+                }
+                SessionCommand::Identity { name, json } => {
+                    session::handle_identity(&backend, &name, json)
                 }
                 SessionCommand::Origin { name } => session::handle_origin(&backend, &name),
                 SessionCommand::Rebind { name, to } => {

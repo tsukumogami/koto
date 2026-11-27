@@ -950,6 +950,31 @@ When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at",
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 
+#### session identity
+
+Prints a session's identity: its id, the id of its run, and its run's template.
+
+```bash
+koto session identity <name> [--json]
+```
+
+A run is a root session and every session spawned under it. Its id is the root's session id, and its template is the root's. With `--json` the command prints one JSON object whose keys are the attribute names the session's records carry:
+
+```json
+{"koto.run.id": "5a1c0f6e-3d0b-4c58-9d4e-2f6b7a1e9c33",
+ "koto.run.template.hash": "c9fe1ea91bcef5c8f75b6664d3bac00b2c4148ccb59ea4175bdaf378c19060dd",
+ "koto.run.template.name": "work-on",
+ "koto.session.id": "5a1c0f6e-3d0b-4c58-9d4e-2f6b7a1e9c33"}
+```
+
+Without `--json` it prints the same pairs as `key=value` lines, one per line.
+
+A root answers from its own header, so its two ids are equal. A child prints its own session id, its root's id as the run id, and its root's template, not its own. koto caches a child's run template when the child is created, in the `run-journal.json` sidecar of its session directory, so the answer outlives the root's local copy. A child with no cached value (one created by an older koto) is answered by reading its ancestors' headers on this host.
+
+A key with no value is left out, never guessed: a template with no name, or a child whose ancestors are gone from this host and whose sidecar caches nothing. The command still exits 0 in that case.
+
+The command reads this host's session store only, as the lookup behind the records does, and writes nothing. Under the cloud backend it doesn't ask the bucket. It exits 2 for a malformed name or a session this host doesn't hold, and 3 when the session's header can't be read, each with a JSON error on stdout: `{"error": "...", "command": "session identity"}`.
+
 #### session origin
 
 Shows which session dispatched a session: an anchor, or a workflow session.
