@@ -39,7 +39,15 @@
 //! counts, records are still queued so each later flush can count them.
 //! After a stop that doesn't, nothing more is queued.
 //!
-//! Drop counts go to each record's session directory (see `carry`).
+//! ## Drop counts and the carry
+//!
+//! Drop counts go to each record's session directory (see `carry`). They
+//! leave with the next call that is delivered: before its first call a
+//! flush takes the count of every session it has records for, and the
+//! orphan count of their stores, and passes the sum as `--carry N`. Only
+//! the first call of a flush carries. A carry that wasn't delivered (the
+//! call was refused, failed, was killed, or the sink said sending is off)
+//! is given back, so the next flush carries it again.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -207,13 +215,80 @@ impl Drops {
         }
     }
 
-    /// Write each session's count beside it. The sessions share one lock
-    /// wait between them, so a flush that drops records of many sessions
+    /// Write each session's count beside it. Every lock wait is measured
+    /// from `started`, so a flush that drops records of many sessions
     /// spends no longer here than one that drops records of one.
-    fn write(self) {
-        let started = Instant::now();
+    fn write(self, started: Instant) {
         for (dir, n) in self.0 {
             carry::add_within(&dir, n, started);
+        }
+    }
+}
+
+/// The counts a flush took to carry out with its first call: each queued
+/// session's own, and the orphans of each store those sessions belong to.
+/// Each was zeroed under its lock as it was taken, so no other process can
+/// carry the same count. If the call that carries them isn't delivered,
+/// they are given back.
+#[derive(Default)]
+struct Taken {
+    sessions: Vec<(Arc<Path>, u64)>,
+    orphans: Vec<(std::path::PathBuf, u64)>,
+}
+
+impl Taken {
+    /// Take the counts of every session `items` belong to, and of their
+    /// stores. The lock waits are measured from `started`, together.
+    fn take(items: &[Queued], started: Instant) -> Taken {
+        let mut taken = Taken::default();
+        let mut dirs: Vec<&Arc<Path>> = Vec::new();
+        let mut bases: Vec<&Path> = Vec::new();
+        for item in items {
+            if !dirs
+                .iter()
+                .any(|d| Arc::ptr_eq(d, &item.session_dir) || **d == item.session_dir)
+            {
+                dirs.push(&item.session_dir);
+                if let Some(base) = item.session_dir.parent() {
+                    if !bases.contains(&base) {
+                        bases.push(base);
+                    }
+                }
+            }
+        }
+        for dir in dirs {
+            let n = carry::take(dir, started);
+            if n > 0 {
+                taken.sessions.push((Arc::clone(dir), n));
+            }
+        }
+        for base in bases {
+            let n = carry::take_orphans(base, started);
+            if n > 0 {
+                taken.orphans.push((base.to_path_buf(), n));
+            }
+        }
+        taken
+    }
+
+    /// What the first call carries.
+    fn total(&self) -> u64 {
+        self.sessions
+            .iter()
+            .map(|(_, n)| *n)
+            .chain(self.orphans.iter().map(|(_, n)| *n))
+            .fold(0u64, u64::saturating_add)
+            .min(carry::MAX_COUNT)
+    }
+
+    /// Put every taken count back where it came from. A session whose
+    /// directory has gone since gets its count in its store's orphans.
+    fn give_back(self, started: Instant) {
+        for (dir, n) in self.sessions {
+            carry::give_back(&dir, n, started);
+        }
+        for (base, n) in self.orphans {
+            carry::give_back_orphans(&base, n, started);
         }
     }
 }
@@ -236,7 +311,7 @@ pub fn flush() {
     }
     if state == Breaker::StoppedCounting {
         drops.add_all(&items);
-        drops.write();
+        drops.write(Instant::now());
         return;
     }
     let Some(sink) = sink::discover() else {
@@ -245,6 +320,11 @@ pub fn flush() {
     };
 
     let deadline = Instant::now() + call_budget();
+    // The counts earlier flushes left behind go out with the first call.
+    // They are taken now, under their locks, and held in `taken` until that
+    // call is known to have been delivered.
+    let mut taken = Some(Taken::take(&items, Instant::now()));
+    let mut carry = taken.as_ref().map_or(0, Taken::total);
     let mut rest = items.as_slice();
     while !rest.is_empty() {
         let (chunk, after) = rest.split_at(rest.len().min(CHUNK));
@@ -256,13 +336,22 @@ pub fn flush() {
             break;
         }
         let lines: Vec<&str> = chunk.iter().map(|q| q.line.as_str()).collect();
-        match sink::send(&sink, &lines, 0, deadline) {
-            Outcome::Posted | Outcome::PostedSomeInvalid => {}
+        let outcome = sink::send(&sink, &lines, carry, deadline);
+        // Only the first call carries. Whether the carry was delivered is
+        // decided by that call alone.
+        carry = 0;
+        match outcome {
+            Outcome::Posted | Outcome::PostedSomeInvalid => taken = None,
             Outcome::Usage => drops.add_all(chunk),
             Outcome::Off => {
                 // Sending is off: stop, and count nothing, not even what
-                // this flush had already set aside.
+                // this flush had already set aside. What was taken is put
+                // back as it was: it was counted before, by a sink that
+                // was on.
                 set_breaker(Breaker::StoppedSilent);
+                if let Some(taken) = taken {
+                    taken.give_back(Instant::now());
+                }
                 return;
             }
             Outcome::Dropped | Outcome::Killed | Outcome::SpawnFailed => {
@@ -273,7 +362,12 @@ pub fn flush() {
         }
         rest = after;
     }
-    drops.write();
+    // The give-back and the new drops share one lock wait.
+    let started = Instant::now();
+    if let Some(taken) = taken {
+        taken.give_back(started);
+    }
+    drops.write(started);
 }
 
 /// The lines waiting for the next flush, in order.
@@ -460,11 +554,12 @@ mod tests {
         // Only the third chunk is counted, and the breaker is open.
         assert_eq!(carry::peek(&f.a), 50);
         assert_eq!(breaker(), Breaker::Open);
-        // The next flush sends.
+        // The next flush sends, and carries the 50 out with it.
         f.queue(&f.a, 450, 5);
         flush();
         assert_eq!(f.sizes(), vec![200, 200, 5]);
-        assert_eq!(carry::peek(&f.a), 50);
+        assert_eq!(f.stub.calls()[2].carry(), Some(50));
+        assert_eq!(carry::peek(&f.a), 0);
     }
 
     #[test]
@@ -490,6 +585,160 @@ mod tests {
         assert_eq!(f.stub.call_count(), 1);
         assert_eq!(carry::peek(&f.a), 251);
         assert_eq!(carry::peek(&f.b), 17);
+    }
+
+    #[test]
+    fn a_count_goes_out_as_carry_on_the_first_call_and_is_zeroed() {
+        let f = Fixture::unhurried();
+        assert!(carry::add(&f.a, 7));
+        assert!(carry::add(&f.b, 3));
+        // Records for both sessions, in three chunks.
+        f.queue(&f.a, 0, 250);
+        f.queue(&f.b, 250, 200);
+        flush();
+        let calls = f.stub.calls();
+        assert_eq!(f.sizes(), vec![200, 200, 50]);
+        // The first call carries both sessions' counts; the others carry
+        // nothing.
+        assert_eq!(calls[0].carry(), Some(10));
+        assert_eq!(
+            calls[0].argv,
+            vec!["send", "--scope", "koto-journal", "--carry", "10"]
+        );
+        assert_eq!(calls[1].carry(), None);
+        assert_eq!(calls[2].carry(), None);
+        assert_eq!(carry::peek(&f.a), 0);
+        assert_eq!(carry::peek(&f.b), 0);
+        // Nothing is left to carry on the next flush.
+        f.queue(&f.a, 450, 1);
+        flush();
+        assert_eq!(f.stub.calls()[3].carry(), None);
+    }
+
+    #[test]
+    fn a_session_with_no_count_sends_no_carry_and_gains_no_files() {
+        let f = Fixture::unhurried();
+        f.queue(&f.a, 0, 3);
+        flush();
+        assert_eq!(f.stub.calls()[0].carry(), None);
+        assert_eq!(std::fs::read_dir(&f.a).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn exit_3_adds_back_taken_carry() {
+        let f = Fixture::unhurried();
+        f.stub.exit_codes(&[3]);
+        assert!(carry::add(&f.a, 7));
+        assert!(carry::add(&f.b, 3));
+        f.queue(&f.a, 0, 250);
+        f.queue(&f.b, 250, 10);
+        flush();
+        // The one call carried what was taken...
+        let calls = f.stub.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].carry(), Some(10));
+        // ...and since the sink refused it, the taken counts are back,
+        // each in its own session, with the failed chunk's records and the
+        // unsent chunk's on top.
+        assert_eq!(carry::peek(&f.a), 7 + 250);
+        assert_eq!(carry::peek(&f.b), 3 + 10);
+        assert_eq!(breaker(), Breaker::StoppedCounting);
+    }
+
+    #[test]
+    fn a_killed_call_adds_back_taken_carry() {
+        let f = Fixture::new();
+        f.stub.sleeps(&["120"]);
+        assert!(carry::add(&f.a, 7));
+        f.queue(&f.a, 0, 5);
+        flush();
+        let calls = f.stub.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].carry(), Some(7));
+        assert!(!calls[0].done);
+        assert_eq!(carry::peek(&f.a), 7 + 5);
+    }
+
+    #[test]
+    fn a_failed_or_switched_off_first_call_gives_the_carry_back() {
+        // Exit 1: the chunk is lost and counted, the carry returns, and the
+        // next flush carries both.
+        let f = Fixture::unhurried();
+        f.stub.exit_codes(&[1, 0]);
+        assert!(carry::add(&f.a, 7));
+        f.queue(&f.a, 0, 2);
+        flush();
+        assert_eq!(f.stub.calls()[0].carry(), Some(7));
+        assert_eq!(carry::peek(&f.a), 7 + 2);
+        f.queue(&f.a, 2, 1);
+        flush();
+        assert_eq!(f.stub.calls()[1].carry(), Some(9));
+        assert_eq!(carry::peek(&f.a), 0);
+        drop(f);
+
+        // Exit 2: nothing new is counted, and what was taken is put back
+        // as it was.
+        let f = Fixture::unhurried();
+        f.stub.exit_codes(&[2]);
+        assert!(carry::add(&f.a, 7));
+        f.queue(&f.a, 0, 2);
+        flush();
+        assert_eq!(f.stub.calls()[0].carry(), Some(7));
+        assert_eq!(carry::peek(&f.a), 7);
+        assert_eq!(breaker(), Breaker::StoppedSilent);
+    }
+
+    #[test]
+    fn a_stores_orphan_count_is_carried_and_given_back_on_failure() {
+        let f = Fixture::unhurried();
+        let base = f.a.parent().unwrap().to_path_buf();
+        // A session that held a count is removed: its count becomes an
+        // orphan of the store.
+        let gone = base.join("session-gone");
+        std::fs::create_dir(&gone).unwrap();
+        assert!(carry::add(&gone, 6));
+        carry::orphan(&gone);
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert_eq!(carry::peek_orphans(&base), 6);
+
+        // A refused call gives the orphans back to the store.
+        f.stub.exit_codes(&[3, 0]);
+        assert!(carry::add(&f.a, 1));
+        f.queue(&f.a, 0, 2);
+        flush();
+        assert_eq!(f.stub.calls()[0].carry(), Some(7));
+        assert_eq!(carry::peek_orphans(&base), 6);
+        assert_eq!(carry::peek(&f.a), 1 + 2);
+
+        // A later flush from any session of the store, in a process whose
+        // breaker is open, carries them out.
+        set_breaker(Breaker::Open);
+        f.queue(&f.b, 2, 1);
+        flush();
+        assert_eq!(f.stub.calls()[1].carry(), Some(6));
+        assert_eq!(carry::peek_orphans(&base), 0);
+        // Session a's own count waits for a flush that has its records.
+        assert_eq!(carry::peek(&f.a), 3);
+    }
+
+    #[test]
+    fn a_session_removed_before_the_give_back_keeps_its_count_as_an_orphan() {
+        let f = Fixture::unhurried();
+        let base = f.a.parent().unwrap().to_path_buf();
+        assert!(carry::add(&f.a, 4));
+        f.queue(&f.a, 0, 2);
+        // The stub removes nothing itself; the session directory is removed
+        // here, as the terminal tick would, after its records were queued.
+        // Its count moves to the orphans first, as the removal path does.
+        carry::orphan(&f.a);
+        std::fs::remove_dir_all(&f.a).unwrap();
+        f.stub.exit_codes(&[3]);
+        flush();
+        // The orphans went out as the carry and came back; the dropped
+        // records of a session with no directory can't be written there.
+        assert_eq!(f.stub.calls()[0].carry(), Some(4));
+        assert_eq!(carry::peek_orphans(&base), 4);
+        assert!(!f.a.exists());
     }
 
     #[test]

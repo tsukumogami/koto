@@ -1440,9 +1440,27 @@ dropped without a call being made, and the next flush sends as usual.
 A record that was queued and not delivered is counted against its session,
 in `telemetry.json` in the session directory: `{"dropped": N}`. The file is
 replaced by rename, mode 0600, under a lock held on `telemetry.lock` beside
-it. Both go when the session directory goes. They are koto's own
-bookkeeping and stay on the host: cloud sync and `koto session import`
-don't carry them.
+it. A session that never drops a record has neither file.
+
+The count goes out with the next call that is delivered. Before the first
+call of a flush, koto takes the count of every session it has records
+for, writing 0 back under the lock, and adds `--carry N` to that call with
+the sum. Because the count is zeroed as it is taken, two koto processes
+working on one session never carry the same count. A call that isn't
+delivered gives the taken counts back, with its own records added, so
+the next delivered call carries them.
+
+A session directory can be removed while it still holds a count, by the
+tick that reaches a terminal state, by `koto session cleanup` or by
+`koto session prune`. Just before the directory goes, its count moves to
+`_telemetry_orphans.json` in the directory that holds the store's session
+directories, under `_telemetry_orphans.lock`. The next flush from any
+session of that store carries it out with the others.
+
+All four files are koto's own bookkeeping and stay on the host: cloud sync
+and `koto session import` don't carry them. The counts can run low, never
+high: a count whose lock can't be taken within 50 ms is left out of that
+change.
 
 ## Reading the journal
 

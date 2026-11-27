@@ -344,6 +344,18 @@ mod queue {
 
 pub use queue::flush;
 
+/// Called just before a session directory is removed, with that directory:
+/// moves the session's count of undelivered records to its store's orphan
+/// count, so it still goes out with a later flush (see `carry`). A session
+/// with no such count costs one `lstat`.
+#[cfg(unix)]
+pub(crate) fn before_session_removal(session_dir: &Path) {
+    carry::orphan(session_dir);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn before_session_removal(_session_dir: &Path) {}
+
 // The stub sink the sender's unit tests install, shared with the
 // integration tests. Declared in this file so the path is read from this
 // directory.
