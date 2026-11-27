@@ -347,6 +347,8 @@ fn main() {
         eprintln!(
             "recursion_caps bench: AD3.3 perf-cliff threshold breached at 26k; KOTO_BENCH_STRICT=1 → failing"
         );
+        // A bench is its own binary with no exit hooks to run.
+        #[allow(clippy::disallowed_methods)]
         std::process::exit(1);
     } else if breaches > 0 {
         eprintln!(

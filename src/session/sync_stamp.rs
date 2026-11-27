@@ -457,6 +457,10 @@ pub fn save_manifest(dir: &Path, bytes: &[u8]) {
 /// Start a tick of the session whose directory is `dir`: write a new id for
 /// it, which every command the tick runs reads. Best-effort: with no id, a
 /// command probes as it would outside a tick.
+///
+/// Built for this module's tests alone: a tick writes the id it minted
+/// (`CloudBackend::begin_tick`), never a fresh one.
+#[cfg(test)]
 pub fn begin_tick(dir: &Path) {
     write_tick_id(dir, &new_tick_id());
 }
@@ -471,7 +475,8 @@ pub fn new_tick_id() -> String {
 }
 
 /// Write `id` as the id of the tick running the session whose directory is
-/// `dir`. Best-effort, as [`begin_tick`].
+/// `dir`. Best-effort: with no id, a command probes as it would outside a
+/// tick.
 pub fn write_tick_id(dir: &Path, id: &str) {
     write_replacing(dir, TICK_FILE, id.as_bytes());
 }

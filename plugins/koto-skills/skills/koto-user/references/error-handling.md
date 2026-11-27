@@ -102,7 +102,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `session_superseded` | 2 | No | The session was superseded with `koto init <succ> --continues <it> --supersede`: its log holds the fence, and koto writes nothing more to it. The message names the newest session in the chain; the body carries `superseded_by`, `newest` and `actor` | Continue in the session the message names. Reads of this session still work. See [session_superseded](#session_superseded) |
 | `session_unlocated` | 2 | No | Under the cloud backend, koto can't tell which bucket copy is the named session's own: no copy on this host and none under this directory's prefix, but one under another directory's (`no_local_copy`; a session the bucket holds nowhere reads as absent, and on a bucket carrying `koto-names/_complete` so does a session only older koto releases have touched, until the next `koto session index audit` revokes that declaration), a recorded copy that is missing or another session's (`recorded_copy_mismatch`), or a session with no recorded prefix, named from outside its own directory, whose two candidate prefixes don't give one copy carrying its `session_id` (`no_candidate_copy`, `ambiguous_copies`, `candidate_copy_mismatch`, `candidate_unreadable`). A session that records its prefix, and one located by its candidates, is read and written there from any directory | Act on the `reason`; for the four candidate reasons, run from the directory the message names. See [session_unlocated](#session_unlocated) |
 | `session_lookup_failed` | 3 | Yes, once the bucket answers | Under the cloud backend, a command named a session with no copy on this host, and koto couldn't finish asking the bucket whether any workspace prefix holds it: the bucket couldn't be reached, a listing still failed after its retries, or the lookup's 6-second deadline passed with prefixes left unasked. The name may be in use, so this is never the not-found reply | Don't treat the name as absent and don't create a session under it on the strength of this reply. Run the command again once the bucket answers; report to the user if it keeps failing. See [session_lookup_failed](#session_lookup_failed) |
-| `session_rebound` | non-zero | No | Under the cloud backend, a write to the session (an event, a context key, a header rewrite) ran from an anchor a `koto session rebind` moved the session away from, or read the session before a rebind. A session a whole-binding move fenced (its origin records `whole_epoch`) refuses on either backend, from under a retired anchor deeper than the current anchor the command is also under, or after a read at a lower epoch; `koto next` then exits 2 with this code in its usual error shape, before it writes. Nothing was written. The message names the anchor the session is bound to now | Stop writing from the old anchor. If this process is the session's current owner, run the command again from the directory the message names; otherwise the session has a successor and this process is done with it |
+| `session_rebound` | non-zero | No | A rebind fenced this write off; nothing was written, and the message names the anchor the session is bound to now. After a plain `koto session rebind`, under the cloud backend only: the write ran from the exact anchor the rebind retired, or the command's latest read came before the rebind. After a `koto session rebind --whole` move (its origin records `whole_epoch`), on either backend: the process first read the session before the move (a later re-read doesn't lift it), or it runs under a retired anchor and its directory is outside the current anchor or under a retired anchor deeper than the current one. A process whose working directory can't be read has no directory to compare, so only the read rule applies to it. Also a cloud push, or `koto session resolve --keep local`, over a bucket copy a rebind moved further. `koto next` exits 2 with this code in its usual error shape; other commands fail non-zero with it on stderr | Stop writing from the old anchor. If this process is the session's current owner, run the command again from the directory the message names; otherwise the session has a successor and this process is done with it |
 | `session conflict` | non-zero | No | Under the cloud backend, this host's state log and the bucket's copy each hold an event the other lacks, so a pull or a push refused instead of overwriting either. The message gives both sides' event counts, byte lengths and last seqs. A refused push leaves the write in this host's log | Escalate: someone decides which history to keep with `koto session resolve <name> --keep local` or `--keep remote`. Don't resolve it yourself unless you were told to |
 | `background_run_in_flight` | 2 | Yes, once the run ends | `koto session rebind`, `koto session import` or a relocation found a `background: true` run of the session still in flight on this machine; moving the session would leave it behind. Nothing moved | Keep ticking the session until the run's result is delivered, or `koto cancel` it if the run should stop, then move it. See the koto-user skill's "When a pool or a background run holds the tick" |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
@@ -165,6 +165,25 @@ A session with no recorded anchor — written before anchoring existed, or creat
 `koto session start` — is not refused. Its first tick adopts the directory it's ticked
 from and prefixes the `directive` with a one-time notice naming the directory it bound.
 Check that the directory is the one you meant.
+
+### Taking a session over: `koto session rebind --whole` refusals
+
+`koto session rebind <name> --whole` moves a session to the agent session whose anchor
+`KOTO_ANCHOR` names. Its refusals come before anything is written, are checked in this order,
+and print this shape on stdout:
+`{"error": {"code", "message"}, "command": "session rebind"}`.
+
+| `error.code` | Exit | Retryable | Meaning | Agent action |
+|---|---|---|---|---|
+| `nested_invocation` | 2 | No | The move ran from inside a command the session's own tick is running; that tick holds the lock the move needs | Run the move after the tick returns, not from a gate or action |
+| `no_anchor` | 2 | No | `KOTO_ANCHOR` is unset, names the session itself, or doesn't name an anchor on this machine, so there's no one to hand the session to | Run it from the agent session taking the session over, whose shells carry its `KOTO_ANCHOR` |
+| `session_busy` | 1 | Yes | A tick still held the session's `tick.lock` when `--wait` ran out (10 seconds by default; `--wait 0` refuses at once) | Run it again once the tick returns, or with a longer `--wait`. A session ticked back to back can keep refusing; moves get no priority, so stop the other driver first |
+| `rebind_cross_host` | 2 | No | Cloud backend: another machine uploaded the session's `version.json` last | Don't move it here. Take it over with `koto session import`, then move the copy it makes if you need to |
+| `background_run_in_flight` | 2 | Yes, once the run ends | A `background: true` run of the session is in flight; `run_id` names it | Keep ticking until its result lands, or `koto cancel` it, then move |
+
+A move that fails part way (a crash, a lock it couldn't take, a lost race with the bucket)
+exits non-zero, and running the same command again finishes it without repeating any part.
+A rebind elsewhere that overtook the move fails it on stderr with `session_rebound:`, exit 1.
 
 ---
 
@@ -359,7 +378,9 @@ cleared environment: the live values of koto's default list of names and the nam
 template declares in `pass_env:`, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the
 session was created, `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, and any `KOTO_SESSION_*`
 variable that set the session's backend or credentials, so a `koto` command a gate runs
-reaches the same backend. The record can't be changed. None of the three messages below is an error envelope or changes `action`, and none
+reaches the same backend. Only `koto session rebind <name> --whole` replaces the record once
+it's there, taking the session over for your agent session and logging `environment_rerecorded`.
+None of the three messages below is an error envelope or changes `action`, and none
 of them alters gate evidence or action output. Keep dispatching on `action` as usual.
 
 **The stale-record note.** When a gate or action fails and either a recorded value no longer
@@ -367,7 +388,7 @@ exists or the failure looks like a missing command (exit code 127, or the shell'
 found` or `command not found` on stderr), `directive` opens with:
 
 ```
-[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. The record can't be changed; to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
+[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. Only `koto session rebind demo --whole`, run by an agent session taking the session over, records new values; otherwise, to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
 ```
 
 When nothing is missing it says instead that the command ran under the session's recorded
@@ -379,7 +400,10 @@ Don't re-tick hoping it clears; it won't. Exporting a different `PATH` in your s
 help either, since commands use the recorded one. Either put the tool back where the note
 says, or start a new session with the right environment: `koto cancel --cleanup <name>`, then
 `koto init` again from a shell where the tool is on `PATH`. Ask the user before discarding a
-session that holds work.
+session that holds work. `koto session rebind <name> --whole` also records your shell's values,
+but it's a takeover: it makes your anchor the only held-by link, drops the publish location, and
+fences off every process that read the session before it. Use it when your agent session is
+taking the run over, not as a way to refresh `PATH`.
 
 **The adoption notice.** A session created by an earlier koto has no record. Its first
 `koto next` records one from your process and opens `directive` once with `[koto] Session

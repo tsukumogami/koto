@@ -21,6 +21,7 @@ pub mod next_types;
 pub mod overrides;
 #[cfg(unix)]
 pub mod pool;
+mod rebind_whole;
 pub mod request;
 pub mod retry;
 pub mod review;
@@ -1094,6 +1095,20 @@ pub enum SessionCommand {
         /// checkout you moved to and rebind.
         #[arg(long = "to")]
         to: Option<String>,
+
+        /// Move the whole binding, as the session's new holder: the
+        /// anchor, the held-by links (only the caller's `KOTO_ANCHOR`
+        /// stays), the `/workflows` publish location and the recorded
+        /// command environment, under the session's tick lock. A process
+        /// that read the session before the move is refused afterwards.
+        #[arg(long)]
+        whole: bool,
+
+        /// With --whole: how many seconds to wait for a tick in flight
+        /// before refusing with `session_busy` (default 10; 0 refuses at
+        /// once).
+        #[arg(long, requires = "whole", value_name = "SECS")]
+        wait: Option<u64>,
     },
 
     /// Import a session from another workspace's copy in the bucket.
@@ -1181,7 +1196,9 @@ pub enum ChildrenPolicy {
     /// Overwrite local child state with remote.
     #[clap(name = "accept-remote")]
     AcceptRemote,
-    /// Overwrite remote child state with local.
+    /// Overwrite remote child state with local, except a child a rebind
+    /// moved past this host's copy, which is reported errored and left as
+    /// it is.
     #[clap(name = "accept-local")]
     AcceptLocal,
 }
@@ -1528,8 +1545,7 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 /// Print a JSON error and exit with a specific exit code.
 pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
-    flush_before_exit();
-    std::process::exit(code);
+    crate::exit::exit(code);
 }
 
 /// Refuse, exit 2, before `command` reads or writes `session`, when under
@@ -1776,7 +1792,6 @@ fn wake_pass_needs_reread(pass: &anyhow::Result<crate::engine::wake::WakeEmissio
 #[cfg(unix)]
 fn hold_tick_lock(backend: &Backend, name: &str) {
     use crate::cli::next_types::{NextError, NextErrorCode};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
@@ -1788,19 +1803,7 @@ fn hold_tick_lock(backend: &Backend, name: &str) {
     let wait = tick_lock_wait();
     let started = std::time::Instant::now();
     loop {
-        if !dir.is_dir() {
-            return;
-        }
-        // O_NOFOLLOW: a link planted at the lock's name is not followed to
-        // create or lock a file elsewhere.
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        else {
+        let Ok(Some(file)) = crate::session::tick_lock::open(&dir) else {
             return;
         };
         match crate::engine::jsonl_append::lock_shared(file.as_raw_fd(), Some(wait), started) {
@@ -1827,11 +1830,7 @@ fn hold_tick_lock(backend: &Backend, name: &str) {
         // A same-host import can swap the directory while this waits: the
         // lock is then on the old copy's file. Take the one there now, in
         // what is left of the same wait.
-        let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
-        let now = std::fs::symlink_metadata(&path)
-            .ok()
-            .map(|m| (m.dev(), m.ino()));
-        if held.is_some() && held == now {
+        if crate::session::tick_lock::still_current(&file, &path) {
             let _ = HELD.set(file);
             return;
         }
@@ -1865,18 +1864,6 @@ pub fn report_failure(e: &anyhow::Error) -> i32 {
 fn is_session_migrated(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.is::<crate::session::SessionMigrated>())
-}
-
-/// What `koto next` runs on its way out, however it exits: the flush of
-/// the writes it and its commands deferred (koto#376, koto#548). Set once,
-/// by the `next` arm of [`run`]; other commands leave it unset.
-static EXIT_FLUSH: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
-
-/// Run the exit flush, if this command set one.
-fn flush_before_exit() {
-    if let Some(flush) = EXIT_FLUSH.get() {
-        flush();
-    }
 }
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
@@ -2388,11 +2375,11 @@ pub fn run(app: App) -> Result<()> {
     match app.command {
         Command::RunAction { session, run_id } => {
             #[cfg(unix)]
-            std::process::exit(run_action::run(&session, &run_id));
+            crate::exit::exit(run_action::run(&session, &run_id));
             #[cfg(not(unix))]
             {
                 let _ = (session, run_id);
-                std::process::exit(2);
+                crate::exit::exit(2);
             }
         }
         Command::Pool { subcommand } => match subcommand {
@@ -2401,7 +2388,7 @@ pub fn run(app: App) -> Result<()> {
                 {
                     let code = pool::status(json)?;
                     if code != 0 {
-                        std::process::exit(code);
+                        crate::exit::exit(code);
                     }
                     Ok(())
                 }
@@ -2676,8 +2663,8 @@ pub fn run(app: App) -> Result<()> {
             dispatch_epoch,
             decider,
         } => {
-            // Leaked so the exit flush can reach it from any exit path,
-            // `std::process::exit` included. One per process, which ends.
+            // Leaked so the exit hook below can reach it from any exit
+            // path. One per process, which ends.
             let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
             // A top-level tick holds its session's tick.lock shared from
             // here to exit, so every read and write below runs under it. Not
@@ -2697,7 +2684,11 @@ pub fn run(app: App) -> Result<()> {
             // own log appends.
             refuse_next_if_superseded(backend, &name);
             let tick = name.clone();
-            let _ = EXIT_FLUSH.set(Box::new(move || {
+            // What `koto next` runs on its way out, however it exits: the
+            // flush of the writes it and its commands deferred (koto#376,
+            // koto#548). An exit hook, so a normal return, an error return
+            // and every early exit below all run it.
+            crate::exit::register(move || {
                 if let Err(e) = backend.flush_pending(&tick) {
                     eprintln!(
                         "warning: cloud sync: the writes this tick and its commands made are \
@@ -2705,7 +2696,7 @@ pub fn run(app: App) -> Result<()> {
                         tick, e
                     );
                 }
-            }));
+            });
             // A new id for this tick, which its own reads and its commands'
             // reads of other sessions are fresh for
             // (`crate::session::sync_stamp`). Picked here, before the tick's
@@ -2715,7 +2706,7 @@ pub fn run(app: App) -> Result<()> {
                 backend.mint_tick(&name);
             }
             let context_store: &dyn ContextStore = backend;
-            let result = handle_next(
+            handle_next(
                 backend,
                 context_store,
                 backend.journal_root(),
@@ -2728,9 +2719,7 @@ pub fn run(app: App) -> Result<()> {
                 redelegation_cap,
                 dispatch_epoch,
                 decider,
-            );
-            flush_before_exit();
-            result
+            )
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
@@ -3014,7 +3003,13 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_identity(&backend, &name, json)
                 }
                 SessionCommand::Origin { name } => session::handle_origin(&backend, &name),
-                SessionCommand::Rebind { name, to } => {
+                SessionCommand::Rebind {
+                    name,
+                    to,
+                    whole: true,
+                    wait,
+                } => rebind_whole::handle(&backend, &name, to.as_deref(), wait),
+                SessionCommand::Rebind { name, to, .. } => {
                     if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
                         refuse_if_lookup_failed(&e, "session rebind");
                         exit_with_error_code(
@@ -3182,8 +3177,8 @@ pub fn run(app: App) -> Result<()> {
                         &session,
                         &key,
                     ) {
-                        context::KeyPresence::Present => std::process::exit(0),
-                        context::KeyPresence::Absent => std::process::exit(1),
+                        context::KeyPresence::Present => crate::exit::exit(0),
+                        context::KeyPresence::Absent => crate::exit::exit(1),
                         context::KeyPresence::Unusable(reason) => {
                             exit_with_error_code(
                                 serde_json::json!({
@@ -3314,21 +3309,21 @@ pub fn run(app: App) -> Result<()> {
             TemplateSubcommand::ValidateFeed { log_file } => {
                 if let Err(e) = validate_feed::validate_feed(&log_file) {
                     eprintln!("error: {}", e);
-                    std::process::exit(1);
+                    crate::exit::exit(1);
                 }
                 Ok(())
             }
             TemplateSubcommand::Export(args) => {
                 if let Err(msg) = validate_export_flags(&args) {
                     eprintln!("error: {}", msg);
-                    std::process::exit(2);
+                    crate::exit::exit(2);
                 }
 
                 let compiled = match resolve_template(&args.input) {
                     Ok(t) => t,
                     Err(e) => {
                         eprintln!("error: {}", e);
-                        std::process::exit(1);
+                        crate::exit::exit(1);
                     }
                 };
 
@@ -3362,7 +3357,7 @@ pub fn run(app: App) -> Result<()> {
                                 "run: koto template export {} --format {} --output {}",
                                 args.input, format_name, output_path
                             );
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                         Ok(crate::export::CheckResult::Missing) => {
                             let format_name = match args.format {
@@ -3374,11 +3369,11 @@ pub fn run(app: App) -> Result<()> {
                                 "run: koto template export {} --format {} --output {}",
                                 args.input, format_name, output_path
                             );
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                         Err(e) => {
                             eprintln!("error: failed to check {}: {}", output_path, e);
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                     }
                 } else if let Some(ref output_path) = args.output {
@@ -3614,7 +3609,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     println!("{}", other);
                     Ok(())
                 }
-                None => std::process::exit(1),
+                None => crate::exit::exit(1),
             }
         }
         ConfigCommand::Get { key } => {
@@ -3626,7 +3621,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     Ok(())
                 }
                 None => {
-                    std::process::exit(1);
+                    crate::exit::exit(1);
                 }
             }
         }
@@ -7742,8 +7737,7 @@ fn handle_next(
                         _batch_lock.as_ref(),
                     );
                 }
-                flush_before_exit();
-                std::process::exit(0);
+                crate::exit::exit(0);
             }
             Err(err) => {
                 let code = err.code.exit_code();
@@ -9607,8 +9601,7 @@ fn handle_next(
                     _batch_lock.as_ref(),
                 );
             }
-            flush_before_exit();
-            std::process::exit(0);
+            crate::exit::exit(0);
         }
         Err(advance_err) => {
             let code = match &advance_err {

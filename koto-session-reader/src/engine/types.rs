@@ -1332,6 +1332,89 @@ pub struct AnchorActivity {
     pub command: String,
 }
 
+/// The event type a whole-binding move (`koto session rebind --whole`)
+/// appends once it has made its new holder's anchor the session's only
+/// held-by link.
+pub const HELD_BY_REBOUND: &str = "held_by_rebound";
+
+/// The event type a whole-binding move appends before it drops the
+/// session's stored `/workflows` publish location.
+pub const PUBLISH_LOCATION_DROPPED: &str = "publish_location_dropped";
+
+/// The event type a whole-binding move appends before it replaces the
+/// session's recorded command environment with its caller's.
+pub const ENVIRONMENT_RERECORDED: &str = "environment_rerecorded";
+
+/// The payload of the `execution_anchor_rebound` event a whole-binding move
+/// appends: the plain rebind's `from` and `to`, plus `whole` and the
+/// `origin.anchor_epoch` the move commits.
+///
+/// A variant of its own rather than two more fields on
+/// [`EventPayload::ExecutionAnchorRebound`], so a plain rebind's line, and
+/// every reader matching that variant's two fields, stay as they are. The
+/// event type is the same: an older reader, which knows only `from` and
+/// `to`, still reads the move as the anchor change it is. `epoch` is
+/// absent when the session records no origin (a log older than origins),
+/// which has no fence to raise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WholeRebound {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<PathBuf>,
+    pub to: PathBuf,
+    #[serde(default)]
+    pub whole: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+}
+
+/// The payload of a [`HELD_BY_REBOUND`] event: the held-by links a
+/// whole-binding move at `epoch` adds and removes. It is appended before
+/// the links change, so a move stopped part way finds the change it owes
+/// already logged and makes it without logging it twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldByRebound {
+    /// The `origin.anchor_epoch` the move committed.
+    pub epoch: u64,
+    /// The caller's anchor, when the session had no link to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<String>,
+    /// Every other anchor the session held a link to, sorted.
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+/// The payload of a [`PUBLISH_LOCATION_DROPPED`] event: the publish
+/// location a whole-binding move at `epoch` drops, so the next commit
+/// publishes to the new holder's folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishLocationDropped {
+    /// The `origin.anchor_epoch` the move committed.
+    pub epoch: u64,
+    /// The location that was stored.
+    pub was: String,
+    /// Whether it was set with `koto workflows publish`.
+    #[serde(default)]
+    pub explicit: bool,
+}
+
+/// The payload of an [`ENVIRONMENT_RERECORDED`] event: the command
+/// environment a whole-binding move at `epoch` records in place of the old
+/// one, so the change to what every later command runs with is in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentRerecorded {
+    /// The `origin.anchor_epoch` the move committed.
+    pub epoch: u64,
+    /// The record the header holds from this event on.
+    pub environment: CommandEnvironment,
+    /// The `PATH` entries recording dropped (empty and relative ones).
+    #[serde(default)]
+    pub dropped: Vec<String>,
+    /// The variables whose recorded value changed, as
+    /// `crate::engine::command_env::drift` names them.
+    #[serde(default)]
+    pub changed: Vec<String>,
+}
+
 /// The leading bytes of a failed command gate's streams, as
 /// `gate_evaluated` records them beside its unchanged `output`.
 ///
@@ -2143,6 +2226,18 @@ pub enum EventPayload {
     BackgroundStarted(BackgroundStarted),
     /// A tick read a background run's end.
     BackgroundFinished(BackgroundFinished),
+    /// A whole-binding move (`koto session rebind --whole`) moved the
+    /// execution anchor. Written as `execution_anchor_rebound`, the plain
+    /// rebind's type, with `whole` and `epoch` beside `from` and `to`.
+    ExecutionAnchorReboundWhole(WholeRebound),
+    /// A whole-binding move made its caller's anchor the only held-by link.
+    /// This and the two below are additive: an older build lands them in
+    /// `Unknown`, and a payload this build can't parse does the same.
+    HeldByRebound(HeldByRebound),
+    /// A whole-binding move dropped the stored publish location.
+    PublishLocationDropped(PublishLocationDropped),
+    /// A whole-binding move re-recorded the command environment.
+    EnvironmentRerecorded(EnvironmentRerecorded),
     /// A `koto next` response printed a non-terminal state's directive.
     /// Appended after the response prints, on every such response.
     InstructionsDelivered {
@@ -2529,6 +2624,10 @@ impl EventPayload {
             EventPayload::PoolReleased(_) => POOL_RELEASED,
             EventPayload::BackgroundStarted(_) => BACKGROUND_STARTED,
             EventPayload::BackgroundFinished(_) => BACKGROUND_FINISHED,
+            EventPayload::ExecutionAnchorReboundWhole(_) => "execution_anchor_rebound",
+            EventPayload::HeldByRebound(_) => HELD_BY_REBOUND,
+            EventPayload::PublishLocationDropped(_) => PUBLISH_LOCATION_DROPPED,
+            EventPayload::EnvironmentRerecorded(_) => ENVIRONMENT_RERECORDED,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -2886,11 +2985,25 @@ impl<'de> Deserialize<'de> for Event {
                 }
             }
             "execution_anchor_rebound" => {
-                let p: ExecutionAnchorReboundPayload = serde_json::from_value(payload_val.clone())
-                    .map_err(serde::de::Error::custom)?;
-                EventPayload::ExecutionAnchorRebound {
-                    from: p.from,
-                    to: p.to,
+                // A whole-binding move's line carries `whole` or `epoch`;
+                // a plain rebind's carries neither and keeps its variant.
+                let whole = payload_val
+                    .as_object()
+                    .is_some_and(|o| o.contains_key("whole") || o.contains_key("epoch"));
+                match whole
+                    .then(|| serde_json::from_value::<WholeRebound>(payload_val.clone()).ok())
+                    .flatten()
+                {
+                    Some(w) => EventPayload::ExecutionAnchorReboundWhole(w),
+                    None => {
+                        let p: ExecutionAnchorReboundPayload =
+                            serde_json::from_value(payload_val.clone())
+                                .map_err(serde::de::Error::custom)?;
+                        EventPayload::ExecutionAnchorRebound {
+                            from: p.from,
+                            to: p.to,
+                        }
+                    }
                 }
             }
             "session_imported" => {
@@ -3201,6 +3314,31 @@ impl<'de> Deserialize<'de> for Event {
             BACKGROUND_FINISHED => {
                 match serde_json::from_value::<BackgroundFinished>(payload_val.clone()) {
                     Ok(b) => EventPayload::BackgroundFinished(b),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            HELD_BY_REBOUND => match serde_json::from_value::<HeldByRebound>(payload_val.clone()) {
+                Ok(h) => EventPayload::HeldByRebound(h),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            PUBLISH_LOCATION_DROPPED => {
+                match serde_json::from_value::<PublishLocationDropped>(payload_val.clone()) {
+                    Ok(p) => EventPayload::PublishLocationDropped(p),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            ENVIRONMENT_RERECORDED => {
+                match serde_json::from_value::<EnvironmentRerecorded>(payload_val.clone()) {
+                    Ok(e) => EventPayload::EnvironmentRerecorded(e),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),
@@ -5630,6 +5768,126 @@ mod tests {
             "an absent previous anchor must not serialize a key: {}",
             serialized
         );
+    }
+
+    #[test]
+    fn a_plain_rebind_line_still_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/old/checkout","to":"/new/checkout"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event.payload,
+            EventPayload::ExecutionAnchorRebound { .. }
+        ));
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn a_whole_rebind_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload, WholeRebound};
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/old/checkout","to":"/new/checkout","whole":true,"epoch":2}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event.payload,
+            EventPayload::ExecutionAnchorReboundWhole(WholeRebound {
+                from: Some("/old/checkout".into()),
+                to: "/new/checkout".into(),
+                whole: true,
+                epoch: Some(2),
+            })
+        );
+        assert_eq!(event.payload.type_name(), "execution_anchor_rebound");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        // A session with no origin has no epoch to name, and the key is
+        // left out rather than written as a null.
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"to":"/new/checkout","whole":true}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event.payload,
+            EventPayload::ExecutionAnchorReboundWhole(WholeRebound { epoch: None, .. })
+        ));
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn held_by_rebound_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload, HeldByRebound, HELD_BY_REBOUND};
+        let json = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"held_by_rebound","payload":{"epoch":1,"added":"anchor-new","removed":["anchor-a","anchor-b"]}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event.payload,
+            EventPayload::HeldByRebound(HeldByRebound {
+                epoch: 1,
+                added: Some("anchor-new".into()),
+                removed: vec!["anchor-a".into(), "anchor-b".into()],
+            })
+        );
+        assert_eq!(event.payload.type_name(), HELD_BY_REBOUND);
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        // Nothing added: the key is left out; the removals stay listed.
+        let json = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"held_by_rebound","payload":{"epoch":1,"removed":["anchor-a"]}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn publish_location_dropped_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload, PublishLocationDropped, PUBLISH_LOCATION_DROPPED};
+        let json = r#"{"seq":6,"timestamp":"2026-01-01T00:00:00Z","type":"publish_location_dropped","payload":{"epoch":1,"was":"/home/u/.claude/projects/p/s/workflows","explicit":true}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event.payload,
+            EventPayload::PublishLocationDropped(PublishLocationDropped {
+                epoch: 1,
+                was: "/home/u/.claude/projects/p/s/workflows".into(),
+                explicit: true,
+            })
+        );
+        assert_eq!(event.payload.type_name(), PUBLISH_LOCATION_DROPPED);
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn environment_rerecorded_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload, ENVIRONMENT_RERECORDED};
+        let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"environment_rerecorded","payload":{"epoch":1,"environment":{"path":"/usr/bin:/bin","home":"/home/u","xdg_config_home":"/home/u/.config-two","pass":["TERM"]},"dropped":["node_modules/.bin"],"changed":["XDG_CONFIG_HOME"]}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::EnvironmentRerecorded(e) => {
+                assert_eq!(e.epoch, 1);
+                assert_eq!(
+                    e.environment.xdg_config_home.as_deref(),
+                    Some("/home/u/.config-two")
+                );
+                assert_eq!(e.dropped, vec!["node_modules/.bin".to_string()]);
+                assert_eq!(e.changed, vec!["XDG_CONFIG_HOME".to_string()]);
+            }
+            other => panic!("expected environment_rerecorded, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), ENVIRONMENT_RERECORDED);
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn a_malformed_whole_binding_event_reads_as_unknown() {
+        use super::{Event, EventPayload};
+        for ty in [
+            "held_by_rebound",
+            "publish_location_dropped",
+            "environment_rerecorded",
+        ] {
+            let json = format!(
+                r#"{{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"{ty}","payload":{{"nope":1}}}}"#
+            );
+            let event: Event = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(event.payload, EventPayload::Unknown { .. }),
+                "{ty}: {:?}",
+                event.payload
+            );
+        }
     }
 
     // ===== Issue 3: ValidatedSessionId / ValidatedCoordId newtypes =====
