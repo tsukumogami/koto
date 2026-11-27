@@ -91,6 +91,7 @@ const KNOWN_KEYS: &[&str] = &[
     "request_store.request_leg_append_cap",
     "request_store.request_leg_cap",
     "workflows.native",
+    "run_journal.enabled",
     "run_journal.rotate_bytes",
     "run_journal.retain_days",
     "run_journal.reader_stale_days",

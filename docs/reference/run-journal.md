@@ -1213,6 +1213,27 @@ To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
 way can't be rebuilt once the sessions they describe are gone.
 
+### Turning the journal off
+
+The journal is written by default. To stop koto writing it, set the
+`enabled` key of the `[run_journal]` table to `false` in user config:
+
+```bash
+koto config set run_journal.enabled false --user
+```
+
+With the key off, no koto command writes a record: the journal file isn't
+created, an existing one isn't appended to, and its lock isn't taken.
+Lines already in the file stay as they are. Nothing else about a session
+changes: its state log, its context and its `run-journal.json` sidecar are
+written as before. Setting the key back to `true`, or unsetting it, resumes
+writing with the next record; records for the time it was off are not
+written later.
+
+Like the rotation settings below, the key is read from user config only.
+`koto config set` refuses it without `--user`, and a project's
+`.koto/config.toml` can't turn the journal off.
+
 ### Rotation
 
 Rotation is off by default, and stays off by default until the journal's

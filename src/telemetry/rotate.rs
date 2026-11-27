@@ -52,19 +52,17 @@ impl Default for Settings {
     }
 }
 
-/// The settings, read from config once per process. A config that can't be
-/// read leaves the defaults, so rotation stays off.
+/// The settings, from the `[run_journal]` table the journal resolves once
+/// per process (`super::journal_config`). A config that can't be read
+/// leaves the defaults, so rotation stays off.
 #[cfg(not(test))]
 fn settings() -> Settings {
-    static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
-    *SETTINGS.get_or_init(|| match crate::config::resolve::load_config() {
-        Ok(c) => Settings {
-            rotate_bytes: c.run_journal.rotate_bytes,
-            retain_days: c.run_journal.retain_days,
-            reader_stale_days: c.run_journal.reader_stale_days,
-        },
-        Err(_) => Settings::default(),
-    })
+    let c = super::journal_config();
+    Settings {
+        rotate_bytes: c.rotate_bytes,
+        retain_days: c.retain_days,
+        reader_stale_days: c.reader_stale_days,
+    }
 }
 
 /// Print a rotation warning on stderr.

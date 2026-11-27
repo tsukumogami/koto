@@ -6283,3 +6283,47 @@ fn a_code_review_round_of_the_longest_values_fits_one_line_per_record() {
         assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
     }
 }
+
+/// With `run_journal.enabled` off, a session's hooks write nothing to the
+/// journal: no file, no lock, no warning. The sidecar is still written,
+/// and turning the journal back on resumes with the next record.
+#[test]
+fn a_disabled_journal_is_never_written_and_the_sidecar_still_is() {
+    let f = Fixture::new();
+    set_journal_enabled_for_test(false);
+    f.init("off", header("off", "off-id", None), Some("a"));
+    f.backend
+        .append_event(
+            "off",
+            &transitioned(Some("a"), "b"),
+            &crate::engine::types::now_iso8601(),
+        )
+        .unwrap();
+    // The journal's directory may not exist at all: nothing created it.
+    let names: Vec<String> = std::fs::read_dir(&f.home)
+        .map(|dir| {
+            dir.map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("_run_journal"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(names.is_empty(), "{names:?}");
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+    assert_eq!(batches_for_test(), (0, 0));
+    assert_eq!(
+        sidecar::read(&f.backend.session_dir("off")).and_then(|s| s.run_id),
+        Some("off-id".to_string())
+    );
+
+    set_journal_enabled_for_test(true);
+    f.backend
+        .append_event(
+            "off",
+            &transitioned(Some("b"), "c"),
+            &crate::engine::types::now_iso8601(),
+        )
+        .unwrap();
+    let j = f.journal();
+    assert_eq!(kinds(&j), vec!["state_entered"]);
+    assert_eq!(j[0]["koto.state"], "c");
+}
