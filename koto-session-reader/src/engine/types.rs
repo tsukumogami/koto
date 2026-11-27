@@ -5618,6 +5618,75 @@ mod tests {
     }
 
     #[test]
+    fn session_superseded_round_trips_replaced_and_omits_it_when_false() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z","replaced":true}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::SessionSuperseded { by, replaced, .. } => {
+                assert_eq!(by, "s");
+                assert!(*replaced);
+            }
+            other => panic!("expected a session_superseded payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        let plain = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z"}}"#;
+        let event: Event = serde_json::from_str(plain).unwrap();
+        match &event.payload {
+            EventPayload::SessionSuperseded { replaced, .. } => assert!(!*replaced),
+            other => panic!("expected a session_superseded payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
+
+        // A false flag written out by hand reads the same and is dropped.
+        let explicit = plain.replace(
+            r#""at":"2026-01-01T00:00:00Z"}"#,
+            r#""at":"2026-01-01T00:00:00Z","replaced":false}"#,
+        );
+        let event: Event = serde_json::from_str(&explicit).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
+    }
+
+    #[test]
+    fn workflow_cancelled_round_trips_replaced_by_and_omits_it_when_none() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"replaced by s","replaced_by":"s","replaced_by_session_id":"9f2e"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::WorkflowCancelled {
+                state,
+                reason,
+                replaced_by,
+                replaced_by_session_id,
+            } => {
+                assert_eq!(state, "work");
+                assert_eq!(reason, "replaced by s");
+                assert_eq!(replaced_by.as_deref(), Some("s"));
+                assert_eq!(replaced_by_session_id.as_deref(), Some("9f2e"));
+            }
+            other => panic!("expected a workflow_cancelled payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "workflow_cancelled");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        let plain = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"cancelled by user"}}"#;
+        let event: Event = serde_json::from_str(plain).unwrap();
+        match &event.payload {
+            EventPayload::WorkflowCancelled {
+                replaced_by,
+                replaced_by_session_id,
+                ..
+            } => {
+                assert_eq!(replaced_by, &None);
+                assert_eq!(replaced_by_session_id, &None);
+            }
+            other => panic!("expected a workflow_cancelled payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
+    }
+
+    #[test]
     fn session_superseded_does_not_move_the_derived_state() {
         use super::{Event, EventPayload, SupersedeActor};
         let at = |seq, payload: EventPayload| Event {
