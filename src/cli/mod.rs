@@ -1171,7 +1171,9 @@ pub enum ChildrenPolicy {
     /// Overwrite local child state with remote.
     #[clap(name = "accept-remote")]
     AcceptRemote,
-    /// Overwrite remote child state with local.
+    /// Overwrite remote child state with local, except a child a rebind
+    /// moved past this host's copy, which is reported errored and left as
+    /// it is.
     #[clap(name = "accept-local")]
     AcceptLocal,
 }

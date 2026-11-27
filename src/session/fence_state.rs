@@ -114,8 +114,12 @@ pub struct TakingOver {
 impl Drop for TakingOver {
     fn drop(&mut self) {
         let mut moved = moved().lock().unwrap_or_else(|e| e.into_inner());
-        // Only the pre-commit lift: once the commit landed, note_mover
-        // recorded the epoch it wrote, and that one stays.
+        // Only the pre-commit lift. The movers drop this before their own
+        // note_mover, which then records the epoch the commit wrote. One
+        // process makes at most one whole move and takes its lift before
+        // that note_mover, so this never meets an earlier record at the
+        // same epoch; if it ever did, removing it would refuse the write,
+        // never admit one.
         if moved.get(&self.key) == Some(&self.whole_epoch) {
             moved.remove(&self.key);
         }

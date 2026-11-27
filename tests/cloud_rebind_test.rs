@@ -1986,10 +1986,6 @@ Done.
         "after-version",
     ];
 
-    /// A point the move doesn't stop at until the carry's fix adds it; till
-    /// then its case runs the move through in one go.
-    const POINT_ADDED_BY_THE_FIX: &str = "after-version";
-
     impl Moving {
         /// [`Moving::new`] with `origin.store.prefix` dropped from the
         /// header of this host's copy and the bucket's, as a koto from
@@ -2045,13 +2041,11 @@ Done.
                 );
 
                 let stopped = mv.mover(&mv.new, &[(FAULT_ENV, point)], &[]);
-                if point != POINT_ADDED_BY_THE_FIX {
-                    assert!(
-                        !stopped.ok(),
-                        "{point}: the stopped move exited 0: {}",
-                        stopped.describe()
-                    );
-                }
+                assert!(
+                    !stopped.ok(),
+                    "{point}: the stopped move exited 0: {}",
+                    stopped.describe()
+                );
                 let run = mv.mover(&mv.new, &[], &[]);
                 assert!(run.ok(), "{point}: run again: {}", run.describe());
 

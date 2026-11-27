@@ -1442,6 +1442,27 @@ impl CloudBackend {
             return Ok(caller());
         };
         let header: Option<serde_json::Value> = serde_json::from_str(line.trim()).ok();
+        self.home_of_header(id, header, identity)
+    }
+
+    /// [`CloudBackend::home_prefix`] as if `id`'s header named `from` as its `execution_dir`.
+    pub(crate) fn home_prefix_from(&self, id: &str, from: &Path) -> Result<Home, Unlocated> {
+        let mut header: Option<serde_json::Value> = first_line(&self.local.state_path(id))
+            .and_then(|line| serde_json::from_str(line.trim()).ok());
+        if let Some(h) = header.as_mut().and_then(|h| h.as_object_mut()) {
+            h.insert("execution_dir".into(), from.to_string_lossy().into());
+        }
+        self.home_of_header(id, header, None)
+    }
+
+    /// [`CloudBackend::home_prefix`]'s rule, applied to `header`.
+    fn home_of_header(
+        &self,
+        id: &str,
+        header: Option<serde_json::Value>,
+        identity: Option<(u64, u64)>,
+    ) -> Result<Home, Unlocated> {
+        let dir = self.local.session_dir(id);
         let field = |pointer: &str| {
             header
                 .as_ref()
@@ -1488,7 +1509,11 @@ impl CloudBackend {
                 }
                 self.locate(id, anchor, candidates)
             }
-            _ => Ok(caller()),
+            _ => Ok(Home {
+                prefix: self.prefix.clone(),
+                own_workspace: true,
+                via: HomeSource::Caller,
+            }),
         }
     }
 
@@ -4775,7 +4800,9 @@ impl CloudBackend {
     ///   the result. `Conflict` surfaces as `ChildResolution::Conflict`
     ///   without touching either side.
     /// * `"accept-remote"` — pull remote over local unconditionally.
-    /// * `"accept-local"` — push local over remote unconditionally.
+    /// * `"accept-local"` — push local over remote, unless a rebind moved
+    ///   the bucket's copy past this host's: that child is reported
+    ///   errored, naming `session_rebound`, and left as the move wrote it.
     /// * `"skip"` — return `ChildResolution::Skipped` without touching
     ///   either side.
     pub fn reconcile_child(&self, id: &str, policy: &str) -> ChildResolution {
@@ -4835,7 +4862,13 @@ impl CloudBackend {
                     message: format!("failed to read the bucket's header: {:#}", e),
                 },
                 Ok(Some(rebound)) => ChildResolution::Errored {
-                    message: rebound.to_string(),
+                    message: format!(
+                        "session_rebound: child session '{id}' was rebound to {} since this \
+                         host's copy was written, so that copy wasn't pushed over the bucket's. \
+                         Keep the bucket's copy with `koto session resolve {id} --keep remote`, \
+                         or run the resolve with `--children accept-remote`",
+                        rebound.anchor.as_deref().unwrap_or("a new anchor")
+                    ),
                 },
                 Ok(None) => match self.push_local_state_bytes(id) {
                     Ok(()) => ChildResolution::AcceptedLocal,
@@ -4860,8 +4893,10 @@ impl CloudBackend {
     /// [`rebound_refusal`] of this host's copy of child `id` against the
     /// bucket's header, read with one ranged GET: the refusal when a rebind
     /// moved the bucket's copy past this host's, `None` when it didn't or
-    /// either copy is missing. A header that can't be read is an error, so
-    /// the child is reported errored rather than pushed unchecked.
+    /// the bucket holds no copy. A missing local copy reads as epoch 0, so
+    /// it is refused whenever the bucket's epoch is above 0. A header that
+    /// can't be read is an error, so the child is reported errored rather
+    /// than pushed unchecked.
     fn child_rebound(
         &self,
         id: &str,
@@ -6075,12 +6110,29 @@ impl CloudBackend {
             };
         remote.drop_host_local();
         remote.drop_pin_records();
+        // A key is skipped only when its object is there, at this host's size if the entry names
+        // this host's copy: a push since the move may name objects that never went up.
+        let ctx_prefix = format!("{}/{}/ctx/", home, id);
+        let listed: HashMap<String, u64> = match self.bucket.list(ctx_prefix.clone(), None) {
+            Ok(pages) => pages
+                .iter()
+                .flat_map(|page| page.contents.iter())
+                .filter_map(|obj| Some((obj.key.strip_prefix(&ctx_prefix)?.to_string(), obj.size)))
+                .collect(),
+            Err(e) => {
+                let e = without_url_userinfo(&e.to_string());
+                missed(&held, &format!("listing its objects there failed: {e}"));
+                return;
+            }
+        };
         let dir = self.local.session_dir(id);
         let synced = crate::session::sync_stamp::SyncedKeys::load(&dir, &home);
         held.retain(|key| {
             let meta = &local.keys[key];
-            remote.keys.get(key).is_none_or(|theirs| {
-                theirs.hash != meta.hash && sync::newer_locally(meta, theirs, synced.hash(key))
+            let theirs = remote.keys.get(key).filter(|_| listed.contains_key(key));
+            theirs.is_none_or(|theirs| {
+                (theirs.hash != meta.hash && sync::newer_locally(meta, theirs, synced.hash(key)))
+                    || (theirs.hash == meta.hash && listed.get(key) != Some(&meta.size))
             })
         });
         if held.is_empty() {

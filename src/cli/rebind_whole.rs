@@ -267,7 +267,7 @@ fn move_cloud(
         waited,
         ..Report::default()
     };
-    let home_before = cloud.home_prefix(name).ok().map(|home| home.prefix);
+    let mut home_before = cloud.home_prefix(name).ok().map(|home| home.prefix);
 
     let (header, events) = backend.read_events(name)?;
     let version_before = refuse_cross_host(cloud, name)?;
@@ -280,6 +280,14 @@ fn move_cloud(
         (Commit::Done, e) => e,
         (_, e) => e.map(|e| e + 1),
     };
+    // Run again past the commit, the header is moved: the logged `from` gives the home before.
+    let logged_from = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::ExecutionAnchorReboundWhole(w) if w.epoch == epoch => Some(w.from.clone()),
+        _ => None,
+    });
+    if let (Commit::Done, Some(Some(from))) = (&commit, logged_from) {
+        home_before = cloud.home_prefix_from(name, &from).ok().map(|h| h.prefix);
+    }
     let state_path = local.state_path(name);
 
     crate::workflows_surface::materialize::without_materializing(|| -> Result<()> {
@@ -323,6 +331,7 @@ fn move_cloud(
     })?;
 
     cloud.push_moved_version(name, version_before)?;
+    crash_at("after-version");
     cloud.carry_context_after_rebind(name, home_before.as_deref());
 
     report.from = if report.rebound {
