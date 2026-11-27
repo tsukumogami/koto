@@ -2341,6 +2341,10 @@ fn sleep_until(
 ) -> Result<(), RequestError> {
     use std::sync::atomic::Ordering;
     loop {
+        // Every wait of `koto request` comes through here. Queued session
+        // records go out before each slice; with nothing queued, which is
+        // every slice after the first, this is one check of an empty queue.
+        crate::telemetry::flush();
         if interrupted.load(Ordering::Relaxed) {
             return Err(RequestError::new(
                 RequestErrorCode::WaitInterrupted,
@@ -2453,6 +2457,21 @@ mod tests {
                 format!("the {verb} was interrupted by a signal")
             );
         }
+    }
+
+    /// Flush point: every wait of `koto request` sends what is queued
+    /// before it sleeps. The flag is already raised, so the loop returns on
+    /// its first pass without sleeping at all, and the records can only
+    /// have gone out from the top of that pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_slice_sends_queued_records_before_it_sleeps() {
+        let sink = crate::telemetry::sink_fixture::SinkFixture::new();
+        sink.queue(3);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let far = Instant::now() + Duration::from_secs(60);
+        sleep_until(far, &flag, "wait").expect_err("a raised flag interrupts");
+        assert_eq!(sink.received(), 3);
     }
 
     #[test]

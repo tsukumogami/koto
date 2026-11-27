@@ -363,6 +363,8 @@ pub(crate) fn before_session_removal(_session_dir: &Path) {}
 #[cfg(all(test, unix))]
 #[path = "../../tests/support/event_sink_stub.rs"]
 mod event_sink_stub;
+#[cfg(all(test, unix))]
+pub(crate) mod sink_fixture;
 
 use std::path::Path;
 
