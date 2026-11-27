@@ -10,6 +10,10 @@
 //! (`nested_invocation`). Every refusal before the lock writes nothing, and
 //! a replace stopped after any write finishes when run again.
 //!
+//! `koto session replace OLD --by NEW` makes the same close for a NEW that
+//! already exists, writing NEW's `koto/replaces` key when NEW lacks it, and
+//! refuses in the nested envelope `koto session rebind` uses.
+//!
 //! `KOTO_TEST_REPLACE_FAULT` names a debug-build point at which the command
 //! stops as a killed process would (exit 86).
 //!
@@ -249,6 +253,19 @@ impl Host {
         self.koto(&args)
     }
 
+    /// `koto session replace old --by NEW`, plus `extra`, from the
+    /// workspace.
+    fn session_replace(&self, old: &str, extra: &[&str]) -> Command {
+        let mut args = vec!["session", "replace", old, "--by", NEW];
+        args.extend_from_slice(extra);
+        self.koto(&args)
+    }
+
+    /// The sessions directory, every session's files under it.
+    fn sessions(&self) -> PathBuf {
+        self.root.join("koto").join("sessions")
+    }
+
     /// The value NEW's `koto/replaces` key holds, from its context file.
     fn replaces_key(&self) -> Option<Value> {
         let path = self.session_dir(NEW).join("ctx").join(REPLACES_KEY);
@@ -466,6 +483,28 @@ fn assert_refused(out: &Out, exit: i32, code: &str) {
         out.describe()
     );
     assert_eq!(json["command"], "init", "{}", out.describe());
+}
+
+/// Assert that `out` is a `koto session replace` refusal in the nested
+/// envelope, `{"error": {"code", "message"}, "command"}`, with `code` and
+/// exit `exit`.
+fn assert_refused_nested(out: &Out, exit: i32, code: &str) {
+    assert_eq!(out.code, Some(exit), "{}", out.describe());
+    let json = out.json();
+    assert_eq!(json["error"]["code"], code, "{}", out.describe());
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "the refusal has no message: {}",
+        out.describe()
+    );
+    assert_eq!(json["command"], "session replace", "{}", out.describe());
+    assert!(
+        json.get("code").is_none(),
+        "the refusal is in the flat envelope: {}",
+        out.describe()
+    );
 }
 
 /// Assert that `old` is closed for [`NEW`]: its last standing event is a
@@ -1016,4 +1055,138 @@ fn needed_on_the_old_directory_stops_holding_it_after_a_replace() {
 
     let out = needed();
     assert_eq!(out.code, Some(0), "{}", out.describe());
+}
+
+#[test]
+fn session_replace_closes_the_old_run_for_an_existing_new_run() {
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    host.init_at(&host.ws, NEW);
+    let new_id = header(&host.log(NEW))["session_id"].clone();
+
+    let out = expect_ok(host.session_replace(NAME, &[]), "session replace");
+
+    let json = out.json();
+    assert_eq!(json["name"], NEW, "{}", out.describe());
+    assert_eq!(json["state"], "start", "{}", out.describe());
+    assert_eq!(json["replaces"], NAME, "{}", out.describe());
+    assert_eq!(json["outcome"], "replaced", "{}", out.describe());
+    assert_eq!(json["waited"], false, "{}", out.describe());
+    assert_eq!(json["tick_in_flight"], false, "{}", out.describe());
+    assert_eq!(json["children"], json!([]), "{}", out.describe());
+    assert_eq!(json["deferred_cleanup"], false, "{}", out.describe());
+
+    // The fence and the cancel name NEW by its own session id, and NEW
+    // holds `koto/replaces` naming OLD.
+    assert_closed(&host, NAME, true, "session replace");
+    let log = host.log(NAME);
+    assert_eq!(
+        payloads(&log, "session_superseded")[0]["by_session_id"],
+        new_id
+    );
+    let cancels = payloads(&log, "workflow_cancelled");
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0]["replaced_by"], NEW, "{cancels:?}");
+    assert_eq!(cancels[0]["replaced_by_session_id"], new_id, "{cancels:?}");
+
+    // NEW is the session that existed, not a new one.
+    assert_eq!(header(&host.log(NEW))["session_id"], new_id);
+    let added: Vec<Value> = payloads(&host.log(NEW), "context_added")
+        .into_iter()
+        .filter(|p| p["key"] == REPLACES_KEY)
+        .collect();
+    assert_eq!(added.len(), 1, "{added:?}");
+}
+
+#[test]
+fn session_replace_repairs_a_new_run_left_without_its_replaces_key() {
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    let mut cmd = host.replace(NAME, &[]);
+    cmd.env(FAULT_ENV, "after-create");
+    let out = run(cmd);
+    assert_eq!(out.code, Some(86), "{}", out.describe());
+    assert!(
+        host.session_dir(NEW).exists(),
+        "the stopped replace left no NEW"
+    );
+    assert!(
+        host.replaces_key().is_none(),
+        "the stopped replace wrote NEW's key"
+    );
+    assert!(payloads(&host.log(NAME), "session_superseded").is_empty());
+    assert!(payloads(&host.log(NAME), "workflow_cancelled").is_empty());
+
+    let out = expect_ok(host.session_replace(NAME, &[]), "session replace");
+    let json = out.json();
+    assert_eq!(json["name"], NEW, "{}", out.describe());
+    assert_eq!(json["outcome"], "replaced", "{}", out.describe());
+    assert_closed(&host, NAME, true, "after the repair");
+
+    // Run again, it reports the close done and appends nothing.
+    let old_before = files(&host.session_dir(NAME));
+    let new_before = files(&host.session_dir(NEW));
+    let out = expect_ok(host.session_replace(NAME, &[]), "session replace again");
+    assert_eq!(out.json()["outcome"], "unchanged", "{}", out.describe());
+    assert_eq!(files(&host.session_dir(NAME)), old_before, "OLD changed");
+    assert_eq!(files(&host.session_dir(NEW)), new_before, "NEW changed");
+    assert_closed(&host, NAME, true, "after the second run");
+}
+
+#[test]
+fn session_replace_refuses_session_busy_with_the_nested_envelope() {
+    let host = Host::new();
+    let gate = host.dir("gate");
+    host.write_template(&gated_template(&gate));
+    host.init_at(&host.ws, NAME);
+    host.init_at(&host.ws, NEW);
+
+    let paused = Paused::start(&host, &gate);
+    let before = files(&host.sessions());
+
+    let started = Instant::now();
+    let out = run(host.session_replace(NAME, &["--wait", "0"]));
+    let took = started.elapsed();
+    assert_refused_nested(&out, 1, "session_busy");
+    assert!(
+        took < Duration::from_secs(5),
+        "--wait 0 waited {took:?} before refusing"
+    );
+
+    assert_eq!(
+        files(&host.sessions()),
+        before,
+        "the refused replace wrote something"
+    );
+    assert!(host.replaces_key().is_none());
+
+    for tick in paused.release() {
+        assert_eq!(tick.code, Some(0), "the tick: {}", tick.describe());
+        assert_eq!(tick.json()["state"], "work", "{}", tick.describe());
+    }
+}
+
+#[test]
+fn session_replace_refuses_a_new_run_whose_key_names_another_run() {
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    host.init_at(&host.ws, "other");
+    expect_ok(host.replace("other", &[]), "setup: init --replaces other");
+    assert_eq!(
+        host.replaces_key().unwrap()["session"],
+        "other",
+        "setup: NEW's key doesn't name the other run"
+    );
+    let before = files(&host.sessions());
+
+    let out = run(host.session_replace(NAME, &[]));
+
+    assert_refused_nested(&out, 2, "session_exists");
+    assert_eq!(
+        files(&host.sessions()),
+        before,
+        "the refused replace wrote something"
+    );
+    assert!(payloads(&host.log(NAME), "session_superseded").is_empty());
+    assert!(payloads(&host.log(NAME), "workflow_cancelled").is_empty());
 }
