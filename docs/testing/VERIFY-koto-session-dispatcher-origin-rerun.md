@@ -17,8 +17,8 @@ closing section asked for:
   and the koto-skills plugin installed for that HOME's user and no launcher on
   its `PATH`. It did not run on a separate machine.
 
-The criteria are read as the PLAN words them on koto#687's branch
-`docs/session-dispatcher-origin`.
+The criteria are read as the PLAN words them on koto#687's branch,
+docs/session-dispatcher-origin.
 
 Results, each explained in its section below:
 
