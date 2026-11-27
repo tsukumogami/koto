@@ -82,6 +82,30 @@ fn set_gave_up(value: bool) {
     GAVE_UP.with(|g| g.set(value));
 }
 
+// What each lock attempt on this thread was allowed: how long it may wait,
+// and the instant that wait is counted from. A test reads these to tell an
+// attempt that may wait from one that may not, and to see that several
+// attempts share one start, without timing anything.
+#[cfg(test)]
+thread_local! {
+    static ATTEMPTS: std::cell::RefCell<Vec<(Duration, Instant)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_attempt(wait: Duration, started: Instant) {
+    ATTEMPTS.with(|a| a.borrow_mut().push((wait, started)));
+}
+
+#[cfg(not(test))]
+fn note_attempt(_wait: Duration, _started: Instant) {}
+
+/// The attempts since the last call; the list is emptied.
+#[cfg(test)]
+fn take_attempts() -> Vec<(Duration, Instant)> {
+    ATTEMPTS.with(|a| std::mem::take(&mut *a.borrow_mut()))
+}
+
 /// The held lock of one session's count. Dropping it releases the lock;
 /// the lock file stays.
 struct Lock {
@@ -109,6 +133,7 @@ impl Lock {
             .open(dir.join(LOCK_FILE))
             .ok()?;
         let wait = if gave_up() { Duration::ZERO } else { LOCK_WAIT };
+        note_attempt(wait, started);
         match crate::engine::jsonl_append::lock_exclusive(file.as_raw_fd(), Some(wait), started) {
             Ok(()) => {
                 set_gave_up(false);
@@ -353,12 +378,22 @@ mod tests {
         // each session would cost three waits: a timeout, then a success
         // that lets the next one wait again.
         let _held: Vec<std::fs::File> = dirs.iter().step_by(2).map(|d| hold(d)).collect();
+        take_attempts();
         let started = Instant::now();
         let written: Vec<bool> = dirs.iter().map(|d| add_within(d, 4, started)).collect();
         let took = started.elapsed();
         assert_eq!(written, vec![false, true, false, true, false, true]);
         assert!(took >= LOCK_WAIT, "{took:?}");
-        assert!(took < LOCK_WAIT * 2, "the waits added up: {took:?}");
+        // Every attempt counted its wait from the one start, so the three
+        // held locks share the one wait: the second and third find it
+        // already spent. That is read from what each attempt was given,
+        // not from the clock, which on a slow host says nothing.
+        let attempts = take_attempts();
+        assert_eq!(attempts.len(), 6);
+        assert!(attempts.iter().all(|(_, from)| *from == started));
+        let waits: Vec<Duration> = attempts.iter().map(|(wait, _)| *wait).collect();
+        let (w, z) = (LOCK_WAIT, Duration::ZERO);
+        assert_eq!(waits, vec![w, z, w, z, w, z]);
         // The held sessions kept the 1 `hold` wrote; the free ones gained 4.
         let counts: Vec<u64> = dirs.iter().map(|d| read(d)).collect();
         assert_eq!(counts, vec![1, 4, 1, 4, 1, 4]);
@@ -380,10 +415,11 @@ mod tests {
         let first = started.elapsed();
         assert!(first >= LOCK_WAIT, "{first:?}");
         assert!(first < Duration::from_secs(2), "{first:?}");
-        // The process has given up once, so the next change doesn't wait.
-        let started = Instant::now();
+        // The process has given up once, so the next change may not wait.
+        take_attempts();
         assert!(!add(tmp.path(), 5));
-        assert!(started.elapsed() < LOCK_WAIT, "{:?}", started.elapsed());
+        let waits: Vec<Duration> = take_attempts().iter().map(|(wait, _)| *wait).collect();
+        assert_eq!(waits, vec![Duration::ZERO]);
         assert_eq!(read(tmp.path()), 1);
         // Once the holder lets go, a change goes through and waits again
         // are allowed. The lock can outlive `holder` by a moment, for the

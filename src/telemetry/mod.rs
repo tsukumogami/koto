@@ -543,6 +543,29 @@ pub(crate) fn set_lock_wait_for_test(wait: std::time::Duration) {
     TEST_LOCK_WAIT.with(|c| c.set(wait));
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCK_WAITS: std::cell::RefCell<Vec<std::time::Duration>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Note the lock wait a write on this thread was allowed, so a test can
+/// tell a write that may wait from one that may not without timing it.
+#[cfg(test)]
+fn note_lock_wait(wait: std::time::Duration) {
+    TEST_LOCK_WAITS.with(|c| c.borrow_mut().push(wait));
+}
+
+#[cfg(not(test))]
+fn note_lock_wait(_wait: std::time::Duration) {}
+
+/// The lock wait each write on this thread was allowed, in order, since the
+/// last call; the list is emptied.
+#[cfg(test)]
+pub(crate) fn take_lock_waits_for_test() -> Vec<std::time::Duration> {
+    TEST_LOCK_WAITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// Count one written batch, and whether the append reported a flush.
 #[cfg(test)]
 fn count_batch(flushed: bool) {
@@ -773,6 +796,7 @@ fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration)
     } else {
         lock_wait
     };
+    note_lock_wait(lock_wait);
     // The batch goes to one file whole: a rotation happens before it or
     // after it, never between two of its lines. The lock wait covers the
     // whole append, the fresh file's lock after a rotation included, but
