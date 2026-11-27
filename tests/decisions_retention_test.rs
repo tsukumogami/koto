@@ -364,7 +364,12 @@ impl Env {
     /// the accepted fixture, installed as this thread's harness record
     /// (the caller holds a [`fx::Records`]); its id.
     fn person_answer(&self, q: &Rec, header: &str, in_session: &str) -> String {
-        let call = "toolu_ZQXMARKERretention01";
+        self.person_answer_at(q, header, in_session, "toolu_ZQXMARKERretention01")
+    }
+
+    /// [`Env::person_answer`] from harness tool call `call`, so a test can
+    /// record more than one: a call position is used once.
+    fn person_answer_at(&self, q: &Rec, header: &str, in_session: &str, call: &str) -> String {
         let lines = fx::with_call(&fx::lines("accepted"), call);
         let harness = fx::harness();
         fx::install(&harness, &fx::render(&lines, &harness, &[header]));
@@ -660,6 +665,7 @@ fn assert_holds_refusal(out: &Out, name: &str, holds: &[(&str, &str)]) {
             "raised" => "raised the open question",
             "answer" => "holds the answer in effect",
             "pass_up" => "holds a pass-up",
+            "person_answer" => "holds the verified person answer",
             other => panic!("unknown hold {other}"),
         };
         assert!(message.contains(says), "{message}");
@@ -713,6 +719,72 @@ fn assert_unreadable_refusal(out: &Out, name: &str, unreadable_in: &str) {
     let message = err["message"].as_str().unwrap();
     assert!(message.contains("can't be read"), "{message}");
     assert!(message.contains(first), "{message}");
+}
+
+/// The `questions` entry for a session holding `answer` (`<holder session
+/// id>/<answer id>`), a verified person answer to `q`.
+fn person_hold(q: &Rec, answer: &str) -> Value {
+    json!({"question": q.identity(), "held": "person_answer", "answer": answer})
+}
+
+/// `<session id>/<id>` of the decision `id` that `holder` holds.
+fn answer_identity(env: &Env, holder: &str, id: &str) -> String {
+    let shown = env.show(holder, id);
+    format!(
+        "{}/{}",
+        shown["decision"]["session"]["id"].as_str().unwrap(),
+        id
+    )
+}
+
+/// Assert `out` is the `holds_question` refusal of `name` holding only the
+/// verified person answer `answer` to `q`, as `koto session cleanup` and
+/// `koto cancel --cleanup` print it (`error` an object) or, with
+/// `replace`, as `koto init --replace-terminal` does (`error` the text).
+fn assert_person_refusal(out: &Out, name: &str, q: &Rec, answer: &str, replace: bool) {
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    let v = out.json();
+    let (body, message) = if replace {
+        assert_eq!(v["command"], "init", "{v}");
+        (&v, v["error"].as_str().unwrap_or_else(|| panic!("{v}")))
+    } else {
+        let err = &v["error"];
+        (
+            err,
+            err["message"].as_str().unwrap_or_else(|| panic!("{v}")),
+        )
+    };
+    assert_eq!(body["code"], "holds_question", "{v}");
+    assert_eq!(body["session"], name, "{v}");
+    let force = format!("koto session cleanup {name} --force");
+    assert_eq!(body["force_command"], force.as_str(), "{v}");
+    assert_eq!(body["questions"], json!([person_hold(q, answer)]), "{v}");
+    assert!(body.get("decisions_unreadable").is_none(), "{v}");
+    for part in [
+        force.as_str(),
+        q.identity().as_str(),
+        answer,
+        "holds the verified person answer",
+        "A verified person answer is kept until its session is removed",
+    ] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+}
+
+/// `a` raises a question to `person:owner`, `b` records the person's
+/// answer to it, verified on this host, and `a` (which holds nothing once
+/// its question is answered) is removed without `--force`. Returns the
+/// question and the answer's `<session id>/<id>`.
+fn verified_without_raiser(env: &Env) -> (Rec, String) {
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let (q, header) = env.raise_for_person("a", "q1", "person:owner");
+    let id = env.person_answer(&q, &header, "b");
+    assert_eq!(env.show("b", &id)["reading"], "verified");
+    let out = env.cleanup("a", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(!env.exists("a"));
+    (q, answer_identity(env, "b", &id))
 }
 
 // ===== Kept at the terminal tick =====
@@ -1677,15 +1749,24 @@ fn a_persons_answer_in_effect_is_the_hold_and_the_outranked_answer_is_released()
     );
     assert_eq!(env.show("p", &by_person)["governs"], true);
 
-    // The person's answer is the one in effect: its holder is refused, by
-    // cleanup and by a replace once it has finished.
+    // The person's answer is the one in effect and reads verified here:
+    // its holder is refused for it, by cleanup and by a replace once it
+    // has finished, which keeps it for that answer.
+    let answer = answer_identity(&env, "p", &by_person);
     let before = env.snapshot_all();
     let out = env.cleanup("p", &[]);
-    assert_holds_refusal(&out, "p", &[(&q.identity(), "answer")]);
+    assert_person_refusal(&out, "p", &q, &answer, false);
     assert_eq!(env.snapshot_all(), before);
-    env.finish("p");
+    assert_eq!(
+        env.finish("p")["retention"],
+        json!({
+            "retained": true,
+            "reason": "person_answer",
+            "answered_questions": [q.identity()],
+        })
+    );
     let before = env.snapshot_all();
-    assert_replace_refusal(&env.replace("p"), "p", &[(&q.identity(), "answer")]);
+    assert_person_refusal(&env.replace("p"), "p", &q, &answer, true);
     assert_eq!(env.snapshot_all(), before);
 
     // The outranked session answer holds nothing.
@@ -1716,6 +1797,165 @@ fn a_pass_up_that_doesnt_count_holds_nothing() {
 
     assert_cleaned_without_force(&env, "passer");
     assert!(env.listed_as_raised(&q));
+}
+
+// ===== A verified person answer keeps its holder =====
+
+#[test]
+fn cleanup_refuses_the_holder_of_a_verified_person_answer_after_its_raiser_is_gone() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    let (q, answer) = verified_without_raiser(&env);
+
+    let before = env.snapshot_all();
+    let out = env.cleanup("b", &[]);
+    assert_person_refusal(&out, "b", &q, &answer, false);
+    assert_eq!(env.snapshot_all(), before);
+    assert!(env.exists("b"));
+
+    // `--force` removes exactly `b`, listed with its warning.
+    let before = env.snapshot_except("b");
+    let out = env.cleanup("b", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(env.snapshot_except("b"), before);
+    assert_eq!(
+        out.json()["orphaned_questions"],
+        json!([person_hold(&q, &answer)])
+    );
+    assert!(
+        out.stderr.contains("with --force")
+            && out.stderr.contains("holds the verified person answer")
+            && out.stderr.contains(&q.identity())
+            && out.stderr.contains(&answer),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.exists("b"));
+}
+
+#[test]
+fn a_verified_person_answer_keeps_its_holder_at_its_tick_and_through_every_prune() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    let (q, _) = verified_without_raiser(&env);
+    let id = q.identity();
+
+    assert_eq!(
+        env.finish_env(&FAST, "b")["retention"],
+        json!({
+            "retained": true,
+            "reason": "person_answer",
+            "answered_questions": [id],
+        })
+    );
+    assert!(env.exists("b"));
+    settle();
+
+    let h = env
+        .ok_env(&FAST, &["session", "hierarchy", "b", "--json"])
+        .json();
+    assert_eq!(h["kept"], true, "{h:#}");
+    let keepers = h["keepers"].as_array().unwrap();
+    assert_eq!(keepers.len(), 1, "{h:#}");
+    assert_eq!(keepers[0]["name"], "b");
+    assert_eq!(keepers[0]["alive"], false);
+    assert_eq!(keepers[0]["answered_questions"], json!([id]));
+    let says = format!("b holds a verified person answer to question {id}");
+
+    let preview = env.prune(&[]);
+    assert!(
+        preview["remove"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+    let detail = kept_entry(&preview, "b")["detail"].as_str().unwrap();
+    assert!(detail.contains(&says), "{detail}");
+
+    for args in [
+        &["--apply", "--all"][..],
+        &["--older-than", "1s", "--apply"][..],
+    ] {
+        let applied = env.prune(args);
+        assert_eq!(applied["removed"], json!([]), "{args:?}: {applied:#}");
+        assert_eq!(names_of(&applied["kept"]), vec!["b"], "{args:?}");
+        assert!(env.exists("b"), "{args:?}");
+    }
+
+    let out = env.run_env(&FAST, &["workspace", "prune", "--root", "b", "--yes"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(out.last_json()["removed"], json!([]));
+    assert!(env.exists("b"));
+}
+
+#[test]
+fn a_session_answer_or_a_remote_reading_person_answer_goes_once_its_raiser_is_gone() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    env.init("a", &[]);
+    // `s` holds only a session's answer.
+    env.init("s", &[]);
+    let by_session = env.escalate("a", "q1", "session:s");
+    env.answer(&by_session, "s", "yes");
+    // `r` and `t` each hold only a person's answer that reads as a remote
+    // session's answer: this host's note in their directories is gone.
+    env.init("r", &[]);
+    env.init("t", &[]);
+    let mut remote = Vec::new();
+    for (holder, question, call) in [
+        ("r", "q2", "toolu_ZQXMARKERretention02"),
+        ("t", "q3", "toolu_ZQXMARKERretention03"),
+    ] {
+        let (q, header) = env.raise_for_person("a", question, "person:owner");
+        let id = env.person_answer_at(&q, &header, holder, call);
+        std::fs::remove_file(env.sessions().join(holder).join("koto-verified-here")).unwrap();
+        assert_eq!(
+            env.show(holder, &id)["reading"],
+            "a remote session's answer"
+        );
+        remote.push(q);
+    }
+
+    // While the raiser is here, the session's answer holds as before, and
+    // the remote-reading answers, which don't count for a question waiting
+    // on a person, hold nothing.
+    assert_holds_refusal(
+        &env.cleanup("s", &[]),
+        "s",
+        &[(&by_session.identity(), "answer")],
+    );
+    for q in &remote {
+        assert!(env.listed_as_raised(q));
+    }
+
+    let out = env.cleanup("a", &["--force"]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+
+    // Removed without force, by cleanup and at the terminal tick.
+    assert_cleaned_without_force(&env, "s");
+    assert_cleaned_without_force(&env, "r");
+    assert_eq!(env.finish("t")["retention"], json!({"retained": false}));
+    assert!(!env.exists("t"));
+}
+
+#[test]
+fn cancel_cleanup_and_replace_refuse_the_holder_of_a_verified_person_answer() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    let (q, answer) = verified_without_raiser(&env);
+
+    let before = env.snapshot_all();
+    let out = env.run(&["cancel", "b", "--cleanup"]);
+    assert_person_refusal(&out, "b", &q, &answer, false);
+    assert_eq!(env.snapshot_all(), before);
+    // Not cancelled: it still advances.
+    let next = env.ok(&["next", "b", "--no-cleanup"]).json();
+    assert_eq!(next["state"], "work", "{next}");
+
+    assert_eq!(env.finish("b")["retention"]["reason"], "person_answer");
+    let before = env.snapshot_all();
+    let out = env.replace("b");
+    assert_person_refusal(&out, "b", &q, &answer, true);
+    assert_eq!(env.snapshot_all(), before);
+    assert!(!env.exists("b_r1"), "b was moved aside");
 }
 
 // ===== Decisions that can't be read =====

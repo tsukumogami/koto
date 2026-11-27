@@ -1315,28 +1315,49 @@ fn pinned_children_by_name(
 
 /// The `kept_children` entry for a child the sweep keeps because it raised
 /// a question that is still open (`crate::decisions::questions::is_open`):
-/// reason `open_question`, with the questions' identities. `None` for a
-/// child that raised none, at the cost of a read of its own decisions.
+/// reason `open_question`, with the questions' identities; or because it
+/// holds a person's answer that reads verified here: reason
+/// `person_answer`, with the identities of the questions answered. `None`
+/// for a child holding neither, at the cost of a read of its own decisions.
 fn question_kept_child(backend: &dyn SessionBackend, child: &str) -> Option<KeptChild> {
+    use super::next_types::RetentionReason;
+    use crate::decisions::questions::{tick_hold, TickHold};
     let base = backend.session_dir(child).parent()?.to_path_buf();
-    let open = crate::decisions::questions::raised_open_in(
+    let hold = tick_hold(
         &crate::session::Backend::Local(crate::session::local::LocalBackend::with_base_dir(base)),
         child,
-    );
-    if open.is_empty() {
-        return None;
-    }
-    let shown: Vec<String> = open.iter().map(|q| hierarchy::sanitize(q)).collect();
+    )?;
     let mut fields = serde_json::Map::new();
-    fields.insert("open_questions".to_string(), serde_json::json!(shown));
+    let (reason, detail) = match hold {
+        TickHold::Open(open) => {
+            let shown: Vec<String> = open.iter().map(|q| hierarchy::sanitize(q)).collect();
+            let detail = format!(
+                "kept: it holds open question {}; it is kept until the question is answered, \
+                 reversed or fenced",
+                shown.join(", ")
+            );
+            fields.insert("open_questions".to_string(), serde_json::json!(shown));
+            (RetentionReason::OpenQuestion, detail)
+        }
+        TickHold::PersonAnswers(answers) => {
+            let mut shown: Vec<String> = answers
+                .iter()
+                .map(|a| hierarchy::sanitize(&a.question))
+                .collect();
+            shown.dedup();
+            let detail = format!(
+                "kept: it holds a verified person answer to question {}; it is kept until it is \
+                 removed with koto session cleanup --force",
+                shown.join(", ")
+            );
+            fields.insert("answered_questions".to_string(), serde_json::json!(shown));
+            (RetentionReason::PersonAnswer, detail)
+        }
+    };
     Some(KeptChild {
         name: child.to_string(),
-        reason: super::next_types::RetentionReason::OpenQuestion.as_str(),
-        detail: format!(
-            "kept: it holds open question {}; it is kept until the question is answered, \
-             reversed or fenced",
-            shown.join(", ")
-        ),
+        reason: reason.as_str(),
+        detail,
         pin: fields,
     })
 }

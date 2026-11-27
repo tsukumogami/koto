@@ -1136,7 +1136,8 @@ pub fn report(backend: &Backend, session: &str) -> Option<Value> {
     (!out.is_empty()).then_some(Value::Array(out))
 }
 
-/// What a session holds that an open question depends on.
+/// What a session holds that an open question depends on, or that keeps
+/// it on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Held {
     /// It raised the question, which is open.
@@ -1145,6 +1146,10 @@ pub enum Held {
     Answer,
     /// It holds a pass-up the question's current addressee rests on.
     PassUp,
+    /// It holds a person's answer whose reading is `verified` on this host
+    /// ([`verified_answers_in`]). It keeps the session whether or not the
+    /// question is open and whether or not its raiser is still here.
+    PersonAnswer,
 }
 
 impl Held {
@@ -1154,6 +1159,7 @@ impl Held {
             Held::Raised => "raised",
             Held::Answer => "answer",
             Held::PassUp => "pass_up",
+            Held::PersonAnswer => "person_answer",
         }
     }
 
@@ -1163,6 +1169,10 @@ impl Held {
             Held::Raised => "the question itself: no open read returns it once its raiser is gone",
             Held::Answer => "the answer in effect: the question reads open again",
             Held::PassUp => "a pass-up: the question waits on the addressee it had before it",
+            Held::PersonAnswer => {
+                "a person's answer this host verified against its prompt: no other copy of it \
+                 reads verified here"
+            }
         }
     }
 
@@ -1175,6 +1185,9 @@ impl Held {
             Held::PassUp => format!(
                 "holds a pass-up that the current addressee of the question {identity} rests on"
             ),
+            Held::PersonAnswer => {
+                format!("holds a verified person answer to the question {identity}")
+            }
         }
     }
 }
@@ -1187,6 +1200,96 @@ pub struct Hold {
     /// The session directory that raised the question: the holder itself
     /// for [`Held::Raised`].
     pub raiser: String,
+    /// For [`Held::PersonAnswer`], the answer: `<holder's session
+    /// id>/<answer decision id>`. `None` for every other hold.
+    pub answer: Option<String>,
+}
+
+impl Hold {
+    /// What the session holds, for a message: `it <describe>`, sanitized,
+    /// naming the answer of a [`Held::PersonAnswer`].
+    pub fn describe(&self) -> String {
+        use crate::session::hierarchy::sanitize;
+        let identity = sanitize(&self.identity);
+        match &self.answer {
+            Some(a) => format!(
+                "holds the verified person answer {} to the question {identity}",
+                sanitize(a)
+            ),
+            None => self.held.describe(&identity),
+        }
+    }
+}
+
+/// The way out a refusal for `holds` names before `--force`: answering,
+/// reversing or passing the question, except when every hold is a verified
+/// person answer, which nothing but a forced removal ends.
+pub fn way_out(holds: &[Hold]) -> &'static str {
+    if !holds.is_empty() && holds.iter().all(|h| h.held == Held::PersonAnswer) {
+        "A verified person answer is kept until its session is removed"
+    } else {
+        "Answer, reverse or pass the question first"
+    }
+}
+
+/// Whether `b`, read from session directory `holder`, is a person's answer
+/// whose `reading` is `verified` here: an answer aimed at a question that
+/// carries a prompt (only a person's answer does), judged by
+/// [`standing::verified_in`] for `holder`, the test `koto decisions show`
+/// prints `reading` from.
+fn verified_held(backend: &Backend, holder: &str, b: &DecisionBody) -> bool {
+    b.kind == "answer"
+        && b.target.is_some()
+        && b.prompt.is_some()
+        && standing::verified_in(backend, holder, b)
+}
+
+/// A person's answer a session holds whose reading is `verified` here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VerifiedAnswer {
+    /// The question it answers: `<raiser's session id>/<question id>`.
+    pub question: String,
+    /// The answer: `<holder's session id>/<answer decision id>`.
+    pub answer: String,
+    /// The raiser's session name, as the answer names it.
+    pub raiser: String,
+}
+
+fn own_decisions(entries: &[Entry]) -> impl Iterator<Item = &DecisionBody> {
+    entries.iter().filter_map(|e| match e {
+        Entry::Decision(b) => Some(&**b),
+        Entry::Unreadable { .. } => None,
+    })
+}
+
+fn verified_among<'e>(
+    backend: &Backend,
+    session: &str,
+    entries: impl Iterator<Item = &'e DecisionBody>,
+) -> Vec<VerifiedAnswer> {
+    let mut out: Vec<VerifiedAnswer> = entries
+        .filter(|b| verified_held(backend, session, b))
+        .filter_map(|b| {
+            let t = b.target.as_ref()?;
+            Some(VerifiedAnswer {
+                question: format!("{}/{}", t.id, t.decision),
+                answer: identity(b),
+                raiser: t.name.clone(),
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The person's answers session directory `session` holds whose reading
+/// is `verified` on this host, whatever their questions read and whether
+/// their raisers are still here. Read from the session's own decisions; a
+/// host-local note is read only for an entry carrying a prompt.
+pub fn verified_answers_in(backend: &Backend, session: &str) -> Vec<VerifiedAnswer> {
+    let own = read::read_session_with(backend, session, false);
+    verified_among(backend, session, own_decisions(&own))
 }
 
 /// The readable decisions the scan read in session directory `session`.
@@ -1222,7 +1325,9 @@ pub fn raised_open(index: &Index, runs: &Runs, session: &str) -> Vec<String> {
 /// [`answer_in_effect`] names for a question whose raiser is in the store,
 /// and a counted pass-up (one [`resolve`] applied) the current addressee
 /// of an open question rests on. An entry that doesn't count, or that a
-/// person's answer outranks, holds nothing. Each is matched by identity,
+/// person's answer outranks, holds nothing. A person's answer whose reading
+/// is `verified` here holds as [`Held::PersonAnswer`] instead, whatever its
+/// question reads and whether or not its raiser is in the store. Each is matched by identity,
 /// never by name, so an answer aimed at a removed session's id holds
 /// nothing once that session is gone, whatever now carries its name.
 pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
@@ -1232,10 +1337,22 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
             identity,
             held: Held::Raised,
             raiser: session.to_string(),
+            answer: None,
         })
         .collect();
     for b in decisions_in(index, session) {
         let Some(t) = &b.target else { continue };
+        // A person's answer that reads verified here holds on its own,
+        // whatever its question reads and wherever its raiser is.
+        if verified_held(runs.backend(), session, b) {
+            out.push(Hold {
+                identity: format!("{}/{}", t.id, t.decision),
+                held: Held::PersonAnswer,
+                raiser: t.name.clone(),
+                answer: Some(identity(b)),
+            });
+            continue;
+        }
         // By kind alone: whether the entry is the answer in effect, or a
         // pass-up in the question's history, is the shared computation's
         // to say.
@@ -1264,13 +1381,14 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
                 is_open(index, runs, q)
                     && resolve(index, runs, q).applied.iter().any(|r| same(r, b))
             }
-            Held::Raised => false,
+            Held::Raised | Held::PersonAnswer => false,
         };
         if holds {
             out.push(Hold {
                 identity: identity(q),
                 held,
                 raiser: q.session.name.clone(),
+                answer: None,
             });
         }
     }
@@ -1279,33 +1397,38 @@ pub fn holds_of(index: &Index, runs: &Runs, session: &str) -> Vec<Hold> {
     out
 }
 
-/// Whether `b` could make a hold [`holds_of`] counts: a question, or (with
-/// `aimed`) an answer or pass-up aimed at one.
-fn may_count(b: &DecisionBody, aimed: bool) -> bool {
-    is_question(b)
-        || (aimed && b.target.is_some() && matches!(b.kind.as_str(), "answer" | "readdress"))
+/// Whether `b` could make a hold [`holds_of`] counts: a question, or an
+/// answer or pass-up aimed at one.
+fn may_count(b: &DecisionBody) -> bool {
+    is_question(b) || (b.target.is_some() && matches!(b.kind.as_str(), "answer" | "readdress"))
 }
 
-/// Whether session `session`'s own decisions could hold anything
-/// [`holds_of`] counts. A session with none never pays for a scan of the
-/// store. An unreadable entry counts as none here: the terminal tick keeps
-/// a session only for a question it can read.
-fn may_hold(backend: &Backend, session: &str, aimed: bool) -> bool {
-    read::read_session_with(backend, session, false)
-        .iter()
-        .any(|e| match e {
-            Entry::Decision(b) => may_count(b, aimed),
-            Entry::Unreadable { .. } => false,
-        })
+/// What keeps a finished session for the questions it holds, at its
+/// terminal tick and in a parent's sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickHold {
+    /// The identities of the open questions it raised.
+    Open(Vec<String>),
+    /// The person's answers it holds whose reading is `verified` here.
+    PersonAnswers(Vec<VerifiedAnswer>),
 }
 
-/// The open questions session `session` raised, for its terminal tick:
-/// empty, at the cost of a read of its own decisions, when it raised none.
-pub fn raised_open_in(backend: &Backend, session: &str) -> Vec<String> {
-    if !may_hold(backend, session, false) {
-        return Vec::new();
+/// What keeps session `session` at its terminal tick for its questions:
+/// the open questions it raised, else the person's answers it holds that
+/// read verified here, else nothing. One read of its own decisions: the
+/// store is scanned only when it raised a question, and a host-local note
+/// is read only when it holds an answer carrying a prompt, so a session
+/// with neither pays that read alone.
+pub fn tick_hold(backend: &Backend, session: &str) -> Option<TickHold> {
+    let own = read::read_session_with(backend, session, false);
+    if own_decisions(&own).any(is_question) {
+        let open = raised_open(&Index::scan(backend, false), &Runs::new(backend), session);
+        if !open.is_empty() {
+            return Some(TickHold::Open(open));
+        }
     }
-    raised_open(&Index::scan(backend, false), &Runs::new(backend), session)
+    let answers = verified_among(backend, session, own_decisions(&own));
+    (!answers.is_empty()).then_some(TickHold::PersonAnswers(answers))
 }
 
 /// What an explicit removal of a session would orphan, and what couldn't
@@ -1376,7 +1499,7 @@ pub fn orphans(backend: &Backend, session: &str) -> Orphans {
         ..Orphans::default()
     };
     let counts = own.iter().any(|e| match e {
-        Entry::Decision(b) => may_count(b, true),
+        Entry::Decision(b) => may_count(b),
         Entry::Unreadable { .. } => false,
     });
     if !counts {
@@ -1415,9 +1538,11 @@ pub fn orphans(backend: &Backend, session: &str) -> Orphans {
 /// of the answer in effect or of a pass-up goes only with the raiser of
 /// that question ([`holds_of`]), and a member kept here keeps the holders
 /// that rest on it, to a fixed point. Asker and answerer removed together
-/// both go. `may_hold` says which members could hold anything (those with
-/// an aimed answer or pass-up); when none could, nothing is read. Read
-/// from the local store only.
+/// both go. A holder of a person's answer that reads verified here
+/// ([`Held::PersonAnswer`]) is kept whatever is removed with it. `may_hold`
+/// says which members could hold anything (those with an aimed answer or
+/// pass-up); when none could, nothing is read. Read from the local store
+/// only.
 pub fn kept_for_raisers(
     backend: &Backend,
     removing: &BTreeSet<String>,
@@ -1443,7 +1568,11 @@ pub fn kept_for_raisers(
             }
             let apart: Vec<Hold> = held
                 .iter()
-                .filter(|h| !removing.contains(&h.raiser) || kept.contains_key(&h.raiser))
+                .filter(|h| {
+                    h.held == Held::PersonAnswer
+                        || !removing.contains(&h.raiser)
+                        || kept.contains_key(&h.raiser)
+                })
                 .cloned()
                 .collect();
             if !apart.is_empty() {
@@ -1463,13 +1592,20 @@ pub fn kept_for_raisers_text(holds: &[Hold]) -> String {
     use crate::session::hierarchy::sanitize;
     let each: Vec<String> = holds
         .iter()
-        .map(|h| {
-            format!(
-                "it {}, and its raiser {} isn't removed with it (removing it would lose {})",
-                h.held.describe(&sanitize(&h.identity)),
+        .map(|h| match h.held {
+            Held::PersonAnswer => format!(
+                "it {}, which keeps it whether or not its raiser {} stays (removing it would \
+                 lose {})",
+                h.describe(),
                 sanitize(&h.raiser),
                 h.held.loss()
-            )
+            ),
+            _ => format!(
+                "it {}, and its raiser {} isn't removed with it (removing it would lose {})",
+                h.describe(),
+                sanitize(&h.raiser),
+                h.held.loss()
+            ),
         })
         .collect();
     format!("kept: {}", each.join("; "))

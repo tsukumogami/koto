@@ -398,7 +398,8 @@ names only in passing.
   session as today. When the rule would have kept it, the output names every
   other live member of its hierarchy (the removed session itself is not
   named); when it wouldn't, the output names none. The one exception is a
-  removal that would orphan a question, which R39 refuses unless forced.
+  removal that would orphan a question or remove a person's verified answer,
+  which R39 refuses unless forced.
 - **R19. koto says why it keeps a session.** Wherever the rule keeps a
   session (the terminal tick, the sweep, both prunes, the replace, and a
   hierarchy query for one named session), koto names the reason: every live
@@ -582,10 +583,14 @@ record defines it. It is open exactly when the decision record says it is:
 in effect, with no answer, settle or withdrawal in effect for it. Which of
 those entries count, and which one is in effect, are the decision record's
 rules; retention adds none and reads them through the same test every open
-read uses. A withdrawn or settled question keeps nothing.
+read uses. A withdrawn or settled question keeps nothing. A person's answer
+that reads verified on this host is the one exception to judging by open: it
+keeps its session whatever became of the question, because it is the
+precedent a later settle cites so the person isn't asked again, and removing
+a replacing answer would make the answer it replaced look current again.
 
-- **R36. A session holding an open question keeps its hierarchy, with no
-  expiry.** A session that raised a question still open is a keeper of its
+- **R36. A session holding an open question or a person's verified answer
+  keeps its hierarchy, with no expiry.** A session that raised a question still open is a keeper of its
   hierarchy whether or not it is alive, until the question is closed,
   reversed or fenced; no retention period runs while it is open. At its
   terminal tick it is kept with or without `--no-cleanup`, with the reason
@@ -594,7 +599,17 @@ read uses. A withdrawn or settled question keeps nothing.
   `koto session prune` keeps it and its hierarchy under rule `h`, and
   `koto workspace prune --root` and the parent sweep follow the same verdict;
   the sweep lists a child kept this way with the reason `open_question`. The
-  same-name replace refuses such a session instead of moving it (R39).
+  same-name replace refuses such a session instead of moving it (R39). A
+  session holding a person's answer whose `reading` is `verified` on this
+  host is a keeper of its hierarchy the same way, alive or not and with no
+  expiry, whether or not the question is still open and whether or not its
+  raiser is still in the store; only a forced removal (R40) releases it. At
+  its terminal tick it is kept with the reason `person_answer` and the
+  identities of the questions it answered, the hierarchy query names it as a
+  keeper with them, both prunes and the parent sweep keep it by that verdict,
+  the sweep listing it with the reason `person_answer`, and the same-name
+  replace refuses it (R39). A session's answer, and a person's answer that
+  reads as a remote session's answer here, get none of this.
 - **R37. An answer or pass-up joins its holder to the question's session.**
   An answer or pass-up stored aimed at a question is an edge between the
   session holding it and the session that raised the question, matched by
@@ -607,7 +622,8 @@ read uses. A withdrawn or settled question keeps nothing.
   effect for a question, or a pass-up that counts and that an open
   question's current addressee rests on, while the question's raiser isn't removed in the same run, and
   lists it with a detail naming the question; when both are removed in that
-  run, both go.
+  run, both go. A session holding a person's verified answer is kept by R36
+  whatever the run removes.
 - **R38. The terminal tick learns of questions without a second scan for a
   session holding none.** The tick checks for an open question after a
   failure terminal and a pin and before the hierarchy, reads and parses the
@@ -618,12 +634,14 @@ read uses. A withdrawn or settled question keeps nothing.
   pass R15 already makes. A session that holds no question and no aimed
   entry, and that no aimed entry names, costs what it cost before, and R34
   holds unchanged.
-- **R39. An explicit removal that would orphan a question is refused unless
-  forced.** `koto session cleanup <name>` on a session that raised an open
+- **R39. An explicit removal that would orphan a question or remove a
+  person's verified answer is refused unless forced.** `koto session cleanup <name>` on a session that raised an open
   question, holds the answer in effect for a question whose raiser is in the
   store, or holds a pass-up that counts and that the current addressee of an
-  open question rests on exits 2 with code `holds_question`, names each question's
-  identity and which of the three the session holds, names
+  open question rests on, or holds a person's answer that reads verified on
+  this host, exits 2 with code `holds_question`, names each question's
+  identity and which of the four the session holds (`raised`, `answer`,
+  `pass_up` or `person_answer`), names
   `koto session cleanup <name> --force`, and removes, stops and writes
   nothing. `koto cancel <name> --cleanup` on such a session is refused the
   same way before the cancel is written. A pinned session is refused for its
@@ -631,13 +649,17 @@ read uses. A withdrawn or settled question keeps nothing.
   judged by the decision record's rules as the removal runs, so these hold
   nothing: a withdrawn or settled question; an answer that doesn't count; an
   answer that counts but isn't the one in effect, as when a person's
-  verified answer outranks a session's; an answer whose raiser is gone; a
-  pass-up that doesn't count; and a pass-up of a question since closed. Both commands also
+  verified answer outranks a session's; a session's answer, or a person's
+  answer reading remote here, whose raiser is gone; a pass-up that doesn't
+  count; and a pass-up of a question since closed. A `person_answer` hold
+  stands whether or not its question is open, the answer is in effect or the
+  raiser is in the store, and its message names the answer and the identity
+  of the question it answered. Both commands also
   refuse without `--force`, with the same code, when the session's own
   decisions can't be read or a question one of its aimed entries points at
   can't be read, and the message names what couldn't be read.
   `koto init <name> --replace-terminal` on a terminal predecessor that holds
-  any of the three, or whose decisions can't be read, exits 2 with code
+  any of the four, or whose decisions can't be read, exits 2 with code
   `holds_question` and the same `questions` and `force_command`, and moves,
   removes and writes nothing; `koto session cleanup <name> --force` followed
   by the `init` is the way through.
@@ -645,7 +667,10 @@ read uses. A withdrawn or settled question keeps nothing.
   <name> --force` removes a session R39 would refuse, exits 0, and prints
   `orphaned_questions`, one entry per question with its identity and what
   the session held, beside `live_members`, with a warning on stderr for
-  each. A removal of a session that holds nothing prints what it printed
+  each; a person's verified answer it removed is listed with
+  `person_answer`. This is the only way a session holding a person's verified
+  answer leaves the store, so a host keeps every such session until it is
+  forced out. A removal of a session that holds nothing prints what it printed
   before, with no new key, with or without `--force`. After it, the open
   reads show what is left: removing the only answer reopens the question,
   removing a pass-up returns the question to its addressee before it, and
@@ -1130,7 +1155,8 @@ with q1's decision id.
   with and without `--force`. An answer that doesn't count, an answer
   outranked by a person's verified answer, and an answer whose raiser was
   removed are removed by a plain cleanup with exit 0, while the session
-  holding the outranking person's answer is refused with `held: "answer"`;
+  holding the outranking person's answer is refused with
+  `held: "person_answer"`;
   a raiser whose question was withdrawn or settled is removed at its
   terminal tick. A session whose decisions directory can't be read, and a holder
   whose answer points at a question that can't be read in A, are refused
@@ -1144,6 +1170,21 @@ with q1's decision id.
   leaves `koto decisions open --person owner` with no questions. A cleanup
   with or without `--force` of a session holding nothing prints no key the
   output lacked before (R40).
+- [ ] **A person's answer keeps until forced.** After a verified person's
+  answer to q1 is recorded in B (`koto decisions answer A <id> --in B --by
+  person:owner --prompt <pointer>`) and `koto decisions show` reads it
+  `verified`, B reaching its terminal step is kept with reason
+  `person_answer` and the identities naming q1, with or without
+  `--no-cleanup`. With A then removed, and with the retention set to 20
+  seconds, `koto session prune --apply --all` 40 seconds later keeps B under
+  rule `h`, and so does a run with `--older-than` selecting B. `koto session
+  cleanup B` exits 2 with code `holds_question` and a `questions` entry
+  naming q1 with `held: "person_answer"`, its message names the answer and
+  q1's identity, and `koto cancel B --cleanup` and `koto init B
+  --replace-terminal` are refused the same way. `koto session cleanup B
+  --force` exits 0 with `orphaned_questions` naming q1 with
+  `held: "person_answer"`. A session's answer to q1 held in C, with A gone,
+  is removed by a plain cleanup with exit 0 (R36, R39, R40).
 
 ### Cross-cutting
 

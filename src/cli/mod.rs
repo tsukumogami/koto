@@ -714,6 +714,8 @@ pub enum SessionCommand {
     /// question itself, the answer in effect for one, or a pass-up its
     /// current addressee rests on) is refused with exit 2, code
     /// `holds_question`, and nothing removed, unless `--force` is passed.
+    /// So is one holding a person's answer that reads `verified` on this
+    /// host, whatever became of its question (held `person_answer`).
     /// So is one whose own decisions can't be read, or that answered or
     /// passed up a question whose session is here but can't be read: the
     /// refusal lists them in `decisions_unreadable`.
@@ -5315,18 +5317,28 @@ fn terminal_retention(
     }
     let session_dir = backend.session_dir(name);
     // An open question the session raised keeps it before anything else
-    // is asked: read from the local store only, so the cloud backend makes
-    // no request for it, and only when the session recorded a question.
+    // is asked, and then a person's answer it holds that reads verified
+    // here: read from the local store only, so the cloud backend makes no
+    // request for it. The store is scanned only when the session recorded
+    // a question, and a host-local note read only when it holds an answer
+    // carrying a prompt.
     if let Some(base) = session_dir.parent() {
-        let open = crate::decisions::questions::raised_open_in(
-            &crate::session::Backend::Local(crate::session::local::LocalBackend::with_base_dir(
-                base.to_path_buf(),
-            )),
-            name,
+        use crate::decisions::questions::{tick_hold, TickHold};
+        let local = crate::session::Backend::Local(
+            crate::session::local::LocalBackend::with_base_dir(base.to_path_buf()),
         );
-        if !open.is_empty() {
-            OPEN_QUESTIONS.with(|q| *q.borrow_mut() = open);
-            return (Some(next_types::RetentionReason::OpenQuestion), guard);
+        match tick_hold(&local, name) {
+            Some(TickHold::Open(open)) => {
+                OPEN_QUESTIONS.with(|q| *q.borrow_mut() = open);
+                return (Some(next_types::RetentionReason::OpenQuestion), guard);
+            }
+            Some(TickHold::PersonAnswers(answers)) => {
+                let mut answered: Vec<String> = answers.into_iter().map(|a| a.question).collect();
+                answered.dedup();
+                OPEN_QUESTIONS.with(|q| *q.borrow_mut() = answered);
+                return (Some(next_types::RetentionReason::PersonAnswer), guard);
+            }
+            None => {}
         }
     }
     let has_edge = match session_dir.parent() {
@@ -5361,8 +5373,9 @@ fn terminal_retention(
 }
 
 thread_local! {
-    /// The open questions a session this tick keeps for them raised, from
-    /// [`terminal_retention`] to the report it prints.
+    /// The questions a session this tick keeps for them names, from
+    /// [`terminal_retention`] to the report it prints: the open questions
+    /// it raised, or those its verified person's answers answer.
     static OPEN_QUESTIONS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -5394,9 +5407,18 @@ fn terminal_retention_report(
         Some(RetentionReason::OpenQuestion) => OPEN_QUESTIONS.with(|q| q.take()),
         _ => Vec::new(),
     };
+    let answered_questions = match reason {
+        Some(RetentionReason::PersonAnswer) => OPEN_QUESTIONS.with(|q| q.take()),
+        _ => Vec::new(),
+    };
     let kept_children = if matches!(
         reason,
-        Some(RetentionReason::Hierarchy | RetentionReason::Pinned | RetentionReason::OpenQuestion)
+        Some(
+            RetentionReason::Hierarchy
+                | RetentionReason::Pinned
+                | RetentionReason::OpenQuestion
+                | RetentionReason::PersonAnswer
+        )
     ) {
         workspace::kept_children(backend, name, compiled)
     } else {
@@ -5411,6 +5433,7 @@ fn terminal_retention_report(
         pin,
         relation,
         open_questions,
+        answered_questions,
         kept_children,
     }
 }

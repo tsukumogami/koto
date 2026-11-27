@@ -915,30 +915,47 @@ say; R87 to R93 only keep the sessions those rules depend on and ring the asker.
   (`koto workspace prune --root`, `koto session prune --older-than` and `--execution-dir`) keep a
   session that holds an answer or pass-up as R89 judges holding, while the question's raiser isn't
   removed in the same run, with a detail naming the question; when both are removed in that run,
-  both go.
+  both go. A session holding a person's answer that R68 reads as verified on this host is kept
+  beyond that: it is a keeper of its hierarchy, alive or not, with no expiry, whether or not the
+  question is still open and whether or not its raiser is in the store, because the answer is the
+  precedent a settle cites under R77 so the person isn't asked again, and removing a replacing
+  answer would put the answer it replaced back in effect (R74). At its terminal tick, with or
+  without `--no-cleanup`, it is kept with `retention` reading `{"retained": true, "reason":
+  "person_answer", "answered_questions": ["<identity>"]}`; `koto session hierarchy` names it as a
+  keeper with those identities; the prunes and the parent sweep keep it by that verdict, the sweep
+  listing it with the reason `person_answer`; and only a forced removal (R90) releases it. A
+  session's answer, and a person's answer that reads as a remote session's answer here, are kept
+  only as an edge is.
 - **R89.** `koto session cleanup <name>` refuses a session that raised an open question, holds the
-  answer in effect (R74) for a question whose raiser is in the store, or holds a pass-up that
-  counts (R73) and that the current addressee of an open question rests on. It exits 2 with code
+  answer in effect (R74) for a question whose raiser is in the store, holds a pass-up that
+  counts (R73) and that the current addressee of an open question rests on, or holds a person's
+  answer that R68 reads as verified on this host. It exits 2 with code
   `holds_question`, a message naming each question's identity, what the session holds of it
-  (`raised`, `answer` or `pass_up`) and the `--force` flag, a `questions` list and a
+  (`raised`, `answer`, `pass_up` or `person_answer`) and the `--force` flag, a `questions` list and a
   `force_command`, and decides this before anything is stopped or written. `koto cancel <name>
   --cleanup` is refused the same way before the cancel is written. A pinned session is refused for
   its pin first. Holds are matched by identity and judged by R72 to R74 as the read runs, so these
   hold nothing: a withdrawn or settled question, and so its raiser; an answer that reads `counted`
   false; an answer that counts but isn't the one in effect, as when a person's verified answer
-  outranks a session's, which leaves the person's answer holding and releases the session's; an
-  answer whose raiser is no longer in the store; a pass-up that reads `counted` false; and a
-  pass-up of a question since closed. Both also refuse without `--force`, with the same code, when
+  outranks a session's, which leaves the person's answer holding and releases the session's; a
+  session's answer, or a person's answer reading remote here, whose raiser is no longer in the
+  store; a pass-up that reads `counted` false; and a
+  pass-up of a question since closed. A `person_answer` hold stands whether or not its question
+  is open, the answer is in effect or the raiser is in the store, and the message names the answer
+  and the identity of the question it answered. Both also refuse without `--force`, with the same code, when
   the session's own decisions can't be read or a question one of its aimed entries points at can't
   be read, naming what couldn't be read. `koto init <name> --replace-terminal` refuses a terminal
-  predecessor that holds any of the three, or whose decisions can't be read, with the same code,
+  predecessor that holds any of the four, or whose decisions can't be read, with the same code,
   exit, `questions` and `force_command`, instead of moving it aside; the way through is
   `koto session cleanup <name> --force` and then the `init`.
 - **R90.** `koto session cleanup <name> --force` removes a session R89 refuses, exits 0, prints
   `orphaned_questions` with each question's identity and what the session held, beside
   `live_members`, and warns on stderr for each; a pinned session is still refused. A cleanup of a
   session holding nothing prints what it printed before, with or without `--force`, so
-  `orphaned_questions` appears only on a forced removal that orphaned a question. What a forced
+  `orphaned_questions` appears only on a forced removal that orphaned a question, and lists a
+  person's verified answer it removed with `person_answer`. That forced removal is the only way a
+  session holding such an answer leaves the store, so a host keeps every one of them until it is
+  forced out. What a forced
   removal leaves is what the reads then show: removing the answer in effect puts in effect the
   entry R74 picks from those left, and reopens the question when none counts; removing a pass-up
   returns the question to the addressee it had before it, with an `addressees` list one shorter;
@@ -1517,8 +1534,18 @@ an `escalate` A records with `recipient=session:B`, so B's answer counts (R72).
   `--force` with exit 0 (R89).
 - [ ] With B's answer in effect on q1, a verified person's answer recorded in C (`--by
   person:owner --prompt <pointer>`) outranks it: C, holding the person's answer, is kept and a plain
-  `koto session cleanup C` is refused with `held: "answer"`, while B is released, holding nothing,
-  and a plain `koto session cleanup B` exits 0 (R74, R89).
+  `koto session cleanup C` is refused with `held: "person_answer"`, while B is released, holding
+  nothing, and a plain `koto session cleanup B` exits 0 (R74, R89).
+- [ ] With C holding a verified person's answer to q1 that `koto decisions show` reads `verified`,
+  C reaching its terminal state reads `retention` retained with reason `person_answer` and
+  `answered_questions` naming q1's identity. After A is removed (q1 is closed, so a plain cleanup
+  removes it) and the retention has passed, `koto session prune --apply --all` keeps C under rule
+  `h`; `koto session cleanup C` and `koto cancel C --cleanup` are refused with code
+  `holds_question`, a `questions` entry with q1's identity and `held: "person_answer"`, and a message
+  naming the answer and q1's identity; `koto init C --replace-terminal` is refused the same way.
+  `koto session cleanup C --force` exits 0 and prints `orphaned_questions` with q1's identity and
+  `held: "person_answer"`. B's session answer, in the same position with A gone, is removed by a
+  plain cleanup (R88, R89, R90).
 - [ ] A pass-up of q1 stored in B that reads `counted` false, such as one to a session that isn't
   B's recorded dispatcher, isn't one an open question rests on: q1's addressee stays B, and a plain
   `koto session cleanup B` exits 0 with no `holds_question` (R73, R89).
@@ -1566,8 +1593,9 @@ an `escalate` A records with `recipient=session:B`, so B's answer counts (R72).
   documents when a decision is reversed.
 - **Session retention, dispatch links and anchors.** They already shipped; this feature reads them
   and changes their rules only where questions need it: an open question keeps its session (R87),
-  an answer or pass-up is an edge (R88), and an explicit removal that would orphan a question is
-  refused unless forced (R89, R90). A person's explicit `koto session cleanup` otherwise still
+  an answer or pass-up is an edge (R88), a person's verified answer keeps its session until it is
+  forced out (R88), and an explicit removal that would orphan a question or remove such an answer
+  is refused unless forced (R89, R90). A person's explicit `koto session cleanup` otherwise still
   removes a session and its decisions. The one change to succession is R38's marker, which the fencing
   command writes beside the fence it already appends.
 - **Who may fence a session.** Anyone who can fence a session can already cancel or change it,

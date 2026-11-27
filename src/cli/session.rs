@@ -1397,17 +1397,23 @@ pub(crate) fn question_holds(
 }
 
 /// The `orphaned_questions` a forced removal prints: one object per
-/// question, its identity and what the removed session held of it.
+/// question, its identity and what the removed session held of it, with
+/// `answer` (`<holder session id>/<answer decision id>`) for a
+/// `person_answer`.
 pub(crate) fn orphaned_json(holds: &[crate::decisions::questions::Hold]) -> serde_json::Value {
     use crate::session::hierarchy::sanitize;
     serde_json::Value::Array(
         holds
             .iter()
             .map(|h| {
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "question": sanitize(&h.identity),
                     "held": h.held.as_str(),
-                })
+                });
+                if let Some(a) = &h.answer {
+                    v["answer"] = serde_json::json!(sanitize(a));
+                }
+                v
             })
             .collect(),
     )
@@ -1432,13 +1438,7 @@ pub(crate) fn holds_reasons(orphans: &crate::decisions::questions::Orphans) -> S
     let mut each: Vec<String> = orphans
         .holds
         .iter()
-        .map(|h| {
-            format!(
-                "it {} (removing it loses {})",
-                h.held.describe(&sanitize(&h.identity)),
-                h.held.loss()
-            )
-        })
+        .map(|h| format!("it {} (removing it loses {})", h.describe(), h.held.loss()))
         .collect();
     if !orphans.unreadable.is_empty() {
         let shown: Vec<String> = orphans.unreadable.iter().map(|u| sanitize(u)).collect();
@@ -1492,9 +1492,10 @@ pub(crate) fn refuse_holds(
     }
     let shown = display_text(name);
     let message = format!(
-        "session '{shown}' wasn't removed: {}. Answer, reverse or pass the question first, or \
-         remove the session anyway with: koto session cleanup {shown} --force",
-        holds_reasons(orphans)
+        "session '{shown}' wasn't removed: {}. {}, or remove the session anyway with: koto \
+         session cleanup {shown} --force",
+        holds_reasons(orphans),
+        crate::decisions::questions::way_out(&orphans.holds)
     );
     super::exit_with_error_code(
         serde_json::json!({ "error": holds_error(name, orphans, message) }),
@@ -1510,7 +1511,7 @@ pub(crate) fn warn_orphaned(name: &str, orphans: &crate::decisions::questions::O
         eprintln!(
             "warning: removed '{}' with --force; it {}, and the removal lost {}",
             sanitize(name),
-            h.held.describe(&sanitize(&h.identity)),
+            h.describe(),
             h.held.loss()
         );
     }

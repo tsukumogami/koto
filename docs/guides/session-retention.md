@@ -3,8 +3,10 @@
 koto keeps a finished session while something still needs it and removes it
 once nothing does. This guide covers the ways a session is kept past that rule: a
 pin, which keeps one session; the continues relation, which keeps a session
-while a later one that carries on its work still stands; and an open
-question, which keeps the session that raised it until it is answered. The
+while a later one that carries on its work still stands; an open
+question, which keeps the session that raised it until it is answered; and
+a person's verified answer, which keeps the session holding it until it is
+removed with `--force`. The
 retention rule itself, and every command that removes sessions, are in the
 [CLI usage guide](cli-usage.md#session-hierarchy).
 
@@ -24,7 +26,9 @@ parent doesn't keep its children.
 
 A session that raised a question still open keeps its hierarchy too, with
 no expiry, and an answer or pass-up aimed at a question joins its holder to
-that hierarchy (see [Open questions](#open-questions)).
+that hierarchy. A session holding a person's answer that reads `verified` on
+this host keeps its hierarchy with no expiry as well, whatever became of the
+question (see [Open questions](#open-questions)).
 
 A session `koto session import` moved is kept too, by the copy. The import
 leaves the source in place as a read-only predecessor, and the source stays
@@ -112,8 +116,9 @@ on is refused instead; see [Open questions](#open-questions)); `koto workspace p
 `koto session prune` with `--all`, `--execution-dir`, `--older-than` and
 `--apply --plan`, including the re-judgment an apply makes before it deletes.
 `koto session cleanup` and `koto cancel --cleanup` remove anyway and report
-what they passed over; a pin still refuses them, and so does a session an
-open question depends on, unless cleanup is given `--force`.
+what they passed over; a pin still refuses them, and so do a session an
+open question depends on and one holding a person's verified answer, unless
+cleanup is given `--force`.
 
 **Reading the report.** A kept entry carries `kept_by_relation: true` and
 `relation_keepers`, one object per keeper ordered by name:
@@ -201,6 +206,31 @@ reads `kept: an open question is held in its hierarchy: <name> holds open
 question <id>`. `koto session prune` keeps such a hierarchy under rule `h`
 with that detail, and `koto workspace prune --root` follows the same verdict.
 
+**A person's verified answer is kept until forced.** A person's answer
+(`koto decisions answer --by person:<handle> --prompt ...`) is the precedent
+a later settle cites with `--basis`, so the person isn't asked the same thing
+twice. Removing the session that holds it would lose that precedent, and
+removing the session that holds a replacing answer would make the answer it
+replaced look current again. So a session holding a person's answer whose
+`reading` is `verified` on this host (as `koto decisions show` prints it) is
+a keeper of its hierarchy, alive or not, with no expiry, whether or not the
+question is still open and whether or not its raiser still exists. At its
+terminal tick it's kept with or without `--no-cleanup`:
+
+```json
+"retention": {"retained": true, "reason": "person_answer",
+              "answered_questions": ["58eabc99-.../000000000001"]}
+```
+
+`answered_questions` lists the identities of the questions its person's
+answers answered. `koto session prune`, `koto workspace prune --root` and a
+parent's sweep keep it too, the sweep listing it in `kept_children` with
+`"reason": "person_answer"`. Only a person's answer that reads `verified`
+here gets this. A session's answer, and a person's answer that reads
+`a remote session's answer` (a copy brought by a pull or an import), keep the
+rule for answers below: held only while it's the answer in effect on an open
+question whose raiser remains.
+
 **Prunes that take part of a hierarchy.** `koto workspace prune --root`,
 `koto session prune --older-than` and `koto session prune --execution-dir`
 can remove some members of a hierarchy and leave others. None of them
@@ -209,17 +239,23 @@ that counts and that an open question's current addressee rests on, unless
 the question's raiser
 is removed in the same run. Such a session is kept and listed with a detail
 naming the question. When the raiser and the holder both go in that run,
-both are removed.
+both are removed. A session holding a person's verified answer is kept by
+every prune whatever else the run removes.
 
 **Removing one by hand.** `koto session cleanup <name>` refuses a session an
 open question depends on: one that raised an open question, holds the answer
 in effect for a question whose raiser is still in the store, or holds a
-pass-up that counts and that the question's current addressee rests on.
+pass-up that counts and that the question's current addressee rests on. It
+refuses a session holding a person's verified answer too, whether or not
+that answer's question is open or its raiser is still in the store.
 Nothing is stopped,
 written or removed; it exits 2 with code `holds_question`, a message naming
 each question and what removing the session would lose, a `questions` list
-of `{"question": "<identity>", "held": "raised" | "answer" | "pass_up"}`,
-and `force_command`, the command that removes it anyway. A pin is refused
+of `{"question": "<identity>", "held": "raised" | "answer" | "pass_up" |
+"person_answer"}`, and `force_command`, the command that removes it anyway.
+A `person_answer` entry also carries `answer`, the answer's identity (the
+holding session's id and the answer's decision id), and the message names
+both the answer and the question it answered. A pin is refused
 first, with code `pinned`, whatever the flags. `koto cancel <name> --cleanup`
 is refused the same way before the cancel is written.
 
@@ -245,18 +281,21 @@ judgment `koto decisions show` prints, so these hold nothing:
 - an answer that counts but doesn't govern. When a person's verified answer
   outranks a session's, the session holding the person's answer holds the
   question and the session holding the outranked answer is released;
-- an answer whose raiser is gone;
+- a session's answer, or a person's answer reading remote here, whose raiser
+  is gone;
 - a pass-up that reads `counted` false, which no open question rests on;
 - a pass-up of a question since closed.
 
-So once a question is closed, removing its raiser and then its answerer needs
-no `--force` at all.
+So once a question is closed, removing its raiser and then a session that
+answered it needs no `--force` at all. A session holding a person's verified
+answer always needs it.
 
 **Replacing one under the same name.** `koto init <name> --replace-terminal`
 doesn't move such a session aside the way it moves other kept predecessors.
 When the finished predecessor raised an open question, holds the answer in
-effect for one, or holds a pass-up an open question rests on, or when its
-decisions can't be read, the replace exits 2 with code `holds_question`,
+effect for one, holds a pass-up an open question rests on or holds a person's
+verified answer, or when its decisions can't be read, the replace exits 2
+with code `holds_question`,
 the same `questions` list and the same `force_command` as cleanup, and
 leaves the predecessor where it is. To replace it anyway, remove it first:
 
@@ -278,17 +317,20 @@ that has the answering session locally but not the asker sees no hold: as far
 as its store knows, the answer's raiser is gone, so the answer holds nothing.
 `koto session cleanup` there deletes the local copy and the bucket copy as it
 always has. Run the removal on a host that has both sessions if the answer
-should be protected.
+should be protected. A person's answer reads `verified` only on the host that
+verified it, so only that host keeps its session for `person_answer`; on
+another host it reads remote, holds as a session's answer does, and a cleanup
+there deletes the bucket copy along with the local one.
 
-**How much this keeps.** Plan for growth. Every answered question joins its
-asker and its answerer, so both are kept at their terminal ticks as one
+**How much this keeps.** Plan for growth. Every question a session answers
+joins its asker and its answerer, so both are kept at their terminal ticks as one
 hierarchy, reason `hierarchy`, until `koto session prune` runs after the
 retention period (`retention.keep`, 7 days by default) has passed since the
 last of them stopped. A question addressed to a person keeps its session
 until that person answers it, its raiser withdraws or settles it, someone
 reverses it or forces the session out; nothing
-expires it. A host where many questions are answered keeps every one of
-those pairs until a prune, so schedule one:
+expires it. A host where many questions are answered by sessions keeps every
+one of those pairs until a prune, so schedule one:
 
 ```bash
 koto session prune --apply --all
@@ -298,6 +340,24 @@ The session holding the answer in effect needs `--force` to be removed by
 hand for as long as its asker is in the store. A prune after the retention period, which
 removes the asker and the answerer together, is the unforced way out; so is
 removing the asker first and the answerer after.
+
+A person's verified answer has no unforced way out. A host accumulates the
+session of every person's answer it has verified, with its hierarchy, until
+each one is forced out; no prune removes them however old they are, and the
+asker stays with its answerer while the two are joined. On a host where a
+person answers many questions, that count only grows. When a precedent is
+no longer wanted, remove the session that holds it:
+
+```bash
+koto session cleanup <name> --force
+```
+
+The output lists the answer's question in `orphaned_questions` with
+`held: "person_answer"` and the `answer`. What it leaves follows the reads:
+if the removed answer was the only one closing the question and its asker is
+still in the store, the question reopens and the asker is kept for
+`open_question` again, so remove the asker first when both should go. An
+asker whose question is closed goes with a plain `koto session cleanup`.
 
 **The asker is woken.** A recorded answer rings the raiser's wake file
 (`wakes/<raiser>` under the koto home), and the newest session continuing it

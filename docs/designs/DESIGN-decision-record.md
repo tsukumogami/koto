@@ -1035,8 +1035,8 @@ over the same store index (`raised_open`, `raised_open_in`, `holds_of`, `orphans
 `open_by_session`), so the five can't disagree about a question, and none can disagree with the
 resolution about which entries count or which one is in effect (R87).
 
-**Which sessions are kept.** Three kinds of session hold something a question depends on, and
-retention keeps each for as long as the question needs it (the session retention design states the
+**Which sessions are kept.** Four kinds of session hold something a question, or a later one,
+depends on, and retention keeps each for as long as that need lasts (the session retention design states the
 rules; this is what they rest on here). What a session holds is read from the resolution each
 time, so it changes when the entries do.
 
@@ -1055,25 +1055,44 @@ time, so it changes when the entries do.
   effect (`governs` true): when a person's verified answer outranks a session's, the person's
   answer holds and the session's is released. A pass-up holds only while it counts and an open
   question's current addressee rests on it.
+- *The holder of a person's verified answer, until it is forced out.* A person's answer whose
+  `reading` is `verified` on this host (the note the answering host keeps, R68) is the precedent a
+  settle cites with `--basis` (R77), so the same person isn't asked the same thing twice. Its
+  session is a keeper of its hierarchy, alive or not, with no expiry, whether or not the question
+  is still open, whether or not the answer is still in effect and whether or not the raiser is in
+  the store. Holding it only while the question needs it would get this wrong twice: the precedent
+  would go with the session, and removing the session holding a replacing answer would put the
+  answer it replaced back in effect (R74), so it would read as current again. Its terminal tick
+  reports `{"retained": true, "reason": "person_answer", "answered_questions": ["<identity>"]}`,
+  checked after an open question and before the hierarchy, and nothing but a forced removal
+  releases it. The test is `verified_answers_in` in `src/decisions/questions.rs`, the same reading
+  `koto decisions show` prints, so a copy pulled or imported, which reads remote, is held only as a
+  session's answer is. This adds to what a host keeps: every session holding a verified person's
+  answer stays, with its hierarchy, until `koto session cleanup <name> --force` removes it (R88).
 - *An explicit removal.* `koto session cleanup` refuses, with code `holds_question`, a session that
   raised an open question, holds the answer in effect for a question whose raiser is in the store,
-  or holds a pass-up that counts and that the current addressee of an open question rests on, and
+  holds a pass-up that counts and that the current addressee of an open question rests on, or holds
+  a person's verified answer (`held: "person_answer"`, with the `answer` beside the `question` it
+  answered), and
   `koto cancel --cleanup` refuses the same before it cancels. `--force` removes it and prints
   `orphaned_questions`. Holds are matched by identity, so these hold nothing: a withdrawn or
-  settled question, an answer that reads `counted` false, a counted answer that doesn't govern, one
-  whose raiser is gone, a pass-up that reads `counted` false and a pass-up of a closed question. A
-  raiser and its answerer can both be removed without force, raiser first. A forced removal leaves
+  settled question, an answer that reads `counted` false, a counted answer that doesn't govern, a
+  session's or remote answer whose raiser is gone, a pass-up that reads `counted` false and a
+  pass-up of a closed question. A raiser and a session that answered it can both be removed without
+  force, raiser first; the holder of a person's verified answer can't. A forced removal leaves
   what the reads then compute: the answer in effect gone leaves the resolution to pick the next
   counted entry, or reopens the question when none counts, a pass-up gone returns it to the
   addressee before, and the raiser gone drops it from every open read while its aimed entries
   still list in their holders (R89, R90). The same refusal covers a session whose own decisions,
   or a question its aimed entries point at, can't be read, and `koto init --replace-terminal`
   refuses such a predecessor rather than moving it aside. The prunes that can take part of a
-  component keep an answer or pass-up holder unless its question's raiser goes in the same run.
+  component keep an answer or pass-up holder unless its question's raiser goes in the same run,
+  and keep a person's verified answer's holder whatever goes.
 
 A session that holds no question pays for none of this. The terminal tick and the refusal each read
 the session's own decisions first and scan the local store only when it holds a question (or, for
-the refusal, an aimed answer or pass-up); the engine reads the store's decisions once per command,
+the refusal, an aimed answer or pass-up), and read the host's verified-answer note only for an
+answer that carries a prompt; the engine reads the store's decisions once per command,
 and only when a judged member holds a decision at all. None of them reads the bucket.
 
 **The wake.** `koto decisions answer` rings the raiser's wake file, `<koto home>/wakes/<raiser>`,

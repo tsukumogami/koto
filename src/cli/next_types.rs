@@ -743,6 +743,13 @@ pub enum RetentionReason {
     /// report carries `open_questions`, the questions' identities. Checked
     /// after a failure terminal and a pin, and before the hierarchy.
     OpenQuestion,
+    /// The session holds a person's answer whose reading is `verified` on
+    /// this host (`crate::decisions::questions::verified_answers_in`), which
+    /// keeps it with no expiry, whether or not the question is open and
+    /// whether or not its raiser is still here. The report carries
+    /// `answered_questions`, the identities of the questions answered.
+    /// Checked after a pin and an open question, and before the hierarchy.
+    PersonAnswer,
 }
 
 impl RetentionReason {
@@ -754,6 +761,7 @@ impl RetentionReason {
             RetentionReason::Pinned => "pinned",
             RetentionReason::BucketUnchecked => "bucket_unchecked",
             RetentionReason::OpenQuestion => "open_question",
+            RetentionReason::PersonAnswer => "person_answer",
         }
     }
 }
@@ -802,6 +810,11 @@ pub struct Retention {
     /// (`<session id>/<decision id>`), printed as `open_questions`. Empty,
     /// and absent from the JSON, for every other session.
     pub open_questions: Vec<String>,
+    /// For a session kept for the person's answers it holds that read
+    /// verified here: the identities of the questions they answer
+    /// (`<session id>/<decision id>`), printed as `answered_questions`.
+    /// Empty, and absent from the JSON, for every other session.
+    pub answered_questions: Vec<String>,
     pub kept_children: Vec<KeptChild>,
 }
 
@@ -810,6 +823,7 @@ impl Serialize for Retention {
         let mut map = serializer.serialize_map(Some(
             1 + usize::from(self.reason.is_some())
                 + usize::from(!self.open_questions.is_empty())
+                + usize::from(!self.answered_questions.is_empty())
                 + self.pin.len()
                 + self.relation.len(),
         ))?;
@@ -819,6 +833,9 @@ impl Serialize for Retention {
         }
         if !self.open_questions.is_empty() {
             map.serialize_entry("open_questions", &self.open_questions)?;
+        }
+        if !self.answered_questions.is_empty() {
+            map.serialize_entry("answered_questions", &self.answered_questions)?;
         }
         for (k, v) in self.pin.iter().chain(&self.relation) {
             map.serialize_entry(k, v)?;

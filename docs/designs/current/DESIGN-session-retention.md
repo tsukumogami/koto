@@ -84,8 +84,10 @@ reporting what it broke (R18), and a reason wherever koto keeps something
 (R19). Questions raised with `escalate` add two rules to the one over the
 hierarchy (R36 to R40): a session holding an open question keeps its
 hierarchy with no expiry, an answer or pass-up aimed at a question joins its
-holder to the question's session, and an explicit removal that would orphan
-a question is refused unless it is forced.
+holder to the question's session, a session holding a person's answer that
+reads verified on this host keeps its hierarchy with no expiry whether or
+not the question's raiser remains, and an explicit removal that would orphan
+a question or such an answer is refused unless it is forced.
 
 **Reads write.** `koto context get` and `koto context exists` append a
 `context_read` event to the read session's log, from the reader's process.
@@ -579,7 +581,9 @@ retention adds no rule of its own, so a withdrawn or settled question keeps
 nothing. The open reads (`koto decisions open --person` and `--at`, the
 `questions` array on `koto next`), the terminal tick, the engine's keepers
 and the cleanup refusal all call it, so a change to what counts as open
-reaches every one of them at once.
+reaches every one of them at once. A third rule, for a person's verified
+answer, rests on the answer's `reading` instead of on open, and doesn't ask
+whether the question's raiser remains.
 
 - **An open question keeps.** A session that raised a question still open
   is a keeper of its hierarchy, alive or not, with no expiry: it keeps until
@@ -598,6 +602,34 @@ reaches every one of them at once.
   edge. `SessionFacts` gains `aimed` (target id and kind, read from each
   body's `kind`) and `holds_decisions`; `Graph::scan` adds one edge per
   aimed fact whose target id is a session in the store, with `Via::Aimed`.
+- **A person's verified answer keeps until forced.** A session holding a
+  person's answer whose `reading` is `verified` on this host (the value
+  `koto decisions show` prints) is a keeper of its hierarchy, alive or not,
+  with no expiry, whether or not the question's raiser is still in the
+  store and whether or not the question is still open. Nothing releases it
+  but an explicit removal with `--force`. A session's answer, and a
+  person's answer that reads `a remote session's answer` here, keep the
+  rule above: they hold only while they are the answer in effect on an open
+  question whose raiser remains.
+
+**Why a person's answer is kept.** A person's verified answer outlives its
+question. It is the precedent a later settle cites with `--basis`, so the
+same person isn't asked the same thing twice, and a settle that cites it is
+judged against it each time the settle is read. Removing the session that
+holds it removes the precedent, and the person is asked again. Removing the
+session that holds a replacing answer does worse: the answer it replaced
+reads as current again. Neither is something a retention period can judge, since the
+precedent is wanted for as long as the person's choice stands, so the rule
+keeps the session until someone removes it on purpose. The reading is
+host-local by construction (the decision record's verified-answer note), so
+only the host that verified the answer keeps it this way; a copy pulled or
+imported elsewhere reads remote and is judged as a session's answer.
+
+This adds to what a host keeps. Every session that ever held a verified
+person's answer stays, with its hierarchy, until it is removed with
+`koto session cleanup <name> --force`; no prune removes it, however old.
+On a host where a person answers many questions, that store grows without
+bound until someone clears it by hand, and the guide says so.
 
 **What the terminal tick reads.** After the failure terminal and the pin,
 and before the edge test, the tick reads and parses the session's own
@@ -608,7 +640,14 @@ the session's questions with `is_open`. A session it keeps that way answers
 "open_questions": ["<session id>/<decision id>"]}`, with or without
 `--no-cleanup`, and its `kept_children` are listed as for `hierarchy`. A
 session that raised no question pays the read and parse of its own decisions
-and no store scan. `edge_of` then learns of aimed entries in the pass it already makes:
+and no store scan. Next, still before the edge test, the tick looks at the
+session's own aimed answers and keeps a session holding a person's answer
+that reads `verified` here, with `"retention": {"retained": true, "reason":
+"person_answer", "answered_questions": ["<session id>/<decision id>"]}`
+naming the questions those answers answered, with or without
+`--no-cleanup`. That needs no store scan, because the raiser's presence
+doesn't matter, and a session holding no aimed answer reads nothing more.
+`edge_of` then learns of aimed entries in the pass it already makes:
 it collects the target ids of the session's own aimed answers and pass-ups
 and compares them with each other session's header id, which the pass
 already reads, and for each other session it looks up
@@ -632,6 +671,13 @@ terminal-state gate, follows the same verdict. The parent sweep keeps a
 terminal child that raised an open question, as it keeps a pinned one, with
 a `kept_children` entry of reason `open_question`, its `open_questions` and
 a detail naming them; like a pin it keeps nothing above the child.
+A member holding a person's verified answer is a keeper the same way, with
+no expiry and alive or not: its keeper object adds `"answered_questions"`, the
+questions it answered, and `"alive": false` when it isn't alive, `koto session prune` keeps it and its hierarchy under rule `h`,
+`koto workspace prune --root` follows that verdict, and the parent sweep
+lists such a child in `kept_children` with reason `person_answer`. No
+retention period ever passes for that hierarchy, so a prune never removes
+it, the raiser included while it stays joined.
 
 **Prunes that take part of a component.** A by-rule prune that can remove
 some members of a component and not others (`koto workspace prune --root`,
@@ -644,7 +690,9 @@ that an open question's current addressee rests on, whenever that question's rai
 in the same run, and lists it with a detail naming the question. When the
 raiser and the holder are both removed in that run, both go. The check is
 the identity match the cleanup refusal makes (below), applied to the run's
-removal set rather than to one session.
+removal set rather than to one session. A holder of a person's verified
+answer needs no such check: the keeper rule above already keeps it, whatever
+else the run removes.
 
 **Explicit removal.** Where explicit removal always removed and reported
 what it broke, a removal that would orphan a question is now refused unless
@@ -652,7 +700,7 @@ it is forced. `koto session cleanup <name>` refuses, before anything is
 stopped or written, a session that raised an open question, holds the
 answer in effect for a question whose raiser is in the store, or holds a
 pass-up that counts and that the current addressee of an open question rests
-on: exit 2,
+on, or holds a person's answer that reads `verified` here: exit 2,
 
 ```json
 {"error": {"code": "holds_question", "message": "...", "session": "<name>",
@@ -660,18 +708,24 @@ on: exit 2,
   "force_command": "koto session cleanup <name> --force"}}
 ```
 
-with `held` one of `raised`, `answer` and `pass_up`. The message names each
-question, what the session holds of it and what removing it loses. A pin is
+with `held` one of `raised`, `answer`, `pass_up` and `person_answer`. The
+message names each question, what the session holds of it and what removing
+it loses. A `person_answer` entry adds `"answer": "<holder id>/<decision
+id>"` beside the `question` it answered, the message names both, and the
+hold stands whether or not that question is open or its raiser is in the
+store. A pin is
 refused first, with code `pinned`, with or without `--force`. `koto cancel
 <name> --cleanup` is refused the same way before the cancel is written, and
 its `force_command` is the cleanup command. Holds are matched by identity
 and read from the resolution, so these hold nothing: a withdrawn or settled
 question; an answer reading `counted` false; a counted answer that doesn't
 govern, so when a person's verified answer outranks a session's the person's
-holder is kept and the outranked holder released; an answer whose raiser is
-no longer in the store; a pass-up reading `counted` false; and a pass-up of a
-question since closed. A raiser and its answerer can both be removed without
-force, raiser first.
+holder is kept and the outranked holder released; a session's answer, or a
+person's answer reading remote here, whose raiser is no longer in the store;
+a pass-up reading `counted` false; and a pass-up of a question since closed.
+A raiser and a session that answered it can both be removed without force,
+raiser first; a session holding a person's verified answer can't be, ever,
+without `--force`.
 The refusal reads the session's own decisions first and scans the local
 store only when they hold a question or an aimed answer or pass-up.
 
@@ -685,8 +739,9 @@ question identity. `--force` removes it as above.
 `koto init <name> --replace-terminal` makes the same check on the terminal
 predecessor before it moves or removes anything. Where an unheld
 predecessor kept by the rule moves aside as `<name>_r<N>`, one that raised
-an open question, holds the answer in effect for one, or holds a pass-up an
-open question rests on, or whose decisions can't be read, is not moved: the
+an open question, holds the answer in effect for one, holds a pass-up an
+open question rests on, holds a person's verified answer, or whose decisions
+can't be read, is not moved: the
 replace exits 2 with code `holds_question` and the same `questions` and
 `force_command` as cleanup; nothing is moved, removed or written. The way
 out is `koto session cleanup <name> --force` and then the `init` again.
@@ -697,13 +752,18 @@ present on this host, so a host that has the answerer locally but not the
 asker sees no hold: the answer's raiser isn't in its store, and the answer
 holds nothing there. Cleanup on that host deletes the local copy and the
 bucket copy as it always has. A host holding the asker locally refuses as
-described.
+described. A person's answer reads `verified` only on the host that verified
+it, so only that host keeps its session for `person_answer`; on any other
+host the answer reads remote and holds only as a session's answer does, and
+a cleanup there deletes the bucket copy too.
 
 `--force` removes the session and adds `orphaned_questions` (the same
 objects as `questions`) beside `live_members`, with one stderr warning per
 question. A removal of a session that holds nothing prints what it printed
 before, with or without `--force`: `orphaned_questions` appears only on a
-forced removal that orphaned a question.
+forced removal that orphaned a question. A forced removal of a session
+holding a person's verified answer lists that answer's question there with
+`held: "person_answer"` and its `answer`.
 The reads then show what the removal left. Removing the only answer reopens
 the question, and the raiser's terminal tick keeps it for `open_question`
 again. Removing a pass-up returns the question to the addressee it had
@@ -1099,11 +1159,11 @@ dispatched agent session's own anchor reading the inherited variable. niwa,
 when present, marks sessions it will reap; the anchor records that marker.
 
 Every removal by rule or subtree asks one engine one question: is anything
-in this session's connected hierarchy alive or holding an open question,
-and if not, has the retention passed since the last member stopped? An
+in this session's connected hierarchy alive, holding an open question or
+holding a person's verified answer, and if not, has the retention passed since the last member stopped? An
 answer or pass-up aimed at a question joins its holder to the question's
-session, and an explicit removal that would orphan a question needs
-`--force`. An anchor is alive until niwa's
+session, and an explicit removal that would orphan a question or remove a
+person's verified answer needs `--force`. An anchor is alive until niwa's
 on-reap command records its observed close; only an unobserved or imported
 anchor closes after its idle period, counted from activity in its own log.
 An observed anchor closes only through an observed close: niwa's next reap
@@ -1328,14 +1388,19 @@ When nothing is alive, `keepers` is empty and `retention` is
 anchor's marker and harness session id filled in; prune prints the same.
 
 A keeper held for open questions adds `"open_questions"`, and
-`"alive": false` when it isn't alive.
+`"alive": false` when it isn't alive; one held for a person's verified
+answer adds `"answered_questions"` the same way.
 
 Tick answer: `"retention": {"retained": true, "reason": "hierarchy"}` and
 `"kept_children": [{"name", "reason"}]`; a session kept for its open
-questions reads `"reason": "open_question"` with `"open_questions"`.
+questions reads `"reason": "open_question"` with `"open_questions"`, and one
+kept for a person's verified answer reads `"reason": "person_answer"` with
+`"answered_questions"`.
 Cleanup and cancel: `"live_members": [{"name", "kind", "observed"}]`; a
 refusal for a held question exits 2 with code `holds_question`, and
-`cleanup --force` adds `"orphaned_questions": [{"question", "held"}]`.
+`cleanup --force` adds `"orphaned_questions": [{"question", "held"}]`, `held`
+being `raised`, `answer`, `pass_up` or `person_answer`, the last with
+`"answer"` too.
 Replace: `"moved_to"`, or, for a predecessor holding what a question
 depends on, the same `holds_question` refusal.
 Prune kept entries: rule `h` with a `hierarchy` object equal to the query's
@@ -1368,7 +1433,8 @@ timeout = "10s"
    session's own agent session; other readers' records go into their own
    anchors.
 4. **Terminal.** The tick keeps a session that raised an open question
-   (`open_question`) and any session with an edge (`hierarchy`), an aimed
+   (`open_question`), one holding a person's verified answer
+   (`person_answer`) and any session with an edge (`hierarchy`), an aimed
    answer or pass-up included; the sweep lists kept children; lone sessions
    go as today.
 5. **Close.** niwa's reap runs the on-reap command, which writes

@@ -315,7 +315,28 @@ pub fn keeper_json(k: &Keeper) -> Value {
         }
         v["open_questions"] = json!(k.questions.iter().map(|q| sanitize(q)).collect::<Vec<_>>());
     }
+    // So does a member kept for the verified person's answers it holds,
+    // naming the questions they answer.
+    if !k.answered.is_empty() {
+        if !k.alive {
+            v["alive"] = json!(false);
+        }
+        v["answered_questions"] = json!(k.answered.iter().map(|q| sanitize(q)).collect::<Vec<_>>());
+    }
     v
+}
+
+/// The verified person's answers a keeper holds, for a reason line:
+/// `<name> holds a verified person answer to question <identity>[,
+/// <identity>...]`.
+fn answer_keeper_text(k: &Keeper) -> String {
+    let ids: Vec<String> = k.answered.iter().map(|q| sanitize(q)).collect();
+    format!(
+        "{} holds a verified person answer to question{} {}",
+        sanitize(&k.name),
+        if ids.len() == 1 { "" } else { "s" },
+        ids.join(", ")
+    )
 }
 
 /// The open questions a keeper holds, for a reason line: `<name> holds
@@ -563,20 +584,31 @@ pub fn reason_text(verdict: &Verdict) -> String {
                     .filter(|k| !k.questions.is_empty())
                     .map(question_keeper_text)
                     .collect();
-                let mut text = if names.is_empty() {
-                    format!(
-                        "kept: an open question is held in its hierarchy: {}",
-                        held.join("; ")
-                    )
-                } else if held.is_empty() {
-                    format!("kept: alive in its hierarchy: {}", names.join(", "))
-                } else {
-                    format!(
-                        "kept: alive in its hierarchy: {}; and an open question is held in it: {}",
-                        names.join(", "),
-                        held.join("; ")
-                    )
-                };
+                let answered: Vec<String> = keepers
+                    .iter()
+                    .filter(|k| !k.answered.is_empty())
+                    .map(answer_keeper_text)
+                    .collect();
+                // The first part says "its hierarchy"; each later one is
+                // joined with "; and" and says "it".
+                let mut parts: Vec<(&str, String)> = Vec::new();
+                if !names.is_empty() {
+                    parts.push(("alive in", names.join(", ")));
+                }
+                if !held.is_empty() {
+                    parts.push(("an open question is held in", held.join("; ")));
+                }
+                if !answered.is_empty() {
+                    parts.push(("a verified person answer is held in", answered.join("; ")));
+                }
+                let mut text = String::from("kept: ");
+                for (i, (what, list)) in parts.iter().enumerate() {
+                    if i == 0 {
+                        text.push_str(&format!("{what} its hierarchy: {list}"));
+                    } else {
+                        text.push_str(&format!("; and {what} it: {list}"));
+                    }
+                }
                 if !unreadable.is_empty() {
                     text.push_str(&format!("; and {}", unreadable_text(unreadable)));
                 }
