@@ -325,7 +325,8 @@ them failed for lack of either (inferred from the exit codes and stderr). A deni
 would look the same. The copy's manifest covers writes only for runs without
 the cloud variables and only under the store root, so a write made only under
 cloud configuration, and swallowed when denied, is covered by neither run.
-The Clause 3 rerun section at the end of this record repeats the hundred reads on the live, cloud-configured store and counts the bucket.
+The Clause 3 rerun section at the end of this record repeats the hundred reads
+on the live, cloud-configured store and lists the bucket objects of the sessions they read.
 
 ### Last: clause 2's values against `koto context get`
 
@@ -435,13 +436,26 @@ bucket's objects before and after. It ran on 2026-11-27 between 13:47Z and
 variables, the backend and five `KOTO_SESSION_CLOUD_*` ones, checked by name
 only.
 
+This section stands on its own. Its blocks ran in one fresh bash shell, not
+the first walk's setup shell, and read the live store, not the clone. The
+setup's note that the sandboxed runs were the only live-store runs, and the
+summary's clause 3 row, describe the first walk and are left as they were. The
+shell starts with a scratch directory, and the functions under "The two
+listings" below are defined in it before any listing runs:
+
+```bash
+S=$(mktemp -d); mkdir -p "$S/out" "$S/awshome" "$S/copy/sessions" "$S/copy/home"
+env | cut -d= -f1 | grep -c '^KOTO_SESSION_'   # 6
+aws --version                                  # aws-cli/2.31.18 ...
+```
+
 ### Binary
 
 There was one release build of `koto-session-list` from koto main at 3112838c,
-in a fresh tree exported with `git archive` into a `mktemp -d` scratch directory
-`S`. It exited 0 in 18.5 s:
+in a fresh tree exported with `git archive`. It exited 0 in 18.5 s:
 
 ```bash
+cd <koto checkout>
 mkdir -p $S/build; git archive 3112838c | tar -x -C $S/build
 cd $S/build && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$PWD/target cargo build --release --locked -p koto-session-list
 ```
@@ -478,14 +492,18 @@ out=[(len(m),r) for r,m in g.items() if len(m)>=4 and all(x in t for x in m)]
 for n,r in sorted(out,reverse=True)[:15]: print(n,r)
 print("trees>=4:", sum(1 for m in g.values() if len(m)>=4), "all-terminal:", len(out))
 PY
+wc -l < $S/headers.tsv   # 9489
 ```
 
 Of 9,489 readable headers, 46 trees have four or more sessions, and 32 of them
 are terminal throughout. The root is `execute-mirror-repair`, a plan run with
 nine children (ten sessions), and the key is `impl_base`. Clause 2's root wasn't
 reused. It was cancelled at `plan_completion`, so it lists as needs-you-stalled,
-not done. Quiet time came from each session's last event and its newest file,
-in bash from `~/.koto/sessions`:
+not done. The ids are taken by name, the root and every id that starts with
+`execute-mirror-repair.`, and they are the same ten the tree script groups
+under the root by parent links (checked by comparing the two lists). Quiet
+time came from each session's last event and its newest file, run from
+`~/.koto/sessions`:
 
 ```bash
 ids=$(awk -F'\t' -v r=execute-mirror-repair '$1==r || index($1, r".")==1' $S/headers.tsv | cut -f1)
@@ -496,13 +514,15 @@ echo "$ids" > $S/root.ids
 
 Across the ten, the newest event is from 2026-11-19T18:25Z and the newest file
 from 2026-11-20T12:25Z, a week before the runs. `list` ran once on a scratch
-copy of the ten directories (`cp -cR` into `$S/copy/sessions`), so the live
-store saw no run before the hundred. It printed ten rows, all with liveness
-`done`, and nine carry a value for the key:
+copy of the ten directories, so the live store saw no run before the hundred.
+It printed ten rows, all with liveness `done`, and nine carry a value for the
+key:
 
 ```bash
+for d in $(cat $S/root.ids); do cp -cR ~/.koto/sessions/$d $S/copy/sessions/; done
 env -i PATH=/usr/bin:/bin HOME=$S/copy/home KOTO_SESSIONS_BASE=$S/copy/sessions \
-  "$S/build/target/release/koto-session-list" list --root execute-mirror-repair --key impl_base
+  "$S/build/target/release/koto-session-list" list --root execute-mirror-repair --key impl_base > $S/copylist
+cut -f4 $S/copylist | sort | uniq -c; awk -F'\t' '$5!=""' $S/copylist | wc -l
 ```
 
 ### The two listings
@@ -565,10 +585,39 @@ localscope() {
 }
 ```
 
+The bucket's top-level prefixes were counted once, with the same read-only
+call and credentials by name:
+
+```bash
+env -i PATH=/usr/bin:/bin:/opt/homebrew/bin HOME="$S/awshome" AWS_CONFIG_FILE=/dev/null \
+  AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_PAGER= \
+  AWS_ACCESS_KEY_ID="$KOTO_SESSION_CLOUD_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$KOTO_SESSION_CLOUD_SECRET_KEY" \
+  AWS_DEFAULT_REGION="$KOTO_SESSION_CLOUD_REGION" \
+  aws --endpoint-url "$KOTO_SESSION_CLOUD_ENDPOINT" s3api list-objects-v2 \
+  --bucket "$KOTO_SESSION_CLOUD_BUCKET" --delimiter / --query "CommonPrefixes[].Prefix" \
+  --output text 2>>$S/aws.err | tr "\t" "\n" | grep -v "^None$" > $S/top.prefixes
+wc -l < $S/top.prefixes; grep -cE "^[0-9a-f]{16}/$" $S/top.prefixes   # 5546, 5545
+```
+
+That is 5,545 workspace prefixes and `koto-names/`. Then a first listing and a
+control, each in its own bash:
+
+```bash
+date -u +%FT%TZ                                         # 13:51:21Z
+bucketscope $S/bucket.before; localscope $S/local.before
+date -u +%FT%TZ                                         # 13:51:47Z
+bucketscope $S/bucket.control; localscope $S/local.control
+cmp $S/bucket.before $S/bucket.control && echo bucket identical
+cmp $S/local.before $S/local.control && echo local identical
+cut -f4 $S/bucket.before | sort | tail -1               # newest last-modified time
+```
+
 The scope covers 20 prefixes: each session's name-index prefix and its home.
-No session's name index named any prefix but its home. A first listing at
-13:51:21Z and a control 26 s later were identical on both sides. The newest
-object's last-modified time was 2026-11-19T18:25:47Z.
+No session's name index named any prefix but its home. The first listing and
+the control, started 26 s apart, were identical on both sides. The newest
+object's last-modified time was 2026-11-19T18:25:47Z. Before the runs, the
+first listing was kept as `bucket.before0` and `local.before0`, and fresh
+listings took the `before` names.
 
 ### The hundred runs
 
@@ -600,24 +649,34 @@ done
 echo "runs $i, nonzero exits $fails, stderr lines $(wc -l < "$O/live.err"), lsof samples $samples, samples with an inet file $hits, stop: ${stop:-none}"
 ```
 
-The loop was saved as `$S/loop.sh` and driven like this, with fresh before
-listings taken right before it:
+The loop was saved as `$S/loop.sh`. It ran in a new bash, which sourced the
+listing functions first (saved as `$S/lib.sh` and `$S/listings.sh`) and took
+fresh before listings right before the loop. The 15,348 below is the loop's
+last line:
 
 ```bash
+source $S/lib.sh; source $S/listings.sh
+mv $S/bucket.before $S/bucket.before0; mv $S/local.before $S/local.before0
+echo "before start $(date -u +%FT%TZ)"
 bucketscope $S/bucket.before; localscope $S/local.before
-source $S/loop.sh
-localscope $S/local.after; bucketscope $S/bucket.after
+cmp -s $S/bucket.before0 $S/bucket.before && echo "bucket same as 13:51Z"
+cmp -s $S/local.before0 $S/local.before && echo "local same as 13:51Z"
+echo "loop start $(date -u +%FT%TZ)"; source $S/loop.sh; echo "loop end $(date -u +%FT%TZ)"
+localscope $S/local.after; bucketscope $S/bucket.after; echo "after end $(date -u +%FT%TZ)"
 cmp $S/local.before $S/local.after && echo "local identical"
 cmp $S/bucket.before $S/bucket.after && echo "bucket identical"
 wc -l < $S/aws.err; wc -c < $O/lsof.out
 ```
 
+Both printed "same as 13:51Z". The before listings started at 13:54:57Z and
+the after listings ended at 14:02:28Z. The loop's end time, 14:02:19Z, is after its last check.
+
 | Measure | Result |
 |---------|--------|
-| Runs | 100 (34 `once`, 33 `once --all`, 33 `list`), 13:55:06Z to 14:02:19Z |
+| Runs | 100 (34 `once`, 33 `once --all`, 33 `list`), loop 13:55:06Z to 14:02:19Z |
 | Nonzero exits | 0 |
 | stderr | 0 lines |
-| Bucket scope, before (13:54:57Z) and after (14:02:28Z) | 278 objects over 20 prefixes, 0 failed listings; identical by `cmp` (key, size, ETag, last modified) |
+| Bucket scope, before and after | 278 objects over 20 prefixes, 0 failed listings; identical by `cmp` (key, size, ETag, last modified) |
 | Local scope, before and after | 614 entries (45 directories, 569 files); identical by `cmp` (path, type, size, modification time to the nanosecond) |
 | The ten checks, one every tenth run | each identical to the before listings on both sides; the loop never stopped |
 | `lsof` samples of the program's pid | 15,348, none showing an internet socket; `lsof.out` 0 bytes |
@@ -658,13 +717,11 @@ holding a known socket, so its sensitivity is inferred, not measured. Clause
 TLS or cloud storage crate, and its binary imports no `connect`, `socket` or
 `getaddrinfo`.
 
-**Reading.** Shown on the scope (measured); nothing pushed outside it is
-inferred. A hundred unsandboxed reads by `koto-session-list` from current main
-ran on the live store of a host using koto's cloud storage, with the cloud
-variables set and writes and network allowed. Every run exited 0 with empty
-stderr. The runs left the ten sessions' 278 bucket objects and 614 local
-entries unchanged, by count and by content: the same keys, sizes, ETags and
-modification times. None of the 15,348 samples of the program's process showed
-an internet socket. That nothing was pushed anywhere else in the bucket is
-inferred from the sampling, within the limits above, and from clause 2's
-dependency and symbol checks. The whole bucket wasn't diffed.
+**Reading.** Shown for the sessions the runs read (measured); nothing pushed
+elsewhere in the bucket is inferred. A hundred unsandboxed reads from current
+main, on the live store of a host using koto's cloud storage with writes and
+network allowed, left those sessions' bucket objects and local entries
+unchanged by count and by content, and no sample of the program's process
+showed an internet socket. The rest of the bucket wasn't diffed. That nothing
+went there rests on the sampling, within its limits above, and on clause 2's
+dependency and symbol checks.
