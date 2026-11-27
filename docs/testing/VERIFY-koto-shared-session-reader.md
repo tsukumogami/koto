@@ -16,9 +16,12 @@ milestone.
 
 - macOS on arm64, run on 2026-11-27 between 05:40Z and 06:30Z. The host's koto
   is 0.41.0 on the cloud session backend. No koto release carries Steps 5 or
-  6, so every binary below was built from source with
-  `CARGO_INCREMENTAL=0 cargo build --release --locked`, one build at a time,
-  and each run names its binary by commit:
+  6, so every binary below was built from source, one build at a time, with
+  `CARGO_INCREMENTAL=0 cargo build --release --locked -p koto` at 22bc3a7e and
+  at 865e5ce4, and `CARGO_INCREMENTAL=0 cargo build --release --locked -p koto
+  -p koto-session-list` at 90aeaaae (the workspace has no default members, so
+  `koto-session-list` builds only when named, as validate.yml names it). Each
+  run names its binary by commit:
 
   | Name | Commit | `koto version` | Role |
   |------|--------|----------------|------|
@@ -28,7 +31,8 @@ milestone.
   | `LIST` | 90aeaaae | (no version command) | `koto-session-list` from current main |
 
   v0.39.0 is the newest tag that doesn't contain the split's first commit,
-  cc9479be (Step 2, koto#742), and its `koto dashboard` already has `--once`
+  cc9479be (Step 2, koto#742): `git tag --no-contains cc9479be
+  --sort=-v:refname | head -1` prints `v0.39.0`. Its `koto dashboard` already has `--once`
   and `--all`, so no other pre-split commit was needed.
 
 - The store is one APFS clone of the host's `~/.koto`, made with
@@ -46,13 +50,18 @@ milestone.
   The only runs against the live store are clause 3's hundred sandboxed runs.
   The clone was left in place when the runs ended, for a later cleanup.
 
-Every block below starts from this setup, with `B` the directory the release
-binaries were copied to and each output written under `$O`:
+The setup below ran once, in one shell, before clause 1; every later block runs
+in that shell, on the same clone, in the order the record gives them, and reads
+the earlier blocks' outputs and variables. `B` is the directory the release
+binaries were copied to:
 
 ```bash
+B=<directory holding the release binaries>
 C=$(mktemp -d); cp -cR ~/.koto "$C/root"; O=$C/out; mkdir -p "$O"; cd "$O"
+find "$C/root" | wc -l          # 1,279,399 entries
 PRE=$B/koto-22bc3a7e OLD=$B/koto-865e5ce4 MAIN=$B/koto-90aeaaae
 LIST=$B/koto-session-list-90aeaaae
+run() { env -i PATH=/usr/bin:/bin HOME="$C/home" KOTO_HOME="$C/root" XDG_CACHE_HOME="$C/home/cache" "$@"; }
 ```
 
 `koto dashboard --once` prints ten tab-separated columns: 1 id, 2 state,
@@ -81,10 +90,13 @@ for v in "" --all; do
   cmp pre1$v.cut main$v.cut && cmp main$v.cut pre2$v.cut && echo "1,2,4,5,6,8 identical"
   cmp pre1$v.cut910 main$v.cut910 && echo "9,10 identical"
   cmp pre1$v.err main$v.err && echo "stderr identical"
-  # full rows that differ, by position, PRE against MAIN
-  paste -d'\n' pre1$v main$v | awk 'NR%2{a=$0;next} a!=$0{c++} END{print c+0}'
-  # which columns differ on those rows
-  paste pre1$v main$v | awk -F'\t' '{for(i=1;i<=10;i++) if($i!=$(i+10)) n[i]++} END{for(i in n) print i, n[i]}'
+  # full rows that differ, by position, and which columns differ on them:
+  # PRE against MAIN, MAIN against PRE again, and PRE against PRE again
+  for p in "pre1 main" "main pre2" "pre1 pre2"; do set -- $p
+    paste -d'\n' $1$v $2$v | awk 'NR%2{a=$0;next} a!=$0{c++} END{print c+0}'
+    paste $1$v $2$v | awk -F'\t' '{for(i=1;i<=10;i++) if($i!=$(i+10)) n[i]++} END{for(i in n) print i, n[i]}'
+  done
+  cut -f8 main$v | sort | uniq -c   # MAIN's liveness classes
 done
 ```
 
@@ -96,8 +108,10 @@ done
 Both binaries print ten fields per row. Every full-row difference is in column
 3 (elapsed: 12 rows default, 137 `--all`) or column 7 (idle: 15 rows default,
 139 `--all`). Both columns are a duration since a recorded time, printed when
-the binary runs; `MAIN` against the second `PRE` run differs on 23 and 248 rows
-the same way. No row differs in id, state, status, intent, template, liveness,
+the binary runs. `MAIN` against the second `PRE` run differs on 23 and 248 rows
+the same way, and the control, `PRE` against `PRE` again, differs on 44 and 492
+rows, again only in column 3 (20 and 267 rows) and column 7 (26 and 272 rows).
+No row differs in id, state, status, intent, template, liveness,
 machine or workspace. `MAIN`'s liveness classes on the clone were idle 6,
 needs-you-blocked 15 and needs-you-stalled 156 in the default view, and done
 1666, idle 6, needs-you-blocked 283, needs-you-failed 13 and needs-you-stalled
@@ -107,7 +121,7 @@ needs-you-blocked 15 and needs-you-stalled 156 in the default view, and done
 before the split and the dashboard on current main list the same sessions in
 the same order, with the same states and liveness classes, in both views. The
 only differences are the two clock columns, and the same binary run twice
-differs in the same way.
+differs in the same two columns, on more rows.
 
 ## Clause 2: the minimal program
 
@@ -119,12 +133,14 @@ koto#778's run 1, with main before koto#778 as `OLD`:
 
 ```bash
 for v in "" --all; do
-  run "$OLD"  dashboard --once $v > old$v  2> old$v.err;  echo "exit $?"
-  run "$MAIN" dashboard --once $v > main$v 2> main$v.err; echo "exit $?"
-  run "$LIST" once $v             > list$v 2> list$v.err; echo "exit $?"
-  for f in old main list; do cut -f1,2,4,5,6,8 $f$v > $f$v.cut; done
-  cmp old$v.cut main$v.cut && cmp main$v.cut list$v.cut && echo identical
-  wc -l old$v.err main$v.err list$v.err
+  run "$OLD"  dashboard --once $v > c2old$v  2> c2old$v.err;  echo "exit $?"
+  run "$MAIN" dashboard --once $v > c2main$v 2> c2main$v.err; echo "exit $?"
+  run "$LIST" once $v             > c2list$v 2> c2list$v.err; echo "exit $?"
+  for f in c2old c2main c2list; do
+    wc -l < $f$v; awk -F'\t' '{print NF}' $f$v | sort -u; wc -l < $f$v.err
+    cut -f1,2,4,5,6,8 $f$v > $f$v.cut
+  done
+  cmp c2old$v.cut c2main$v.cut && cmp c2main$v.cut c2list$v.cut && echo identical
 done
 ```
 
@@ -143,13 +159,15 @@ were picked from `koto workflows` and `koto context list` on the clone.
 ROOT=execute-skill-regression-detection KEY=impl_base
 run "$LIST" list --root "$ROOT" --key "$KEY" > listroot 2> listroot.err; echo "exit $?"
 wc -l < listroot; awk -F'\t' '{print NF}' listroot | sort -u; wc -l < listroot.err
+head -1 listroot | cut -f1                 # the root's id first
+awk -F'\t' '$5!=""' listroot | wc -l     # rows that carry a value
 # list's fields: 1 id, 2 parent, 3 state, 4 liveness, 5 value.
 # State and liveness against columns 2 and 8 of MAIN's --all row for the same id
-# (main--all is the clause 2 three-way diff's MAIN --all output):
+# (c2main--all is the three-way diff's MAIN --all output):
 st=0 lv=0
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | cut -f1)
-  d=$(awk -F'\t' -v id="$id" '$1==id' main--all)
+  d=$(awk -F'\t' -v id="$id" '$1==id' c2main--all)
   [ "$(printf '%s' "$d" | cut -f2)" = "$(printf '%s' "$line" | cut -f3)" ] && st=$((st+1))
   [ "$(printf '%s' "$d" | cut -f8)" = "$(printf '%s' "$line" | cut -f4)" ] && lv=$((lv+1))
 done < listroot
@@ -180,15 +198,22 @@ run, clause 3's included.
 
 ### Dependencies and CI
 
+Run from the koto checkout at 90aeaaae:
+
 ```bash
-cargo tree --locked -p koto-session-list -e normal,build --prefix none \
-  | grep -cE '^(rust-s3|rustls[^ ]*|attohttpc|http|url|ratatui|crossterm) '
+PAT='^(rust-s3|rustls[^ ]*|attohttpc|http|url|ratatui|crossterm) '
+tree() { cargo tree --offline --locked -p "$1" -e normal,build --prefix none; }
+tree koto-session-list | wc -l
+tree koto-session-list | grep -cE "$PAT"
+tree koto | grep -oE "$PAT" | sort -u
 nm -u "$LIST" | grep -cwE '_(connect|socket|getaddrinfo)'
+nm -u "$MAIN" | grep -owE '_(connect|socket|getaddrinfo)' | sort -u
 ```
 
-The first prints 0 (the tree has 51 lines), where the same pattern on `-p koto`
-names attohttpc, crossterm, http, ratatui, rust-s3, rustls, rustls-pki-types,
-rustls-webpki and url. The second prints 0, where `nm -u "$MAIN"` lists
+The tree of `koto-session-list` has 67 lines and the pattern matches none of
+them, where on `koto` it matches nine crates: attohttpc, crossterm, http,
+ratatui, rust-s3, rustls, rustls-pki-types, rustls-webpki and url. `nm -u` on
+`LIST` matches none of the three socket calls, where on `MAIN` it lists
 `_connect`, `_getaddrinfo` and `_socket`.
 
 In CI, validate.yml's Session List Checks job runs both checks on the release
@@ -199,8 +224,9 @@ record was written, so it gives no result here. At koto#778's merge, f6c8e275,
 the job passed in validate run 45878295232 (job 140110880850).
 
 **Reading.** Shown (measured). The program built from current main reports the
-dashboard's rows on a real store in both views, and on main before koto#778 and
-current main the dashboard's rows are identical, so the program and the
+dashboard's rows on a real store in both views, equal on every column that
+doesn't read the clock (the two it leaves out aside), and on main before
+koto#778 and current main the dashboard's rows are equal on those columns, so the program and the
 dashboard agree across the step that added it. On a real root it lists each
 session with the state and liveness the dashboard shows. Its build graph holds
 none of the nine cloud storage, TLS, HTTP and terminal crates the same pattern
@@ -243,11 +269,12 @@ host.
 | 100 sandboxed | live `~/.koto` | 0 (every run exited 0) | 0 lines, 0 bytes | not compared: other sessions write the live store; the sandbox denied this program every write |
 | 100 unsandboxed | the clone | 0 (every run exited 0) | 0 lines | manifest of 1,279,399 entries (path, type, size, modification time to the nanosecond) identical before and after |
 
-The profile was checked against controls. Under it, `touch` on a scratch path
-was denied. For network, the same loopback connect ran without and with the
-profile, each time to a listener started outside the sandbox:
+The profile was checked against controls. A write to a scratch path, then the
+same loopback connect without and with the profile, each time to a listener
+started outside the sandbox:
 
 ```bash
+sandbox-exec -p "$SB" /usr/bin/touch "$O/sb-probe"; echo "sandboxed touch: exit $?"
 P=$((20000 + RANDOM % 20000))
 /usr/bin/nc -l 127.0.0.1 "$P" > /dev/null 2>&1 & L=$!; sleep 1
 /usr/bin/nc -z -G 3 127.0.0.1 "$P"; echo "unsandboxed: exit $?"
@@ -257,14 +284,15 @@ sandbox-exec -p "$SB" /usr/bin/nc -z -G 3 127.0.0.1 "$P"; echo "sandboxed: exit 
 kill $L; wait $L
 ```
 
-Without the profile the connect exited 0; under it, it exited 1 with empty
-stderr. The control stays on loopback, so no request left the host; it shows
+The sandboxed `touch` failed and left no file. Without the profile the connect
+exited 0; under it, it exited 1 with empty stderr. The control stays on loopback, so no request left the host; it shows
 the profile itself refuses a connect, separately from anything on the host
 that filters outbound traffic.
 
-**How "nothing pushed" was checked.** The program has no way to push: its
-dependency tree holds no storage, TLS or HTTP crate and its binary imports no
-`connect`, `socket` or `getaddrinfo` (clause 2). The sandboxed runs also ran
+**How "nothing pushed" was checked.** The program shows no way to push: its
+dependency tree holds none of the nine crates `koto`'s cloud storage, TLS and
+HTTP come from, and its binary imports no `connect`, `socket` or `getaddrinfo`
+(clause 2). The sandboxed runs also ran
 with network access denied; a push attempt there would have failed the run or
 written to stderr (inferred), and none did. The unsandboxed runs had no
 `KOTO_SESSION_*` variable, so no bucket was named to them. The bucket itself
@@ -272,8 +300,9 @@ wasn't read: this walk makes no request to it, and CI's hundred-read test,
 which counts FakeS3 requests (verified by reading the test), is the check that
 measures zero requests directly.
 
-**Reading.** Shown on a copy (measured); "nothing pushed" verified by reading
-and by the sandbox, not by a bucket count. A hundred runs on a copy of a real
+**Reading.** Partly shown (measured): shown on a copy, while the
+cloud-configured case is covered only by the sandboxed runs; "nothing pushed"
+verified by reading and by the sandbox, not by a bucket count. A hundred runs on a copy of a real
 cloud host's store left every entry unchanged in type, size and modification
 time. A hundred runs on the live store, with the cloud environment set, all
 exited 0 with empty stderr while writes and network were denied, so none of
@@ -298,24 +327,31 @@ E="env -i HOME=$S4/home PATH=/usr/bin:/bin:$HOME/.local/bin SHELL=/bin/zsh TMPDI
 $E claude plugin marketplace add "tsukumogami/shirabe" --scope user
 $E claude plugin install shirabe@shirabe --scope project
 $E ~/.tsuku/bin/tsuku install tsukumogami/shirabe
+# what the installs left in the scratch home
+P=$S4/home/.claude/plugins/cache/shirabe/shirabe/0.56.4-dev
+find "$P" -type f | wc -l; du -sh "$P"
+find "$S4" -type d -name target | wc -l; find "$S4" -name '*.rlib' | wc -l
+find "$S4" -name koto -type f
+grep -rlE 'koto-session-reader|koto_session_reader' "$S4" | wc -l
+X=$S4/home/.tsuku/tools/shirabe-0.56.3/bin/shirabe
+file -b "$X"; $E "$X" --version
 ```
 
 - `marketplace add` exited 0, cloning the marketplace into the scratch home.
   `plugin install` exited 0 and installed shirabe 0.56.4-dev: 2,898 files,
   43M, with no `target` directory and no `.rlib` anywhere in the scratch
-  home. The only files named `koto` are checked-in test stubs under
-  `skills/*/scripts/testdata/` and `skills/*/evals/fixtures/bin/`.
-- `tsuku install` exited 0 and installed shirabe 0.56.3 as a downloaded
-  arm64 Mach-O binary; `shirabe --version` prints `shirabe v0.56.3`. Its
-  log has no line naming cargo, rustc, a compile or koto.
+  home. The only files named `koto` are ten checked-in test stubs under
+  `skills/*/scripts/testdata/` and `skills/*/evals/fixtures/`.
+- `tsuku install` exited 0 and installed shirabe 0.56.3; `file` reports an
+  arm64 Mach-O executable, and `shirabe --version` prints `shirabe v0.56.3`.
 - `install.sh` wasn't run. The documented form pipes `curl` into `bash`, and
   this host's network gate refuses `curl` commands, so the README's tsuku
   route stood in for it. The script, read from main, downloads a released
   binary and its checksums and builds nothing (verified by reading).
 - koto itself isn't part of either install. The README lists koto 0.33.0 or
-  later as a requirement of the koto-backed skills, which `tsuku install`
-  provides as a released binary (verified by reading); it wasn't installed in
-  the scratch home.
+  later as a separate requirement of the koto-backed skills, installed through
+  tsuku as a released binary (verified by reading the README); koto wasn't
+  installed in the scratch home, so that install didn't run here.
 
 **Does shirabe take koto-session-reader?** No. Nothing in the installed plugin
 tree names `koto-session-reader` or `koto_session_reader` (0 files), and the
@@ -342,5 +378,5 @@ step; that is inferred, not run.
 |--------|--------------------|
 | 1. Dashboard before and after | Shown: same sessions, states and liveness classes in both views; only the two clock columns differ |
 | 2. The minimal program | Shown: rows equal the dashboard's in both views, `list` agrees with the dashboard and with `koto context get`, none of the nine crates `koto`'s tree matches and no `connect`, `socket` or `getaddrinfo` import |
-| 3. A hundred reads change nothing | Shown on a copy: a hundred runs left a copy of the store identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
+| 3. A hundred reads change nothing | Partly shown: a hundred runs left a copy of the store identical, and a hundred sandboxed runs on the live store exited 0 with writes and network denied; "nothing pushed" rests on reading and the sandbox, not on a bucket count |
 | 4. shirabe installs without a koto build step | Not shown: the install needs no koto build step, but shirabe doesn't take koto-session-reader yet |
