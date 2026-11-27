@@ -2091,6 +2091,51 @@ Done.
         );
     }
 
+    /// The move of the test above, stopped at `after-version`, the last
+    /// point before the carry, where the new home already holds the moved
+    /// state, and run again with `--to` the new directory from a third one,
+    /// neither the old directory nor the new: there the moved header doesn't
+    /// name the caller's directory, so the home is located, and the home
+    /// before the move must still come from the logged move's `from`, not
+    /// from that located answer.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_after_its_commit_and_run_again_elsewhere_carries_the_context() {
+        let mv = Moving::unrecorded();
+        let new_prefix = prefix_of(&mv.new);
+        let third = mv.m.dir("third");
+        let third_prefix = prefix_of(&third);
+        assert!(
+            new_prefix != mv.prefix && third_prefix != mv.prefix && third_prefix != new_prefix,
+            "setup: the three directories don't have three prefixes"
+        );
+
+        let stopped = mv.mover(&mv.new, &[(FAULT_ENV, "after-version")], &[]);
+        assert!(
+            !stopped.ok(),
+            "the stopped move exited 0: {}",
+            stopped.describe()
+        );
+        let run = mv.mover(&third, &[], &["--to", s(&mv.new)]);
+        assert!(
+            run.ok(),
+            "run again from a third directory: {}",
+            run.describe()
+        );
+
+        for (key, value) in [("notes.md", "notes"), ("carried.md", "carried")] {
+            let object = session_key(&new_prefix, NAME, &format!("ctx/{key}"));
+            assert_eq!(
+                mv.s3.object(&object).as_deref(),
+                Some(value.as_bytes()),
+                "context key '{key}' from before the move isn't at the new home {object}; keys \
+                 under it: {:?}; the stopped move: {}; run again: {}",
+                mv.s3.keys_under(&format!("{new_prefix}/{NAME}/")),
+                stopped.describe(),
+                run.describe()
+            );
+        }
+    }
+
     /// `koto session resolve <parent> --keep local --children accept-local`
     /// over a child moved with `--whole` elsewhere reports the child errored,
     /// as the move refuses this host's copy. The child's row says what to
