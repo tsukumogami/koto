@@ -386,9 +386,18 @@ mod tests {
         assert!(started.elapsed() < LOCK_WAIT, "{:?}", started.elapsed());
         assert_eq!(read(tmp.path()), 1);
         // Once the holder lets go, a change goes through and waits again
-        // are allowed.
+        // are allowed. The lock can outlive `holder` by a moment, for the
+        // same reason as above (a child being started holds a copy of its
+        // descriptor until it execs), so the change is tried until it
+        // lands.
         drop(holder);
-        assert!(add(tmp.path(), 5));
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut written = add(tmp.path(), 5);
+        while !written && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+            written = add(tmp.path(), 5);
+        }
+        assert!(written, "the freed lock was never taken");
         assert_eq!(read(tmp.path()), 6);
         assert!(!gave_up());
     }
