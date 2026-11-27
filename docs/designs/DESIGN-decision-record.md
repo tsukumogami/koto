@@ -1031,7 +1031,7 @@ or leave it waiting until the raiser's run closes one of its twenty.
 retention engine and the cleanup refusal all decide open through `is_open` in
 `src/decisions/questions.rs`, which reads the resolution above: a question that reads `in-effect`
 and has no entry in effect. Retention adds no test of its own. Each reaches it through a helper
-over the same store index (`raised_open`, `raised_open_in`, `holds_of`, `orphans`,
+over the same store index (`raised_open`, `tick_hold`, `holds_of`, `orphans`,
 `open_by_session`), so the five can't disagree about a question, and none can disagree with the
 resolution about which entries count or which one is in effect (R87).
 
