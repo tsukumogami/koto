@@ -385,3 +385,120 @@ fn the_read_writes_nothing_and_repeats_byte_for_byte() {
     history(&env, &q5);
     assert_eq!(env.snapshot_all(), before);
 }
+
+/// Record an attempt in `session` citing `basis`; its id.
+fn attempt(env: &Env, session: &str, what: &str, basis: &[String]) -> String {
+    let w = format!("what={what}");
+    let mut args = vec![
+        "decisions",
+        "record",
+        session,
+        "--kind",
+        "judgment",
+        "--outcome",
+        "settled",
+        "--subject",
+        &w,
+        "--subject",
+        "result=undecided",
+    ];
+    for b in basis {
+        args.extend_from_slice(&["--basis", b]);
+    }
+    args.extend_from_slice(&["--by", "session"]);
+    env.ok(&args).json()["id"].as_str().unwrap().to_string()
+}
+
+/// Raise `question` in `name` to `recipient`, its escalate citing `basis`.
+fn raise_naming(env: &Env, name: &str, question: &str, recipient: &str, basis: &[String]) -> Q {
+    let qf = format!("question={question}");
+    let tf = format!("text=what about {question}?");
+    let rf = format!("recipient={recipient}");
+    let mut args = vec![
+        "decisions",
+        "record",
+        name,
+        "--kind",
+        "escalate",
+        "--outcome",
+        "escalated",
+        "--subject",
+        &qf,
+        "--subject",
+        &tf,
+        "--subject",
+        &rf,
+    ];
+    for b in basis {
+        args.extend_from_slice(&["--basis", b]);
+    }
+    args.extend_from_slice(&["--by", "session"]);
+    let v = env.ok(&args).json();
+    Q {
+        session: name.to_string(),
+        id: v["id"].as_str().unwrap().to_string(),
+        session_id: v["decision"]["session"]["id"].as_str().unwrap().to_string(),
+        header: String::new(),
+    }
+}
+
+#[test]
+fn the_attempts_tied_to_the_question_are_listed_and_each_pass_up_names_them() {
+    let env = Env::new();
+    env.ladder();
+    // Made before the raise, named by its escalate: listed ahead of it.
+    let a1 = attempt(&env, "worker", "a1", &[]);
+    let q = raise_naming(
+        &env,
+        "worker",
+        "q1",
+        "session:manager",
+        &[format!("worker:{a1}")],
+    );
+    let cite_q = format!("worker:{}", q.id);
+    // Citing the question from another session ties it.
+    let a2 = attempt(&env, "manager", "a2", std::slice::from_ref(&cite_q));
+    // Neither names the other: not tied.
+    let loose = attempt(&env, "worker2", "loose", &[]);
+    let up = env.readdress(&q, "manager", "session:director");
+    let a3 = attempt(&env, "director", "a3", std::slice::from_ref(&cite_q));
+    let doc = history(&env, &q);
+    assert_eq!(
+        order(&doc),
+        vec![
+            row("attempt", "worker", &a1),
+            row("raise", "worker", &q.id),
+            row("attempt", "manager", &a2),
+            row("pass-up", "manager", &up),
+            row("attempt", "director", &a3),
+        ],
+        "{doc}"
+    );
+    assert_eq!(
+        entry(&doc, "manager", &up)["attempts"],
+        json!([
+            {"session": "worker", "id": a1},
+            {"session": "manager", "id": a2},
+        ])
+    );
+    let shown = entry(&doc, "worker", &a1);
+    assert_eq!(shown["result"], "undecided");
+    assert_eq!(shown["what"], "a1");
+    assert_eq!(shown["status"], "in-effect");
+    assert!(
+        !order(&doc).iter().any(|r| r.1 == "worker2" && r.2 == loose),
+        "{doc}"
+    );
+
+    // An escalate naming another session's attempt doesn't tie it.
+    let theirs = attempt(&env, "manager", "theirs", &[]);
+    let q2 = raise_naming(
+        &env,
+        "worker",
+        "q2",
+        "session:manager",
+        &[format!("manager:{theirs}")],
+    );
+    let doc2 = history(&env, &q2);
+    assert_eq!(order(&doc2), vec![row("raise", "worker", &q2.id)], "{doc2}");
+}

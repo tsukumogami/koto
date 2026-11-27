@@ -343,6 +343,23 @@ pub struct Filters {
     pub awaiting_review: bool,
 }
 
+/// The attempts tied to `question` by the rule this module states, each
+/// once, ordered by time, then the recording session's name, then id.
+pub fn tied_to<'i>(
+    backend: &Backend,
+    index: &'i Index,
+    question: &DecisionBody,
+) -> Vec<&'i DecisionBody> {
+    let ties = Ties::build(backend, index);
+    let mut out: Vec<&DecisionBody> = decisions(index)
+        .into_iter()
+        .filter(|b| is_attempt(b))
+        .filter(|b| ties.questions_of(b).iter().any(|q| same(q, question)))
+        .collect();
+    out.sort_by(|a, b| (&a.time, &a.session.name, &a.id).cmp(&(&b.time, &b.session.name, &b.id)));
+    out
+}
+
 /// `koto decisions attempts`: every attempt at the position that passes
 /// the filters, ordered by time, then the recording session's name, then
 /// id.

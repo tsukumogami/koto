@@ -4,15 +4,21 @@
 //! resolution every other read applies, [`questions::resolve`]), and an
 //! ordered list of everything this machine's store holds about it: the
 //! raise, every pass-up, every `answer` entry whatever its outcome, each
+//! attempt tied to the question by the rule [`attempts`] applies, each
 //! decision whose `basis` cites one of the question's answers, and each
-//! file in the question's aimed area of any session that doesn't read.
-//! An entry that doesn't count is listed and marked, never left out.
+//! file that doesn't read in the aimed area, of any session, for the
+//! raiser's session id. That area is the raiser's, not the question's, so
+//! such a file is listed in the history of every question that raiser
+//! asked. An entry that doesn't count is listed and marked, never left out.
 //!
-//! The order is causal. The raise comes first. The rest sort by time, then
-//! the recording session's name, then id, with two corrections a skewed
-//! clock can't undo: a pass-up that moved the question never comes before
-//! the pass-up it follows (the order of `addressees`), and a citing
-//! decision never comes before the entry it cites. Unreadable files carry
+//! The order is causal. An attempt the question's escalate names was made
+//! before the raise and comes ahead of it; then the raise; the rest sort
+//! by time, then the recording session's name, then id, with three
+//! corrections a skewed clock can't undo: a pass-up that moved the
+//! question never comes before the pass-up it follows (the order of
+//! `addressees`), a pass-up never comes before an attempt recorded before
+//! it, which its `attempts` names, and a citing decision never comes before
+//! the entry it cites. Unreadable files carry
 //! no time and come last, by session name, then file name.
 //!
 //! The read looks only at the local store: no lock, no pull, no bucket
@@ -27,7 +33,7 @@ use super::questions::{self, Runs};
 use super::read::Entry;
 use super::standing::{self, Index};
 use super::store::{self, Area};
-use super::{chain, packets, FORMAT_VERSION};
+use super::{attempts, chain, packets, FORMAT_VERSION};
 use crate::session::Backend;
 
 /// Why the history can't be read.
@@ -155,6 +161,70 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
         }
     }
 
+    // The attempts tied to the question. One its escalate names was made
+    // before the raise and is listed ahead of it; the others are ordered
+    // with the rest, each pass-up after the attempts recorded before it,
+    // which it names.
+    let tied = attempts::tied_to(backend, &index, q);
+    let named_by_raise = |a: &DecisionBody| {
+        q.basis
+            .iter()
+            .any(|c| c.session == a.session.name && c.id == a.id)
+    };
+    let attempt_json = |a: &DecisionBody| {
+        json!({
+            "entry": "attempt",
+            "session": a.session.name,
+            "session_id": a.session.id,
+            "id": a.id,
+            "time": a.time,
+            "kind": a.kind,
+            "what": questions::subject_str(a, "what"),
+            "state": questions::subject_str(a, "state"),
+            "result": questions::subject_str(a, "result"),
+            "decider": a.decider,
+            "status": index.status(a),
+        })
+    };
+    let before_raise: Vec<Value> = tied
+        .iter()
+        .filter(|a| named_by_raise(a))
+        .map(|a| attempt_json(a))
+        .collect();
+    let mut attempt_items: Vec<usize> = Vec::new();
+    for a in tied.iter().filter(|a| !named_by_raise(a)) {
+        attempt_items.push(items.len());
+        items.push(Item {
+            key: (a.time.clone(), a.session.name.clone(), a.id.clone()),
+            after: Vec::new(),
+            json: attempt_json(a),
+        });
+    }
+    for (i, b) in aimed.iter().enumerate() {
+        if b.kind != "readdress" {
+            continue;
+        }
+        let mut names = Vec::new();
+        let mut k = 0;
+        for a in &tied {
+            let unnamed = !named_by_raise(a);
+            if a.time <= b.time {
+                names.push(json!({"session": a.session.name, "id": a.id}));
+                if unnamed {
+                    items[i].after.push(attempt_items[k]);
+                }
+            }
+            if unnamed {
+                k += 1;
+            }
+        }
+        items[i].json["attempts"] = Value::Array(names);
+    }
+    let listed: BTreeSet<(&str, &str)> = tied
+        .iter()
+        .map(|a| (a.session.id.as_str(), a.id.as_str()))
+        .collect();
+
     // Decisions citing one of the question's answers.
     let answers: std::collections::BTreeMap<(&str, &str), usize> = (0..aimed.len())
         .filter(|&i| aimed[i].kind == "answer")
@@ -163,6 +233,9 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
     let mut seen_citing = BTreeSet::new();
     for d in questions::decisions(&index) {
         if aimed_at(d) && (d.kind == "answer" || d.kind == "readdress") {
+            continue;
+        }
+        if listed.contains(&(d.session.id.as_str(), d.id.as_str())) {
             continue;
         }
         let mut cites: Vec<usize> = Vec::new();
@@ -201,7 +274,8 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
         });
     }
 
-    let mut entries = vec![json!({
+    let mut entries = before_raise;
+    entries.push(json!({
         "entry": "raise",
         "session": q.session.name,
         "session_id": q.session.id,
@@ -210,7 +284,7 @@ pub fn history(backend: &Backend, sid: &str, id: &str) -> Result<Value, Refusal>
         "kind": q.kind,
         "decider": q.decider,
         "recipient": questions::recipient_of(q).map(|r| r.to_json()),
-    })];
+    }));
     entries.extend(causal(items));
     entries.extend(unreadable(&index, backend, &q.session.id));
 
