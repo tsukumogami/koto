@@ -182,7 +182,7 @@ walking to this ancestor's published key -- so the same mechanism serves the
 single session and a future hierarchy's tree, and the opt-in stays "presence of a published
 location," not config.
 
-**Amended after ship.** Two follow-on changes evolved the enable model beyond this
+**Amended after ship.** Three follow-on changes evolved the enable model beyond this
 original design:
 
 - **Config-based enable + environment self-discovery.** koto can now resolve the target
@@ -196,6 +196,21 @@ original design:
   inside a Claude Code session; a fully headless run still renders nothing, and an
   operator opts out with `workflows.native = false`. The original "opt-in is presence of a
   published location, not config" framing is superseded by this default-on config gate.
+- **The location follows the driving Claude Code session (koto#361).** A self-discovered
+  location is `~/.claude/projects/<project>/<session>/workflows`, so the stored value
+  records the Claude Code session it was resolved for. When a run is resumed or rebound
+  under a different `CLAUDE_CODE_SESSION_ID`, the stored key doesn't pin it for good:
+  if the stored location is another Claude Code session's folder under this `HOME`, the
+  new session's transcript exists, and `workflows.native` is on, the commit renders into
+  the new session's folder instead. Only the session that owns the key rewrites it, on its
+  own commit; a descendant renders into the new folder without writing any key. The old
+  folder's file is left in place and no longer updated. A single-session run still
+  publishes once: the check is a string compare until the session id changes.
+  `koto workflows publish` now also writes a second host-local key,
+  `workflows/publish-explicit`, holding the same directory, and a location counts as
+  explicit only while the two match. An explicit location never moves with the driver,
+  and `KOTO_WORKFLOWS_DIR` still wins for the call it's set on. Publishing appends a
+  `context_added` event for each key it writes.
 
 - *Rejected: the hook shells out `koto context add <koto-session> ...`.* The
   most direct "publish into the context store" phrasing, but it presumes the
@@ -309,7 +324,10 @@ trait-level commit funnel. On each `SessionBackend::append_event`:
    `KOTO_WORKFLOWS_DIR` is set and this session has no published location yet,
    self-publish it into this session's store (so the walk finds it and
    descendants can too). No location resolvable -> return, writing nothing
-   (R6/R10).
+   (R6/R10). (Amended: a stored location that names another Claude Code
+   session's folder follows the current driving session, as described under
+   Fork C; with no location anywhere in the chain, env self-discovery
+   publishes one.)
 2. **Derive the minimal projection** from the read seam: display name, current
    state, running/done/failed status.
 3. **Build the file** -- the extensible JSON with the koto-namespaced block and
@@ -381,6 +399,9 @@ koto next / --to / rewind / exit
             gate: KOTO_WORKFLOWS_DIR set OR key published?  no -> return
             self-publish KOTO_WORKFLOWS_DIR into own ctx store (idempotent)
             dir = resolve_publish_location(self, id)   (self-then-ancestor walk)
+            if dir is another Claude Code session's folder and the current
+              driver's transcript exists (not explicit, native on):
+                dir = driver's folder; republish only if self owns the key
             proj = derive_minimal_projection(self, id) (read seam)
             create_dir_all(dir); atomic-write koto-<uuid>.json
 ```

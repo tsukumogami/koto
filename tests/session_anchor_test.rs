@@ -793,3 +793,240 @@ fn a_leftover_staging_entry_is_invisible_to_list_and_prune_and_is_swept() {
     );
     assert!(!staging.exists());
 }
+
+/// The open's `origin=` line and its exit, for each state, and a
+/// dispatcher value that would have been refused before is now recorded.
+#[test]
+fn an_open_prints_its_origin_and_never_fails_over_the_dispatcher() {
+    let tmp = setup();
+    let dir = tmp.path();
+
+    let out = open(dir, "o1", &["--dispatched-by=anchor-parent"]);
+    assert_eq!(out["anchor"], "anchor-o1");
+    assert_eq!(out["origin"], "dispatched");
+    assert!(link_exists(
+        dir,
+        "anchor-o1",
+        "dispatched-by",
+        "anchor-parent"
+    ));
+
+    let out = open(dir, "o2", &[]);
+    assert_eq!(out["origin"], "none");
+    let out = open(dir, "o3", &["--dispatched-by="]);
+    assert_eq!(out["origin"], "none");
+
+    for (harness, value) in [
+        ("o4", "--dispatched-by=_x"),
+        ("o5", "--dispatched-by=a b"),
+        ("o6", "--dispatched-by=-leading-dash"),
+    ] {
+        let out = open(dir, harness, &[value]);
+        assert_eq!(out["anchor"], format!("anchor-{harness}"), "{value}");
+        assert_eq!(out["origin"], "unrecorded", "{value}");
+        let started = events_of_type(dir, &format!("anchor-{harness}"), "anchor_started");
+        assert_eq!(started[0]["payload"]["origin"]["state"], "unrecorded");
+        assert_eq!(
+            started[0]["payload"]["origin"]["reason"],
+            "malformed: not an anchor name"
+        );
+        assert!(started[0]["payload"].get("dispatched_by").is_none());
+    }
+
+    let out = open(dir, "o7", &["--dispatched-by=anchor-o7"]);
+    assert_eq!(out["origin"], "unrecorded");
+
+    // A continue prints no origin; the creating event's stands.
+    let out = open(dir, "o1", &["--dispatched-by=anchor-other"]);
+    assert_eq!(out["opened"], "continued");
+    assert!(!out.contains_key("origin"), "{out:?}");
+}
+
+/// A dispatched-by link write that fails after the anchor exists: the open
+/// still prints its `anchor=` line and `origin=unrecorded` and exits 0, and
+/// records the failure once.
+#[test]
+fn an_open_whose_link_write_fails_still_succeeds() {
+    let tmp = setup();
+    let dir = tmp.path();
+    // A file where the dispatched-by links directory has to go makes that
+    // one write fail, and nothing else.
+    let blocker = sessions(dir).join("anchor-f1").join("ctx/koto/links");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("dispatched-by"), "not a directory").unwrap();
+
+    let out = run(
+        dir,
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "f1",
+            "--source",
+            "startup",
+            "--dispatched-by=anchor-parent",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let got = lines(&out.stdout);
+    assert_eq!(got["anchor"], "anchor-f1");
+    assert_eq!(got["origin"], "unrecorded");
+    let unrecorded = events_of_type(dir, "anchor-f1", "origin_unrecorded");
+    assert_eq!(unrecorded.len(), 1);
+    assert_eq!(unrecorded[0]["payload"]["named"], "anchor-parent");
+    assert_eq!(
+        unrecorded[0]["payload"]["reason"],
+        "link write failed: store error"
+    );
+}
+
+// ===== koto session origin =====
+
+/// `koto session origin <name>`'s JSON, after checking it exited 0.
+fn origin(dir: &Path, name: &str) -> serde_json::Value {
+    let out = ok(run(dir, &["session", "origin", name]), "session origin");
+    serde_json::from_str(out.stdout.trim()).unwrap()
+}
+
+/// Each state through the CLI, on an anchor and on a workflow session it
+/// holds, each exiting 0, and none of the reads writing anything.
+#[test]
+fn session_origin_reports_each_state_for_anchors_and_the_sessions_they_hold() {
+    let tmp = setup();
+    let dir = tmp.path();
+    open(dir, "w1", &["--dispatched-by=anchor-coord"]);
+    open(dir, "w2", &[]);
+    open(dir, "w3", &["--dispatched-by=a b"]);
+    for (name, anchor) in [
+        ("s1", "anchor-w1"),
+        ("s2", "anchor-w2"),
+        ("s3", "anchor-w3"),
+    ] {
+        ok(init_env(dir, name, &[("KOTO_ANCHOR", anchor)]), "init");
+    }
+    ok(init_env(dir, "plain", &[]), "init");
+
+    let before = store_hashes(dir, &[]);
+    assert_eq!(
+        origin(dir, "anchor-w1"),
+        serde_json::json!({
+            "session": "anchor-w1",
+            "via": "anchor-w1",
+            "origin": {
+                "state": "dispatched",
+                "dispatcher": "anchor-coord",
+                "dispatcher_kind": "anchor",
+            },
+        })
+    );
+    assert_eq!(
+        origin(dir, "s1"),
+        serde_json::json!({
+            "session": "s1",
+            "via": "anchor-w1",
+            "origin": {
+                "state": "dispatched",
+                "dispatcher": "anchor-coord",
+                "dispatcher_kind": "anchor",
+            },
+        })
+    );
+    for name in ["anchor-w2", "s2"] {
+        let got = origin(dir, name);
+        assert_eq!(got["via"], "anchor-w2", "{got}");
+        assert_eq!(got["origin"], serde_json::json!({"state": "none"}), "{got}");
+    }
+    for name in ["anchor-w3", "s3"] {
+        let got = origin(dir, name);
+        assert_eq!(got["origin"]["state"], "unrecorded", "{got}");
+        assert_eq!(
+            got["origin"]["reason"], "malformed: not an anchor name",
+            "{got}"
+        );
+        assert!(
+            got["origin"]["named"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "{got}"
+        );
+    }
+    assert_eq!(
+        origin(dir, "plain"),
+        serde_json::json!({"session": "plain", "via": null, "origin": {"state": "none"}})
+    );
+    assert_eq!(store_hashes(dir, &[]), before);
+
+    // A workflow session's own dispatched-by link comes first.
+    ok(
+        run(
+            dir,
+            &["session", "link", "s2", "--dispatched-by", "coordinator"],
+        ),
+        "session link",
+    );
+    let got = origin(dir, "s2");
+    assert_eq!(got["via"], serde_json::Value::Null, "{got}");
+    assert_eq!(
+        got["origin"],
+        serde_json::json!({
+            "state": "dispatched",
+            "dispatcher": "coordinator",
+            "dispatcher_kind": "workflow",
+        })
+    );
+
+    // A held-by anchor removed after the link was written.
+    ok(init_env(dir, "s4", &[("KOTO_ANCHOR", "anchor-w2")]), "init");
+    ok(run(dir, &["session", "cleanup", "anchor-w2"]), "cleanup");
+    assert!(!sessions(dir).join("anchor-w2").exists());
+    let got = origin(dir, "s4");
+    assert_eq!(got["via"], "anchor-w2", "{got}");
+    assert_eq!(
+        got["origin"],
+        serde_json::json!({"state": "unrecorded", "named": "", "reason": "anchor not found"})
+    );
+}
+
+/// An open whose link write failed reads as unrecorded on the anchor and on
+/// a session it holds, and a malformed name or a missing session exits 2.
+#[test]
+fn session_origin_after_a_failed_link_and_its_refusals() {
+    let tmp = setup();
+    let dir = tmp.path();
+    let blocker = sessions(dir).join("anchor-f1").join("ctx/koto/links");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("dispatched-by"), "not a directory").unwrap();
+    open(dir, "f1", &["--dispatched-by=anchor-parent"]);
+    ok(init_env(dir, "s1", &[("KOTO_ANCHOR", "anchor-f1")]), "init");
+    for name in ["anchor-f1", "s1"] {
+        let got = origin(dir, name);
+        assert_eq!(got["via"], "anchor-f1", "{got}");
+        assert_eq!(
+            got["origin"],
+            serde_json::json!({
+                "state": "unrecorded",
+                "named": "anchor-parent",
+                "reason": "link write failed: store error",
+            })
+        );
+    }
+
+    for name in ["nope", "../x"] {
+        let out = run(dir, &["session", "origin", name]);
+        assert_eq!(out.code, 2, "{name}: {}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("\"session origin\""), "{}", out.stdout);
+    }
+
+    // An anchor that is there and can't be read is a failed read (exit 3),
+    // never reported as a lost dispatcher.
+    std::fs::write(
+        sessions(dir).join("anchor-f1/koto-anchor-f1.state.jsonl"),
+        "not a header\n",
+    )
+    .unwrap();
+    let out = run(dir, &["session", "origin", "s1"]);
+    assert_eq!(out.code, 3, "{}\n{}", out.stdout, out.stderr);
+    assert!(!out.stdout.contains("unrecorded"), "{}", out.stdout);
+}

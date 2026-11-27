@@ -402,3 +402,163 @@ fn a_host_with_no_local_copy_and_a_workspace_read_list_the_decisions() {
     );
     assert_ne!(refused.code, Some(0));
 }
+
+#[test]
+fn the_open_reads_make_no_request_under_the_cloud_backend() {
+    let s3 = FakeS3::start(BUCKET);
+    let shared = tempfile::TempDir::new().unwrap();
+    let ws = workspace(shared.path());
+    let host = Host::new(&s3);
+    host.ok(&ws, &["init", "director", "--template", TEMPLATE_FILE]);
+    host.ok(
+        &ws,
+        &[
+            "init",
+            NAME,
+            "--template",
+            TEMPLATE_FILE,
+            "--dispatched-by",
+            "director",
+        ],
+    );
+    let q = host.ok(
+        &ws,
+        &[
+            "decisions",
+            "record",
+            NAME,
+            "--kind",
+            "escalate",
+            "--outcome",
+            "escalated",
+            "--subject",
+            "question=q1",
+            "--subject",
+            "text=which?",
+            "--subject",
+            "recipient=session:director",
+            "--by",
+            "session",
+        ],
+    );
+    let id = q["id"].as_str().unwrap();
+    host.ok(
+        &ws,
+        &[
+            "decisions",
+            "readdress",
+            NAME,
+            id,
+            "--in",
+            "director",
+            "--to",
+            "person:owner",
+            "--by",
+            "session",
+        ],
+    );
+
+    s3.clear_requests();
+    let at = host.ok(&ws, &["decisions", "open", "--at", "director"]);
+    assert_eq!(at["questions"].as_array().unwrap().len(), 1, "{at}");
+    let person = host.ok(&ws, &["decisions", "open", "--person", "owner"]);
+    assert_eq!(person["questions"].as_array().unwrap().len(), 1, "{person}");
+    assert!(
+        s3.requests().is_empty(),
+        "an open read reached the bucket: {:?}",
+        s3.requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.key))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn show_and_attempts_agree_on_a_provisional_judgments_review() {
+    let s3 = FakeS3::start(BUCKET);
+    let shared = tempfile::TempDir::new().unwrap();
+    let ws = workspace(shared.path());
+    let host = Host::new(&s3);
+    host.ok(&ws, &["init", "director", "--template", TEMPLATE_FILE]);
+    host.ok(
+        &ws,
+        &[
+            "init",
+            NAME,
+            "--template",
+            TEMPLATE_FILE,
+            "--dispatched-by",
+            "director",
+        ],
+    );
+    let p = host.ok(
+        &ws,
+        &[
+            "decisions",
+            "record",
+            NAME,
+            "--kind",
+            "judgment",
+            "--outcome",
+            "settled",
+            "--subject",
+            "what=p",
+            "--subject",
+            "result=provisional",
+            "--by",
+            "session",
+        ],
+    );
+    let id = p["id"].as_str().unwrap().to_string();
+    let session_id = p["decision"]["session"]["id"].as_str().unwrap().to_string();
+
+    let agree = |state: &str| {
+        let shown = host.ok(&ws, &["decisions", "show", NAME, &id]);
+        let listed = host.ok(&ws, &["decisions", "attempts", "--in", NAME]);
+        let element = &listed["attempts"][0];
+        assert_eq!(shown["review"]["state"], state, "{shown}");
+        assert_eq!(shown["review"], element["review"], "{shown}\n{listed}");
+    };
+    agree("awaiting");
+
+    let r = host.ok(
+        &ws,
+        &[
+            "decisions",
+            "reverse",
+            NAME,
+            &id,
+            "--in",
+            "director",
+            "--by",
+            "session",
+            "--reason",
+            "wrong call",
+        ],
+    );
+    let rid = r["id"].as_str().unwrap().to_string();
+    agree("reversed");
+
+    // With the reversal left only in the bucket, `show`'s remote-aware
+    // status reads reversed, and its review says the same. The attempts
+    // read uses this host's store alone, so it doesn't see the reversal.
+    let held = host
+        .home
+        .join(".koto/sessions/director/ctx/koto/aimed")
+        .join(&session_id)
+        .join(&rid);
+    std::fs::remove_file(&held).unwrap();
+    let shown = host.ok(&ws, &["decisions", "show", NAME, &id]);
+    assert_eq!(shown["status"], "reversed", "{shown}");
+    assert_eq!(shown["review"]["state"], "reversed", "{shown}");
+    assert_eq!(
+        shown["review"]["reversed_by"]["id"],
+        rid.as_str(),
+        "{shown}"
+    );
+    let listed = host.ok(&ws, &["decisions", "attempts", "--in", NAME]);
+    assert_eq!(
+        listed["attempts"][0]["review"]["state"], "awaiting",
+        "{listed}"
+    );
+}

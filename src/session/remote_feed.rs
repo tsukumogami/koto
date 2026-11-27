@@ -494,17 +494,9 @@ pub struct ScannedSession {
 }
 
 /// A source a local session was imported from, by its latest
-/// `session_imported` event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportedSource {
-    /// The source's workspace prefix; `None` when its workspace path
-    /// couldn't be turned into one.
-    pub prefix: Option<String>,
-    /// The source's session name.
-    pub name: String,
-    /// The source's `session_id`.
-    pub session_id: String,
-}
+/// `session_imported` event. Defined beside the dashboard's local scan,
+/// which records it.
+pub use koto_session_reader::dashboard::ImportedSource;
 
 /// What a scan needs to know about this machine's own sessions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

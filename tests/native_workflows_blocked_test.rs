@@ -15,7 +15,7 @@ mod host_session;
 use koto::engine::types::{Event, EventPayload, StateFileHeader};
 use koto::session::local::LocalBackend;
 use koto::session::SessionBackend;
-use koto::workflows_surface::{publish_location, workflow_filename};
+use koto::workflows_surface::{publish_location, workflow_filename, CONTRACT_VERSION};
 
 const WORKFLOW: &str = "impl-feature";
 const SESSION_UUID: &str = "blocked-uuid";
@@ -161,7 +161,7 @@ fn a_gate_blocked_session_reads_blocked_in_the_running_bucket() {
         v["status"]
     );
     assert_eq!(v["koto"]["status"], "blocked");
-    assert_eq!(v["koto"]["contractVersion"], 5);
+    assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
 
     let step = verify_step(&v);
     assert_eq!(step["state"], "error");

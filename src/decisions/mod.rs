@@ -13,11 +13,16 @@
 //! or removal reaches them: [`crate::session::links::check_decision_key`]
 //! refuses every writer under the three areas. Only [`store`] writes them.
 //!
+//! - [`attempts`]: judgments carrying `state` and `result`, the attempts
+//!   read and the review of a provisional judgment.
 //! - [`body`]: the decision body, its kinds, outcomes and subjects, and its
 //!   size caps.
 //! - [`decider`]: the decider, agent, run mode and authority, from koto's
 //!   own variables and keys.
-//! - [`chain`]: the chain snapshot over dispatched-by and held-by links.
+//! - [`chain`]: the chain snapshot over dispatched-by and held-by links,
+//!   and the chain read that follows supersede markers forward.
+//! - [`marker`]: the supersede marker `koto init --supersede` writes in
+//!   the session it fences.
 //! - [`store`]: the allocator, the create-only writer and the listing of a
 //!   session's areas with their integrity checks.
 //! - [`gate_pass`]: the decisions koto's own commands record with the
@@ -26,10 +31,17 @@
 //! - [`standing`]: who may reverse what, where a reversal is recorded,
 //!   racing reversals and each decision's status.
 
+pub mod attempts;
 pub mod body;
 pub mod chain;
 pub mod decider;
 pub mod gate_pass;
+pub mod history;
+pub mod marker;
+pub mod packets;
+pub mod precedent;
+pub mod prompt;
+pub mod questions;
 pub mod read;
 pub mod standing;
 pub mod store;
@@ -47,6 +59,13 @@ pub const PACKS_AREA: &str = "koto/packs";
 /// The three areas, as context-key prefixes without the trailing slash.
 pub const AREAS: [&str; 3] = [DECISIONS_AREA, AIMED_AREA, PACKS_AREA];
 
+/// The question content area: one write-once file per question, keyed by
+/// the escalate's decision id, holding the bytes a person was shown
+/// ([`packets`]). It isn't a decision area: nothing in it is a decision
+/// body, so the readers that iterate [`AREAS`] never see it, but it is as
+/// write-once as they are.
+pub const PACKETS_AREA: &str = "koto/packets";
+
 /// How many digits a decision id has.
 pub const ID_WIDTH: usize = 12;
 
@@ -59,8 +78,8 @@ pub const FORMAT_VERSION: u32 = 1;
 /// sessions below it.
 pub const MAX_AREA_ENTRIES: usize = 100_000;
 
-/// Whether `key` lies in one of the three decision areas, or names an area
-/// root itself. The first component is compared case-insensitively, as
+/// Whether `key` lies in one of the three decision areas or the question
+/// content area, or names an area root itself. The first component is compared case-insensitively, as
 /// [`crate::session::links::is_reserved_key`] does, so `KOTO/decisions/...`
 /// can't reach the same directory on a case-insensitive filesystem; the
 /// area component is compared the same way.
@@ -69,9 +88,17 @@ pub fn is_decision_area_key(key: &str) -> bool {
     let first = parts.next().unwrap_or("");
     let second = parts.next().unwrap_or("");
     first.eq_ignore_ascii_case("koto")
-        && ["decisions", "aimed", "packs"]
+        && ["decisions", "aimed", "packs", "packets"]
             .iter()
             .any(|area| second.eq_ignore_ascii_case(area))
+}
+
+/// Whether `key` is one no writer may change or remove through a context
+/// store, koto's own included: a key in a decision area
+/// ([`is_decision_area_key`]) or the supersede marker
+/// ([`marker::is_marker_key`]), each compared case-insensitively.
+pub fn is_write_once_key(key: &str) -> bool {
+    is_decision_area_key(key) || marker::is_marker_key(key)
 }
 
 /// Whether `id` is a decision id: exactly [`ID_WIDTH`] ASCII digits.
@@ -100,6 +127,9 @@ pub mod codes {
     /// A reversal was refused; the output names the reason from
     /// [`super::standing::reasons`].
     pub const REVERSAL_REFUSED: &str = "reversal_refused";
+    /// A person's answer failed a check against the harness's record of
+    /// its question prompt; the message names the check.
+    pub const PROMPT_UNVERIFIED: &str = "prompt_unverified";
 }
 
 /// A decision command's refusal: a code from [`codes`], the field it names
@@ -148,9 +178,21 @@ mod tests {
         assert!(is_decision_area_key("koto/aimed/abc/000000000001"));
         assert!(is_decision_area_key("koto/packs"));
         assert!(is_decision_area_key("koto/decisions"));
+        assert!(is_decision_area_key("koto/packets/000000000001"));
+        assert!(is_decision_area_key("KOTO/PACKETS"));
         assert!(!is_decision_area_key("koto/links/held-by/a"));
         assert!(!is_decision_area_key("decisions/000000000001"));
         assert!(!is_decision_area_key("koto/decisionsx/1"));
+    }
+
+    #[test]
+    fn the_marker_is_write_once_and_not_a_decision_area() {
+        assert!(is_write_once_key("koto/superseded-by"));
+        assert!(is_write_once_key("Koto/SUPERSEDED-BY"));
+        assert!(is_write_once_key("koto/decisions/000000000001"));
+        assert!(!is_decision_area_key("koto/superseded-by"));
+        assert!(!is_write_once_key("koto/superseded-carry-complete"));
+        assert!(!is_write_once_key("koto/links/held-by/a"));
     }
 
     #[test]

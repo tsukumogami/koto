@@ -26,21 +26,64 @@ jobs:
           done
           exit $failed
 
-  unit-tests:
-    name: Unit Tests
+  # The suite runs once, under coverage instrumentation, with nextest giving
+  # each test its own process. The nextest `ci` profile in .config/nextest.toml
+  # forbids retries and filters; `validate` fails unless this job succeeded.
+  tests:
+    name: Tests and Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Prebuilt, checksum-verified binaries at pinned versions; fallback: none
+      # fails the step rather than build a tool from source.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.150
+          fallback: none
+
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh -p koto -p koto-session-reader -p koto-session-list`: the same nextest `ci`
+      # profile, without coverage or --all-features, falling back to a serial `cargo test` where
+      # cargo-nextest isn't installed.
       # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
       # version bump that skips the lock file can't reach a tag.
-      - name: Run tests
-        run: cargo test --locked -- --test-threads=1
+      # Without -p, cargo runs only the root package, so koto-session-reader
+      # is named beside koto and its tests count toward coverage.
+      - name: Run tests with coverage
+        run: cargo llvm-cov nextest --locked --all-features --profile ci -p koto -p koto-session-reader -p koto-session-list --lcov --output-path lcov.info
+
+      # nextest doesn't run doctests; this runs any that are added.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is the same command, without --all-features.
+      - name: Run doctests
+        run: cargo test --locked --all-features --doc -p koto -p koto-session-reader
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: target/**/nextest/ci/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   retention-cost:
     # The retention engine's cost bound: on a generated store of 2,000
@@ -58,6 +101,63 @@ jobs:
 
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
+
+      - name: Run the questions cost test in release mode
+        run: cargo test --locked --release --test questions_cost -- --nocapture
+
+  attempts-cost:
+    # The attempts read's cost bound: on a generated store of 1,000
+    # sessions in chains four deep, `koto decisions attempts --at` the top
+    # coordinator and `--in` a worker each answer within 5 seconds. The
+    # bound holds for a release build only, so the default suite runs the
+    # test on a smaller store and checks only its counts.
+    name: Attempts Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the cost test in release mode
+        run: cargo test --locked --release --test attempts_cost -- --nocapture
+
+  precedent-cost:
+    # The question reads' cost bound: on a generated store of 1,001
+    # sessions, `koto decisions precedent` and `koto decisions history` each
+    # answer within 5 seconds, locally and as the cloud backend's local copy,
+    # with no request to the bucket. The bound holds for a release build
+    # only, so the default suite runs the test on a smaller store without it.
+    name: Precedent Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the cost test in release mode
+        run: cargo test --locked --release --test precedent_cost -- --nocapture
+
+  pool-tick-cost:
+    # Host resource pools' cost bound (PRD-host-resource-pools.md R28): the
+    # median of 50 ticks on a state whose action names an undefined pool is
+    # at most 5 ms above the median of 50 on the same state without `pool`.
+    # The debug suite runs the same test; this job times a release build
+    # and prints both medians.
+    name: Pool Tick Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the tick-cost check in release mode
+        run: cargo test --locked --release --test pool_compat -- --nocapture
 
   pin-compat-v0-23:
     # Proves koto v0.23.0, the last release before pins, keeps a session the
@@ -124,18 +224,35 @@ jobs:
     # a release.
     #
     # See docs/STABILITY.md for the bump protocol.
+    #
+    # Runs under nextest's `ci` profile like the `tests` job: one process per
+    # test, no retries, no filter.
     name: Stability Tests
     runs-on: ubuntu-latest
+    # nextest's slow-timeout only warns, so this bounds a hung test.
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Same pinned install as the `tests` job.
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-nextest@0.9.150
+          fallback: none
+
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Locally it is `bash scripts/run-tests.sh -p koto-stability-tests`, the same command where
+      # cargo-nextest is installed and a serial `cargo test` where it isn't.
       - name: Run external-consumer stability tests
-        run: cargo test -p koto-stability-tests -- --test-threads=1
+        run: cargo nextest run --locked -p koto-stability-tests --profile ci
 
   msrv:
     # Builds koto on exactly the toolchain Cargo.toml's rust-version declares,
@@ -192,7 +309,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Check formatting
         run: cargo fmt --check
 
@@ -208,9 +325,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # One of the five default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # Each package is linted under its own clippy.toml, so koto-session-reader
+      # gets its write ban here as well as in the Reader Write Guard job.
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy -p koto -p koto-session-reader -p koto-session-list --all-targets -- -D warnings
 
   decider-checks:
     # The decider must not pull an async HTTP stack or a second attohttpc
@@ -245,6 +364,75 @@ jobs:
 
       - name: Check decider module purity
         run: bash scripts/check-decider-purity.sh
+
+  reader-write-guard:
+    # koto-session-reader reads the session store and must never write it.
+    # Clippy applies the crate's own clippy.toml ban list (every write,
+    # create, remove, link, lock, spawn and socket path, and file opens outside
+    # src/fs_read.rs); the script checks what the lint can't: the lib.rs
+    # attributes, no lint allows outside fs_read.rs, the one custom_flags
+    # call, the ban list's entries, no build script or [patch], crates.io-only
+    # dependencies within an allowlist, and who may call open_plain. The
+    # self-test runs after the plain check, which fills the dependency cache
+    # its --offline cargo runs read.
+    name: Reader Write Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy on koto-session-reader under its ban list
+        run: cargo clippy -p koto-session-reader --all-targets --locked -- -D warnings
+
+      - name: Check the reader's read-only rules
+        run: bash scripts/check-reader-readonly.sh
+
+      - name: Check that planted violations make it fail
+        run: bash scripts/check-reader-readonly.sh --self-test
+
+  reader-version:
+    # koto and koto-session-reader release together under the workspace
+    # version: a dependent pins the crate by koto's release tag. This fails
+    # when the two versions differ or the crate declares a path dependency,
+    # then packages the crate as a registry would, which fails if it reaches
+    # a file outside its directory or a dependency not on crates.io.
+    name: Reader Version and Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check koto and koto-session-reader share one version
+        run: |
+          set -euo pipefail
+          meta="$(cargo metadata --no-deps --format-version 1 --locked)"
+          versions="$(jq -r '.packages[] | select(.name == "koto" or .name == "koto-session-reader") | "\(.name) \(.version)"' <<<"$meta")"
+          echo "$versions"
+          if [ "$(printf '%s\n' "$versions" | grep -c .)" -ne 2 ]; then
+            echo "::error::cargo metadata does not list both koto and koto-session-reader"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$versions" | awk '{ print $2 }' | sort -u | wc -l)" -ne 1 ]; then
+            echo "::error::koto and koto-session-reader have different versions"
+            exit 1
+          fi
+          paths="$(jq -r '.packages[] | select(.name == "koto-session-reader") | .dependencies[] | select(.path != null) | .name' <<<"$meta")"
+          if [ -n "$paths" ]; then
+            echo "::error::koto-session-reader declares a path dependency: $(printf '%s\n' "$paths" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "PASS: one version, no path dependency in koto-session-reader"
+
+      - name: Package koto-session-reader
+        run: cargo package -p koto-session-reader --locked
 
   decider-compat-v0-12-2:
     # Proves koto v0.12.2 ignores field-level `decider` blocks without
@@ -620,6 +808,69 @@ jobs:
       - name: Check that log mutations make it fail
         run: test/compat/check-lifecycle-v0_14_1.sh --self-test
 
+  pool-compat-v0-38-0:
+    # Proves koto v0.38.0, the release before host resource pools, compiles
+    # and runs a template with `pool: test-suite` unthrottled while the
+    # PR's koto holds that pool's only slot, and reads with `koto status` a
+    # session log holding all five pool and background event types. Same
+    # pinned installer as the jobs above (install.sh is unchanged between
+    # the two tags); no secret is needed.
+    name: Pool Compat (koto v0.38.0)
+    runs-on: ubuntu-latest
+    env:
+      KOTO_FLOOR_VERSION: v0.38.0
+      # Commit the v0.38.0 tag points to, and the SHA-256 of its install.sh.
+      KOTO_INSTALLER_COMMIT: 556f26dd27d54d2103ae676126663ef51164a9c4
+      KOTO_INSTALLER_SHA256: 5f8c62f618f8181fa4b48e0e600e1208dddd1f0dab668a73e1b52ae7b52ba319
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require sha256sum
+        run: |
+          if ! command -v sha256sum >/dev/null 2>&1; then
+            echo "::error::sha256sum is not on PATH; the koto installer can't be verified"
+            exit 1
+          fi
+
+      - name: Install koto v0.38.0 through the pinned installer
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/koto-install.sh"
+          curl -fsSL -o "$installer" \
+            "https://raw.githubusercontent.com/tsukumogami/koto/${KOTO_INSTALLER_COMMIT}/install.sh"
+          if ! echo "${KOTO_INSTALLER_SHA256}  ${installer}" | sha256sum -c -; then
+            echo "::error::install.sh at ${KOTO_INSTALLER_COMMIT} does not match the recorded SHA-256"
+            exit 1
+          fi
+          install_dir="$RUNNER_TEMP/koto-floor"
+          KOTO_INSTALL_DIR="$install_dir" bash "$installer" --version="$KOTO_FLOOR_VERSION" --no-modify-path
+          KOTO_FLOOR_BIN="$install_dir/bin/koto"
+          reported="$("$KOTO_FLOOR_BIN" version)"
+          echo "$reported"
+          case "$reported" in
+            "koto ${KOTO_FLOOR_VERSION#v} "*|"koto ${KOTO_FLOOR_VERSION#v}") ;;
+            *)
+              echo "::error::$KOTO_FLOOR_BIN reports '$reported', expected koto ${KOTO_FLOOR_VERSION#v}"
+              exit 1
+              ;;
+          esac
+          echo "KOTO_FLOOR_BIN=$KOTO_FLOOR_BIN" >> "$GITHUB_ENV"
+
+      - name: Build the PR's koto
+        run: |
+          cargo build --release
+          echo "KOTO_NEW_BIN=$GITHUB_WORKSPACE/target/release/koto" >> "$GITHUB_ENV"
+
+      - name: Run the v0.38.0 compatibility check
+        run: test/compat/pool-v0_38_0.sh
+
+      - name: Check that log and pool mutations make it fail
+        run: test/compat/pool-v0_38_0.sh --self-test
+
   poll-forge-neutral:
     # The polling gate and clear-on-entry code stay free of any forge and of
     # credentials: koto runs the command a template names and nothing else.
@@ -646,6 +897,68 @@ jobs:
       - name: Check no skill passes koto evidence inline
         run: bash scripts/check-inline-evidence_test.sh
 
+  session-list:
+    # koto-session-list reads koto's session store through
+    # koto-session-reader alone. On the release build this checks that its
+    # rows match koto dashboard's and its values koto context get's, that
+    # nothing in its build can reach storage or the network, and that a
+    # hundred of its reads on a cloud host change no file and send no
+    # request. tests/koto_session_list_test.rs says what each test proves.
+    name: Session List Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build koto and koto-session-list in release mode
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p koto -p koto-session-list
+          echo "SESSION_LIST_BIN=$GITHUB_WORKSPACE/target/release/koto-session-list" >> "$GITHUB_ENV"
+
+      # The same pattern run on koto must match, so a renamed crate or a
+      # changed cargo tree format can't turn the check into a pass. Each
+      # command's output is captured before it is searched, so a failing
+      # cargo tree or nm fails the step under `set -e` rather than handing
+      # grep an empty input that reads as a pass.
+      - name: Check the build graph has no storage, TLS, HTTP or terminal crate
+        run: |
+          set -euo pipefail
+          banned='^(rust-s3|rustls[^ ]*|attohttpc|http|url|ratatui|crossterm) '
+          list_tree="$(cargo tree --locked -p koto-session-list -e normal,build --prefix none)"
+          koto_tree="$(cargo tree --locked -p koto -e normal,build --prefix none)"
+          if grep -E "$banned" <<<"$list_tree"; then
+            echo "::error::koto-session-list's build graph holds the crates above"
+            exit 1
+          fi
+          if ! grep -qE "$banned" <<<"$koto_tree"; then
+            echo "::error::the pattern matched nothing in koto's own build graph"
+            exit 1
+          fi
+          echo "PASS: no storage, TLS, HTTP or terminal crate"
+
+      - name: Check the binary imports no network call
+        run: |
+          set -euo pipefail
+          imports() { nm -D --undefined-only "$1" | awk '{print $NF}' | sed 's/@.*//'; }
+          list_syms="$(imports target/release/koto-session-list)"
+          koto_syms="$(imports target/release/koto)"
+          if grep -xE 'connect|socket|getaddrinfo' <<<"$list_syms"; then
+            echo "::error::koto-session-list imports the calls above"
+            exit 1
+          fi
+          if ! grep -qxE 'connect|socket|getaddrinfo' <<<"$koto_syms"; then
+            echo "::error::the symbol check found no network call in koto itself"
+            exit 1
+          fi
+          echo "PASS: no connect, socket or getaddrinfo import"
+
+      - name: Run the parity and hundred-read tests
+        run: cargo test --locked --release --test koto_session_list_test -- --ignored
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
@@ -661,30 +974,6 @@ jobs:
 
       - name: Run audit
         run: cargo audit
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -- --test-threads=1
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
 
   tsuku-distributed-install:
     name: Distributed Install (tsuku)
@@ -738,29 +1027,40 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, retention-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, tests, retention-cost, attempts-cost, precedent-cost, pool-tick-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, reader-write-guard, reader-version, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, pool-compat-v0-38-0, poll-forge-neutral, inline-evidence, session-list, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # The two suite jobs, tests and stability-tests, must be exactly
+      # `success`: a cancelled or skipped suite run would otherwise pass.
+      # session-list is held to the same rule, since its parity and
+      # hundred-read tests run nowhere else.
       - name: Check results
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
-             [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.tests.result }}" != "success" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
+             [ "${{ needs.attempts-cost.result }}" = "failure" ] || \
+             [ "${{ needs.precedent-cost.result }}" = "failure" ] || \
+             [ "${{ needs.pool-tick-cost.result }}" = "failure" ] || \
              [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
-             [ "${{ needs.stability-tests.result }}" = "failure" ] || \
+             [ "${{ needs.stability-tests.result }}" != "success" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.decider-checks.result }}" = "failure" ] || \
+             [ "${{ needs.reader-write-guard.result }}" = "failure" ] || \
+             [ "${{ needs.reader-version.result }}" = "failure" ] || \
              [ "${{ needs.decider-compat-v0-12-2.result }}" = "failure" ] || \
              [ "${{ needs.failure-reporting-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.ci-wait-stale-keys-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.decider-checks-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.value-routing-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.check-lifecycle-compat-v0-14-1.result }}" = "failure" ] || \
+             [ "${{ needs.pool-compat-v0-38-0.result }}" = "failure" ] || \
              [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
              [ "${{ needs.inline-evidence.result }}" = "failure" ] || \
+             [ "${{ needs.session-list.result }}" != "success" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then

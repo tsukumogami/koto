@@ -7,15 +7,23 @@
 //!
 //! 1. **Check.** PRED's log is read. A fence already naming SUCC (same name
 //!    and session id, or SUCC's name when SUCC doesn't exist yet: a crash
-//!    between the fence and the create) makes this a re-run, which goes on
-//!    to step 3. A fence naming another session, a state other than
-//!    `--expect-state`, SUCC being PRED (`self`) or a supersede loop
-//!    (`cycle`) refuse, exit 2, with nothing written.
-//! 2. **Fence.** A `session_superseded` event naming SUCC is appended to
-//!    PRED's own log under its append lock, waited for at most
+//!    between the fence and the create) makes this a re-run, which writes
+//!    the supersede marker if it is missing and goes on to step 3. A fence
+//!    naming another session, a state other than `--expect-state`, SUCC
+//!    being PRED (`self`) or a supersede loop (`cycle`) refuse, exit 2,
+//!    with nothing written.
+//! 2. **Fence.** PRED's `ctx/manifest.lock` is taken, the highest decision
+//!    id PRED holds is read under it, and a `session_superseded` event
+//!    naming SUCC is appended to PRED's own log under its append lock, both
+//!    locks held through the append. Each wait is bounded by
 //!    [`FENCE_LOCK_WAIT`]: a lock still held then exits 3
 //!    `fence_unavailable`, nothing written. The log is checked again under
-//!    the lock, so of two successors the first append wins.
+//!    the lock, so of two successors the first append wins. Then the
+//!    supersede marker, `koto/superseded-by` ([`crate::decisions::marker`]),
+//!    is written create-only in PRED, naming SUCC by name and id with the
+//!    fence's actor and time and that decision id. A marker that can't be
+//!    written exits 3 `persistence_error` before SUCC is created, and a
+//!    re-run writes it.
 //! 3. **Create.** SUCC is created with the minted id and its continues
 //!    relation, unless an earlier run of this command already created it.
 //! 4. **Carry.** Every key under each `--carry` prefix is copied from PRED
@@ -31,10 +39,13 @@
 //! workspace's prefix, and steps 1 and 2 work on the bucket's copy there,
 //! not on this host's: its state is pulled with its ETag (from the
 //! `--continues-from` prefix, else the one its local copy records), checked,
-//! and pushed back with the fence appended, conditional on that ETag. A
-//! refused or failed conditional push, or a bucket that can't write
-//! conditionally, exits 3 `fence_unavailable` with nothing written; there
-//! is no unconditional fallback. Of two successors the first push wins; the
+//! its decision areas are listed for the marker's decision id, and it is
+//! pushed back with the fence appended, conditional on that ETag. A failed
+//! listing, a refused or failed conditional push, or a bucket that can't
+//! write conditionally, exits 3 `fence_unavailable` with nothing written;
+//! there is no unconditional fallback. The marker is then PUT beside PRED's
+//! state object with `If-None-Match: *`, and copied into this host's copy
+//! of PRED when it has one. Of two successors the first push wins; the
 //! other's push is refused, it reads the fence, and it refuses as it would
 //! at step 1. Step 4 reads the predecessor's manifest from the same prefix,
 //! skips the keys this host's copy of the successor already holds with the
@@ -54,9 +65,11 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::decisions::marker::{self, SupersedeMarker};
+use crate::decisions::store;
 use crate::engine::persistence::{
-    append_supersede_fence, derive_state_from_log, superseded_by, FenceOutcome, SupersedeFence,
-    FENCE_LOCK_WAIT,
+    append_supersede_fence, derive_state_from_log, read_fence, superseded_by, FenceOutcome,
+    SupersedeFence, FENCE_LOCK_WAIT,
 };
 use crate::engine::types::{generate_session_id, now_iso8601, Event, EventPayload, SupersedeActor};
 use crate::session::cloud::{
@@ -476,24 +489,29 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
             .map(|h| h.session_id)
             .unwrap_or_default()
     };
-    // `Some(id)` when an earlier run of this command already fenced PRED
-    // for this successor: the id the successor has, or is created with.
-    let rerun_id = match superseded_by(&pred_events).map(|f| trusted(pred, f)) {
+    // `Some(fence)` when an earlier run of this command already fenced
+    // PRED for this successor: its session id is the one the successor
+    // has, or is created with.
+    let rerun = match superseded_by(&pred_events).map(|f| trusted(pred, f)) {
         Some(fence) if fence.by == name => {
             if succ_exists && succ_session_id() != fence.by_session_id {
                 // A session of the same name, but not the one the fence
                 // names: another session, not this command's earlier run.
                 refuse_superseded_by(backend, pred, &fence);
             }
-            Some(fence.by_session_id)
+            Some(fence)
         }
         Some(fence) => refuse_superseded_by(backend, pred, &fence),
         None => None,
     };
 
-    let fenced_now = rerun_id.is_none();
-    let session_id = match rerun_id {
-        Some(id) => id,
+    let fenced_now = rerun.is_none();
+    let (fence, marker) = match rerun {
+        // A re-run writes the marker an earlier run was stopped before.
+        Some(fence) => {
+            let marker = mark_on_rerun(backend, pred, name, pulled.as_ref(), &fence);
+            (fence, marker)
+        }
         None => {
             if let Some(expected) = args.expect_state {
                 let actual = derive_state_from_log(&pred_events).unwrap_or_default();
@@ -532,19 +550,23 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
                 );
             }
             // 2. Fence, with the successor's id minted first.
-            let id = generate_session_id();
             let fence = SupersedeFence {
                 by: name.to_string(),
-                by_session_id: id.clone(),
+                by_session_id: generate_session_id(),
                 actor: actor(),
                 at: now_iso8601(),
             };
-            match &pulled {
-                Some(pulled) => fence_in_bucket(backend, pred, pulled, &fence, id),
-                None => fence_locally(backend, pred, &pred_log, &fence, id),
-            }
+            let (fence, through) = match &pulled {
+                Some(pulled) => fence_in_bucket(backend, pred, pulled, &fence),
+                None => fence_locally(backend, pred, &pred_log, &fence),
+            };
+            // 2b. The marker, after the fence and before the create.
+            let marker = SupersedeMarker::new(&fence, through);
+            let written = write_marker(backend, pred, name, pulled.as_ref(), &marker);
+            (fence, written)
         }
     };
+    let session_id = fence.by_session_id.clone();
 
     // 3. Create, unless an earlier run already did.
     let mut environment_report = None;
@@ -609,67 +631,110 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
         "superseded": pred,
         "carried": carried,
         "forward": name,
+        "marker": marker.as_str(),
     });
     super::add_environment_report(&mut out, environment_report.as_ref());
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
-/// Step 2 on the local backend: append the fence to `pred`'s own log under
-/// its append lock. Returns the successor's session id, or refuses.
+/// Step 2 on the local backend: take `pred`'s `ctx/manifest.lock`, read
+/// the highest decision id it holds, and append the fence to its own log
+/// under its append lock, both locks held through the append. Returns the
+/// fence as the log records it and that id, or refuses.
+///
+/// The manifest lock comes first and the append lock inside it, the order a
+/// decision writer takes them in too (it allocates under the manifest lock
+/// in [`crate::decisions::store`] and appends a gate-passing event inside
+/// it), so the two can't deadlock and a decision can't land between the
+/// count and the fence. Each wait is bounded by [`FENCE_LOCK_WAIT`].
+///
+/// A predecessor whose decision areas can't be listed is refused rather
+/// than fenced: the marker would have to record a `decisions_through` koto
+/// can't vouch for, and a reader would take a later decision for one the
+/// fence saw.
 fn fence_locally(
     backend: &Backend,
     pred: &str,
     pred_log: &Path,
     fence: &SupersedeFence,
-    id: String,
-) -> String {
-    match append_supersede_fence(pred_log, fence, &fence.at, FENCE_LOCK_WAIT) {
-        Ok(FenceOutcome::Fenced { .. }) | Ok(FenceOutcome::AlreadyOurs) => id,
-        Ok(FenceOutcome::SupersededByOther(other)) => refuse_superseded_by(backend, pred, &other),
-        Ok(FenceOutcome::Unavailable) => refuse(
+) -> (SupersedeFence, Option<String>) {
+    let local = local_of(backend);
+    let locked = local.with_manifest_lock_within(pred, FENCE_LOCK_WAIT, || {
+        let through = match marker::decisions_through(&store::list_local(&local.ctx_path(pred))) {
+            Ok(through) => through,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let outcome = append_supersede_fence(pred_log, fence, &fence.at, FENCE_LOCK_WAIT)?;
+        Ok(Ok((outcome, through)))
+    });
+    let unavailable = |what: &str| -> ! {
+        refuse(
             "fence_unavailable",
             format!(
-                "--supersede: '{pred}''s log stayed locked by another writer for {} \
+                "--supersede: '{pred}''s {what} stayed locked by another writer for {} \
                  seconds; nothing was written. Run the command again",
                 FENCE_LOCK_WAIT.as_secs()
             ),
             super::EXIT_INFRASTRUCTURE,
             serde_json::Value::Null,
-        ),
-        Err(e) => refuse(
+        )
+    };
+    let failed = |e: String| -> ! {
+        refuse(
             "persistence_error",
-            format!("--supersede: could not fence '{pred}': {e:#}; nothing was written"),
+            format!("--supersede: could not fence '{pred}': {e}; nothing was written"),
             super::EXIT_INFRASTRUCTURE,
             serde_json::Value::Null,
-        ),
+        )
+    };
+    match locked {
+        Ok(None) => unavailable("context manifest"),
+        Err(e) => failed(format!("{e:#}")),
+        Ok(Some(Err(problem))) => failed(format!(
+            "it holds decision files koto can't read ({problem}), so the fence can't record \
+             which decisions came before it"
+        )),
+        Ok(Some(Ok((outcome, through)))) => match outcome {
+            FenceOutcome::Fenced { .. } => (fence.clone(), through),
+            // The log's own fence names the same successor and id; its
+            // actor and time are the ones the marker records.
+            FenceOutcome::AlreadyOurs => {
+                let recorded = read_fence(pred_log)
+                    .ok()
+                    .flatten()
+                    .filter(|f| f.by == fence.by && f.by_session_id == fence.by_session_id)
+                    .unwrap_or_else(|| fence.clone());
+                (recorded, through)
+            }
+            FenceOutcome::SupersededByOther(other) => refuse_superseded_by(backend, pred, &other),
+            FenceOutcome::Unavailable => unavailable("log"),
+        },
     }
 }
 
-/// Step 2 on the cloud backend: push the fence into the pulled copy,
-/// conditional on its ETag. Returns the successor's session id, or refuses:
-/// a rival's fence as `superseded_by`, and anything that isn't a confirmed
-/// conditional push exits 3 `fence_unavailable`, nothing written.
+/// Step 2 on the cloud backend: list the predecessor's decisions in the
+/// bucket, then push the fence into the pulled copy, conditional on its
+/// ETag. Returns the fence the bucket holds and the highest decision id
+/// listed, or refuses: a rival's fence as `superseded_by`, and a failed
+/// listing or anything that isn't a confirmed conditional push exits 3
+/// `fence_unavailable`, nothing written.
+///
+/// No lock spans this host and the predecessor's, so the listing comes
+/// before the push; a decision written between the two reads as written
+/// after the fence, which errs toward the fence.
 fn fence_in_bucket(
     backend: &Backend,
     pred: &str,
     pulled: &PulledState,
     fence: &SupersedeFence,
-    id: String,
-) -> String {
+) -> (SupersedeFence, Option<String>) {
     // `pulled` is only ever set under the cloud backend.
     let Some(cloud) = backend.as_cloud() else {
         unreachable!("a pulled copy is the cloud backend's");
     };
-    match cloud.push_fence(pulled, fence) {
-        CloudFence::Fenced => id,
-        CloudFence::Taken(other)
-            if other.by == fence.by && other.by_session_id == fence.by_session_id =>
-        {
-            id
-        }
-        CloudFence::Taken(other) => refuse_superseded_by(backend, pred, &trusted(pred, other)),
-        CloudFence::Unavailable(reason) => refuse(
+    let unavailable = |reason: String| -> ! {
+        refuse(
             "fence_unavailable",
             format!(
                 "--supersede: '{pred}' couldn't be fenced in the bucket: {reason}; nothing was \
@@ -677,7 +742,200 @@ fn fence_in_bucket(
             ),
             super::EXIT_INFRASTRUCTURE,
             serde_json::Value::Null,
+        )
+    };
+    let through = cloud
+        .decisions_through_at(&pulled.prefix, pred)
+        .unwrap_or_else(|e| unavailable(format!("its decisions can't be listed: {e:#}")));
+    match cloud.push_fence(pulled, fence) {
+        CloudFence::Fenced => (fence.clone(), through),
+        CloudFence::Taken(other)
+            if other.by == fence.by && other.by_session_id == fence.by_session_id =>
+        {
+            (trusted(pred, other), through)
+        }
+        CloudFence::Taken(other) => refuse_superseded_by(backend, pred, &trusted(pred, other)),
+        CloudFence::Unavailable(reason) => unavailable(reason),
+    }
+}
+
+/// What a run found or did about the predecessor's supersede marker, as
+/// the success output's `marker` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerOutcome {
+    /// This run wrote it.
+    Written,
+    /// One was already there, and was left as it is.
+    Present,
+    /// One was already there that doesn't parse; it was left as it is,
+    /// and every reader treats the predecessor as unreadable.
+    Unreadable,
+}
+
+impl MarkerOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            MarkerOutcome::Written => "written",
+            MarkerOutcome::Present => "present",
+            MarkerOutcome::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// The local backend under `backend`: itself, or the cloud backend's
+/// local store.
+fn local_of(backend: &Backend) -> &crate::session::local::LocalBackend {
+    match backend {
+        Backend::Local(l) => l,
+        Backend::Cloud(c) => c.local(),
+    }
+}
+
+/// The refusal for a marker that couldn't be written once the fence is in
+/// place. The successor isn't created: a re-run finds the fence, writes the
+/// marker and goes on.
+fn refuse_marker_failed(pred: &str, name: &str, why: String) -> ! {
+    refuse(
+        "persistence_error",
+        format!(
+            "--supersede: '{pred}' is fenced for '{name}', but its supersede marker couldn't be \
+             written: {why}. '{name}' wasn't created; run the same command again to write the \
+             marker and finish"
         ),
+        super::EXIT_INFRASTRUCTURE,
+        serde_json::Value::Null,
+    )
+}
+
+/// Write `marker` in the predecessor, create-only: locally in its context
+/// directory, or under the cloud backend in the bucket beside its state
+/// object (`If-None-Match: *`), then best-effort in this host's copy. A
+/// marker already there is left as it is. A write that fails refuses
+/// `persistence_error`, exit 3, before the successor is created.
+fn write_marker(
+    backend: &Backend,
+    pred: &str,
+    name: &str,
+    pulled: Option<&PulledState>,
+    marker: &SupersedeMarker,
+) -> MarkerOutcome {
+    match (pulled, backend.as_cloud()) {
+        (Some(pulled), Some(cloud)) => {
+            let written = cloud
+                .put_supersede_marker(&pulled.prefix, pred, &marker.to_bytes())
+                .unwrap_or_else(|e| refuse_marker_failed(pred, name, format!("{e:#}")));
+            if written {
+                cloud.copy_supersede_marker_locally(&pulled.prefix, pred, marker);
+                MarkerOutcome::Written
+            } else {
+                MarkerOutcome::Present
+            }
+        }
+        _ => {
+            let local = local_of(backend);
+            let written =
+                marker::write_local(&local.session_dir(pred), &local.ctx_path(pred), marker)
+                    .unwrap_or_else(|e| refuse_marker_failed(pred, name, format!("{e:#}")));
+            if written {
+                MarkerOutcome::Written
+            } else {
+                existing_marker(&local.ctx_path(pred))
+            }
+        }
+    }
+}
+
+/// How a marker found already in place at `ctx_dir` reads.
+fn existing_marker(ctx_dir: &Path) -> MarkerOutcome {
+    match marker::read(ctx_dir) {
+        Ok(_) => MarkerOutcome::Present,
+        Err(_) => MarkerOutcome::Unreadable,
+    }
+}
+
+/// On a re-run (the fence already names this successor), write the marker
+/// when an earlier run stopped between the fence and the marker, with
+/// `decisions_through` read again: under the predecessor's manifest lock,
+/// waited for at most [`FENCE_LOCK_WAIT`], or from the bucket's listing.
+/// A marker already there is left as it is, a malformed one included: it is
+/// never replaced, and every reader treats the predecessor as unreadable.
+fn mark_on_rerun(
+    backend: &Backend,
+    pred: &str,
+    name: &str,
+    pulled: Option<&PulledState>,
+    fence: &SupersedeFence,
+) -> MarkerOutcome {
+    match (pulled, backend.as_cloud()) {
+        (Some(pulled), Some(cloud)) => {
+            match cloud.supersede_marker_at(&pulled.prefix, pred) {
+                Ok(Some(bytes)) => {
+                    return match SupersedeMarker::parse(&bytes) {
+                        Ok(_) => MarkerOutcome::Present,
+                        Err(_) => MarkerOutcome::Unreadable,
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => refuse_marker_failed(pred, name, format!("{e:#}")),
+            }
+            let through = cloud
+                .decisions_through_at(&pulled.prefix, pred)
+                .unwrap_or_else(|e| {
+                    refuse_marker_failed(
+                        pred,
+                        name,
+                        format!("its decisions can't be listed: {e:#}"),
+                    )
+                });
+            write_marker(
+                backend,
+                pred,
+                name,
+                Some(pulled),
+                &SupersedeMarker::new(fence, through),
+            )
+        }
+        _ => {
+            let local = local_of(backend);
+            let ctx = local.ctx_path(pred);
+            match marker::read(&ctx) {
+                Ok(Some(_)) => return MarkerOutcome::Present,
+                Err(_) => return MarkerOutcome::Unreadable,
+                Ok(None) => {}
+            }
+            let locked = local.with_manifest_lock_within(pred, FENCE_LOCK_WAIT, || {
+                let through = marker::decisions_through(&store::list_local(&ctx));
+                Ok(through.map(|through| {
+                    write_marker(
+                        backend,
+                        pred,
+                        name,
+                        None,
+                        &SupersedeMarker::new(fence, through),
+                    )
+                }))
+            });
+            match locked {
+                Ok(Some(Ok(outcome))) => outcome,
+                Ok(Some(Err(problem))) => refuse_marker_failed(
+                    pred,
+                    name,
+                    format!(
+                        "it holds decision files koto can't read ({problem}), so the marker \
+                         can't record which decisions came before the fence"
+                    ),
+                ),
+                Ok(None) => refuse_marker_failed(
+                    pred,
+                    name,
+                    format!(
+                        "its context manifest stayed locked by another writer for {} seconds",
+                        FENCE_LOCK_WAIT.as_secs()
+                    ),
+                ),
+                Err(e) => refuse_marker_failed(pred, name, format!("{e:#}")),
+            }
+        }
     }
 }
 

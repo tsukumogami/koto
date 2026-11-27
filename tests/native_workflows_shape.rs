@@ -10,15 +10,23 @@
 //! convention guard's job (`scripts/check-claude-code-conventions.sh`), which
 //! reads a Claude Code release, and `tests/native_workflows_conventions.rs`
 //! keeps every field of this fixture covered by one of the guard's probes.
+//!
+//! A second fixture, `tests/fixtures/native-workflows/reconciled-shape.json`,
+//! pins the entry the retention sweep writes for a session quiet past the
+//! stale window (contract v6: top-level `killed`, `koto.staleSince`).
 
 #[path = "support/host_session.rs"]
 mod host_session;
 
+use std::time::{Duration, UNIX_EPOCH};
+
 use koto::workflows_surface::{
-    HoldingKey, Holdings, Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION,
+    retention, HoldingKey, Holdings, Phase, ProgressNode, RenderStatus, WorkflowFile,
+    CONTRACT_VERSION,
 };
 
 const FIXTURE: &str = "tests/fixtures/native-workflows/enriched-shape.json";
+const RECONCILED_FIXTURE: &str = "tests/fixtures/native-workflows/reconciled-shape.json";
 
 /// A canonical enriched file: a four-phase session with two completed phases
 /// (one carrying evidence, one bare), an active phase blocked on a failed gate,
@@ -151,15 +159,17 @@ fn enriched_shape_matches_golden_fixture() {
     );
 }
 
-/// The fixture pins contract version 5 and the additive fields, holdings,
+/// The fixture pins contract version 6 and the additive fields, holdings,
 /// the /workflows title fields and the blocked step included, so a future
-/// reader can assert the shape it targets.
+/// reader can assert the shape it targets. Version 6's own fields are the
+/// reconciled shape's (below); a projected entry carries neither.
 #[test]
-fn fixture_pins_contract_v5_and_new_fields() {
+fn fixture_pins_contract_v6_and_new_fields() {
     let fixture = std::fs::read_to_string(FIXTURE).unwrap();
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 5);
+    assert_eq!(v["koto"]["contractVersion"], 6);
+    assert!(v["koto"].get("staleSince").is_none());
     // v5: the top-level status is the screen's word, and a blocked session
     // is running; koto's classification is koto.status.
     assert_eq!(v["status"], "running");
@@ -200,5 +210,93 @@ fn fixture_pins_contract_v5_and_new_fields() {
 #[ignore = "regeneration helper; prints the golden fixture JSON"]
 fn print_canonical_enriched_file() {
     let bytes = canonical_enriched_file().to_json_bytes().unwrap();
+    print!("{}", String::from_utf8(bytes).unwrap());
+}
+
+/// The last write of the canonical reconciled entry: 2026-11-13 01:58 UTC.
+const QUIET_SINCE_SECS: u64 = 1_794_535_080;
+
+/// A canonical reconciled entry: a running session in its `implement` phase,
+/// put through the retention sweep's own edit as though it went quiet at
+/// [`QUIET_SINCE_SECS`]. The edit is the one the sweep writes, so the fixture
+/// pins what lands on disk, not a hand-built copy.
+fn canonical_reconciled_entry() -> serde_json::Value {
+    let workflow_progress = vec![
+        ProgressNode::WorkflowPhase {
+            index: 1,
+            title: "Implement".to_string(),
+        },
+        ProgressNode::WorkflowAgent {
+            index: 1,
+            label: "Implement".to_string(),
+            phase_index: 1,
+            phase_title: "Implement".to_string(),
+            state: "progress".to_string(),
+            prompt_preview: "Implement the change per the gathered context.".to_string(),
+            result_preview: String::new(),
+            blocked: false,
+            error: String::new(),
+        },
+    ];
+    let phases = vec![Phase {
+        title: "Implement".to_string(),
+        detail: String::new(),
+    }];
+    let projected = WorkflowFile::new(
+        "11111111-2222-4333-8444-555555555555",
+        "work-on",
+        "work-on \u{b7} implement".to_string(),
+        Some("implement".to_string()),
+        RenderStatus::Running,
+        1_700_000_000_000,
+    )
+    .with_detail(phases, workflow_progress);
+    let value: serde_json::Value =
+        serde_json::from_slice(&projected.to_json_bytes().unwrap()).unwrap();
+    retention::reconciled(&value, UNIX_EPOCH + Duration::from_secs(QUIET_SINCE_SECS))
+}
+
+/// The reconciled entry matches its committed fixture: what the sweep
+/// writes for a session quiet past the stale window.
+#[test]
+fn reconciled_shape_matches_golden_fixture() {
+    let actual = canonical_reconciled_entry();
+    let fixture = std::fs::read_to_string(RECONCILED_FIXTURE)
+        .unwrap_or_else(|e| panic!("read golden fixture {RECONCILED_FIXTURE}: {e}"));
+    let expected: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    assert_eq!(
+        actual, expected,
+        "the reconciled /workflows shape drifted from the golden fixture \
+         ({RECONCILED_FIXTURE}). If the change is intentional, regenerate it with \
+         `cargo test --test native_workflows_shape -- --ignored --nocapture`, \
+         commit the printed JSON, and run \
+         `cargo test --test native_workflows_conventions`."
+    );
+}
+
+/// The reconciled fixture is version 6's own shape: `killed`, the summary
+/// suffix, `koto.staleSince`, and koto's classification left as it was.
+#[test]
+fn reconciled_fixture_pins_killed_and_stale_since() {
+    let fixture = std::fs::read_to_string(RECONCILED_FIXTURE).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    assert_eq!(v["status"], "killed");
+    assert_eq!(
+        v["summary"],
+        "koto \u{b7} work-on \u{b7} implement \u{b7} no activity since 2026-11-13 01:58 UTC"
+    );
+    assert_eq!(v["koto"]["staleSince"], QUIET_SINCE_SECS * 1000);
+    assert_eq!(v["koto"]["status"], "running");
+    assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
+    assert_eq!(v["koto"]["contractVersion"], 6);
+}
+
+/// Regeneration helper (ignored by default): prints the canonical reconciled
+/// JSON. Run with `cargo test --test native_workflows_shape -- --ignored --nocapture`.
+#[test]
+#[ignore = "regeneration helper; prints the reconciled fixture JSON"]
+fn print_canonical_reconciled_entry() {
+    let mut bytes = serde_json::to_vec_pretty(&canonical_reconciled_entry()).unwrap();
+    bytes.push(b'\n');
     print!("{}", String::from_utf8(bytes).unwrap());
 }

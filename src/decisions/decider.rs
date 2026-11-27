@@ -370,7 +370,7 @@ fn refuse_person_flags(flags: &Flags) -> Result<(), DecisionError> {
 /// A handle or check name is stored as given, opaque, never looked up
 /// (R8); it only has to be non-empty, bounded and free of control
 /// characters.
-fn check_handle(field: &str, value: &str) -> Result<(), DecisionError> {
+pub(crate) fn check_handle(field: &str, value: &str) -> Result<(), DecisionError> {
     if value.trim().is_empty()
         || value.len() > MAX_HANDLE_BYTES
         || value.chars().any(char::is_control)

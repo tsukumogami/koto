@@ -5,13 +5,20 @@
 //! the names koto's file relies on, one probe per field, listed in
 //! `tests/fixtures/native-workflows/claude-code-conventions.json`. The guard
 //! only checks what that file lists, so a field koto starts writing without a
-//! probe would go unchecked. This test walks the shape fixture koto's own shape
-//! test pins (`tests/fixtures/native-workflows/enriched-shape.json`), collects
-//! every key outside the top-level `koto` block and every `type` value, and
-//! fails naming any that is neither a file-shape probe's `item` nor listed in
-//! that convention's `unread` list, the fields koto writes that Claude Code
-//! doesn't read, each with its reason. Keys inside `koto` are skipped: Claude
-//! Code ignores that block.
+//! probe would go unchecked. This test walks the shape fixtures koto's own
+//! shape test pins (`tests/fixtures/native-workflows/enriched-shape.json` and
+//! `tests/fixtures/native-workflows/reconciled-shape.json`), collects every key
+//! outside the top-level `koto` block and every `type` value, and fails naming
+//! any that is neither a file-shape probe's `item` nor listed in that
+//! convention's `unread` list, the fields koto writes that Claude Code doesn't
+//! read, each with its reason. Keys inside `koto` are skipped: Claude Code
+//! ignores that block.
+//!
+//! Status words get the same treatment: each shape fixture's top-level
+//! `status` must be the `item` of a probe in the status-words convention, so a
+//! word koto starts writing is checked against the release's own list of
+//! statuses before it ships. Claude Code fails the parse of an entry whose
+//! status it doesn't list.
 //!
 //! It also checks the recorded release the guard reads by default parses as a
 //! `MAJOR.MINOR.PATCH` version. Nothing here touches the network.
@@ -23,10 +30,15 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-const SHAPE: &str = "tests/fixtures/native-workflows/enriched-shape.json";
+/// Every shape fixture koto's shape test pins.
+const SHAPES: [&str; 2] = [
+    "tests/fixtures/native-workflows/enriched-shape.json",
+    "tests/fixtures/native-workflows/reconciled-shape.json",
+];
 const CONVENTIONS: &str = "tests/fixtures/native-workflows/claude-code-conventions.json";
 const RELEASE: &str = "tests/fixtures/native-workflows/claude-code-release";
 const FILE_SHAPE_SLUG: &str = "file-shape";
+const STATUS_WORDS_SLUG: &str = "status-words";
 
 fn read_json(path: &str) -> Value {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -78,13 +90,39 @@ fn walk(value: &Value, names: &mut BTreeSet<String>) {
     }
 }
 
-fn file_shape(conventions: &Value) -> &Value {
+/// The screen names across every shape fixture.
+fn all_screen_names() -> BTreeSet<String> {
+    SHAPES
+        .iter()
+        .flat_map(|path| screen_names(&read_json(path)))
+        .collect()
+}
+
+fn convention<'a>(conventions: &'a Value, slug: &str) -> &'a Value {
     conventions["conventions"]
         .as_array()
         .unwrap_or_else(|| panic!("{CONVENTIONS}: conventions is not a list"))
         .iter()
-        .find(|c| c["slug"] == FILE_SHAPE_SLUG)
-        .unwrap_or_else(|| panic!("{CONVENTIONS}: no convention with slug {FILE_SHAPE_SLUG}"))
+        .find(|c| c["slug"] == slug)
+        .unwrap_or_else(|| panic!("{CONVENTIONS}: no convention with slug {slug}"))
+}
+
+fn file_shape(conventions: &Value) -> &Value {
+    convention(conventions, FILE_SHAPE_SLUG)
+}
+
+/// The top-level `status` word of each shape that no status-words probe
+/// names, with the fixture it came from. A shape whose `status` isn't a
+/// string has no word to check.
+fn unprobed_status_words<'a>(
+    shapes: &'a [(&'a str, Value)],
+    probed: &BTreeSet<String>,
+) -> Vec<(&'a str, &'a str)> {
+    shapes
+        .iter()
+        .filter_map(|(path, shape)| shape["status"].as_str().map(|word| (word, *path)))
+        .filter(|(word, _)| !probed.contains(*word))
+        .collect()
 }
 
 fn strings_at(list: &Value, key: &str) -> BTreeSet<String> {
@@ -102,7 +140,7 @@ fn strings_at(list: &Value, key: &str) -> BTreeSet<String> {
 /// listed as a field Claude Code doesn't read.
 #[test]
 fn every_shape_fixture_field_has_a_file_shape_probe() {
-    let names = screen_names(&read_json(SHAPE));
+    let names = all_screen_names();
     let conventions = read_json(CONVENTIONS);
     let shape = file_shape(&conventions);
     let probed = strings_at(&shape["probes"], "item");
@@ -114,7 +152,7 @@ fn every_shape_fixture_field_has_a_file_shape_probe() {
         .collect();
     assert!(
         missing.is_empty(),
-        "fields in {SHAPE} with no file-shape probe in {CONVENTIONS}: {}. \
+        "fields in {SHAPES:?} with no file-shape probe in {CONVENTIONS}: {}. \
          Find where Claude Code's /workflows reader uses each one and add a \
          probe whose item is the field name, then run \
          scripts/check-claude-code-conventions.sh against the recorded release \
@@ -133,15 +171,68 @@ fn every_shape_fixture_field_has_a_file_shape_probe() {
 /// can't outlive its field and quietly cover a later one of the same name.
 #[test]
 fn unread_fields_are_fields_koto_writes() {
-    let names = screen_names(&read_json(SHAPE));
+    let names = all_screen_names();
     let conventions = read_json(CONVENTIONS);
     let unread = strings_at(&file_shape(&conventions)["unread"], "field");
     let stale: Vec<&String> = unread.iter().filter(|f| !names.contains(*f)).collect();
     assert!(
         stale.is_empty(),
-        "{CONVENTIONS} lists unread fields that {SHAPE} doesn't have: {stale:?}; \
+        "{CONVENTIONS} lists unread fields that no shape in {SHAPES:?} has: {stale:?}; \
          remove them"
     );
+}
+
+/// Every top-level status word a shape fixture holds has a status-words
+/// probe, so the guard checks the release knows it.
+#[test]
+fn every_shape_fixture_status_word_has_a_status_probe() {
+    let shapes: Vec<(&str, Value)> = SHAPES.iter().map(|p| (*p, read_json(p))).collect();
+    let conventions = read_json(CONVENTIONS);
+    let probed = strings_at(
+        &convention(&conventions, STATUS_WORDS_SLUG)["probes"],
+        "item",
+    );
+
+    let missing = unprobed_status_words(&shapes, &probed);
+    assert!(
+        missing.is_empty(),
+        "top-level status words with no status-words probe in {CONVENTIONS}: {}. \
+         Find where Claude Code's workflow snapshot schema lists its statuses \
+         (next to the progress-node state values) and add a probe whose item is \
+         the word, then run scripts/check-claude-code-conventions.sh against the \
+         recorded release and --alter status-words \
+         (docs/guides/native-workflows-verification.md). Claude Code fails the \
+         parse of an entry whose status it doesn't list.",
+        missing
+            .iter()
+            .map(|(word, path)| format!("{word} (in {path})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// The status-word check names a word a shape gains without a probe, and
+/// passes again once the word is gone.
+#[test]
+fn an_unprobed_status_word_is_named_until_it_is_removed() {
+    let probed: BTreeSet<String> = ["running", "completed", "failed", "killed"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut shapes = vec![
+        ("enriched", serde_json::json!({"status": "running"})),
+        ("reconciled", serde_json::json!({"status": "killed"})),
+    ];
+    assert!(unprobed_status_words(&shapes, &probed).is_empty());
+
+    shapes.push(("added", serde_json::json!({"status": "paused"})));
+    assert_eq!(
+        unprobed_status_words(&shapes, &probed),
+        vec![("paused", "added")]
+    );
+
+    shapes.pop();
+    assert!(unprobed_status_words(&shapes, &probed).is_empty());
 }
 
 /// The release the guard checks by default is one `MAJOR.MINOR.PATCH` line.

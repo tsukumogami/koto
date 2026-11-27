@@ -13,10 +13,20 @@
 //! the same walk over a real tree with no change to this key or algorithm. The
 //! walk copies `crate::engine::caps::measure_depth_from_parent`'s robustness:
 //! a cycle guard, a hop cap, and treating a missing header or empty parent as
-//! the root.
+//! the root. [`resolve_publish_owner`] runs the same walk and also names the
+//! session the location was found on, which is the only session whose key
+//! the renderer may rewrite.
+//!
+//! A location set with `koto workflows publish` is marked explicit: the same
+//! directory is written under [`EXPLICIT_LOCATION_KEY`] too
+//! ([`publish_explicit_location`]). The renderer moves a self-discovered
+//! location when another Claude Code session starts driving the run
+//! (koto#361), but never an explicit one. The marker counts only while its
+//! content equals the stored location ([`is_explicit_location`]), so once
+//! anything else rewrites the location, the stale marker has no effect.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
@@ -25,6 +35,13 @@ use crate::session::SessionBackend;
 /// directory. Namespaced under `workflows/` so koto's agent-surface reserved
 /// keys never collide with user context keys; passes `validate_context_key`.
 pub const PUBLISH_LOCATION_KEY: &str = "workflows/publish-location";
+
+/// Reserved context-store key marking a session's published location as
+/// explicit: `koto workflows publish` writes the published directory here as
+/// well as under [`PUBLISH_LOCATION_KEY`]. While the two hold the same
+/// directory, a change of driving Claude Code session doesn't move the
+/// location.
+pub const EXPLICIT_LOCATION_KEY: &str = "workflows/publish-explicit";
 
 /// Upper bound on ancestor-walk hops (matches `measure_depth_from_parent`).
 const MAX_WALK_HOPS: u32 = 1000;
@@ -59,6 +76,55 @@ pub fn publish_location(
     Ok(())
 }
 
+/// Publish `dir` as `session_id`'s location and mark it explicit, for
+/// `koto workflows publish`.
+///
+/// The marker goes to the store first, then [`publish_location`] writes the
+/// location and appends its `context_added`, then the marker's own
+/// `context_added` is appended (best-effort). The order matters: the
+/// location's event goes through the commit funnel and materializes, and
+/// that render has to see a matching marker, or a driver change could move
+/// the location away before the marker lands.
+pub fn publish_explicit_location(
+    backend: &dyn SessionBackend,
+    store: &dyn ContextStore,
+    session_id: &str,
+    dir: &str,
+) -> anyhow::Result<()> {
+    use crate::session::context_log::{added_event, append_to_session_best_effort, WRITER_KOTO};
+    store.add_with_writer(
+        session_id,
+        EXPLICIT_LOCATION_KEY,
+        dir.as_bytes(),
+        WRITER_KOTO,
+    )?;
+    publish_location(backend, store, session_id, dir)?;
+    append_to_session_best_effort(
+        backend,
+        session_id,
+        &added_event(EXPLICIT_LOCATION_KEY, dir.as_bytes(), WRITER_KOTO),
+    );
+    Ok(())
+}
+
+/// Whether `location`, the location published on `owner`, was set with
+/// `koto workflows publish`: `owner` holds [`EXPLICIT_LOCATION_KEY`] and its
+/// content names the same directory. A marker naming any other directory is
+/// stale and doesn't count.
+pub fn is_explicit_location(store: &dyn ContextStore, owner: &str, location: &Path) -> bool {
+    if !store.ctx_exists(owner, EXPLICIT_LOCATION_KEY) {
+        return false;
+    }
+    let Ok(bytes) = store.get(owner, EXPLICIT_LOCATION_KEY) else {
+        return false;
+    };
+    let Ok(marker) = String::from_utf8(bytes) else {
+        return false;
+    };
+    let marker = marker.trim();
+    !marker.is_empty() && Path::new(marker) == location
+}
+
 /// Whether `session_id` already has a published location in its own store.
 pub fn has_published_location(store: &dyn ContextStore, session_id: &str) -> bool {
     store.ctx_exists(session_id, PUBLISH_LOCATION_KEY)
@@ -75,6 +141,16 @@ pub fn resolve_publish_location(
     store: &dyn ContextStore,
     session_id: &str,
 ) -> Option<PathBuf> {
+    resolve_publish_owner(backend, store, session_id).map(|(_, location)| location)
+}
+
+/// [`resolve_publish_location`], also naming the session the location was
+/// found on: `session_id` itself, or the ancestor that owns the key.
+pub fn resolve_publish_owner(
+    backend: &dyn SessionBackend,
+    store: &dyn ContextStore,
+    session_id: &str,
+) -> Option<(String, PathBuf)> {
     let mut current = session_id.to_string();
     let mut hops: u32 = 0;
     let mut seen: HashSet<String> = HashSet::new();
@@ -95,7 +171,7 @@ pub fn resolve_publish_location(
                 if let Ok(s) = String::from_utf8(bytes) {
                     let trimmed = s.trim();
                     if !trimmed.is_empty() {
-                        return Some(PathBuf::from(trimmed));
+                        return Some((current, PathBuf::from(trimmed)));
                     }
                 }
             }
@@ -198,5 +274,85 @@ mod tests {
         init_session(&backend, "lonely", None);
 
         assert_eq!(resolve_publish_location(&backend, &backend, "lonely"), None);
+    }
+
+    #[test]
+    fn resolve_publish_owner_names_the_session_holding_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        init_session(&backend, "root", None);
+        init_session(&backend, "mid", Some("root"));
+        init_session(&backend, "leaf", Some("mid"));
+        publish_location(&backend, &backend, "root", "/tmp/wf/root").unwrap();
+
+        assert_eq!(
+            resolve_publish_owner(&backend, &backend, "leaf"),
+            Some(("root".to_string(), PathBuf::from("/tmp/wf/root")))
+        );
+        assert_eq!(
+            resolve_publish_owner(&backend, &backend, "root"),
+            Some(("root".to_string(), PathBuf::from("/tmp/wf/root")))
+        );
+
+        publish_location(&backend, &backend, "leaf", "/tmp/wf/leaf").unwrap();
+        assert_eq!(
+            resolve_publish_owner(&backend, &backend, "leaf"),
+            Some(("leaf".to_string(), PathBuf::from("/tmp/wf/leaf")))
+        );
+    }
+
+    #[test]
+    fn an_explicit_publish_writes_the_marker_and_logs_both_keys() {
+        let tmp = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        init_session(&backend, "solo", None);
+
+        publish_explicit_location(&backend, &backend, "solo", "/tmp/wf/solo").unwrap();
+
+        assert_eq!(
+            backend.get("solo", EXPLICIT_LOCATION_KEY).unwrap(),
+            b"/tmp/wf/solo"
+        );
+        assert_eq!(
+            resolve_publish_location(&backend, &backend, "solo"),
+            Some(PathBuf::from("/tmp/wf/solo"))
+        );
+        let (_, events) = backend.read_events("solo").unwrap();
+        let added: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ContextAdded { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added, vec![PUBLISH_LOCATION_KEY, EXPLICIT_LOCATION_KEY]);
+    }
+
+    #[test]
+    fn a_location_is_explicit_only_while_the_marker_names_it() {
+        let tmp = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        init_session(&backend, "solo", None);
+        let here = Path::new("/tmp/wf/solo");
+
+        // No marker: not explicit.
+        publish_location(&backend, &backend, "solo", "/tmp/wf/solo").unwrap();
+        assert!(!is_explicit_location(&backend, "solo", here));
+
+        // An explicit publish marks it.
+        publish_explicit_location(&backend, &backend, "solo", "/tmp/wf/solo").unwrap();
+        assert!(is_explicit_location(&backend, "solo", here));
+
+        // Anything else rewriting the location leaves the marker stale.
+        publish_location(&backend, &backend, "solo", "/tmp/wf/other").unwrap();
+        assert!(!is_explicit_location(
+            &backend,
+            "solo",
+            Path::new("/tmp/wf/other")
+        ));
+
+        // The marker is read from the owner only.
+        init_session(&backend, "child", Some("solo"));
+        assert!(!is_explicit_location(&backend, "child", here));
     }
 }

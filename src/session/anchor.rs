@@ -33,8 +33,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::types::{
-    generate_session_id, iso8601_at, now_iso8601, AnchorActivity, AnchorStarted, Event,
-    EventPayload, SessionKind, StateFileHeader, ANCHOR_STARTED,
+    generate_session_id, iso8601_at, now_iso8601, AnchorActivity, AnchorOrigin, AnchorStarted,
+    Event, EventPayload, OriginUnrecorded, SessionKind, StateFileHeader, ANCHOR_STARTED,
 };
 use crate::session::context::ContextStore;
 use crate::session::context_log::{added_event, append_to_session_best_effort, WRITER_KOTO};
@@ -71,7 +71,7 @@ pub const CLOSED_SUFFIX: &str = "-closed";
 /// directory. No session name can start with a dot, so listing, prune and
 /// every other walk of the store already pass these by; [`sweep_staging`]
 /// removes a leftover one once it is older than [`STAGING_SWEEP_AGE`].
-pub const STAGING_PREFIX: &str = ".koto-staging-";
+pub use koto_session_reader::source::STAGING_PREFIX;
 
 /// How old a staging entry must be before a close sweeps it. A fresher one
 /// may be a close still in progress.
@@ -640,6 +640,101 @@ impl Source {
     }
 }
 
+// ---------------------------------------------------------------------
+// origin
+// ---------------------------------------------------------------------
+
+/// The longest dispatcher value koto considers; a longer one is malformed.
+/// Today the link key's own length rule already refuses every value this
+/// long, so the bound changes no outcome; it is checked first so the
+/// contract the start hook relies on (it cuts at this size) doesn't hang on
+/// the link rule staying as it is.
+pub const MAX_DISPATCHER_BYTES: usize = 256;
+
+/// The most characters of a dispatcher value an `unrecorded` origin keeps.
+const NAMED_PREVIEW_CHARS: usize = 64;
+
+/// Every reason an `unrecorded` origin can give is one of these fixed
+/// texts. None of them carries a value from the caller or the store: a
+/// store's error can hold endpoints or fragments of credentials, so it is
+/// never written into the record.
+pub const ORIGIN_MALFORMED: &str = "malformed: not an anchor name";
+/// The value names the anchor being opened, or its family's first anchor.
+pub const ORIGIN_SELF: &str = "self: names this anchor";
+/// The dispatched-by link write failed after the anchor was created.
+pub const ORIGIN_LINK_FAILED: &str = "link write failed: store error";
+
+/// What an open's dispatcher value is, decided once and never refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Dispatcher {
+    /// No value, or an empty one.
+    Absent,
+    /// A value that can be a dispatched-by link's peer.
+    Valid(String),
+    /// Anything else, kept only as its [`named_preview`].
+    Malformed(String),
+}
+
+impl Dispatcher {
+    fn classify(raw: Option<&str>) -> Self {
+        match raw {
+            None | Some("") => Dispatcher::Absent,
+            Some(v)
+                if v.len() <= MAX_DISPATCHER_BYTES
+                    && links::validate_peer(LinkKind::DispatchedBy, v).is_ok() =>
+            {
+                Dispatcher::Valid(v.to_string())
+            }
+            Some(v) => Dispatcher::Malformed(named_preview(v)),
+        }
+    }
+
+    /// The dispatcher for anchor `name` of the family `base`, when it is a
+    /// valid name other than either.
+    fn peer_for(&self, name: &str, base: &str) -> Option<&str> {
+        match self {
+            Dispatcher::Valid(d) if d != name && d != base => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The origin anchor `name` of the family `base` records at creation.
+    fn origin_for(&self, name: &str, base: &str) -> AnchorOrigin {
+        match self {
+            Dispatcher::Absent => AnchorOrigin::NoDispatcher,
+            Dispatcher::Malformed(named) => AnchorOrigin::Unrecorded {
+                named: named.clone(),
+                reason: ORIGIN_MALFORMED.to_string(),
+            },
+            Dispatcher::Valid(d) if d == name || d == base => AnchorOrigin::Unrecorded {
+                named: named_preview(d),
+                reason: ORIGIN_SELF.to_string(),
+            },
+            Dispatcher::Valid(d) => AnchorOrigin::Dispatched {
+                dispatcher: d.clone(),
+            },
+        }
+    }
+}
+
+/// What an `unrecorded` origin keeps of a dispatcher value. A value made
+/// only of plain-name characters (letters, digits, `.`, `_`, `-`) is kept
+/// as its first [`NAMED_PREVIEW_CHARS`] characters. Any other value, which
+/// includes every value holding a control character, a newline, a quote or
+/// a space, is kept as a SHA-256 prefix and its length in bytes, never as
+/// text, so a value can't put a forged `anchor=` line or a terminal escape
+/// in the record or in what a reader prints.
+pub fn named_preview(value: &str) -> String {
+    let plain = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        value.chars().take(NAMED_PREVIEW_CHARS).collect()
+    } else {
+        format!("sha256:{} ({} bytes)", digest(value), value.len())
+    }
+}
+
 /// One `koto session anchor open`.
 #[derive(Debug, Clone)]
 pub struct OpenRequest {
@@ -647,6 +742,9 @@ pub struct OpenRequest {
     pub source: Source,
     /// The process token, `<host>:<pid>:<epoch-start>`.
     pub process: Option<String>,
+    /// The dispatcher value exactly as the caller gave it. An open never
+    /// refuses over it: a valid name is recorded as `dispatched`, anything
+    /// else as `unrecorded` with a fixed reason.
     pub dispatched_by: Option<String>,
     pub observed_key: Option<String>,
     pub workspace: Option<PathBuf>,
@@ -689,6 +787,10 @@ pub struct OpenOutcome {
     /// After such a `/clear`: until when the start hook keeps copying the
     /// predecessor's marker.
     pub inherit_until: Option<String>,
+    /// The origin the open recorded, when it created the anchor: the one
+    /// its `anchor_started` carries, or `unrecorded` when the dispatched-by
+    /// link write then failed. `None` on a continue.
+    pub origin: Option<AnchorOrigin>,
 }
 
 /// The process start a token carries, `<host>:<pid>:<epoch-start>`, as a
@@ -861,11 +963,6 @@ pub fn open<S: ContextStore + SessionBackend>(
     req: &OpenRequest,
 ) -> anyhow::Result<OpenOutcome> {
     validate_harness_session(&req.harness_session)?;
-    if let Some(d) = &req.dispatched_by {
-        if let Err(e) = links::validate_peer(LinkKind::DispatchedBy, d) {
-            return refuse(format!("--dispatched-by: {e}"));
-        }
-    }
     if let Some(k) = &req.observed_key {
         if !valid_token(k) {
             return refuse(format!(
@@ -888,12 +985,6 @@ pub fn open<S: ContextStore + SessionBackend>(
              under its name"
         ));
     }
-    if req.dispatched_by.as_deref() == Some(base.as_str()) {
-        return refuse(format!(
-            "--dispatched-by: anchor '{base}' can't be recorded as dispatched by itself"
-        ));
-    }
-
     let _lock = lock_family(store, &base)?;
     let outcome = open_locked(store, req, base)?;
     if let Some(raw) = &req.authority {
@@ -909,6 +1000,7 @@ fn open_locked<S: ContextStore + SessionBackend>(
     req: &OpenRequest,
     base: String,
 ) -> anyhow::Result<OpenOutcome> {
+    let dispatcher = Dispatcher::classify(req.dispatched_by.as_deref());
     let mut started = AnchorStarted {
         source: req.source.as_str().to_string(),
         harness_session: req.harness_session.clone(),
@@ -921,7 +1013,8 @@ fn open_locked<S: ContextStore + SessionBackend>(
         transcript: req.transcript_path.as_deref().map(digest),
         predecessor: None,
         reason: None,
-        dispatched_by: req.dispatched_by.clone(),
+        dispatched_by: None,
+        origin: None,
     };
 
     if store.exists(&base) {
@@ -938,18 +1031,30 @@ fn open_locked<S: ContextStore + SessionBackend>(
             started.opened = Opened::Successor.as_str().to_string();
             started.predecessor = Some(current.clone());
             started.reason = Some(reason.to_string());
-            create_anchor(store, &name, req, started, Some(&current), None)?;
+            let origin = create_anchor(
+                store,
+                &name,
+                &base,
+                req,
+                &dispatcher,
+                started,
+                Some(&current),
+                None,
+            )?;
             return Ok(OpenOutcome {
                 observed: read_marker(store, &name).is_some(),
                 anchor: name,
                 opened: Opened::Successor,
                 previous: None,
                 inherit_until: None,
+                origin: Some(origin),
             });
         }
-        // A continue: the event records the inherited dispatcher, and no
-        // link is written.
+        // A continue: the event records the inherited dispatcher when it is
+        // a valid one, and neither an origin nor a link is written; the
+        // creating event's origin stands.
         started.opened = Opened::Continued.as_str().to_string();
+        started.dispatched_by = dispatcher.peer_for(&current, &base).map(str::to_string);
         store.append_event(
             &current,
             &EventPayload::AnchorStarted(started),
@@ -966,6 +1071,7 @@ fn open_locked<S: ContextStore + SessionBackend>(
             opened: Opened::Continued,
             previous: None,
             inherit_until: None,
+            origin: None,
         });
     }
 
@@ -991,7 +1097,16 @@ fn open_locked<S: ContextStore + SessionBackend>(
         } else {
             None
         };
-        create_anchor(store, &base, req, started, Some(&pred), inherited)?;
+        let origin = create_anchor(
+            store,
+            &base,
+            &base,
+            req,
+            &dispatcher,
+            started,
+            Some(&pred),
+            inherited,
+        )?;
         let clear = reason == REASON_CLEAR;
         return Ok(OpenOutcome {
             observed: read_marker(store, &base).is_some(),
@@ -999,6 +1114,7 @@ fn open_locked<S: ContextStore + SessionBackend>(
             opened: Opened::Successor,
             previous: clear.then(|| pred.clone()),
             inherit_until: clear.then(|| iso8601_at(SystemTime::now() + INHERIT_WINDOW)),
+            origin: Some(origin),
         });
     }
 
@@ -1008,27 +1124,46 @@ fn open_locked<S: ContextStore + SessionBackend>(
         Opened::New
     };
     started.opened = opened.as_str().to_string();
-    create_anchor(store, &base, req, started, None, None)?;
+    let origin = create_anchor(store, &base, &base, req, &dispatcher, started, None, None)?;
     Ok(OpenOutcome {
         observed: read_marker(store, &base).is_some(),
         anchor: base,
         opened,
         previous: None,
         inherit_until: None,
+        origin: Some(origin),
     })
 }
 
-/// Create the anchor `name` with its first `anchor_started`, then its
+/// Create the anchor `name`, of the family whose first anchor is `base`,
+/// with its first `anchor_started` carrying its origin, then its
 /// dispatched-by links (to `predecessor` and to the caller's dispatcher)
 /// and its observed marker: `--observed-key` first, else `inherited`.
+///
+/// Returns the origin as it stands once the call is done. A failed write
+/// of the dispatcher's link doesn't fail the open: the anchor exists and
+/// its creating event already says who was named, so the failure is
+/// recorded as one `origin_unrecorded` event with a fixed reason and the
+/// origin reads `unrecorded`. The error itself is dropped, never written,
+/// since a store's error text can carry endpoints or credentials. A failed
+/// predecessor link still fails the open, as before.
+// Each of the three creating paths calls this with its own name, predecessor
+// and marker; bundling them in a struct would only move the same fields.
+#[allow(clippy::too_many_arguments)]
 fn create_anchor<S: ContextStore + SessionBackend>(
     store: &S,
     name: &str,
+    base: &str,
     req: &OpenRequest,
-    started: AnchorStarted,
+    dispatcher: &Dispatcher,
+    mut started: AnchorStarted,
     predecessor: Option<&str>,
     inherited: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AnchorOrigin> {
+    let origin = dispatcher.origin_for(name, base);
+    let peer = dispatcher.peer_for(name, base);
+    started.dispatched_by = peer.map(str::to_string);
+    started.origin = Some(origin.clone());
     create_kind_session(
         store,
         name,
@@ -1038,23 +1173,52 @@ fn create_anchor<S: ContextStore + SessionBackend>(
         vec![EventPayload::AnchorStarted(started)],
     )
     .map_err(|e| anyhow::anyhow!("failed to create anchor '{name}': {e}"))?;
-    for peer in predecessor.into_iter().chain(req.dispatched_by.as_deref()) {
-        if peer == name {
-            continue;
+    if let Some(pred) = predecessor.filter(|p| *p != name) {
+        write_dispatched_by(store, name, pred)?;
+    }
+    let mut origin = origin;
+    if let Some(peer) = peer {
+        if write_dispatched_by(store, name, peer).is_err() {
+            let unrecorded = OriginUnrecorded {
+                named: named_preview(peer),
+                reason: ORIGIN_LINK_FAILED.to_string(),
+            };
+            // Best effort: if this append fails too, the creating event
+            // still names the dispatcher with no link beside it, which a
+            // reader of the origin must take as unrecorded all the same
+            // (see `AnchorStarted::origin`).
+            let _ = store.append_event(
+                name,
+                &EventPayload::OriginUnrecorded(unrecorded.clone()),
+                &now_iso8601(),
+            );
+            origin = AnchorOrigin::Unrecorded {
+                named: unrecorded.named,
+                reason: unrecorded.reason,
+            };
         }
-        let hints = LinkHints::for_peer(store, peer);
-        links::write_link_via(
-            store,
-            name,
-            LinkKind::DispatchedBy,
-            peer,
-            &hints,
-            Some("anchor"),
-        )?;
     }
     if let Some(key) = req.observed_key.clone().or(inherited) {
         write_marker(store, name, &key)?;
     }
+    Ok(origin)
+}
+
+/// Write `name`'s dispatched-by link to `peer`, as the anchor writes it.
+fn write_dispatched_by<S: ContextStore + SessionBackend>(
+    store: &S,
+    name: &str,
+    peer: &str,
+) -> anyhow::Result<()> {
+    let hints = LinkHints::for_peer(store, peer);
+    links::write_link_via(
+        store,
+        name,
+        LinkKind::DispatchedBy,
+        peer,
+        &hints,
+        Some("anchor"),
+    )?;
     Ok(())
 }
 

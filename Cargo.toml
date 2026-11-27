@@ -4,7 +4,17 @@
 # the koto dependency via `path = ".."`. The koto crate itself
 # remains the workspace root package (this is a hybrid layout —
 # `[package]` below + `[workspace]` here).
-members = ["koto-stability-tests"]
+#
+# koto-session-reader holds the read half of the session store (the frozen
+# engine types, the log readers and the dashboard's local scan); koto depends
+# on it by path and re-exports it at the old module paths. koto-session-list
+# is the minimal second program that reads the store through that crate alone.
+members = ["koto-stability-tests", "koto-session-reader", "koto-session-list"]
+
+# koto and koto-session-reader release together under one version. The
+# release hook stamps this line; koto-stability-tests keeps its own version.
+[workspace.package]
+version = "0.42.1-dev"
 
 [package]
 name = "koto"
@@ -13,7 +23,7 @@ name = "koto"
 # discipline, MINOR is treated as MAJOR (Cargo convention for
 # pre-1.0 crates). See CHANGELOG.md for the release notes and
 # docs/STABILITY.md for the bump protocol.
-version = "0.37.3-dev"
+version.workspace = true
 edition = "2021"
 # The lowest toolchain the locked dependency tree builds with: time 0.3.47 and
 # home 0.5.12 (through rust-s3) and darling 0.23 and instability 0.3.12
@@ -31,6 +41,7 @@ name = "koto"
 path = "src/main.rs"
 
 [dependencies]
+koto-session-reader = { path = "koto-session-reader" }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 serde = { version = "1", features = ["derive"] }

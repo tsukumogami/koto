@@ -20,6 +20,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto review record` | Runner — a skill recording a document review as telemetry |
 | `koto decisions record` | Runner — primary |
 | `koto decisions list` | Runner — primary |
+| `koto decisions attempts` | Coordinators — whether a session tried a question before passing it up, and which provisional decisions still await review |
 | `koto session dir` | Runner — primary |
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
@@ -29,6 +30,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg; or a session that carries on another's work, naming it with `--continues` |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
+| `koto session origin` | Operator and reviewer — which session dispatched a session or an anchor |
 | `koto session pin/unpin` | Runner and operator — keeping a finished session's record past every removal, and releasing it |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
@@ -44,6 +46,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto context exists` | Runner — primary |
 | `koto context remove` | Runner — primary |
 | `koto context list` | Runner — primary |
+| `koto context history` | Runner — when a script checks how a key came to hold its value |
 | `koto config get/set/unset/list` | Runner — setup only |
 | `koto decider answer` | Runner — primary, when a decider-check criterion waits on your answer |
 | `koto decider report` | Maintainer — decider promotion |
@@ -77,7 +80,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--var KEY=VALUE` | No | Set a template variable. Repeatable. Required variables must be supplied; unknown keys are rejected. VALUE is checked against an allowlist (see Notes). |
 | `--execution-dir <path>` | No | Bind the session's execution anchor to this directory instead of the one `koto init` ran in. Canonicalized at init time; a path that doesn't resolve is an error. |
 | `--vars-file <file>` | No | Read variables from a JSON list of `["KEY", "VALUE"]` string pairs (regular file, not a symlink, at most 64 KiB). A repeated key is refused as `duplicate_var`. Variables are validated before the name is looked up. Can't be combined with `--var`; a bad file is `invalid_vars_file`. |
-| `--replace-terminal` | No | If a finished session (terminal or cancelled) has the name, start fresh under it; the output carries `replaced_result`. When the retention rule releases the old run's hierarchy, the old run is removed. When it keeps it (a dispatcher still runs, or the retention hasn't passed), the old run and its koto subtree move aside to `<name>_r<N>` instead, still readable there, and the output adds `moved_to` and `moved_reason` (what the rule kept it for). A descendant still running refuses with `replace_held_live` (exit 2); a move that fails partway is undone and refused with `replace_failed` (exit 1). A running session is refused with `session_live`. |
+| `--replace-terminal` | No | If a finished session (terminal or cancelled) has the name, start fresh under it; the output carries `replaced_result`. When the retention rule releases the old run's hierarchy, the old run is removed. When it keeps it (a dispatcher still runs, or the retention hasn't passed), the old run and its koto subtree move aside to `<name>_r<N>` instead, still readable there, and the output adds `moved_to` and `moved_reason` (what the rule kept it for). A finished session holding an open question, the answer in effect for one, a pass-up that counts and that an open question rests on, or a person's answer that reads `verified` on this host (or whose decisions can't be read) is refused with `holds_question` (exit 2, with `questions` and `force_command`) and nothing moves; `koto session cleanup <name> --force` and init again is the way past it. A descendant still running refuses with `replace_held_live` (exit 2); a move that fails partway is undone and refused with `replace_failed` (exit 1). A running session is refused with `session_live`. |
 | `--attach-live` | No | If a running session has the name, attach to it when its template file name, origin record (anchor and session store) and every explicitly passed non-`rebind` variable match (`template_mismatch`, `origin_mismatch`, `var_mismatch` otherwise), then re-apply its `rebind: true` variables. A caller whose `PATH`, `HOME` or `XDG_CONFIG_HOME` differs from the session's record still attaches; the output adds `environment_drift` naming the variables (never values) and one warning goes to stderr. A finished session is refused with `session_terminal` unless `--replace-terminal` is also given. |
 | `--legacy-environment` | No | Run this session's commands with the caller's whole environment, plus `KOTO_TICK_SESSION`, as before koto recorded one. Recorded at creation; no effect when attaching to an existing session; refused with `--parent`. **Removed in the next release.** |
 | `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. Once bound, the session gets a dispatched-by link naming the request's `requested_by` (none when that name can't be a link's peer). |
@@ -749,6 +752,27 @@ Returns decisions for the current epoch only. Decisions recorded before the last
 
 ---
 
+## koto decisions attempts
+
+```
+koto decisions attempts --in <session> [--result <r>] [--state <name:visit>] [--question <identity>] [--awaiting-review]
+koto decisions attempts --at <session-or-anchor> [same filters]
+```
+
+An attempt is a `judgment` recorded with `--subject result=decided|undecided|provisional`, optionally with `--subject state=<state name>:<visit>` (an `escalate` takes `state` too). A judgment with neither field isn't an attempt. Neither field changes `koto next` or any exit code.
+
+Takes exactly one of `--in` (the session and the sessions it continues) and `--at` (the position, the sessions it continues and every session below it; each element adds `relation`, `at` or `below`). Both or neither exits 2. The filters keep exact matches and combine.
+
+```json
+{"v":1,"in":"worker","attempts":[{"identity":"<session id>/000000000001","session":"worker","id":"000000000001","what":"...","state":"implement:1","result":"undecided","decider":{...},"run_mode":{...},"time":"...","status":"in-effect","question":null,"questions":[]}],"unreadable":[]}
+```
+
+`questions` lists every question the attempt is tied to through `--basis`, and `question` is the first (or null), or the one `--question` named. The attempt citing the `escalate` always ties; the `escalate` citing the attempt ties only when the attempt is in the raiser's own run (the raiser and the sessions it continues or that continue it), so a raiser can't make another session look as if it tried. `--in manager --question <identity>` returning an empty array means `manager` recorded no attempt at that question. koto never refuses a pass-up for lack of an attempt; checking is the caller's job.
+
+A provisional element carries `review`: `awaiting` (with the earliest question citing it, or null), `reviewed` (a question citing it is governed by a person's answer that reads `verified`; carries the question and the answer), or `reversed` (with `reversed_by`). Only a governing verified person answer or a reversal ends the wait; a settle, a withdrawal or an outranked answer doesn't. `--awaiting-review` keeps the `awaiting` ones. `koto decisions show` prints the same `review`. `unreadable` lists entries the read couldn't use, including a decision whose stored `state` or `result` was edited into a value `record` would refuse; non-empty means the listing may be incomplete. The read uses only the local store and writes nothing, and `show` computes `review` from the same local reading, except that its `review` reads `reversed` whenever its `status` does.
+
+---
+
 ## koto session dir
 
 ```
@@ -763,7 +787,7 @@ Prints the absolute path of the session directory to stdout (plain text, not JSO
 
 The path always ends with the session name as the last component. This is the same path that `{{SESSION_DIR}}` resolves to everywhere koto substitutes it (see Variable substitution below). Always exits 0 — the path is computed from the name, not read from disk.
 
-With no name, `koto session dir` prints the koto root instead: `$KOTO_HOME` when it is set, else `~/.koto`. `koto session dir --json` (no name) prints the root with the backend koto resolved: `root`, `backend` (`local` or `cloud`), `backend_source` (`default`, `user-config`, `project-config` or `env`), `bucket` for the cloud backend, `backend_ignored` when `KOTO_HOME` kept the run off a cloud backend another layer asked for, and `project_config`, whether the directory's project config applied (see `koto config`). Under `KOTO_HOME` only the root's own `config.toml` selects the cloud backend; a `KOTO_SESSION_BACKEND` from the environment or a project config's `session.backend` is ignored with one warning. Neither form builds a backend or writes anything, so a harness can check where koto will act before it runs anything else.
+With no name, `koto session dir` prints the koto root instead: `$KOTO_HOME` when it is set, else `~/.koto`. `koto session dir --json` (no name) prints the root with the backend koto resolved: `root`, `backend` (`local` or `cloud`), `backend_source` (`default`, `user-config`, `project-config` or `env`), `sessions` (the sessions directory that backend keeps on this host: `<root>/sessions`, or `KOTO_SESSIONS_BASE` when set on the local backend), `bucket` for the cloud backend, `backend_ignored` when `KOTO_HOME` kept the run off a cloud backend another layer asked for, and `project_config`, whether the directory's project config applied (see `koto config`). Under `KOTO_HOME` only the root's own `config.toml` selects the cloud backend; a `KOTO_SESSION_BACKEND` from the environment or a project config's `session.backend` is ignored with one warning. Neither form builds a backend or writes anything, so a harness can check where koto will act before it runs anything else.
 
 ---
 
@@ -798,10 +822,12 @@ Note: this command uses `id` where `koto workflows` uses `name`. Both refer to t
 ## koto session cleanup
 
 ```
-koto session cleanup <name>
+koto session cleanup <name> [--force]
 ```
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist.
+
+A session holding something an open question depends on is refused before anything is stopped or written: exit 2, code `holds_question`, with `questions` listing each `{"question": "<session id>/<decision id>", "held": "raised" | "answer" | "pass_up" | "person_answer"}` (it raised the open question, holds the answer in effect for it, holds a pass-up that counts and that its current addressee rests on, or holds a person's answer that reads `verified` on this host) and `force_command`. A `person_answer` entry adds `answer`, the answer's `<session id>/<decision id>`, and holds whether or not the question is still open or its raiser still exists: the answer is the precedent that keeps the person from being asked again, so only `--force` removes it. Open, counted and in effect are the decisions rules (`counted` and `governs` on `koto decisions show`), judged as the cleanup runs. These hold nothing, so a plain cleanup removes the session: a question its raiser withdrew or settled; an answer reading `counted` false; an answer that counts but doesn't govern, as when a person's verified answer outranks a session's (the person-answer holder is refused with `held: "person_answer"`, the outranked holder is released); a session's answer, or a person's answer reading remote, whose raiser is gone; a pass-up reading `counted` false; and a pass-up of a closed question. When the session's own decisions, or the question one of its answers or pass-ups points at, can't be read, it is refused the same way with `decisions_unreadable` naming what couldn't be read, since koto can't tell what removing it would orphan. Answer, reverse or pass the question first. `--force` removes it anyway and adds `orphaned_questions` (the same list) to the output, with a stderr warning per question: removing the answer in effect hands the question to the next entry that counts or, with none, reopens it, removing a pass-up returns it to its earlier addressee, and removing the raiser drops it from every open read. `koto cancel --cleanup` is refused the same way, before it cancels, naming `koto session cleanup <name> --force`. Without `--force`, a session holding none of these prints exactly what it printed before.
 
 A pinned session is refused: exit 2, code `pinned` (or `pin_unreadable`), naming the pin's reason, setter and time, and nothing is removed. Unpin it first with `koto session unpin <name>`, and only when the pin's reason says the record can go. A migrated source is the exception: its moved copy holds the pin, so cleanup removes the source and unpin refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`. `koto cancel --cleanup` refuses the same way, before it cancels.
 
@@ -855,6 +881,8 @@ A stale observed anchor (past `retention.stale_after` since its last activity) k
 - Under the cloud backend, `--apply` without `--plan` refuses when `retention.keep` or `retention.idle_period` is under an hour and the selection has no age bound of an hour or more: exit 2 with `prune_short_retention`, nothing removed locally or in the bucket, and the error names the short settings, `backend`, `bucket`, `store` and `would_remove`. Preview and apply the token instead, or pass `--confirm-short-retention`. `koto workspace prune --yes` refuses the same way. A scratch `HOME` doesn't move a command off the cloud backend when `KOTO_SESSION_BACKEND` sets it.
 - Apply prints `{"mode": "apply", "removed": [...], "skipped": [...], "kept": [...], "failed": [...], "stale_anchors": [...]}`; a `removed` entry carries `detail` and `retention` from the judgment that let it go. `koto workspace prune` reports the same as `released`, a map from each removed member to its `reason` and `retention`. Each hierarchy is locked and judged again just before its members go; a session another koto process holds, one the rule now keeps, or one that changed since it was judged is `skipped` (exit 0). A removal that failed is listed under `failed` and the command exits 3.
 - A malformed token or age, `--plan` without `--apply` or with a filter, or a bare `--apply` exits 2 with `invalid_arguments`; a malformed retention setting exits 2 with `invalid_retention_setting`, naming it; a sessions directory that can't be read exits 3 with `prune_scan_failed`. None of these removes anything.
+
+A session that raised an open question is kept with no expiry, and so is a session holding a person's answer that reads `verified` on this host, with its hierarchy: no prune removes it, whatever the filters or its age, and only `koto session cleanup <name> --force` does. With `--older-than` or `--execution-dir`, a session holding the answer in effect or a pass-up that counts and that an open question rests on is kept, with a detail naming the question, unless the question's raiser is removed in the same run; `--all` after `retention.keep` removes both together, which is the unforced way to clear a closed question's sessions when a session answered it. `koto workspace prune --root` keeps such a holder the same way.
 
 Clean up after your own work with `koto session prune --execution-dir <your directory>`, read the preview, then apply its token.
 
@@ -968,7 +996,7 @@ koto session anchor close --key=<key> --harness-session=<id>
 
 An anchor is the session koto keeps for one agent session (`kind: "anchor"`), so that what the agent session opens or ticks under `KOTO_ANCHOR` can name it in a held-by link. You rarely run these by hand: the start hook runs `open` and `observe`, and a workspace's reap command runs `close`. All three print `key=value` lines; a refusal prints `{"error", "command"}` and exits 2, any other failure exits 3, and a failed `open` prints no `anchor=` line. Ids and keys must match `^[A-Za-z0-9_-]{1,128}$`.
 
-- **open** creates or continues `anchor-<id>` under its lock and never reads `KOTO_ANCHOR`. Prints `anchor=<name>`, `opened=new|continued|reopened|successor`, `observed=yes|no`, and after a `clear` that found the anchor its process ran before, `previous=<name>` and `inherit_until=<rfc3339>`. An anchor that reads closed (or was migrated) gets a successor `anchor-<id>-s2`, `-s3`, ... linked to it. A `resume` with no anchor of its own links to a predecessor found through the transcript path, without copying its marker. `--dispatched-by` becomes a link only when an anchor is created; `--observed-key` becomes the marker only when there is none. Each call appends an `anchor_started` event holding digests of the process token and transcript path, never the values.
+- **open** creates or continues `anchor-<id>` under its lock and never reads `KOTO_ANCHOR`. Prints `anchor=<name>`, `opened=new|continued|reopened|successor`, `observed=yes|no`, then `origin=dispatched|none|unrecorded` when the open created the anchor (the origin its `anchor_started` records, which `koto session origin` reads; the `--dispatched-by` value never refuses the open, and a malformed one, a self-naming one or a failed link write records `unrecorded`), and after a `clear` that found the anchor its process ran before, `previous=<name>` and `inherit_until=<rfc3339>`. An anchor that reads closed (or was migrated) gets a successor `anchor-<id>-s2`, `-s3`, ... linked to it. A `resume` with no anchor of its own links to a predecessor found through the transcript path, without copying its marker. `--dispatched-by` becomes a link only when an anchor is created; `--observed-key` becomes the marker only when there is none. Each call appends an `anchor_started` event holding digests of the process token and transcript path, never the values.
 - **observe** writes the observed marker into the named anchor only: `--key` the key given, `--inherit` the marker of the predecessor its `anchor_started` recorded. A marker already there is kept. Prints `anchor=<name>` and `observed=yes|no`.
 - **close** records `anchor-<id>`, and the anchors that succeeded it after a `/clear` or a resume, each only when its marker equals the key, in a separate close session `<anchor>-closed` (`kind: "anchor-close"`, already finished). It never writes an anchor. Prints `closed=<n>`; a repeat, or nothing matching, prints `closed=0` and exits 0. A child anchor dispatched by the session, or a successor opened because its predecessor was already closed, stays open.
 
@@ -989,7 +1017,7 @@ KOTO_ANCHOR=anchor-demo-1 koto init demo-run --template ./demo.md
 koto session anchor close --key=demo-key --harness-session=demo-1    # closed=1
 ```
 
-**The plugin's start hook.** koto-skills registers `hooks/session-start.sh` for every start, resume, compaction and `/clear`. It opens `anchor-<session id>`, linked to the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`), with niwa's `NIWA_REAP_KEY` as the marker only when no `KOTO_ANCHOR` was inherited. It writes `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'` (both its own anchor), `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY` into its `# >>> koto-skills` block of `CLAUDE_ENV_FILE`, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the open fails. Without a usable env file it returns the `KOTO_ANCHOR` export line as `additionalContext`. A detached watcher picks up a reap key niwa writes later, or a `/clear` predecessor's marker. So in a session with the plugin `KOTO_ANCHOR` is already set: don't run the anchor verbs, and ask `koto session hierarchy` why a session is kept.
+**The plugin's start hook.** koto-skills registers `hooks/session-start.sh` for every start, resume, compaction and `/clear`. It opens `anchor-<session id>`, passing the dispatcher it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`) whatever it holds, cut to 256 bytes, so koto records the origin, with niwa's `NIWA_REAP_KEY` as the marker only when no `KOTO_ANCHOR` was inherited. It writes `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'` (both its own anchor), `unset NIWA_REAP_KEY` and `unset KOTO_AUTHORITY` into its `# >>> koto-skills` block of `CLAUDE_ENV_FILE`. When the open is cut off after 5 seconds or fails without a refusal, both name `anchor-<session id>`, the family's first name, so a slow store doesn't erase the dispatcher; only a refused open writes `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR`. Without a usable env file it returns the `KOTO_ANCHOR` export line as `additionalContext`, only for an anchor the open printed. A detached watcher picks up a reap key niwa writes later, or a `/clear` predecessor's marker. So in a session with the plugin `KOTO_ANCHOR` is already set: don't run the anchor verbs, and ask `koto session hierarchy` why a session is kept.
 
 ---
 
@@ -1019,6 +1047,28 @@ Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: i
 | `relation_unreadable` | `[{holder, reason}]` for a relation that couldn't be judged (`unparseable`, `too_large`, `mismatch`, `cycle`, `unlistable`), which keeps the session |
 
 A stale anchor is a report and nothing more: koto never closes an observed anchor on its own. When the agent session behind it is truly gone, run the printed `close_command`. A malformed retention setting, or a name with no session, exits 2; a sessions directory that can't be listed exits 3.
+
+---
+
+## koto session origin
+
+```
+koto session origin <name>
+```
+
+Says which session dispatched `<name>`, a workflow session or an anchor. Read-only: it reads through the configured store backend, as `koto status` does, and writes nothing, never pushing to the cloud bucket. You rarely need it while driving a workflow; it answers "who started this?" afterwards.
+
+```json
+{"session": "work-on-12", "via": "anchor-1f3c",
+ "origin": {"state": "dispatched", "dispatcher": "anchor-9a07", "dispatcher_kind": "anchor"}}
+```
+
+`origin.state` is `dispatched` (with `dispatcher` and `dispatcher_kind`), `none` (nothing named a dispatcher) or `unrecorded` (with `named`, a bounded preview of what was named, empty when nothing was, and `reason`, a fixed text). All three exit 0; a malformed name or a name with no session exits 2, and any other failed read exits 3.
+
+- **An anchor** is read directly (`via` is the anchor): the `origin` its creating `anchor_started` recorded, together with its dispatched-by link to that dispatcher and any `origin_unrecorded` event. A named dispatcher with no link reads `unrecorded` (`link not found`, or the event's reason). An anchor created before koto recorded origin reads `dispatched` when its creating event names a dispatcher and the link to it is there, else `unrecorded` (`link not found`, or `recorded before koto tracked origin` when it names none).
+- **A workflow session** reports its own dispatched-by link first (`dispatcher_kind: "workflow"`, `via: null`), else the origin of the anchor its first held-by link names (`via` names it; `unrecorded` with `anchor not found` when that anchor is gone or the link names a session that isn't an anchor), else `none`.
+
+`dispatched` is what the starting environment claimed, not an authenticated fact.
 
 ---
 
@@ -1055,11 +1105,11 @@ Creates a new local session from the copy another workspace pushed to the bucket
 | `template` | Where the compiled template came from: `local-cache`, `bucket` (under `--trust-template`), or `unchanged` when a re-run found the session already built here and took none. |
 | `marked` | Always `true` on success: the source carries a `migrated.json` marker. |
 
-The new session holds the source's events plus a `session_imported` event, every context key except `workflows/publish-location`, and the compiled template, and a relation `koto/links/continues/<source>` recording the source's name, session id, workspace path and bucket prefix plus the copy's own session id. It is pushed under this workspace's prefix before the marker is written, after a back-reference is written beside the source, so a failed push leaves no marker. A relation the source itself held isn't carried over. From then on the old copy is a read-only predecessor: `koto next`, `koto context add` and `remove`, `koto rewind`, `koto cancel`, `koto decisions record`, `koto overrides record`, `koto session link`, `koto session rebind`, `resolve`, `update`, `pin` and `unpin` refuse with `session_migrated` in its own workspace (see `error-handling.md#session_migrated`), while `koto status`, `koto context get`, `exists` and `list`, `koto decisions list` and `koto overrides list` (and their `--workspace` forms) still exit 0 and answer from the source's last pushed bucket copy, changing nothing. The import writes nothing else under the source's prefix and deletes nothing; the source's objects stay in the bucket while the copy keeps it (see `koto session prune --migrated-from`) or until a `koto session cleanup` in the source workspace, which keeps `migrated.json`. Re-running the import on a copy built without a relation adds it and exits 0; on a copy whose relation names another session it exits 2 with `relation_conflict`, changing nothing. A child session is refused on its own, and importing a parent doesn't bring its children.
+The new session holds the source's events plus a `session_imported` event, every context key except `workflows/publish-location` and `workflows/publish-explicit`, and the compiled template, and a relation `koto/links/continues/<source>` recording the source's name, session id, workspace path and bucket prefix plus the copy's own session id. It is pushed under this workspace's prefix before the marker is written, after a back-reference is written beside the source, so a failed push leaves no marker. A relation the source itself held isn't carried over. From then on the old copy is a read-only predecessor: `koto next`, `koto context add` and `remove`, `koto rewind`, `koto cancel`, `koto decisions record`, `koto overrides record`, `koto session link`, `koto session rebind`, `resolve`, `update`, `pin` and `unpin` refuse with `session_migrated` in its own workspace (see `error-handling.md#session_migrated`), while `koto status`, `koto context get`, `exists` and `list`, `koto decisions list` and `koto overrides list` (and their `--workspace` forms) still exit 0 and answer from the source's last pushed bucket copy, changing nothing. The import writes nothing else under the source's prefix and deletes nothing; the source's objects stay in the bucket while the copy keeps it (see `koto session prune --migrated-from`) or until a `koto session cleanup` in the source workspace, which keeps `migrated.json`. Re-running the import on a copy built without a relation adds it and exits 0; on a copy whose relation names another session it exits 2 with `relation_conflict`, changing nothing. A child session is refused on its own, and importing a parent doesn't bring its children.
 
 **koto's own keys.** Import an anchor before the sessions it holds. The import treats the bucket as untrusted for the reserved `koto/` area. It leaves behind the observed marker (`koto/anchor/observed`), any close record (`koto/anchor-close`), every `koto/links/closes/*` link and any `koto/imported-from` the source held, and drops any link whose key or body is malformed, with a warning on stderr. Each `koto/links/held-by/<anchor>` is kept when that anchor is open and not migrated in this host's store (its recorded workspace doesn't matter); otherwise it is rewritten to `koto/links/held-by/<your anchor>`, carrying `"was"` with the old name, when you import with `KOTO_ANCHOR` naming an anchor here, and dropped when you don't. Dispatched-by links are carried unchanged. Every copy gets `koto/imported-from` (`{"from_session","from_session_id"}`) and its one continues relation to the source. Import from your agent session's shell to have it hold what you move. An anchor's close session is refused as a source; an anchor imports with this build's embedded template when the cache has none.
 
-`workflows/publish-location` names a `/workflows` folder on the source's host, so it never leaves that host: the cloud backend doesn't upload it, and the import leaves it behind even when a manifest an older koto pushed lists it. The new session publishes its own location on its first commit here, from `KOTO_WORKFLOWS_DIR` or this host's Claude Code session, like any session.
+`workflows/publish-location` names a `/workflows` folder on the source's host, so it never leaves that host: the cloud backend doesn't upload it, and the import leaves it behind even when a manifest an older koto pushed lists it. The same goes for `workflows/publish-explicit`, the marker `koto workflows publish` writes beside it. The new session publishes its own location on its first commit here, from `KOTO_WORKFLOWS_DIR` or this host's Claude Code session, like any session.
 
 **On the same host.** Workspaces on one host share the local store, so the source's own copy already holds the name there. Without `--as` the import takes the name over and the output's `name` is the original name: it builds the new session in `~/.koto/sessions/.takeover-<name>/`, pushes it, writes the marker, then swaps the two directories in one atomic call. Before writing anything it refuses, leaving the source untouched, if another process holds the session's lock, the local copy is ahead of the bucket, or a local child names it as parent (the `import_source_*` codes below). A stop at any step is finished by running the same command again; while `.takeover-<name>/` exists, commands on the name refuse and say so. Where the filesystem can't swap directories atomically, the import refuses before writing and names `--as`. Run from the source workspace itself, or with `--as`, the import behaves as above.
 
@@ -1075,9 +1125,10 @@ The new session holds the source's events plus a `session_imported` event, every
 | `import_source_is_anchor_close` | 2 | The named session is an anchor's close session (`kind: "anchor-close"`). | Don't import it; import the anchor or the sessions it holds. |
 | `import_name_taken` | 2 | A different session holds the name here or under this workspace's prefix. | Re-run with `--as <new-name>`. |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash (in the cache, or under `--trust-template` in the bucket). | Run `koto template compile` on the session's template here, then import again without `--trust-template`. |
-| `import_source_unreadable` | 1 | A source object couldn't be fetched or failed validation. | Retry if the bucket was unreachable; otherwise report the message. |
+| `import_source_unreadable` | 1 | A source object is missing or failed validation. | Report the message. |
+| `import_source_unreachable` | 1 | The bucket didn't answer while fetching a context key, after retries. Keys already fetched are kept. | Retry after a backoff; the re-run fetches only the missing keys. |
 | `import_push_failed` | 1 | Building, pushing or moving the session into place failed. Before the source is marked, what this run pushed was taken back; after it (a same-host swap that failed), everything is kept and the message says so. | Fix what the message names and run the same import again; after the marker, that finishes it. When the message names `--as` (the store can't take the same-host swap), import under another name instead. |
-| `import_source_running` | 2 | Same host: another process holds the source session's lock. | Stop what is advancing it, then import again. |
+| `import_source_running` | 2 | Same host: another process holds the source session's lock, or a `koto next` on it is in flight (it holds the session's `tick.lock`). | Stop what is advancing it, then import again. |
 | `import_source_unpushed` | 2 | Same host: the source's local copy holds events or context the bucket lacks. Any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes, or by a write window not yet closed (`koto session flush`). | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then import again. |
 | `import_source_has_children` | 2 | Same host: a local session names the source as its parent. | Finish or clean up the child the message names, or import with `--as`. |
 | `import_unmarked` | 1 | Imported and pushed, but the source's marker couldn't be written, so the old copy won't refuse yet. | Run the same import again; it writes only the marker. Keep the source stopped meanwhile. |
@@ -1118,6 +1169,10 @@ koto session resolve <name> --keep <local|remote> [--children <auto|skip|accept-
 ```
 
 Resolves a version conflict when using the cloud session backend. Only valid when `session.backend = "cloud"` is configured; fails with an error on the local backend.
+
+It works from any directory on the host that holds the session's copy, and it doesn't first push a batch a failed push left open: `--keep local` uploads that batch's writes with the rest of the session, and `--keep remote` drops them.
+
+`--keep local` uploads every context key the bucket doesn't hold as this host has it, then the manifest, the state file and `version.json`. A key whose upload the bucket doesn't confirm stays out of the manifest, and the command exits non-zero naming it after the rest went up. Run it again once the bucket answers.
 
 `--children` (default `auto`) controls how the parent's direct children reconcile alongside the parent log:
 
@@ -1192,6 +1247,8 @@ Keys are hierarchical path strings (e.g., `scope.md`, `research/r1/lead.md`). Ke
 **Keys under `koto/` are reserved.** koto writes its own records there (the dispatched-by links of `koto session link`, the held-by links `KOTO_ANCHOR` records, and an anchor's observed marker). `context add` and `context remove` refuse any key whose first component is `koto`, in any case (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. `context get`, `exists` and `list` read them like any other key.
 
 No stdout on success. Exit 2 with `workflow '<session>' not found` if the session has no state log, and nothing is stored. That covers a name that was never initialized, a session that finished and was cleaned up, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. To give a batch child input before it starts, put it in the task entry's `vars`, or store it on the parent and read it from the child with `koto context get <parent> <key>`. Exit 3 on infrastructure errors, including a state log that exists but has no header.
+
+Under the cloud backend, an add made outside a tick or write window uploads the key's object before the manifest. koto asks the bucket up to twice and, when the last failure could still have stored it, reads the object back. When the bucket doesn't confirm it, the add exits 3 with an error naming the key. The content stays on this host, the add logs no `context_added` event, and the bucket's manifest leaves the key out until a later push of the session uploads it. Run the add again once the bucket answers.
 
 ---
 
@@ -1376,6 +1433,30 @@ Lists all context keys as a JSON array sorted alphabetically.
 A key a transition assigned whose store write was lost is listed too, as `koto context get` answers it from the session's log; nothing is stored (see `koto context get`).
 
 `--prefix <prefix>` filters to keys that start with the given prefix. Returns `[]` when no keys exist or no keys match.
+
+## koto context history
+
+```
+koto context history <session> <key>
+```
+
+Prints how `<key>` came to hold its value: a JSON array with one record per write, oldest first, read from the session's log.
+
+```json
+[
+  {"seq": 12, "timestamp": "2026-11-13T01:01:55.905Z", "writer": "agent", "hash": "2ba5...", "size": 41, "state": "analysis"},
+  {"seq": 30, "timestamp": "2026-11-13T01:03:58.152Z", "writer": "transition", "hash": "d0d8...", "size": 8, "state": "done"}
+]
+```
+
+- `writer` -- `agent` (`koto context add`), `transition` (a transition's `context_assignments`) or `koto` (koto's own writes); `null` for a write logged before writers were recorded.
+- `hash` and `size` -- SHA-256 (lowercase hex) and byte length of the content written. Compare `hash` with the SHA-256 of what `koto context get` returns to check that the last write is the current value.
+- `state` -- the state the session was in when the write was recorded. A transition's assignment counts in the state it entered.
+- `seq` and `timestamp` -- the log event that records the write.
+
+A cloud pull of the key (writer `sync`) is not a write and isn't listed, so the records are the same on the local and cloud backends and on every host. A removal or a `clear_on_entry` clearing isn't a write either; a removed key has no current value to match.
+
+Exit codes: 0 with the array, `[]` for a key the session never wrote; 2 for a session that doesn't exist (`workflow '<session>' not found`), a key that isn't a usable key, or a cloud session this host holds no copy of (`code: "no_local_copy"`; take one with `koto session resolve <session> --keep remote`); 3 when the session's log exists but can't be read. The command reads the log only: it stores nothing and records no read. It doesn't take `--workspace`, and a session imported into another workspace refuses it with exit 2.
 
 ---
 

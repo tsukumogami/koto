@@ -66,6 +66,11 @@ const TEMPLATE_DIRS: &[(&str, &str)] = &[
     // recorded with the released v0.25.0 binary, so they also pin that unit
     // mode left such checks' compiled bytes alone.
     ("tests/fixtures/decider_checks", "decider-checks"),
+    // A template using none of pool, background or timeout_secs, pinned to
+    // the hash koto v0.38.0 gave it. It is kept out of template-hash, which
+    // the v0.14.1 compat script compiles with that release, because it uses
+    // a polled gate v0.14.1 predates.
+    ("tests/fixtures/pool", "pool"),
 ];
 
 /// Every fixture template paired with its snapshot path, sorted by source.

@@ -44,7 +44,7 @@ Don't reach for it when:
 
 ## Prerequisites
 
-- koto >= 0.37.3 must be installed and on PATH (`koto version` to verify).
+- koto >= 0.42.1 must be installed and on PATH (`koto version` to verify).
 
 If koto is not installed or the version is too old, install the latest release:
 
@@ -130,6 +130,7 @@ A workflow that compiles isn't automatically a good workflow. Run your decomposi
 - **Does the command's risk live in a bad success, or only in a bad failure?** Keep `default_action` off any command whose *successful* exit is itself the irreversible, externally visible event — `gh pr create`, `gh pr comment`, `gh pr ready`. Nothing arriving afterward can un-fire it. Allow it where the only irreversibility is bounded and repairable after a successful run: a bad failure is a diagnosis problem, and the action failure path stops the tick and hands you the command's exit status, both streams, a `failure_kind`, the findings koto read from its output (the `failure` object koto-user describes), and the author's `fallback` prose in one response.
 - The temptation is sharper here than in a durable template, because you're the author and the runner at once and the command is right there in front of you. The rule doesn't relax for a one-off — a pull request opened by mistake is just as open.
 - An action must be safe to re-run. It fires on every tick that enters the state without evidence, gate-blocked retries and self-loops included: `mkdir -p`, not `mkdir`.
+- An action that loads the machine, such as a test suite or a full build, can name a host pool (`pool: test-suite`) so other sessions on the machine take turns with it, and one that runs longer than koto's 30-second action limit needs `background: true` with `timeout_secs` (1 to 86400). Don't size the pool in the definition: `size` and the other pool settings are compile errors there, and a pool the machine's config doesn't define is simply no limit. While queued or running, the tick answers `gate_blocked` with a temporal `__pool__` (`queued`) or `__action__` (`running`) condition: nothing failed, tick again after its `retry_after_secs`. The template format guide's "`pool` and `background`" section has the rules.
 - The full rule, with worked examples on both sides, is in the [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md); the field schema is in the [template format guide](../koto-author/references/template-format.md).
 
 **Branching**
@@ -352,6 +353,8 @@ Rule of thumb: first time, ad-hoc; second time you reach for the same shape, mak
 **Compilation fails on `--from-stdin`** — koto exits non-zero and names the failing element (a state, transition, or gate). Common causes: a state declared in the frontmatter with no `## state` body section; a gate with no `gates.<name>.<field>` routing on its transitions (rejected on the strict path); overlapping `when` conditions on two transitions from the same state. Fix the named element and re-pipe.
 
 **"execution_anchor_mismatch"** — you piped the definition from one directory and are ticking from another. The message names the directory the session is bound to; `cd` there (or into a subdirectory of it) and re-run. Nothing ran on the refused tick.
+
+**A tick keeps answering `__pool__` with `status: "queued"`** — another session on this machine holds the pool's slots. It isn't stuck: tick again after `retry_after_secs`, and `koto pool status` shows who holds the slots and where you are in the queue. A `__pool__` condition whose `status` is `invalid`, `unavailable` or `unsupported` is the machine's setup, not your definition; report it.
 
 **"session already exists"** — a session with this name is already active. Resume it with `koto next <name>`, or cancel and re-init: `koto cancel <name> --cleanup` then re-pipe.
 

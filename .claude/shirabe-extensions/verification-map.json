@@ -1,14 +1,15 @@
 {
   "schema": "shirabe-verification-map/v1",
   "commands": {
-    "cargo-test": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "--locked", "--", "--test-threads=1"], "timeout_secs": 3600},
-    "stability-tests": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "-p", "koto-stability-tests", "--", "--test-threads=1"], "timeout_secs": 3600},
-    "fmt": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "fmt", "--check"]},
-    "clippy": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "clippy", "--all-targets", "--", "-D", "warnings"], "timeout_secs": 3600},
+    "cargo-test": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "bash", "scripts/run-tests.sh", "-p", "koto", "-p", "koto-session-reader", "-p", "koto-session-list"], "timeout_secs": 3600, "max_procs": 2048},
+    "doctests": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "test", "--locked", "--doc", "-p", "koto", "-p", "koto-session-reader"], "timeout_secs": 3600, "max_procs": 2048},
+    "stability-tests": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "bash", "scripts/run-tests.sh", "-p", "koto-stability-tests"], "timeout_secs": 3600, "max_procs": 2048},
+    "fmt": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "fmt", "--check"]},
+    "clippy": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "clippy", "-p", "koto", "-p", "koto-session-reader", "-p", "koto-session-list", "--all-targets", "--", "-D", "warnings"], "timeout_secs": 3600, "max_procs": 2048},
     "decider-purity": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/check-decider-purity.sh"]},
-    "doc-names": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600},
-    "plugin-hooks-shape": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "--locked", "--test", "plugin_hooks_shape"], "timeout_secs": 3600},
-    "shipped-spec": {"run": ["bash", "scripts/without-session-env.sh", "cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
+    "doc-names": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600, "max_procs": 2048},
+    "plugin-hooks-shape": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "test", "--locked", "--test", "plugin_hooks_shape"], "timeout_secs": 3600, "max_procs": 2048},
+    "shipped-spec": {"run": ["bash", "scripts/without-session-env.sh", "env", "CARGO_INCREMENTAL=0", "cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600, "max_procs": 2048},
     "evals-exist": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/check-evals-exist.sh"]},
     "inline-evidence": {"run": ["bash", "scripts/without-session-env.sh", "bash", "scripts/check-inline-evidence_test.sh"]},
     "session-start-workflows-hook": {"run": ["bash", "scripts/without-session-env.sh", "bash", "plugins/koto-skills/hooks/test/session-start-workflows.test.sh"]},
@@ -16,8 +17,8 @@
   },
   "entries": [
     {
-      "paths": ["src/**", "tests/**", "test/functional/fixtures/**", "benches/**", "koto-stability-tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "CLAUDE.md", "scripts/without-session-env.sh"],
-      "commands": ["cargo-test", "stability-tests", "fmt", "clippy", "decider-purity"]
+      "paths": ["src/**", "tests/**", "test/functional/fixtures/**", "benches/**", "koto-stability-tests/**", "koto-session-reader/**", "koto-session-list/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "CLAUDE.md", "scripts/without-session-env.sh", "scripts/run-tests.sh", ".config/nextest.toml"],
+      "commands": ["cargo-test", "doctests", "stability-tests", "fmt", "clippy", "decider-purity"]
     },
     {
       "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh", "scripts/check-inline-evidence.sh", "scripts/check-inline-evidence_test.sh"],
@@ -32,5 +33,6 @@
       "commands": ["run-evals-test"]
     }
   ],
-  "default": ["cargo-test", "stability-tests", "fmt", "clippy"]
+  "default": ["cargo-test", "doctests", "stability-tests", "fmt", "clippy"],
+  "build_output": ["target/"]
 }

@@ -382,7 +382,10 @@ fn first_rule(
     }
     if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
         let hierarchy = Some(hierarchy::to_json(judgment, settings));
-        if let Some(own) = keepers.iter().find(|k| k.name == name) {
+        // Rule a is the session's own life; a member kept only for the
+        // open questions it holds is kept with its hierarchy (rule h),
+        // whose detail names them.
+        if let Some(own) = keepers.iter().find(|k| k.name == name && k.alive) {
             let detail = match own.kind {
                 MemberKind::KotoSession if session.seen.status == SessionStatus::Running => {
                     "the session is running".to_string()
@@ -642,6 +645,11 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
             }
         }
     }
+    // A session holding the answer in effect for a question, or a pass-up
+    // resting under an open one, goes only with the question's raiser: one
+    // whose raiser stays (kept, or left out by a filter) is kept with it, or
+    // the question would read open again or go back to an earlier addressee.
+    keep_question_holders(engine.graph, &mut remove, &mut kept);
     // A close session goes only with its anchor: one whose anchor stays in
     // the store (kept, or left out by a filter) is kept with it, or the
     // anchor would read open again.
@@ -703,6 +711,36 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
         stale,
         token,
     }
+}
+
+/// Move each session entry of `remove` that holds what a question rests on
+/// while the question's raiser isn't removed with it
+/// (`workspace::question_holders_kept`) to `kept`, under rule h with a
+/// detail naming the question and its raiser.
+fn keep_question_holders(graph: &Graph, remove: &mut Vec<RemoveEntry>, kept: &mut Vec<KeptEntry>) {
+    let removing: BTreeSet<String> = remove
+        .iter()
+        .filter(|e| e.kind == KIND_SESSION)
+        .map(|e| e.name.clone())
+        .collect();
+    let held = super::workspace::question_holders_kept(graph, &removing);
+    if held.is_empty() {
+        return;
+    }
+    remove.retain(|e| {
+        let Some(detail) = held.get(&e.name).filter(|_| e.kind == KIND_SESSION) else {
+            return true;
+        };
+        kept.push(KeptEntry {
+            name: e.name.clone(),
+            rule: 'h',
+            detail: detail.clone(),
+            hierarchy: None,
+            pin: Default::default(),
+            relation: Default::default(),
+        });
+        false
+    });
 }
 
 /// The `detail` and `retention` of a remove entry whose hierarchy `verdict`
@@ -1217,6 +1255,20 @@ fn apply_component(
     // A removed entry names the release this judgment, made under the
     // lock, let it go by, which may be later than the preview's.
     let (detail, retention) = release_fields(&judgment.verdict);
+    // What goes now, by this judgment, so a holder whose question's raiser
+    // stays (its lock was held, or a pin set since the plan keeps it) stays
+    // too. A raiser and its holders share a hierarchy, so this one judgment
+    // sees both.
+    let going: BTreeSet<String> = if judgment.verdict.is_kept() {
+        BTreeSet::new()
+    } else {
+        locked
+            .iter()
+            .map(|(e, _)| e.name.clone())
+            .filter(|n| !judgment.pin_of(n).is_pinned() && !judgment.relation_of(n).keeps())
+            .collect()
+    };
+    let held = super::workspace::question_holders_kept(engine.graph, &going);
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
     for (entry, lock) in &locked {
@@ -1245,6 +1297,8 @@ fn apply_component(
                 ),
                 hierarchy::relation_json(&related),
             ))
+        } else if let Some(kept) = held.get(&entry.name) {
+            Err(Refusal::Skipped(format!("now {kept}")))
         } else {
             remove_member(
                 backend,

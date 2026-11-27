@@ -27,12 +27,18 @@ pub enum Via {
     /// A link's session-id hint naming a session other than the one its
     /// name resolves to (a predecessor moved aside under a new name).
     SessionIdHint(String),
+    /// An `answer` or `readdress` decision the holder keeps under
+    /// `koto/aimed/<id>/`, aimed at a question raised in the session whose
+    /// header id is `<id>`, by the decision's kind.
+    Aimed(String),
 }
 
 impl Via {
     /// How a report names this edge.
     pub fn describe(&self) -> String {
         match self {
+            Via::Aimed(kind) if kind == "answer" => "answer aimed at its question".to_string(),
+            Via::Aimed(_) => "pass-up aimed at its question".to_string(),
             Via::Link(kind) => format!("{kind} link"),
             Via::Lineage => "parent_workflow".to_string(),
             Via::ChainParent => "chain/parent".to_string(),
@@ -425,6 +431,19 @@ impl Graph {
                             via: Via::SessionIdHint(link.kind.clone()),
                         });
                     }
+                }
+            }
+            // An answer or pass-up joins its holder to the question's
+            // session, found by the header id it is aimed at: by identity,
+            // so a later session that reuses the name joins nothing.
+            for aimed in &f.aimed {
+                for other in by_id.get(aimed.target_id.as_str()).into_iter().flatten() {
+                    edges.push(Edge {
+                        holder: f.name.clone(),
+                        named: other.to_string(),
+                        target: other.to_string(),
+                        via: Via::Aimed(aimed.kind.clone()),
+                    });
                 }
             }
         }

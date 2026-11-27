@@ -48,12 +48,27 @@ pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
             ContextCommand::Get { session, .. } => Some(("context get", session)),
             ContextCommand::Exists { session, .. } => Some(("context exists", session)),
             ContextCommand::List { session, .. } => Some(("context list", session)),
-            ContextCommand::Add { .. } | ContextCommand::Remove { .. } => None,
+            ContextCommand::Add { .. }
+            | ContextCommand::Remove { .. }
+            | ContextCommand::History { .. } => None,
         },
         Command::Decisions { subcommand } => match subcommand {
             DecisionsSubcommand::List { name, .. } => Some(("decisions list", name)),
             DecisionsSubcommand::Show { name, .. } => Some(("decisions show", name)),
-            DecisionsSubcommand::Record { .. } | DecisionsSubcommand::Reverse { .. } => None,
+            // `chain` walks this host's copies of the sessions on the
+            // chain, which a scratch read of one session can't give it,
+            // and `open`, `attempts`, `precedent`, `history` and
+            // `content read` read every session in the local store.
+            DecisionsSubcommand::Record { .. }
+            | DecisionsSubcommand::Reverse { .. }
+            | DecisionsSubcommand::Answer { .. }
+            | DecisionsSubcommand::Readdress { .. }
+            | DecisionsSubcommand::Open { .. }
+            | DecisionsSubcommand::Attempts { .. }
+            | DecisionsSubcommand::Precedent { .. }
+            | DecisionsSubcommand::History { .. }
+            | DecisionsSubcommand::Content { .. }
+            | DecisionsSubcommand::Chain { .. } => None,
         },
         Command::Overrides { subcommand } => match subcommand {
             overrides::OverridesSubcommand::List { name } => Some(("overrides list", name)),
@@ -308,8 +323,10 @@ fn serve(
                         context::exit_with_failed_read(verb, &e);
                     }
                 }
-                ContextCommand::Add { .. } | ContextCommand::Remove { .. } => {
-                    unreachable!("read_verb refuses context add and remove")
+                ContextCommand::Add { .. }
+                | ContextCommand::Remove { .. }
+                | ContextCommand::History { .. } => {
+                    unreachable!("read_verb refuses context add, remove and history")
                 }
             }
             Ok(())

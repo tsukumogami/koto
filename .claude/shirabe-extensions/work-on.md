@@ -18,16 +18,19 @@ default list and passes the gate without the checks this file names for them: ru
 Each JSON command runs through `scripts/without-session-env.sh`, which removes `KOTO_SESSIONS_BASE`,
 every `KOTO_SESSION_*` variable, `KOTO_ANCHOR`, `KOTO_DISPATCHER_ANCHOR` and `KOTO_AUTHORITY` and
 refuses to start the command while any is still set, since the koto driving the gate or the session
-around it can set them; the commands below are listed without it.
+around it can set them. Each `cargo` command in the JSON also runs as `env CARGO_INCREMENTAL=0 cargo ...`,
+right after that script, so the suite's build leaves no `target/debug/incremental/` behind; an exported
+variable would not reach the suite, since koto runs a session's commands with a fixed environment. The
+commands below are listed without either prefix.
 
 ## Verification map
 
 - `src/**`, `tests/**`, `test/functional/fixtures/**`, `benches/**`, `koto-stability-tests/**`,
-  `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`
-  -> every default command below
+  `koto-session-reader/**`, `koto-session-list/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md`, `scripts/without-session-env.sh`,
+  `scripts/run-tests.sh`, `.config/nextest.toml` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
-  - `cargo test --test doc_names --test plugin_hooks_shape` (the two Rust tests that read `plugins/`)
+  - `cargo test --locked --test doc_names` and `cargo test --locked --test plugin_hooks_shape` (the two Rust tests that read `plugins/`, two map commands)
   - `bash scripts/check-evals-exist.sh`
   - `bash scripts/check-inline-evidence_test.sh` (`validate.yml`'s `inline-evidence` job)
   - `for d in $(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null); do test ! -f "$d/hooks.json" || exit 1; done`
@@ -39,7 +42,7 @@ around it can set them; the commands below are listed without it.
   - `bash plugins/koto-skills/hooks/test/session-start-workflows.test.sh` (needs `jq` on the PATH)
   - `bash plugins/koto-skills/hooks/test/pre-tool-use-agent.test.sh` (needs `jq` on the PATH; brings its own stub koto, so no build)
 - `docs/**` -> all of:
-  - `cargo test --test doc_names` and `cargo test --lib shipped_spec` (the only tests that read `docs/`)
+  - `cargo test --locked --test doc_names` and `cargo test --locked --lib shipped_spec` (the only tests that read `docs/`)
   - `B=$(git merge-base origin/main HEAD) && git diff --name-only --diff-filter=ACMR "$B" -- :/docs/ | grep -vE "(^|/)(evals|tests)/fixtures/" | xargs -r shirabe validate --visibility=public` (errors out when `origin/main` is missing: that is cannot-verify, not a failed change)
   - `shirabe validate --visibility=public --lifecycle . --mode=draft` (not `ready`: an in-flight `/execute` chain keeps its PLAN, which the ready posture rejects)
 - `scripts/run-evals.sh`, `scripts/run-evals_test.sh`, `scripts/classify-eval-session.py` ->
@@ -77,7 +80,7 @@ around it can set them; the commands below are listed without it.
   in the next entry until someone checks its `on:` block against this rule and adds it here. The
   check script itself is under `scripts/**`, so a change to it stays with a person too.
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
-  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, `scripts/without-session-env.sh`, the two
+  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, `scripts/without-session-env.sh`, `scripts/run-tests.sh`, the two
   inline-evidence files and the three run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
   `plugins/koto-skills/hooks/*.sh` (except `session-start.sh`, `session-start-workflows.sh` and `pre-tool-use-agent.sh`, which the session-start and agent-hook suites in the `plugins/**` entry run); `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
@@ -87,11 +90,27 @@ around it can set them; the commands below are listed without it.
 
 ### Default verification command (when no map entry matches; all must pass)
 
-Four of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
-change both together. Its other jobs (audit, coverage, the tsuku install, cloud integration,
-leftover-artifact checks) are left out on purpose.
+Five of the checks `.github/workflows/validate.yml` runs on every PR, which point back here;
+change both together. Its other jobs (audit, the tsuku install, cloud integration,
+leftover-artifact checks) are left out on purpose. The two test commands run through
+`scripts/run-tests.sh`, which uses cargo-nextest's `ci` profile from `.config/nextest.toml` (one
+process per test, as the `tests` and `stability-tests` jobs do) when a cargo-nextest at or above
+that file's `nextest-version` is installed, and otherwise says so on stderr and falls back to
+`cargo test --locked ... -- --test-threads=1`. CI's `tests` job also adds coverage and
+`--all-features`; locally the suite runs without either. Like CI, the test, doctest and clippy
+commands name `koto` and `koto-session-reader`, since cargo without `-p` runs only the root
+package, and the test and clippy commands name `koto-session-list` too, which has no library and
+so no doctests; `run-tests.sh` given arguments skips the doctests, which have their own command.
 
-- `cargo test --locked -- --test-threads=1`
-- `cargo test -p koto-stability-tests -- --test-threads=1`
+- `bash scripts/run-tests.sh -p koto -p koto-session-reader -p koto-session-list`
+- `cargo test --locked --doc -p koto -p koto-session-reader`
+- `bash scripts/run-tests.sh -p koto-stability-tests`
 - `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy -p koto -p koto-session-reader -p koto-session-list --all-targets -- -D warnings`
+
+### Build output
+
+The JSON's top-level `build_output` lists `target/`, the tree the cargo commands above build into. Verification
+never reads it. shirabe removes the listed paths from a finished run's worktree only on a workspace that
+turns the cleanup on in an untracked `CLAUDE.local.md`, and reads the list at the merge base, so a branch
+can't change what its own run removes.

@@ -60,6 +60,56 @@ pub struct ContinuesFact {
     pub body: Result<Option<String>, super::relation::Reason>,
 }
 
+/// One `answer` or `readdress` a session holds aimed at a question
+/// (DESIGN-session-retention.md, "Questions"): an edge between the holder
+/// and the session whose header id is `target_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AimedFact {
+    /// The header session id the `koto/aimed/<target>/` directory names.
+    pub target_id: String,
+    /// `answer` or `readdress`.
+    pub kind: String,
+}
+
+/// Where a session's own decisions sit under `ctx/`.
+const DECISIONS_PREFIX: &str = "koto/decisions/";
+
+/// Where a session's aimed decisions sit under `ctx/`.
+const AIMED_PREFIX: &str = "koto/aimed/";
+
+/// The largest aimed decision body read; a stored body is never larger.
+const MAX_AIMED_BODY_BYTES: u64 = crate::decisions::body::MAX_BODY_BYTES as u64;
+
+#[derive(Deserialize)]
+struct AimedBody {
+    kind: String,
+}
+
+/// The kind of the aimed decision at `path`, when it is an `answer` or a
+/// `readdress` (the two that join a hierarchy). Anything else, or a file
+/// that can't be read as a decision, joins nothing.
+pub(crate) fn aimed_kind(path: &Path) -> Option<String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() && meta.len() <= MAX_AIMED_BODY_BYTES => {}
+        _ => return None,
+    }
+    let bytes = fs::read(path).ok()?;
+    let body: AimedBody = serde_json::from_slice(&bytes).ok()?;
+    matches!(body.kind.as_str(), "answer" | "readdress").then_some(body.kind)
+}
+
+/// The aimed fact a file under `ctx/koto/` at context key `key` makes.
+fn aimed_fact(key: &str, path: &Path) -> Option<AimedFact> {
+    let (target, _id) = key.strip_prefix(AIMED_PREFIX)?.split_once('/')?;
+    if !crate::decisions::store::is_target_id(target) {
+        return None;
+    }
+    Some(AimedFact {
+        target_id: target.to_string(),
+        kind: aimed_kind(path)?,
+    })
+}
+
 /// What `koto/imported-from` says the session was copied from.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImportedFrom {
@@ -98,6 +148,14 @@ pub struct SessionFacts {
     /// Whether `pin` is the bucket's rather than this host's copy's: set
     /// only by a cloud host's check of its scan ([`super::Graph::set_pin`]).
     pub pin_in_bucket: bool,
+    /// Each `answer` or `readdress` decision this session holds under
+    /// `koto/aimed/<target>/`, in key order: an edge to the session whose
+    /// header id is the target, when that session is in the store. A
+    /// reversal, or a file that can't be read as a decision, is none.
+    pub aimed: Vec<AimedFact>,
+    /// Whether the session holds any file under `koto/decisions/`, so it
+    /// may have raised a question the retention engine must ask about.
+    pub holds_decisions: bool,
     /// What makes this session's own component unreadable: a malformed
     /// link or `chain/parent`, a symlink or special file under `ctx/koto/`.
     pub problems: Vec<String>,
@@ -396,6 +454,13 @@ impl SessionFacts {
                         .to_string(),
                 );
                 return;
+            }
+        }
+
+        self.holds_decisions = files.keys().any(|k| k.starts_with(DECISIONS_PREFIX));
+        for (key, path) in &files {
+            if let Some(fact) = aimed_fact(key, path) {
+                self.aimed.push(fact);
             }
         }
 

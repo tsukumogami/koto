@@ -19,7 +19,8 @@ decision: |
   `koto request watch --session <id> --timeout-secs <n> [--since <cursor>]`,
   which polls it every 100 ms and exits when it changes. The wake-candidates
   pass in `koto next` rings the same file through a new `SignalWaker`, and
-  `LoggingWaker` is deleted.
+  `LoggingWaker` is deleted. A recorded answer to a question rings the
+  asker's file the same way.
 rationale: |
   Every leg change already funnels through the store's typed writes, so ringing
   there covers every route, runs in the process that made the change, and
@@ -320,6 +321,19 @@ duplicate costs one tick that finds nothing new. Where nothing subscribes,
 wake-candidates pass rings the same file through `SignalWaker`, and
 `LoggingWaker` is gone.
 
+Beside the request store and the wake pass, one more writer rings. When
+`koto decisions answer` records an answer (outcome `answered`), it rings
+the wake file of the question's raiser through `ring`, and, when the
+raiser was superseded, the wake file of the newest session continuing it,
+which `supersede_chain::newest_member` finds in the sessions directory the
+command used. The ring
+comes after the answer is stored and before the command returns. It means
+"look again" here too: the line carries nothing about the question or the
+answer, and the asker's next tick reads the answer from the decision
+store. A refused answer, a pass-up (`readdress`) and `koto decisions
+record` ring nothing, and a failure to ring is one warning on stderr that
+leaves the path as it was and never fails the answer.
+
 ### Rationale
 
 The request store is the one place every leg change passes, and ringing
@@ -370,6 +384,12 @@ R11 with a one-method adapter.
   are updated.
 - **`src/cli/mod.rs`.** `handle_next` constructs `SignalWaker { koto_root }`
   instead of `LoggingWaker`.
+- **`src/cli/decisions.rs`.** `handle_answer` calls `wake_signal::ring`
+  for the question's raiser once the answer is stored, and again for the
+  successor `supersede_chain::newest_member` finds in the sessions
+  directory the command used, warning on stderr when
+  the koto root can't be resolved or the ring is refused (an unwritable
+  `wakes/`, or a symlink, directory or FIFO at the path).
 - **`src/cli/request.rs`.** A `Watch { session, timeout_secs, since }`
   subcommand. It validates the session name and parses `--since` before any
   I/O: a bad session is `InvalidIdentifier` and a bad cursor
@@ -397,6 +417,9 @@ koto next (terminal) ─► promote_leg_result ─► record_result ─┬─►
 
 koto request resolve / abandon / abandon-request / close / koto init --koto-leg refusal
                                    ─► typed write ───────────────► same rings
+
+koto decisions answer <raiser> ... ─► answer stored ─► ring ─┬─► append line to <raiser>
+                                                             └─► newest_member ─► append line to its newest successor
 
 coordinator's harness:   koto request watch --session <coordinator> --since <c>   (polls every 100 ms)
                             │ exits woke:true with new cursor
