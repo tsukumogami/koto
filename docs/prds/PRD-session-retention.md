@@ -1259,6 +1259,21 @@ with q1's decision id.
   close.
 - A worker with no start hook (a Codex worker, for one) has no anchor, so
   its sessions use the koto-level reading.
+- R36 to R40 don't guard every removal. The parent sweep's removal of a
+  released parent's descendants keeps a child holding a person's verified
+  answer, but still removes a child holding the answer in effect, or a
+  pass-up, for a question raised outside the parent's subtree, and that
+  question then reads open again. Rollbacks of sessions koto just created,
+  batch and retry respawns, and the removal of a migrated source aren't
+  guarded either.
+- Only the explicit paths (`koto session cleanup`, `koto cancel --cleanup`
+  and `koto init --replace-terminal`) refuse when a session's decisions
+  can't be read (R39). The by-rule paths (the terminal tick,
+  `koto session prune` and `koto workspace prune`) judge a session whose
+  question file doesn't parse as holding nothing.
+- Under the cloud backend the holds R39 refuses on are worked out from the
+  local store only; cleanup's pin check, which runs first, consults the
+  bucket as it always did.
 
 ## Decisions and Trade-offs
 

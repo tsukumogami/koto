@@ -719,6 +719,20 @@ fn assert_unreadable_refusal(out: &Out, name: &str, unreadable_in: &str) {
     let message = err["message"].as_str().unwrap();
     assert!(message.contains("can't be read"), "{message}");
     assert!(message.contains(first), "{message}");
+    assert_unreadable_way_out(message, name, "");
+}
+
+/// Assert `message`, a refusal of `name` for decisions that couldn't be
+/// read and nothing held, says `--force` removes the session without the
+/// check and ends with the force command, then `suffix`; nothing to answer,
+/// reverse or pass is named.
+fn assert_unreadable_way_out(message: &str, name: &str, suffix: &str) {
+    let tail = format!(
+        ". --force removes the session without checking what it holds: koto session cleanup \
+         {name} --force{suffix}"
+    );
+    assert!(message.ends_with(&tail), "{message}");
+    assert!(!message.contains("Answer, reverse or pass"), "{message}");
 }
 
 /// The `questions` entry for a session holding `answer` (`<holder session
@@ -1564,6 +1578,71 @@ fn workspace_prune_removes_asker_and_answerer_together() {
 }
 
 #[test]
+fn session_prune_apply_plan_keeps_an_answerer_whose_asker_stays_and_an_open_raiser() {
+    let env = Env::new();
+    // `a` asked `b`, which answered; `r` raised a question still open;
+    // `z` holds nothing. `b`, `r` and `z` end first, `a` three seconds
+    // later.
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let q = env.escalate("a", "q1", "session:b");
+    env.answer(&q, "b", "yes");
+    env.init("r", &[]);
+    let open = env.escalate("r", "q1", "person:owner");
+    env.init("z", &[]);
+    env.finish_env(&FAST, "b");
+    env.finish_env(&FAST, "r");
+    env.ok_env(
+        &FAST,
+        &["next", "z", "--with-data", r#"{"go":"go"}"#, "--no-cleanup"],
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    env.finish_env(&FAST, "a");
+    settle();
+
+    // `b`, `r` and `z` stopped over four seconds ago, `a` about two: the
+    // asker stays.
+    let preview = env.prune(&["--older-than", "4s"]);
+    assert_eq!(names_of(&preview["remove"]), vec!["z"], "{preview:#}");
+    let kept = kept_entry(&preview, "b");
+    assert_eq!(kept["rule"], "h", "{kept}");
+    assert_kept_for_raiser(kept["detail"].as_str().unwrap(), &q);
+    let kept = kept_entry(&preview, "r")["detail"].as_str().unwrap();
+    assert!(
+        kept.contains(&format!("holds open question {}", open.identity())),
+        "{kept}"
+    );
+    let token = preview["plan"].as_str().unwrap().to_string();
+
+    // What the apply may change: the removed session, the wakes, and the
+    // stored plan it consumes.
+    let unchanged = |env: &Env| -> BTreeMap<PathBuf, Vec<u8>> {
+        let plans = Path::new("sessions").join(".prune-plans");
+        env.snapshot_except("z")
+            .into_iter()
+            .filter(|(p, _)| !p.starts_with(&plans))
+            .collect()
+    };
+    let before = unchanged(&env);
+    let applied = env.prune(&["--apply", "--plan", &token]);
+    assert_eq!(
+        names_of(&applied["removed"]),
+        names_of(&preview["remove"]),
+        "{applied:#}"
+    );
+    assert_eq!(applied["skipped"], json!([]), "{applied:#}");
+    assert_eq!(applied["failed"], json!([]), "{applied:#}");
+    assert_eq!(names_of(&applied["kept"]), names_of(&preview["kept"]));
+    assert_eq!(unchanged(&env), before);
+    assert!(!env.exists("z"));
+    for name in ["a", "b", "r"] {
+        assert!(env.exists(name), "{name}");
+    }
+    assert!(!env.listed_as_raised(&q));
+    assert!(env.listed_as_raised(&open));
+}
+
+#[test]
 fn session_prune_older_than_keeps_an_answerer_whose_asker_is_too_young() {
     let env = Env::new();
     env.init("a", &[]);
@@ -1958,6 +2037,34 @@ fn cancel_cleanup_and_replace_refuse_the_holder_of_a_verified_person_answer() {
     assert!(!env.exists("b_r1"), "b was moved aside");
 }
 
+#[test]
+fn a_pinned_holder_of_a_verified_person_answer_is_refused_for_its_pin_even_with_force() {
+    let _records = fx::Records::new();
+    let env = Env::new();
+    env.init("a", &[]);
+    env.init("b", &[]);
+    let (q, header) = env.raise_for_person("a", "q1", "person:owner");
+    let id = env.person_answer_at(&q, &header, "b", "toolu_ZQXMARKERretention04");
+    assert_eq!(env.show("b", &id)["reading"], "verified");
+    // The raiser goes, so what `b` holds is the person answer alone.
+    let out = env.cleanup("a", &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    env.ok(&["session", "pin", "b", "--reason", "x"]);
+
+    let before = env.snapshot_all();
+    for extra in [&[][..], &["--force"][..]] {
+        let out = env.cleanup("b", extra);
+        assert_eq!(out.code, 2, "{extra:?}\n{}\n{}", out.stdout, out.stderr);
+        assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
+        assert_eq!(env.snapshot_all(), before, "{extra:?}");
+    }
+    let out = env.run(&["cancel", "b", "--cleanup"]);
+    assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(out.json()["error"]["code"], "pinned", "{}", out.stdout);
+    assert_eq!(env.snapshot_all(), before, "cancel");
+    assert_eq!(env.show("b", &id)["reading"], "verified");
+}
+
 // ===== Decisions that can't be read =====
 
 #[test]
@@ -2010,12 +2117,62 @@ fn unreadable_decisions_refuse_cleanup_cancel_and_replace_and_remove_nothing() {
             .is_some_and(|u| u.contains("'a'")),
         "{v}"
     );
+    let message = v["error"].as_str().unwrap();
+    assert!(message.contains("can't be read"), "{v}");
     assert!(
-        v["error"].as_str().unwrap().contains("can't be read"),
-        "{v}"
+        message.starts_with("finished session 'a' wasn't replaced: "),
+        "{message}"
     );
+    assert_unreadable_way_out(message, "a", ", then run koto init again");
     assert_eq!(env.snapshot_all(), before);
     assert!(!env.exists("a_r1"));
+}
+
+#[test]
+fn a_refusal_for_holds_and_unreadable_decisions_keeps_the_hold_wording() {
+    let env = Env::new();
+    // `d` raised an open question and answered `c`'s, whose decisions
+    // will be unreadable.
+    env.init("c", &[]);
+    env.init("d", &[]);
+    let raised = env.escalate("d", "q1", "person:owner");
+    let cq = env.escalate("c", "q1", "session:d");
+    env.answer(&cq, "d", "yes");
+
+    let before = env.snapshot_all();
+    if !env.lock_decisions("c") {
+        return;
+    }
+    let out = env.cleanup("d", &[]);
+    let cancel = env.run(&["cancel", "d", "--cleanup"]);
+    env.unlock_decisions("c");
+    for out in [&out, &cancel] {
+        assert_eq!(out.code, 2, "{}\n{}", out.stdout, out.stderr);
+        let err = &out.json()["error"];
+        assert_eq!(err["code"], "holds_question", "{err}");
+        assert_eq!(
+            err["questions"],
+            json!([{"question": raised.identity(), "held": "raised"}]),
+            "{err}"
+        );
+        assert!(err["decisions_unreadable"][0]
+            .as_str()
+            .is_some_and(|u| u.contains("'c'")));
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.contains(&raised.identity()) && message.contains("can't be read"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                ". --force removes the session without checking what couldn't be read. \
+                 Answer, reverse or pass the question first, or remove the session anyway \
+                 with: koto session cleanup d --force"
+            ),
+            "{message}"
+        );
+    }
+    assert_eq!(env.snapshot_all(), before);
 }
 
 #[test]

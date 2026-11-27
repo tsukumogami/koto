@@ -1451,6 +1451,37 @@ pub(crate) fn holds_reasons(orphans: &crate::decisions::questions::Orphans) -> S
     each.join("; ")
 }
 
+/// What a `holds_question` refusal of `name` tells the caller to do, ending
+/// in `koto session cleanup <name> --force`. With holds: the way out
+/// [`crate::decisions::questions::way_out`] names, then `alternative` (how
+/// the command is introduced) and the command, after a sentence that
+/// `--force` doesn't check what couldn't be read when something couldn't.
+/// With nothing but decisions that couldn't be read there is no question to
+/// answer, reverse or pass, so it says only that `--force` removes the
+/// session without the check, and gives the command.
+pub(crate) fn holds_way_out(
+    name: &str,
+    orphans: &crate::decisions::questions::Orphans,
+    alternative: &str,
+) -> String {
+    let command = format!(
+        "koto session cleanup {} --force",
+        crate::session::hierarchy::display_text(name)
+    );
+    if orphans.holds.is_empty() {
+        return format!("--force removes the session without checking what it holds: {command}");
+    }
+    let holds = format!(
+        "{}, or {alternative} with: {command}",
+        crate::decisions::questions::way_out(&orphans.holds)
+    );
+    if orphans.unreadable.is_empty() {
+        holds
+    } else {
+        format!("--force removes the session without checking what couldn't be read. {holds}")
+    }
+}
+
 /// The `holds_question` error body for session `name` holding `orphans`,
 /// with `message`.
 pub(crate) fn holds_error(
@@ -1490,12 +1521,11 @@ pub(crate) fn refuse_holds(
     if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
         super::exit_with_error_code(refusal.to_json(), refusal.exit);
     }
-    let shown = display_text(name);
     let message = format!(
-        "session '{shown}' wasn't removed: {}. {}, or remove the session anyway with: koto \
-         session cleanup {shown} --force",
+        "session '{}' wasn't removed: {}. {}",
+        display_text(name),
         holds_reasons(orphans),
-        crate::decisions::questions::way_out(&orphans.holds)
+        holds_way_out(name, orphans, "remove the session anyway")
     );
     super::exit_with_error_code(
         serde_json::json!({ "error": holds_error(name, orphans, message) }),

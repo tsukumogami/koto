@@ -675,7 +675,10 @@ A member holding a person's verified answer is a keeper the same way, with
 no expiry and alive or not: its keeper object adds `"answered_questions"`, the
 questions it answered, and `"alive": false` when it isn't alive, `koto session prune` keeps it and its hierarchy under rule `h`,
 `koto workspace prune --root` follows that verdict, and the parent sweep
-lists such a child in `kept_children` with reason `person_answer`. No
+lists such a child in `kept_children` with reason `person_answer`. Its
+reason text is `kept: a verified person answer is held in its hierarchy:
+<name> holds a verified person answer to question <id>`, so a
+`koto session prune` preview lists every such session on the host. No
 retention period ever passes for that hierarchy, so a prune never removes
 it, the raiser included while it stays joined.
 
@@ -693,6 +696,15 @@ the identity match the cleanup refusal makes (below), applied to the run's
 removal set rather than to one session. A holder of a person's verified
 answer needs no such check: the keeper rule above already keeps it, whatever
 else the run removes.
+
+**What isn't guarded.** The parent sweep's removal of descendants, once a
+finished parent's hierarchy is released, keeps a child holding a person's
+verified answer, but makes no check for answers or pass-ups: it still
+removes a child holding the answer in effect, or a pass-up, for a question
+raised outside the parent's subtree, and that question then reads open
+again. The rollback of sessions koto has just created, the respawn of batch
+and retry children, and the removal of a migrated source make no question
+check at all.
 
 **Explicit removal.** Where explicit removal always removed and reported
 what it broke, a removal that would orphan a question is now refused unless
@@ -734,7 +746,12 @@ decisions can't be read, or a question one of its aimed entries points at
 can't be read in the raiser's session, cleanup and `cancel --cleanup`
 refuse without `--force` with the same code and exit, and the message names
 what couldn't be read: the session's decisions, or the raiser and the
-question identity. `--force` removes it as above.
+question identity. `--force` removes it as above. Only the explicit
+paths refuse on unreadable data: cleanup, `cancel --cleanup` and the
+same-name replace below. The by-rule paths (the terminal tick,
+`koto session prune` and `koto workspace prune`) judge a session whose
+question file doesn't parse as holding nothing, so its questions keep
+nothing there.
 
 `koto init <name> --replace-terminal` makes the same check on the terminal
 predecessor before it moves or removes anything. Where an unheld
@@ -746,8 +763,9 @@ replace exits 2 with code `holds_question` and the same `questions` and
 `force_command` as cleanup; nothing is moved, removed or written. The way
 out is `koto session cleanup <name> --force` and then the `init` again.
 
-**The cloud backend.** The refusal, the replace check and the prunes' hold
-read only the local store. A question's holds are found from the sessions
+**The cloud backend.** The hold computation behind the refusal, the replace
+check and the prunes reads only the local store. The pin check cleanup runs
+first is unchanged and consults the bucket as cleanup always did. A question's holds are found from the sessions
 present on this host, so a host that has the answerer locally but not the
 asker sees no hold: the answer's raiser isn't in its store, and the answer
 holds nothing there. Cleanup on that host deletes the local copy and the
@@ -1726,9 +1744,18 @@ store shared by mixed koto versions loses the guarantee.
   and so does a same-name replace of such a session, which used to move it
   aside. Holding the answer in effect counts for as long as the asker is in
   the store.
-- Under the cloud backend the refusal reads only the local store, so a host
-  that has the answerer but not the asker removes the answerer, bucket copy
-  included, without asking.
+- Under the cloud backend the refusal computes holds from the local store
+  only (its pin check still consults the bucket), so a host that has the
+  answerer but not the asker removes the answerer, bucket copy included,
+  without asking.
+- The parent sweep's descendant removal still removes a child holding the
+  answer in effect, or a pass-up, for a question raised outside the
+  parent's subtree, and the question reads open again. Rollbacks of
+  just-created sessions, batch and retry respawns and a migrated source's
+  removal aren't guarded at all.
+- The by-rule paths judge a session whose question file doesn't parse as
+  holding nothing; only the explicit removals and the same-name replace
+  refuse on it.
 - Four existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.

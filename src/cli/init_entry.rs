@@ -655,12 +655,11 @@ fn refuse_question_holder(backend: &Backend, entry: &EntryFlags, name: &str) {
     if !orphans.refuses() {
         return;
     }
-    let shown = display_text(name);
     let message = format!(
-        "finished session '{shown}' wasn't replaced: {}. {}, or remove the session with: koto \
-         session cleanup {shown} --force, then run koto init again",
+        "finished session '{}' wasn't replaced: {}. {}, then run koto init again",
+        display_text(name),
         super::session::holds_reasons(&orphans),
-        crate::decisions::questions::way_out(&orphans.holds)
+        super::session::holds_way_out(name, &orphans, "remove the session")
     );
     let mut r = Refusal::new(Some("holds_question"), message.clone(), 2);
     for (k, v) in super::session::holds_error(name, &orphans, message) {

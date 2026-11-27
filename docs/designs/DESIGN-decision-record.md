@@ -1089,11 +1089,24 @@ time, so it changes when the entries do.
   component keep an answer or pass-up holder unless its question's raiser goes in the same run,
   and keep a person's verified answer's holder whatever goes.
 
+Some removals aren't guarded. The parent sweep's removal of a released parent's descendants keeps a
+child holding a person's verified answer, but still removes a child holding the answer in
+effect, or a pass-up, for a question raised outside the parent's subtree, and that question then
+reads open again. Rollbacks of sessions koto just created, batch and retry respawns and the
+removal of a migrated source aren't guarded either. Only the explicit paths refuse on a
+session whose decisions can't be read: the by-rule ones (the terminal tick, `koto session prune`
+and `koto workspace prune`) judge a question file that doesn't parse as holding nothing.
+
+A `koto session prune` preview lists every session kept for a person's verified answer, under rule
+`h` with the detail `kept: a verified person answer is held in its hierarchy: <name> holds a
+verified person answer to question <id>`; `koto session hierarchy <name>` prints the same reason.
+
 A session that holds no question pays for none of this. The terminal tick and the refusal each read
 the session's own decisions first and scan the local store only when it holds a question (or, for
 the refusal, an aimed answer or pass-up), and read the host's verified-answer note only for an
 answer that carries a prompt; the engine reads the store's decisions once per command,
-and only when a judged member holds a decision at all. None of them reads the bucket.
+and only when a judged member holds a decision at all. None of them reads the bucket for holds;
+cleanup's pin check, which runs before the refusal, consults it as it always did.
 
 **The wake.** `koto decisions answer` rings the raiser's wake file, `<koto home>/wakes/<raiser>`,
 after the answer is stored and before the command returns, by calling the leg wake's `ring` in

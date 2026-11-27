@@ -242,6 +242,14 @@ naming the question. When the raiser and the holder both go in that run,
 both are removed. A session holding a person's verified answer is kept by
 every prune whatever else the run removes.
 
+**What isn't guarded.** When a finished parent's hierarchy is released, its
+sweep of descendants keeps a child holding a person's verified answer, but
+it still removes a child holding the answer in effect, or a pass-up, for a
+question raised outside the parent's subtree, and that question then reads
+open again. Nor do these check for questions: the rollback that removes
+sessions koto has just created, the respawn of batch and retry children,
+and the removal of a migrated source.
+
 **Removing one by hand.** `koto session cleanup <name>` refuses a session an
 open question depends on: one that raised an open question, holds the answer
 in effect for a question whose raiser is still in the store, or holds a
@@ -263,6 +271,11 @@ koto refuses when it can't tell, too. If the session's own decisions can't
 be read, or a question one of its answers or pass-ups points at can't be read
 in the raiser's session, cleanup and `cancel --cleanup` refuse without
 `--force` with the same code, and the message names what couldn't be read.
+Only these explicit removals, and the same-name replace below, refuse on
+data they can't read. The removals that go by rule (the terminal tick,
+`koto session prune` and `koto workspace prune`) judge a session whose
+question file doesn't parse as holding nothing, so they don't keep it for
+its questions.
 
 ```bash
 koto session cleanup A --force
@@ -312,7 +325,9 @@ addressee it had before it. Removing the raiser drops the question from every
 open read, while the answers and pass-ups aimed at it still list in their own
 sessions.
 
-**Under the cloud backend** the refusal reads only the local store. A host
+**Under the cloud backend** the refusal works out what a session holds from
+the local store only. The pin check cleanup runs first is unchanged and
+consults the bucket as cleanup always has. A host
 that has the answering session locally but not the asker sees no hold: as far
 as its store knows, the answer's raiser is gone, so the answer holds nothing.
 `koto session cleanup` there deletes the local copy and the bucket copy as it
@@ -345,8 +360,18 @@ A person's verified answer has no unforced way out. A host accumulates the
 session of every person's answer it has verified, with its hierarchy, until
 each one is forced out; no prune removes them however old they are, and the
 asker stays with its answerer while the two are joined. On a host where a
-person answers many questions, that count only grows. When a precedent is
-no longer wanted, remove the session that holds it:
+person answers many questions, that count only grows.
+
+To list them, run `koto session prune` with no `--apply`. The preview
+removes nothing and prints each one as kept under rule `h`, with a `detail`
+of `kept: a verified person answer is held in its hierarchy: <name> holds a
+verified person answer to question <id>` (`questions` and a comma-separated
+list when it answered more than one; when something else in the hierarchy
+keeps it too, the clause follows the others as `; and a verified person
+answer is held in it: ...`). `koto session hierarchy <name>` prints the same
+reason for one session.
+
+When a precedent is no longer wanted, remove the session that holds it:
 
 ```bash
 koto session cleanup <name> --force
