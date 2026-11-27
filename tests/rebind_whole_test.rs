@@ -1460,6 +1460,31 @@ fn a_whole_rebind_works_when_every_directory_the_session_recorded_is_gone() {
 }
 
 #[test]
+fn a_whole_rebind_of_a_session_with_no_execution_dir_logs_its_anchor_as_from() {
+    let host = Host::new();
+    let old = host.dir("old");
+    let new = host.dir("new");
+    host.init_at(&old, NAME);
+    let log = host.log(NAME);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let mut h: Value = serde_json::from_str(first).unwrap();
+    assert_eq!(h["origin"]["anchor"], s(&old), "setup: {h}");
+    assert!(
+        h.as_object_mut().unwrap().remove("execution_dir").is_some(),
+        "setup: {h}"
+    );
+    std::fs::write(&log, format!("{h}\n{rest}")).unwrap();
+    let anchor = host.open_anchor("new");
+
+    let out = expect_ok(host.whole_at(&new, NAME, &anchor), "rebind --whole");
+
+    let moves = whole_moves(&log);
+    assert_eq!(moves.len(), 1, "{moves:?}; {}", out.describe());
+    assert_eq!(moves[0]["from"], s(&old), "{moves:?}");
+}
+
+#[test]
 fn a_writer_that_read_before_a_whole_rebind_is_refused_after_it() {
     // A command a tick started in the background outlives the tick and
     // writes after the move, from the anchor the move retired. The tick

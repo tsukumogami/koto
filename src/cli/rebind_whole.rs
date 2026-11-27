@@ -390,7 +390,10 @@ fn commit_remote(
         .with_context(|| format!("failed to read {}", state_path.display()))?;
     let payload = matches!(commit, Commit::Needed).then(|| {
         EventPayload::ExecutionAnchorReboundWhole(WholeRebound {
-            from: header.execution_dir.clone(),
+            from: header
+                .execution_dir
+                .clone()
+                .or_else(|| header.origin.as_ref().map(|o| o.anchor.clone())),
             to: target.to_path_buf(),
             whole: true,
             epoch,
@@ -726,7 +729,10 @@ fn commit_move(
 ) -> Result<()> {
     use crate::engine::persistence;
 
-    let from = header.execution_dir.clone();
+    let from = header
+        .execution_dir
+        .clone()
+        .or_else(|| header.origin.as_ref().map(|o| o.anchor.clone()));
     let payload = EventPayload::ExecutionAnchorReboundWhole(WholeRebound {
         from: from.clone(),
         to: target.to_path_buf(),

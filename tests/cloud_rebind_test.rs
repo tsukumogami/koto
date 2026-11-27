@@ -904,6 +904,7 @@ mod whole {
         "after-publish",
         "after-environment-event",
         "after-environment",
+        "after-version",
     ];
 
     /// Two states that take evidence, so a tick with `GO` stops short of
@@ -2158,13 +2159,13 @@ Done.
         }
     }
 
-    /// The move of the test above, stopped at `after-version`, the last
-    /// point before the carry, where the new home already holds the moved
-    /// state, and run again with `--to` the new directory from a third one,
-    /// neither the old directory nor the new: there the moved header doesn't
-    /// name the caller's directory, so the home is located, and the home
-    /// before the move must still come from the logged move's `from`, not
-    /// from that located answer.
+    /// The move of the per-point test above, on [`Moving::unrecorded`], stopped at
+    /// `after-version`, the last point before the carry, where the new home
+    /// already holds the moved state, and run again with `--to` the new
+    /// directory from a third one, neither the old directory nor the new. It
+    /// carries the context because the home before the move can't be located
+    /// from the logged `from`: both homes hold the state, so that home is
+    /// none, and the carry treats none as moved. It doesn't locate the old home.
     #[test]
     fn a_cloud_whole_rebind_stopped_after_its_commit_and_run_again_elsewhere_carries_the_context() {
         let mv = Moving::unrecorded();

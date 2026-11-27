@@ -2225,6 +2225,7 @@ change it is:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `from` | string | No | The directory the session was bound to before the rebind: its execution directory, or its anchor when it recorded none; absent only when it recorded neither. |
 | `whole` | boolean | No | `true` on a whole-binding move. Absent on a plain rebind. |
 | `epoch` | integer | No | The `origin.anchor_epoch` the move commits, which the header also records as `origin.whole_epoch`. Absent on a plain rebind, and on a whole-binding move of a session with no origin record, which has no epoch to raise. |
 
