@@ -48,7 +48,9 @@ pub(crate) enum TakeError {
     /// The session's directory doesn't exist; nothing was created.
     Missing,
     /// Still held elsewhere once the wait had passed.
-    Busy(Busy),
+    // `koto init --replaces` reads `waited_for` in its busy refusal; until
+    // it lands, only the tests read the field.
+    Busy(#[allow(dead_code)] Busy),
     /// The lock file couldn't be opened or locked.
     Failed(anyhow::Error),
     /// The platform has no `flock`.
