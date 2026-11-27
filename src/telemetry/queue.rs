@@ -77,6 +77,13 @@ fn call_budget() -> Duration {
     TEST_CALL_BUDGET.with(|b| b.get())
 }
 
+/// Give this thread's flushes a call budget other than the real one, until
+/// the next [`reset_for_test`].
+#[cfg(test)]
+pub(crate) fn set_call_budget_for_test(budget: Duration) {
+    TEST_CALL_BUDGET.with(|b| b.set(budget));
+}
+
 // How much of a flush's budget a test says each call used up, on top of
 // the time it really took. A test that needs a call to leave too little
 // time for the next one sets this and a long budget, so the outcome is
@@ -241,6 +248,15 @@ impl Drops {
 /// Send what is queued to the event sink. Returns at once, having called
 /// nothing, when nothing is queued. See the module documentation for what
 /// each outcome does.
+///
+/// It is called at fixed points, so a long command doesn't hold its
+/// records until it ends: before a gate's or an action's command is
+/// started (`run_shell_command`), before a decider is called, before each
+/// wait (a polling gate's, a polling action's, `koto request`'s, the
+/// decider lock's), on the terminal tick before the session directory can
+/// be removed, and from the exit hook. Code that adds a new slow step or a
+/// new wait should call it first. The one rule is that no call may sit
+/// inside a command's time limit.
 pub fn flush() {
     let Queue { items, oversize } = with_queue(std::mem::take);
     if items.is_empty() && oversize.is_empty() {
@@ -336,7 +352,7 @@ mod tests {
         /// the host is at starting the stub.
         fn unhurried() -> Self {
             let f = Fixture::new();
-            TEST_CALL_BUDGET.with(|b| b.set(Duration::from_secs(120)));
+            set_call_budget_for_test(Duration::from_secs(120));
             f
         }
 
