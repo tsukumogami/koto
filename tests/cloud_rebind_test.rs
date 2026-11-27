@@ -2159,6 +2159,68 @@ Done.
         }
     }
 
+    /// The test above on a session `koto session start` made, whose header
+    /// records neither `origin` nor `execution_dir`, so the logged move's
+    /// `from` is empty: run again, the move must still carry the context
+    /// from the old home to the new one.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_after_its_commit_carries_the_context_of_a_session_with_no_origin(
+    ) {
+        let s3 = FakeS3::start(BUCKET);
+        let m = Machine::new(&s3);
+        let old = m.dir("old");
+        let new = m.dir("new");
+        m.init(&old, &[], "parent", &[]);
+        m.ok(
+            &old,
+            &[],
+            &["session", "start", "kid", "--parent", "parent"],
+            "setup: session start",
+        );
+        let h = m.header("kid");
+        assert!(
+            h.get("origin").is_none() && h.get("execution_dir").is_none(),
+            "setup: the kid's header records origin or execution_dir: {h}"
+        );
+        let added = m.add(&old, "kid", "notes.md", "notes");
+        assert!(added.ok(), "setup: context add: {}", added.describe());
+        let anchor = m.open_anchor(&old, "new");
+        let new_prefix = prefix_of(&new);
+        assert_ne!(
+            new_prefix,
+            prefix_of(&old),
+            "setup: the two directories share a prefix"
+        );
+        let args = ["session", "rebind", "kid", "--whole"];
+
+        let stopped = m.run(
+            &new,
+            &[
+                ("KOTO_ANCHOR", anchor.as_str()),
+                (FAULT_ENV, "after-version"),
+            ],
+            &args,
+        );
+        assert!(
+            !stopped.ok(),
+            "the stopped move exited 0: {}",
+            stopped.describe()
+        );
+        let run = m.run(&new, &[("KOTO_ANCHOR", anchor.as_str())], &args);
+        assert!(run.ok(), "run again: {}", run.describe());
+
+        let object = session_key(&new_prefix, "kid", "ctx/notes.md");
+        assert_eq!(
+            s3.object(&object).as_deref(),
+            Some("notes".as_bytes()),
+            "context key 'notes.md' from before the move isn't at the new home {object}; keys \
+             under it: {:?}; the stopped move: {}; run again: {}",
+            s3.keys_under(&format!("{new_prefix}/kid/")),
+            stopped.describe(),
+            run.describe()
+        );
+    }
+
     /// The move of the per-point test above, on [`Moving::unrecorded`], stopped at
     /// `after-version`, the last point before the carry, where the new home
     /// already holds the moved state, and run again with `--to` the new
