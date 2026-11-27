@@ -592,6 +592,10 @@ pub(crate) fn run(backend: &Backend, args: &InitArgs<'_>, entry: &EntryFlags) ->
         entry.replace_terminal,
     ) {
         (Some(_), _, true) => {
+            // A run another run replaced reads finished, but its name stays
+            // its replacement's to point back at: starting a fresh run under
+            // it would put a second live run beside the replacement.
+            refuse_replaced(backend, entry, name, &existing.events);
             // Before the old run is judged, moved aside or removed: moving
             // it renames it, and its decisions, which name it, stop reading.
             refuse_question_holder(backend, entry, name);
@@ -639,6 +643,29 @@ fn spawn_kind_code(kind: &SpawnErrorKind) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "init_failed".to_string())
+}
+
+/// Refuse `--replace-terminal` over session `name` when its log holds a
+/// fence marked `replaced`: another run replaced it, with `koto init
+/// --replaces` or `koto session replace`. Code `session_replaced`, exit 2,
+/// nothing judged, moved or removed.
+fn refuse_replaced(backend: &Backend, entry: &EntryFlags, name: &str, events: &[Event]) {
+    let fence = match crate::engine::persistence::superseded_by(events) {
+        Some(f) if f.replaced => f,
+        _ => return,
+    };
+    let newest = crate::session::links::newest_member(backend, name)
+        .map(|s| s.newest)
+        .unwrap_or_else(|| fence.by.clone());
+    let message = format!(
+        "session '{name}' was replaced by '{}', so --replace-terminal won't start a fresh \
+         session under its name; nothing was written. Continue in '{newest}'",
+        fence.by
+    );
+    let r = Refusal::new(Some("session_replaced"), message, 2)
+        .with_field("replaced_by", fence.by.as_str())
+        .with_field("newest", newest.as_str());
+    refuse(entry, r);
 }
 
 /// Refuse `--replace-terminal` over finished session `name` when it holds

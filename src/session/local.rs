@@ -3137,6 +3137,7 @@ mod tests {
             truncated: false,
             finished_at: "2026-10-12T00:00:00.000Z".to_string(),
             removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+            replaced_by: None,
         };
         crate::session::finished::write(tmp.path(), &stale).unwrap();
 

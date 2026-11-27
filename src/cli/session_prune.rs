@@ -1880,6 +1880,7 @@ mod tests {
             truncated: false,
             finished_at: finished_at.to_string(),
             removed_by: finished::REMOVED_BY_TERMINAL.to_string(),
+            replaced_by: None,
         };
         finished::write(&store.base, &record("2026-10-12T00:00:00.000Z")).unwrap();
         finished::write(

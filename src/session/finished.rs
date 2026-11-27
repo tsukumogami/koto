@@ -65,6 +65,13 @@ pub struct FinishedRecord {
     pub finished_at: String,
     /// `terminal` or `parent`.
     pub removed_by: String,
+    /// The run that replaced the session (`koto init --replaces` or `koto
+    /// session replace`), from the `by` of its log's fence marked
+    /// `replaced`. Absent for a session nothing replaced, so its record
+    /// reads and writes as it always has, and a record written before the
+    /// field existed parses with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 /// The records directory of the store whose session directories sit
@@ -261,6 +268,7 @@ mod tests {
             truncated: false,
             finished_at: "2026-10-12T00:00:00.000Z".to_string(),
             removed_by: REMOVED_BY_TERMINAL.to_string(),
+            replaced_by: None,
         }
     }
 

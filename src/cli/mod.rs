@@ -1752,14 +1752,20 @@ fn locate_or_serve(
 /// The message and fields of a `session_superseded` refusal of `session`,
 /// or `None` when `session` isn't superseded. The message names the newest
 /// session in its supersede chain, the one to continue in; the fields carry
-/// the direct successor, the newest member and the fence's actor.
+/// the direct successor, the newest member and the fence's actor. A fence
+/// marked `replaced` says the session was replaced rather than superseded.
 fn superseded_refusal(
     backend: &dyn SessionBackend,
     session: &str,
 ) -> Option<(String, serde_json::Value)> {
     let superseded = crate::session::links::newest_member(backend, session)?;
+    let how = if superseded.fence.replaced {
+        "replaced"
+    } else {
+        "superseded"
+    };
     let message = format!(
-        "session '{session}' was superseded by '{}' (session_superseded), so nothing was \
+        "session '{session}' was {how} by '{}' (session_superseded), so nothing was \
          written; continue in '{}'",
         superseded.fence.by, superseded.newest
     );
@@ -5353,6 +5359,7 @@ fn finish_terminal_tick(
                 truncated: false,
                 finished_at: crate::engine::types::now_iso8601(),
                 removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+                replaced_by: None,
             },
         );
         #[cfg(test)]
@@ -5487,6 +5494,11 @@ pub(crate) fn finished_record_for_child(
     };
 
     let (header, events) = backend.read_events(name).ok()?;
+    // A child a replace closed names the run that replaced it, so its status
+    // still says so once the parent has removed it.
+    let replaced_by = crate::engine::persistence::superseded_by(&events)
+        .filter(|fence| fence.replaced)
+        .map(|fence| fence.by);
     let base = |state: String, status: &str, failure: bool, result| FinishedRecord {
         v: RECORD_VERSION,
         name: name.to_string(),
@@ -5499,6 +5511,7 @@ pub(crate) fn finished_record_for_child(
         truncated: false,
         finished_at: crate::engine::types::now_iso8601(),
         removed_by: REMOVED_BY_PARENT.to_string(),
+        replaced_by: replaced_by.clone(),
     };
     // The sweep treats any cancel as terminal, so the record does too.
     let cancelled_in = events.iter().rev().find_map(|e| match &e.payload {
@@ -10241,6 +10254,11 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                 if record.truncated {
                     response["result_truncated"] = serde_json::json!(true);
                 }
+                // A replaced session names the run that replaced it, as its
+                // answer did while it was kept.
+                if let Some(by) = &record.replaced_by {
+                    response["replaced_by"] = serde_json::json!(by);
+                }
                 println!("{}", serde_json::to_string(&response)?);
                 return Ok(());
             }
@@ -10339,6 +10357,24 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // A run another run replaced (its fence is marked `replaced`) names its
+    // replacement. When it stands cancelled, which the close makes it unless
+    // it had already finished, it reads as finished and cancelled, the way a
+    // removed cancelled session's record reads. A kept cancelled run with no
+    // such fence reads as it always has.
+    if let Some(fence) = crate::engine::persistence::superseded_by(&events) {
+        if fence.replaced {
+            response["replaced_by"] = serde_json::json!(fence.by);
+            let stands_cancelled = crate::session::inventory::last_standing_event(&events)
+                .is_some_and(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+            if stands_cancelled {
+                let status = crate::session::finished::STATUS_CANCELLED;
+                response["is_terminal"] = serde_json::json!(true);
+                response["status"] = serde_json::json!(status);
+            }
+        }
+    }
 
     // Verify the compiled template read above against the hash recorded
     // in the session header -- the same check `koto next` performs

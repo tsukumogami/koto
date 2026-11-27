@@ -745,6 +745,9 @@ pub struct Superseded {
 /// visited, or [`MAX_SUPERSEDE_HOPS`] hops end the walk at the last member
 /// reached. A successor whose session doesn't exist (a crash between the
 /// fence and its creation) is still the newest member: the fence names it.
+/// A fence marked `replaced` is followed like any other, since the run that
+/// replaced the session is where its work goes on; the refusals that print
+/// the result say "replaced" rather than "superseded" for it.
 pub fn newest_member(backend: &dyn SessionBackend, session: &str) -> Option<Superseded> {
     let fence = supersede_fence(backend, session)?;
     let mut visited = std::collections::HashSet::from([session.to_string()]);

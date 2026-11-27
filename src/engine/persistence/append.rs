@@ -1022,9 +1022,16 @@ pub struct SessionSupersededError {
 
 impl std::fmt::Display for SessionSupersededError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A fence marked `replaced` was written by the close of a run another
+        // run replaced, not by a supersede.
+        let how = if self.fence.replaced {
+            "replaced"
+        } else {
+            "superseded"
+        };
         write!(
             f,
-            "session '{}' was superseded by '{}' (session_superseded), so nothing was written; \
+            "session '{}' was {how} by '{}' (session_superseded), so nothing was written; \
              continue as '{}'",
             self.session, self.fence.by, self.fence.by
         )

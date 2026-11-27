@@ -470,9 +470,11 @@ pub enum Reach {
 /// fence still names the successor, so the walk goes on by that name, but
 /// nothing past it is confirmed. So does a walk past
 /// [`MAX_SUPERSEDE_HOPS`] hops, so a reach beyond the cap is refused as
-/// unconfirmed rather than read as off the chain. A name that isn't a
-/// session name, or one already met, ends the walk. Reads only; no lock,
-/// no pull, no write.
+/// unconfirmed rather than read as off the chain. A fence marked
+/// `replaced` names no successor: the run it names replaced the session
+/// rather than continuing it, so the walk ends there. A name that isn't a
+/// session name, or one already met, ends the walk too. Reads only; no
+/// lock, no pull, no write.
 pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
     let mut steps = Vec::new();
     let mut confirmed = true;
@@ -497,6 +499,12 @@ pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
                 let Some(fence) = crate::session::links::supersede_fence(store, &at) else {
                     return Reach::No;
                 };
+                // A fence marked `replaced` closed the session for a fresh
+                // run rather than handing its work on, so the run it names
+                // is no successor, confirmed or not.
+                if fence.replaced {
+                    return Reach::No;
+                }
                 confirmed = false;
                 fence.by
             }

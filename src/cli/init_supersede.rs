@@ -365,6 +365,28 @@ fn refuse_superseded_by(backend: &Backend, pred: &str, fence: &SupersedeFence) -
     )
 }
 
+/// The refusal for a predecessor another run replaced (its fence is marked
+/// `replaced`): code `session_replaced`, exit 2, nothing written.
+fn refuse_replaced_by(backend: &Backend, pred: &str, fence: &SupersedeFence) -> ! {
+    let newest = links::newest_member(backend, pred)
+        .map(|s| s.newest)
+        .unwrap_or_else(|| fence.by.clone());
+    refuse(
+        "session_replaced",
+        format!(
+            "--supersede: session '{pred}' was replaced by '{}', which closed it, so it can't \
+             be superseded; nothing was written. Continue in '{newest}'",
+            fence.by
+        ),
+        super::EXIT_CALLER_ERROR,
+        serde_json::json!({
+            "replaced_by": fence.by,
+            "newest": newest,
+            "actor": fence.actor,
+        }),
+    )
+}
+
 /// Who is running this command, from the environment.
 pub(super) fn actor() -> SupersedeActor {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -493,6 +515,9 @@ pub(crate) fn run(backend: &Backend, args: &SupersedeArgs<'_>) -> Result<()> {
     // PRED for this successor: its session id is the one the successor
     // has, or is created with.
     let rerun = match superseded_by(&pred_events).map(|f| trusted(pred, f)) {
+        // A fence a replace wrote is no earlier run of this command, even
+        // when it names this successor: the run was closed, not continued.
+        Some(fence) if fence.replaced => refuse_replaced_by(backend, pred, &fence),
         Some(fence) if fence.by == name => {
             if succ_exists && succ_session_id() != fence.by_session_id {
                 // A session of the same name, but not the one the fence

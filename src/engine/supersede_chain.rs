@@ -15,7 +15,8 @@
 //! and a valid workflow name before a path is built from it. Each hop's
 //! log must exist and its header's `session_id` must equal the fence's
 //! `by_session_id`; a hop that fails either, or that the walk already
-//! visited, ends the walk at the last good member. After
+//! visited, ends the walk at the last good member, and so does a fence
+//! marked `replaced`, which a restart wrote, not a supersede. After
 //! [`MAX_CHAIN_HOPS`] hops the walk gives up and the ring reaches the
 //! principal only.
 //!
@@ -69,7 +70,9 @@ fn read_member(
 /// A broken hop (a name that isn't usable, a missing or unreadable log, a
 /// header whose `session_id` isn't the fence's `by_session_id`, or a
 /// member already visited) ends the walk at the last good member before
-/// it. The principal itself is never returned.
+/// it. So does a fence marked `replaced`: the run it names replaced the
+/// member rather than continuing it. The principal itself is never
+/// returned.
 pub fn newest_member(sessions_dir: &Path, principal: &str) -> Option<String> {
     if !usable_name(principal) {
         return None;
@@ -78,6 +81,11 @@ pub fn newest_member(sessions_dir: &Path, principal: &str) -> Option<String> {
     let mut visited = HashSet::from([principal.to_string()]);
     let mut last_good = None;
     for _ in 0..MAX_CHAIN_HOPS {
+        // A replaced run's fence names the run that replaced it, which took
+        // on none of its requests: the ring stops short of it.
+        if fence.replaced {
+            return last_good;
+        }
         let member = fence.by;
         if !usable_name(&member) || visited.contains(&member) {
             return last_good;
