@@ -1970,4 +1970,202 @@ Done.
         );
         assert_eq!(s3.object(&version_key).unwrap(), version);
     }
+
+    /// The points a move of a session from before koto recorded its prefix
+    /// can stop at after its commit landed here, in the order the move
+    /// reaches them: each one past the commit, then `after-version`, between
+    /// the move's push of `version.json` and its carry of the context.
+    const CARRY_POINTS: &[&str] = &[
+        "after-commit",
+        "after-held-by-event",
+        "after-held-by",
+        "after-publish-event",
+        "after-publish",
+        "after-environment-event",
+        "after-environment",
+        "after-version",
+    ];
+
+    /// A point the move doesn't stop at until the carry's fix adds it; till
+    /// then its case runs the move through in one go.
+    const POINT_ADDED_BY_THE_FIX: &str = "after-version";
+
+    impl Moving {
+        /// [`Moving::new`] with `origin.store.prefix` dropped from the
+        /// header of this host's copy and the bucket's, as a koto from
+        /// before the session recorded its prefix left it, and a second key
+        /// added after that: the session's home then follows its execution
+        /// anchor, so the move takes it from the old directory's prefix to
+        /// the new one's.
+        fn unrecorded() -> Self {
+            let mv = Moving::new();
+            let path = mv.m.state_path(NAME);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (first, rest) = text.split_once('\n').unwrap();
+            let mut header: Value = serde_json::from_str(first).unwrap();
+            let store = header["origin"]["store"]
+                .as_object_mut()
+                .expect("setup: the header records no origin.store");
+            assert!(
+                store.remove("prefix").is_some(),
+                "setup: a new session records its prefix: {header}"
+            );
+            let text = format!("{}\n{}", serde_json::to_string(&header).unwrap(), rest);
+            std::fs::write(&path, &text).unwrap();
+            mv.s3.put(&mv.state_key(), text.as_bytes());
+            let run = mv.m.add(&mv.old, NAME, "carried.md", "carried");
+            assert!(
+                run.ok(),
+                "setup: context add after the prefix was dropped: {}",
+                run.describe()
+            );
+            mv
+        }
+    }
+
+    /// koto#739: `koto session rebind --whole` read the session's home
+    /// before it moved anything and carried the context there from that
+    /// home once the move was done. Stopped after its commit landed here and
+    /// run again, the move read the home from the header it had already
+    /// moved, found it unchanged and carried nothing, so the keys from
+    /// before the move stayed under the old prefix and in this host's copy
+    /// only. Each point is run on its own session, and every point whose
+    /// carry is missing is named.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_after_its_commit_still_carries_the_context_to_the_new_home() {
+        let mut failed: Vec<String> = Vec::new();
+        for point in CARRY_POINTS {
+            let point = *point;
+            let case = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mv = Moving::unrecorded();
+                let new_prefix = prefix_of(&mv.new);
+                assert_ne!(
+                    new_prefix, mv.prefix,
+                    "{point}: setup: the two directories share a prefix"
+                );
+
+                let stopped = mv.mover(&mv.new, &[(FAULT_ENV, point)], &[]);
+                if point != POINT_ADDED_BY_THE_FIX {
+                    assert!(
+                        !stopped.ok(),
+                        "{point}: the stopped move exited 0: {}",
+                        stopped.describe()
+                    );
+                }
+                let run = mv.mover(&mv.new, &[], &[]);
+                assert!(run.ok(), "{point}: run again: {}", run.describe());
+
+                let local = mv.m.session_dir(NAME).join("ctx").join("manifest.json");
+                let local: Value =
+                    serde_json::from_slice(&std::fs::read(&local).unwrap_or_else(|e| {
+                        panic!("{point}: no local manifest at {}: {e}", local.display())
+                    }))
+                    .unwrap();
+                let manifest =
+                    remote_json(&mv.s3, &session_key(&new_prefix, NAME, "ctx/manifest.json"))
+                        .unwrap_or(Value::Null);
+                for (key, value) in [("notes.md", "notes"), ("carried.md", "carried")] {
+                    let object = session_key(&new_prefix, NAME, &format!("ctx/{key}"));
+                    assert_eq!(
+                        mv.s3.object(&object).as_deref(),
+                        Some(value.as_bytes()),
+                        "{point}: context key '{key}' from before the move isn't at the new \
+                         home {object}; keys under it: {:?}; its manifest: {manifest}; the \
+                         stopped move: {}; run again: {}",
+                        mv.s3.keys_under(&format!("{new_prefix}/{NAME}/")),
+                        stopped.describe(),
+                        run.describe()
+                    );
+                    assert!(
+                        manifest["keys"].get(key).is_some(),
+                        "{point}: the new home's manifest doesn't list '{key}': {manifest}"
+                    );
+                    assert_eq!(
+                        manifest["keys"][key]["hash"], local["keys"][key]["hash"],
+                        "{point}: the new home's manifest doesn't name this host's copy of \
+                         '{key}'"
+                    );
+                }
+            }));
+            if case.is_err() {
+                failed.push(point.to_string());
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "points after which the re-run left the context behind: {failed:?}"
+        );
+    }
+
+    /// `koto session resolve <parent> --keep local --children accept-local`
+    /// over a child moved with `--whole` elsewhere reports the child errored,
+    /// as the move refuses this host's copy. The child's row says what to
+    /// run instead, `koto session resolve child --keep remote`, and doesn't
+    /// read as a stale write of this command's own: the command wrote the
+    /// parent, and the child was moved before it ran, not after it read it.
+    #[test]
+    fn resolve_children_accept_local_names_keep_remote_for_a_moved_child() {
+        let mv = Moving::new();
+        mv.m.init(&mv.old, &[], "child", &["--parent", NAME]);
+        let child_key = state_key(&mv.prefix, "child");
+        assert!(
+            mv.s3.object(&child_key).is_some(),
+            "setup: no bucket copy of the child at {}; keys: {:?}",
+            child_key,
+            mv.s3.keys()
+        );
+        let moved = moved_copy(
+            &remote_text(&mv.s3, &child_key),
+            &mv.old,
+            &mv.new,
+            true,
+            true,
+        );
+        mv.s3.put(&child_key, moved.as_bytes());
+
+        let run = mv.m.run(
+            &mv.old,
+            &[],
+            &[
+                "session",
+                "resolve",
+                NAME,
+                "--keep",
+                "local",
+                "--children",
+                "accept-local",
+            ],
+        );
+
+        assert_eq!(
+            run.code,
+            Some(0),
+            "an errored child row doesn't fail the resolve: {}",
+            run.describe()
+        );
+        let rows = run.json["children"].as_array().cloned().unwrap_or_default();
+        let child = rows
+            .iter()
+            .find(|row| row["name"] == "child")
+            .unwrap_or_else(|| panic!("no row for the child: {}", run.describe()));
+        assert_eq!(child["action"], "errored", "{}", run.describe());
+        let message = child["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("koto session resolve child --keep remote")
+                || message.contains("--keep remote")
+                || message.contains("accept-remote"),
+            "the child's row doesn't say to keep the bucket's copy (`koto session resolve child \
+             --keep remote` or `accept-remote`): {message}"
+        );
+        assert!(
+            !message.contains("nothing was written"),
+            "the child's row says nothing was written, though the resolve wrote the parent: \
+             {message}"
+        );
+        assert!(
+            !message.contains("after this command read it"),
+            "the child's row says the child was rebound after this command read it, though it \
+             was moved before the command ran: {message}"
+        );
+    }
 }
