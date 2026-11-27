@@ -1435,7 +1435,9 @@ A point with nothing queued makes no call. One flush sends everything
 queued under a single deadline, and takes at most 3.0 seconds. A call
 still running at the deadline is ended by killing the sink's process
 group, and that stops later calls for the process (see below), so a sink
-that hangs delays a command by one deadline, not one per point. The flush
+that hangs delays a command by one deadline, not one per point. A sink
+that is slow but always answers in time is different: it adds its own time
+at every point that has records to send. The flush
 before a command runs before the command's time limit starts, so the sink
 never eats into it. Nothing about the sink changes a command's output or
 exit status, and koto prints no warning about it.

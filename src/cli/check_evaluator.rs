@@ -1536,7 +1536,9 @@ mod tests {
     /// provider call. The gate's own command runs first and flushes an
     /// empty queue, so the records the first provider call queues can only
     /// reach the sink through the flush inside the retry loop, and the
-    /// second call finds them already there.
+    /// second call finds them already there. What this pins is that a
+    /// flush sits between one provider call and the next; that it is the
+    /// statement before the call's clock starts is read off the code.
     #[cfg(unix)]
     #[test]
     fn decider_flush_precedes_provider_call() {
