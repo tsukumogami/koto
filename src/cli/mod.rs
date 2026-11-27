@@ -14,6 +14,8 @@ pub mod decisions;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
+#[cfg(unix)]
+mod init_replace;
 pub mod init_supersede;
 pub(crate) mod move_aside;
 pub mod next;
@@ -268,6 +270,34 @@ pub enum Command {
         /// written) unless PRED is in state STATE.
         #[arg(long = "expect-state", value_name = "STATE", requires = "supersede")]
         expect_state: Option<String>,
+
+        /// Restart OLD's work as this new session, and close OLD: it is
+        /// cancelled, naming this session, and fenced so nothing drives it
+        /// again, in one write to its log after this session is created.
+        /// This session records OLD in its `koto/replaces` key and neither
+        /// continues OLD nor carries anything from it. Not the same as
+        /// --replace-terminal, which reuses a finished session's own name.
+        /// OLD's tick.lock is taken first (see --wait), so a tick of OLD in
+        /// flight finishes before anything is written. Can't be used with
+        /// --continues, --supersede, --parent, --from-stdin, --vars-file,
+        /// --attach-live, --replace-terminal or --koto-leg. Refusals before
+        /// the lock write nothing; running the same command again finishes
+        /// an interrupted run, or changes nothing.
+        #[arg(long = "replaces", value_name = "OLD")]
+        replaces: Option<String>,
+
+        /// With --replaces, ask for OLD's tick.lock once and, when a tick
+        /// holds it, close OLD anyway, reporting `tick_in_flight: true`;
+        /// only the fence then holds that tick's later writes off. For a
+        /// tick that can't be stopped. Can't be used with --wait.
+        #[arg(long, requires = "replaces", conflicts_with = "wait")]
+        abandon_tick: bool,
+
+        /// With --replaces, how long to wait for a tick of OLD in flight to
+        /// return, in seconds (default 10). Still held then refuses
+        /// `session_busy`, exit 1, nothing written; 0 refuses at once.
+        #[arg(long, value_name = "SECS", requires = "replaces")]
+        wait: Option<u64>,
 
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
@@ -2426,12 +2456,31 @@ pub fn run(app: App) -> Result<()> {
             supersede,
             carry,
             expect_state,
+            replaces,
+            abandon_tick,
+            wait,
             execution_dir,
             legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
             let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if replaces.is_some()
+                && (entry_flags_used
+                    || continues.is_some()
+                    || supersede
+                    || !carry.is_empty()
+                    || expect_state.is_some()
+                    || parent.is_some()
+                    || from_stdin
+                    || vars_file.is_some())
+            {
+                init_entry::usage_error(
+                    "--replaces can't be used with --continues, --supersede, --carry, \
+                     --expect-state, --parent, --from-stdin, --vars-file, --attach-live, \
+                     --replace-terminal or --koto-leg",
+                );
+            }
             if supersede && (entry_flags_used || from_stdin || parent.is_some()) {
                 init_entry::usage_error(
                     "--supersede can't be used with --parent, --from-stdin, --attach-live, \
@@ -2497,6 +2546,35 @@ pub fn run(app: App) -> Result<()> {
                     2,
                 ),
             };
+            if let Some(old) = replaces.as_deref() {
+                let template = template.unwrap_or_else(|| {
+                    init_entry::usage_error("koto init --replaces requires --template <path>")
+                });
+                let execution_dir = execution_dir.map(canonical_dir);
+                #[cfg(unix)]
+                init_replace::run(
+                    &backend,
+                    &init_replace::ReplaceArgs {
+                        name: &name,
+                        template: &template,
+                        vars: &vars,
+                        intent: intent.as_deref(),
+                        dispatched_by: dispatched_by.as_deref(),
+                        old,
+                        execution_dir: execution_dir.as_deref(),
+                        legacy_environment,
+                        wait,
+                        abandon_tick,
+                    },
+                )?;
+                #[cfg(not(unix))]
+                {
+                    let _ = (old, template, execution_dir, wait, abandon_tick);
+                    init_entry::usage_error("--replaces needs flock, which this platform lacks");
+                }
+                session_anchor::hold_from_env(&backend, &name, "init");
+                return Ok(());
+            }
             if supersede {
                 // `requires` holds both: clap refuses --supersede without
                 // --continues, and the --from-stdin path is refused above.

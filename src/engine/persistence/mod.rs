@@ -22,7 +22,7 @@ mod append;
 pub(crate) use append::held_state_locks;
 pub(crate) use append::{
     append_close, append_event_tracked, append_event_tracked_held, hold_log_lock_blocking, Close,
-    CloseOutcome, CommitInfo,
+    CloseOutcome, CommitInfo, REPLACE_FAULT_ENV,
 };
 pub use append::{
     append_event, append_event_idempotent, append_event_idempotent_in, append_event_in,

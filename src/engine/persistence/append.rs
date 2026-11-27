@@ -1123,9 +1123,13 @@ pub fn append_supersede_fence(
     Ok(FenceOutcome::Fenced { seq: tail.next_seq })
 }
 
+/// The fault-injection seam of `koto init --replaces`, for the binary's
+/// tests: a debug build reads it, a release build never does, so it is not
+/// a setting. Unset, nothing changes. [`append_close`] stops at
+/// `torn-close`, having written half of what it owed.
+pub(crate) const REPLACE_FAULT_ENV: &str = "KOTO_TEST_REPLACE_FAULT";
+
 /// What [`append_close`] closes a replaced run's log with.
-// Built and read by `koto init --replaces`, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Close {
     /// Events owed ahead of the cancel, in order: a stopped runner's settle
@@ -1141,8 +1145,6 @@ pub(crate) struct Close {
 }
 
 /// What [`append_close`] did.
-// Read by `koto init --replaces`, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CloseOutcome {
     /// Every line owed went in, in one write. `commits` holds each event
@@ -1245,6 +1247,9 @@ pub(crate) fn append_close(
         prior_log = next_prior;
     }
 
+    if cfg!(debug_assertions) && std::env::var(REPLACE_FAULT_ENV).as_deref() == Ok("torn-close") {
+        tear_close(path, &buf);
+    }
     let torn_backup = match torn {
         Some(torn) => {
             let backup = write_backup(path, &torn.log, tail.next_seq, "torn")?;
@@ -1266,6 +1271,22 @@ pub(crate) fn append_close(
         commits,
         torn_backup,
     })
+}
+
+/// The `torn-close` fault point: append the first half of `buf`, cut inside
+/// a line so the log ends in a write cut short, and stop as a killed
+/// process would.
+fn tear_close(path: &Path, buf: &str) -> ! {
+    let mut cut = buf.len() / 2;
+    if buf[..cut].ends_with('\n') {
+        cut = cut.saturating_sub(2);
+    }
+    while !buf.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let _ = append_bytes(path, &buf[..cut]);
+    eprintln!("{REPLACE_FAULT_ENV}: stopping at torn-close");
+    crate::exit::crash(86)
 }
 
 /// The events [`append_close`] owes the log whose bytes are `content`, in

@@ -366,7 +366,7 @@ fn refuse_superseded_by(backend: &Backend, pred: &str, fence: &SupersedeFence) -
 }
 
 /// Who is running this command, from the environment.
-fn actor() -> SupersedeActor {
+pub(super) fn actor() -> SupersedeActor {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     SupersedeActor {
         claude_session: var("CLAUDE_CODE_SESSION_ID"),
@@ -1202,7 +1202,12 @@ fn pull_pred(
 }
 
 /// Write `key` in `session` with writer `koto` and log it there.
-fn write_koto_key(backend: &Backend, session: &str, key: &str, value: &[u8]) -> Result<()> {
+pub(super) fn write_koto_key(
+    backend: &Backend,
+    session: &str,
+    key: &str,
+    value: &[u8],
+) -> Result<()> {
     let store: &dyn ContextStore = backend;
     store.add_with_writer(session, key, value, WRITER_KOTO)?;
     backend.append_event(

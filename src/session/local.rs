@@ -155,8 +155,6 @@ impl LocalBackend {
     /// after-commit steps run once per event written, after both locks are
     /// released. A manifest lock still held once `wait` has passed is
     /// [`persistence::CloseOutcome::Unavailable`], with nothing written.
-    // Its caller, `koto init --replaces`, lands in a later change.
-    #[allow(dead_code)]
     pub(crate) fn append_close(
         &self,
         id: &str,

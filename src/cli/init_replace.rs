@@ -1,0 +1,589 @@
+//! `koto init NEW --template T --replaces OLD [--wait SECS | --abandon-tick]`:
+//! open NEW as a fresh run that restarts OLD's work, and close OLD so
+//! nothing drives it again.
+//!
+//! The command runs in this order:
+//!
+//! 1. **Check.** Every check that can refuse runs before anything is
+//!    written: the names, a call from inside OLD's own tick or background
+//!    action (`nested_invocation`), OLD existing and being a run, OLD not
+//!    being NEW (`self`), OLD's fence (`superseded_by`, `session_replaced`),
+//!    NEW not being some other session (`session_exists`), and for a NEW
+//!    still to be created, the template's compile and its variables.
+//! 2. **Lock.** OLD's `tick.lock` is taken exclusive, waited for at most
+//!    `--wait` seconds (10 by default). Still held then refuses
+//!    `session_busy`, exit 1, nothing written. With `--abandon-tick` the
+//!    lock is asked for once: when it is held, the close goes on without it
+//!    and the output reports `tick_in_flight: true`.
+//! 3. **Stop.** OLD's background runner is stopped and its pool queues
+//!    left, as `koto cancel` does; the events that record it go into the
+//!    close.
+//! 4. **Create.** NEW is created, with no continues relation and nothing
+//!    carried, and `koto/replaces` is written in it, naming OLD by name and
+//!    session id.
+//! 5. **Close.** OLD's log takes, in one write: the stop's events, a
+//!    `workflow_cancelled` naming NEW (unless OLD already stands cancelled,
+//!    or is finished), and a `session_superseded` fence with `replaced`
+//!    set. Without the lock, OLD's runner is then stopped once more and
+//!    what that records goes in past the fence.
+//! 6. **Leg.** A self-attached request leg of OLD is answered as failed,
+//!    best-effort, as `koto cancel` does.
+//!
+//! Running the same command again finishes an interrupted run: a NEW whose
+//! `koto/replaces` names OLD is the earlier run's, and the close writes
+//! only what OLD's log still lacks. A NEW without the key isn't taken for
+//! an earlier run.
+
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::cli::init_child::{self, TemplateCompileCache};
+use crate::engine::persistence::{
+    derive_machine_state, derive_state_from_log, is_terminal_state, superseded_by, Close,
+    CloseOutcome, SupersedeFence, FENCE_LOCK_WAIT, REPLACE_FAULT_ENV,
+};
+use crate::engine::types::{generate_session_id, now_iso8601, Event, SessionKind, StateFileHeader};
+use crate::session::context::ContextStore;
+use crate::session::local::LocalBackend;
+use crate::session::tick_lock::{take_exclusive, TakeError};
+use crate::session::{Backend, SessionBackend};
+
+/// The key NEW holds naming the run it replaces.
+pub const REPLACES_KEY: &str = "koto/replaces";
+
+/// How long the command waits for a tick in flight when `--wait` isn't given.
+const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+
+/// The arguments of one `koto init --replaces`.
+pub(crate) struct ReplaceArgs<'a> {
+    pub name: &'a str,
+    pub template: &'a str,
+    pub vars: &'a [String],
+    pub intent: Option<&'a str>,
+    pub dispatched_by: Option<&'a str>,
+    pub old: &'a str,
+    pub execution_dir: Option<&'a Path>,
+    pub legacy_environment: bool,
+    pub wait: Option<u64>,
+    pub abandon_tick: bool,
+}
+
+/// The value of [`REPLACES_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Replaces {
+    v: u32,
+    session: String,
+    session_id: String,
+}
+
+/// Stop at `point`, as a killed process would, when the fault seam names
+/// it. A release build never reads the seam.
+fn crash_at(point: &str) {
+    if cfg!(debug_assertions) && std::env::var(REPLACE_FAULT_ENV).as_deref() == Ok(point) {
+        eprintln!("{REPLACE_FAULT_ENV}: stopping at {point}");
+        crate::exit::crash(86);
+    }
+}
+
+/// Print a refusal, `{"error", "command": "init", "code", ...extra}`, and
+/// exit with `exit`.
+fn refuse(code: &str, message: String, exit: i32, extra: serde_json::Value) -> ! {
+    let mut body = serde_json::json!({
+        "error": message,
+        "command": "init",
+        "code": code,
+    });
+    if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+        obj.extend(more.clone());
+    }
+    super::exit_with_error_code(body, exit)
+}
+
+/// Refuse with exit 3 `persistence_error`.
+fn failed(message: String) -> ! {
+    refuse(
+        "persistence_error",
+        message,
+        super::EXIT_INFRASTRUCTURE,
+        serde_json::Value::Null,
+    )
+}
+
+/// The refusal for an OLD whose fence isn't this command's: another
+/// session superseded or replaced it. `after` is what was already written.
+fn refuse_fenced(
+    backend: &Backend,
+    old: &str,
+    name: &str,
+    fence: &SupersedeFence,
+    after: &str,
+) -> ! {
+    let newest = crate::session::links::newest_member(backend, old)
+        .map(|s| s.newest)
+        .unwrap_or_else(|| fence.by.clone());
+    let plain_to_new = fence.by == name && !fence.replaced;
+    let how = if fence.replaced {
+        "replaced"
+    } else {
+        "superseded"
+    };
+    // A plain fence naming NEW isn't this replace's close, so it can't
+    // finish it either.
+    let code = if fence.replaced || plain_to_new {
+        "session_replaced"
+    } else {
+        "superseded_by"
+    };
+    let message = if plain_to_new {
+        format!(
+            "--replaces: session '{old}' is already {how} by '{name}' through a plain \
+             supersede, not replaced; {after}. Continue in '{newest}'"
+        )
+    } else {
+        format!(
+            "--replaces: session '{old}' is already {how} by '{}'; {after}. Continue in \
+             '{newest}'",
+            fence.by
+        )
+    };
+    let mut extra = serde_json::json!({
+        "newest": newest,
+        "actor": fence.actor,
+    });
+    let field = if fence.replaced {
+        "replaced_by"
+    } else {
+        "superseded_by"
+    };
+    extra[field] = serde_json::json!(fence.by);
+    refuse(code, message, super::EXIT_CALLER_ERROR, extra)
+}
+
+/// The value of NEW's [`REPLACES_KEY`], `None` when it holds none.
+fn read_replaces(backend: &Backend, name: &str) -> std::result::Result<Option<Replaces>, String> {
+    let store: &dyn ContextStore = backend;
+    if !store.ctx_exists(name, REPLACES_KEY) {
+        return Ok(None);
+    }
+    let bytes = store
+        .get(name, REPLACES_KEY)
+        .map_err(|e| format!("{e:#}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("it doesn't parse: {e}"))
+}
+
+/// Whether OLD, as `header` and `events` read, is owed a cancel: false only
+/// for a run standing in a terminal state of its template.
+fn owes_cancel(backend: &Backend, old: &str, header: &StateFileHeader, events: &[Event]) -> bool {
+    match derive_machine_state(header, events, &backend.session_dir(old)) {
+        Some(machine) => !is_terminal_state(&machine.template_path, &machine.current_state),
+        None => true,
+    }
+}
+
+/// Run `koto init --replaces`. Prints one JSON object on success; every
+/// refusal prints its error and exits.
+pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
+    let ReplaceArgs { name, old, .. } = *args;
+
+    // 1. Checks, nothing written.
+    for (flag, value) in [("", name), ("--replaces ", old)] {
+        if let Err(msg) = crate::discover::validate_workflow_name(value) {
+            refuse(
+                "invalid_usage",
+                format!("{flag}{msg}"),
+                super::EXIT_CALLER_ERROR,
+                serde_json::Value::Null,
+            );
+        }
+    }
+    if name == old {
+        refuse(
+            "self",
+            format!("--replaces: session '{name}' can't replace itself; nothing was written"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    if let Err(message) = crate::engine::reentrancy::refuse_if_own_tick(old, "init --replaces") {
+        refuse(
+            "nested_invocation",
+            message,
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    let background_of = crate::engine::background::BACKGROUND_OF_ENV;
+    if std::env::var(background_of).as_deref() == Ok(old) {
+        refuse(
+            "nested_invocation",
+            format!(
+                "koto init --replaces cannot run on session '{old}' from inside its own \
+                 background action: this process inherited {background_of}={old}, and closing \
+                 '{old}' stops the runner this command runs under. Run it outside the action; \
+                 nothing was written"
+            ),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    let local = match backend {
+        Backend::Local(local) => local,
+        Backend::Cloud(_) => refuse(
+            "invalid_usage",
+            "--replaces: the cloud backend can't close a replaced run in this release; nothing \
+             was written"
+                .to_string(),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        ),
+    };
+    if !backend.exists(old) {
+        refuse(
+            "session_not_found",
+            format!("--replaces: no session named '{old}' in this store; nothing was written"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
+        failed(format!(
+            "--replaces: could not read '{old}''s log: {e:#}; nothing was written"
+        ))
+    });
+    if old_header.session_kind() != SessionKind::Ordinary {
+        refuse(
+            "invalid_usage",
+            format!(
+                "--replaces: '{old}' is koto's record of an agent session, not a run, so \
+                 nothing replaces it; nothing was written"
+            ),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+    let old_id = old_header.session_id.clone();
+
+    let new_exists = backend.exists(name);
+    let new_id = new_exists.then(|| {
+        backend
+            .read_header(name)
+            .map(|h| h.session_id)
+            .unwrap_or_else(|e| {
+                failed(format!(
+                    "--replaces: could not read '{name}''s header: {e:#}; nothing was written"
+                ))
+            })
+    });
+    let nothing = "nothing was written";
+    let fence_ours = match superseded_by(&old_events) {
+        Some(f)
+            if f.replaced
+                && f.by == name
+                && new_id.as_deref() == Some(f.by_session_id.as_str()) =>
+        {
+            true
+        }
+        Some(f) => refuse_fenced(backend, old, name, &f, nothing),
+        None => false,
+    };
+    if new_exists {
+        let ours = match read_replaces(backend, name) {
+            Ok(Some(r)) => r.session == old && r.session_id == old_id,
+            Ok(None) => fence_ours,
+            Err(why) => failed(format!(
+                "--replaces: '{name}''s {REPLACES_KEY} can't be read: {why}; nothing was written"
+            )),
+        };
+        if !ours {
+            refuse(
+                "session_exists",
+                format!(
+                    "--replaces: session '{name}' already exists, and no earlier run of this \
+                     command opened it to replace '{old}'; pick a new name, or remove it with \
+                     `koto cancel {name} --cleanup` and run the command again. Nothing was \
+                     written"
+                ),
+                super::EXIT_CALLER_ERROR,
+                serde_json::Value::Null,
+            );
+        }
+    } else {
+        precheck_new(args);
+    }
+
+    // 2. OLD's tick lock.
+    let dir = backend.session_dir(old);
+    let (tick_lock, waited) = take_tick_lock(old, &dir, args);
+    let tick_in_flight = tick_lock.is_none();
+    crash_at("after-lock");
+
+    // 3. Stop OLD's runner, from its log as it stands under the lock.
+    let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
+        failed(format!(
+            "--replaces: could not read '{old}''s log: {e:#}; nothing was written"
+        ))
+    });
+    let side_events = super::stop_session_pool_work(backend, old, &old_events);
+    let cancel = owes_cancel(backend, old, &old_header, &old_events);
+
+    // 4. Create NEW and record what it replaces.
+    let mut wrote = false;
+    let mut environment_report = None;
+    let new_id = match new_id {
+        Some(id) => id,
+        None => {
+            let id = generate_session_id();
+            let (_, report) = super::create_session(
+                backend,
+                name,
+                args.template,
+                args.vars,
+                None,
+                args.intent,
+                args.execution_dir,
+                args.legacy_environment,
+                args.dispatched_by,
+                None,
+                Some(&id),
+            )?;
+            environment_report = report;
+            wrote = true;
+            id
+        }
+    };
+    crash_at("after-create");
+    let key_held = matches!(read_replaces(backend, name), Ok(Some(_)));
+    if !key_held {
+        let value = serde_json::to_vec(&Replaces {
+            v: 1,
+            session: old.to_string(),
+            session_id: old_id.clone(),
+        })?;
+        if let Err(e) = super::init_supersede::write_koto_key(backend, name, REPLACES_KEY, &value) {
+            failed(format!(
+                "--replaces: '{name}' was created, but its {REPLACES_KEY} key couldn't be \
+                 written: {e:#}. '{old}' is still open; remove '{name}' with `koto cancel \
+                 {name} --cleanup` and run the command again"
+            ));
+        }
+        wrote = true;
+    }
+    crash_at("after-key");
+
+    // 5. Close OLD.
+    let at = now_iso8601();
+    let fence = SupersedeFence {
+        by: name.to_string(),
+        by_session_id: new_id,
+        actor: super::init_supersede::actor(),
+        at: at.clone(),
+        replaced: true,
+    };
+    let close = Close {
+        side_events,
+        cancel,
+        fence,
+    };
+    wrote |= close_old(backend, local, old, name, &close, &at);
+    if tick_in_flight {
+        // The tick in flight may have started a runner since the first stop.
+        let (_, events) = backend.read_events(old).unwrap_or_else(|e| {
+            failed(format!(
+                "--replaces: '{old}' is closed, but its log couldn't be read again to stop its \
+                 runner once more: {e:#}"
+            ))
+        });
+        let side_events = super::stop_session_pool_work(backend, old, &events);
+        if !side_events.is_empty() {
+            let again = Close {
+                side_events,
+                cancel: false,
+                fence: close.fence.clone(),
+            };
+            wrote |= close_old(backend, local, old, name, &again, &now_iso8601());
+        }
+    }
+    drop(tick_lock);
+    crash_at("after-close");
+
+    // 6. The leg, best-effort.
+    if cancel {
+        if let Some(state) = backend
+            .read_events(old)
+            .ok()
+            .and_then(|(_, events)| derive_state_from_log(&events))
+        {
+            super::promote_cancel_onto_self_attached_leg(&dir, &state);
+        }
+    }
+
+    let children = super::query_children(backend, old);
+    let deferred_cleanup = !children.is_empty();
+    if deferred_cleanup {
+        eprintln!(
+            "note: '{old}' has children; they are neither cancelled nor refused, and one that \
+             finishes later can't record it in '{old}''s closed log, so its cleanup waits until \
+             it is cleaned up directly"
+        );
+    }
+    let (_, events) = backend
+        .read_events(name)
+        .map_err(|e| anyhow::anyhow!("failed to read '{name}': {e}"))?;
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": derive_state_from_log(&events).unwrap_or_default(),
+        "replaces": old,
+        "outcome": if wrote { "replaced" } else { "unchanged" },
+        "waited": waited,
+        "tick_in_flight": tick_in_flight,
+        "children": children,
+        "deferred_cleanup": deferred_cleanup,
+    });
+    super::add_environment_report(&mut out, environment_report.as_ref());
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+/// The checks creating NEW can refuse on, run before any lock: its
+/// template's compile and its variables.
+fn precheck_new(args: &ReplaceArgs<'_>) {
+    let mut cache = TemplateCompileCache::new();
+    let compiled = match init_child::compile_for_init(Path::new(args.template), &mut cache) {
+        Ok((compiled, _)) => compiled,
+        Err(info) => {
+            let code = serde_json::to_value(&info.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "template_compile_failed".to_string());
+            refuse(&code, info.message, 1, serde_json::Value::Null);
+        }
+    };
+    if let Err(e) = super::resolve_variables(args.vars, &compiled.variables) {
+        let mut body = serde_json::json!({
+            "error": e.to_string(),
+            "command": "init",
+        });
+        if let Some(obj) = body.as_object_mut() {
+            obj.extend(e.fields());
+        }
+        super::exit_with_error_code(body, super::EXIT_CALLER_ERROR);
+    }
+}
+
+/// OLD's `tick.lock`, taken exclusive within `--wait`, and whether the take
+/// had to wait. With `--abandon-tick` it is asked for once, and `None` when
+/// it is held elsewhere.
+fn take_tick_lock(old: &str, dir: &Path, args: &ReplaceArgs<'_>) -> (Option<std::fs::File>, bool) {
+    let wait = if args.abandon_tick {
+        Duration::ZERO
+    } else {
+        args.wait.map_or(DEFAULT_WAIT, Duration::from_secs)
+    };
+    match take_exclusive(dir, wait) {
+        Ok((file, waited)) => (Some(file), waited),
+        Err(TakeError::Busy(_)) if args.abandon_tick => (None, false),
+        Err(TakeError::Busy(busy)) => {
+            let waited_for_ms = u64::try_from(busy.waited_for.as_millis()).unwrap_or(u64::MAX);
+            refuse(
+                "session_busy",
+                format!(
+                    "session '{old}' is busy: a tick of it is in flight, and it still held {} \
+                     after {} s; nothing was written. Stopping that tick's `koto next` frees \
+                     the lock; then run the command again, or give --wait more seconds, or \
+                     pass --abandon-tick to close '{old}' without it",
+                    dir.join(crate::session::TICK_LOCK_FILE).display(),
+                    wait.as_secs()
+                ),
+                1,
+                serde_json::json!({"details": {"waited_for_ms": waited_for_ms}}),
+            )
+        }
+        Err(TakeError::Missing) => failed(format!(
+            "--replaces: '{old}''s directory went away before its tick.lock could be taken; \
+             nothing was written"
+        )),
+        Err(TakeError::Failed(e)) => failed(format!(
+            "--replaces: '{old}''s tick.lock couldn't be taken: {e:#}; nothing was written"
+        )),
+    }
+}
+
+/// Write `close` to OLD's log, refusing as the outcome says. Returns
+/// whether anything was written.
+fn close_old(
+    backend: &Backend,
+    local: &LocalBackend,
+    old: &str,
+    name: &str,
+    close: &Close,
+    at: &str,
+) -> bool {
+    match local.append_close(old, close, at, FENCE_LOCK_WAIT) {
+        Ok(CloseOutcome::Closed {
+            commits,
+            torn_backup,
+        }) => !commits.is_empty() || torn_backup.is_some(),
+        Ok(CloseOutcome::FencedByOther(other)) => refuse_fenced(
+            backend,
+            old,
+            name,
+            &other,
+            &format!(
+                "'{name}' was created and is left as it is, and '{old}' wasn't closed. Remove \
+                 '{name}' with `koto cancel {name} --cleanup` if it isn't wanted"
+            ),
+        ),
+        Ok(CloseOutcome::Unavailable) => refuse(
+            "fence_unavailable",
+            format!(
+                "--replaces: '{old}''s log stayed locked by another writer for {} seconds, so \
+                 '{old}' wasn't closed; '{name}' exists. Run the command again",
+                FENCE_LOCK_WAIT.as_secs()
+            ),
+            super::EXIT_INFRASTRUCTURE,
+            serde_json::Value::Null,
+        ),
+        Err(e) => {
+            if let Some(rebound) = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<crate::session::rebind_fence::SessionRebound>())
+            {
+                refuse(
+                    "session_rebound",
+                    format!("--replaces: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
+                    super::EXIT_CALLER_ERROR,
+                    serde_json::Value::Null,
+                );
+            }
+            failed(format!(
+                "--replaces: '{old}' couldn't be closed: {e:#}; '{name}' exists. Run the \
+                 command again to finish"
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_replaces_key_round_trips_its_value() {
+        let r = Replaces {
+            v: 1,
+            session: "old".to_string(),
+            session_id: "abc".to_string(),
+        };
+        let bytes = serde_json::to_vec(&r).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"v":1,"session":"old","session_id":"abc"}"#
+        );
+        assert_eq!(serde_json::from_slice::<Replaces>(&bytes).unwrap(), r);
+    }
+}
