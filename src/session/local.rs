@@ -150,11 +150,19 @@ impl LocalBackend {
     }
 
     /// [`SessionBackend::add_context_locked`] with the wait for `id`'s
-    /// append lock bounded by `wait`.
+    /// manifest lock and then its append lock bounded by `wait` in all.
     ///
-    /// A session whose directory is missing gets no lock (the sidecar has
-    /// nowhere to go) and fails at the header read, as it did with no lock,
-    /// having created nothing.
+    /// The manifest lock comes first, as it does for every context write: a
+    /// decision writer holds it and then takes the append lock, so an add
+    /// holding the append lock while it waited on the manifest lock could
+    /// wait on that writer forever. The store write inside runs under the
+    /// manifest lock this thread holds rather than taking it again. A
+    /// manifest lock still held elsewhere once `wait` has passed is
+    /// [`persistence::StateLogBusy`], with nothing stored.
+    ///
+    /// A session whose directory is missing gets no lock (the lock files
+    /// have nowhere to go) and fails at the header read, as it did with no
+    /// lock, having created nothing.
     pub(crate) fn add_context_locked_within(
         &self,
         id: &str,
@@ -164,13 +172,22 @@ impl LocalBackend {
         wait: std::time::Duration,
     ) -> anyhow::Result<()> {
         let path = self.state_path(id);
-        let held = persistence::hold_log_lock(&path, wait)?;
-        persistence::read_header(&path)?;
-        store_write()?;
-        let commit = persistence::append_event_tracked_held(&held, &path, event, timestamp)?;
-        // The event is in: nothing that replaces the log from here on can
-        // drop it, so the after-commit steps run with the lock released.
-        drop(held);
+        let commit = if self.session_dir(id).is_dir() {
+            let started = std::time::Instant::now();
+            let locked = self.with_manifest_lock_within(id, wait, || {
+                let remaining = wait.saturating_sub(started.elapsed());
+                commit_context_add(&path, store_write, event, timestamp, remaining)
+            })?;
+            let Some(commit) = locked else {
+                let waited = started.elapsed();
+                return Err(persistence::StateLogBusy::new(path, waited).into());
+            };
+            commit
+        } else {
+            commit_context_add(&path, store_write, event, timestamp, wait)?
+        };
+        // The event is in and every lock is released: the after-commit
+        // steps append a nested `context_added`, which takes them again.
         self.after_commit(id, event, &commit);
         Ok(())
     }
@@ -726,23 +743,41 @@ impl LocalBackend {
         session: &str,
         change: impl FnOnce(&mut Manifest),
     ) -> anyhow::Result<()> {
-        let ctx_dir = self.ctx_dir(session);
-        fs::create_dir_all(&ctx_dir)
-            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
-        #[cfg(unix)]
-        let manifest_lock = Self::acquire_flock(&self.manifest_lock_path(session))?;
-        let mut manifest = self.read_manifest(session)?;
-        change(&mut manifest);
-        self.write_manifest(session, &manifest)?;
-        #[cfg(unix)]
-        Self::release_flock(&manifest_lock);
-        Ok(())
+        self.with_manifest_lock(session, || {
+            let mut manifest = self.read_manifest(session)?;
+            change(&mut manifest);
+            self.write_manifest(session, &manifest)
+        })
+    }
+
+    /// [`update_manifest_locked`](Self::update_manifest_locked) with the
+    /// wait for the lock bounded by `wait`: `Ok(false)`, with nothing
+    /// changed, when another process still holds it once `wait` has passed.
+    /// For a best-effort writer that must not wait without bound while it
+    /// holds a lock that comes after the manifest lock, as the carry of a
+    /// pin record during a flush does. A hold of this thread's covers it at
+    /// once.
+    pub(crate) fn update_manifest_locked_within(
+        &self,
+        session: &str,
+        wait: std::time::Duration,
+        change: impl FnOnce(&mut Manifest),
+    ) -> anyhow::Result<bool> {
+        let updated = self.with_manifest_lock_within(session, wait, || {
+            let mut manifest = self.read_manifest(session)?;
+            change(&mut manifest);
+            self.write_manifest(session, &manifest)
+        })?;
+        Ok(updated.is_some())
     }
 
     /// Run `f` inside `session`'s `ctx/manifest.lock` critical section,
     /// the lock every context write takes. The decision writer allocates
     /// and publishes under it, so two writers in one session serialize and
     /// their ids follow commit order (DESIGN-decision-record.md, Decision 1).
+    ///
+    /// A thread that already holds the lock runs `f` under that hold, so a
+    /// context write inside the section doesn't wait on it.
     pub(crate) fn with_manifest_lock<T>(
         &self,
         session: &str,
@@ -751,12 +786,8 @@ impl LocalBackend {
         let ctx_dir = self.ctx_dir(session);
         fs::create_dir_all(&ctx_dir)
             .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
-        #[cfg(unix)]
-        let manifest_lock = Self::acquire_flock(&self.manifest_lock_path(session))?;
-        let out = f();
-        #[cfg(unix)]
-        Self::release_flock(&manifest_lock);
-        out
+        let _lock = self.lock_manifest(session)?;
+        f()
     }
 
     /// [`with_manifest_lock`](Self::with_manifest_lock) with the wait for
@@ -777,18 +808,51 @@ impl LocalBackend {
         let ctx_dir = self.ctx_dir(session);
         fs::create_dir_all(&ctx_dir)
             .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
+        let Some(_lock) = self.lock_manifest_within(session, wait)? else {
+            return Ok(None);
+        };
+        f().map(Some)
+    }
+
+    /// Take `session`'s manifest lock, whose directory the caller created,
+    /// waiting as long as it takes. When this thread already holds it, the
+    /// outer hold covers the caller and nothing is taken.
+    fn lock_manifest(&self, session: &str) -> anyhow::Result<ManifestLock> {
+        let path = self.manifest_lock_path(session);
+        if held_manifest_locks::held_by_this_thread(&path) {
+            return Ok(ManifestLock::nested());
+        }
+        Ok(ManifestLock {
+            #[cfg(unix)]
+            file: Some(Self::acquire_flock(&path)?),
+            _held: Some(held_manifest_locks::hold(&path)),
+        })
+    }
+
+    /// [`lock_manifest`](Self::lock_manifest) with the wait bounded by
+    /// `wait`: `Ok(None)` when another process still holds the lock once
+    /// `wait` has passed.
+    fn lock_manifest_within(
+        &self,
+        session: &str,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<Option<ManifestLock>> {
+        let path = self.manifest_lock_path(session);
+        if held_manifest_locks::held_by_this_thread(&path) {
+            return Ok(Some(ManifestLock::nested()));
+        }
         #[cfg(unix)]
-        let Some(manifest_lock) =
-            Self::acquire_flock_within(&self.manifest_lock_path(session), wait)?
+        let Some(file) = Self::acquire_flock_within(&path, wait)?
         else {
             return Ok(None);
         };
         #[cfg(not(unix))]
         let _ = wait;
-        let out = f();
-        #[cfg(unix)]
-        Self::release_flock(&manifest_lock);
-        out.map(Some)
+        Ok(Some(ManifestLock {
+            #[cfg(unix)]
+            file: Some(file),
+            _held: Some(held_manifest_locks::hold(&path)),
+        }))
     }
 
     /// [`acquire_flock`](Self::acquire_flock) with the wait bounded by
@@ -905,17 +969,7 @@ impl LocalBackend {
         crate::session::links::check_decision_key(key)?;
         validate_context_key(key)?;
 
-        let ctx_dir = self.ctx_dir(session);
-        fs::create_dir_all(&ctx_dir)
-            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
-
-        // Step 1: Write the content file (create parent dirs for hierarchical keys).
         let content_path = self.content_path(session, key);
-        if let Some(parent) = content_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-        }
-
         // Per-key advisory flock prevents concurrent writes to the same key.
         let key_lock_path = content_path.with_extension(
             content_path
@@ -923,33 +977,35 @@ impl LocalBackend {
                 .map(|e| format!("{}.lock", e.to_string_lossy()))
                 .unwrap_or_else(|| "lock".to_string()),
         );
-        #[cfg(unix)]
-        let _key_lock = Self::acquire_flock(&key_lock_path)?;
 
-        fs::write(&content_path, content)
-            .with_context(|| format!("failed to write content file: {}", content_path.display()))?;
+        // The manifest lock first, as every context write takes it (it
+        // creates the ctx directory it lives in), then the key's lock, the
+        // content file and the manifest entry.
+        self.with_manifest_lock(session, || {
+            // Parent dirs for hierarchical keys.
+            if let Some(parent) = content_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+            }
+            #[cfg(unix)]
+            let _key_lock = Self::acquire_flock(&key_lock_path)?;
 
-        // Step 2: Lock manifest, read-modify-write, unlock.
-        let manifest_lock_path = self.manifest_lock_path(session);
-        #[cfg(unix)]
-        let manifest_lock = Self::acquire_flock(&manifest_lock_path)?;
+            fs::write(&content_path, content).with_context(|| {
+                format!("failed to write content file: {}", content_path.display())
+            })?;
 
-        let mut manifest = self.read_manifest(session)?;
-        manifest.keys.insert(
-            key.to_string(),
-            KeyMeta {
-                created_at: now_iso8601(),
-                size: content.len() as u64,
-                hash: sha256_hex(content),
-                writer: writer.map(str::to_string),
-            },
-        );
-        self.write_manifest(session, &manifest)?;
-
-        #[cfg(unix)]
-        Self::release_flock(&manifest_lock);
-
-        Ok(())
+            let mut manifest = self.read_manifest(session)?;
+            manifest.keys.insert(
+                key.to_string(),
+                KeyMeta {
+                    created_at: now_iso8601(),
+                    size: content.len() as u64,
+                    hash: sha256_hex(content),
+                    writer: writer.map(str::to_string),
+                },
+            );
+            self.write_manifest(session, &manifest)
+        })
     }
 }
 
@@ -1001,39 +1057,39 @@ impl ContextStore for LocalBackend {
         validate_context_key(key)?;
 
         let content_path = self.content_path(session, key);
-
-        // Remove the content file if it exists.
-        if content_path.exists() {
-            fs::remove_file(&content_path).with_context(|| {
-                format!("failed to remove content file: {}", content_path.display())
-            })?;
-        }
-
-        // Remove the per-key lock file if it exists.
         let key_lock_path = content_path.with_extension(
             content_path
                 .extension()
                 .map(|e| format!("{}.lock", e.to_string_lossy()))
                 .unwrap_or_else(|| "lock".to_string()),
         );
-        let _ = fs::remove_file(&key_lock_path);
 
-        // Update the manifest under lock.
-        let manifest_lock_path = self.manifest_lock_path(session);
-        let ctx_dir = self.ctx_dir(session);
-        if ctx_dir.exists() {
-            #[cfg(unix)]
-            let manifest_lock = Self::acquire_flock(&manifest_lock_path)?;
-
-            let mut manifest = self.read_manifest(session)?;
-            manifest.keys.remove(key);
-            self.write_manifest(session, &manifest)?;
-
-            #[cfg(unix)]
-            Self::release_flock(&manifest_lock);
+        // A session with no ctx directory holds no key to remove, and taking
+        // the manifest lock would create the directory.
+        if !self.ctx_dir(session).exists() {
+            return Ok(());
         }
 
-        Ok(())
+        // The manifest lock first, as every context write takes it, then
+        // the content file, the per-key lock file and the manifest entry.
+        self.with_manifest_lock(session, || {
+            if content_path.exists() {
+                fs::remove_file(&content_path).with_context(|| {
+                    format!("failed to remove content file: {}", content_path.display())
+                })?;
+            }
+            let _ = fs::remove_file(&key_lock_path);
+
+            // A key the manifest doesn't list leaves it as it is. A deferred
+            // cloud removal takes this lock in a session with no ctx
+            // directory, creating one, and an empty manifest written here
+            // would go up over the bucket's at the next push.
+            let mut manifest = self.read_manifest(session)?;
+            if manifest.keys.remove(key).is_none() {
+                return Ok(());
+            }
+            self.write_manifest(session, &manifest)
+        })
     }
 
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
@@ -1049,6 +1105,107 @@ impl ContextStore for LocalBackend {
             .collect();
         keys.sort();
         Ok(keys)
+    }
+}
+
+/// The steps of `koto context add` under the append lock of the log at
+/// `path`, waited for at most `wait`: the header check, the store write and
+/// the append. The lock is released once the event is in.
+fn commit_context_add(
+    path: &Path,
+    store_write: &mut dyn FnMut() -> anyhow::Result<()>,
+    event: &EventPayload,
+    timestamp: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<persistence::CommitInfo> {
+    let held = persistence::hold_log_lock(path, wait)?;
+    persistence::read_header(path)?;
+    store_write()?;
+    persistence::append_event_tracked_held(&held, path, event, timestamp)
+}
+
+/// The manifest locks each thread of this process holds, by the lock file's
+/// path. A context write nested inside a held manifest lock (the store write
+/// of `koto context add`, a write under a decision writer's lock) runs under
+/// that hold: a second `flock` of the file on a descriptor of its own would
+/// wait on the first forever. Unlike `held_state_locks` this changes what
+/// runs, so release builds keep it too. It is kept per thread, so another
+/// thread of this process still takes the `flock` and waits its turn.
+mod held_manifest_locks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    static HELD: Mutex<Vec<(ThreadId, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// The lock file's path with its directory resolved, so two spellings
+    /// of one store name one lock. The directory exists by the time a lock
+    /// is looked up or taken.
+    fn identity(path: &Path) -> PathBuf {
+        match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|_| path.to_path_buf()),
+            _ => path.to_path_buf(),
+        }
+    }
+
+    fn held() -> std::sync::MutexGuard<'static, Vec<(ThreadId, PathBuf)>> {
+        HELD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Marks `path` as held by the current thread until dropped.
+    pub(super) struct Held {
+        entry: (ThreadId, PathBuf),
+    }
+
+    pub(super) fn hold(path: &Path) -> Held {
+        let entry = (std::thread::current().id(), identity(path));
+        held().push(entry.clone());
+        Held { entry }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let mut entries = held();
+            if let Some(i) = entries.iter().position(|e| *e == self.entry) {
+                entries.swap_remove(i);
+            }
+        }
+    }
+
+    pub(super) fn held_by_this_thread(path: &Path) -> bool {
+        let entry = (std::thread::current().id(), identity(path));
+        held().contains(&entry)
+    }
+}
+
+/// A session's manifest lock, held until dropped: the `flock` and this
+/// thread's record of it, or neither when this thread already held the lock
+/// and the hold is the outer one's.
+struct ManifestLock {
+    _held: Option<held_manifest_locks::Held>,
+    #[cfg(unix)]
+    file: Option<fs::File>,
+}
+
+#[cfg(unix)]
+impl Drop for ManifestLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            LocalBackend::release_flock(file);
+        }
+    }
+}
+
+impl ManifestLock {
+    /// The hold of a lock this thread already holds.
+    fn nested() -> Self {
+        ManifestLock {
+            _held: None,
+            #[cfg(unix)]
+            file: None,
+        }
     }
 }
 
@@ -1453,6 +1610,118 @@ mod tests {
             .unwrap_err();
         assert!(!wrote);
         assert!(!tmp.path().join("gone").exists());
+    }
+
+    /// `add_as` takes the manifest lock before it writes anything: while
+    /// another descriptor holds the lock, the content file isn't there yet.
+    #[cfg(unix)]
+    #[test]
+    fn add_as_takes_the_manifest_lock_before_it_writes_the_content_file() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        fs::create_dir_all(backend.ctx_dir("s")).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(backend.manifest_lock_path("s"))
+            .unwrap();
+        // SAFETY: the fd belongs to `held`, which outlives the call.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let writer = Arc::clone(&backend);
+        let add = std::thread::spawn(move || writer.add_as("s", "k.md", b"v", None));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let written_early = backend.content_path("s", "k.md").exists();
+        drop(held);
+        add.join().unwrap().unwrap();
+
+        assert!(
+            !written_early,
+            "the content file was written before the manifest lock was held"
+        );
+        assert_eq!(fs::read(backend.content_path("s", "k.md")).unwrap(), b"v");
+    }
+
+    /// A context write inside a manifest lock its own thread holds runs
+    /// under that hold instead of waiting on it forever.
+    #[test]
+    fn a_context_add_under_its_own_manifest_lock_does_not_wait_on_itself() {
+        use std::sync::{mpsc, Arc};
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(test_backend(tmp.path()));
+        fs::create_dir_all(tmp.path().join("s")).unwrap();
+
+        let (done, finished) = mpsc::channel();
+        let writer = Arc::clone(&backend);
+        let nested = std::thread::spawn(move || {
+            let out = writer.with_manifest_lock("s", || writer.add_as("s", "k.md", b"v", None));
+            let _ = done.send(out);
+        });
+        match finished.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(out) => out.unwrap(),
+            Err(_) => panic!("a context add under its own manifest lock waited on itself"),
+        }
+        nested.join().unwrap();
+        assert_eq!(fs::read(backend.content_path("s", "k.md")).unwrap(), b"v");
+        let manifest = backend.read_manifest("s").unwrap();
+        assert!(manifest.keys.contains_key("k.md"));
+    }
+
+    /// A bounded manifest update gives up once its wait has passed while
+    /// another descriptor holds the lock, changing nothing, and runs at once
+    /// under a hold of its own thread's.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_manifest_update_gives_up_on_a_lock_held_elsewhere() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        fs::create_dir_all(tmp.path().join("s")).unwrap();
+        backend.add_as("s", "k.md", b"v", None).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(backend.manifest_lock_path("s"))
+            .unwrap();
+        // SAFETY: the fd belongs to `held`, which outlives the call.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let updated = backend
+            .update_manifest_locked_within("s", wait, |m| {
+                m.keys.remove("k.md");
+            })
+            .unwrap();
+        assert!(
+            !updated,
+            "the update ran while another descriptor held the lock"
+        );
+        assert!(started.elapsed() >= wait);
+        assert!(backend
+            .read_manifest("s")
+            .unwrap()
+            .keys
+            .contains_key("k.md"));
+        drop(held);
+
+        let nested = backend
+            .with_manifest_lock("s", || {
+                backend.update_manifest_locked_within("s", wait, |m| {
+                    m.keys.remove("k.md");
+                })
+            })
+            .unwrap();
+        assert!(nested, "the update didn't run under its own thread's hold");
+        assert!(!backend
+            .read_manifest("s")
+            .unwrap()
+            .keys
+            .contains_key("k.md"));
     }
 
     /// Helper: create a LocalBackend using a temp directory as base.

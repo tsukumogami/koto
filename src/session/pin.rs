@@ -74,6 +74,46 @@ pub const RELEASE_PIN: &str = "release-pin";
 /// How long [`pin`] and [`unpin`] wait for the session's lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
+/// How long [`carry_indexed`] waits for the session's manifest lock to drop
+/// a carried record's entry. A flush carries holding the batch lock, and a
+/// pull holding the append lock, and both come after the manifest lock, so
+/// the wait is bounded: a busy manifest leaves the record indexed for the
+/// next push to carry.
+const CARRY_MANIFEST_WAIT: Duration = Duration::from_secs(2);
+
+/// [`carry_indexed`] found the bucket holding record `key` but couldn't
+/// drop its index entry within [`CARRY_MANIFEST_WAIT`]: the record is in
+/// the bucket, and only the entry stays for the next push to drop.
+#[derive(Debug)]
+pub(crate) struct CarryManifestBusy {
+    pub(crate) key: String,
+}
+
+impl std::fmt::Display for CarryManifestBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the session's manifest is busy, so '{}' stays indexed and is carried on the next push",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for CarryManifestBusy {}
+
+/// The warning for a [`carry_indexed`] of session `name`'s pin records that
+/// failed with `e`, when `e` is [`CarryManifestBusy`]: the record is in the
+/// bucket, and only its index entry is kept for the next push to drop.
+/// `None` for any other failure, which is the caller's to report.
+pub(crate) fn carry_busy_warning(name: &str, e: &anyhow::Error) -> Option<String> {
+    e.downcast_ref::<CarryManifestBusy>().map(|_| {
+        format!(
+            "warning: cloud sync: the pin of '{name}' is in the bucket, and only its index \
+             entry is kept: {e:#}"
+        )
+    })
+}
+
 /// A readable pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pin {
@@ -624,9 +664,18 @@ pub(crate) fn carry_indexed(
                     }
                 })
                 .and_then(|()| {
-                    local.update_manifest_locked(name, |m| {
-                        m.keys.remove(key);
-                    })
+                    let updated =
+                        local.update_manifest_locked_within(name, CARRY_MANIFEST_WAIT, |m| {
+                            m.keys.remove(key);
+                        })?;
+                    if updated {
+                        Ok(())
+                    } else {
+                        Err(CarryManifestBusy {
+                            key: key.to_string(),
+                        }
+                        .into())
+                    }
                 }),
             // Nothing to upload: an unreadable record stays as this host
             // reads it, indexed, and keeps the session from here.
@@ -746,7 +795,11 @@ fn new_id() -> String {
 /// and the new one is written as its own object first: a write the bucket
 /// doesn't confirm exits 3 (`pin_not_pushed`) with no pin anywhere. A pin
 /// only this host's copy holds (set under the local backend, not yet
-/// pushed) is uploaded now and reported as the existing pin.
+/// pushed) is uploaded now and reported as the existing pin. When the
+/// session's manifest stays busy while that upload drops the pin's index
+/// entry (`CarryManifestBusy`), the pin is in the bucket all the same:
+/// a warning says only the entry is kept, for the next push to drop, and
+/// the existing pin is still reported.
 pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, PinError> {
     validate_reason(reason).map_err(|why| PinError::refusal("invalid_reason", why))?;
     check_session(backend, name)?;
@@ -783,7 +836,14 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
         Guard::Clear => {}
         Guard::Pinned { pin, source } => {
             if let (Backend::Cloud(cloud), SOURCE_LOCAL) = (backend, source) {
-                carry_indexed(cloud, name).map_err(not_pushed)?;
+                // A busy manifest kept only the index entry: the bucket took
+                // the pin, which the check below finds.
+                if let Err(e) = carry_indexed(cloud, name) {
+                    let Some(warning) = carry_busy_warning(name, &e) else {
+                        return Err(not_pushed(e));
+                    };
+                    eprintln!("{warning}");
+                }
                 if !matches!(cloud.bucket_pin(name, None), BucketPin::Pin(_)) {
                     let bytes = serde_json::to_vec(&pin).expect("a pin always serializes");
                     cloud
