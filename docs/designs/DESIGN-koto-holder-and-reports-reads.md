@@ -492,11 +492,14 @@ pushed with none.
 
 The first local `dispatched/` write creates `<sessions>/.dispatched-since`
 create-only, as `.continued-by-since` is. On the cloud, a host's first pointer
-PUT also writes `koto-names/_dispatched-since` with a conditional create that
-loses harmlessly to an earlier writer, and the host notes it has done so. A
-holder created before the stamp, or in a store with none, reads
-`predates_record`; one after it with an empty area reads `recorded` with
-`reports: []`.
+PUT under a workspace prefix also writes `koto-names/_dispatched-since/<prefix>`
+with a conditional create that loses harmlessly to an earlier writer, and the
+host notes it has done so. The stamp is kept per workspace prefix, not per
+bucket, so one workspace's upgrade doesn't speak for another's, and it is a
+lower bound: it says pointers exist from a point on, not that every host
+writing that prefix runs a build that writes them. A holder created before the
+stamp, or in a store with none, reads `predates_record`; one after it with an
+empty area reads `recorded` with `reports: []`.
 
 #### Alternatives Considered
 
@@ -538,7 +541,7 @@ writes (koto, inside existing calls)
       local -> <sessions>/<D>/ctx/koto/dispatched/<C>          (new)
                <sessions>/.dispatched-since                    (first write)
       cloud -> <Dp>/<D>/ctx/koto/dispatched/<Cp>/<C>          (new)
-               koto-names/_dispatched-since                    (first per host)
+               koto-names/_dispatched-since/<prefix>           (first per host and prefix)
       both  -> dispatched-by link body gains holder_session_id
   koto session rebind -> execution_anchor_rebound.actor
   koto next           -> driver_changed (only when the driver changed)
@@ -585,11 +588,16 @@ koto session reports <NAME> [--chain] [--json]
 ```
 
 `names` lists sessions whose names start with P, sorted, reading no header; on
-the cloud `complete` reflects `koto-names/_complete`.
+the cloud `complete` reflects `koto-names/_complete`. Each entry carries the
+workspace prefix it was found under (`null` locally), because a name match
+spans every workspace sharing the bucket and isn't proof of membership. In
+`chain`, a member reached only by name and joined to no other member by a link
+reads `"linked": false`, so a consumer can filter on the seat's own workspace.
 
 ```json
 {"v": 1, "prefix": "coordinate-foo-", "store": "bucket", "complete": true,
- "names": ["coordinate-foo-20261101T090000Z", "coordinate-foo-20261103T141522Z"]}
+ "names": [{"name": "coordinate-foo-20261101T090000Z", "prefix": "3f9a0c12d4e5b678"},
+           {"name": "coordinate-foo-20261103T141522Z", "prefix": "3f9a0c12d4e5b678"}]}
 ```
 
 `chain` walks each named member both ways and places each member once.
@@ -693,7 +701,7 @@ copies into a cloud host's mirror). A result read from a mirror says
 | Successor pointer | `<sessions>/<P>/ctx/koto/continued-by/<Sp>/<S>` (new) | `<Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>` (unchanged) | `{"v":1,"holder_session_id":"<S id>"}` |
 | Dispatched pointer | `<sessions>/<D>/ctx/koto/dispatched/<C>` | `<Dp>/<D>/ctx/koto/dispatched/<Cp>/<C>` | `{"v":1,"holder_session_id":"<C id>"}` |
 | Successor stamp | `<sessions>/.continued-by-since` | not needed | `{"v":1,"at":"<RFC 3339>"}` |
-| Dispatched stamp | `<sessions>/.dispatched-since` | `koto-names/_dispatched-since` | `{"v":1,"at":"<RFC 3339>"}` |
+| Dispatched stamp | `<sessions>/.dispatched-since` | `koto-names/_dispatched-since/<prefix>` | `{"v":1,"at":"<RFC 3339>"}` |
 
 None is in a manifest or under `koto/links/`. Local pointers are never pushed;
 a store that moves to the cloud owes its cloud pointers until each session's
@@ -948,7 +956,28 @@ rule moves to `koto session origin`.
 
 ## Security Considerations
 
-Not written yet: a later /design phase replaces this line.
+The reads in this design consume objects that other hosts and processes write: pointer keys and bodies, link bodies, synced event logs, the bucket's name index, the stamp objects, and the session title the assistant puts in the SessionStart payload. koto treats all of them as untrusted data. Nothing is executed, and nothing read from the bucket or a log is interpreted as code or as an instruction.
+
+**Pointers are hints, and the owner's own record decides.** A pointer under a holder's context names a candidate and nothing more. The read accepts a successor only through that successor's own continues relation, and a report only through the child's own `dispatched-by` link, matching session ids on both sides and the child's `holder_session_id` against the pointer's. A stale pointer, a reused name with a new id, or an orphan left by a failed write finds no matching record and is dropped. A forged pointer can cost a read some requests but can't put a session in an answer without the matching record in the child's or successor's own prefix. That record is itself a claim by whoever controls that prefix. Someone who can write their own workspace prefix and can read the dispatcher's session id can forge both halves, the same trust the dispatched-by link has always carried, so a report means "this session says it was dispatched by that holder", never "that holder is authorized to act on it". Nothing in these reads grants authority, and shirabe and decision records read them as claims. Where an older link body has no `holder_session_id`, the child is accepted only as weakly verified, matched by name and time window, and is reported that way.
+
+**Input is validated before it is used.** Every key segment and body field that becomes a request, a path or output is checked first: workspace prefixes are 16 lowercase hex digits, names pass the session-name grammar, session ids match the id format, `at` is RFC 3339, and pointer keys have exactly the expected segments (one for the local dispatched area, two for the cloud shapes). Pulled copies of pointers pass the same checks before landing in a local mirror. Anything that fails is reported as unreadable and never walked. Names and prefixes printed from bucket data, and the unknown names echoed on exit 4, go through the existing `sanitize` and `display_text` rendering. Error output uses a closed list of reasons and never raw store error text, which can carry endpoints or credential fragments.
+
+**Reads are bounded.** A pointer listing past a fixed per-holder cap isn't walked and reads `unverifiable`. Each verb call has a request budget and a maximum fan-out for its parallel rounds, stops at 1024 hops with an explicit `hop_cap`, and caps the size of every link, pointer, state and log read. Running out of budget reports the walk as incomplete and never as empty. A listing that fails for any reason, a permission error included, is unreadable, not "no successor" or "no reports".
+
+**Permissions.** The feature adds one cross-prefix write: the child's create-only PUT, and on removal DELETE, of `ctx/koto/dispatched/<Cp>/<C>` under the dispatcher's prefix, plus a conditional create of `koto-names/_dispatched-since/<prefix>`. This extends the existing `continued-by/` write and the import marker, and bucket policy should grant exactly those key patterns, not all of `ctx/koto/`. Without the permission the PUT gets a 403, the link is still written, the pointer stays owed, and the user sees a warning; a credentials gap never becomes a deletion or a refused dispatch. A holder deletes only the pointer built from its own workspace id, its own name and the dispatcher its own link names, never a key taken from bucket data. When the child must find the dispatcher's prefix through the name index, it uses the listed entry only if the entry's session id matches the id it already holds for the dispatcher and the entry is unambiguous; otherwise it writes nothing and leaves the pointer owed. The area sits under the reserved `koto/` prefix, so `koto context add` and `remove` can't reach it. Locally, the child writes into another session's directory only after validating every segment, without following symlinks, by temp file and rename with mode 0600, and only when the target session's state file and `ctx/` exist. The reader crate stays read-only, and the bucket source issues only GET and LIST.
+
+**Known limits, accepted.**
+
+- Anyone who can write a prefix can hold or hide a report or a successor by writing or removing pointers there, the same exposure as continues pointers and pins. Bucket policy limiting who can write `ctx/koto/` under each workspace prefix is the control.
+- A name-prefix read returns every session in the bucket whose name matches, across workspaces. Sessions reached only by name are marked as not linked and carry their workspace prefix; a consumer that needs the seat's own workspace must filter on it and must not treat a name match as proof of membership.
+- The `recorded` state of a holder depends on every writer to the store running a build that writes pointers. The stamp tells a reader that pointers exist from a point on, not that every host wrote them, so on a bucket shared with hosts on older builds, `recorded` with no reports can still miss a worker. The stamp is kept per workspace prefix so one workspace's upgrade doesn't speak for another's, and a stamp is only a lower bound on what the writer promised.
+- `driver` values come from `CLAUDE_CODE_SESSION_ID`, which any process in the agent's environment can set. koto records them only when they are well-formed session ids, and they are a claim about the starting environment, not an identity.
+- An older release sharing the bucket ignores both pointer areas. It can leave orphans, which verification drops, and its writes are invisible to the stamp.
+- Pointers survive until their holder is removed and carry the child's name, workspace prefix and session id. koto never deletes a pointer it can't attribute.
+
+**The session title is untrusted display text.** The hook forwards the payload's `session_title`, cut to 256 bytes on a UTF-8 boundary, as one `--harness-name=<value>` argument in `--flag=value` form, so a leading dash isn't read as a flag and nothing passes through a shell expansion. koto never refuses an open over it. It replaces control, format, line-separator and private-use characters with U+FFFD, trims whitespace and keeps at most 128 characters, so a title can't forge an `anchor=` line, carry terminal escapes or flip text direction. Cleaning can't make the words themselves safe: a title can still contain text written to steer a reader, so readers must show it as quoted data and never act on it. The hook test runs a hostile title (quotes, `$(...)`, newlines, escapes, a leading dash) and checks that the open output and the recorded value stay intact.
+
+**What the records reveal.** The title is written to the anchor's event log, and the log is pushed to the bucket with the session, so anyone who can read that prefix can read the title for as long as the session exists. A title can name a customer, a ticket or a person, which until now stayed inside the assistant. koto records it only when the payload carries one, never reads a title from anywhere else, and offers a setting that tells the hook to skip the flag. The rebind actor and the drivers record an assistant session id, a hostname and an OS user name in the synced log, the same shape a supersede fence already writes. The dispatched pointer's key holds the child's workspace prefix and name, so anyone who can list a holder's `ctx/koto/` sees the holder's direct reports, including ones from other workspaces; this is narrower than the store-wide index the design rejected, which would have exposed every workspace's dispatch graph. The name index is already listable across workspaces by `koto session list`, so the name-prefix read adds no new visibility. Pointer and stamp bodies hold times and session ids only, and no local path is copied into another workspace's prefix. Where that visibility matters, scope bucket read access per workspace.
 
 ## Consequences
 
