@@ -162,9 +162,11 @@ impl RunTemplate {
 /// its sidecar caches, and when they are empty from [`found_run_template`].
 /// A cached template is used only when the sidecar's run id doesn't
 /// contradict the run id the header records, so a header that was re-rooted
-/// by hand never keeps printing another run's template. Nothing is written
-/// here; [`found_run_template`] is what the callers that keep the sidecar
-/// store.
+/// by hand never keeps printing another run's template.
+///
+/// Nothing is written here. The sidecar is kept by the telemetry module,
+/// which stores what [`found_run_template`] returns when a child is created
+/// and on a later record of a child that caches none.
 pub(crate) fn run_template(
     backend: &dyn SessionBackend,
     name: &str,

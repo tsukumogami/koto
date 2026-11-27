@@ -307,7 +307,7 @@ fn a_child_without_a_cache_resolves_while_its_root_is_here_and_omits_otherwise()
     let root = env.header("root");
     let kid = env.header("root.kid");
 
-    // A session made before the cache existed has no sidecar fields: the
+    // With no sidecar at all, as when it was lost, nothing is cached: the
     // walk to the root answers while the root is on this host.
     std::fs::remove_file(env.session_dir("root.kid").join("run-journal.json")).unwrap();
     let id = env.identity("root.kid");
@@ -402,6 +402,8 @@ fn a_cached_template_for_another_run_is_not_printed() {
     assert_eq!(id["koto.run.template.hash"], root["template_hash"]);
 }
 
+/// A session this host doesn't hold exits 2 and says so. A name that isn't
+/// a valid session name exits 2 as well, with whatever the name check says.
 #[test]
 fn missing_session_exits_2() {
     let env = Env::new();

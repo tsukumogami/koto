@@ -1761,6 +1761,11 @@ fn session_started(
 /// written for a driver before the run id resolved) is derived again, so a
 /// parent header that was briefly unreadable is tried again on the next
 /// record.
+///
+/// The same pass keeps a child's run template cached. A child whose
+/// sidecar holds a run id and no template is looked up again too, and the
+/// sidecar is rewritten only when a lookup found something it didn't hold.
+/// A root is never looked up for a template: its own header answers.
 fn cached_run_id(
     backend: &dyn SessionBackend,
     session_dir: &Path,
