@@ -500,7 +500,7 @@ pub(super) fn handle(backend: &Backend, args: &PruneArgs<'_>) -> Result<()> {
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     if !outcome.failed.is_empty() {
-        std::process::exit(EXIT_REMOVAL_FAILED);
+        crate::exit::exit(EXIT_REMOVAL_FAILED);
     }
     Ok(())
 }

@@ -48,7 +48,7 @@ fn fault(point: &str) -> bool {
 fn crash_at(point: &str) {
     if fault(point) {
         eprintln!("{}: stopping at {}", FAULT_ENV, point);
-        std::process::exit(86);
+        crate::exit::crash(86);
     }
 }
 

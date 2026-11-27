@@ -1528,8 +1528,7 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 /// Print a JSON error and exit with a specific exit code.
 pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
-    flush_before_exit();
-    std::process::exit(code);
+    crate::exit::exit(code);
 }
 
 /// Refuse, exit 2, before `command` reads or writes `session`, when under
@@ -1865,18 +1864,6 @@ pub fn report_failure(e: &anyhow::Error) -> i32 {
 fn is_session_migrated(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.is::<crate::session::SessionMigrated>())
-}
-
-/// What `koto next` runs on its way out, however it exits: the flush of
-/// the writes it and its commands deferred (koto#376, koto#548). Set once,
-/// by the `next` arm of [`run`]; other commands leave it unset.
-static EXIT_FLUSH: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
-
-/// Run the exit flush, if this command set one.
-fn flush_before_exit() {
-    if let Some(flush) = EXIT_FLUSH.get() {
-        flush();
-    }
 }
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
@@ -2388,11 +2375,11 @@ pub fn run(app: App) -> Result<()> {
     match app.command {
         Command::RunAction { session, run_id } => {
             #[cfg(unix)]
-            std::process::exit(run_action::run(&session, &run_id));
+            crate::exit::exit(run_action::run(&session, &run_id));
             #[cfg(not(unix))]
             {
                 let _ = (session, run_id);
-                std::process::exit(2);
+                crate::exit::exit(2);
             }
         }
         Command::Pool { subcommand } => match subcommand {
@@ -2401,7 +2388,7 @@ pub fn run(app: App) -> Result<()> {
                 {
                     let code = pool::status(json)?;
                     if code != 0 {
-                        std::process::exit(code);
+                        crate::exit::exit(code);
                     }
                     Ok(())
                 }
@@ -2676,8 +2663,8 @@ pub fn run(app: App) -> Result<()> {
             dispatch_epoch,
             decider,
         } => {
-            // Leaked so the exit flush can reach it from any exit path,
-            // `std::process::exit` included. One per process, which ends.
+            // Leaked so the exit hook below can reach it from any exit
+            // path. One per process, which ends.
             let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
             // A top-level tick holds its session's tick.lock shared from
             // here to exit, so every read and write below runs under it. Not
@@ -2697,7 +2684,11 @@ pub fn run(app: App) -> Result<()> {
             // own log appends.
             refuse_next_if_superseded(backend, &name);
             let tick = name.clone();
-            let _ = EXIT_FLUSH.set(Box::new(move || {
+            // What `koto next` runs on its way out, however it exits: the
+            // flush of the writes it and its commands deferred (koto#376,
+            // koto#548). An exit hook, so a normal return, an error return
+            // and every early exit below all run it.
+            crate::exit::register(move || {
                 if let Err(e) = backend.flush_pending(&tick) {
                     eprintln!(
                         "warning: cloud sync: the writes this tick and its commands made are \
@@ -2705,7 +2696,7 @@ pub fn run(app: App) -> Result<()> {
                         tick, e
                     );
                 }
-            }));
+            });
             // A new id for this tick, which its own reads and its commands'
             // reads of other sessions are fresh for
             // (`crate::session::sync_stamp`). Picked here, before the tick's
@@ -2715,7 +2706,7 @@ pub fn run(app: App) -> Result<()> {
                 backend.mint_tick(&name);
             }
             let context_store: &dyn ContextStore = backend;
-            let result = handle_next(
+            handle_next(
                 backend,
                 context_store,
                 backend.journal_root(),
@@ -2728,9 +2719,7 @@ pub fn run(app: App) -> Result<()> {
                 redelegation_cap,
                 dispatch_epoch,
                 decider,
-            );
-            flush_before_exit();
-            result
+            )
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
@@ -3182,8 +3171,8 @@ pub fn run(app: App) -> Result<()> {
                         &session,
                         &key,
                     ) {
-                        context::KeyPresence::Present => std::process::exit(0),
-                        context::KeyPresence::Absent => std::process::exit(1),
+                        context::KeyPresence::Present => crate::exit::exit(0),
+                        context::KeyPresence::Absent => crate::exit::exit(1),
                         context::KeyPresence::Unusable(reason) => {
                             exit_with_error_code(
                                 serde_json::json!({
@@ -3314,21 +3303,21 @@ pub fn run(app: App) -> Result<()> {
             TemplateSubcommand::ValidateFeed { log_file } => {
                 if let Err(e) = validate_feed::validate_feed(&log_file) {
                     eprintln!("error: {}", e);
-                    std::process::exit(1);
+                    crate::exit::exit(1);
                 }
                 Ok(())
             }
             TemplateSubcommand::Export(args) => {
                 if let Err(msg) = validate_export_flags(&args) {
                     eprintln!("error: {}", msg);
-                    std::process::exit(2);
+                    crate::exit::exit(2);
                 }
 
                 let compiled = match resolve_template(&args.input) {
                     Ok(t) => t,
                     Err(e) => {
                         eprintln!("error: {}", e);
-                        std::process::exit(1);
+                        crate::exit::exit(1);
                     }
                 };
 
@@ -3362,7 +3351,7 @@ pub fn run(app: App) -> Result<()> {
                                 "run: koto template export {} --format {} --output {}",
                                 args.input, format_name, output_path
                             );
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                         Ok(crate::export::CheckResult::Missing) => {
                             let format_name = match args.format {
@@ -3374,11 +3363,11 @@ pub fn run(app: App) -> Result<()> {
                                 "run: koto template export {} --format {} --output {}",
                                 args.input, format_name, output_path
                             );
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                         Err(e) => {
                             eprintln!("error: failed to check {}: {}", output_path, e);
-                            std::process::exit(1);
+                            crate::exit::exit(1);
                         }
                     }
                 } else if let Some(ref output_path) = args.output {
@@ -3614,7 +3603,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     println!("{}", other);
                     Ok(())
                 }
-                None => std::process::exit(1),
+                None => crate::exit::exit(1),
             }
         }
         ConfigCommand::Get { key } => {
@@ -3626,7 +3615,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                     Ok(())
                 }
                 None => {
-                    std::process::exit(1);
+                    crate::exit::exit(1);
                 }
             }
         }
@@ -7742,8 +7731,7 @@ fn handle_next(
                         _batch_lock.as_ref(),
                     );
                 }
-                flush_before_exit();
-                std::process::exit(0);
+                crate::exit::exit(0);
             }
             Err(err) => {
                 let code = err.code.exit_code();
@@ -9607,8 +9595,7 @@ fn handle_next(
                     _batch_lock.as_ref(),
                 );
             }
-            flush_before_exit();
-            std::process::exit(0);
+            crate::exit::exit(0);
         }
         Err(advance_err) => {
             let code = match &advance_err {

@@ -8,6 +8,7 @@ pub mod decider;
 pub mod decisions;
 pub mod discover;
 pub mod engine;
+pub mod exit;
 pub mod export;
 pub use koto_session_reader::findings;
 #[cfg(unix)]
