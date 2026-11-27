@@ -445,10 +445,13 @@ ends it quietly. The flushing thread calls `wait_timeout(deadline - now)`.
 When that runs out, it sends `SIGKILL` to the group, but only when the
 spawn succeeded and the pgid is the child's pid and greater than 1. It then
 reaps the child, waits up to 100 ms for the group to empty with
-`wait_for_group_exit` from `src/action.rs` (made `pub(crate)`), and only
-then joins the writer thread. A spawn failure counts as a kill, with no
-signal sent. A sink that exits on time but leaves children in its group is
-left alone.
+`wait_for_group_exit` from `src/action.rs` (made `pub(crate)`). The writer
+thread is joined only once it has finished: after a kill its write has
+already failed, and after a call that ended on time it is given up to 50 ms
+inside the call deadline. A writer still blocked then is left parked, since
+a sink that exits on time but leaves a child holding the pipe could block
+it for good. A spawn failure counts as a kill, with no signal sent. A sink
+that exits on time but leaves children in its group is left alone.
 
 **The flush.** `flush()` takes the queue's items and releases the mutex
 before anything slow, so a flush never blocks another thread's enqueue for
@@ -539,9 +542,11 @@ would quietly test the no-sink path. The harness chmods its own directories
 to 0700 and checks the full ancestor chain before a test starts, failing
 with a clear message if the build directory's layout breaks discovery.
 
-The stub is a shell script written by the harness. Each call appends one
-JSON line to a log beside it: a high-resolution timestamp, its argv, and the
-stdin lines it read. Its exit code, a sleep before exiting, and a check that
+The stub is a shell script written by the harness. Each call gets a
+directory of its own in a log beside it, numbered in the order the calls
+started, holding a high-resolution timestamp, its argv, its environment and
+the stdin lines it read; one directory per call means two calls at once
+can't interleave their output. Its exit code, a sleep before exiting, and a check that
 a named directory exists are set per test through files the stub reads, not
 through koto's environment. Tests set `HOME` on the command they build with
 `koto_command`, which already removes `KOTO_SESSION_*` and runs every test

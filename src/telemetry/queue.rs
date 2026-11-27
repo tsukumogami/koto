@@ -49,13 +49,6 @@ use std::time::{Duration, Instant};
 use super::carry;
 use super::sink::{self, Outcome};
 
-// The stub sink the unit tests install, shared with the integration tests.
-// Declared here, at the file's top level, so the path is read from this
-// file's own directory.
-#[cfg(test)]
-#[path = "../../tests/support/event_sink_stub.rs"]
-mod event_sink_stub;
-
 /// The most records one call carries.
 pub(crate) const CHUNK: usize = 200;
 
@@ -64,6 +57,25 @@ pub(crate) const CALL_BUDGET: Duration = Duration::from_millis(2850);
 
 /// The least time a call is started with: the sink's own per-call bound.
 pub(crate) const MIN_CALL: Duration = Duration::from_millis(2000);
+
+#[cfg(not(test))]
+fn call_budget() -> Duration {
+    CALL_BUDGET
+}
+
+// The budget is the real one in every unit test unless the test widens it.
+// A later chunk starts only when the calls before it were quick, so on a
+// starved test host a test about something other than timing would
+// otherwise fail for a reason it isn't testing.
+#[cfg(test)]
+thread_local! {
+    static TEST_CALL_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(CALL_BUDGET) };
+}
+
+#[cfg(test)]
+fn call_budget() -> Duration {
+    TEST_CALL_BUDGET.with(|b| b.get())
+}
 
 /// One queued record: its line as it will be sent, and the session it
 /// belongs to, for the count if it is dropped.
@@ -229,7 +241,7 @@ pub fn flush() {
         return;
     };
 
-    let deadline = Instant::now() + CALL_BUDGET;
+    let deadline = Instant::now() + call_budget();
     let mut rest = items.as_slice();
     while !rest.is_empty() {
         let (chunk, after) = rest.split_at(rest.len().min(CHUNK));
@@ -272,13 +284,14 @@ pub(crate) fn queued_for_test() -> Vec<String> {
 pub(crate) fn reset_for_test() {
     with_queue(|q| *q = Queue::default());
     set_breaker(Breaker::Open);
+    TEST_CALL_BUDGET.with(|b| b.set(CALL_BUDGET));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use super::event_sink_stub::Stub;
+    use crate::telemetry::event_sink_stub::Stub;
 
     /// A stub sink installed for this thread, and two session directories
     /// to queue records for.
@@ -290,6 +303,19 @@ mod tests {
     }
 
     impl Fixture {
+        /// A fixture for a test that isn't about the deadline: the call
+        /// budget is long enough that no chunk is ever late, however slow
+        /// the host is at starting the stub.
+        fn unhurried() -> Self {
+            let f = Fixture::new();
+            TEST_CALL_BUDGET.with(|b| b.set(Duration::from_secs(120)));
+            f
+        }
+
+        /// A fixture with the real call budget. The tests that use it run
+        /// with every core to themselves under the CI test runner
+        /// (`.config/nextest.toml`), since they depend on the stub starting
+        /// promptly.
         fn new() -> Self {
             reset_for_test();
             let tmp = tempfile::tempdir().unwrap();
@@ -330,7 +356,7 @@ mod tests {
 
     #[test]
     fn an_empty_queue_makes_no_call() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         flush();
         flush();
         assert_eq!(f.stub.call_count(), 0);
@@ -339,7 +365,7 @@ mod tests {
 
     #[test]
     fn nothing_is_queued_or_called_without_a_sink() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         sink::set_sink_for_test(None);
         assert!(!active());
         // A record pushed anyway is discarded by the flush, uncounted.
@@ -382,7 +408,7 @@ mod tests {
 
     #[test]
     fn exactly_two_hundred_records_make_one_call() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         f.queue(&f.a, 0, 200);
         flush();
         assert_eq!(f.sizes(), vec![200]);
@@ -438,7 +464,7 @@ mod tests {
 
     #[test]
     fn exit_3_trips_breaker_and_counts() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         f.stub.exit_codes(&[3]);
         f.queue(&f.a, 0, 250);
         f.queue(&f.b, 250, 10);
@@ -463,7 +489,7 @@ mod tests {
 
     #[test]
     fn exit_2_stops_without_counting() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         f.stub.exit_codes(&[2]);
         f.queue(&f.a, 0, 450);
         flush();
@@ -481,7 +507,7 @@ mod tests {
 
     #[test]
     fn exit_1_drops_its_chunk_and_goes_on() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         f.stub.exit_codes(&[1, 0]);
         f.queue(&f.a, 0, 250);
         flush();
@@ -492,7 +518,7 @@ mod tests {
 
     #[test]
     fn exit_4_counts_nothing_and_goes_on() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         f.stub.exit_codes(&[4]);
         f.queue(&f.a, 0, 250);
         flush();
@@ -504,7 +530,7 @@ mod tests {
     #[test]
     fn a_sink_that_stops_passing_its_check_is_not_run_and_trips_the_breaker() {
         use std::os::unix::fs::PermissionsExt;
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         std::fs::set_permissions(&f.stub.path, std::fs::Permissions::from_mode(0o770)).unwrap();
         f.queue(&f.a, 0, 3);
         flush();
@@ -515,7 +541,7 @@ mod tests {
 
     #[test]
     fn records_too_long_to_send_are_counted_by_the_next_flush() {
-        let f = Fixture::new();
+        let f = Fixture::unhurried();
         push(&f.a, vec!["{\"kind\":\"test\"}".to_string()], 2);
         push(&f.b, Vec::new(), 1);
         // Nothing is written until the flush.

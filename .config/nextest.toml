@@ -35,3 +35,11 @@ path = "junit.xml"
 [[profile.default.overrides]]
 filter = 'binary(=cloud_read_cost_test) & (test(=a_forty_read_action_on_the_cloud_backend_is_within_twice_local) | test(=a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing) | test(=a_hub_select_over_its_workers_checks_each_session_once))'
 threads-required = "num-cpus"
+
+# The event sink's flush sends chunks under one deadline, and a later chunk
+# starts only when the calls before it left time for it. These three tests
+# use the real deadline against a stub sink, so they need the stub to start
+# promptly: each runs with every core to itself.
+[[profile.default.overrides]]
+filter = 'package(koto) & test(/^telemetry::queue::tests::(chunks_200_200_50|deadline_drops_unreached_chunk|late_chunk_dropped_breaker_stays_open)$/)'
+threads-required = "num-cpus"

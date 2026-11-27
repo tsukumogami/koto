@@ -19,6 +19,11 @@
 #   exit        the exit code (default 0)
 #   sleep       seconds to sleep after reading stdin (default 0)
 
+# The installer's probe: proves the file can be executed, and logs nothing.
+if [ "$1" = "--probe" ]; then
+    exit 0
+fi
+
 n=0
 while ! mkdir "$CTL/calls/$n" 2>/dev/null; do
     n=$((n + 1))

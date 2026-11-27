@@ -68,7 +68,8 @@ const ENV_ALLOWLIST: &[&str] = &[
 /// How long a killed call's process group is given to empty.
 const GROUP_EXIT_WAIT: Duration = Duration::from_millis(100);
 
-/// How long a finished call waits for its stdin writer before leaving it.
+/// How long a call that ended on time waits for its stdin writer before
+/// leaving it, within the call's deadline.
 const WRITER_WAIT: Duration = Duration::from_millis(50);
 
 /// The canonical path of a sink that passed discovery.
@@ -264,12 +265,20 @@ pub(crate) fn send(path: &SinkPath, lines: &[&str], carry: u64, deadline: Instan
 
     // The writer has finished, or will as soon as the pipe's last reader is
     // gone. A sink that exited on time but left a child holding the pipe
-    // could block it for good, so it is given a moment and then left: a
-    // parked thread costs nothing and ends with the process.
+    // could block it for good, so the writer is never waited on without a
+    // bound: a parked thread costs nothing and ends with the process.
+    //
+    // After a kill it isn't waited on at all. The group is gone, so its
+    // write has already failed, and the time past the deadline is spoken
+    // for: the group wait above and the drop count's lock are what the
+    // flush's 3.0 s allows. A call that ended on time gives the writer a
+    // moment, never past the deadline.
     if let Some(writer) = writer {
-        let until = Instant::now() + WRITER_WAIT;
-        while !writer.is_finished() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(1));
+        if outcome != Outcome::Killed {
+            let until = (Instant::now() + WRITER_WAIT).min(deadline);
+            while !writer.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         if writer.is_finished() {
             let _ = writer.join();
@@ -379,46 +388,68 @@ mod tests {
 
     #[test]
     fn send_maps_exit_codes_and_refuses_a_file_that_no_longer_passes() {
+        use crate::telemetry::event_sink_stub::Stub;
         let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("sink");
-        let sink = SinkPath(file.clone());
-        let later = || Instant::now() + Duration::from_secs(20);
-        for (code, outcome) in [
+        let stub = Stub::install(&tmp.path().join("sink"), &tmp.path().join("ctl"));
+        let sink = SinkPath(stub.path.clone());
+        let later = || Instant::now() + Duration::from_secs(60);
+        let cases = [
             (0, Outcome::Posted),
             (1, Outcome::Usage),
             (2, Outcome::Off),
             (3, Outcome::Dropped),
             (4, Outcome::PostedSomeInvalid),
             (9, Outcome::Usage),
-        ] {
-            std::fs::write(&file, format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n")).unwrap();
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ];
+        let codes: Vec<i32> = cases.iter().map(|(code, _)| *code).collect();
+        stub.exit_codes(&codes);
+        for (code, outcome) in cases {
             assert_eq!(send(&sink, &["{}"], 0, later()), outcome, "exit {code}");
         }
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o770)).unwrap();
+        // The arguments, the carry and the lines arrive as sent.
+        assert_eq!(
+            send(&sink, &["{\"a\":1}", "{\"b\":2}"], 7, later()),
+            Outcome::Usage
+        );
+        let calls = stub.calls();
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[0].argv, vec!["send", "--scope", "koto-journal"]);
+        assert_eq!(calls[0].carry(), None);
+        assert_eq!(
+            calls[6].argv,
+            vec!["send", "--scope", "koto-journal", "--carry", "7"]
+        );
+        assert_eq!(calls[6].lines, vec!["{\"a\":1}", "{\"b\":2}"]);
+
+        // A file that no longer passes its check is not run.
+        std::fs::set_permissions(&stub.path, std::fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(send(&sink, &["{}"], 0, later()), Outcome::SpawnFailed);
-        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(&stub.path).unwrap();
         assert_eq!(send(&sink, &["{}"], 0, later()), Outcome::SpawnFailed);
+        assert_eq!(stub.call_count(), 7);
     }
 
     #[test]
     fn send_kills_a_call_that_outlives_its_deadline() {
+        use crate::telemetry::event_sink_stub::Stub;
         let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("sink");
-        std::fs::write(&file, "#!/bin/sh\ncat >/dev/null\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stub = Stub::install(&tmp.path().join("sink"), &tmp.path().join("ctl"));
+        stub.sleeps(&["120"]);
         let started = Instant::now();
         let outcome = send(
-            &SinkPath(file),
+            &SinkPath(stub.path.clone()),
             &["{}"],
             0,
-            Instant::now() + Duration::from_millis(300),
+            Instant::now() + Duration::from_millis(1500),
         );
         assert_eq!(outcome, Outcome::Killed);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );
+        let calls = stub.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].done, "the call ran to its own exit");
     }
 }

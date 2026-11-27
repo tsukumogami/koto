@@ -344,6 +344,13 @@ mod queue {
 
 pub use queue::flush;
 
+// The stub sink the sender's unit tests install, shared with the
+// integration tests. Declared in this file so the path is read from this
+// directory.
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/event_sink_stub.rs"]
+mod event_sink_stub;
+
 use std::path::Path;
 
 use serde_json::Value;

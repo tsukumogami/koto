@@ -63,6 +63,34 @@ impl Call {
     }
 }
 
+/// Run the stub's probe until the kernel will execute the file.
+///
+/// A test process has other threads, and one of them may fork a child
+/// while this thread holds the script open for writing. Until that child
+/// execs, it holds a copy of the descriptor, and an exec of the script
+/// fails with "text file busy". The window is a few milliseconds and
+/// closes for good once the copies are gone, so the stub is probed here
+/// until it runs, and the test's own first call never meets it.
+fn wait_until_executable(path: &Path) {
+    const ETXTBSY: i32 = 26;
+    for _ in 0..400 {
+        match std::process::Command::new(path)
+            .arg("--probe")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Anything else is the test's to find: a stub that can't run
+            // for another reason fails the test that uses it.
+            _ => return,
+        }
+    }
+}
+
 impl Stub {
     /// Write the stub to `path`, mode 0700, with `ctl` as its control
     /// directory. `ctl` is created, with an empty call log.
@@ -76,6 +104,7 @@ impl Stub {
         let script = format!("#!/bin/sh\nCTL='{quoted}'\n{BODY}");
         std::fs::write(path, script).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(path);
         Stub {
             path: path.to_path_buf(),
             ctl: ctl.to_path_buf(),

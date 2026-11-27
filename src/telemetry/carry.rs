@@ -316,11 +316,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(add(tmp.path(), 1));
         let holder = std::fs::File::open(tmp.path().join(LOCK_FILE)).unwrap();
+        // A blocking lock: a child process another test thread is starting
+        // can hold a copy of the descriptor `add` just closed until its
+        // exec, and with it the lock, for a moment.
         // SAFETY: the descriptor belongs to `holder`, which outlives the call.
-        assert_eq!(
-            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
         let started = Instant::now();
         assert!(!add(tmp.path(), 5));
         let first = started.elapsed();
