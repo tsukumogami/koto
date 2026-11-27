@@ -1032,6 +1032,59 @@ pub fn handle_origin(backend: &Backend, name: &str) -> Result<()> {
     }
 }
 
+/// Handle `koto session identity <name> [--json]`: print the session's id,
+/// its run id and its run's template name and hash, each under the
+/// attribute name its records use. A value that didn't resolve is left out.
+///
+/// Reads this host's store only, as the lookup behind the records does,
+/// and writes nothing: no cache is filled, so the command can be run
+/// against a session another process is ticking.
+pub fn handle_identity(backend: &Backend, name: &str, json: bool) -> Result<()> {
+    use crate::session::lineage::{identity, IdentityError};
+
+    let found = match identity(backend, name) {
+        Ok(found) => found,
+        Err(e) => {
+            let (error, code) = match e {
+                IdentityError::InvalidName(reason) => (reason, super::EXIT_CALLER_ERROR),
+                IdentityError::NoSuchSession => (
+                    format!("session '{name}' does not exist"),
+                    super::EXIT_CALLER_ERROR,
+                ),
+                IdentityError::Unreadable(reason) => (
+                    format!("the header of session '{name}' can't be read: {reason}"),
+                    super::EXIT_INFRASTRUCTURE,
+                ),
+            };
+            super::exit_with_error_code(
+                serde_json::json!({ "error": error, "command": "session identity" }),
+                code,
+            )
+        }
+    };
+    let pairs: Vec<(&str, String)> = [
+        ("koto.session.id", found.session_id),
+        ("koto.run.id", found.run_id),
+        ("koto.run.template.name", found.run_template.name),
+        ("koto.run.template.hash", found.run_template.hash),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect();
+    if json {
+        let object: serde_json::Map<String, serde_json::Value> = pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), serde_json::Value::String(value)))
+            .collect();
+        println!("{}", serde_json::Value::Object(object));
+    } else {
+        for (key, value) in pairs {
+            println!("{key}={value}");
+        }
+    }
+    Ok(())
+}
+
 /// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
 /// `name` belongs to and print the verdict, its members and the settings.
 ///

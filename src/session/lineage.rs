@@ -10,6 +10,14 @@
 //! when a link in that chain is gone: an omitted run id is better than a
 //! wrong one, so a child's run id is never a non-root ancestor's id.
 //!
+//! A run also has a template: its root session's. Every record of a run
+//! can name it, so a reader can group a run's sessions by what the run was
+//! started as. A root answers from its own header. A child caches the
+//! answer in its sidecar when it is created, the one time its parent is
+//! sure to be on this host, and otherwise finds it by the same walk, which
+//! accepts only the header of the session whose id is the run id. A
+//! template that can't be resolved is left out, never guessed.
+//!
 //! The walk, and the parent read a new child's lineage starts from, read
 //! headers from this host's store only (see [`local_header`]). They never
 //! go through `SessionBackend::read_header`, which on a cloud store pulls
@@ -118,4 +126,161 @@ pub(crate) fn child_lineage(
             .or_else(|| walk(backend, parent_header.parent_workflow.as_deref())),
     };
     (root, parent_id)
+}
+
+/// The template of a run: its root session's template name and hash, each
+/// present only when it resolved to a value of the right shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunTemplate {
+    pub(crate) name: Option<String>,
+    pub(crate) hash: Option<String>,
+}
+
+impl RunTemplate {
+    /// Whether neither value resolved.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.name.is_none() && self.hash.is_none()
+    }
+
+    /// The template `header` itself records: its name when it has the name
+    /// shape, and its hash when it is non-empty and id-shaped. An empty
+    /// hash is left out, as `session_started` leaves it out.
+    fn of(header: &StateFileHeader) -> Self {
+        RunTemplate {
+            name: header
+                .template_name
+                .clone()
+                .filter(|n| crate::names::is_name(n)),
+            hash: id(&header.template_hash),
+        }
+    }
+}
+
+/// The run template of the session `name`, whose header is `header`.
+///
+/// A root answers from its own header. A child answers from the two fields
+/// its sidecar caches, and when they are empty from [`found_run_template`].
+/// A cached template is used only when the sidecar's run id doesn't
+/// contradict the run id the header records, so a header that was re-rooted
+/// by hand never keeps printing another run's template.
+///
+/// Nothing is written here. The sidecar is kept by the telemetry module,
+/// which stores what [`found_run_template`] returns when a child is created
+/// and on a later record of a child that caches none.
+pub(crate) fn run_template(
+    backend: &dyn SessionBackend,
+    name: &str,
+    header: &StateFileHeader,
+) -> RunTemplate {
+    if header.parent_workflow.is_none() {
+        return RunTemplate::of(header);
+    }
+    // The run id the header alone states, when it states one.
+    let recorded = from_header_alone(header).flatten();
+    let cached = sidecar::read(&backend.session_dir(name))
+        .filter(|s| match (&recorded, &s.run_id) {
+            (Some(recorded), Some(cached)) => recorded == cached,
+            _ => true,
+        })
+        .map(|s| RunTemplate {
+            name: s.run_template_name,
+            hash: s.run_template_hash,
+        })
+        .unwrap_or_default();
+    if !cached.is_empty() {
+        return cached;
+    }
+    found_run_template(backend, header)
+}
+
+/// The run template of a child whose header is `header`, found without its
+/// own sidecar: from the first ancestor on this host that can answer.
+///
+/// The walk goes up `parent_workflow` names, as [`walk`] does. A root ends
+/// it: its template is the run's only when its `session_id` is the child's
+/// run id, so a chain that was re-rooted or hand-edited never lends another
+/// run's template. An ancestor whose sidecar caches a template for the same
+/// run id ends it early. An ancestor that is missing or unreadable ends it
+/// with nothing, as does a child with no run id.
+pub(crate) fn found_run_template(
+    backend: &dyn SessionBackend,
+    header: &StateFileHeader,
+) -> RunTemplate {
+    let Some(run) = run_id(backend, header) else {
+        return RunTemplate::default();
+    };
+    let mut next = header.parent_workflow.clone();
+    for _ in 0..MAX_WALK {
+        let Some(name) = next else {
+            break;
+        };
+        let Some(ancestor) = local_header(backend, &name) else {
+            break;
+        };
+        if ancestor.parent_workflow.is_none() {
+            if ancestor.session_id == run {
+                return RunTemplate::of(&ancestor);
+            }
+            break;
+        }
+        if let Some(cached) = sidecar::read(&backend.session_dir(&name)) {
+            let template = RunTemplate {
+                name: cached.run_template_name,
+                hash: cached.run_template_hash,
+            };
+            if cached.run_id.as_deref() == Some(run.as_str()) && !template.is_empty() {
+                return template;
+            }
+        }
+        next = ancestor.parent_workflow;
+    }
+    RunTemplate::default()
+}
+
+/// What `koto session identity` prints: a session's id, its run's id and
+/// its run's template. Each value is present only when it resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub(crate) session_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) run_template: RunTemplate,
+}
+
+/// Why [`identity`] has no answer.
+#[derive(Debug)]
+pub(crate) enum IdentityError {
+    /// The name isn't a valid session name.
+    InvalidName(String),
+    /// This host's store holds no session of that name.
+    NoSuchSession,
+    /// The session's state file is there and its header can't be read.
+    Unreadable(String),
+}
+
+/// The identity of session `name`, read from this host's store alone and
+/// with nothing written: the lookup the journal's records use, minus the
+/// caching, so the values are the ones those records carry.
+///
+/// The run id is the one the sidecar caches when it caches one, as it is
+/// for a record, and otherwise the one the header and the walk give.
+pub(crate) fn identity(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> Result<Identity, IdentityError> {
+    validate_session_id(name).map_err(|e| IdentityError::InvalidName(e.to_string()))?;
+    let dir = backend.session_dir(name);
+    let path = dir.join(state_file_name(name));
+    if !path.is_file() {
+        return Err(IdentityError::NoSuchSession);
+    }
+    let header =
+        persistence::read_header(&path).map_err(|e| IdentityError::Unreadable(format!("{e:#}")))?;
+    let run_id = sidecar::read(&dir)
+        .and_then(|s| s.run_id)
+        .or_else(|| run_id(backend, &header));
+    Ok(Identity {
+        session_id: id(&header.session_id),
+        run_id,
+        run_template: run_template(backend, name, &header),
+    })
 }

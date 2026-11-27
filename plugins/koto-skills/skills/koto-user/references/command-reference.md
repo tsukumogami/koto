@@ -30,6 +30,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg; or a session that carries on another's work, naming it with `--continues` |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
+| `koto session identity` | Tooling and runner — a session's id, its run's id and its run's template, as JSON |
 | `koto session origin` | Operator and reviewer — which session dispatched a session or an anchor |
 | `koto session pin/unpin` | Runner and operator — keeping a finished session's record past every removal, and releasing it |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
@@ -1089,6 +1090,25 @@ Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: i
 | `relation_unreadable` | `[{holder, reason}]` for a relation that couldn't be judged (`unparseable`, `too_large`, `mismatch`, `cycle`, `unlistable`), which keeps the session |
 
 A stale anchor is a report and nothing more: koto never closes an observed anchor on its own. When the agent session behind it is truly gone, run the printed `close_command`. A malformed retention setting, or a name with no session, exits 2; a sessions directory that can't be listed exits 3.
+
+---
+
+## koto session identity
+
+```
+koto session identity <name> [--json]
+```
+
+Prints the session's id, the id of its run and its run's template. A run is a root session and every session spawned under it, so a child prints its root's id and its root's template, not its own. Read-only: it reads this host's session store, never the cloud bucket, and writes nothing. Use it when a tool needs to label its own output with the session or run it belongs to; you don't need it to drive a workflow.
+
+```json
+{"koto.run.id": "5a1c0f6e-3d0b-4c58-9d4e-2f6b7a1e9c33",
+ "koto.run.template.hash": "c9fe1ea91bcef5c8f75b6664d3bac00b2c4148ccb59ea4175bdaf378c19060dd",
+ "koto.run.template.name": "work-on",
+ "koto.session.id": "5a1c0f6e-3d0b-4c58-9d4e-2f6b7a1e9c33"}
+```
+
+The keys are the attribute names the session's records carry. A key with no value is left out (a template with no name, or a child whose ancestors are gone from this host), and the command still exits 0. Without `--json` the same pairs print as `key=value` lines. A malformed name or a session this host doesn't hold exits 2, and a header that can't be read exits 3, each with `{"error": "...", "command": "session identity"}` on stdout.
 
 ---
 

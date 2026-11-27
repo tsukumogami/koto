@@ -152,6 +152,8 @@ fn init_writes_session_started_then_the_initial_state_and_a_sidecar() {
         Some(sidecar::Sidecar {
             run_id: Some("root-id".into()),
             driver: Some("driver-a".into()),
+            // A root caches no run template: its header answers.
+            ..sidecar::Sidecar::default()
         })
     );
 }
