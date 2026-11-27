@@ -1541,7 +1541,8 @@ fn context_write_exit_code(e: &anyhow::Error) -> i32 {
 /// event sink, when one is installed. `main` registers this as its first
 /// exit hook, so it runs last, after every other hook has journaled what it
 /// had to: a command that exits with records still queued sends them on
-/// its way out.
+/// its way out. It is the last of the flush points, not the only one;
+/// `telemetry::flush` lists the others.
 pub fn flush_session_records() {
     crate::telemetry::flush();
 }

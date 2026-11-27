@@ -499,8 +499,9 @@ impl<'a> CliCheckEvaluator<'a> {
             if let Some(hold) = self.try_lock() {
                 return Some(hold);
             }
-            // About to wait on another tick's lock: send what is queued
-            // first. Every poll after the first finds the queue empty.
+            // Another tick holds the lock. Send what is queued before
+            // waiting on it; this also runs on the pass that gives up, which
+            // is harmless. Every pass after the first finds the queue empty.
             crate::telemetry::flush();
             let now = Instant::now();
             if now >= deadline {

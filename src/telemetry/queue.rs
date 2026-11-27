@@ -228,6 +228,15 @@ impl Drops {
 /// Send what is queued to the event sink. Returns at once, having called
 /// nothing, when nothing is queued. See the module documentation for what
 /// each outcome does.
+///
+/// It is called at fixed points, so a long command doesn't hold its
+/// records until it ends: before a gate's or an action's command is
+/// started (`run_shell_command`), before a decider is called, before each
+/// wait (a polling gate's, a polling action's, `koto request`'s, the
+/// decider lock's), on the terminal tick before the session directory can
+/// be removed, and from the exit hook. Code that adds a new slow step or a
+/// new wait should call it first. The one rule is that no call may sit
+/// inside a command's time limit.
 pub fn flush() {
     let Queue { items, oversize } = with_queue(std::mem::take);
     if items.is_empty() && oversize.is_empty() {

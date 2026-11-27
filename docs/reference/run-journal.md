@@ -1437,8 +1437,8 @@ still running at the deadline is ended by killing the sink's process
 group, and that stops later calls for the process (see below), so a sink
 that hangs delays a command by one deadline, not one per point. A sink
 that is slow but always answers in time is different: it adds its own time
-at every point that has records to send. The flush
-before a command runs before the command's time limit starts, so the sink
+at every point that has records to send. A gate's or an action's time
+limit starts only after the flush ahead of it has returned, so the sink
 never eats into it. Nothing about the sink changes a command's output or
 exit status, and koto prints no warning about it.
 
