@@ -129,7 +129,7 @@ impl Pointer {
             return Err(shape.to_string());
         };
         let position: u32 = p.parse().map_err(|_| shape.to_string())?;
-        if !crate::run_journal::is_id(h) || !crate::run_journal::is_id(c) || position == 0 {
+        if !crate::names::is_id(h) || !crate::names::is_id(c) || position == 0 {
             return Err(shape.to_string());
         }
         Ok(Self {

@@ -1985,7 +1985,7 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 /// The run journal lives with the store it describes. The default store
 /// under `<koto root>/sessions` journals into the koto root; a store whose base
 /// `KOTO_SESSIONS_BASE` redirected journals inside that base, so it never
-/// writes the real home's journal (see `crate::run_journal`).
+/// writes the real home's journal (see `crate::telemetry`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     use koto_session_reader::source::{locate_sessions_dir, BackendKind, SessionsDir};
     match locate_sessions_dir(Some(BackendKind::Local))? {
@@ -5143,7 +5143,7 @@ fn finish_terminal_tick(
     if arrival {
         // The run journal's `terminal` record, once per arrival and before
         // any cleanup below, so it survives the session's removal.
-        crate::run_journal::terminal(journal_root, backend, name, header, final_state);
+        crate::telemetry::terminal(journal_root, backend, name, header, final_state);
         // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
         let post_events = backend
             .read_events(name)
@@ -7991,7 +7991,7 @@ fn handle_next(
             // The enum and boolean values telemetry may carry, read against
             // the state's declared `accepts` while the compiled template is
             // at hand; the run journal relays them as `evidence_field`.
-            let exported_fields = crate::run_journal::exported_fields(
+            let exported_fields = crate::telemetry::exported_fields(
                 accepts,
                 data.as_object()
                     .expect("validate_evidence guarantees object input"),
@@ -9603,7 +9603,7 @@ fn handle_next(
 /// Journal a `koto next` response that has just been printed: one
 /// `response` record when it carries a directive, nothing for a terminal or
 /// an error. Called after the `instructions_delivered` append, so the
-/// record's `koto.seq` covers it. See `crate::run_journal::response`.
+/// record's `koto.seq` covers it. See `crate::telemetry::response`.
 #[cfg(unix)]
 fn journal_response(
     journal_root: Option<&Path>,
@@ -9612,12 +9612,12 @@ fn journal_response(
     resp: &next_types::NextResponse,
 ) {
     if let Some((state, directive, details)) = resp.directive_parts() {
-        crate::run_journal::response(
+        crate::telemetry::response(
             journal_root,
             backend,
             name,
             state,
-            crate::run_journal::ResponseSource::Next,
+            crate::telemetry::ResponseSource::Next,
             directive,
             details,
         );
@@ -10210,7 +10210,7 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // session lock is taken anywhere in this function. The one thing it
     // writes is the run journal's `response` record at the end, which waits
     // only briefly for the journal's lock and never touches the session's
-    // files (see `crate::run_journal::response`).
+    // files (see `crate::telemetry::response`).
     if let Some(state) = current_template_state {
         if !state.terminal {
             // Re-validates values as defense in depth, mirroring
@@ -10331,14 +10331,14 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // A printed directive (present only for a non-terminal state) is
     // journaled as a `response`, the only write this command makes; a
     // terminal's status prints none and writes nothing. See
-    // `crate::run_journal::response`.
+    // `crate::telemetry::response`.
     if let Some(directive) = response.get("directive").and_then(|d| d.as_str()) {
-        crate::run_journal::response(
+        crate::telemetry::response(
             backend.journal_root(),
             backend,
             name,
             &machine_state.current_state,
-            crate::run_journal::ResponseSource::Status,
+            crate::telemetry::ResponseSource::Status,
             directive,
             response.get("details").and_then(|d| d.as_str()),
         );

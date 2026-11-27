@@ -774,9 +774,9 @@ fn init_child_core(
 
     // The child's run identity, fixed now from the parent's header so it
     // stays right after the parent or root is removed (see
-    // `crate::run_journal`).
+    // `crate::telemetry`).
     let (root_session_id, parent_session_id) = match parent_name {
-        Some(parent) => crate::run_journal::child_lineage(backend, parent),
+        Some(parent) => crate::session::lineage::child_lineage(backend, parent),
         None => (None, None),
     };
 

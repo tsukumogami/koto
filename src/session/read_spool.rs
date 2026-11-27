@@ -43,7 +43,7 @@
 //! `koto context get` and `koto context exists` for an anchorless read, on
 //! either backend, and the cloud backend's `append_event` in
 //! `crate::session::cloud`, for reads and pulls. Whatever consumes these reads (today the run
-//! journal's visit fold, `crate::run_journal`) goes through `read`, so the
+//! journal's visit fold, `crate::telemetry`) goes through `read`, so the
 //! spool can move or change shape by changing these two functions and both
 //! call sites.
 //! A line names no session: the spool's place beside the session says

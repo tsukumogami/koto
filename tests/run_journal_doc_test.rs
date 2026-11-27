@@ -3,7 +3,7 @@
 //! The reference is what external tooling reads the journal by, so every
 //! record kind and field it names has to be one koto writes, and every one
 //! koto writes has to be named there. The source of truth is the string
-//! literals in `src/run_journal/`, the only module that builds records.
+//! literals in `src/telemetry/`, the only module that builds records.
 //!
 //! The reference also has to stay a description of a local file: no link
 //! outside the koto repository, no attribute name outside the `koto.`
@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const REFERENCE: &str = "docs/reference/run-journal.md";
-const SOURCE_DIR: &str = "src/run_journal";
+const SOURCE_DIR: &str = "src/telemetry";
 
 /// Fields every record carries that aren't in the `koto.` namespace.
 const ENVELOPE: &[&str] = &["kind", "v", "at", "session"];

@@ -6,7 +6,7 @@
 //! rule and section, the decision that follows the round, and publish-time
 //! document check results. Each appends typed session events, and the run
 //! journal relays each event as one telemetry record (see
-//! `crate::run_journal`).
+//! `crate::telemetry`).
 //!
 //! Three more record what happens to the document while it is drafted:
 //! `rule-checks` (each check-held rule's outcome at one moment),
@@ -428,7 +428,7 @@ pub fn declared_or_other(value: &str, declared: &[String]) -> String {
 /// Whether `value` is a rule id koto records: 1 to 128 bytes in the run
 /// journal's name shape, the bound koto puts on a finding's rule id.
 pub fn valid_rule_id(value: &str) -> bool {
-    value.len() <= crate::findings::RULE_ID_MAX_BYTES && crate::run_journal::is_name(value)
+    value.len() <= crate::findings::RULE_ID_MAX_BYTES && crate::names::is_name(value)
 }
 
 /// A positive integer written in decimal digits.
@@ -854,14 +854,14 @@ pub fn fix_recorded(
 /// A `code-round` call's `--round` and `--head`, as `(round, head digest)`.
 /// The round is a positive integer; the head is 1 to [`HEAD_MAX_BYTES`]
 /// bytes of any text and is kept only as its digest
-/// ([`crate::run_journal::digest`]), so the same head gives the same value
+/// ([`crate::names::digest`]), so the same head gives the same value
 /// in every session and the value given is never stored.
 pub fn code_round_flags(round: &str, head: &str) -> Result<(u64, String), Refusal> {
     let round = positive(round).ok_or_else(|| bad_value("--round", "a positive integer"))?;
     if head.is_empty() || head.len() > HEAD_MAX_BYTES {
         return Err(bad_value("--head", &format!("1 to {HEAD_MAX_BYTES} bytes")));
     }
-    Ok((round, crate::run_journal::digest(head)))
+    Ok((round, crate::names::digest(head)))
 }
 
 /// A seat's model as a `code-round` call stores it: as given when it has the
@@ -870,7 +870,7 @@ pub fn code_round_flags(round: &str, head: &str) -> Result<(u64, String), Refusa
 /// such as a model id with a `[1m]` suffix. Callers record best effort, so
 /// an odd model id costs that seat's model, not the round.
 pub fn code_model(value: &str) -> String {
-    if crate::run_journal::is_name(value) {
+    if crate::names::is_name(value) {
         value.to_string()
     } else {
         UNDECLARED.to_string()
@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn a_fix_check_rule_is_bound_like_a_rule_id() {
         let v = ReviewVocabulary::default();
-        let digest = crate::run_journal::digest("a rule id outside the name shape");
+        let digest = crate::names::digest("a rule id outside the name shape");
         for ok in ["none", "docs/required-sections", digest.as_str()] {
             let batch =
                 text(&[serde_json::json!({"rule_id": ok, "section": "s", "check_rule": ok})]);
@@ -1827,7 +1827,7 @@ mod tests {
             CodeReviewRoundRecorded {
                 state: "review".into(),
                 round: 2,
-                head: crate::run_journal::digest("0123abcd"),
+                head: crate::names::digest("0123abcd"),
                 entries: vec![
                     CodeReviewSeat {
                         seat: "correctness".into(),
@@ -1858,7 +1858,7 @@ mod tests {
         let head = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         let (round, digest) = code_round_flags("1", head).unwrap();
         assert_eq!(round, 1);
-        assert_eq!(digest, crate::run_journal::digest(head));
+        assert_eq!(digest, crate::names::digest(head));
         assert!(digest.starts_with("sha256:"));
         assert!(!digest.contains(head));
         // The same head gives the same digest; another head another.

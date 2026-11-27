@@ -11,6 +11,7 @@ pub mod hierarchy;
 pub mod import_links;
 pub mod index_audit;
 pub mod inventory;
+pub(crate) mod lineage;
 pub mod links;
 pub mod local;
 pub mod name_index;
@@ -1113,7 +1114,7 @@ impl Backend {
 
     /// Where this backend's run journal is written: the journal root of the
     /// local store it is, or, for the cloud backend, of the local store it
-    /// keeps its copies in. `None` writes no journal. See `crate::run_journal`.
+    /// keeps its copies in. `None` writes no journal. See `crate::telemetry`.
     pub(crate) fn journal_root(&self) -> Option<&std::path::Path> {
         match self {
             Backend::Local(b) => b.journal_root(),

@@ -31,7 +31,7 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 pub struct LocalBackend {
     base_dir: PathBuf,
     /// The directory this store's run journal is written in (see
-    /// `crate::run_journal`). The journal lives with the store it
+    /// `crate::telemetry`). The journal lives with the store it
     /// describes: [`LocalBackend::new`] sets it to the koto root (`~/.koto`
     /// unless `KOTO_HOME` moves it), the home its
     /// sessions live in, and a store on an explicit base directory
@@ -113,8 +113,8 @@ impl LocalBackend {
     ) {
         // Journal the committed payload (best-effort, after the commit, so a
         // failed append never writes a record), with the seq it took and the
-        // log it was appended to. See `crate::run_journal`.
-        crate::run_journal::after_commit(self.journal_root(), self, id, payload, commit);
+        // log it was appended to. See `crate::telemetry`.
+        crate::telemetry::after_commit(self.journal_root(), self, id, payload, commit);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
@@ -480,7 +480,7 @@ impl SessionBackend for LocalBackend {
                     .open(session_dir.join(crate::session::TICK_LOCK_FILE));
                 // The session now exists: journal its creation and initial
                 // state (best-effort, never fails the init).
-                crate::run_journal::after_init(
+                crate::telemetry::after_init(
                     self.journal_root(),
                     self,
                     id,

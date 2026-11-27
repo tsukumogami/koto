@@ -6903,7 +6903,7 @@ impl CloudBackend {
                     // further. A rollback never reaches here.
                     if let Ok((header, events)) = self.local.read_events(req.target) {
                         let current = crate::engine::persistence::derive_state_from_log(&events);
-                        crate::run_journal::imported(
+                        crate::telemetry::imported(
                             self.local.journal_root(),
                             &self.local,
                             req.target,

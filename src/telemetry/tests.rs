@@ -356,7 +356,7 @@ fn a_symlink_at_the_journal_path_is_refused_with_one_warning() {
 fn a_child_records_its_lineage_and_carries_the_roots_run_id() {
     let f = Fixture::new();
     f.init("root", header("root", "root-id", None), Some("a"));
-    let (root, parent) = child_lineage(&f.backend, "root");
+    let (root, parent) = lineage::child_lineage(&f.backend, "root");
     assert_eq!(
         (root.as_deref(), parent.as_deref()),
         (Some("root-id"), Some("root-id"))
@@ -367,7 +367,7 @@ fn a_child_records_its_lineage_and_carries_the_roots_run_id() {
     child.parent_session_id = parent;
     f.init("root.c", child, Some("work"));
 
-    let (root2, parent2) = child_lineage(&f.backend, "root.c");
+    let (root2, parent2) = lineage::child_lineage(&f.backend, "root.c");
     assert_eq!(
         (root2.as_deref(), parent2.as_deref()),
         (Some("root-id"), Some("child-id"))
@@ -397,12 +397,12 @@ fn an_older_child_walks_to_its_root_and_omits_the_run_id_when_the_root_is_gone()
     )
     .unwrap();
     assert_eq!(
-        run_id::run_id(&f.backend, &f.backend.read_header("root.old").unwrap()).as_deref(),
+        lineage::run_id(&f.backend, &f.backend.read_header("root.old").unwrap()).as_deref(),
         Some("root-id")
     );
 
     // A grandchild spawned under it now records the true root.
-    let (root, parent) = child_lineage(&f.backend, "root.old");
+    let (root, parent) = lineage::child_lineage(&f.backend, "root.old");
     assert_eq!(
         (root.as_deref(), parent.as_deref()),
         (Some("root-id"), Some("old-id"))
@@ -411,10 +411,10 @@ fn an_older_child_walks_to_its_root_and_omits_the_run_id_when_the_root_is_gone()
     // With the root gone and no cache, nothing resolves, and the
     // child's own id is never used in its place.
     f.backend.cleanup("root").unwrap();
-    let (root, parent) = child_lineage(&f.backend, "root.old");
+    let (root, parent) = lineage::child_lineage(&f.backend, "root.old");
     assert_eq!((root, parent.as_deref()), (None, Some("old-id")));
     assert_eq!(
-        run_id::run_id(&f.backend, &f.backend.read_header("root.old").unwrap()),
+        lineage::run_id(&f.backend, &f.backend.read_header("root.old").unwrap()),
         None
     );
 }

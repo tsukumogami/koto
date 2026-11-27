@@ -313,9 +313,9 @@ pub fn handle_start(
     .map_err(|msg| anyhow::anyhow!(msg))?;
 
     // The session's run identity, fixed now from the parent's header (see
-    // `crate::run_journal`).
+    // `crate::telemetry`).
     let (root_session_id, parent_session_id) =
-        crate::run_journal::child_lineage(backend, validated_parent.as_str());
+        crate::session::lineage::child_lineage(backend, validated_parent.as_str());
 
     // -- Compose the header --
     let ts = now_iso8601();

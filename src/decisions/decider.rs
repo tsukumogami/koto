@@ -233,11 +233,11 @@ impl Observed {
         let anchor = crate::session::anchor::anchor_from_env()
             .filter(|a| crate::session::anchor::is_anchor(store, a));
         Self {
-            harness: crate::run_journal::driver::driver(),
+            harness: crate::telemetry::driver::driver(),
             anchor,
             agent: std::env::var(AGENT_ENV)
                 .ok()
-                .filter(|v| crate::run_journal::is_id(v)),
+                .filter(|v| crate::names::is_id(v)),
             run_mode: std::env::var(RUN_MODE_ENV)
                 .ok()
                 .filter(|v| RUN_MODES.contains(&v.as_str())),
@@ -259,7 +259,7 @@ pub fn resolve(
         anchor: Sourced::observed(observed.anchor.clone().unwrap_or_default()),
     };
     let agent = match &flags.agent {
-        Some(a) if crate::run_journal::is_id(a) => Sourced::handed(a.clone()),
+        Some(a) if crate::names::is_id(a) => Sourced::handed(a.clone()),
         Some(_) => {
             return Err(DecisionError::invalid(
                 "agent",

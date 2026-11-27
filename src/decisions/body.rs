@@ -534,7 +534,7 @@ pub fn validate(req: &Request) -> Result<BTreeMap<String, Value>, DecisionError>
         ));
     }
     if let Some(tool_call) = &req.tool_call {
-        if !crate::run_journal::is_id(tool_call) {
+        if !crate::names::is_id(tool_call) {
             return Err(DecisionError::invalid(
                 "tool_call",
                 "the tool-call identifier must be 1 to 128 characters from A-Z a-z 0-9 . _ : -",
