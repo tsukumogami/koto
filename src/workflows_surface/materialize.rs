@@ -68,6 +68,19 @@ pub fn materialize_after_commit(
     }
 }
 
+/// Run `f` with no commit on this thread materializing.
+///
+/// For a whole-binding move (`koto session rebind --whole`), whose commits
+/// run before it has dropped the old publish location: a materialization
+/// then would render into the old folder, or move a self-discovered
+/// location to the caller's Claude Code session ahead of the drop, which
+/// would log the wrong location as dropped. The next tick's commit renders
+/// the session where it now belongs.
+pub(crate) fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = MaterializeGuard::enter();
+    f()
+}
+
 thread_local! {
     static MATERIALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

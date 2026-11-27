@@ -472,6 +472,54 @@ events:
       to:
         type: string
         required: true
+      whole:
+        type: boolean
+        required: false
+      epoch:
+        type: integer
+        required: false
+
+  held_by_rebound:
+    tier: 2
+    fields:
+      epoch:
+        type: integer
+        required: true
+      added:
+        type: string
+        required: false
+      removed:
+        type: array
+        required: false
+
+  publish_location_dropped:
+    tier: 2
+    fields:
+      epoch:
+        type: integer
+        required: true
+      was:
+        type: string
+        required: true
+      explicit:
+        type: boolean
+        required: false
+
+  environment_rerecorded:
+    tier: 2
+    fields:
+      epoch:
+        type: integer
+        required: true
+      environment:
+        type: object
+        required: true
+      dropped:
+        type: array
+        required: false
+      changed:
+        type: array
+        required: false
 
   session_imported:
     tier: 2
@@ -1094,7 +1142,9 @@ runs with:
 | `legacy` | boolean | No | `true` when the session was created with `koto init --legacy-environment`, so its commands run with the ticking process's whole environment. Absent when false. |
 
 The field is written at `koto init`, copied from the parent into every child
-(including one made by `koto session start`), and never rewritten afterwards. It holds no value of any
+(including one made by `koto session start`). After that only `koto session rebind --whole`
+replaces it, with the record of the agent session taking the session over, and it logs the new
+record in an `environment_rerecorded` event first. It holds no value of any
 variable except the three above. Names a template declares in `pass_env:` aren't
 stored here; they come from the compiled template on each tick. The field is
 absent on sessions created by a koto that didn't record one; the first tick of
@@ -2156,6 +2206,129 @@ bound to writes nothing, so consecutive events always differ.
 
 The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
+
+`koto session rebind --whole` writes the same event type with two more fields,
+`whole` and `epoch`, and fills `from` from the session's anchor when it recorded
+no directory, so a reader that knows only `from` and `to` still reads the move as
+the anchor change it is:
+
+```json
+{
+  "type": "execution_anchor_rebound",
+  "payload": {
+    "from": "/home/user/src/koto",
+    "to": "/home/user/work/koto",
+    "whole": true,
+    "epoch": 2
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from` | string | No | The directory the session was bound to before the rebind: its execution directory, or its anchor when it recorded none; absent only when it recorded neither. |
+| `whole` | boolean | No | `true` on a whole-binding move. Absent on a plain rebind. |
+| `epoch` | integer | No | The `origin.anchor_epoch` the move commits, which the header also records as `origin.whole_epoch`. Absent on a plain rebind, and on a whole-binding move of a session with no origin record, which has no epoch to raise. |
+
+A whole-binding move's later parts follow in a fixed order, each logged before
+it's made and each carrying the same `epoch`: `held_by_rebound`,
+`publish_location_dropped` and `environment_rerecorded`. A part with nothing to
+change logs nothing, and on a session with no origin record they carry `epoch: 0`.
+Other events, such as the `context_added` and `context_removed` of the links
+the move writes, can fall between them. A move stopped part way and run again
+logs only the parts it hadn't logged, so each appears once per move. A crash
+between this event and the header rewrite leaves the event alone in the log; the
+re-run finishes the header from it without appending a second one.
+
+---
+
+#### `held_by_rebound`
+
+Written by `koto session rebind --whole` before it makes the caller's anchor
+(the one `KOTO_ANCHOR` names) the session's only held-by link.
+
+```json
+{
+  "type": "held_by_rebound",
+  "payload": {
+    "epoch": 2,
+    "added": "anchor-9a07",
+    "removed": ["anchor-1f3c", "anchor-55e0"]
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `epoch` | integer | Yes | The epoch of the move this part belongs to, as on its `execution_anchor_rebound`. |
+| `added` | string | No | The caller's anchor, when the session had no held-by link to it. Absent otherwise. |
+| `removed` | array of strings | No | Every other anchor the session held a link to, sorted. The link keys are `koto/links/held-by/<anchor>`. |
+
+---
+
+#### `publish_location_dropped`
+
+Written by `koto session rebind --whole` before it drops the session's stored
+`/workflows` publish location, so the next commit publishes where the new holder
+reads: `KOTO_WORKFLOWS_DIR` when set, otherwise the folder of the Claude Code
+session driving the tick. Only written when a location was stored.
+
+```json
+{
+  "type": "publish_location_dropped",
+  "payload": {
+    "epoch": 2,
+    "was": "/home/user/.claude/projects/p/s/workflows",
+    "explicit": true
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `epoch` | integer | Yes | The epoch of the move this part belongs to. |
+| `was` | string | Yes | The location that was stored. |
+| `explicit` | boolean | No | `true` when `koto workflows publish` set it, so the move removed its explicit mark too. |
+
+A re-run of a move that logged this event removes the location only while it
+still holds the value logged, so a location published after the move stays.
+
+---
+
+#### `environment_rerecorded`
+
+Written by `koto session rebind --whole` before it replaces the session's
+`command_environment` with the caller's, so the change to what every later
+command runs with is in the log. A session with no record yet gets none here; its
+next tick adopts one and logs `environment_adopted`.
+
+```json
+{
+  "type": "environment_rerecorded",
+  "payload": {
+    "epoch": 2,
+    "environment": {
+      "path": "/usr/bin:/bin",
+      "home": "/home/user",
+      "xdg_config_home": "/home/user/.config-two",
+      "pass": ["TERM"]
+    },
+    "dropped": ["node_modules/.bin"],
+    "changed": ["XDG_CONFIG_HOME"]
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `epoch` | integer | Yes | The epoch of the move this part belongs to. |
+| `environment` | object | Yes | The new record, in the shape of the header's `command_environment`, and exactly what the header holds from this event on. The legacy flag is carried over from the old record. |
+| `dropped` | array of strings | No | The `PATH` entries recording dropped (empty and relative ones). |
+| `changed` | array of strings | No | The variables whose recorded value changed: `PATH`, `HOME`, `XDG_CONFIG_HOME`. Names only, never values. |
+
+The payload holds no value of any variable except the three recorded ones, under
+the same rules as `environment_adopted`. The same caller running the move again
+from a shell with different values logs a second one at the same `epoch`.
 
 ---
 

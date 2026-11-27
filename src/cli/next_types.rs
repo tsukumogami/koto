@@ -227,8 +227,10 @@ pub fn environment_adopted_notice(
     format!(
         "[koto] Session '{name}' had no recorded command environment; its commands now run \
          with PATH={}, HOME={}, XDG_CONFIG_HOME={}.{dropped} Other variables reach them only \
-         when koto's default list or the template's pass_env names them. The record can't be \
-         changed; start a new session to run with a different one.\n\n",
+         when koto's default list or the template's pass_env names them. The record stays \
+         until `koto session rebind {name} --whole`, run by an agent session taking the \
+         session over, records that session's values; otherwise start a new session to run \
+         with a different one.\n\n",
         show(&record.path),
         show(&record.home),
         show(&record.xdg_config_home),
@@ -255,8 +257,9 @@ pub fn command_environment_note(
         return None;
     }
     let remedy = format!(
-        "The record can't be changed; to run with different values, start a new session: \
-         `koto cancel --cleanup {name}`, then `koto init` again."
+        "Only `koto session rebind {name} --whole`, run by an agent session taking the \
+         session over, records new values; otherwise, to run with different values, start a \
+         new session: `koto cancel --cleanup {name}`, then `koto init` again."
     );
     let stale_text = stale
         .iter()

@@ -21,6 +21,7 @@ pub mod next_types;
 pub mod overrides;
 #[cfg(unix)]
 pub mod pool;
+mod rebind_whole;
 pub mod request;
 pub mod retry;
 pub mod review;
@@ -1069,6 +1070,20 @@ pub enum SessionCommand {
         /// checkout you moved to and rebind.
         #[arg(long = "to")]
         to: Option<String>,
+
+        /// Move the whole binding, as the session's new holder: the
+        /// anchor, the held-by links (only the caller's `KOTO_ANCHOR`
+        /// stays), the `/workflows` publish location and the recorded
+        /// command environment, under the session's tick lock. A process
+        /// that read the session before the move is refused afterwards.
+        #[arg(long)]
+        whole: bool,
+
+        /// With --whole: how many seconds to wait for a tick in flight
+        /// before refusing with `session_busy` (default 10; 0 refuses at
+        /// once).
+        #[arg(long, requires = "whole", value_name = "SECS")]
+        wait: Option<u64>,
     },
 
     /// Import a session from another workspace's copy in the bucket.
@@ -1156,7 +1171,9 @@ pub enum ChildrenPolicy {
     /// Overwrite local child state with remote.
     #[clap(name = "accept-remote")]
     AcceptRemote,
-    /// Overwrite remote child state with local.
+    /// Overwrite remote child state with local, except a child a rebind
+    /// moved past this host's copy, which is reported errored and left as
+    /// it is.
     #[clap(name = "accept-local")]
     AcceptLocal,
 }
@@ -1751,7 +1768,6 @@ fn wake_pass_needs_reread(pass: &anyhow::Result<crate::engine::wake::WakeEmissio
 #[cfg(unix)]
 fn hold_tick_lock(backend: &Backend, name: &str) {
     use crate::cli::next_types::{NextError, NextErrorCode};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
@@ -1763,19 +1779,7 @@ fn hold_tick_lock(backend: &Backend, name: &str) {
     let wait = tick_lock_wait();
     let started = std::time::Instant::now();
     loop {
-        if !dir.is_dir() {
-            return;
-        }
-        // O_NOFOLLOW: a link planted at the lock's name is not followed to
-        // create or lock a file elsewhere.
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        else {
+        let Ok(Some(file)) = crate::session::tick_lock::open(&dir) else {
             return;
         };
         match crate::engine::jsonl_append::lock_shared(file.as_raw_fd(), Some(wait), started) {
@@ -1802,11 +1806,7 @@ fn hold_tick_lock(backend: &Backend, name: &str) {
         // A same-host import can swap the directory while this waits: the
         // lock is then on the old copy's file. Take the one there now, in
         // what is left of the same wait.
-        let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
-        let now = std::fs::symlink_metadata(&path)
-            .ok()
-            .map(|m| (m.dev(), m.ino()));
-        if held.is_some() && held == now {
+        if crate::session::tick_lock::still_current(&file, &path) {
             let _ = HELD.set(file);
             return;
         }
@@ -2986,7 +2986,13 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_hierarchy(&backend, &name, json)
                 }
                 SessionCommand::Origin { name } => session::handle_origin(&backend, &name),
-                SessionCommand::Rebind { name, to } => {
+                SessionCommand::Rebind {
+                    name,
+                    to,
+                    whole: true,
+                    wait,
+                } => rebind_whole::handle(&backend, &name, to.as_deref(), wait),
+                SessionCommand::Rebind { name, to, .. } => {
                     if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
                         refuse_if_lookup_failed(&e, "session rebind");
                         exit_with_error_code(
