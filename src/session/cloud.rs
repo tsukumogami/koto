@@ -9418,6 +9418,17 @@ mod tests {
         backend
     }
 
+    #[test]
+    fn begin_tick_without_a_minted_tick_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_cloud_backend(dir.path());
+        let id = "begin-tick-never-minted";
+        let session_dir = backend.local.session_dir(id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        backend.begin_tick(id);
+        assert_eq!(sync_stamp::tick_id(&session_dir), None);
+    }
+
     /// Helper: write a minimal state file header into a session directory.
     fn write_state_file(base_dir: &Path, id: &str, created_at: &str) {
         let session_dir = base_dir.join(id);

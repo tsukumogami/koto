@@ -26,6 +26,7 @@ pub mod state_log;
 pub mod summary;
 pub mod sync;
 pub mod sync_stamp;
+pub mod tick_lock;
 pub use koto_session_reader::session::validate;
 pub mod version;
 

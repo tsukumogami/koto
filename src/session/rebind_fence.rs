@@ -297,6 +297,21 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_rebind_after_a_whole_move_leaves_reads_since_the_move_their_epoch() {
+        // A whole move to /ws/a recorded epoch 3; a plain rebind (from a
+        // gate, say) then moved the anchor to /ws/a/b, epoch 4. A read taken
+        // after the whole move is still current; one from before it isn't.
+        let line = r#"{"execution_dir":"/ws/a/b","origin":{"anchor":"/ws/a/b","store":{"kind":"local","base":"/s"},"anchor_epoch":4,"whole_epoch":3,"retired_anchors":["/ws/a","/ws/old"]}}"#;
+        let at = |cwd: &str, seen| check_whole("wf", line, Some(Path::new(cwd)), seen);
+        assert!(at("/ws/a/b", Some(3)).is_ok());
+        assert!(at("/ws/a/b/c", Some(4)).is_ok());
+        assert!(at("/elsewhere", Some(3)).is_ok());
+        assert!(!at("/ws/a/b", Some(2)).unwrap_err().from_retired);
+        // The plain rebind's retired anchor still refuses by path.
+        assert!(at("/ws/a/c", Some(3)).unwrap_err().from_retired);
+    }
+
+    #[test]
     fn advance_retires_the_old_anchor_and_reinstates_the_target() {
         let mut origin = crate::engine::types::SessionOrigin {
             anchor: "/a".into(),

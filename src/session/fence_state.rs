@@ -109,3 +109,43 @@ pub(crate) fn with_cwd<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
     TEST_CWD.with(|c| *c.borrow_mut() = before);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moved_line(epoch: u64) -> String {
+        format!(
+            r#"{{"workflow":"wf","execution_dir":"/ws/new","origin":{{"anchor":"/ws/new","store":{{"kind":"local","base":"/s"}},"anchor_epoch":{epoch},"whole_epoch":{epoch},"retired_anchors":["/ws/old"]}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_later_read_doesnt_replace_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("wf.state.jsonl");
+        note_read(&log, 1);
+        note_read(&log, 2);
+        let refused = with_cwd(Path::new("/ws/new"), || check("wf", &log, &moved_line(2)));
+        assert!(!refused.unwrap_err().from_retired);
+    }
+
+    #[test]
+    fn the_mover_records_the_epoch_it_wrote_over_the_one_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("wf.state.jsonl");
+        note_read(&log, 1);
+        note_mover(&log, 2);
+        // The mover's own later writes pass at the epoch it committed.
+        assert!(with_cwd(Path::new("/ws/new"), || check("wf", &log, &moved_line(2))).is_ok());
+        assert_eq!(recorded(&log), Some(2));
+    }
+
+    fn recorded(log: &Path) -> Option<u64> {
+        epochs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key(log))
+            .copied()
+    }
+}
