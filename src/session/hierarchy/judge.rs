@@ -80,11 +80,27 @@ impl CloseKind {
     }
 }
 
-/// A live member that keeps its hierarchy.
+/// A member that keeps its hierarchy: one that is alive, or one that holds
+/// an open question (DESIGN-session-retention.md, "Questions") or a
+/// person's answer that reads verified here, either of which keeps it with
+/// no expiry, alive or not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keeper {
     pub name: String,
     pub kind: MemberKind,
+    /// Whether the member is alive. `false` only for a stopped member kept
+    /// for the open questions or verified person's answers it holds.
+    pub alive: bool,
+    /// The identities (`<session id>/<decision id>`) of the open questions
+    /// the member raised, as `crate::decisions::questions::raised_open`
+    /// computes them. Empty for a member that holds none.
+    pub questions: Vec<String>,
+    /// The identities of the questions answered by the person's answers
+    /// the member holds whose reading is `verified` on this host
+    /// (`crate::decisions::questions::verified_answers_in`), whether or not
+    /// those questions are open or their raisers are still here. Empty for
+    /// a member that holds none.
+    pub answered: Vec<String>,
     /// For an anchor, whether it holds an observed marker.
     pub observed: bool,
     /// An observed anchor past its last activity plus the stale threshold.
@@ -261,6 +277,12 @@ pub struct Judge<'g> {
     cache: TemplateCache,
     states: HashMap<String, MemberState>,
     components: HashMap<Scope, Components>,
+    /// The open questions each session raised, read on the first judgment
+    /// that has a member holding decisions, and kept for the command.
+    open: Option<BTreeMap<String, Vec<String>>>,
+    /// The questions each member's verified person's answers answer, read
+    /// once per member that holds an aimed answer.
+    answered: HashMap<String, Vec<String>>,
 }
 
 impl<'g> Judge<'g> {
@@ -275,7 +297,58 @@ impl<'g> Judge<'g> {
             cache: TemplateCache::new(),
             states: HashMap::new(),
             components: HashMap::new(),
+            open: None,
+            answered: HashMap::new(),
         }
+    }
+
+    /// The questions answered by the person's answers member `name` holds
+    /// that read verified here. Only a member holding an aimed answer is
+    /// read, once per command.
+    fn answered_of(&mut self, name: &str) -> Vec<String> {
+        let aims_answer = self
+            .graph
+            .facts(name)
+            .is_some_and(|f| f.aimed.iter().any(|a| a.kind == "answer"));
+        if !aims_answer {
+            return Vec::new();
+        }
+        if let Some(hit) = self.answered.get(name) {
+            return hit.clone();
+        }
+        let mut answered: Vec<String> = crate::decisions::questions::verified_answers_in(
+            &crate::session::Backend::Local(LocalBackend::with_base_dir(
+                self.graph.base().to_path_buf(),
+            )),
+            name,
+        )
+        .into_iter()
+        .map(|a| a.question)
+        .collect();
+        answered.dedup();
+        self.answered.insert(name.to_string(), answered.clone());
+        answered
+    }
+
+    /// The open questions member `name` raised. The store's decisions are
+    /// read once per command, and only when a judged member holds a
+    /// decision at all, so a hierarchy with none costs nothing new. What
+    /// counts as open is the open reads' own test
+    /// (`crate::decisions::questions::is_open`).
+    fn open_questions_of(&mut self, name: &str) -> Vec<String> {
+        if !self.graph.facts(name).is_some_and(|f| f.holds_decisions) {
+            return Vec::new();
+        }
+        let base = self.graph.base().to_path_buf();
+        self.open
+            .get_or_insert_with(|| {
+                crate::decisions::questions::open_by_session(&crate::session::Backend::Local(
+                    LocalBackend::with_base_dir(base),
+                ))
+            })
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The members of `name`'s hierarchy under `scope`, present ones first
@@ -344,10 +417,15 @@ impl<'g> Judge<'g> {
             if state.clamped {
                 clamped.push(m.clone());
             }
-            if state.alive {
+            let questions = self.open_questions_of(m);
+            let answered = self.answered_of(m);
+            if state.alive || !questions.is_empty() || !answered.is_empty() {
                 keepers.push(Keeper {
                     name: m.clone(),
                     kind: state.kind,
+                    alive: state.alive,
+                    questions,
+                    answered,
                     observed: state.observed,
                     stale: state.stale,
                     close_command: state.close_command.clone(),

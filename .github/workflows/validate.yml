@@ -102,6 +102,9 @@ jobs:
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
 
+      - name: Run the questions cost test in release mode
+        run: cargo test --locked --release --test questions_cost -- --nocapture
+
   attempts-cost:
     # The attempts read's cost bound: on a generated store of 1,000
     # sessions in chains four deep, `koto decisions attempts --at` the top

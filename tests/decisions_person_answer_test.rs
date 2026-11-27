@@ -1460,3 +1460,20 @@ fn a_host_identity_others_may_write_seals_nothing() {
     let shown = env.ok(&["decisions", "show", ANSWERER, &id]).json();
     assert_eq!(shown["reading"], "a remote session's answer");
 }
+
+#[test]
+fn a_verified_person_answer_rings_the_raiser_wake_as_a_session_answer_does() {
+    let env = Env::new();
+    let lines = fx::lines("accepted");
+    let q = env.raise_shown(&lines, 1);
+    let wake = env.home().join("wakes").join(RAISER);
+    assert!(!wake.exists(), "no wake before the answer");
+    let out = answer_with(&env, &q, &lines);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let rung = std::fs::read_to_string(&wake).expect("the raiser's wake file is rung");
+    assert_eq!(rung.lines().count(), 1, "one ring per answer: {rung:?}");
+    assert!(
+        !env.home().join("wakes").join(ANSWERER).exists(),
+        "the answering session is not rung"
+    );
+}

@@ -64,7 +64,9 @@ Fields:
 - `duplicate_var` — the same key was passed twice. Carries `var`.
 - `unknown_var` — the template doesn't declare the key. Carries `var`.
 
-`koto init --replace-terminal` adds two codes of its own when it can't replace a finished session:
+`koto init --replace-terminal` adds three codes of its own when it can't replace a finished session:
+
+- `holds_question` (exit 2) — the finished session raised an open question, holds the answer in effect for one, holds a pass-up an open question rests on, holds a person's answer that reads `verified` on this host (`held: "person_answer"`), or has decisions koto couldn't read. Carries `questions` and `force_command`, as `koto session cleanup` does. Nothing moved or changed; run `koto session cleanup <name> --force` and init again only when orphaning the question, or discarding the person's answer as precedent, is intended.
 
 - `replace_held_live` (exit 2) — the finished session is still kept by the retention rule, so it would be moved aside, but a session under it is still running, waits to promote its result to a request leg, or can't be read. Carries `live`, naming them. Nothing changed; finish or cancel those first.
 - `replace_failed` (exit 1) — removing or moving aside the finished session failed partway. koto undid the move, so nothing was replaced; when even the undo failed, `stranded` lists the renames left in place, which stay readable under their new names.

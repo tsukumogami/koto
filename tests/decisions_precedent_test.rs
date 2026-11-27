@@ -758,16 +758,21 @@ fn a_replaced_answer_stays_replaced_while_its_replacement_is_readable() {
 }
 
 #[test]
-fn removing_the_replacing_session_is_the_stated_limit() {
+fn forcing_out_the_replacing_session_is_the_stated_limit() {
     let env = Env::new();
     env.ladder();
     let (q, first) = q1(&env, "director");
     let second = env.person(&q, "worker2");
     assert_eq!(found(&env, "manager", Some("cache")), one(&q, &second));
-    // Nothing readable says the first answer was replaced once both the
-    // raiser and the session holding the replacement are gone.
     env.cleanup("worker");
-    env.cleanup("worker2");
+    // Retention keeps the session holding the replacement: a plain removal
+    // is refused and the replacement still governs.
+    let refused = env.run(&["session", "cleanup", "worker2"]);
+    assert_eq!(refused.code, 2, "{}", refused.all());
+    assert_eq!(found(&env, "manager", Some("cache")), one(&q, &second));
+    // Forced out, nothing readable says the first answer was replaced.
+    env.ok(&["session", "cleanup", "worker2", "--force"]);
+    assert!(!env.sessions().join("worker2").exists());
     assert_eq!(found(&env, "manager", Some("cache")), one(&q, &first));
 }
 
