@@ -57,6 +57,7 @@ pub fn still_current(file: &File, path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::session::TICK_LOCK_FILE;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn open_creates_the_lock_in_an_existing_directory_and_keeps_its_bytes() {
@@ -93,5 +94,39 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"").unwrap();
         assert!(!still_current(&file, &path));
+    }
+
+    #[test]
+    fn take_exclusive_returns_busy_after_the_wait() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let held = open(dir.path()).unwrap().unwrap();
+        // SAFETY: flock on a descriptor `held` owns, for the duration of the call.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let wait = Duration::from_millis(150);
+        let started = Instant::now();
+        let busy = match take_exclusive(dir.path(), wait) {
+            Err(TakeError::Busy(busy)) => busy,
+            other => panic!("expected Busy, got {other:?}"),
+        };
+        assert!(started.elapsed() >= wait);
+        assert!(busy.waited_for >= wait);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(TICK_LOCK_FILE)]);
+        drop(held);
+    }
+
+    #[test]
+    fn take_exclusive_takes_a_free_lock_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, waited) = take_exclusive(dir.path(), Duration::from_millis(150)).unwrap();
+        assert!(!waited);
+        assert!(still_current(&file, &dir.path().join(TICK_LOCK_FILE)));
     }
 }
