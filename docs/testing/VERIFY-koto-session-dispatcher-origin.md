@@ -13,7 +13,8 @@ origin record works on the dispatched path: every dispatched worker's anchor
 reported the dispatching coordinator's anchor on the cloud store, and the
 agent wrote nothing to make the anchor say so. The failures come from how the
 runs were set up and from what the PLAN assumed about the briefs. Each one
-is explained below.
+is explained below. The rerun koto#766 asked for is in
+[VERIFY-koto-session-dispatcher-origin-rerun.md](VERIFY-koto-session-dispatcher-origin-rerun.md).
 
 ## Host and versions
 
