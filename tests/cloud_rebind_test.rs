@@ -1737,6 +1737,65 @@ Done.
     }
 
     #[test]
+    fn resolve_children_accept_local_refuses_to_overwrite_a_moved_child() {
+        // The parent is where this host left it; its child was moved with
+        // `--whole` elsewhere. Accepting this host's copy of the child would
+        // undo the move, so the child is reported errored and its bucket
+        // copy is left as the move wrote it.
+        let mv = Moving::new();
+        mv.m.init(&mv.old, &[], "child", &["--parent", NAME]);
+        let child_key = state_key(&mv.prefix, "child");
+        assert!(
+            mv.s3.object(&child_key).is_some(),
+            "setup: no bucket copy of the child at {}; keys: {:?}",
+            child_key,
+            mv.s3.keys()
+        );
+        let moved = moved_copy(
+            &remote_text(&mv.s3, &child_key),
+            &mv.old,
+            &mv.new,
+            true,
+            true,
+        );
+        mv.s3.put(&child_key, moved.as_bytes());
+
+        let run = mv.m.run(
+            &mv.old,
+            &[],
+            &[
+                "session",
+                "resolve",
+                NAME,
+                "--keep",
+                "local",
+                "--children",
+                "accept-local",
+            ],
+        );
+
+        assert_eq!(
+            remote_text(&mv.s3, &child_key),
+            moved,
+            "the resolve replaced the moved child: {}",
+            run.describe()
+        );
+        let rows = run.json["children"].as_array().cloned().unwrap_or_default();
+        let child = rows
+            .iter()
+            .find(|row| row["name"] == "child")
+            .unwrap_or_else(|| panic!("no row for the child: {}", run.describe()));
+        assert_eq!(child["action"], "errored", "{}", run.describe());
+        assert!(
+            child["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("session_rebound")),
+            "the child's refusal doesn't name session_rebound: {}",
+            run.describe()
+        );
+    }
+
+    #[test]
     fn a_cloud_whole_rebind_on_a_child_and_with_every_directory_gone() {
         let s3 = FakeS3::start(BUCKET);
         let m = Machine::new(&s3);
