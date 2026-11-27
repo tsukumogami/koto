@@ -158,6 +158,10 @@ brief Issue 4 leaves unchanged, so this task can't show the link step gone.
 
 ## What would close the checks
 
+The rerun these call for is recorded in
+[VERIFY-koto-session-dispatcher-origin-rerun.md](VERIFY-koto-session-dispatcher-origin-rerun.md)
+(koto#766).
+
 - AC1: ten runs from one coordinator session with no handover in between,
   using workers whose brief has no `--dispatched-by` open.
 - AC3: a host with koto, shirabe and the koto-skills plugin installed for the

@@ -20,7 +20,22 @@ closing section asked for:
 The criteria are read as the PLAN words them on koto#687's branch
 `docs/session-dispatcher-origin`.
 
-RESULT-SUMMARY-PENDING
+Results, each explained in its section below:
+
+- **AC1: not met as worded.** The anchor half holds in all ten runs, and all
+  ten came from one coordinator session. Every workflow session reports the
+  coordinator's workflow run instead of its anchor. The cause is now koto,
+  not the brief: under `--koto-leg`, koto writes the workflow session a
+  dispatched-by link of its own, naming the session that holds the request
+  leg.
+- **AC3: met.**
+- **AC7: not met.** The after runs made 21, 22 and 17 koto calls against 14
+  in each baseline, and cost more. The two sides also differ in more than
+  shirabe#2117, so this pair can't isolate that change's cost.
+- **AC8: met within the scope stated below, not met on the raw search.**
+  Every hit in the three after transcripts is the loaded `/shirabe:work-on`
+  skill text naming its open script's `--dispatched-by` option, or a copy of
+  that text. Nothing comes from the brief or from a command the agent ran.
 
 ## Host and versions
 
@@ -28,7 +43,13 @@ RESULT-SUMMARY-PENDING
 |------|------|-------------|----------------|--------------------|-------|
 | Baselines b1 to b3 | 0.37.2 (dde9edb) | v0.55.0 | 0.55.0 | 0.37.2 | scratch HOME `$S`, local koto store |
 | AC3 | 0.41.0 (d54c489) | v0.56.0 | 0.56.0 | 0.41.0 | scratch HOME `$S3`, local koto store, no niwa |
-| Probes p1 to p10 | PROBE-VERSIONS-PENDING | | | | instances the coordinator provisioned, cloud store |
+| Probes p1 to p7 | 0.41.0 | as installed | 0.56.2 | as installed | one instance per probe, provisioned by the coordinator, cloud store |
+| Probes p8 to p10 | 0.41.0 | as installed | 0.56.3 | as installed | same |
+
+The probes ran the shirabe plugin the host had installed when each one
+started. That was 0.56.2 for the first seven and 0.56.3 for the last three,
+not the 0.56.0 the rerun was planned around. All ten ran Claude Code
+2.1.332.
 
 koto 0.37.2 is the last release before v0.38.0, and shirabe v0.55.0 is the
 last release without shirabe#2117. Both scratch HOMEs got their koto and
@@ -96,37 +117,148 @@ input plus output, the PLAN's measure, and (b) adds cache creation and cache
 read as context.
 
 The counter is the one Issue 5 used. Its built-in wrapper list predates the
-`/work-on` scripts, so for every run the wrapper set adds each shirabe script
-the run invoked that runs koto. In these runs that's `review-level.sh`, which
-runs `koto context exists`, and `work-on-open.sh`, which opens the session
-through `koto-open.sh`. The same rule applies to baseline and after runs.
-With the built-in list alone, b1 counts 13 calls instead of 14.
+`/work-on` scripts, so one wrapper set, applied to all six runs, adds every
+script a run invoked that runs koto. From shirabe, that's `review-level.sh`
+(`koto context exists`), `work-on-open.sh` (the session open) and
+`check-branch-output.sh` (`koto context get`). The workers' own helpers are
+added too. Several workers wrote a small script that writes the evidence
+file and runs `koto next`, and then ticked through it: b3's `b3tick.sh`, and
+the probes' `tick.sh` and `tickf.sh`. A call through such a helper runs koto
+as surely as a direct one. Without them b3 would count 9 calls and p3 11.
 
 | Run | koto calls | Failed | (a) input + output | (b) with cache |
 |-----|-----------:|-------:|-------------------:|---------------:|
 | b1 | 14 | 1 | 5435 | 907580 |
 | b2 | 14 | 1 | 5364 | 910083 |
-| b3 | 9 | 1 | 3677 | 590391 |
-| p1 | P1-PENDING | | | |
-| p2 | P2-PENDING | | | |
-| p3 | P3-PENDING | | | |
+| b3 | 14 | 1 | 4903 | 945149 |
+| p1 | 21 | 0 | 9107 | 2203334 |
+| p2 | 22 | 4 | 8343 | 2586857 |
+| p3 | 17 | 1 | 6847 | 1822251 |
 
-Baseline range: 9 to 14 calls, median 14; (a) 3677 to 5435, median 5364.
-In each baseline the failed call is the one Bash command that ran the link
-step and then `resolve-coordinator.sh`. The link exited 0, and the resolve
-exited 1 because the stand-in coordinator run holds no run record. b3 made
-fewer calls because its worker batched several `koto next` steps into fewer
-Bash commands.
+Baselines: 14 calls in every run, so the range is 14 to 14 with median 14.
+(a) runs from 4903 to 5435, median 5364. After runs: median 21 calls and
+median (a) 8343. In each baseline the failed call is the one Bash command
+that ran the link step and then `resolve-coordinator.sh`. The link exited 0,
+and the resolve exited 1 because the stand-in coordinator run holds no run
+record. p2's four failed calls come from its session refusing a tick from
+the niwa worktree it had moved into (`execution_anchor_mismatch`), until it
+rebound the session there. p4, p5 and p6 did the same. That behaviour is
+tracked on shirabe#792.
 
-AC7-RESULT-PENDING
+**Result: not met.** The after runs make more koto calls than the
+baselines, not the same number, and their median (a) is outside the
+baseline range. This pair can't attribute the difference to shirabe#2117,
+because the two sides differ in more than that change:
+
+- The probes ran shirabe 0.56.2, which adds more `/work-on` states and
+  checks than shirabe#2117 alone.
+- The probes ran in niwa instances with the cloud store, and some of them in
+  a worktree. The baselines ran in a plain clone with a local store.
+- The probes' briefs came through the coordinator's dispatch. The baselines'
+  briefs were rendered by hand from the same input.
+
+The baselines lose one call to the link step that shirabe#2117 removed, and
+the after runs still make 3 to 8 more. A comparison that isolates the change
+would take baselines and after runs in the same kind of environment, with
+shirabe releases on either side of a699db22 and nothing else between them.
 
 ## AC8: no trace of the link step
 
-AC8-PENDING
+The search is case-insensitive, for `dispatched-by`, `link-dispatcher` and
+`dispatcher_session`, over each probe's whole main transcript file, every
+record included. No probe produced a subagent transcript. The raw result:
+
+| Run | dispatched-by | link-dispatcher | dispatcher_session |
+|-----|--------------:|----------------:|-------------------:|
+| p1 | 4 | 0 | 0 |
+| p2 | 4 | 0 | 0 |
+| p3 | 4 | 0 | 0 |
+| p4 to p7, p9, p10 | 4 each | 0 | 0 |
+| p8 | 8 | 0 | 0 |
+
+Where each hit comes from:
+
+- **Skill text the harness loaded: 2 in every run.** When `/shirabe:work-on`
+  starts, Claude Code writes the skill's whole `SKILL.md` into the
+  transcript as a user record marked `isMeta`. That text names
+  `--dispatched-by` twice: once in `work-on-open.sh`'s usage line and once
+  in the description of what the option does. Every shirabe version since
+  0.38.0 has both lines.
+- **A copy of that skill text: 2 in every run.** The transcript also keeps
+  one record of the API request body, and it carries the same two lines.
+- **Tool output: 2 more in p8, plus their copy.** p8 listed the context keys
+  of two other probes' sessions with `koto context list`. The output
+  includes `koto/links/dispatched-by/<coordinator run>`, the key koto stores
+  a dispatched-by link under (see AC1). The transcript repeats that tool
+  result in its own copy, which makes four.
+- **The brief, and commands or text from the agent: none in any run.** Each
+  brief, as the coordinator recorded it at dispatch, matches none of the
+  three terms.
+
+The scope AC8 is judged by is what the brief and the agent add: the brief,
+every command the agent ran, the agent's own text, and tool output. It
+leaves out the skill text the harness loaded, and that text's copy. The
+criterion is about the link step: whether the worker was told to link its
+session to a dispatcher, or did. A worker can't run `/shirabe:work-on`
+without loading the skill, and the skill's own reference to the option
+says nothing about whether the link step ran. Within that scope the three
+after transcripts, p1 to p3, find nothing.
+
+**Result: met within the stated scope, not met on the raw search.** The raw
+search finds 4 hits in each after transcript, all of them the skill text or
+its copy.
 
 ## AC1: ten dispatched workers report the coordinator
 
-AC1-PENDING
+**Result: not met as worded.** The anchor half holds in all ten runs, and
+the series meets the PLAN's conditions. The workflow-session half reads the
+coordinator's workflow run, not its anchor, in all ten.
+
+One coordinator session made the ten dispatches, one at a time from
+2026-11-26 21:04Z to 2026-11-27 04:01Z, and reaped each probe before
+dispatching the next. That was the status breadcrumbs coordinator, whose
+anchor is `anchor-19188424-6743-4c42-9909-0ca5315f65fe` and whose
+coordinator run is `coordinate-roadmap-shirabe-status-breadcrumbs-20261126T200307Z`.
+No successor session took over between the first dispatch and the tenth:
+every probe's anchor names that one anchor, and every workflow session names
+that one run. Each probe's koto session directory holds the cloud store's
+sync files, so the cloud store was in use. No brief matches any of the three
+search terms, and so none carries a link step or a `--dispatched-by` open.
+Each probe pushed `chore/koto766-probe-pN` in the sandbox repository, adding
+only its note, and opened no pull request.
+
+The coordinator ran `koto session origin` on each probe's anchor
+(`anchor-<its session id>`) and its workflow session
+(`task_koto766-probe-pN`), before that probe's reap:
+
+| Run | Claude session | Branch head | Read at | Anchor origin | Workflow session origin |
+|-----|----------------|-------------|---------|---------------|-------------------------|
+| p1 | f5ce77d0 | 9b9f7105 | 11-26 21:08Z | dispatched, the coordinator's anchor (anchor) | dispatched, the coordinator run (workflow), via none |
+| p2 | ffc71913 | 7c36cb92 | 11-26 21:31Z | same | same |
+| p3 | a94b3d79 | 793070e7 | 11-26 22:15Z | same | same |
+| p4 | 90b8f2b2 | ee634424 | 11-26 22:35Z | same | same |
+| p5 | e26bf19d | 3d2ffa31 | 11-26 22:55Z | same | same |
+| p6 | f381392a | b67fc803 | 11-26 23:26Z | same | same |
+| p7 | 7888d003 | 7ebea4ec | 11-26 23:51Z | same | same |
+| p8 | d58b5b88 | 9611ca73 | 11-27 02:59Z | same | same |
+| p9 | 9f95ab83 | f8ee5411 | 11-27 03:28Z | same | same |
+| p10 | c0380d51 | ad1c40c9 | 11-27 04:01Z | same | same |
+
+This time the workflow sessions didn't get their link from the brief.
+Each probe's workflow session holds a `koto/links/dispatched-by/<coordinator
+run>` record that koto wrote itself while opening the session, before its
+held-by link (in p1, two seconds after the session was created). The record says `"via":"leg"`. The
+probes opened their sessions with `--koto-leg`, and koto recorded the
+session that owns the request leg, which is the coordinator run, as the
+dispatcher. Issue 2's precedence reports a session's own dispatched-by link
+first, so the read names the coordinator run with `dispatcher_kind:
+workflow` and never follows the held-by link to the anchor.
+
+Each workflow session still names the coordinator that dispatched it, by
+its run instead of its anchor. AC1 asks for the anchor. A coordinator that
+dispatches `/shirabe:work-on` workers with a request leg can't meet that
+half while koto records the leg's owner this way. Whether the check or that
+record should change is a question for the PLAN's owner.
 
 ## AC3: no launcher
 
@@ -188,4 +320,9 @@ AC3 is met.
   `~/.claude`, and no `.niwa` directory exists in either.
 - niwa stays installed and resolves on the real `PATH`.
 
-SCRATCH-DISPOSITION-PENDING
+The probes ran in instances the coordinator provisioned and tore down
+through niwa. They didn't run in either scratch HOME, and nothing above
+covers them.
+
+Both scratch HOMEs were removed once the figures above had been read from
+them.
