@@ -33,6 +33,13 @@
 //! `koto/replaces` names OLD is the earlier run's, and the close writes
 //! only what OLD's log still lacks. A NEW without the key isn't taken for
 //! an earlier run.
+//!
+//! `koto session replace OLD --by NEW [--wait SECS | --abandon-tick]` runs
+//! the same close for a NEW that already exists: step 4 creates nothing,
+//! and writes `koto/replaces` in NEW only when NEW lacks it, so it also
+//! repairs a NEW an interrupted `koto init --replaces` left without its
+//! key. A NEW whose key names another run is refused `session_exists`. Its
+//! refusals print the nested envelope `koto session rebind` prints.
 
 use std::path::Path;
 use std::time::Duration;
@@ -79,6 +86,55 @@ struct Replaces {
     session_id: String,
 }
 
+/// The command a replace runs under. It decides the refusal envelope and
+/// how a message names the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Front {
+    /// `koto init NEW --replaces OLD`: the flat init envelope.
+    Init,
+    /// `koto session replace OLD --by NEW`: the nested envelope.
+    Session,
+}
+
+impl Front {
+    /// What a message starts with: the flag, or the command.
+    fn prefix(self) -> &'static str {
+        match self {
+            Front::Init => "--replaces",
+            Front::Session => "session replace",
+        }
+    }
+
+    /// The command as a caller types it.
+    fn invocation(self) -> &'static str {
+        match self {
+            Front::Init => "koto init --replaces",
+            Front::Session => "koto session replace",
+        }
+    }
+
+    /// The command as the nested-tick refusal names it, after `koto`.
+    fn tick_command(self) -> &'static str {
+        match self {
+            Front::Init => "init --replaces",
+            Front::Session => "session replace",
+        }
+    }
+}
+
+/// One replace, as either command asks for it.
+struct Replace<'a> {
+    front: Front,
+    /// NEW.
+    name: &'a str,
+    old: &'a str,
+    wait: Option<u64>,
+    abandon_tick: bool,
+    /// How to create NEW when it doesn't exist yet. `None` when NEW must
+    /// already exist.
+    create: Option<&'a ReplaceArgs<'a>>,
+}
+
 /// Stop at `point`, as a killed process would, when the fault seam names
 /// it. A release build never reads the seam.
 fn crash_at(point: &str) {
@@ -88,23 +144,44 @@ fn crash_at(point: &str) {
     }
 }
 
-/// Print a refusal, `{"error", "command": "init", "code", ...extra}`, and
-/// exit with `exit`.
-fn refuse(code: &str, message: String, exit: i32, extra: serde_json::Value) -> ! {
-    let mut body = serde_json::json!({
-        "error": message,
-        "command": "init",
-        "code": code,
-    });
-    if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
-        obj.extend(more.clone());
-    }
+/// Print a refusal and exit with `exit`. Under [`Front::Init`] it is
+/// `{"error", "command": "init", "code", ...extra}`; under
+/// [`Front::Session`] it is `{"error": {"code", "message", ...extra},
+/// "command": "session replace"}`.
+fn refuse(front: Front, code: &str, message: String, exit: i32, extra: serde_json::Value) -> ! {
+    let body = match front {
+        Front::Init => {
+            let mut body = serde_json::json!({
+                "error": message,
+                "command": "init",
+                "code": code,
+            });
+            if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+                obj.extend(more.clone());
+            }
+            body
+        }
+        Front::Session => {
+            let mut error = serde_json::json!({
+                "code": code,
+                "message": message,
+            });
+            if let (Some(obj), Some(more)) = (error.as_object_mut(), extra.as_object()) {
+                obj.extend(more.clone());
+            }
+            serde_json::json!({
+                "error": error,
+                "command": "session replace",
+            })
+        }
+    };
     super::exit_with_error_code(body, exit)
 }
 
 /// Refuse with exit 3 `persistence_error`.
-fn failed(message: String) -> ! {
+fn failed(front: Front, message: String) -> ! {
     refuse(
+        front,
         "persistence_error",
         message,
         super::EXIT_INFRASTRUCTURE,
@@ -116,11 +193,13 @@ fn failed(message: String) -> ! {
 /// session superseded or replaced it. `after` is what was already written.
 fn refuse_fenced(
     backend: &Backend,
+    front: Front,
     old: &str,
     name: &str,
     fence: &SupersedeFence,
     after: &str,
 ) -> ! {
+    let p = front.prefix();
     let newest = crate::session::links::newest_member(backend, old)
         .map(|s| s.newest)
         .unwrap_or_else(|| fence.by.clone());
@@ -139,12 +218,12 @@ fn refuse_fenced(
     };
     let message = if plain_to_new {
         format!(
-            "--replaces: session '{old}' is already {how} by '{name}' through a plain \
+            "{p}: session '{old}' is already {how} by '{name}' through a plain \
              supersede, not replaced; {after}. Continue in '{newest}'"
         )
     } else {
         format!(
-            "--replaces: session '{old}' is already {how} by '{}'; {after}. Continue in \
+            "{p}: session '{old}' is already {how} by '{}'; {after}. Continue in \
              '{newest}'",
             fence.by
         )
@@ -159,7 +238,7 @@ fn refuse_fenced(
         "superseded_by"
     };
     extra[field] = serde_json::json!(fence.by);
-    refuse(code, message, super::EXIT_CALLER_ERROR, extra)
+    refuse(front, code, message, super::EXIT_CALLER_ERROR, extra)
 }
 
 /// The value of NEW's [`REPLACES_KEY`], `None` when it holds none.
@@ -188,12 +267,58 @@ fn owes_cancel(backend: &Backend, old: &str, header: &StateFileHeader, events: &
 /// Run `koto init --replaces`. Prints one JSON object on success; every
 /// refusal prints its error and exits.
 pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
-    let ReplaceArgs { name, old, .. } = *args;
+    close_and_replace(
+        backend,
+        &Replace {
+            front: Front::Init,
+            name: args.name,
+            old: args.old,
+            wait: args.wait,
+            abandon_tick: args.abandon_tick,
+            create: Some(args),
+        },
+    )
+}
+
+/// Run `koto session replace OLD --by NEW`: the close `koto init
+/// --replaces` makes, for a NEW that already exists. Prints one JSON object
+/// on success; every refusal prints its error and exits.
+pub(crate) fn run_session(
+    backend: &Backend,
+    old: &str,
+    new: &str,
+    wait: Option<u64>,
+    abandon_tick: bool,
+) -> Result<()> {
+    close_and_replace(
+        backend,
+        &Replace {
+            front: Front::Session,
+            name: new,
+            old,
+            wait,
+            abandon_tick,
+            create: None,
+        },
+    )
+}
+
+/// The replace both commands run, in the order the module doc gives.
+fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
+    let front = job.front;
+    let name = job.name;
+    let old = job.old;
+    let p = front.prefix();
 
     // 1. Checks, nothing written.
-    for (flag, value) in [("", name), ("--replaces ", old)] {
+    let labels = match front {
+        Front::Init => [("", name), ("--replaces ", old)],
+        Front::Session => [("--by ", name), ("", old)],
+    };
+    for (flag, value) in labels {
         if let Err(msg) = crate::discover::validate_workflow_name(value) {
             refuse(
+                front,
                 "invalid_usage",
                 format!("{flag}{msg}"),
                 super::EXIT_CALLER_ERROR,
@@ -203,14 +328,17 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
     }
     if name == old {
         refuse(
+            front,
             "self",
-            format!("--replaces: session '{name}' can't replace itself; nothing was written"),
+            format!("{p}: session '{name}' can't replace itself; nothing was written"),
             super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
         );
     }
-    if let Err(message) = crate::engine::reentrancy::refuse_if_own_tick(old, "init --replaces") {
+    let own_tick = crate::engine::reentrancy::refuse_if_own_tick(old, front.tick_command());
+    if let Err(message) = own_tick {
         refuse(
+            front,
             "nested_invocation",
             message,
             super::EXIT_CALLER_ERROR,
@@ -220,12 +348,14 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
     let background_of = crate::engine::background::BACKGROUND_OF_ENV;
     if std::env::var(background_of).as_deref() == Ok(old) {
         refuse(
+            front,
             "nested_invocation",
             format!(
-                "koto init --replaces cannot run on session '{old}' from inside its own \
+                "{} cannot run on session '{old}' from inside its own \
                  background action: this process inherited {background_of}={old}, and closing \
                  '{old}' stops the runner this command runs under. Run it outside the action; \
-                 nothing was written"
+                 nothing was written",
+                front.invocation()
             ),
             super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
@@ -234,32 +364,37 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
     let local = match backend {
         Backend::Local(local) => local,
         Backend::Cloud(_) => refuse(
+            front,
             "invalid_usage",
-            "--replaces: the cloud backend can't close a replaced run in this release; nothing \
-             was written"
-                .to_string(),
+            format!(
+                "{p}: the cloud backend can't close a replaced run in this release; nothing \
+                 was written"
+            ),
             super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
         ),
     };
     if !backend.exists(old) {
         refuse(
+            front,
             "session_not_found",
-            format!("--replaces: no session named '{old}' in this store; nothing was written"),
+            format!("{p}: no session named '{old}' in this store; nothing was written"),
             super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
         );
     }
     let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
-        failed(format!(
-            "--replaces: could not read '{old}''s log: {e:#}; nothing was written"
-        ))
+        failed(
+            front,
+            format!("{p}: could not read '{old}''s log: {e:#}; nothing was written"),
+        )
     });
     if old_header.session_kind() != SessionKind::Ordinary {
         refuse(
+            front,
             "invalid_usage",
             format!(
-                "--replaces: '{old}' is koto's record of an agent session, not a run, so \
+                "{p}: '{old}' is koto's record of an agent session, not a run, so \
                  nothing replaces it; nothing was written"
             ),
             super::EXIT_CALLER_ERROR,
@@ -269,15 +404,40 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
     let old_id = old_header.session_id.clone();
 
     let new_exists = backend.exists(name);
+    if job.create.is_none() && !new_exists {
+        refuse(
+            front,
+            "session_not_found",
+            format!(
+                "{p}: no session named '{name}' in this store, and this command closes '{old}' \
+                 only for a session that already exists. Create '{name}' first, or create it \
+                 and close '{old}' in one step with `koto init {name} --template <path> \
+                 --replaces {old}`; nothing was written"
+            ),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
     let new_id = new_exists.then(|| {
-        backend
-            .read_header(name)
-            .map(|h| h.session_id)
-            .unwrap_or_else(|e| {
-                failed(format!(
-                    "--replaces: could not read '{name}''s header: {e:#}; nothing was written"
-                ))
-            })
+        let header = backend.read_header(name).unwrap_or_else(|e| {
+            failed(
+                front,
+                format!("{p}: could not read '{name}''s header: {e:#}; nothing was written"),
+            )
+        });
+        if front == Front::Session && header.session_kind() != SessionKind::Ordinary {
+            refuse(
+                front,
+                "invalid_usage",
+                format!(
+                    "{p}: '{name}' is koto's record of an agent session, not a run, so it \
+                     replaces nothing; nothing was written"
+                ),
+                super::EXIT_CALLER_ERROR,
+                serde_json::Value::Null,
+            );
+        }
+        header.session_id
     });
     let nothing = "nothing was written";
     let fence_ours = match superseded_by(&old_events) {
@@ -288,55 +448,68 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
         {
             true
         }
-        Some(f) => refuse_fenced(backend, old, name, &f, nothing),
+        Some(f) => refuse_fenced(backend, front, old, name, &f, nothing),
         None => false,
     };
     if new_exists {
         let ours = match read_replaces(backend, name) {
             Ok(Some(r)) => r.session == old && r.session_id == old_id,
-            Ok(None) => fence_ours,
-            Err(why) => failed(format!(
-                "--replaces: '{name}''s {REPLACES_KEY} can't be read: {why}; nothing was written"
-            )),
+            // `koto session replace` writes the key a NEW lacks.
+            Ok(None) => fence_ours || front == Front::Session,
+            Err(why) => failed(
+                front,
+                format!("{p}: '{name}''s {REPLACES_KEY} can't be read: {why}; nothing was written"),
+            ),
         };
         if !ours {
-            refuse(
-                "session_exists",
-                format!(
+            let message = match front {
+                Front::Init => format!(
                     "--replaces: session '{name}' already exists, and no earlier run of this \
                      command opened it to replace '{old}'; pick a new name, or remove it with \
                      `koto cancel {name} --cleanup` and run the command again. Nothing was \
                      written"
                 ),
+                Front::Session => format!(
+                    "session replace: session '{name}' already replaces another run: its \
+                     {REPLACES_KEY} key names a run other than '{old}', so it can't replace \
+                     '{old}' too; nothing was written"
+                ),
+            };
+            refuse(
+                front,
+                "session_exists",
+                message,
                 super::EXIT_CALLER_ERROR,
                 serde_json::Value::Null,
             );
         }
-    } else {
+    } else if let Some(args) = job.create {
         precheck_new(args);
     }
 
     // 2. OLD's tick lock.
     let dir = backend.session_dir(old);
-    let (tick_lock, waited) = take_tick_lock(old, &dir, args);
+    let (tick_lock, waited) = take_tick_lock(old, &dir, job);
     let tick_in_flight = tick_lock.is_none();
     crash_at("after-lock");
 
     // 3. Stop OLD's runner, from its log as it stands under the lock.
     let (old_header, old_events) = backend.read_events(old).unwrap_or_else(|e| {
-        failed(format!(
-            "--replaces: could not read '{old}''s log: {e:#}; nothing was written"
-        ))
+        failed(
+            front,
+            format!("{p}: could not read '{old}''s log: {e:#}; nothing was written"),
+        )
     });
     let side_events = super::stop_session_pool_work(backend, old, &old_events);
     let cancel = owes_cancel(backend, old, &old_header, &old_events);
 
-    // 4. Create NEW and record what it replaces.
+    // 4. Create NEW, unless it exists, and record what it replaces.
     let mut wrote = false;
     let mut environment_report = None;
-    let new_id = match new_id {
-        Some(id) => id,
-        None => {
+    let new_id = match (new_id, job.create) {
+        (Some(id), _) => id,
+        (None, None) => unreachable!("a NEW that doesn't exist is refused above"),
+        (None, Some(args)) => {
             let id = generate_session_id();
             let (_, report) = super::create_session(
                 backend,
@@ -365,11 +538,18 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
             session_id: old_id.clone(),
         })?;
         if let Err(e) = super::init_supersede::write_koto_key(backend, name, REPLACES_KEY, &value) {
-            failed(format!(
-                "--replaces: '{name}' was created, but its {REPLACES_KEY} key couldn't be \
-                 written: {e:#}. '{old}' is still open; remove '{name}' with `koto cancel \
-                 {name} --cleanup` and run the command again"
-            ));
+            let message = match front {
+                Front::Init => format!(
+                    "--replaces: '{name}' was created, but its {REPLACES_KEY} key couldn't be \
+                     written: {e:#}. '{old}' is still open; remove '{name}' with `koto cancel \
+                     {name} --cleanup` and run the command again"
+                ),
+                Front::Session => format!(
+                    "session replace: '{name}''s {REPLACES_KEY} key couldn't be written: \
+                     {e:#}. '{old}' is still open; run the command again"
+                ),
+            };
+            failed(front, message);
         }
         wrote = true;
     }
@@ -389,14 +569,17 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
         cancel,
         fence,
     };
-    wrote |= close_old(backend, local, old, name, &close, &at);
+    wrote |= close_old(backend, front, local, old, name, &close, &at);
     if tick_in_flight {
         // The tick in flight may have started a runner since the first stop.
         let (_, events) = backend.read_events(old).unwrap_or_else(|e| {
-            failed(format!(
-                "--replaces: '{old}' is closed, but its log couldn't be read again to stop its \
-                 runner once more: {e:#}"
-            ))
+            failed(
+                front,
+                format!(
+                    "{p}: '{old}' is closed, but its log couldn't be read again to stop its \
+                     runner once more: {e:#}"
+                ),
+            )
         });
         let side_events = super::stop_session_pool_work(backend, old, &events);
         if !side_events.is_empty() {
@@ -405,7 +588,7 @@ pub(crate) fn run(backend: &Backend, args: &ReplaceArgs<'_>) -> Result<()> {
                 cancel: false,
                 fence: close.fence.clone(),
             };
-            wrote |= close_old(backend, local, old, name, &again, &now_iso8601());
+            wrote |= close_old(backend, front, local, old, name, &again, &now_iso8601());
         }
     }
     drop(tick_lock);
@@ -460,7 +643,7 @@ fn precheck_new(args: &ReplaceArgs<'_>) {
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| "template_compile_failed".to_string());
-            refuse(&code, info.message, 1, serde_json::Value::Null);
+            refuse(Front::Init, &code, info.message, 1, serde_json::Value::Null);
         }
     };
     if let Err(e) = super::resolve_variables(args.vars, &compiled.variables) {
@@ -478,18 +661,21 @@ fn precheck_new(args: &ReplaceArgs<'_>) {
 /// OLD's `tick.lock`, taken exclusive within `--wait`, and whether the take
 /// had to wait. With `--abandon-tick` it is asked for once, and `None` when
 /// it is held elsewhere.
-fn take_tick_lock(old: &str, dir: &Path, args: &ReplaceArgs<'_>) -> (Option<std::fs::File>, bool) {
-    let wait = if args.abandon_tick {
+fn take_tick_lock(old: &str, dir: &Path, job: &Replace<'_>) -> (Option<std::fs::File>, bool) {
+    let front = job.front;
+    let p = front.prefix();
+    let wait = if job.abandon_tick {
         Duration::ZERO
     } else {
-        args.wait.map_or(DEFAULT_WAIT, Duration::from_secs)
+        job.wait.map_or(DEFAULT_WAIT, Duration::from_secs)
     };
     match take_exclusive(dir, wait) {
         Ok((file, waited)) => (Some(file), waited),
-        Err(TakeError::Busy(_)) if args.abandon_tick => (None, false),
+        Err(TakeError::Busy(_)) if job.abandon_tick => (None, false),
         Err(TakeError::Busy(busy)) => {
             let waited_for_ms = u64::try_from(busy.waited_for.as_millis()).unwrap_or(u64::MAX);
             refuse(
+                front,
                 "session_busy",
                 format!(
                     "session '{old}' is busy: a tick of it is in flight, and it still held {} \
@@ -503,13 +689,17 @@ fn take_tick_lock(old: &str, dir: &Path, args: &ReplaceArgs<'_>) -> (Option<std:
                 serde_json::json!({"details": {"waited_for_ms": waited_for_ms}}),
             )
         }
-        Err(TakeError::Missing) => failed(format!(
-            "--replaces: '{old}''s directory went away before its tick.lock could be taken; \
-             nothing was written"
-        )),
-        Err(TakeError::Failed(e)) => failed(format!(
-            "--replaces: '{old}''s tick.lock couldn't be taken: {e:#}; nothing was written"
-        )),
+        Err(TakeError::Missing) => failed(
+            front,
+            format!(
+                "{p}: '{old}''s directory went away before its tick.lock could be taken; \
+                 nothing was written"
+            ),
+        ),
+        Err(TakeError::Failed(e)) => failed(
+            front,
+            format!("{p}: '{old}''s tick.lock couldn't be taken: {e:#}; nothing was written"),
+        ),
     }
 }
 
@@ -517,31 +707,34 @@ fn take_tick_lock(old: &str, dir: &Path, args: &ReplaceArgs<'_>) -> (Option<std:
 /// whether anything was written.
 fn close_old(
     backend: &Backend,
+    front: Front,
     local: &LocalBackend,
     old: &str,
     name: &str,
     close: &Close,
     at: &str,
 ) -> bool {
+    let p = front.prefix();
     match local.append_close(old, close, at, FENCE_LOCK_WAIT) {
         Ok(CloseOutcome::Closed {
             commits,
             torn_backup,
         }) => !commits.is_empty() || torn_backup.is_some(),
-        Ok(CloseOutcome::FencedByOther(other)) => refuse_fenced(
-            backend,
-            old,
-            name,
-            &other,
-            &format!(
-                "'{name}' was created and is left as it is, and '{old}' wasn't closed. Remove \
-                 '{name}' with `koto cancel {name} --cleanup` if it isn't wanted"
-            ),
-        ),
+        Ok(CloseOutcome::FencedByOther(other)) => {
+            let after = match front {
+                Front::Init => format!(
+                    "'{name}' was created and is left as it is, and '{old}' wasn't closed. Remove \
+                     '{name}' with `koto cancel {name} --cleanup` if it isn't wanted"
+                ),
+                Front::Session => format!("'{name}' is left as it is, and '{old}' wasn't closed"),
+            };
+            refuse_fenced(backend, front, old, name, &other, &after)
+        }
         Ok(CloseOutcome::Unavailable) => refuse(
+            front,
             "fence_unavailable",
             format!(
-                "--replaces: '{old}''s log stayed locked by another writer for {} seconds, so \
+                "{p}: '{old}''s log stayed locked by another writer for {} seconds, so \
                  '{old}' wasn't closed; '{name}' exists. Run the command again",
                 FENCE_LOCK_WAIT.as_secs()
             ),
@@ -554,16 +747,20 @@ fn close_old(
                 .find_map(|c| c.downcast_ref::<crate::session::rebind_fence::SessionRebound>())
             {
                 refuse(
+                    front,
                     "session_rebound",
-                    format!("--replaces: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
+                    format!("{p}: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
                     super::EXIT_CALLER_ERROR,
                     serde_json::Value::Null,
                 );
             }
-            failed(format!(
-                "--replaces: '{old}' couldn't be closed: {e:#}; '{name}' exists. Run the \
-                 command again to finish"
-            ))
+            failed(
+                front,
+                format!(
+                    "{p}: '{old}' couldn't be closed: {e:#}; '{name}' exists. Run the \
+                     command again to finish"
+                ),
+            )
         }
     }
 }

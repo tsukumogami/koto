@@ -1141,6 +1141,42 @@ pub enum SessionCommand {
         wait: Option<u64>,
     },
 
+    /// Close a run in favour of an existing session that restarts its work.
+    ///
+    /// The close `koto init NEW --replaces OLD` makes, for a NEW that
+    /// already exists: OLD's runner is stopped, and OLD is cancelled,
+    /// naming NEW, and fenced so nothing drives it again, in one write to
+    /// its log. NEW gets a `koto/replaces` key naming OLD when it doesn't
+    /// hold one, which also repairs a NEW an interrupted `koto init
+    /// --replaces` left without it. A NEW whose key names another run is
+    /// refused with `session_exists`. OLD's tick.lock is taken first (see
+    /// --wait). Refusals print `{"error": {"code", "message"}, "command":
+    /// "session replace"}` and, before the lock, write nothing. Running the
+    /// same command again finishes an interrupted close, or changes
+    /// nothing.
+    Replace {
+        /// The run to close
+        #[arg(value_name = "OLD")]
+        old: String,
+
+        /// The existing session that replaces OLD
+        #[arg(long = "by", value_name = "NEW")]
+        by: String,
+
+        /// Ask for OLD's tick.lock once and, when a tick holds it, close
+        /// OLD anyway, reporting `tick_in_flight: true`; only the fence
+        /// then holds that tick's later writes off. Can't be used with
+        /// --wait.
+        #[arg(long, conflicts_with = "wait")]
+        abandon_tick: bool,
+
+        /// How long to wait for a tick of OLD in flight to return, in
+        /// seconds (default 10). Still held then refuses `session_busy`,
+        /// exit 1, nothing written; 0 refuses at once.
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
+    },
+
     /// Import a session from another workspace's copy in the bucket.
     ///
     /// Reads session <NAME> as the workspace at --from pushed it to the
@@ -3099,6 +3135,32 @@ pub fn run(app: App) -> Result<()> {
                         );
                     }
                     session::handle_rebind(&backend, &name, to.as_deref())
+                }
+                SessionCommand::Replace {
+                    old,
+                    by,
+                    abandon_tick,
+                    wait,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        init_replace::run_session(&backend, &old, &by, wait, abandon_tick)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (old, by, abandon_tick, wait);
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": {
+                                    "code": "invalid_usage",
+                                    "message": "koto session replace needs flock, which this \
+                                                platform lacks",
+                                },
+                                "command": "session replace",
+                            }),
+                            EXIT_CALLER_ERROR,
+                        )
+                    }
                 }
                 SessionCommand::Import {
                     name,

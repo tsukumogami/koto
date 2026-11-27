@@ -1055,6 +1055,39 @@ Under the cloud backend the move pulls the session under `tick.lock` and creates
 
 **Older builds.** An older koto doesn't know `whole_epoch`. If one rewrites the header of a session moved with `--whole`, on any host, the field is dropped, and a stale process of the new build then passes the whole-binding fence. Every host that touches such a session needs this release or later.
 
+#### session replace
+
+Closes a run in favour of a session that already exists and restarts its work.
+
+```bash
+koto session replace <old> --by <new> [--wait <secs> | --abandon-tick]
+```
+
+It makes the same close as `koto init <new> --template <path> --replaces <old>`, for a `<new>` that's already there, such as a session made by `koto session start`, or one an interrupted `koto init --replaces` left behind. Holding `<old>`'s `tick.lock`, it stops `<old>`'s background runner and then writes, in one append to `<old>`'s log, the events that stop records, a `workflow_cancelled` with `replaced_by` and `replaced_by_session_id` naming `<new>` (unless `<old>` already stands cancelled or finished), and a `session_superseded` fence with `replaced: true`. `<new>`'s session id comes from its header. When `<new>` holds no `koto/replaces` key, the command writes one, `{"v":1,"session":"<old>","session_id":"<old's id>"}`. `<new>` isn't otherwise changed.
+
+```json
+{"name":"deploy-r2","state":"plan","replaces":"deploy","outcome":"replaced","waited":false,
+ "tick_in_flight":false,"children":[],"deferred_cleanup":false}
+```
+
+`outcome` is `unchanged` when a re-run finds the close already made. `children` lists `<old>`'s children, which are neither cancelled nor refused; `deferred_cleanup` is `true` when there are any.
+
+A tick of `<old>` in flight holds its lock, and the command waits for it for up to `--wait` seconds (10 by default; `0` asks once), then refuses `session_busy`, exit 1, having written nothing. `--abandon-tick` asks for the lock once instead and, when a tick holds it, closes `<old>` anyway and reports `tick_in_flight: true`; the fence then refuses that tick's later writes. The two flags can't be combined.
+
+Refusals print `{"error": {"code", "message"}, "command": "session replace"}` on stdout:
+
+| Code | Exit | When |
+|------|:----:|------|
+| `nested_invocation` | 2 | The command ran inside `<old>`'s own tick (`KOTO_TICK_SESSION`) or one of its background actions (`KOTO_BACKGROUND_OF`). |
+| `session_not_found` | 2 | `<old>` or `<new>` doesn't exist. To create `<new>` and close `<old>` in one step, use `koto init --replaces`. |
+| `self` | 2 | `<old>` and `<new>` are the same name. |
+| `session_exists` | 2 | `<new>`'s `koto/replaces` key names a run other than `<old>`. |
+| `superseded_by`, `session_replaced` | 2 | Another session already superseded or replaced `<old>`, or `<old>` was superseded by `<new>` through a plain `--supersede`. |
+| `session_busy` | 1 | A tick still held `<old>`'s `tick.lock` when `--wait` ran out. |
+| `fence_unavailable`, `persistence_error` | 3 | `<old>`'s log stayed locked by another writer, or a read or write failed. Run the command again. |
+
+Every refusal before the lock writes nothing. A close stopped part way finishes when you run the same command again. The command needs the local backend; under the cloud backend it refuses with `invalid_usage`.
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.

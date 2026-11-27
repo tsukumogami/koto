@@ -27,6 +27,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session prune` | Runner and operator — removing finished sessions in bulk |
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves; with `--whole`, an agent session taking a run over |
+| `koto session replace` | Runner — closing a run in favour of an existing session that restarts its work |
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg; or a session that carries on another's work, naming it with `--continues` |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
@@ -1002,6 +1003,45 @@ Refusals print `{"error": {"code", "message"}, "command": "session rebind"}` on 
 | `rebind_cross_host` | 2 | Cloud backend: another machine uploaded the session's `version.json` last | Don't move it here; take it over with `koto session import`, then move the copy |
 
 A move that a rebind elsewhere overtook fails on stderr with `session_rebound:`, exit 1. Once a move has landed, every process that read the session before it, and every process under a retired anchor that is outside the new one or deeper than it, is refused with `session_rebound` on both backends; the move's own process isn't. Every host that touches a session moved this way needs this koto release or later: an older koto that rewrites the header drops `whole_epoch`, and the fence goes with it.
+
+---
+
+## koto session replace
+
+```
+koto session replace <old> --by <new> [--wait <secs> | --abandon-tick]
+```
+
+Closes `<old>` in favour of `<new>`, a session that already exists and restarts `<old>`'s work. It's the close `koto init <new> --template <path> --replaces <old>` makes, without creating `<new>`: under `<old>`'s `tick.lock`, `<old>`'s background runner is stopped, and one append to `<old>`'s log records the stop, a `workflow_cancelled` naming `<new>` (`replaced_by`, `replaced_by_session_id`; skipped when `<old>` already stands cancelled or finished) and a `session_superseded` fence with `replaced: true`. After that, nothing drives `<old>` again. `<new>` gets a `koto/replaces` key naming `<old>` when it holds none, which also repairs a `<new>` an interrupted `koto init --replaces` left without it.
+
+```json
+{"name":"deploy-r2","state":"plan","replaces":"deploy","outcome":"replaced","waited":false,
+ "tick_in_flight":false,"children":[],"deferred_cleanup":false}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | `<new>`. `state` is its current state. |
+| `outcome` | `replaced` when this call wrote something; `unchanged` on a re-run that found the close made. |
+| `waited` | `true` when a tick held `<old>`'s lock on the first try and the command waited for it. |
+| `tick_in_flight` | `true` only under `--abandon-tick` when a tick held the lock and `<old>` was closed without it. |
+| `children` | `<old>`'s children, each `{name, state}`. They are neither cancelled nor refused. `deferred_cleanup` is `true` when there are any. |
+
+`--wait <secs>` (10 by default; `0` asks once) bounds the wait for a tick of `<old>` in flight. `--abandon-tick` asks once and closes `<old>` even when a tick holds the lock; the fence refuses that tick's later writes. The two can't be combined.
+
+Refusals print `{"error": {"code", "message"}, "command": "session replace"}` on stdout:
+
+| Code | Exit | When | What to do |
+|---|---|---|---|
+| `nested_invocation` | 2 | Run from inside `<old>`'s own tick or background action | Run it outside, once the tick has returned |
+| `session_not_found` | 2 | `<old>` or `<new>` doesn't exist | Create `<new>` first, or use `koto init --replaces` |
+| `self` | 2 | `<old>` and `<new>` are the same | Name another session with `--by` |
+| `session_exists` | 2 | `<new>`'s `koto/replaces` names another run | Pick another `<new>` |
+| `superseded_by`, `session_replaced` | 2 | `<old>` is already superseded or replaced by another session, or plainly superseded by `<new>` | Continue in the session the message names |
+| `session_busy` | 1 | A tick still held `<old>`'s `tick.lock` when `--wait` ran out | Retry once the tick returns, give `--wait` more seconds, or pass `--abandon-tick` |
+| `fence_unavailable`, `persistence_error` | 3 | `<old>`'s log stayed locked, or a read or write failed | Run the command again |
+
+Refusals before the lock write nothing, and a close stopped part way finishes when the same command runs again. Local backend only: under the cloud backend it refuses with `invalid_usage`.
 
 ---
 
