@@ -288,6 +288,12 @@ impl Env {
     /// Record `person:owner`'s answer to `q` in `in_session` from a fresh
     /// copy of the accepted fixture (its own call id), with `extra` flags.
     pub fn person_run(&self, q: &Q, in_session: &str, extra: &[&str]) -> Out {
+        self.person_run_as(q, in_session, "owner", extra)
+    }
+
+    /// As [`Env::person_run`], answering as `person:<handle>`.
+    pub fn person_run_as(&self, q: &Q, in_session: &str, handle: &str, extra: &[&str]) -> Out {
+        let by = format!("person:{handle}");
         let n = self.calls.get() + 1;
         self.calls.set(n);
         let call = format!("toolu_ZQXMARKERcall{n:012}");
@@ -303,7 +309,7 @@ impl Env {
             "--in",
             in_session,
             "--by",
-            "person:owner",
+            &by,
             "--prompt",
             &pointer,
         ];

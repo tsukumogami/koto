@@ -996,8 +996,10 @@ say; R87 to R93 only keep the sessions those rules depend on and ring the asker.
   session's answer, a settle, a withdrawal and a person's answer read as a remote session's are
   never returned, and a raiser's settle is never precedent in its own right. When the store no
   longer holds the question, because its raiser was removed, the element is the verified person
-  answer in effect on it, unless a reversal of the question stored in any session or another
-  readable answer to it naming that answer in its `basis` withdraws it. A reversal recorded in the
+  answer in effect on it by the same rule as while the raiser is there: a later `answered` person
+  answer to the same question that reads verified here and names it in its `basis` replaces it, and
+  a reversal of the question stored in any session withdraws it. A citing entry of any other kind,
+  or a person answer that reads as a remote session's, changes nothing. A reversal recorded in the
   raiser goes with the raiser. Retention keeps the session holding a replacing person answer that
   reads verified (R88) and refuses its removal without `--force` (R89, R90); once that session has been
   forced out too, nothing readable says the earlier answer was replaced, so the read returns it.
@@ -1021,10 +1023,13 @@ say; R87 to R93 only keep the sessions those rules depend on and ring the asker.
   answer recorded before koto copied labels carries none: once its raiser is removed, the precedent
   read returns it only without `--label`, with a null `label`, and no settle accepts it as a basis.
   When koto records a person's `answered` answer to a question that already has a verified person
-  answer in effect, it adds that answer to the new answer's `basis`, and a person answer another
-  answer to the same question names in its `basis` is never the answer in effect. `koto decisions
-  show` reads the answer the precedent read returns for a question the store no longer holds as
-  counted and governing, with reason `question_gone`.
+  answer in effect, it adds that answer to the new answer's `basis`. A person answer is replaced
+  when a later `answered` person answer to the same question that reads verified here names it in
+  its `basis`, whichever handle gave the later one: the replaced answer is then neither the owner's
+  precedent nor a basis a settle accepts, and the later one is its own handle's precedent. `koto
+  decisions show` reads a question the store no longer holds the way it read it while the raiser
+  was there, with reason `question_gone`: the answer the precedent read returns as counted and
+  governing, and a verified person answer it replaced as counted and not governing.
 - **R96.** `koto decisions history <session id>/<decision id>` prints one question by its identity:
   the question as raised (identifier, question, text, `label`, `need`, `state`, the `packet` hash,
   whether content is stored for it, and the recipient it was raised with); the raiser's name and

@@ -393,13 +393,15 @@ pub fn person_in_effect<'i>(
 /// A raiser's settles and withdrawals sat in the raiser's own area and went
 /// with it, and a verified person answer wins over any session's answer, so
 /// the person answer in effect ([`person_in_effect`]) is the answer in
-/// effect, except when what is left still says otherwise:
+/// effect, the same one the raiser's presence would give, unless a
+/// reversal of the question is stored anywhere this store reads (one
+/// recorded `--in` another session), which withdraws every answer to it.
 ///
-/// - a reversal of the question stored anywhere this store reads (one
-///   recorded `--in` another session) withdraws every answer to it;
-/// - an answer of any kind aimed at the question that cites the person
-///   answer in its `basis` has replaced it, whether or not that answer reads
-///   as verified here.
+/// Replacement is decided by [`person_in_effect`] on both paths: an answer
+/// is replaced only by a later `answered` person answer to the same
+/// question that reads verified here and cites it. A citing entry of any
+/// other kind, a session's answer, or a person answer that reads as a
+/// remote session's changes nothing.
 ///
 /// What this can't see: a reversal recorded in the raiser itself went with
 /// the raiser, and a replacing answer whose session was forced out (retention
@@ -414,12 +416,7 @@ pub fn gone_question_answer<'i>(
     if index.winner_of(session_id, id).is_some() {
         return None;
     }
-    let w = person_in_effect(index, backend, session_id, id)?;
-    let replaced = index
-        .answers_of(session_id, id)
-        .into_iter()
-        .any(|o| !same(o, w) && cites(o, w));
-    (!replaced).then_some(w)
+    person_in_effect(index, backend, session_id, id)
 }
 
 /// Whether `by` names `p` in its `basis`.
@@ -804,15 +801,21 @@ pub fn judge_entry(index: &Index, backend: &Backend, body: &DecisionBody) -> Ent
     };
     let Some(question) = question_of(index, target) else {
         // The question went with its raiser. The answer the precedent read
-        // and a settle take as in effect reads that way here too.
-        let in_effect = answer
-            && gone_question_answer(index, backend, &target.id, &target.decision)
-                .is_some_and(|w| same(w, body));
-        return if in_effect {
+        // and a settle take as in effect reads that way here too, and a
+        // verified person answer it replaced still counts without
+        // governing, as it did while the raiser was there.
+        let Some(w) = answer
+            .then(|| gone_question_answer(index, backend, &target.id, &target.decision))
+            .flatten()
+        else {
+            return lost;
+        };
+        let governs = same(w, body);
+        return if governs || verified_person(index, backend, body) {
             EntryJudgment {
                 counted: true,
                 reason: Some(reasons::QUESTION_GONE),
-                governs: Some(true),
+                governs: Some(governs),
             }
         } else {
             lost

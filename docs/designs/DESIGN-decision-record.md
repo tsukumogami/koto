@@ -1188,10 +1188,14 @@ identifier). The output is `{"v", "person", "chain", "label", "answers": [{"iden
 *A replaced answer.* A person answer outranks an earlier one by time, which a removed session can
 undo, so the replacement is also written down: when `koto decisions answer` records a person's
 answer to a question that already has a verified person answer in effect, it adds that answer to
-the new one's `basis` (the new answer then takes at most 63 `--basis` entries of its own), and a
-person answer that another answer to the same question cites is never the one in effect
-(`person_winner`). The record of the replacement lives in the replacing answer, so it lasts as
-long as the session holding that answer.
+the new one's `basis` (the new answer then takes at most 63 `--basis` entries of its own). A
+person answer is replaced when a later `answered` person answer to the same question that reads
+verified here cites it (`person_winner`, over the answers `verified_person` admits), whichever
+handle gave it. A session's answer, a withdrawal or a person answer read as a remote session's
+replaces nothing, even with the citation in its `basis`. The raiser-gone path decides by the same
+`person_in_effect` as the present one, so the three reads agree before and after the raiser is
+removed. The record of the replacement lives in the replacing answer, so it lasts as long as the
+session holding that answer.
 
 *Limits once the raiser is gone.* A reversal recorded in the raiser itself goes with the raiser,
 and nothing then withdraws the answer. The session holding a replacing answer that reads verified
@@ -1199,8 +1203,9 @@ is a keeper under the retention rules above, and a removal of it without `--forc
 the replacement outlives the raiser unless that session is forced out. Once it is, nothing readable
 says the first answer was replaced, and it reads as in effect again: neither read can see what the
 store no longer holds.
-`show` reads such an answer the way precedent does: `counted` and `governs` true with reason
-`question_gone`, the one reason carried on an entry that counts.
+`show` reads such a question the way it did while the raiser was there, with reason
+`question_gone`, the one reason carried on an entry that counts: the answer precedent returns is
+`counted` and `governs`, and a verified person answer it replaced is `counted` and not `governs`.
 
 *The history.* `koto decisions history <session id>/<decision id>` finds the question by identity,
 preferring the copy in the raiser's own directory, and prints `{"v", "identity", "question":

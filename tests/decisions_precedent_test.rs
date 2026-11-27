@@ -731,7 +731,23 @@ fn a_reversed_question_stays_reversed_once_its_raiser_is_removed() {
 }
 
 #[test]
-fn a_replaced_answer_stays_replaced_while_its_replacement_is_readable() {
+fn a_reversal_recorded_in_the_raiser_goes_with_it_as_the_limit_says() {
+    let env = Env::new();
+    env.ladder();
+    let (q, a) = q1(&env, "director");
+    reverse(&env, &q, "worker");
+    assert!(found(&env, "manager", Some("cache")).is_empty());
+    env.ok(&["session", "cleanup", "worker", "--force"]);
+    assert!(!env.sessions().join("worker").exists());
+    // Nothing left says the question was reversed: the answer is precedent
+    // again and a settle accepts it.
+    assert_eq!(found(&env, "manager", Some("cache")), one(&q, &a));
+    let q7 = env.raise("worker2", "q7", "person:owner", &["label=cache"]);
+    env.settle_ok(&q7, "worker2", &format!("director:{a}"));
+}
+
+#[test]
+fn a_replaced_answer_stays_replaced_once_the_raiser_is_removed() {
     let env = Env::new();
     env.ladder();
     let (q, first) = q1(&env, "director");
@@ -744,14 +760,8 @@ fn a_replaced_answer_stays_replaced_while_its_replacement_is_readable() {
         "{basis}"
     );
     assert_eq!(found(&env, "worker2", Some("cache")), one(&q, &second));
-
-    // With the raiser removed, the replacement governs; once it no longer
-    // reads as verified here it isn't precedent, and it still keeps the
-    // answer it cites from coming back.
     env.cleanup("worker");
     assert_eq!(found(&env, "worker2", Some("cache")), one(&q, &second));
-    env.forget_verified("manager");
-    assert!(found(&env, "worker2", Some("cache")).is_empty());
     let q7 = env.raise("worker2", "q7", "person:owner", &["label=cache"]);
     let out = env.settle(&q7, "worker2", &["--basis", &format!("director:{first}")]);
     assert_eq!(out.code, 2, "{}", out.all());
@@ -820,4 +830,119 @@ fn show_reads_a_removed_raisers_answer_the_way_precedent_does() {
     assert_eq!(after["counted"], true, "{after}");
     assert_eq!(after["governs"], true, "{after}");
     assert_eq!(after["reason"], "question_gone", "{after}");
+}
+
+/// What precedent, show and a settle make of `first` and `second` on the
+/// store as it stands: the owner's and the other handle's precedent from
+/// `manager`, `counted` and `governs` for each answer, and the exit code
+/// of a settle citing each on a fresh question named after `tag`.
+fn readings(env: &Env, first: (&str, &str), second: (&str, &str), tag: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "owner".into(),
+        serde_json::json!(found(env, "manager", Some("cache"))),
+    );
+    let other: Vec<Value> = answers(env, "someone-else", "manager", Some("cache"))
+        .iter()
+        .map(|e| e["id"].clone())
+        .collect();
+    out.insert("someone-else".into(), Value::Array(other));
+    for (key, (holder, id)) in [("first", first), ("second", second)] {
+        let shown = env.show(holder, id);
+        out.insert(
+            format!("{key}-show"),
+            serde_json::json!([shown["counted"], shown["governs"]]),
+        );
+        let q = env.raise(
+            "worker2",
+            &format!("{tag}-{key}"),
+            "person:owner",
+            &["label=cache"],
+        );
+        let code = env
+            .settle(&q, "worker2", &["--basis", &format!("{holder}:{id}")])
+            .code;
+        out.insert(format!("{key}-settle"), serde_json::json!(code));
+    }
+    Value::Object(out)
+}
+
+/// A session's answer to `q` citing `first`, planted in `manager`'s aimed
+/// area as an import would leave it; its id.
+fn plant_session_citation(env: &Env, q: &Q, first: &str) -> String {
+    let dir = env.aimed("manager", q, "x");
+    let dir = dir.parent().unwrap();
+    let existing = std::fs::read_dir(dir).unwrap().next().unwrap().unwrap();
+    let holder: Value = serde_json::from_slice(&std::fs::read(existing.path()).unwrap()).unwrap();
+    let id = "000000999001".to_string();
+    let mut body = env.stored("director", q, first);
+    body["id"] = Value::from(id.as_str());
+    body["session"] = holder["session"].clone();
+    body["decider"] = serde_json::json!({"kind": "session"});
+    body.as_object_mut().unwrap().remove("prompt");
+    body["basis"] = serde_json::json!([{"session": "director", "id": first}]);
+    env.plant("manager", q, &id, &body);
+    id
+}
+
+#[test]
+fn replacement_reads_the_same_before_and_after_the_raiser_is_forced_out() {
+    for case in ["verified", "remote", "session", "other-handle"] {
+        let env = Env::new();
+        env.ladder();
+        let (q, first) = q1(&env, "director");
+        let second = match case {
+            "verified" => env.person(&q, "manager"),
+            "remote" => {
+                let a = env.person(&q, "manager");
+                env.forget_verified("manager");
+                a
+            }
+            "session" => plant_session_citation(&env, &q, &first),
+            _ => {
+                let out = env.person_run_as(&q, "manager", "someone-else", &[]);
+                assert_eq!(out.code, 0, "{}", out.all());
+                out.json()["id"].as_str().unwrap().to_string()
+            }
+        };
+        let before = readings(&env, ("director", &first), ("manager", &second), "before");
+        env.ok(&["session", "cleanup", "worker", "--force"]);
+        assert!(!env.sessions().join("worker").exists());
+        let after = readings(&env, ("director", &first), ("manager", &second), "after");
+        assert_eq!(before, after, "{case}");
+
+        // What governs in each case, the same on both paths.
+        match case {
+            "verified" => {
+                assert_eq!(after["owner"], serde_json::json!(one(&q, &second)));
+                assert_eq!(after["first-settle"], 2);
+                assert_eq!(after["second-settle"], 0);
+            }
+            "remote" | "session" => {
+                assert_eq!(after["owner"], serde_json::json!(one(&q, &first)), "{case}");
+                assert_eq!(
+                    after["first-show"],
+                    serde_json::json!([true, true]),
+                    "{case}"
+                );
+                assert_eq!(after["first-settle"], 0, "{case}");
+                assert_eq!(after["second-settle"], 2, "{case}");
+            }
+            _ => {
+                // A verified answer under another handle replaces it too:
+                // replacement goes by the question, not by the person. It
+                // is that handle's precedent, and a question waiting on the
+                // owner can't settle on it.
+                assert_eq!(after["owner"], serde_json::json!([]), "{after}");
+                assert_eq!(
+                    after["someone-else"],
+                    serde_json::json!([second]),
+                    "{after}"
+                );
+                assert_eq!(after["first-show"], serde_json::json!([true, false]));
+                assert_eq!(after["first-settle"], 2);
+                assert_eq!(after["second-settle"], 2);
+            }
+        }
+    }
 }
