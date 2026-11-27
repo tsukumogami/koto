@@ -703,7 +703,7 @@ mod tests {
         );
         assert_eq!(v["koto"]["staleSince"], 1_794_535_080_000u64);
         assert_eq!(v["koto"]["status"], "blocked");
-        assert_eq!(v["koto"]["contractVersion"], 6);
+        assert_eq!(v["koto"]["contractVersion"], 7);
         assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
         assert_eq!(v["startTime"], 1_000);
         assert_eq!(v["workflowName"], "quiet");

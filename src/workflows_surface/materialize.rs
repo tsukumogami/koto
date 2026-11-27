@@ -1377,7 +1377,7 @@ mod tests {
         assert_eq!(v["koto"]["currentState"], "review");
         assert!(v["koto"].get("staleSince").is_none());
         assert!(!v["summary"].as_str().unwrap().contains("no activity since"));
-        assert_eq!(v["koto"]["contractVersion"], 6);
+        assert_eq!(v["koto"]["contractVersion"], 7);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "id": "koto-11111111-2222-4333-8444-555555555555",
   "name": "impl-feature · verify",
-  "workflowName": "impl-feature · verify",
+  "workflowName": "blocked · impl-feature · verify",
   "summary": "koto · impl-feature · verify · blocked on gate tests-pass",
   "status": "running",
   "startTime": 1700000000000,
@@ -79,7 +79,7 @@
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "workflow": "impl-feature",
     "currentState": "verify",
-    "contractVersion": 6,
+    "contractVersion": 7,
     "status": "blocked",
     "holdings": {
       "keyCount": 3,

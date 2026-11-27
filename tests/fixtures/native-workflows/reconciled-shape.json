@@ -1,7 +1,7 @@
 {
   "id": "koto-11111111-2222-4333-8444-555555555555",
   "koto": {
-    "contractVersion": 6,
+    "contractVersion": 7,
     "currentState": "implement",
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "staleSince": 1794535080000,
