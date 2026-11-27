@@ -742,6 +742,7 @@ koto::engine::types::SessionOrigin::anchor: field: std::path::PathBuf
 koto::engine::types::SessionOrigin::anchor_epoch: #[serde(default, skip_serializing_if = "is_zero_u64")] field: u64
 koto::engine::types::SessionOrigin::retired_anchors: #[serde(default, skip_serializing_if = "Vec::is_empty")] field: Vec<std::path::PathBuf>
 koto::engine::types::SessionOrigin::store: field: SessionStoreIdentity
+koto::engine::types::SessionOrigin::whole_epoch: #[serde(default, skip_serializing_if = "is_zero_u64")] field: u64
 koto::engine::types::SessionStoreIdentity: impl Clone
 koto::engine::types::SessionStoreIdentity: impl Debug
 koto::engine::types::SessionStoreIdentity: impl Deserialize<'de>

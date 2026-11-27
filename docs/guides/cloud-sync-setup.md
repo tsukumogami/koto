@@ -382,7 +382,7 @@ koto session import review --from /srv/ws-a
 
 It prints the same JSON as an import from another host, with `name` set to `review`. Afterwards `koto status review` run from the source workspace answers with the source's state, and from this workspace with the copy's. Before it writes anything, it checks the old copy and refuses, leaving it untouched, when:
 
-- another process holds the session's lock (`import_source_running`): stop it first;
+- another process holds the session's lock, or a `koto next` on it is still running (`import_source_running`): stop it first;
 - the local copy holds events or context the bucket lacks (`import_source_unpushed`): run `koto session resolve review --keep local` in the source workspace, then import again;
 - a local session names it as its parent (`import_source_has_children`).
 
@@ -446,7 +446,7 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_source_unreadable` | 1 | A source object is missing, failed validation (for example, a state log this koto can't carry intact), or was refused for a reason other than the bucket being unreachable | If the message names a validation failure, the source needs repair on its host |
 | `import_source_unreachable` | 1 | A source context key couldn't be fetched because the bucket didn't answer (a dropped connection, a timeout, a throttle or a 5xx), still failing after retries. The keys fetched before it are kept | Run it again after a backoff; the re-run fetches only the keys still missing |
 | `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed. Before the source is marked, what the run pushed was taken back; once it's marked (a same-host import whose swap failed), everything is kept and the message says so | Fix what the message names (usually connectivity or local disk) and run the same import again; after the marker, that finishes it. When the message names `--as` (a same-host import this host's store can't swap), import under another name instead |
-| `import_source_running` | 2 | Same host only: another process holds the source session's lock | Stop whatever is advancing the session, then import again |
+| `import_source_running` | 2 | Same host only: another process holds the source session's lock, or a `koto next` on it is in flight and holds its `tick.lock` | Stop whatever is advancing the session, then import again |
 | `import_source_unpushed` | 2 | The source's host holds writes the bucket lacks. On the same host: the source's local copy holds events or context keys the bucket lacks. From any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes, or by a write window not yet closed | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`. Then import again |
 | `import_source_has_children` | 2 | Same host only: a local session names the source as its parent | Finish or clean up the child it names, or import under `--as` |
 | `import_unmarked` | 1 | The session was imported and pushed, but the marker on the source couldn't be written, so the old copy won't refuse yet | Run the same import again; it writes only the marker. Keep the source stopped until it succeeds |
