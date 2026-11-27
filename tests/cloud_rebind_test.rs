@@ -2136,6 +2136,69 @@ Done.
         }
     }
 
+    /// The move of the test above, stopped at `after-commit` instead, where
+    /// the moved header is only under the old home: run again with `--to` the
+    /// new directory from a third one, it is refused as `session_unlocated`
+    /// and writes nothing under either home. Run again from the new
+    /// directory, it then carries the context there.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_at_its_commit_is_refused_from_a_third_dir_writing_nothing() {
+        let mv = Moving::unrecorded();
+        let new_prefix = prefix_of(&mv.new);
+        let third = mv.m.dir("third");
+        let third_prefix = prefix_of(&third);
+        assert!(
+            new_prefix != mv.prefix && third_prefix != mv.prefix && third_prefix != new_prefix,
+            "setup: the three directories don't have three prefixes"
+        );
+
+        let stopped = mv.mover(&mv.new, &[(FAULT_ENV, "after-commit")], &[]);
+        assert!(
+            !stopped.ok(),
+            "the stopped move exited 0: {}",
+            stopped.describe()
+        );
+        let homes = || {
+            (
+                snapshot(&mv.s3, &format!("{}/", mv.prefix)),
+                snapshot(&mv.s3, &format!("{new_prefix}/")),
+            )
+        };
+        let before = homes();
+        let elsewhere = mv.mover(&third, &[], &["--to", s(&mv.new)]);
+        assert!(
+            !elsewhere.ok()
+                && format!("{}{}", elsewhere.stdout, elsewhere.stderr)
+                    .contains("session_unlocated"),
+            "run again from a third directory wasn't refused as session_unlocated: {}",
+            elsewhere.describe()
+        );
+        assert!(
+            homes() == before,
+            "the refused run wrote under the old home or the new one: {}",
+            elsewhere.describe()
+        );
+
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(
+            run.ok(),
+            "run again from the new directory: {}",
+            run.describe()
+        );
+        for (key, value) in [("notes.md", "notes"), ("carried.md", "carried")] {
+            let object = session_key(&new_prefix, NAME, &format!("ctx/{key}"));
+            assert_eq!(
+                mv.s3.object(&object).as_deref(),
+                Some(value.as_bytes()),
+                "context key '{key}' from before the move isn't at the new home {object}; keys \
+                 under it: {:?}; the stopped move: {}; run again: {}",
+                mv.s3.keys_under(&format!("{new_prefix}/{NAME}/")),
+                stopped.describe(),
+                run.describe()
+            );
+        }
+    }
+
     /// `koto session resolve <parent> --keep local --children accept-local`
     /// over a child moved with `--whole` elsewhere reports the child errored,
     /// as the move refuses this host's copy. The child's row says what to

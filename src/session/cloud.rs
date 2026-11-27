@@ -1442,17 +1442,17 @@ impl CloudBackend {
             return Ok(caller());
         };
         let header: Option<serde_json::Value> = serde_json::from_str(line.trim()).ok();
-        self.home_of_header(id, header, identity)
+        self.home_of_header(id, header, identity, true)
     }
 
-    /// [`CloudBackend::home_prefix`] as if `id`'s header named `from` as its `execution_dir`.
+    /// [`CloudBackend::home_prefix`] for a header naming `from` as its `execution_dir`, uncached.
     pub(crate) fn home_prefix_from(&self, id: &str, from: &Path) -> Result<Home, Unlocated> {
         let mut header: Option<serde_json::Value> = first_line(&self.local.state_path(id))
             .and_then(|line| serde_json::from_str(line.trim()).ok());
         if let Some(h) = header.as_mut().and_then(|h| h.as_object_mut()) {
             h.insert("execution_dir".into(), from.to_string_lossy().into());
         }
-        self.home_of_header(id, header, None)
+        self.home_of_header(id, header, None, false)
     }
 
     /// [`CloudBackend::home_prefix`]'s rule, applied to `header`.
@@ -1461,6 +1461,7 @@ impl CloudBackend {
         id: &str,
         header: Option<serde_json::Value>,
         identity: Option<(u64, u64)>,
+        cached: bool,
     ) -> Result<Home, Unlocated> {
         let dir = self.local.session_dir(id);
         let field = |pointer: &str| {
@@ -1507,7 +1508,7 @@ impl CloudBackend {
                 if let Some(stamped) = stamped.filter(|s| !candidates.contains(s)) {
                     candidates.push(stamped);
                 }
-                self.locate(id, anchor, candidates)
+                self.locate(id, anchor, candidates, cached)
             }
             _ => Ok(Home {
                 prefix: self.prefix.clone(),
@@ -1522,7 +1523,7 @@ impl CloudBackend {
     /// anchor's prefix, then the prefix this host's sync stamp names, with
     /// no prefix twice) whose listing shows the session's state object.
     ///
-    /// Each candidate is listed once per process, with a delimiter, so the
+    /// Each candidate is listed once per process when `cached`, with a delimiter, so the
     /// listing reads only the session's top level. Every listing is one
     /// bounded ask ([`probe_ask`]), and all of them together end within
     /// [`PROBE_DEADLINE`]; one with no answer by then is a listing that
@@ -1538,6 +1539,7 @@ impl CloudBackend {
         id: &str,
         anchor: Option<String>,
         candidates: Vec<String>,
+        cached: bool,
     ) -> Result<Home, Unlocated> {
         if let Some(answer) = self
             .probes
@@ -1545,6 +1547,7 @@ impl CloudBackend {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|_| cached)
         {
             return answer.clone();
         }
@@ -1600,7 +1603,7 @@ impl CloudBackend {
             .located
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), answer.clone());
+            .extend(cached.then(|| (id.to_string(), answer.clone())));
         answer
     }
 
@@ -11347,6 +11350,7 @@ mod tests {
             "wf",
             Some("/the/anchor".to_string()),
             vec![first.to_string(), second.to_string()],
+            true,
         );
         let took = started.elapsed();
         assert!(took < ms(1500), "took {took:?}");
