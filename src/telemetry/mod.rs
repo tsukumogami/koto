@@ -1761,26 +1761,68 @@ fn session_started(
 /// written for a driver before the run id resolved) is derived again, so a
 /// parent header that was briefly unreadable is tried again on the next
 /// record.
+///
+/// The same pass keeps a child's run template cached. A child whose
+/// sidecar holds a run id and no template is looked up again too, and the
+/// sidecar is rewritten only when a lookup found something it didn't hold.
+/// A root is never looked up for a template: its own header answers.
 fn cached_run_id(
     backend: &dyn SessionBackend,
     session_dir: &Path,
     header: &StateFileHeader,
 ) -> Option<String> {
-    let cached = sidecar::read(session_dir);
-    if let Some(run_id) = cached.as_ref().and_then(|c| c.run_id.clone()) {
-        return Some(run_id);
+    let cached = sidecar::read(session_dir).unwrap_or_default();
+    let is_child = header.parent_workflow.is_some();
+    let has_template = cached.run_template_name.is_some() || cached.run_template_hash.is_some();
+    if cached.run_id.is_some() && (has_template || !is_child) {
+        return cached.run_id;
     }
-    let run_id = lineage::run_id(backend, header);
-    if run_id.is_some() {
+    // Something is missing: the run id, or a child's run template (a child
+    // created before the template was cached, or whose sidecar was lost).
+    // Both are looked up again and stored when the lookup finds more than
+    // the sidecar holds, so the next record needs no walk. A child whose
+    // ancestors are gone from this host finds nothing and is looked up
+    // again by its next record; that lookup ends at the first missing
+    // header.
+    let run_id = cached
+        .run_id
+        .clone()
+        .or_else(|| lineage::run_id(backend, header));
+    let template = if has_template {
+        lineage::RunTemplate {
+            name: cached.run_template_name.clone(),
+            hash: cached.run_template_hash.clone(),
+        }
+    } else {
+        child_run_template(backend, header)
+    };
+    let found_more =
+        (cached.run_id.is_none() && run_id.is_some()) || (!has_template && !template.is_empty());
+    if found_more {
         let _ = sidecar::write(
             session_dir,
             &sidecar::Sidecar {
                 run_id: run_id.clone(),
-                driver: cached.and_then(|c| c.driver),
+                driver: cached.driver,
+                run_template_name: template.name,
+                run_template_hash: template.hash,
             },
         );
     }
     run_id
+}
+
+/// The run template a child's sidecar caches: what its ancestors on this
+/// host give (see `lineage::found_run_template`). A root caches none, since
+/// its own header answers, so its sidecar keeps the bytes it always had.
+fn child_run_template(
+    backend: &dyn SessionBackend,
+    header: &StateFileHeader,
+) -> lineage::RunTemplate {
+    if header.parent_workflow.is_none() {
+        return lineage::RunTemplate::default();
+    }
+    lineage::found_run_template(backend, header)
 }
 
 /// The session's header: the first line of the log `commit` read under its
@@ -1814,7 +1856,9 @@ fn changed_driver(session_dir: &Path) -> Option<String> {
 /// Journal a session that `init_state_file` has just committed:
 /// `session_started`, then a `state_entered` for each state its initial
 /// events enter. Writes the session's sidecar with its run id and creation
-/// driver. `journal_root` is the store's journal home; `None` writes
+/// driver and, for a child, its run's template: this is when the parent is
+/// on this host, so it is read from the parent's header or the parent's own
+/// sidecar. `journal_root` is the store's journal home; `None` writes
 /// nothing.
 pub(crate) fn after_init(
     journal_root: Option<&Path>,
@@ -1840,9 +1884,15 @@ pub(crate) fn after_init(
             .iter()
             .filter_map(|e| record_for(&e.payload, session, header, run_id.as_deref())),
     );
+    let template = child_run_template(backend, header);
     let _ = sidecar::write(
         &backend.session_dir(session),
-        &sidecar::Sidecar { run_id, driver },
+        &sidecar::Sidecar {
+            run_id,
+            driver,
+            run_template_name: template.name,
+            run_template_hash: template.hash,
+        },
     );
     write(root, &records);
 }
@@ -1970,11 +2020,15 @@ pub(crate) fn after_commit(
     // it. A write that failed (and warned) is not retried: the cache moves
     // either way, as every journal write is best-effort.
     if new_driver.is_some() {
+        // Only the driver moves: a cached run template stays.
+        let cached = sidecar::read(&session_dir).unwrap_or_default();
         let _ = sidecar::write(
             &session_dir,
             &sidecar::Sidecar {
                 run_id,
                 driver: new_driver,
+                run_template_name: cached.run_template_name,
+                run_template_hash: cached.run_template_hash,
             },
         );
     }
@@ -2190,9 +2244,15 @@ pub(crate) fn imported(
             .name("koto.state", Some(state)),
         );
     }
+    // An imported session is its own run, so its header answers for the
+    // run template and the sidecar caches none.
     let _ = sidecar::write(
         &backend.session_dir(session),
-        &sidecar::Sidecar { run_id, driver },
+        &sidecar::Sidecar {
+            run_id,
+            driver,
+            ..sidecar::Sidecar::default()
+        },
     );
     write(root, &records);
 }

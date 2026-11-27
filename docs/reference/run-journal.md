@@ -40,9 +40,12 @@ koto creates the file with mode 0600 and refuses to write through a symlink
 at the journal's path.
 
 Each session directory also holds a sidecar, `run-journal.json`, that
-caches the session's run id and the driver last recorded for it. It's for
-koto's own use, not for readers: it goes when the session directory goes,
-and koto rebuilds it from the session header when it's missing.
+caches the session's run id and the driver last recorded for it. A child
+session's sidecar also caches the template name and hash of its run's root
+session, which `koto session identity` prints. It's for koto's own use, not
+for readers: it goes when the session directory goes, and koto rebuilds it
+when it's missing, from the session header and, for a child's run template,
+from the headers of its ancestors on this host.
 
 ## Line format
 
