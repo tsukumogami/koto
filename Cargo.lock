@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "koto"
-version = "0.42.0"
+version = "0.42.1-dev"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "koto-session-reader"
-version = "0.42.0"
+version = "0.42.1-dev"
 dependencies = [
  "aho-corasick",
  "anyhow",
