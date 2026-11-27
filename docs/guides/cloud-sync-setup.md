@@ -236,6 +236,8 @@ Securing the index:
 
 koto's own reads of other sessions, such as an agent session's anchor or another member of a hierarchy, use the same copy, and a session koto can't locate is read as this host holds it. `koto next` keeps its own check: it refuses a directory outside the session's execution anchor with `execution_anchor_mismatch`.
 
+### Rebinding a session on this host
+
 `koto session rebind` is a different thing. It's for a checkout that moved on the same host: stand in the new location and rebind the session's execution anchor there. Don't use it to carry a session to another machine.
 
 Under the cloud backend, rebind pushes the rewritten header to the bucket along with its `execution_anchor_rebound` event. If that push fails, the rebind still succeeds locally and prints a warning to stderr; the session's next successful push carries the new anchor.
@@ -245,6 +247,12 @@ Run the rebind from the new location (`koto session rebind <name>`), or from any
 A session that records no prefix takes its home from its execution anchor, so its rebind moves the home to the new location's prefix, which may hold an older copy of the session's context or none. The rebind brings the context there too: every key this host holds that the new home lacks, or holds an older copy of, is pushed, and the new home's manifest names it. A key it couldn't push is named in a warning on stderr; the rebind still succeeds, and the key goes up the next time it's read or written.
 
 A rebind also fences the anchor it leaves. It raises the session's `origin.anchor_epoch` and lists the old anchor in `origin.retired_anchors`, and from then on a write to the session (an event, a header rewrite, a context key) refuses with `session_rebound` when it runs from the old anchor, or when its command read the session before the rebind. A process still working from the old checkout gets that error instead of writing a second history of the session. A rebind back to a retired anchor takes it off the list. A session with no origin record has no fence. An older koto ignores both fields, and reads such a header as before.
+
+A push is refused the same way when the bucket's copy was rebound past the one being pushed: its header records a higher `anchor_epoch`, or it retired the anchor the pushed header names. The push answers `session_rebound` rather than `session conflict`, and the bucket keeps the moved copy. `koto session resolve <name> --keep local` refuses such a copy with `session_rebound` too, so following conflict advice can't undo a move. On a bucket without conditional writes (one that answers them `501`), a push first reads the bucket's header with a ranged GET, refuses `session_rebound` when the bucket is ahead, and then PUTs without a condition. That narrows the window and doesn't close it: a move that lands between the GET and the PUT is still written over.
+
+`koto session rebind <name> --whole` takes a session over for the agent session whose anchor `KOTO_ANCHOR` names. It moves the anchor, the held-by links, the publish location and the command environment in one call; the [CLI usage guide](cli-usage.md#session-rebind) has the details. Under the cloud backend it stays a same-host move. It refuses `rebind_cross_host` when the bucket's `version.json` says another machine uploaded it last, and points at `koto session import` instead. Its commit goes to the bucket first, conditional on the copy it pulled, so a move that loses a race writes nothing anywhere and a re-run finishes it. Afterwards it uploads `version.json` as this machine's, one version up, and a host that pushed before the move refuses its next flush with `session_rebound` before any of its writes go up. The cross-host check sees only the hosts that upload `version.json`: a tick's flush and a context write do, while `koto cancel`, `koto rewind` and a plain rebind don't, so a host whose only writes were those isn't seen.
+
+Every host that touches a session moved with `--whole` needs this release or later. The move records `origin.whole_epoch`, which turns on a stricter fence on both backends. An older koto that rewrites the session's header on any host drops the field, and a stale process of the new build then passes the whole-binding fence.
 
 ### Reading a session in another workspace
 
@@ -531,7 +539,7 @@ Any S3-compatible storage works:
 
 Set `session.cloud.endpoint` to your provider's S3-compatible URL.
 
-State pushes are conditional writes (`If-Match`, `If-None-Match`), which AWS S3, Cloudflare R2 and MinIO support. A provider that answers them with `501 Not Implemented` gets the push without the check and a warning on stderr, as before conditional pushes.
+State pushes are conditional writes (`If-Match`, `If-None-Match`), which AWS S3, Cloudflare R2 and MinIO support. A provider that answers them with `501 Not Implemented` gets the push without the check and a warning on stderr, as before conditional pushes. Such a push still reads the bucket's header first and refuses `session_rebound` when a rebind moved the copy past the one being pushed, but a move that lands between that read and the PUT is written over (see [Rebinding a session on this host](#rebinding-a-session-on-this-host)).
 
 ## Verifying sync
 

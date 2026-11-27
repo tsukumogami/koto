@@ -705,3 +705,49 @@ fn a_workspace_that_names_nothing_or_a_local_backend_is_refused() {
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json["code"], "workspace_needs_cloud", "{json}");
 }
+
+/// A whole rebind is a write: it refuses `--workspace` with
+/// `workspace_read_only`, exit 2, before any request, whatever its other
+/// arguments, and before the anchor check that would refuse it here for
+/// running without `KOTO_ANCHOR`.
+#[test]
+fn a_whole_rebind_refuses_workspace() {
+    let f = fixture();
+    let before = objects(&f.s3);
+    f.s3.clear_requests();
+    let b_ws = f.b.ws_str();
+    let refused: Vec<Vec<&str>> = vec![
+        vec!["session", "rebind", NAME, "--whole"],
+        vec!["session", "rebind", NAME, "--whole", "--wait", "0"],
+        vec!["session", "rebind", NAME, "--whole", "--to", &b_ws],
+    ];
+    for args in refused {
+        let run = read(&f.b, &f.a.prefix(), &args);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+        assert_eq!(
+            run.json["code"],
+            "workspace_read_only",
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+        assert!(
+            run.json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("--workspace")),
+            "`{}`: {}",
+            args.join(" "),
+            run.describe()
+        );
+    }
+    assert!(f.s3.requests().is_empty(), "a refused verb made requests");
+    assert_eq!(objects(&f.s3), before);
+    let status = f.a.koto(&["status", NAME]);
+    assert_eq!(status.json["current_state"], "done");
+}

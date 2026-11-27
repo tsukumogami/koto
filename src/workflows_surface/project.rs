@@ -207,6 +207,9 @@ fn fold_holdings(header: &StateFileHeader, events: &[Event]) -> Holdings {
             EventPayload::ExecutionAnchorRebound { to, .. } => {
                 event_anchor = Some(to.as_path());
             }
+            EventPayload::ExecutionAnchorReboundWhole(w) => {
+                event_anchor = Some(w.to.as_path());
+            }
             _ => {}
         }
     }
@@ -605,6 +608,23 @@ mod tests {
         assert_eq!(holdings.anchor.as_deref(), Some("/srv/rebound"));
         let none = fold_holdings(&h, &[]);
         assert_eq!(none.anchor.as_deref(), Some("/srv/original"));
+    }
+
+    #[test]
+    fn holdings_anchor_follows_a_whole_rebind() {
+        let mut h = header(None, None);
+        h.execution_dir = Some(std::path::PathBuf::from("/srv/original"));
+        let events = vec![event(
+            1,
+            EventPayload::ExecutionAnchorReboundWhole(crate::engine::types::WholeRebound {
+                from: Some(std::path::PathBuf::from("/srv/original")),
+                to: std::path::PathBuf::from("/srv/moved"),
+                whole: true,
+                epoch: Some(1),
+            }),
+        )];
+        let holdings = fold_holdings(&h, &events);
+        assert_eq!(holdings.anchor.as_deref(), Some("/srv/moved"));
     }
 
     #[test]

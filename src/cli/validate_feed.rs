@@ -469,6 +469,41 @@ Body text.
         }
     }
 
+    /// The events `koto session rebind --whole` writes, each missing a field
+    /// koto-session-reader's payload type requires (or, for the move's own
+    /// `execution_anchor_rebound`, with `epoch` of the wrong type), so a
+    /// clean result can only mean the spec doesn't declare the shape.
+    #[test]
+    fn shipped_spec_declares_the_rebind_whole_events() {
+        for (event, malformed) in [
+            (
+                "execution_anchor_rebound",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/old","to":"/new","whole":true,"epoch":"1"}}"#,
+            ),
+            (
+                "held_by_rebound",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"held_by_rebound","payload":{"added":"anchor-new","removed":["anchor-old"]}}"#,
+            ),
+            (
+                "publish_location_dropped",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"publish_location_dropped","payload":{"epoch":1,"explicit":true}}"#,
+            ),
+            (
+                "environment_rerecorded",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"environment_rerecorded","payload":{"epoch":1,"dropped":["node_modules/.bin"],"changed":["XDG_CONFIG_HOME"]}}"#,
+            ),
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(
+                result.is_err(),
+                "{} is not declared in the shipped spec as the whole-binding move \
+                 writes it: a malformed payload validated clean",
+                event
+            );
+        }
+    }
+
     /// The four `koto review record` events: a well-formed line of each
     /// validates clean, and one missing a required field or carrying a value
     /// outside its closed set is rejected, so the contract declares them

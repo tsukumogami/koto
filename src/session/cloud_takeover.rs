@@ -778,22 +778,19 @@ enum TryLock {
 /// A session made before the lock existed has none, so the file is created
 /// here and held: a tick that starts while the import runs then waits on
 /// it, as it would on one an earlier tick made. The directory is never
-/// created; `None` when it isn't there.
+/// created; `None` when it isn't there. `path` is the lock's path in the
+/// session's directory, opened as every taker opens it
+/// ([`crate::session::tick_lock::open`]).
 fn try_tick_lock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        let Some(dir) = path.parent() else {
+            return Ok(None);
+        };
+        let file = match crate::session::tick_lock::open(dir) {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(None),
             Err(e) => return Err(TryLock::Io(e)),
         };
         // SAFETY: the fd belongs to `file`, which outlives the call.
