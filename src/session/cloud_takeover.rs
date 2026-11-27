@@ -839,3 +839,57 @@ fn try_flock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
     }
     Ok(Some(file))
 }
+
+#[cfg(all(test, unix))]
+mod tick_probe_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// A session made before `tick.lock` existed has none until its next
+    /// tick creates one. The probe creates it and holds it, so a tick that
+    /// starts while the import runs waits on the lock, instead of finding
+    /// no file and running with only the state-file lock between it and the
+    /// import.
+    #[test]
+    fn the_probe_creates_and_holds_a_missing_tick_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::session::TICK_LOCK_FILE);
+        assert!(!path.exists());
+
+        let held = match try_tick_lock(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => panic!("the probe must create a missing tick.lock"),
+            Err(_) => panic!("the probe must not fail on a missing tick.lock"),
+        };
+        assert!(path.exists(), "tick.lock must be left in the directory");
+
+        // A tick's shared take, as `lock_shared` makes it, can't get in.
+        let tick = std::fs::File::open(&path).unwrap();
+        // SAFETY: the fd belongs to `tick`, which outlives the call.
+        let ret = unsafe { libc::flock(tick.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_ne!(ret, 0, "a tick must wait while the probe holds the lock");
+        drop(held);
+    }
+
+    /// The directory is never created: a session with no local directory
+    /// has nothing a tick could be holding.
+    #[test]
+    fn the_probe_leaves_a_missing_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("no-such-session");
+        let path = gone.join(crate::session::TICK_LOCK_FILE);
+        assert!(matches!(try_tick_lock(&path), Ok(None)));
+        assert!(!gone.exists());
+    }
+
+    /// A planted link is never followed.
+    #[test]
+    fn the_probe_does_not_follow_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        let path = dir.path().join(crate::session::TICK_LOCK_FILE);
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        assert!(matches!(try_tick_lock(&path), Err(TryLock::Io(_))));
+        assert!(!elsewhere.exists(), "nothing is created through the link");
+    }
+}
