@@ -80,7 +80,7 @@ cached one.
 ## The worker task
 
 Baseline and after runs ran the same task, in the sandbox repository
-tsukumogami/dms-verdict-sandbox, with only the label changing (`b1` to `b3`
+(a private repository), with only the label changing (`b1` to `b3`
 for baselines, `p1` to `p10` for probes):
 
 > Add the file notes/koto766-probe-LABEL.md to this repository, holding the
