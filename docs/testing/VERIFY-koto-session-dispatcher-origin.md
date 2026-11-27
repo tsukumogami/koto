@@ -13,7 +13,8 @@ origin record works on the dispatched path: every dispatched worker's anchor
 reported the dispatching coordinator's anchor on the cloud store, and the
 agent wrote nothing to make the anchor say so. The failures come from how the
 runs were set up and from what the PLAN assumed about the briefs. Each one
-is explained below.
+is explained below. The rerun koto#766 asked for is in
+[VERIFY-koto-session-dispatcher-origin-rerun.md](VERIFY-koto-session-dispatcher-origin-rerun.md).
 
 ## Host and versions
 
@@ -157,6 +158,10 @@ them. The PLAN's AC7 and AC8 reuse the baseline's `/explore` task, whose
 brief Issue 4 leaves unchanged, so this task can't show the link step gone.
 
 ## What would close the checks
+
+The rerun these call for is recorded in
+[VERIFY-koto-session-dispatcher-origin-rerun.md](VERIFY-koto-session-dispatcher-origin-rerun.md)
+(koto#766).
 
 - AC1: ten runs from one coordinator session with no handover in between,
   using workers whose brief has no `--dispatched-by` open.
