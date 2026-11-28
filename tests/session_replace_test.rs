@@ -15,7 +15,12 @@
 //! refuses in the nested envelope `koto session rebind` uses.
 //!
 //! `KOTO_TEST_REPLACE_FAULT` names a debug-build point at which the command
-//! stops as a killed process would (exit 86).
+//! stops as a killed process would (exit 86). Its `rebind-check-serialize`
+//! point doesn't stop the command: it fails the serialization of OLD's
+//! header for the rebind check. `KOTO_TEST_REPLACE_HOLD` names a file the
+//! command creates at a debug-build hold point, just before OLD's tick.lock
+//! unless `KOTO_TEST_REPLACE_HOLD_AT` names a fault point, and waits on
+//! until the file is gone.
 //!
 //! Every command runs with an environment built from scratch and under a
 //! timeout, as tests/rebind_whole_test.rs does, whose helpers these are.
@@ -39,6 +44,14 @@ const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const GO: &str = r#"{"choice":"go"}"#;
 const OK: &str = r#"{"verdict":"ok"}"#;
 const FAULT_ENV: &str = "KOTO_TEST_REPLACE_FAULT";
+/// The replace's hold seam: it creates this file once every check has
+/// passed, just before it asks for OLD's tick.lock, and waits until the
+/// file is gone. `HOLD_AT_ENV` moves the wait to a fault point.
+const HOLD_ENV: &str = "KOTO_TEST_REPLACE_HOLD";
+const HOLD_AT_ENV: &str = "KOTO_TEST_REPLACE_HOLD_AT";
+const REBIND_FAULT_ENV: &str = "KOTO_TEST_REBIND_FAULT";
+const REBIND_HOLD_ENV: &str = "KOTO_TEST_REBIND_HOLD";
+const REBIND_HOLD_AT_ENV: &str = "KOTO_TEST_REBIND_HOLD_AT";
 const REPLACES_KEY: &str = "koto/replaces";
 
 /// The points at which `KOTO_TEST_REPLACE_FAULT` stops a replace, in the
@@ -1681,4 +1694,444 @@ fn init_replaces_from_a_retired_anchor_is_refused_before_it_creates_the_new_run(
         old_log,
         "the refused replace wrote to {NAME}'s log"
     );
+}
+
+/// Spawn `cmd` with its hold file at `hold` under `env`, and wait until the
+/// process has created it.
+fn spawn_until_held(mut cmd: Command, env: &str, hold: &Path, what: &str) -> (Child, Instant) {
+    cmd.env(env, hold);
+    let started = Instant::now();
+    let mut child = spawn(cmd);
+    while !hold.exists() {
+        if child.try_wait().unwrap().is_some() {
+            let out = finish(child, started);
+            panic!("{what} exited before its hold point: {}", out.describe());
+        }
+        assert!(
+            started.elapsed() < START_BOUND,
+            "{what} didn't reach its hold point within {START_BOUND:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child, started)
+}
+
+/// Run [`NAME`] created in `old`, with an anchor open for a move of it
+/// into `a`.
+fn movable(host: &Host) -> (PathBuf, PathBuf, String) {
+    let old = host.dir("old");
+    let a = host.dir("a");
+    host.init_at(&old, NAME);
+    let anchor = host.open_anchor("new");
+    (old, a, anchor)
+}
+
+#[test]
+fn init_replaces_refuses_a_whole_move_made_while_it_waited_for_the_lock() {
+    let host = Host::new();
+    let (_old, a, anchor) = movable(&host);
+    let hold = host.root.join("hold");
+    let template = host.template();
+
+    // The replace reads OLD and passes every check, then waits.
+    let (replace, started) = spawn_until_held(
+        host.koto_at(
+            &a,
+            &["init", NEW, "--template", &template, "--replaces", NAME],
+        ),
+        HOLD_ENV,
+        &hold,
+        "the replace",
+    );
+    // The move lands between the checks and the lock.
+    expect_ok(host.whole_at(&a, NAME, &anchor), "rebind --whole");
+    assert_eq!(header(&host.log(NAME))["origin"]["whole_epoch"], 1);
+    let old_log = std::fs::read(host.log(NAME)).unwrap();
+    std::fs::remove_file(&hold).unwrap();
+    let out = finish(replace, started);
+
+    assert_refused(&out, 2, "session_rebound");
+    assert!(
+        !host.session_dir(NEW).exists(),
+        "the replace created {NEW} for a run moved while it waited: {}",
+        out.describe()
+    );
+    assert_eq!(
+        std::fs::read(host.log(NAME)).unwrap(),
+        old_log,
+        "the refused replace wrote to {NAME}'s log"
+    );
+}
+
+#[test]
+fn session_replace_refuses_a_whole_move_made_while_it_waited_for_the_lock() {
+    let host = Host::new();
+    let (_old, a, anchor) = movable(&host);
+    host.init_at(&a, NEW);
+    let new_files = files(&host.session_dir(NEW));
+    let hold = host.root.join("hold");
+
+    let (replace, started) = spawn_until_held(
+        host.koto_at(&a, &["session", "replace", NAME, "--by", NEW]),
+        HOLD_ENV,
+        &hold,
+        "the replace",
+    );
+    expect_ok(host.whole_at(&a, NAME, &anchor), "rebind --whole");
+    let old_log = std::fs::read(host.log(NAME)).unwrap();
+    std::fs::remove_file(&hold).unwrap();
+    let out = finish(replace, started);
+
+    assert_refused_nested(&out, 2, "session_rebound");
+    assert_eq!(host.replaces_key(), None, "{}", out.describe());
+    assert_eq!(
+        files(&host.session_dir(NEW)),
+        new_files,
+        "the refused replace wrote into {NEW}: {}",
+        out.describe()
+    );
+    assert_eq!(std::fs::read(host.log(NAME)).unwrap(), old_log);
+}
+
+/// A whole-binding move stopped right after its commit leaves tick.lock free
+/// and owes its held-by link. Every replace front refuses
+/// `rebind_incomplete`, exit 2, before writing anything, with or without
+/// `--abandon-tick`. Once the move is run again and finishes, the same
+/// replace closes the run.
+#[test]
+fn a_replace_refuses_rebind_incomplete_after_a_whole_move_stopped_past_its_commit() {
+    for (session_front, abandon) in [(false, false), (false, true), (true, false), (true, true)] {
+        let what = format!("session_front={session_front} abandon_tick={abandon}");
+        let host = Host::new();
+        let old = host.dir("old");
+        let a = host.dir("a");
+        host.init_at(&old, NAME);
+        if session_front {
+            host.init_at(&host.ws, NEW);
+        }
+        let anchor = host.open_anchor("new");
+
+        let mut mover = host.whole_at(&a, NAME, &anchor);
+        mover.env(REBIND_FAULT_ENV, "after-commit");
+        let out = run(mover);
+        assert_eq!(out.code, Some(86), "{what}: {}", out.describe());
+        let log = host.log(NAME);
+        let h = header(&log);
+        assert_eq!(
+            h["origin"]["whole_epoch"], 1,
+            "{what}: the move didn't commit: {h}"
+        );
+        assert!(
+            payloads(&log, "held_by_rebound").is_empty(),
+            "{what}: the held-by part ran"
+        );
+
+        let old_before = files(&host.session_dir(NAME));
+        let new_before = files(&host.session_dir(NEW)); // empty on the init front
+        let extra: &[&str] = if abandon { &["--abandon-tick"] } else { &[] };
+        let out = if session_front {
+            let out = run(host.session_replace(NAME, extra));
+            assert_refused_nested(&out, 2, "rebind_incomplete");
+            out
+        } else {
+            let out = run(host.replace(NAME, extra));
+            assert_refused(&out, 2, "rebind_incomplete");
+            out
+        };
+        assert!(
+            out.stdout.contains("koto session rebind wf --whole"),
+            "{what}: {}",
+            out.describe()
+        );
+        assert_eq!(
+            files(&host.session_dir(NAME)),
+            old_before,
+            "{what}: the refusal wrote to OLD"
+        );
+        assert_eq!(
+            files(&host.session_dir(NEW)),
+            new_before,
+            "{what}: the refusal touched NEW"
+        );
+        assert!(payloads(&log, "session_superseded").is_empty(), "{what}");
+
+        // Finish the move, then the replace goes through.
+        expect_ok(host.whole_at(&a, NAME, &anchor), "the move run again");
+        let held = payloads(&log, "held_by_rebound");
+        assert_eq!(held.len(), 1, "{what}: {held:?}");
+        assert_eq!(held[0]["epoch"], 1, "{what}");
+        assert!(
+            header(&log)["origin"].get("whole_parts_owed").is_none(),
+            "{what}: the mark stayed"
+        );
+        if session_front {
+            expect_ok(
+                host.session_replace(NAME, extra),
+                "session replace after the move",
+            );
+        } else {
+            expect_ok(host.replace(NAME, extra), "init --replaces after the move");
+        }
+        assert_closed(&host, NAME, true, &what);
+    }
+}
+
+/// `--abandon-tick` skips past the lock holder. When the holder is a
+/// whole-binding move between its commit and its later parts, the replace
+/// refuses `rebind_incomplete` and leaves OLD as it was. The move then
+/// finishes, and the replace closes the run.
+#[test]
+fn abandon_tick_refuses_rebind_incomplete_while_a_whole_move_holds_after_its_commit() {
+    for session_front in [false, true] {
+        let what = format!("session_front={session_front}");
+        let host = Host::new();
+        let old = host.dir("old");
+        let a = host.dir("a");
+        host.init_at(&old, NAME);
+        if session_front {
+            host.init_at(&host.ws, NEW);
+        }
+        let anchor = host.open_anchor("new");
+        let hold = host.root.join("hold");
+
+        let mut cmd = host.whole_at(&a, NAME, &anchor);
+        cmd.env(REBIND_HOLD_AT_ENV, "after-commit");
+        let (mover, started) = spawn_until_held(cmd, REBIND_HOLD_ENV, &hold, "the move");
+        let log = host.log(NAME);
+        assert_eq!(header(&log)["origin"]["whole_epoch"], 1, "{what}");
+        let before = files(&host.session_dir(NAME));
+
+        if session_front {
+            let out = run(host.session_replace(NAME, &["--abandon-tick"]));
+            assert_refused_nested(&out, 2, "rebind_incomplete");
+        } else {
+            let out = run(host.replace(NAME, &["--abandon-tick"]));
+            assert_refused(&out, 2, "rebind_incomplete");
+            assert!(!host.session_dir(NEW).exists(), "{what}: NEW was created");
+        }
+        assert_eq!(
+            files(&host.session_dir(NAME)),
+            before,
+            "{what}: OLD changed"
+        );
+
+        std::fs::remove_file(&hold).unwrap();
+        let moved = finish(mover, started);
+        assert_eq!(
+            moved.code,
+            Some(0),
+            "{what}: the move: {}",
+            moved.describe()
+        );
+        assert_eq!(payloads(&log, "held_by_rebound").len(), 1, "{what}");
+
+        let extra = ["--abandon-tick"];
+        if session_front {
+            expect_ok(
+                host.session_replace(NAME, &extra),
+                "session replace after the move",
+            );
+        } else {
+            expect_ok(host.replace(NAME, &extra), "init --replaces after the move");
+        }
+        assert_closed(&host, NAME, true, &what);
+    }
+}
+
+#[test]
+fn session_replace_refuses_a_new_run_that_is_itself_replaced() {
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    host.init_at(&host.ws, NEW);
+    expect_ok(
+        host.session_replace(NAME, &[]),
+        "setup: session replace wf --by wf-r2",
+    );
+    assert_closed(&host, NAME, true, "setup");
+    let before = files(&host.sessions());
+
+    // Twice: without the refusal the first try leaves a stray key in
+    // NAME's context, and the second then closes NEW too, leaving no live
+    // run under either name.
+    for attempt in ["first", "second"] {
+        let out = run(host.koto(&["session", "replace", NEW, "--by", NAME]));
+        assert_refused_nested(&out, 2, "session_replaced");
+        assert_eq!(
+            out.json()["error"]["replaced_by"],
+            NEW,
+            "{attempt}: {}",
+            out.describe()
+        );
+        assert_eq!(
+            out.json()["error"]["newest"],
+            NEW,
+            "{attempt}: {}",
+            out.describe()
+        );
+        assert_eq!(
+            files(&host.sessions()),
+            before,
+            "{attempt}: the refused replace wrote something"
+        );
+        assert!(
+            payloads(&host.log(NEW), "session_superseded").is_empty(),
+            "{attempt}: the run that replaced {NAME} was closed"
+        );
+    }
+}
+
+#[test]
+fn a_replace_chain_runs_its_first_step_again_unchanged() {
+    const THIRD: &str = "wf-r3";
+    let host = Host::new();
+    host.init_at(&host.ws, NAME);
+    host.init_at(&host.ws, NEW);
+    host.init_at(&host.ws, THIRD);
+    expect_ok(
+        host.session_replace(NAME, &[]),
+        "setup: replace wf --by wf-r2",
+    );
+    expect_ok(
+        host.koto(&["session", "replace", NEW, "--by", THIRD]),
+        "setup: replace wf-r2 --by wf-r3",
+    );
+    let before = files(&host.sessions());
+
+    // NEW is replaced now, but NAME's close into it already landed.
+    let out = expect_ok(
+        host.session_replace(NAME, &[]),
+        "replace wf --by wf-r2 again",
+    );
+    assert_eq!(out.json()["outcome"], "unchanged", "{}", out.describe());
+    assert_eq!(
+        files(&host.sessions()),
+        before,
+        "the re-run wrote something"
+    );
+}
+
+/// Under `--abandon-tick` a whole-binding move held before its commit lets
+/// the replace past the lock and every check; the move then commits and
+/// finishes before the close, and the close itself refuses it.
+#[test]
+fn abandon_tick_refuses_at_the_close_a_whole_move_committed_after_the_checks() {
+    let host = Host::new();
+    let (_old, a, anchor) = movable(&host);
+    let template = host.template();
+    let move_hold = host.root.join("move-hold");
+    let replace_hold = host.root.join("replace-hold");
+
+    // The move takes tick.lock and waits before its commit.
+    let (mover, move_started) = spawn_until_held(
+        host.whole_at(&a, NAME, &anchor),
+        REBIND_HOLD_ENV,
+        &move_hold,
+        "the move",
+    );
+    // The replace finds the lock held and goes on without it, passes every
+    // check, creates NEW, writes its key and waits before the close.
+    let mut cmd = host.koto_at(
+        &a,
+        &[
+            "init",
+            NEW,
+            "--template",
+            &template,
+            "--replaces",
+            NAME,
+            "--abandon-tick",
+        ],
+    );
+    cmd.env(HOLD_AT_ENV, "after-key");
+    let (replace, replace_started) = spawn_until_held(cmd, HOLD_ENV, &replace_hold, "the replace");
+
+    std::fs::remove_file(&move_hold).unwrap();
+    let moved = finish(mover, move_started);
+    assert_eq!(moved.code, Some(0), "the move: {}", moved.describe());
+    assert_eq!(header(&host.log(NAME))["origin"]["whole_epoch"], 1);
+    let old_log = std::fs::read(host.log(NAME)).unwrap();
+
+    std::fs::remove_file(&replace_hold).unwrap();
+    let out = finish(replace, replace_started);
+
+    assert_refused(&out, 2, "session_rebound");
+    assert!(
+        out.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("'{NAME}' wasn't closed, and '{NEW}' exists")),
+        "not the close's refusal: {}",
+        out.describe()
+    );
+    assert!(
+        payloads(&host.log(NAME), "session_superseded").is_empty(),
+        "{}",
+        out.describe()
+    );
+    assert_eq!(
+        std::fs::read(host.log(NAME)).unwrap(),
+        old_log,
+        "the refused close wrote to {NAME}'s log"
+    );
+}
+
+/// OLD is moved whole, so the rebind check before the lock runs on its
+/// header. When that header can't be serialized for the check, both fronts
+/// refuse `persistence_error`, exit 3, and write nothing. The replace runs
+/// from the workspace, which no move retired, so only the check itself
+/// stands between the fault and a close.
+#[test]
+fn a_replace_fails_closed_when_the_rebind_check_cannot_serialize_the_header() {
+    for session_front in [false, true] {
+        let what = format!("session_front={session_front}");
+        let host = Host::new();
+        let (_old, a, anchor) = movable(&host);
+        if session_front {
+            host.init_at(&host.ws, NEW);
+        }
+        expect_ok(host.whole_at(&a, NAME, &anchor), "rebind --whole");
+        assert_eq!(
+            header(&host.log(NAME))["origin"]["whole_epoch"],
+            1,
+            "{what}: the move didn't commit"
+        );
+        let before = files(&host.sessions());
+
+        let message = if session_front {
+            let mut cmd = host.session_replace(NAME, &[]);
+            cmd.env(FAULT_ENV, "rebind-check-serialize");
+            let out = run(cmd);
+            assert_refused_nested(&out, 3, "persistence_error");
+            assert_eq!(host.replaces_key(), None, "{what}: {}", out.describe());
+            out.json()["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            let mut cmd = host.replace(NAME, &[]);
+            cmd.env(FAULT_ENV, "rebind-check-serialize");
+            let out = run(cmd);
+            assert_refused(&out, 3, "persistence_error");
+            assert!(
+                !host.session_dir(NEW).exists(),
+                "{what}: the replace created {NEW}: {}",
+                out.describe()
+            );
+            out.json()["error"].as_str().unwrap_or("").to_string()
+        };
+        assert!(
+            message.contains("doesn't serialize for the rebind check"),
+            "{what}: the message doesn't name the rebind check: {message}"
+        );
+        assert!(message.contains("nothing was written"), "{what}: {message}");
+        assert_eq!(
+            files(&host.sessions()),
+            before,
+            "{what}: the refused replace wrote something"
+        );
+        assert!(
+            payloads(&host.log(NAME), "session_superseded").is_empty(),
+            "{what}: {NAME} was closed"
+        );
+    }
 }

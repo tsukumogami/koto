@@ -1744,6 +1744,45 @@ Done.
         );
     }
 
+    /// A cloud move stopped after its commit owes its later parts. A replace
+    /// from the new anchor refuses `rebind_incomplete` and changes nothing in
+    /// the bucket. The move run again finishes, and the replace then closes
+    /// the run.
+    #[test]
+    fn a_replace_refuses_rebind_incomplete_after_a_cloud_move_stopped_past_its_commit() {
+        let mv = Moving::new();
+        let out = mv.mover(&mv.new, &[(FAULT_ENV, "after-commit")], &[]);
+        assert_eq!(out.code, Some(86), "{}", out.describe());
+        assert_eq!(header_of(&mv.remote())["origin"]["whole_parts_owed"], true);
+        let remote_before = mv.remote();
+
+        let replace = [
+            "init",
+            "r2",
+            "--template",
+            s(&mv.m.template),
+            "--replaces",
+            NAME,
+        ];
+        let out = mv.m.run(&mv.new, &[], &replace);
+        assert_eq!(out.code, Some(2), "{}", out.describe());
+        assert_eq!(out.json["code"], "rebind_incomplete", "{}", out.describe());
+        assert_eq!(
+            mv.remote(),
+            remote_before,
+            "the refused replace changed the bucket"
+        );
+
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "the move run again: {}", run.describe());
+        mv.assert_moved("after the move ran again");
+        assert!(header_of(&mv.remote())["origin"]
+            .get("whole_parts_owed")
+            .is_none());
+
+        mv.m.ok(&mv.new, &[], &replace, "init --replaces after the move");
+    }
+
     /// A cloud move whose push of the cleared mark fails exits non-zero,
     /// asking for the move to be run again, with the mark still in the
     /// bucket; running it again pushes the clear.

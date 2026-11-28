@@ -471,3 +471,170 @@ fn a_cloud_replace_of_a_run_another_host_rebound_creates_nothing() {
     );
     assert_eq!(h.local_log("p"), local_before, "this host's copy changed");
 }
+
+/// The bucket's copy of OLD is moved whole by another host after the
+/// replace's checks pulled it and before the pull under the lock: the
+/// replace refuses `session_rebound` there, so `s` is never created.
+#[test]
+fn a_cloud_replace_refuses_a_whole_move_made_while_it_waited_for_the_lock() {
+    let h = Host::new();
+    h.old();
+    let moved = h.root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    let bucket_moved = moved_whole(&h.bucket_log("p"), &h.ws, &moved);
+    let key = h.state_key("p");
+    // The checks' pull (the first GET of p's state) reads the copy before
+    // the move; every later pull reads the moved one.
+    h.s3.put_after("GET", &key, &key, &bucket_moved);
+    let local_before = h.local_log("p");
+
+    let out = h.replace();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(
+        printed_json(&out.stdout)["code"],
+        "session_rebound",
+        "{out:?}"
+    );
+    assert!(
+        !h.root.join("koto-home").join("sessions").join("s").exists(),
+        "the replace created s for a run moved while it waited: {out:?}"
+    );
+    assert!(h.s3.object(&h.state_key("s")).is_none(), "{out:?}");
+    assert_eq!(h.bucket_log("p"), bucket_moved, "the bucket's copy changed");
+    assert_eq!(h.local_log("p"), local_before, "this host's copy changed");
+    let pulls =
+        h.s3.requests()
+            .into_iter()
+            .filter(|r| r.method == "GET" && r.key == key)
+            .count();
+    assert!(pulls >= 2, "the replace pulled p's state {pulls} time(s)");
+}
+
+#[test]
+fn a_cloud_session_replace_refuses_a_whole_move_made_while_it_waited_for_the_lock() {
+    let h = Host::new();
+    h.old();
+    let template = h.template.to_str().unwrap().to_string();
+    h.ok(&["init", "s", "--template", &template]);
+    let moved = h.root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    let bucket_moved = moved_whole(&h.bucket_log("p"), &h.ws, &moved);
+    let key = h.state_key("p");
+    h.s3.put_after("GET", &key, &key, &bucket_moved);
+    let local_before = h.local_log("p");
+
+    let out = h.run(&["session", "replace", "p", "--by", "s"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(
+        printed_json(&out.stdout)["error"]["code"],
+        "session_rebound",
+        "{out:?}"
+    );
+    let key_file = h.root.join("koto-home/sessions/s/ctx/koto/replaces");
+    assert!(
+        !key_file.exists(),
+        "the refused replace wrote s's key: {out:?}"
+    );
+    assert_eq!(h.bucket_log("p"), bucket_moved, "the bucket's copy changed");
+    assert_eq!(h.local_log("p"), local_before, "this host's copy changed");
+}
+
+/// `bytes` as `moved_whole` leaves them, with the move's later parts still
+/// owed.
+fn moved_whole_owing(bytes: &[u8], from: &Path, to: &Path) -> Vec<u8> {
+    let moved = moved_whole(bytes, from, to);
+    let text = String::from_utf8(moved).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["origin"]["whole_parts_owed"] = serde_json::json!(true);
+    lines[0] = serde_json::to_string(&header).unwrap();
+    (lines.join("\n") + "\n").into_bytes()
+}
+
+/// Another host moved `p` whole into this workspace and stopped before its
+/// later parts: the bucket's copy says so. A replace here refuses
+/// `rebind_incomplete`, exit 2, creates nothing, and leaves both copies of
+/// `p` as they were.
+#[test]
+fn a_cloud_replace_refuses_rebind_incomplete_for_a_move_owing_its_parts() {
+    let h = Host::new();
+    h.old();
+    let elsewhere = h.root.join("elsewhere");
+    let owing = moved_whole_owing(&h.bucket_log("p"), &elsewhere, &h.ws);
+    let key = h.state_key("p");
+    h.s3.put(&key, &owing);
+    // This host's copy agrees with the bucket's, so the read rule sees
+    // epoch 1 on both and only the mark can refuse.
+    std::fs::write(h.local_path("p"), &owing).unwrap();
+    // And this host's sync stamp names the bucket's new bytes, as a pull
+    // of them would leave it, so the read takes this copy as current.
+    let session = h.root.join("koto-home").join("sessions").join("p");
+    let stamp_path = session.join("cloud-sync.json");
+    if let Ok(bytes) = std::fs::read(&stamp_path) {
+        let mut stamp: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            stamp["state_key"],
+            key.as_str(),
+            "setup: the stamp is for another key: {stamp}"
+        );
+        stamp["state_etag"] = serde_json::json!(h.s3.etag_of(&key).unwrap());
+        stamp["state_len"] = serde_json::json!(owing.len());
+        stamp["state_sha256"] = serde_json::json!(hex::encode(Sha256::digest(&owing)));
+        stamp["verified_tick"] = Value::Null;
+        std::fs::write(&stamp_path, serde_json::to_vec(&stamp).unwrap()).unwrap();
+    }
+    let _ = std::fs::remove_file(session.join("cloud-check.json"));
+
+    let out = h.replace();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let json = printed_json(&out.stdout);
+    assert_eq!(json["code"], "rebind_incomplete", "{out:?}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("koto session rebind p --whole"),
+        "{out:?}"
+    );
+    assert_eq!(h.bucket_log("p"), owing, "the bucket's copy changed");
+    assert_eq!(h.local_log("p"), owing, "this host's copy changed");
+    assert!(
+        h.s3.object(&h.state_key("s")).is_none(),
+        "the refused replace put s: {out:?}"
+    );
+}
+
+/// The move lands after every check, at the first push of `s`'s state
+/// inside its creation: only the close's own rule refuses it.
+#[test]
+fn a_cloud_replace_refuses_at_the_close_a_move_made_after_the_lock() {
+    let h = Host::new();
+    h.old();
+    let moved = h.root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    let bucket_moved = moved_whole(&h.bucket_log("p"), &h.ws, &moved);
+    h.s3.put_after("PUT", &h.state_key("s"), &h.state_key("p"), &bucket_moved);
+    let local_before = h.local_log("p");
+
+    let out = h.replace();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let json = printed_json(&out.stdout);
+    assert_eq!(json["code"], "session_rebound", "{out:?}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("'p' wasn't closed, and 's' exists"),
+        "not the close's refusal: {out:?}"
+    );
+    assert_eq!(
+        h.bucket_log("p"),
+        bucket_moved,
+        "the refused close wrote the bucket's copy"
+    );
+    assert_eq!(
+        h.local_log("p"),
+        local_before,
+        "the refused close wrote this host's copy"
+    );
+}

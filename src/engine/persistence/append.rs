@@ -2041,4 +2041,119 @@ mod close_tests {
         assert_eq!(outcome, CloseOutcome::FencedByOther(plain));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
     }
+
+    /// A whole-binding move recorded in the header after this process first
+    /// read the log refuses the close, with nothing written.
+    #[test]
+    fn append_close_refuses_a_log_rebound_after_its_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        crate::session::fence_state::note_read(&log, 0);
+        let content = std::fs::read_to_string(&log).unwrap();
+        let (first, rest) = content.split_once('\n').unwrap();
+        let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+        let new = dir.path().join("ws").join("new");
+        header["execution_dir"] = serde_json::json!(new);
+        header["origin"] = serde_json::json!({
+            "anchor": new,
+            "store": {"kind": "local", "base": dir.path()},
+            "anchor_epoch": 1,
+            "whole_epoch": 1,
+            "retired_anchors": [dir.path().join("ws").join("old")],
+        });
+        std::fs::write(&log, format!("{header}\n{rest}")).unwrap();
+        let before = std::fs::read(&log).unwrap();
+
+        let err =
+            crate::session::fence_state::with_cwd(&new, || append_close(&log, &close(), TS, WAIT))
+                .unwrap_err();
+        let rebound = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::session::rebind_fence::SessionRebound>())
+            .unwrap_or_else(|| panic!("not session_rebound: {err:#}"));
+        assert!(!rebound.from_retired, "{err:#}");
+        assert_eq!(std::fs::read(&log).unwrap(), before, "nothing was written");
+    }
+
+    /// The log of `old` after a whole-binding move from a directory that
+    /// no longer exists to `anchor`, at epoch 1: the move event, and a
+    /// header recording it, whose `whole_parts_owed` field (the mark a
+    /// whole move's commit writes) is set when `owed` is. `torn` leaves the
+    /// header at epoch 0, as a commit stopped between its event and its
+    /// header does.
+    fn moved_log(dir: &Path, anchor: &Path, owed: bool, torn: bool) -> std::path::PathBuf {
+        let session = dir.join("old");
+        std::fs::create_dir_all(&session).unwrap();
+        let log = session.join("koto-old.state.jsonl");
+        let mut origin = serde_json::json!({
+            "anchor": anchor,
+            "store": {"kind": "local", "base": dir},
+        });
+        if !torn {
+            origin["anchor_epoch"] = 1.into();
+            origin["whole_epoch"] = 1.into();
+            origin["retired_anchors"] = serde_json::json!(["/koto-test-gone/old"]);
+            if owed {
+                origin["whole_parts_owed"] = true.into();
+            }
+        }
+        let execution_dir = if torn {
+            serde_json::json!("/koto-test-gone/old")
+        } else {
+            serde_json::json!(anchor)
+        };
+        let header = serde_json::json!({
+            "schema_version": 1, "workflow": "wf", "template_hash": "abc",
+            "created_at": "2025-01-01T00:00:00Z",
+            "execution_dir": execution_dir,
+            "origin": origin,
+        });
+        std::fs::write(&log, format!("{header}\n")).unwrap();
+        let moved = EventPayload::ExecutionAnchorReboundWhole(crate::engine::types::WholeRebound {
+            from: Some("/koto-test-gone/old".into()),
+            to: anchor.to_path_buf(),
+            whole: true,
+            epoch: Some(1),
+        });
+        append_event(&log, &moved, TS).unwrap();
+        log
+    }
+
+    #[test]
+    fn append_close_refuses_rebind_incomplete_while_a_whole_move_owes_its_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, true, false);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let e = crate::session::fence_state::with_cwd(&anchor, || {
+            append_close(&log, &close(), TS, WAIT)
+        })
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("rebind_incomplete"), "{e:#}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+
+        // The same log with the mark clear closes.
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, false, false);
+        crate::session::fence_state::with_cwd(&anchor, || append_close(&log, &close(), TS, WAIT))
+            .unwrap();
+    }
+
+    #[test]
+    fn append_close_refuses_rebind_incomplete_for_a_torn_whole_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, false, true);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let e = crate::session::fence_state::with_cwd(&anchor, || {
+            append_close(&log, &close(), TS, WAIT)
+        })
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("rebind_incomplete"), "{e:#}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+    }
 }

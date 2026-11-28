@@ -145,9 +145,46 @@ struct Replace<'a> {
     create: Option<&'a ReplaceArgs<'a>>,
 }
 
+/// A debug-build seam naming a file the replace creates at its hold point
+/// and then waits on until the file is gone, so a test can act between two
+/// steps. The point is `before-lock`, once every check has passed and just
+/// before OLD's tick.lock is asked for, unless [`HOLD_AT_ENV`] names one of
+/// [`crash_at`]'s points. A release build never reads it.
+const HOLD_ENV: &str = "KOTO_TEST_REPLACE_HOLD";
+
+/// Moves [`HOLD_ENV`]'s wait to one of [`crash_at`]'s points.
+const HOLD_AT_ENV: &str = "KOTO_TEST_REPLACE_HOLD_AT";
+
+/// The longest the replace waits at [`HOLD_ENV`]'s file.
+const HOLD_CAP: Duration = Duration::from_secs(60);
+
+/// Wait at [`HOLD_ENV`]'s file when the hold point is `point`, in a debug
+/// build with the variable set.
+fn hold_at(point: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let at = std::env::var(HOLD_AT_ENV).unwrap_or_else(|_| "before-lock".to_string());
+    if at != point {
+        return;
+    }
+    let Some(path) = std::env::var_os(HOLD_ENV).map(std::path::PathBuf::from) else {
+        return;
+    };
+    if std::fs::write(&path, b"").is_err() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while path.exists() && started.elapsed() < HOLD_CAP {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Stop at `point`, as a killed process would, when the fault seam names
-/// it. A release build never reads the seam.
+/// it, after waiting there when [`HOLD_AT_ENV`] names it. A release build
+/// never reads either seam.
 fn crash_at(point: &str) {
+    hold_at(point);
     if cfg!(debug_assertions) && std::env::var(REPLACE_FAULT_ENV).as_deref() == Ok(point) {
         eprintln!("{REPLACE_FAULT_ENV}: stopping at {point}");
         crate::exit::crash(86);
@@ -280,7 +317,20 @@ fn refuse_rebound_before_the_lock(
     let path = backend
         .session_dir(old)
         .join(crate::session::state_file_name(old));
-    let line = serde_json::to_string(header).unwrap_or_default();
+    // A debug build can fail this serialization at the fault seam's
+    // `rebind-check-serialize` point, since a real header always
+    // serializes. The point never stops the process by itself, and a
+    // release build never reads it.
+    let line = if cfg!(debug_assertions)
+        && std::env::var(REPLACE_FAULT_ENV).as_deref() == Ok("rebind-check-serialize")
+    {
+        Err(<serde_json::Error as serde::ser::Error>::custom(
+            "rebind-check-serialize",
+        ))
+    } else {
+        serde_json::to_string(header)
+    }
+    .unwrap_or_default();
     if let Err(rebound) = crate::session::fence_state::check(old, &path, &line) {
         let p = front.prefix();
         refuse(
@@ -521,6 +571,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
     } else if let Some(args) = job.create {
         precheck_new(args);
     }
+    hold_at("before-lock");
 
     // 2. OLD's tick lock. Under the cloud backend this host may hold no
     // copy of OLD yet, and the lock lives in its local directory.

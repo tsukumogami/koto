@@ -1214,4 +1214,87 @@ mod tests {
             FailureClass::Unreachable
         );
     }
+
+    fn rebound_pulled(run: &str, anchor: &str, retired: &str) -> PulledState {
+        let header = serde_json::json!({
+            "schema_version": 1, "workflow": run, "template_hash": "abc",
+            "created_at": "2026-01-01T00:00:00Z", "execution_dir": anchor,
+            "origin": {"anchor": anchor, "store": {"kind": "local", "base": "/s"},
+                       "anchor_epoch": 1, "whole_epoch": 1, "retired_anchors": [retired]},
+        });
+        PulledState {
+            prefix: PREFIX.to_string(),
+            key: format!("{PREFIX}/{run}/{}", state_file_name(run)),
+            bytes: format!("{header}\n").into_bytes(),
+            etag: "e1".to_string(),
+            header: serde_json::from_value(header).unwrap(),
+            events: Vec::new(),
+            last_seq: 0,
+        }
+    }
+
+    fn replaced_close() -> Close {
+        Close {
+            side_events: Vec::new(),
+            cancel: true,
+            fence: SupersedeFence {
+                by: "s".to_string(),
+                by_session_id: "id-s".to_string(),
+                actor: Default::default(),
+                at: "2026-01-01T00:00:00Z".to_string(),
+                replaced: true,
+            },
+        }
+    }
+
+    /// The close's own rebind rule, asked of the bucket's copy: a whole move
+    /// there past the epoch this process first read of its own copy refuses
+    /// the close before any request is made.
+    #[test]
+    fn push_close_refuses_a_bucket_copy_rebound_after_the_first_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let local = backend.local.session_dir("p").join(state_file_name("p"));
+        crate::session::fence_state::note_read(&local, 0);
+        let pulled = rebound_pulled("p", "/ws/new", "/ws/old");
+        let outcome =
+            crate::session::fence_state::with_cwd(std::path::Path::new("/ws/new"), || {
+                backend.push_close(&pulled, &replaced_close(), "2026-01-01T00:00:00Z")
+            });
+        match outcome {
+            CloudClose::Rebound(r) => assert!(!r.from_retired),
+            CloudClose::Closed { .. } => panic!("the rebound copy was closed"),
+            _ => panic!("not Rebound"),
+        }
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            0,
+            "the refused close made a request"
+        );
+    }
+
+    /// The same rule's other half: run from the directory the move retired,
+    /// with no earlier read noted.
+    #[test]
+    fn push_close_refuses_a_bucket_copy_rebound_after_its_anchor_was_retired() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let pulled = rebound_pulled("q", "/ws/new", "/ws/old");
+        let outcome =
+            crate::session::fence_state::with_cwd(std::path::Path::new("/ws/old"), || {
+                backend.push_close(&pulled, &replaced_close(), "2026-01-01T00:00:00Z")
+            });
+        match outcome {
+            CloudClose::Rebound(r) => assert!(r.from_retired),
+            CloudClose::Closed { .. } => panic!("the rebound copy was closed"),
+            _ => panic!("not Rebound"),
+        }
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            0,
+            "the refused close made a request"
+        );
+    }
 }
