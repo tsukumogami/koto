@@ -43,7 +43,7 @@ use crate::engine::persistence::{
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
 use crate::session::context::Manifest;
 use crate::session::links::is_reserved_key;
-use crate::session::rebind_fence::SessionRebound;
+use crate::session::rebind_fence::{MoveUnfinished, SessionRebound};
 use crate::session::remote_feed::{failure_class, FailureClass};
 use crate::session::state_log::{self, LogOrder};
 use crate::session::validate::{validate_context_key, validate_session_id};
@@ -254,6 +254,9 @@ pub(crate) enum CloudClose {
     /// [`crate::engine::persistence::append_close`] refuses one in a local
     /// log. Nothing was written.
     Rebound(SessionRebound),
+    /// The bucket's copy records a whole-binding move that still owes its
+    /// later parts, which the fence would strand. Nothing was written.
+    MoveUnfinished(MoveUnfinished),
     /// Nothing was written; the reason says why.
     Unavailable(String),
 }
@@ -495,11 +498,11 @@ impl CloudBackend {
         let ours = |f: &SupersedeFence| {
             f.replaced && f.by == fence.by && f.by_session_id == fence.by_session_id
         };
-        match pulled.fence() {
+        let unfenced = match pulled.fence() {
             Ok(Some(existing)) if !ours(&existing) => return CloudClose::FencedByOther(existing),
-            Ok(_) => {}
+            Ok(found) => found.is_none(),
             Err(e) => return CloudClose::Unavailable(format!("{e:#}")),
-        }
+        };
         let content = String::from_utf8_lossy(&pulled.bytes);
         // `append_close`'s rebind rule, asked of the bucket's header: a
         // rebind there since this process first read this host's copy (the
@@ -513,6 +516,14 @@ impl CloudBackend {
                 Ok(rebound) => CloudClose::Rebound(rebound),
                 Err(e) => CloudClose::Unavailable(format!("{e:#}")),
             };
+        }
+        // `append_close`'s unfinished-move rule, asked of the bucket's copy:
+        // a move landing after this pull changes the copy, and the PUT
+        // loses. A copy this close already fenced is a re-run.
+        if unfenced {
+            if let Some(m) = crate::session::rebind_fence::move_unfinished_in_log(run, &content) {
+                return CloudClose::MoveUnfinished(m);
+            }
         }
         let payloads = match close_payloads(&content, close, &fence) {
             Ok(payloads) => payloads,

@@ -9,17 +9,22 @@
 //!    action (`nested_invocation`), OLD existing and being a run, OLD not
 //!    being NEW (`self`), OLD's fence (`superseded_by`, `session_replaced`),
 //!    a whole-binding move of OLD that fences this process off
-//!    (`session_rebound`), NEW not being some other session
-//!    (`session_exists`), and for a NEW still to be created, the template's
-//!    compile and its variables.
+//!    (`session_rebound`) or hasn't finished its later parts
+//!    (`rebind_incomplete`), NEW not being some other run
+//!    (`session_exists`) or itself superseded or replaced (`superseded_by`,
+//!    `session_replaced`), and for a NEW still to be created, the
+//!    template's compile and its variables.
 //! 2. **Lock.** OLD's `tick.lock` is taken exclusive, waited for at most
 //!    `--wait` seconds (10 by default). Still held then refuses
 //!    `session_busy`, exit 1, nothing written. With `--abandon-tick` the
 //!    lock is asked for once: when it is held, the close goes on without it
 //!    and the output reports `tick_in_flight: true`.
-//! 3. **Stop.** OLD's background runner is stopped and its pool queues
-//!    left, as `koto cancel` does; the events that record it go into the
-//!    close.
+//! 3. **Stop.** OLD's log is read again, and a whole-binding move of it
+//!    that fences this process off, or that hasn't finished, is refused
+//!    once more: a move that held the lock while this command waited for
+//!    it lands here. Then OLD's background runner is stopped and its pool
+//!    queues left, as `koto cancel` does; the events that record it go into
+//!    the close.
 //! 4. **Create.** NEW is created, with no continues relation and nothing
 //!    carried, and `koto/replaces` is written in it, naming OLD by name and
 //!    session id.
@@ -291,32 +296,38 @@ fn refuse_fenced(
 /// Refuse `session_rebound`, with nothing written, when a whole-binding
 /// move recorded in OLD's `header` fences this process off from OLD: it
 /// runs from a directory the move retired, or it read OLD before the move.
-/// It's the check `koto next` makes, run before the lock so such a process
-/// takes no lock, stops no runner and creates no NEW; the close repeats it
-/// for a move made after this.
+/// It's the check `koto next` makes. It runs on the header the checks read,
+/// before the lock, and again on the header read under the lock, before the
+/// stop, so a move that held `tick.lock` while this command waited for it
+/// is refused before any runner is stopped or NEW created. The close
+/// repeats it for a move made after that: under `--abandon-tick`, or under
+/// the cloud backend by another host, whose move doesn't take this host's
+/// `tick.lock`.
 ///
 /// Under the cloud backend `header` is the bucket's copy. This host's copy
-/// is read first, for the epoch the read records: a check with no earlier
-/// read would record the bucket's epoch as this process's first read of
-/// OLD, and a host whose copy predates the move would then pass the epoch
-/// rule here and at the close.
-fn refuse_rebound_before_the_lock(
-    backend: &Backend,
-    front: Front,
-    old: &str,
-    header: &StateFileHeader,
-) {
-    if header.origin.as_ref().is_none_or(|o| o.whole_epoch == 0) {
-        return;
-    }
+/// is read first, whatever the bucket's header says, for the epoch the
+/// read records: the first call is then this process's first read of OLD,
+/// so a move this host makes while the command waits for the lock is
+/// measured against the epoch read before it, and a host whose copy
+/// predates a move doesn't pass the epoch rule here or at the close.
+///
+/// A header that can't be serialized for the check refuses
+/// `persistence_error`, exit 3, rather than passing unchecked.
+fn refuse_rebound(backend: &Backend, front: Front, old: &str, header: &StateFileHeader) {
     if backend.as_cloud().is_some() {
         // Read for the epoch it records alone; a host with no copy of OLD
         // has none to record, and the retired-directory rule still applies.
         let _ = backend.read_events_local(old);
     }
+    // No whole-binding move recorded: nothing here can fence this process
+    // off (`fence_state::check` passes such a header too).
+    if header.origin.as_ref().is_none_or(|o| o.whole_epoch == 0) {
+        return;
+    }
     let path = backend
         .session_dir(old)
         .join(crate::session::state_file_name(old));
+    let p = front.prefix();
     // A debug build can fail this serialization at the fault seam's
     // `rebind-check-serialize` point, since a real header always
     // serializes. The point never stops the process by itself, and a
@@ -330,9 +341,16 @@ fn refuse_rebound_before_the_lock(
     } else {
         serde_json::to_string(header)
     }
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        failed(
+            front,
+            format!(
+                "{p}: '{old}''s header doesn't serialize for the rebind check: {e}; nothing \
+                 was written"
+            ),
+        )
+    });
     if let Err(rebound) = crate::session::fence_state::check(old, &path, &line) {
-        let p = front.prefix();
         refuse(
             front,
             "session_rebound",
@@ -341,6 +359,67 @@ fn refuse_rebound_before_the_lock(
             serde_json::Value::Null,
         );
     }
+}
+
+/// Refuse `rebind_incomplete`, exit 2, when OLD's log, as `header` and
+/// `events` read it, records a whole-binding move that still owes its later
+/// parts: closing OLD now would strand them, since each is an append the
+/// fence refuses. `after` says what the refusal left.
+fn refuse_move_unfinished(
+    front: Front,
+    old: &str,
+    header: &StateFileHeader,
+    events: &[Event],
+    after: &str,
+) {
+    if let Some(m) = crate::session::rebind_fence::move_unfinished(old, header, events) {
+        let p = front.prefix();
+        refuse(
+            front,
+            "rebind_incomplete",
+            format!("{p}: {m}; {after}"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+}
+
+/// The refusal for a NEW another run already superseded or replaced:
+/// closing OLD into a run that is itself closed would leave no live run
+/// for OLD's work, and `replace A --by B` then `replace B --by A` would
+/// close both.
+fn refuse_new_fenced(
+    backend: &Backend,
+    front: Front,
+    old: &str,
+    name: &str,
+    fence: &SupersedeFence,
+) -> ! {
+    let p = front.prefix();
+    let newest = crate::session::links::newest_member(backend, name)
+        .map(|s| s.newest)
+        .unwrap_or_else(|| fence.by.clone());
+    let (code, how, field) = if fence.replaced {
+        ("session_replaced", "replaced", "replaced_by")
+    } else {
+        ("superseded_by", "superseded", "superseded_by")
+    };
+    let mut extra = serde_json::json!({
+        "newest": newest,
+        "actor": fence.actor,
+    });
+    extra[field] = serde_json::json!(fence.by);
+    refuse(
+        front,
+        code,
+        format!(
+            "{p}: '{name}' is itself {how} by '{}', so it can't take over '{old}''s work; \
+             nothing was written. Continue in '{newest}'",
+            fence.by
+        ),
+        super::EXIT_CALLER_ERROR,
+        extra,
+    )
 }
 
 /// The value of NEW's [`REPLACES_KEY`], `None` when it holds none.
@@ -535,8 +614,31 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         Some(f) => refuse_fenced(backend, front, old, name, &f, nothing),
         None => false,
     };
-    refuse_rebound_before_the_lock(backend, front, old, &old_header);
+    // Here, among the checks and before the lock: a process a whole-binding
+    // move fenced off from OLD must take no lock, stop no runner, leave no
+    // pool queue and create no NEW, and the close's own check (in
+    // `append_close` and `push_close`) only comes after all of that. It
+    // follows OLD's fence check, so an OLD already closed is refused with
+    // where its work goes on rather than as rebound. It runs again under
+    // the lock, before the stop, for a move that held the lock while this
+    // one waited; a move made after that is refused at the close.
+    refuse_rebound(backend, front, old, &old_header);
+    refuse_move_unfinished(front, old, &old_header, &old_events, nothing);
     if new_exists {
+        // A NEW that is itself closed can't take OLD's work over. A re-run
+        // whose close already landed (`fence_ours`) skips this, so it still
+        // reports `unchanged` after NEW has been superseded or replaced.
+        if !fence_ours {
+            let (_, new_events) = backend.read_events(name).unwrap_or_else(|e| {
+                failed(
+                    front,
+                    format!("{p}: could not read '{name}''s log: {e:#}; nothing was written"),
+                )
+            });
+            if let Some(f) = superseded_by(&new_events) {
+                refuse_new_fenced(backend, front, old, name, &f);
+            }
+        }
         let ours = match read_replaces(backend, name) {
             Ok(Some(r)) => r.session == old && r.session_id == old_id,
             // `koto session replace` writes the key a NEW lacks.
@@ -606,6 +708,18 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         }
     }
     let (old_header, old_events) = read_old(backend, front, old);
+    // A whole-binding move that held tick.lock while this command waited
+    // for it committed after the checks: refuse it before the stop, as the
+    // checks would have. Under `--abandon-tick` this runs too, without the
+    // lock.
+    refuse_rebound(backend, front, old, &old_header);
+    refuse_move_unfinished(
+        front,
+        old,
+        &old_header,
+        &old_events,
+        &format!("nothing was written; '{old}' wasn't closed"),
+    );
     // The runner to stop is this host's: under the cloud backend this
     // host's copy of OLD records what it started, whatever the bucket's
     // copy holds.
@@ -683,7 +797,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         cancel,
         fence,
     };
-    wrote |= close_old(backend, front, old, name, &close, &at);
+    wrote |= close_old(backend, front, old, name, &close, &at, fence_ours);
     if tick_in_flight {
         // The tick in flight may have started a runner since the first stop.
         let (_, events) = read_here(backend, old).unwrap_or_else(|e| {
@@ -702,7 +816,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
                 cancel: false,
                 fence: close.fence.clone(),
             };
-            wrote |= close_old(backend, front, old, name, &again, &now_iso8601());
+            wrote |= close_old(backend, front, old, name, &again, &now_iso8601(), true);
         }
     }
     drop(tick_lock);
@@ -898,9 +1012,25 @@ fn left_as_is(front: Front, old: &str, name: &str) -> String {
     }
 }
 
+/// What a refusal at the close says of OLD and NEW. `closed` is true when
+/// OLD already carried this command's fence before this write: the second
+/// runner stop under `--abandon-tick`, or a re-run whose close had landed.
+fn close_left(old: &str, name: &str, closed: bool) -> String {
+    if closed {
+        format!(
+            "'{old}' is closed, but what this run owed its log past the fence wasn't \
+             written, and '{name}' exists"
+        )
+    } else {
+        format!("'{old}' wasn't closed, and '{name}' exists")
+    }
+}
+
 /// Write `close` to OLD's copy in the bucket and then to this host's, as
 /// [`CloudBackend::push_close`] does, on a copy pulled just now, refusing
-/// as the outcome says. Returns whether anything was written.
+/// as the outcome says. Returns whether anything was written. `closed` is
+/// [`close_left`]'s.
+#[allow(clippy::too_many_arguments)]
 fn close_in_bucket(
     backend: &Backend,
     cloud: &CloudBackend,
@@ -909,9 +1039,10 @@ fn close_in_bucket(
     name: &str,
     close: &Close,
     at: &str,
+    closed: bool,
 ) -> bool {
     let p = front.prefix();
-    let after = format!("'{old}' wasn't closed, and '{name}' exists");
+    let after = close_left(old, name, closed);
     let pulled = pull_old(cloud, front, old, &after);
     match cloud.push_close(&pulled, close, at) {
         CloudClose::Closed { wrote } => wrote,
@@ -926,27 +1057,45 @@ fn close_in_bucket(
         CloudClose::Rebound(rebound) => refuse(
             front,
             "session_rebound",
-            format!("{p}: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
+            format!("{p}: {rebound}; {after}"),
             super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
         ),
-        CloudClose::Unavailable(reason) => refuse(
+        CloudClose::MoveUnfinished(m) => refuse(
             front,
-            "fence_unavailable",
-            format!(
-                "{p}: '{old}' couldn't be closed in the bucket: {reason}. Nothing of the close \
-                 was written, so '{old}' is still open, and '{name}' exists. Run the command \
-                 again"
-            ),
-            super::EXIT_INFRASTRUCTURE,
+            "rebind_incomplete",
+            format!("{p}: {m}; {after}"),
+            super::EXIT_CALLER_ERROR,
             serde_json::Value::Null,
         ),
+        CloudClose::Unavailable(reason) => {
+            let message = if closed {
+                format!(
+                    "{p}: '{old}''s log couldn't be written in the bucket: {reason}. {after}. \
+                     Run the command again"
+                )
+            } else {
+                format!(
+                    "{p}: '{old}' couldn't be closed in the bucket: {reason}. Nothing of the \
+                     close was written, so '{old}' is still open, and '{name}' exists. Run the \
+                     command again"
+                )
+            };
+            refuse(
+                front,
+                "fence_unavailable",
+                message,
+                super::EXIT_INFRASTRUCTURE,
+                serde_json::Value::Null,
+            )
+        }
     }
 }
 
 /// Write `close` to OLD's log, refusing as the outcome says. Returns
 /// whether anything was written. Under the cloud backend the close goes to
-/// the bucket's copy first ([`close_in_bucket`]).
+/// the bucket's copy first ([`close_in_bucket`]). `closed` is
+/// [`close_left`]'s.
 fn close_old(
     backend: &Backend,
     front: Front,
@@ -954,12 +1103,13 @@ fn close_old(
     name: &str,
     close: &Close,
     at: &str,
+    closed: bool,
 ) -> bool {
     let p = front.prefix();
     let local = match backend {
         Backend::Local(local) => local,
         Backend::Cloud(cloud) => {
-            return close_in_bucket(backend, cloud, front, old, name, close, at)
+            return close_in_bucket(backend, cloud, front, old, name, close, at, closed)
         }
     };
     match local.append_close(old, close, at, FENCE_LOCK_WAIT) {
@@ -971,17 +1121,29 @@ fn close_old(
             let after = left_as_is(front, old, name);
             refuse_fenced(backend, front, old, name, &other, &after)
         }
-        Ok(CloseOutcome::Unavailable) => refuse(
-            front,
-            "fence_unavailable",
-            format!(
-                "{p}: '{old}''s log stayed locked by another writer for {} seconds, so \
-                 '{old}' wasn't closed; '{name}' exists. Run the command again",
-                FENCE_LOCK_WAIT.as_secs()
-            ),
-            super::EXIT_INFRASTRUCTURE,
-            serde_json::Value::Null,
-        ),
+        Ok(CloseOutcome::Unavailable) => {
+            let message = if closed {
+                format!(
+                    "{p}: '{old}''s log stayed locked by another writer for {} seconds; {}. \
+                     Run the command again",
+                    FENCE_LOCK_WAIT.as_secs(),
+                    close_left(old, name, true)
+                )
+            } else {
+                format!(
+                    "{p}: '{old}''s log stayed locked by another writer for {} seconds, so \
+                     '{old}' wasn't closed; '{name}' exists. Run the command again",
+                    FENCE_LOCK_WAIT.as_secs()
+                )
+            };
+            refuse(
+                front,
+                "fence_unavailable",
+                message,
+                super::EXIT_INFRASTRUCTURE,
+                serde_json::Value::Null,
+            )
+        }
         Err(e) => {
             if let Some(rebound) = e
                 .chain()
@@ -990,18 +1152,36 @@ fn close_old(
                 refuse(
                     front,
                     "session_rebound",
-                    format!("{p}: {rebound}; '{old}' wasn't closed, and '{name}' exists"),
+                    format!("{p}: {rebound}; {}", close_left(old, name, closed)),
                     super::EXIT_CALLER_ERROR,
                     serde_json::Value::Null,
                 );
             }
-            failed(
-                front,
+            if let Some(m) = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<crate::session::rebind_fence::MoveUnfinished>())
+            {
+                refuse(
+                    front,
+                    "rebind_incomplete",
+                    format!("{p}: {m}; {}", close_left(old, name, closed)),
+                    super::EXIT_CALLER_ERROR,
+                    serde_json::Value::Null,
+                );
+            }
+            let message = if closed {
+                format!(
+                    "{p}: '{old}''s log couldn't be written: {e:#}; {}. Run the command again \
+                     to finish",
+                    close_left(old, name, true)
+                )
+            } else {
                 format!(
                     "{p}: '{old}' couldn't be closed: {e:#}; '{name}' exists. Run the \
                      command again to finish"
-                ),
-            )
+                )
+            };
+            failed(front, message)
         }
     }
 }

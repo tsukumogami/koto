@@ -279,10 +279,11 @@ pub enum Command {
         /// --replace-terminal, which reuses a finished session's own name.
         /// OLD's tick.lock is taken first (see --wait), so a tick of OLD in
         /// flight finishes before anything is written. Can't be used with
-        /// --continues, --supersede, --parent, --from-stdin, --vars-file,
-        /// --attach-live, --replace-terminal or --koto-leg. Refusals before
-        /// the lock write nothing; running the same command again finishes
-        /// an interrupted run, or changes nothing.
+        /// --continues, --supersede, --carry, --expect-state, --parent,
+        /// --from-stdin, --vars-file, --attach-live, --replace-terminal or
+        /// --koto-leg. Refusals before the lock write nothing; running the
+        /// same command again finishes an interrupted run, or changes
+        /// nothing.
         #[arg(long = "replaces", value_name = "OLD")]
         replaces: Option<String>,
 

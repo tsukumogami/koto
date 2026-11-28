@@ -1211,15 +1211,25 @@ pub(crate) fn append_close(
         replaced: true,
         ..close.fence.clone()
     };
-    if let Some(existing) = superseded_by_in_log(&tail.content) {
+    let fenced = superseded_by_in_log(&tail.content);
+    if let Some(existing) = &fenced {
         let ours = existing.replaced
             && existing.by == fence.by
             && existing.by_session_id == fence.by_session_id;
         if !ours {
-            return Ok(CloseOutcome::FencedByOther(existing));
+            return Ok(CloseOutcome::FencedByOther(existing.clone()));
         }
     }
     refuse_if_rebound(path, &tail.content, &fence.to_payload())?;
+    // A whole-binding move that still owes its later parts would be
+    // stranded by the fence: its next part is an append the fence refuses.
+    // A log this close already fenced is a re-run, and owes nothing new.
+    if fenced.is_none() {
+        let run = extract_session_id_from_path(path);
+        if let Some(m) = crate::session::rebind_fence::move_unfinished_in_log(&run, &tail.content) {
+            return Err(m.into());
+        }
+    }
     let payloads = close_payloads(&tail.content, close, &fence)?;
     if payloads.is_empty() && torn.is_none() {
         return Ok(CloseOutcome::Closed {
