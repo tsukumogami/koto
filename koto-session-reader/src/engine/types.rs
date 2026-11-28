@@ -251,6 +251,13 @@ pub struct SessionOrigin {
     /// is also under. A session without it keeps the plain rebind's fence.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub whole_epoch: u64,
+    /// Set by a whole-binding move's commit and cleared by its last write,
+    /// once the held-by links, the publish location and the command
+    /// environment are moved. A move that stopped after its commit leaves it
+    /// set until the move is run again. Omitted when false; an older koto
+    /// drops it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_parts_owed: bool,
 }
 
 fn is_zero_u64(n: &u64) -> bool {

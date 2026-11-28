@@ -1309,6 +1309,7 @@ mod tests {
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
             whole_epoch: 0,
+            whole_parts_owed: false,
         };
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
         let msg = r.body["error"].as_str().unwrap();
@@ -1373,6 +1374,7 @@ mod tests {
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
             whole_epoch: 0,
+            whole_parts_owed: false,
         }
     }
 
