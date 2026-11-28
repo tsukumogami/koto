@@ -1470,3 +1470,215 @@ fn a_replaced_child_its_parent_removed_still_reads_replaced_by_from_its_record()
     let json = status(&host, NEW);
     assert!(json.get("replaced_by").is_none(), "{json}");
 }
+
+/// A template whose one state's background action writes its shell's pid
+/// to `pid_file` and then sleeps, so the run's runner stays live.
+fn background_template(pid_file: &Path) -> String {
+    format!(
+        r#"---
+name: background
+version: "1.0"
+initial_state: run
+states:
+  run:
+    default_action:
+      command: 'echo $$ > {pid}; exec sleep 120'
+      background: true
+      timeout_secs: 300
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## run
+
+Run it.
+
+## done
+
+Done.
+"#,
+        pid = pid_file.display()
+    )
+}
+
+impl Host {
+    /// Open the anchor for harness session `harness` and return its name.
+    fn open_anchor(&self, harness: &str) -> String {
+        let out = expect_ok(
+            self.koto(&[
+                "session",
+                "anchor",
+                "open",
+                "--harness-session",
+                harness,
+                "--source",
+                "startup",
+            ]),
+            "anchor open",
+        );
+        out.stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("anchor="))
+            .expect("anchor open printed no anchor line")
+            .to_string()
+    }
+
+    /// `koto session rebind <name> --whole` from `cwd`, as the holder of
+    /// `anchor`.
+    fn whole_at(&self, cwd: &Path, name: &str, anchor: &str) -> Command {
+        let mut cmd = self.koto_at(cwd, &["session", "rebind", name, "--whole"]);
+        cmd.env("KOTO_ANCHOR", anchor);
+        cmd
+    }
+}
+
+/// Whether `pid` is a live process (not a zombie).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    // On Linux a zombie still answers signal 0, so read its state too.
+    #[cfg(target_os = "linux")]
+    if exists {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) {
+                return rest.split_whitespace().next() != Some("Z");
+            }
+        }
+    }
+    exists
+}
+
+/// Session [`NAME`], created in `old` and moved whole into `a`, so `old` is
+/// a retired anchor outside the current one, with a background runner of
+/// it live, started by a tick from `a` after the move. Dropping it kills the
+/// runner and its command.
+struct Retired {
+    host: Host,
+    old: PathBuf,
+    runner: i32,
+    group: i32,
+}
+
+impl Retired {
+    fn start() -> Self {
+        let host = Host::new();
+        let old = host.dir("old");
+        let a = host.dir("a");
+        let pid_file = host.root.join("action.pid");
+        host.write_template(&background_template(&pid_file));
+        host.init_at(&old, NAME);
+        let anchor = host.open_anchor("new");
+        expect_ok(host.whole_at(&a, NAME, &anchor), "rebind --whole");
+        let h = header(&host.log(NAME));
+        assert_eq!(h["origin"]["whole_epoch"], 1, "{h}");
+        assert_eq!(h["execution_dir"], a.to_str().unwrap(), "{h}");
+
+        let tick = expect_ok(host.koto_at(&a, &["next", NAME]), "the tick from a");
+        let runs = host.session_dir(NAME).join("runs");
+        let started = Instant::now();
+        let (runner, group) = loop {
+            let runner = std::fs::read_dir(&runs).ok().and_then(|dir| {
+                dir.flatten().find_map(|run| {
+                    let text = std::fs::read_to_string(run.path().join("run.json")).ok()?;
+                    let record: Value = serde_json::from_str(&text).ok()?;
+                    i32::try_from(record["runner_pid"].as_i64()?).ok()
+                })
+            });
+            let group = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok());
+            if let (Some(runner), Some(group)) = (runner, group) {
+                break (runner, group);
+            }
+            assert!(
+                started.elapsed() < START_BOUND,
+                "the runner didn't start within {START_BOUND:?}: {}",
+                tick.describe()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(alive(runner), "the runner isn't live: {}", tick.describe());
+        Retired {
+            host,
+            old,
+            runner,
+            group,
+        }
+    }
+}
+
+impl Drop for Retired {
+    fn drop(&mut self) {
+        // SAFETY: SIGKILL to the command's group and to its runner, both
+        // started by this test through koto, and only while they're live.
+        unsafe {
+            if alive(self.group) {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+            if alive(self.runner) {
+                libc::kill(self.runner, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[test]
+fn session_replace_from_a_retired_anchor_is_refused_before_it_stops_the_runner() {
+    let retired = Retired::start();
+    let host = &retired.host;
+    host.init_at(&host.ws, NEW);
+    let old_log = std::fs::read(host.log(NAME)).unwrap();
+    let new_files = files(&host.session_dir(NEW));
+
+    let out = run(host.koto_at(&retired.old, &["session", "replace", NAME, "--by", NEW]));
+
+    assert_refused_nested(&out, 2, "session_rebound");
+    assert!(
+        alive(retired.runner),
+        "the refused replace stopped {NAME}'s runner: {}",
+        out.describe()
+    );
+    assert_eq!(
+        files(&host.session_dir(NEW)),
+        new_files,
+        "the refused replace wrote into {NEW}: {}",
+        out.describe()
+    );
+    assert_eq!(
+        std::fs::read(host.log(NAME)).unwrap(),
+        old_log,
+        "the refused replace wrote to {NAME}'s log"
+    );
+}
+
+#[test]
+fn init_replaces_from_a_retired_anchor_is_refused_before_it_creates_the_new_run() {
+    let retired = Retired::start();
+    let host = &retired.host;
+    let old_log = std::fs::read(host.log(NAME)).unwrap();
+    let template = host.template();
+
+    let out = run(host.koto_at(
+        &retired.old,
+        &["init", NEW, "--template", &template, "--replaces", NAME],
+    ));
+
+    assert_refused(&out, 2, "session_rebound");
+    assert!(
+        alive(retired.runner),
+        "the refused replace stopped {NAME}'s runner: {}",
+        out.describe()
+    );
+    assert!(
+        !host.session_dir(NEW).exists(),
+        "the refused replace created {NEW}: {}",
+        out.describe()
+    );
+    assert_eq!(
+        std::fs::read(host.log(NAME)).unwrap(),
+        old_log,
+        "the refused replace wrote to {NAME}'s log"
+    );
+}

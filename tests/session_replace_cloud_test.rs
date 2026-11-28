@@ -435,3 +435,39 @@ fn a_cloud_replace_refuses_a_run_another_host_rebound() {
     );
     assert_eq!(h.local_log("p"), local_before, "this host's copy changed");
 }
+
+/// The same rebound run, replaced from the directory the move retired: the
+/// refusal comes before anything is done, so `s` is never created, on this
+/// host or in the bucket, and neither copy of OLD changes.
+#[test]
+fn a_cloud_replace_of_a_run_another_host_rebound_creates_nothing() {
+    let h = Host::new();
+    h.old();
+    let moved = h.root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    let bucket_before = moved_whole(&h.bucket_log("p"), &h.ws, &moved);
+    h.s3.put(&h.state_key("p"), &bucket_before);
+    let local_before = h.local_log("p");
+
+    let out = h.replace();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(
+        printed_json(&out.stdout)["code"],
+        "session_rebound",
+        "{out:?}"
+    );
+    assert!(
+        !h.root.join("koto-home").join("sessions").join("s").exists(),
+        "the refused replace created s on this host: {out:?}"
+    );
+    assert!(
+        h.s3.object(&h.state_key("s")).is_none(),
+        "the refused replace put s in the bucket: {out:?}"
+    );
+    assert_eq!(
+        h.bucket_log("p"),
+        bucket_before,
+        "the bucket's copy changed"
+    );
+    assert_eq!(h.local_log("p"), local_before, "this host's copy changed");
+}
