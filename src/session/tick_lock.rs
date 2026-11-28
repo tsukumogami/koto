@@ -10,12 +10,118 @@
 //! A same-host import can swap the session's directory while a taker waits
 //! for the lock, which then sits on the old copy's file. [`still_current`]
 //! tells a taker that holds it whether the file at the lock's path is still
-//! the one it holds.
+//! the one it holds. [`take_exclusive`] takes the lock exclusive within a
+//! wait, taking it again at its path when the file it got was replaced.
 
-#[cfg(unix)]
 use std::fs::File;
-#[cfg(unix)]
 use std::path::Path;
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
+
+/// How often a lock that is waited for is asked for again.
+#[cfg(unix)]
+const POLL: Duration = Duration::from_millis(50);
+
+/// The lock was still held elsewhere once the wait had passed.
+#[derive(Debug)]
+pub(crate) struct Busy {
+    /// How long the taker waited before giving up.
+    pub(crate) waited_for: Duration,
+}
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tick.lock was still held elsewhere after {} ms",
+            self.waited_for.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// Why [`take_exclusive`] didn't take the lock.
+#[derive(Debug)]
+pub(crate) enum TakeError {
+    /// The session's directory doesn't exist; nothing was created.
+    Missing,
+    /// Still held elsewhere once the wait had passed.
+    Busy(Busy),
+    /// The lock file couldn't be opened or locked.
+    Failed(anyhow::Error),
+    /// The platform has no `flock`.
+    #[cfg(not(unix))]
+    Unsupported,
+}
+
+/// Take `dir`'s `tick.lock` exclusive, asking every 50 ms until `wait` has
+/// passed, and say whether it had to wait. A lock file a same-host import
+/// replaced while the taker waited is taken again at its path, in what is
+/// left of the same wait. A `wait` of zero asks once.
+#[cfg(unix)]
+pub(crate) fn take_exclusive(dir: &Path, wait: Duration) -> Result<(File, bool), TakeError> {
+    use anyhow::Context as _;
+    let path = dir.join(crate::session::TICK_LOCK_FILE);
+    let started = Instant::now();
+    let mut waited = false;
+    loop {
+        let Some(file) = open(dir)
+            .with_context(|| format!("failed to open {}", path.display()))
+            .map_err(TakeError::Failed)?
+        else {
+            return Err(TakeError::Missing);
+        };
+        match flock_within(&file, wait, started).map_err(TakeError::Failed)? {
+            Some(w) => waited |= w,
+            None => {
+                return Err(TakeError::Busy(Busy {
+                    waited_for: started.elapsed(),
+                }))
+            }
+        }
+        if still_current(&file, &path) {
+            return Ok((file, waited));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn take_exclusive(_dir: &Path, _wait: Duration) -> Result<(File, bool), TakeError> {
+    Err(TakeError::Unsupported)
+}
+
+/// Ask for `file`'s exclusive `flock` every 50 ms until `wait` has passed
+/// since `started`: `Some(waited)` once held, where `waited` says whether
+/// the first ask failed, and `None` when it was still held elsewhere then.
+/// A `wait` of zero asks once.
+#[cfg(unix)]
+pub(crate) fn flock_within(
+    file: &File,
+    wait: Duration,
+    started: Instant,
+) -> anyhow::Result<Option<bool>> {
+    use std::os::unix::io::AsRawFd;
+    let mut waited = false;
+    loop {
+        // SAFETY: flock on a descriptor `file` owns, for the duration of the
+        // call; it neither closes nor keeps the descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(waited));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(anyhow::anyhow!("failed to lock: {err}"));
+        }
+        waited = true;
+        let elapsed = started.elapsed();
+        if elapsed >= wait {
+            return Ok(None);
+        }
+        std::thread::sleep(POLL.min(wait - elapsed));
+    }
+}
 
 /// Open `dir`'s `tick.lock` for reading and writing, creating the file when
 /// it is missing. `Ok(None)` when `dir` doesn't exist, with nothing created;
@@ -57,6 +163,7 @@ pub fn still_current(file: &File, path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::session::TICK_LOCK_FILE;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn open_creates_the_lock_in_an_existing_directory_and_keeps_its_bytes() {
@@ -93,5 +200,39 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"").unwrap();
         assert!(!still_current(&file, &path));
+    }
+
+    #[test]
+    fn take_exclusive_returns_busy_after_the_wait() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let held = open(dir.path()).unwrap().unwrap();
+        // SAFETY: flock on a descriptor `held` owns, for the duration of the call.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let wait = Duration::from_millis(150);
+        let started = Instant::now();
+        let busy = match take_exclusive(dir.path(), wait) {
+            Err(TakeError::Busy(busy)) => busy,
+            other => panic!("expected Busy, got {other:?}"),
+        };
+        assert!(started.elapsed() >= wait);
+        assert!(busy.waited_for >= wait);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(TICK_LOCK_FILE)]);
+        drop(held);
+    }
+
+    #[test]
+    fn take_exclusive_takes_a_free_lock_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, waited) = take_exclusive(dir.path(), Duration::from_millis(150)).unwrap();
+        assert!(!waited);
+        assert!(still_current(&file, &dir.path().join(TICK_LOCK_FILE)));
     }
 }

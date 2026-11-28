@@ -14,6 +14,8 @@ pub mod decisions;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
+#[cfg(unix)]
+mod init_replace;
 pub mod init_supersede;
 pub(crate) mod move_aside;
 pub mod next;
@@ -268,6 +270,35 @@ pub enum Command {
         /// written) unless PRED is in state STATE.
         #[arg(long = "expect-state", value_name = "STATE", requires = "supersede")]
         expect_state: Option<String>,
+
+        /// Restart OLD's work as this new session, and close OLD: it is
+        /// cancelled, naming this session, and fenced so nothing drives it
+        /// again, in one write to its log after this session is created.
+        /// This session records OLD in its `koto/replaces` key and neither
+        /// continues OLD nor carries anything from it. Not the same as
+        /// --replace-terminal, which reuses a finished session's own name.
+        /// OLD's tick.lock is taken first (see --wait), so a tick of OLD in
+        /// flight finishes before anything is written. Can't be used with
+        /// --continues, --supersede, --carry, --expect-state, --parent,
+        /// --from-stdin, --vars-file, --attach-live, --replace-terminal or
+        /// --koto-leg. Refusals before the lock write nothing; running the
+        /// same command again finishes an interrupted run, or changes
+        /// nothing.
+        #[arg(long = "replaces", value_name = "OLD")]
+        replaces: Option<String>,
+
+        /// With --replaces, ask for OLD's tick.lock once and, when a tick
+        /// holds it, close OLD anyway, reporting `tick_in_flight: true`;
+        /// only the fence then holds that tick's later writes off. For a
+        /// tick that can't be stopped. Can't be used with --wait.
+        #[arg(long, requires = "replaces", conflicts_with = "wait")]
+        abandon_tick: bool,
+
+        /// With --replaces, how long to wait for a tick of OLD in flight to
+        /// return, in seconds (default 10). Still held then refuses
+        /// `session_busy`, exit 1, nothing written; 0 refuses at once.
+        #[arg(long, value_name = "SECS", requires = "replaces")]
+        wait: Option<u64>,
 
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
@@ -1111,6 +1142,42 @@ pub enum SessionCommand {
         wait: Option<u64>,
     },
 
+    /// Close a run in favour of an existing session that restarts its work.
+    ///
+    /// The close `koto init NEW --replaces OLD` makes, for a NEW that
+    /// already exists: OLD's runner is stopped, and OLD is cancelled,
+    /// naming NEW, and fenced so nothing drives it again, in one write to
+    /// its log. NEW gets a `koto/replaces` key naming OLD when it doesn't
+    /// hold one, which also repairs a NEW an interrupted `koto init
+    /// --replaces` left without it. A NEW whose key names another run is
+    /// refused with `session_exists`. OLD's tick.lock is taken first (see
+    /// --wait). Refusals print `{"error": {"code", "message"}, "command":
+    /// "session replace"}` and, before the lock, write nothing. Running the
+    /// same command again finishes an interrupted close, or changes
+    /// nothing.
+    Replace {
+        /// The run to close
+        #[arg(value_name = "OLD")]
+        old: String,
+
+        /// The existing session that replaces OLD
+        #[arg(long = "by", value_name = "NEW")]
+        by: String,
+
+        /// Ask for OLD's tick.lock once and, when a tick holds it, close
+        /// OLD anyway, reporting `tick_in_flight: true`; only the fence
+        /// then holds that tick's later writes off. Can't be used with
+        /// --wait.
+        #[arg(long, conflicts_with = "wait")]
+        abandon_tick: bool,
+
+        /// How long to wait for a tick of OLD in flight to return, in
+        /// seconds (default 10). Still held then refuses `session_busy`,
+        /// exit 1, nothing written; 0 refuses at once.
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
+    },
+
     /// Import a session from another workspace's copy in the bucket.
     ///
     /// Reads session <NAME> as the workspace at --from pushed it to the
@@ -1696,14 +1763,20 @@ fn locate_or_serve(
 /// The message and fields of a `session_superseded` refusal of `session`,
 /// or `None` when `session` isn't superseded. The message names the newest
 /// session in its supersede chain, the one to continue in; the fields carry
-/// the direct successor, the newest member and the fence's actor.
+/// the direct successor, the newest member and the fence's actor. A fence
+/// marked `replaced` says the session was replaced rather than superseded.
 fn superseded_refusal(
     backend: &dyn SessionBackend,
     session: &str,
 ) -> Option<(String, serde_json::Value)> {
     let superseded = crate::session::links::newest_member(backend, session)?;
+    let how = if superseded.fence.replaced {
+        "replaced"
+    } else {
+        "superseded"
+    };
     let message = format!(
-        "session '{session}' was superseded by '{}' (session_superseded), so nothing was \
+        "session '{session}' was {how} by '{}' (session_superseded), so nothing was \
          written; continue in '{}'",
         superseded.fence.by, superseded.newest
     );
@@ -2439,12 +2512,31 @@ pub fn run(app: App) -> Result<()> {
             supersede,
             carry,
             expect_state,
+            replaces,
+            abandon_tick,
+            wait,
             execution_dir,
             legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
             let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if replaces.is_some()
+                && (entry_flags_used
+                    || continues.is_some()
+                    || supersede
+                    || !carry.is_empty()
+                    || expect_state.is_some()
+                    || parent.is_some()
+                    || from_stdin
+                    || vars_file.is_some())
+            {
+                init_entry::usage_error(
+                    "--replaces can't be used with --continues, --supersede, --carry, \
+                     --expect-state, --parent, --from-stdin, --vars-file, --attach-live, \
+                     --replace-terminal or --koto-leg",
+                );
+            }
             if supersede && (entry_flags_used || from_stdin || parent.is_some()) {
                 init_entry::usage_error(
                     "--supersede can't be used with --parent, --from-stdin, --attach-live, \
@@ -2510,6 +2602,35 @@ pub fn run(app: App) -> Result<()> {
                     2,
                 ),
             };
+            if let Some(old) = replaces.as_deref() {
+                let template = template.unwrap_or_else(|| {
+                    init_entry::usage_error("koto init --replaces requires --template <path>")
+                });
+                let execution_dir = execution_dir.map(canonical_dir);
+                #[cfg(unix)]
+                init_replace::run(
+                    &backend,
+                    &init_replace::ReplaceArgs {
+                        name: &name,
+                        template: &template,
+                        vars: &vars,
+                        intent: intent.as_deref(),
+                        dispatched_by: dispatched_by.as_deref(),
+                        old,
+                        execution_dir: execution_dir.as_deref(),
+                        legacy_environment,
+                        wait,
+                        abandon_tick,
+                    },
+                )?;
+                #[cfg(not(unix))]
+                {
+                    let _ = (old, template, execution_dir, wait, abandon_tick);
+                    init_entry::usage_error("--replaces needs flock, which this platform lacks");
+                }
+                session_anchor::hold_from_env(&backend, &name, "init");
+                return Ok(());
+            }
             if supersede {
                 // `requires` holds both: clap refuses --supersede without
                 // --continues, and the --from-stdin path is refused above.
@@ -3034,6 +3155,32 @@ pub fn run(app: App) -> Result<()> {
                         );
                     }
                     session::handle_rebind(&backend, &name, to.as_deref())
+                }
+                SessionCommand::Replace {
+                    old,
+                    by,
+                    abandon_tick,
+                    wait,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        init_replace::run_session(&backend, &old, &by, wait, abandon_tick)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (old, by, abandon_tick, wait);
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": {
+                                    "code": "invalid_usage",
+                                    "message": "koto session replace needs flock, which this \
+                                                platform lacks",
+                                },
+                                "command": "session replace",
+                            }),
+                            EXIT_CALLER_ERROR,
+                        )
+                    }
                 }
                 SessionCommand::Import {
                     name,
@@ -5232,6 +5379,7 @@ fn finish_terminal_tick(
                 truncated: false,
                 finished_at: crate::engine::types::now_iso8601(),
                 removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+                replaced_by: None,
             },
         );
         #[cfg(test)]
@@ -5366,6 +5514,11 @@ pub(crate) fn finished_record_for_child(
     };
 
     let (header, events) = backend.read_events(name).ok()?;
+    // A child a replace closed names the run that replaced it, so its status
+    // still says so once the parent has removed it.
+    let replaced_by = crate::engine::persistence::superseded_by(&events)
+        .filter(|fence| fence.replaced)
+        .map(|fence| fence.by);
     let base = |state: String, status: &str, failure: bool, result| FinishedRecord {
         v: RECORD_VERSION,
         name: name.to_string(),
@@ -5378,6 +5531,7 @@ pub(crate) fn finished_record_for_child(
         truncated: false,
         finished_at: crate::engine::types::now_iso8601(),
         removed_by: REMOVED_BY_PARENT.to_string(),
+        replaced_by: replaced_by.clone(),
     };
     // The sweep treats any cancel as terminal, so the record does too.
     let cancelled_in = events.iter().rev().find_map(|e| match &e.payload {
@@ -10120,6 +10274,11 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                 if record.truncated {
                     response["result_truncated"] = serde_json::json!(true);
                 }
+                // A replaced session names the run that replaced it, as its
+                // answer did while it was kept.
+                if let Some(by) = &record.replaced_by {
+                    response["replaced_by"] = serde_json::json!(by);
+                }
                 println!("{}", serde_json::to_string(&response)?);
                 return Ok(());
             }
@@ -10218,6 +10377,24 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
         "template_hash": machine_state.template_hash,
         "is_terminal": is_terminal,
     });
+
+    // A run another run replaced (its fence is marked `replaced`) names its
+    // replacement. When it stands cancelled, which the close makes it unless
+    // it had already finished, it reads as finished and cancelled, the way a
+    // removed cancelled session's record reads. A kept cancelled run with no
+    // such fence reads as it always has.
+    if let Some(fence) = crate::engine::persistence::superseded_by(&events) {
+        if fence.replaced {
+            response["replaced_by"] = serde_json::json!(fence.by);
+            let stands_cancelled = crate::session::inventory::last_standing_event(&events)
+                .is_some_and(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+            if stands_cancelled {
+                let status = crate::session::finished::STATUS_CANCELLED;
+                response["is_terminal"] = serde_json::json!(true);
+                response["status"] = serde_json::json!(status);
+            }
+        }
+    }
 
     // Verify the compiled template read above against the hash recorded
     // in the session header -- the same check `koto next` performs
@@ -10811,6 +10988,8 @@ fn handle_cancel(
     let payload = EventPayload::WorkflowCancelled {
         state: current_state.clone(),
         reason: "cancelled by user".to_string(),
+        replaced_by: None,
+        replaced_by_session_id: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({

@@ -46,9 +46,6 @@ const COMMAND: &str = "session rebind";
 /// How long the move waits for a tick in flight when `--wait` isn't given.
 const DEFAULT_WAIT: Duration = Duration::from_secs(10);
 
-/// How often a lock the move waits for is asked for again.
-const POLL: Duration = Duration::from_millis(50);
-
 /// The bound on the waits for the session's other locks (its manifest, its
 /// log's append lock and `environment.lock`), which are held only for a
 /// few writes at a time.
@@ -1068,45 +1065,32 @@ fn finish_move(backend: &Backend, name: &str) -> Result<()> {
     })
 }
 
-/// Take `name`'s `tick.lock` exclusive, asking every [`POLL`] until `wait`
-/// has passed, and say whether it had to wait. Past `wait` the move refuses
-/// with `session_busy`, exit 1, having written nothing. A lock file a
-/// same-host import replaced while the move waited is taken again at its
-/// path, in what is left of the same wait.
-#[cfg(unix)]
+/// Take `name`'s `tick.lock` exclusive within `wait`
+/// ([`crate::session::tick_lock::take_exclusive`]), and say whether it had
+/// to wait. Past `wait` the move refuses with `session_busy`, exit 1, having
+/// written nothing.
 fn take_tick_lock(name: &str, dir: &Path, wait: Duration) -> Result<(std::fs::File, bool)> {
-    let path = dir.join(crate::session::TICK_LOCK_FILE);
-    let started = Instant::now();
-    let mut waited = false;
-    loop {
-        let Some(file) = crate::session::tick_lock::open(dir)
-            .with_context(|| format!("failed to open {}", path.display()))?
-        else {
-            anyhow::bail!("session '{}' does not exist", name);
-        };
-        match flock_within(&file, wait, started)? {
-            Some(w) => waited |= w,
-            None => refuse(
-                "session_busy",
-                format!(
-                    "session '{name}' is busy: a tick of it still held {} after {} s; nothing \
-                     was written. Run `koto session rebind {name} --whole` again once the tick \
-                     returns, or give --wait more seconds",
-                    path.display(),
-                    wait.as_secs()
-                ),
-                1,
+    use crate::session::tick_lock::{take_exclusive, TakeError};
+    match take_exclusive(dir, wait) {
+        Ok(taken) => Ok(taken),
+        Err(TakeError::Missing) => anyhow::bail!("session '{}' does not exist", name),
+        Err(TakeError::Failed(e)) => Err(e),
+        Err(TakeError::Busy(_)) => refuse(
+            "session_busy",
+            format!(
+                "session '{name}' is busy: a tick of it still held {} after {} s; nothing \
+                 was written. Run `koto session rebind {name} --whole` again once the tick \
+                 returns, or give --wait more seconds",
+                dir.join(crate::session::TICK_LOCK_FILE).display(),
+                wait.as_secs()
             ),
-        }
-        if crate::session::tick_lock::still_current(&file, &path) {
-            return Ok((file, waited));
+            1,
+        ),
+        #[cfg(not(unix))]
+        Err(TakeError::Unsupported) => {
+            anyhow::bail!("koto session rebind --whole needs flock, which this platform lacks")
         }
     }
-}
-
-#[cfg(not(unix))]
-fn take_tick_lock(_name: &str, _dir: &Path, _wait: Duration) -> Result<(std::fs::File, bool)> {
-    anyhow::bail!("koto session rebind --whole needs flock, which this platform lacks")
 }
 
 /// Open `path` (created when missing) and lock it exclusive within `wait`:
@@ -1119,7 +1103,7 @@ fn lock_file_within(path: &Path, wait: Duration) -> Result<Option<std::fs::File>
         .write(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
-    Ok(flock_within(&file, wait, Instant::now())?.map(|_| file))
+    Ok(crate::session::tick_lock::flock_within(&file, wait, Instant::now())?.map(|_| file))
 }
 
 #[cfg(not(unix))]
@@ -1132,33 +1116,6 @@ fn lock_file_within(path: &Path, _wait: Duration) -> Result<Option<std::fs::File
             .open(path)
             .with_context(|| format!("failed to open {}", path.display()))?,
     ))
-}
-
-/// Ask for `file`'s exclusive `flock` every [`POLL`] until `wait` has
-/// passed since `started`: `Some(waited)` once held, where `waited` says
-/// whether the first ask failed, and `None` when it was still held
-/// elsewhere then. A `wait` of zero asks once.
-#[cfg(unix)]
-fn flock_within(file: &std::fs::File, wait: Duration, started: Instant) -> Result<Option<bool>> {
-    use std::os::unix::io::AsRawFd;
-    let mut waited = false;
-    loop {
-        // SAFETY: flock on a descriptor `file` owns, for the duration of the
-        // call; it neither closes nor keeps the descriptor.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(waited));
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(anyhow::anyhow!("failed to lock: {err}"));
-        }
-        waited = true;
-        let elapsed = started.elapsed();
-        if elapsed >= wait {
-            return Ok(None);
-        }
-        std::thread::sleep(POLL.min(wait - elapsed));
-    }
 }
 
 #[cfg(test)]

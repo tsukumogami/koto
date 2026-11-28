@@ -15,7 +15,8 @@
 //! and a valid workflow name before a path is built from it. Each hop's
 //! log must exist and its header's `session_id` must equal the fence's
 //! `by_session_id`; a hop that fails either, or that the walk already
-//! visited, ends the walk at the last good member. After
+//! visited, ends the walk at the last good member, and so does a fence
+//! marked `replaced`, which a restart wrote, not a supersede. After
 //! [`MAX_CHAIN_HOPS`] hops the walk gives up and the ring reaches the
 //! principal only.
 //!
@@ -69,7 +70,9 @@ fn read_member(
 /// A broken hop (a name that isn't usable, a missing or unreadable log, a
 /// header whose `session_id` isn't the fence's `by_session_id`, or a
 /// member already visited) ends the walk at the last good member before
-/// it. The principal itself is never returned.
+/// it. So does a fence marked `replaced`: the run it names replaced the
+/// member rather than continuing it. The principal itself is never
+/// returned.
 pub fn newest_member(sessions_dir: &Path, principal: &str) -> Option<String> {
     if !usable_name(principal) {
         return None;
@@ -78,6 +81,11 @@ pub fn newest_member(sessions_dir: &Path, principal: &str) -> Option<String> {
     let mut visited = HashSet::from([principal.to_string()]);
     let mut last_good = None;
     for _ in 0..MAX_CHAIN_HOPS {
+        // A replaced run's fence names the run that replaced it, which took
+        // on none of its requests: the ring stops short of it.
+        if fence.replaced {
+            return last_good;
+        }
         let member = fence.by;
         if !usable_name(&member) || visited.contains(&member) {
             return last_good;
@@ -128,6 +136,7 @@ mod tests {
                 by_session_id: by_session_id.to_string(),
                 actor: SupersedeActor::default(),
                 at: "2026-01-01T00:00:00Z".to_string(),
+                replaced: false,
             },
             idempotency_hash: None,
         };
@@ -196,6 +205,57 @@ mod tests {
         fence(tmp.path(), "b", "a", "id-a");
         assert_eq!(newest_member(tmp.path(), "a").as_deref(), Some("b"));
         assert_eq!(newest_member(tmp.path(), "b").as_deref(), Some("a"));
+    }
+
+    /// Close `name` for `by`, whose session id the fence records as
+    /// `by_session_id`, with the fence a replace writes: one marked
+    /// `replaced`.
+    fn replaced_fence(dir: &Path, name: &str, by: &str, by_session_id: &str) {
+        let event = Event {
+            seq: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "session_superseded".to_string(),
+            payload: EventPayload::SessionSuperseded {
+                by: by.to_string(),
+                by_session_id: by_session_id.to_string(),
+                actor: SupersedeActor::default(),
+                at: "2026-01-01T00:00:00Z".to_string(),
+                replaced: true,
+            },
+            idempotency_hash: None,
+        };
+        let mut content = std::fs::read_to_string(log(dir, name)).unwrap();
+        content.push_str(&serde_json::to_string(&event).unwrap());
+        content.push('\n');
+        std::fs::write(log(dir, name), content).unwrap();
+    }
+
+    #[test]
+    fn newest_member_stops_at_a_replaced_fence() {
+        // A principal another run replaced has no newest member: the ring
+        // reaches the principal only.
+        let tmp = tempfile::tempdir().unwrap();
+        session(tmp.path(), "a", "id-a");
+        session(tmp.path(), "b", "id-b");
+        replaced_fence(tmp.path(), "a", "b", "id-b");
+        assert_eq!(newest_member(tmp.path(), "a"), None);
+
+        // A replaced member further on ends the walk at that member.
+        let tmp = tempfile::tempdir().unwrap();
+        chain(tmp.path(), &["a", "b"]);
+        session(tmp.path(), "c", "id-c");
+        replaced_fence(tmp.path(), "b", "c", "id-c");
+        assert_eq!(newest_member(tmp.path(), "a").as_deref(), Some("b"));
+        assert_eq!(newest_member(tmp.path(), "b"), None);
+
+        // The run that replaced a member is a principal of its own, and its
+        // own supersede chain is followed as before.
+        let tmp = tempfile::tempdir().unwrap();
+        session(tmp.path(), "a", "id-a");
+        chain(tmp.path(), &["b", "c"]);
+        replaced_fence(tmp.path(), "a", "b", "id-b");
+        assert_eq!(newest_member(tmp.path(), "a"), None);
+        assert_eq!(newest_member(tmp.path(), "b").as_deref(), Some("c"));
     }
 
     #[test]

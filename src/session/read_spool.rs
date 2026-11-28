@@ -199,6 +199,8 @@ mod tests {
         let other = EventPayload::WorkflowCancelled {
             state: "work".to_string(),
             reason: "x".to_string(),
+            replaced_by: None,
+            replaced_by_session_id: None,
         };
         let anchored = match read_payload("a") {
             EventPayload::ContextRead {

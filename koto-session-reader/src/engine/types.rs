@@ -1687,6 +1687,14 @@ pub enum EventPayload {
     WorkflowCancelled {
         state: String,
         reason: String,
+        /// The run that replaced this one, on a cancel written by the
+        /// close of a replaced run. Absent on every other cancel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced_by: Option<String>,
+        /// The replacing run's session id, as its header records it.
+        /// Present only beside `replaced_by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced_by_session_id: Option<String>,
     },
     DefaultActionExecuted {
         state: String,
@@ -1849,9 +1857,7 @@ pub enum EventPayload {
     /// Emitted by `koto session update --intent` to update the workflow's
     /// stated goal concurrently with execution. Multiple events may appear;
     /// the last one wins (see `derive_intent`).
-    IntentUpdated {
-        intent: String,
-    },
+    IntentUpdated { intent: String },
     /// Emitted on the first tick of a session that carries no
     /// `execution_dir` in its header -- a session created before
     /// execution anchoring existed (R14). The tick adopts the
@@ -1862,9 +1868,7 @@ pub enum EventPayload {
     /// is what makes it happen once. A later tick finds
     /// `execution_dir` recorded and takes the ordinary path, so
     /// exactly one of these can appear per session.
-    ExecutionAnchorAdopted {
-        anchor: PathBuf,
-    },
+    ExecutionAnchorAdopted { anchor: PathBuf },
     /// Emitted on the first tick of a session whose header carries no
     /// `command_environment` -- a session created by a koto that recorded
     /// none (DESIGN-koto-fixed-environment.md, R16). The tick records the
@@ -1938,6 +1942,11 @@ pub enum EventPayload {
         by_session_id: String,
         actor: SupersedeActor,
         at: String,
+        /// True when `by` replaced this run rather than continuing it: the
+        /// close that wrote this fence also cancelled the run. Omitted when
+        /// false, so a plain supersede fence reads as it always has.
+        #[serde(default, skip_serializing_if = "is_false")]
+        replaced: bool,
     },
     /// A state's `default_action` delivered its stdout under the name the
     /// state declared in `capture_stdout_as`
@@ -1955,10 +1964,7 @@ pub enum EventPayload {
     /// The event is additive and does not move `CURRENT_SCHEMA_VERSION`: an
     /// older build lands it in [`Unknown`](EventPayload::Unknown) and keeps
     /// reading the log.
-    VariableCaptured {
-        key: String,
-        value: String,
-    },
+    VariableCaptured { key: String, value: String },
     /// An accepted attach re-applied the session's `rebind: true` variables
     /// from the attaching invocation (`crate::engine::variables`).
     ///
@@ -2889,6 +2895,8 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::WorkflowCancelled {
                     state: p.state,
                     reason: p.reason,
+                    replaced_by: p.replaced_by,
+                    replaced_by_session_id: p.replaced_by_session_id,
                 }
             }
             "default_action_executed" => {
@@ -3032,6 +3040,7 @@ impl<'de> Deserialize<'de> for Event {
                     by_session_id: p.by_session_id,
                     actor: p.actor,
                     at: p.at,
+                    replaced: p.replaced,
                 }
             }
             "variable_captured" => {
@@ -3504,6 +3513,10 @@ struct InstructionsDeliveredPayload {
 struct WorkflowCancelledPayload {
     state: String,
     reason: String,
+    #[serde(default)]
+    replaced_by: Option<String>,
+    #[serde(default)]
+    replaced_by_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3613,6 +3626,8 @@ struct SessionSupersededPayload {
     #[serde(default)]
     actor: SupersedeActor,
     at: String,
+    #[serde(default)]
+    replaced: bool,
 }
 
 #[derive(Deserialize)]
@@ -5628,7 +5643,9 @@ mod tests {
                 by_session_id,
                 actor,
                 at,
+                replaced,
             } => {
+                assert!(!replaced);
                 assert_eq!(by, "s");
                 assert_eq!(by_session_id, "9f2e");
                 assert_eq!(
@@ -5653,6 +5670,75 @@ mod tests {
         let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z"}}"#;
         let event: Event = serde_json::from_str(json).unwrap();
         assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn session_superseded_round_trips_replaced_and_omits_it_when_false() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z","replaced":true}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::SessionSuperseded { by, replaced, .. } => {
+                assert_eq!(by, "s");
+                assert!(*replaced);
+            }
+            other => panic!("expected a session_superseded payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        let plain = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z"}}"#;
+        let event: Event = serde_json::from_str(plain).unwrap();
+        match &event.payload {
+            EventPayload::SessionSuperseded { replaced, .. } => assert!(!*replaced),
+            other => panic!("expected a session_superseded payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
+
+        // A false flag written out by hand reads the same and is dropped.
+        let explicit = plain.replace(
+            r#""at":"2026-01-01T00:00:00Z"}"#,
+            r#""at":"2026-01-01T00:00:00Z","replaced":false}"#,
+        );
+        let event: Event = serde_json::from_str(&explicit).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
+    }
+
+    #[test]
+    fn workflow_cancelled_round_trips_replaced_by_and_omits_it_when_none() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"replaced by s","replaced_by":"s","replaced_by_session_id":"9f2e"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::WorkflowCancelled {
+                state,
+                reason,
+                replaced_by,
+                replaced_by_session_id,
+            } => {
+                assert_eq!(state, "work");
+                assert_eq!(reason, "replaced by s");
+                assert_eq!(replaced_by.as_deref(), Some("s"));
+                assert_eq!(replaced_by_session_id.as_deref(), Some("9f2e"));
+            }
+            other => panic!("expected a workflow_cancelled payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "workflow_cancelled");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        let plain = r#"{"seq":5,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_cancelled","payload":{"state":"work","reason":"cancelled by user"}}"#;
+        let event: Event = serde_json::from_str(plain).unwrap();
+        match &event.payload {
+            EventPayload::WorkflowCancelled {
+                replaced_by,
+                replaced_by_session_id,
+                ..
+            } => {
+                assert_eq!(replaced_by, &None);
+                assert_eq!(replaced_by_session_id, &None);
+            }
+            other => panic!("expected a workflow_cancelled payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
     }
 
     #[test]
@@ -5684,6 +5770,7 @@ mod tests {
                     by_session_id: "9f2e".to_string(),
                     actor: SupersedeActor::default(),
                     at: "2026-01-01T00:00:00Z".to_string(),
+                    replaced: false,
                 },
             ),
         ];

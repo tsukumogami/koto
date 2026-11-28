@@ -3,6 +3,12 @@
 //! own workspace prefix, the fence pushed back conditional on that copy,
 //! and the carried keys read from the same prefix.
 //!
+//! The close `koto init --replaces` and `koto session replace` make
+//! (`src/cli/init_replace.rs`) goes the same way: every line it owes the
+//! bucket's copy (the stop's events, the cancel and the replaced fence) is
+//! worked out against the pulled bytes by the writer the local backend
+//! uses, and goes up in the one conditional PUT, with the same rules.
+//!
 //! The fence is the one write this makes under another workspace's prefix,
 //! and it is a PUT with `If-Match` on the ETag the pull returned, as every
 //! state push has been since koto#480. Anything but a confirmed PUT (a 412,
@@ -31,11 +37,13 @@ use super::{
 };
 use crate::cache::sha256_hex;
 use crate::engine::persistence::{
-    append_supersede_fence, superseded_by, SessionSupersededError, SupersedeFence,
+    append_supersede_fence, close_payloads, refuse_if_rebound, replace_log_bytes, superseded_by,
+    with_log_replace_lock, Close, CloseOutcome, CommitInfo, SessionSupersededError, SupersedeFence,
 };
-use crate::engine::types::Event;
+use crate::engine::types::{Event, EventPayload, StateFileHeader};
 use crate::session::context::Manifest;
 use crate::session::links::is_reserved_key;
+use crate::session::rebind_fence::{MoveUnfinished, SessionRebound};
 use crate::session::remote_feed::{failure_class, FailureClass};
 use crate::session::state_log::{self, LogOrder};
 use crate::session::validate::{validate_context_key, validate_session_id};
@@ -189,6 +197,8 @@ pub(crate) struct PulledState {
     key: String,
     bytes: Vec<u8>,
     etag: String,
+    /// Its header, parsed.
+    pub header: StateFileHeader,
     /// Its events, parsed.
     pub events: Vec<Event>,
     last_seq: u64,
@@ -232,6 +242,29 @@ pub(crate) enum CloudFence {
     Unavailable(String),
 }
 
+/// What [`CloudBackend::push_close`] did.
+pub(crate) enum CloudClose {
+    /// The bucket's copy holds every line of the close. `wrote` is false
+    /// when it, and this host's copy, held them all already.
+    Closed { wrote: bool },
+    /// The bucket's copy holds a fence other than this close's own replaced
+    /// fence. Nothing was written.
+    FencedByOther(SupersedeFence),
+    /// The bucket's copy records a rebind that fences this process off, as
+    /// [`crate::engine::persistence::append_close`] refuses one in a local
+    /// log. Nothing was written.
+    Rebound(SessionRebound),
+    /// The bucket's copy records a whole-binding move that still owes its
+    /// later parts, which the fence would strand. Nothing was written.
+    MoveUnfinished(MoveUnfinished),
+    /// Nothing was written; the reason says why.
+    Unavailable(String),
+}
+
+/// One line a conditional push adds to a pulled copy: the event, and the
+/// line as it went up.
+type AddedLine = (Event, String);
+
 impl CloudBackend {
     /// Pull `pred`'s state file from workspace prefix `prefix`: `Ok(None)`
     /// when the bucket holds none there, `Err` when it can't be read or
@@ -263,6 +296,7 @@ impl CloudBackend {
             key,
             bytes,
             etag,
+            header: log.header,
             events,
             last_seq: log.last_seq,
         }))
@@ -316,6 +350,27 @@ impl CloudBackend {
     /// [`CloudFence::Unavailable`]. Nothing is ever PUT without the
     /// condition.
     pub(crate) fn push_fence(&self, pulled: &PulledState, fence: &SupersedeFence) -> CloudFence {
+        self.push_lines(
+            pulled,
+            &[fence.to_payload()],
+            &fence.at,
+            |fenced, _, etag| self.adopt_fenced_copy(pulled, fence, fenced, etag),
+        )
+    }
+
+    /// Append one line per payload to the pulled copy, with consecutive
+    /// seqs from the copy's last, each stamped `at`, and PUT it back in one
+    /// request with `If-Match` on the copy's ETag, as
+    /// [`CloudBackend::push_fence`] describes. Once the bucket confirms the
+    /// PUT, `adopt` runs with the bytes put, the lines added and the new
+    /// ETag. Nothing is ever PUT without the condition.
+    fn push_lines(
+        &self,
+        pulled: &PulledState,
+        payloads: &[EventPayload],
+        at: &str,
+        adopt: impl FnOnce(&[u8], &[AddedLine], Option<String>),
+    ) -> CloudFence {
         if let Err(e) = self.refuse_if_read_only(&format!("S3 PUT of {}", pulled.key)) {
             return CloudFence::Unavailable(format!("{e:#}"));
         }
@@ -326,28 +381,33 @@ impl CloudBackend {
                     .to_string(),
             );
         }
-        let payload = fence.to_payload();
-        let event = Event {
-            seq: pulled.last_seq + 1,
-            timestamp: fence.at.clone(),
-            event_type: payload.type_name().to_string(),
-            payload,
-            idempotency_hash: None,
-        };
-        let line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(e) => return CloudFence::Unavailable(format!("the fence doesn't serialize: {e}")),
-        };
         let mut fenced = pulled.bytes.clone();
         if !fenced.ends_with(b"\n") {
             fenced.push(b'\n');
         }
-        fenced.extend_from_slice(line.as_bytes());
-        fenced.push(b'\n');
+        let mut added: Vec<AddedLine> = Vec::with_capacity(payloads.len());
+        for (i, payload) in payloads.iter().enumerate() {
+            let event = Event {
+                seq: pulled.last_seq + 1 + i as u64,
+                timestamp: at.to_string(),
+                event_type: payload.type_name().to_string(),
+                payload: payload.clone(),
+                idempotency_hash: None,
+            };
+            let line = match serde_json::to_string(&event) {
+                Ok(line) => line,
+                Err(e) => {
+                    return CloudFence::Unavailable(format!("the fence doesn't serialize: {e}"))
+                }
+            };
+            fenced.extend_from_slice(line.as_bytes());
+            fenced.push(b'\n');
+            added.push((event, line));
+        }
 
         match self.put_state_if(&pulled.key, &fenced, Some(&pulled.etag)) {
             Ok(response) => {
-                self.adopt_fenced_copy(pulled, fence, &fenced, response_etag(&response));
+                adopt(&fenced, &added, response_etag(&response));
                 CloudFence::Fenced
             }
             Err(e) if is_precondition_failed(&e) => {
@@ -418,6 +478,151 @@ impl CloudBackend {
                 let _ = append_supersede_fence(&path, fence, &fence.at, LOCAL_FENCE_WAIT);
             }
             LogOrder::Unrelated => {}
+        }
+    }
+
+    /// Close the replaced run whose bucket copy is `pulled`: the lines
+    /// [`close_payloads`] owes that copy, worked out against its own bytes
+    /// (the side events, the cancel unless it already stands cancelled, the
+    /// replaced fence unless it holds it), go up in one PUT with `If-Match`
+    /// on its ETag, then this host's copy takes the same close. A copy
+    /// holding another fence is [`CloudClose::FencedByOther`]; a PUT the
+    /// bucket refuses, or anything else that isn't a confirmed conditional
+    /// PUT, is [`CloudClose::Unavailable`], with nothing written in either
+    /// copy. There is no unconditional fallback.
+    pub(crate) fn push_close(&self, pulled: &PulledState, close: &Close, at: &str) -> CloudClose {
+        let fence = SupersedeFence {
+            replaced: true,
+            ..close.fence.clone()
+        };
+        let ours = |f: &SupersedeFence| {
+            f.replaced && f.by == fence.by && f.by_session_id == fence.by_session_id
+        };
+        let unfenced = match pulled.fence() {
+            Ok(Some(existing)) if !ours(&existing) => return CloudClose::FencedByOther(existing),
+            Ok(found) => found.is_none(),
+            Err(e) => return CloudClose::Unavailable(format!("{e:#}")),
+        };
+        let content = String::from_utf8_lossy(&pulled.bytes);
+        // `append_close`'s rebind rule, asked of the bucket's header: a
+        // rebind there since this process first read this host's copy (the
+        // epoch `note_epoch_read` recorded under its local path) refuses the
+        // close before anything is built, so a run another host rebound in
+        // between is never closed. A race after this pull loses the PUT.
+        let run = pred_of(&pulled.key);
+        let path = self.local.session_dir(run).join(state_file_name(run));
+        if let Err(e) = refuse_if_rebound(&path, &content, &fence.to_payload()) {
+            return match e.downcast::<SessionRebound>() {
+                Ok(rebound) => CloudClose::Rebound(rebound),
+                Err(e) => CloudClose::Unavailable(format!("{e:#}")),
+            };
+        }
+        // `append_close`'s unfinished-move rule, asked of the bucket's copy:
+        // a move landing after this pull changes the copy, and the PUT
+        // loses. A copy this close already fenced is a re-run.
+        if unfenced {
+            if let Some(m) = crate::session::rebind_fence::move_unfinished_in_log(run, &content) {
+                return CloudClose::MoveUnfinished(m);
+            }
+        }
+        let payloads = match close_payloads(&content, close, &fence) {
+            Ok(payloads) => payloads,
+            Err(e) => {
+                return CloudClose::Unavailable(format!(
+                    "the close can't be worked out from the bucket's copy: {e:#}"
+                ))
+            }
+        };
+        if payloads.is_empty() {
+            // The bucket's copy is closed already; this host's may not be.
+            let etag = Some(pulled.etag.clone());
+            let wrote = self.adopt_closed_copy(pulled, close, at, &pulled.bytes, &[], etag);
+            return CloudClose::Closed { wrote };
+        }
+        let pushed = self.push_lines(pulled, &payloads, at, |closed, added, etag| {
+            self.adopt_closed_copy(pulled, close, at, closed, added, etag);
+        });
+        match pushed {
+            CloudFence::Fenced => CloudClose::Closed { wrote: true },
+            // This close's own fence, put there since the pull: the lines
+            // this push owed were worked out against a copy that is gone.
+            CloudFence::Taken(existing) if ours(&existing) => CloudClose::Unavailable(
+                "the run's state changed in the bucket under the close's conditional push"
+                    .to_string(),
+            ),
+            CloudFence::Taken(existing) => CloudClose::FencedByOther(existing),
+            CloudFence::Unavailable(reason) => CloudClose::Unavailable(reason),
+        }
+    }
+
+    /// After a close is in the bucket, close this host's copy of the run
+    /// too, when it has one homed at the same prefix. A copy the closed one
+    /// extends is replaced by it and stamped, as a pull would, under the
+    /// log's append lock, and the after-commit steps run for each line the
+    /// push added. A copy holding events the bucket's lacks gets the close
+    /// appended by [`crate::session::local::LocalBackend::append_close`],
+    /// worked out against its own bytes, so it too stands cancelled and
+    /// fenced. Best-effort: the bucket's close holds either way. Returns
+    /// whether this host's copy was written.
+    fn adopt_closed_copy(
+        &self,
+        pulled: &PulledState,
+        close: &Close,
+        at: &str,
+        closed: &[u8],
+        added: &[AddedLine],
+        etag: Option<String>,
+    ) -> bool {
+        let run = pred_of(&pulled.key);
+        if self.read_local_state_bytes(run).is_none()
+            || !self
+                .home_prefix(run)
+                .is_ok_and(|h| h.prefix == pulled.prefix)
+        {
+            return false;
+        }
+        let path = self.local.state_path(run);
+        self.forget_probe(run);
+        // `Some(wrote)` when the copy was settled under the lock, `None`
+        // when it holds events the bucket's lacks.
+        let replaced = with_log_replace_lock(&path, LOCAL_FENCE_WAIT, || {
+            let local = std::fs::read(&path)?;
+            Ok(match state_log::compare(&local, &pulled.bytes) {
+                LogOrder::Same | LogOrder::RemoteExtends | LogOrder::HeaderOnly => {
+                    let differs = local.as_slice() != closed;
+                    if differs {
+                        replace_log_bytes(&path, closed)?;
+                    }
+                    Some(differs)
+                }
+                LogOrder::LocalExtends | LogOrder::Diverged => None,
+                LogOrder::Unrelated => Some(false),
+            })
+        });
+        match replaced {
+            Ok(Some(true)) => {
+                self.record_synced(run, etag.as_deref(), closed, false);
+                let mut prior_log = String::from_utf8_lossy(&pulled.bytes).into_owned();
+                if !prior_log.ends_with('\n') {
+                    prior_log.push('\n');
+                }
+                for (event, line) in added {
+                    let next = format!("{prior_log}{line}\n");
+                    let commit = CommitInfo {
+                        seq: event.seq,
+                        prior_log,
+                    };
+                    self.local.after_commit(run, &event.payload, &commit);
+                    prior_log = next;
+                }
+                true
+            }
+            Ok(Some(false)) | Err(_) => false,
+            Ok(None) => matches!(
+                self.local.append_close(run, close, at, LOCAL_FENCE_WAIT),
+                Ok(CloseOutcome::Closed { commits, torn_backup })
+                    if !commits.is_empty() || torn_backup.is_some()
+            ),
         }
     }
 
@@ -1018,6 +1223,89 @@ mod tests {
         assert_eq!(
             failed_after(S3Error::HttpFailWithBody(500, String::new()), timeout).class(),
             FailureClass::Unreachable
+        );
+    }
+
+    fn rebound_pulled(run: &str, anchor: &str, retired: &str) -> PulledState {
+        let header = serde_json::json!({
+            "schema_version": 1, "workflow": run, "template_hash": "abc",
+            "created_at": "2026-01-01T00:00:00Z", "execution_dir": anchor,
+            "origin": {"anchor": anchor, "store": {"kind": "local", "base": "/s"},
+                       "anchor_epoch": 1, "whole_epoch": 1, "retired_anchors": [retired]},
+        });
+        PulledState {
+            prefix: PREFIX.to_string(),
+            key: format!("{PREFIX}/{run}/{}", state_file_name(run)),
+            bytes: format!("{header}\n").into_bytes(),
+            etag: "e1".to_string(),
+            header: serde_json::from_value(header).unwrap(),
+            events: Vec::new(),
+            last_seq: 0,
+        }
+    }
+
+    fn replaced_close() -> Close {
+        Close {
+            side_events: Vec::new(),
+            cancel: true,
+            fence: SupersedeFence {
+                by: "s".to_string(),
+                by_session_id: "id-s".to_string(),
+                actor: Default::default(),
+                at: "2026-01-01T00:00:00Z".to_string(),
+                replaced: true,
+            },
+        }
+    }
+
+    /// The close's own rebind rule, asked of the bucket's copy: a whole move
+    /// there past the epoch this process first read of its own copy refuses
+    /// the close before any request is made.
+    #[test]
+    fn push_close_refuses_a_bucket_copy_rebound_after_the_first_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let local = backend.local.session_dir("p").join(state_file_name("p"));
+        crate::session::fence_state::note_read(&local, 0);
+        let pulled = rebound_pulled("p", "/ws/new", "/ws/old");
+        let outcome =
+            crate::session::fence_state::with_cwd(std::path::Path::new("/ws/new"), || {
+                backend.push_close(&pulled, &replaced_close(), "2026-01-01T00:00:00Z")
+            });
+        match outcome {
+            CloudClose::Rebound(r) => assert!(!r.from_retired),
+            CloudClose::Closed { .. } => panic!("the rebound copy was closed"),
+            _ => panic!("not Rebound"),
+        }
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            0,
+            "the refused close made a request"
+        );
+    }
+
+    /// The same rule's other half: run from the directory the move retired,
+    /// with no earlier read noted.
+    #[test]
+    fn push_close_refuses_a_bucket_copy_rebound_after_its_anchor_was_retired() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (url, answered) = scripted(&[]);
+        let backend = cloud_backend_at(tmp.path(), url);
+        let pulled = rebound_pulled("q", "/ws/new", "/ws/old");
+        let outcome =
+            crate::session::fence_state::with_cwd(std::path::Path::new("/ws/old"), || {
+                backend.push_close(&pulled, &replaced_close(), "2026-01-01T00:00:00Z")
+            });
+        match outcome {
+            CloudClose::Rebound(r) => assert!(r.from_retired),
+            CloudClose::Closed { .. } => panic!("the rebound copy was closed"),
+            _ => panic!("not Rebound"),
+        }
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            0,
+            "the refused close made a request"
         );
     }
 }

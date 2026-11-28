@@ -470,9 +470,11 @@ pub enum Reach {
 /// fence still names the successor, so the walk goes on by that name, but
 /// nothing past it is confirmed. So does a walk past
 /// [`MAX_SUPERSEDE_HOPS`] hops, so a reach beyond the cap is refused as
-/// unconfirmed rather than read as off the chain. A name that isn't a
-/// session name, or one already met, ends the walk. Reads only; no lock,
-/// no pull, no write.
+/// unconfirmed rather than read as off the chain. A fence marked
+/// `replaced` names no successor: the run it names replaced the session
+/// rather than continuing it, so the walk ends there. A name that isn't a
+/// session name, or one already met, ends the walk too. Reads only; no
+/// lock, no pull, no write.
 pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
     let mut steps = Vec::new();
     let mut confirmed = true;
@@ -497,6 +499,12 @@ pub fn hops_to(store: &dyn SessionBackend, from: &str, to: &str) -> Reach {
                 let Some(fence) = crate::session::links::supersede_fence(store, &at) else {
                     return Reach::No;
                 };
+                // A fence marked `replaced` closed the session for a fresh
+                // run rather than handing its work on, so the run it names
+                // is no successor, confirmed or not.
+                if fence.replaced {
+                    return Reach::No;
+                }
                 confirmed = false;
                 fence.by
             }
@@ -590,4 +598,88 @@ pub fn predecessors(store: &dyn SessionBackend, sessions: &[String], session: &s
         .filter(|s| matches!(hops_to(store, s, session), Reach::Confirmed(_)))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::persistence::SupersedeFence;
+    use crate::engine::types::StateFileHeader;
+    use crate::session::local::LocalBackend;
+
+    fn backend() -> (tempfile::TempDir, LocalBackend) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let b = LocalBackend::with_base_dir(tmp.path().join("sessions"));
+        (tmp, b)
+    }
+
+    /// Session `name`, its header recording `id-<name>`.
+    fn make_session(b: &LocalBackend, name: &str) {
+        let mut header: StateFileHeader = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow": name,
+            "template_hash": "abc",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        header.session_id = format!("id-{name}");
+        b.create(name).unwrap();
+        let path = b
+            .session_dir(name)
+            .join(crate::session::state_file_name(name));
+        crate::engine::persistence::append_header(&path, &header).unwrap();
+    }
+
+    /// Fence `session` for `by`, with no marker beside it: `replaced` as a
+    /// replace writes it, else as a supersede stopped before its marker.
+    fn fence(b: &LocalBackend, session: &str, by: &str, replaced: bool) {
+        let path = b
+            .session_dir(session)
+            .join(crate::session::state_file_name(session));
+        let fence = SupersedeFence {
+            by: by.to_string(),
+            by_session_id: format!("id-{by}"),
+            actor: SupersedeActor::default(),
+            at: "2026-01-01T00:00:00Z".to_string(),
+            replaced,
+        };
+        crate::engine::persistence::append_supersede_fence(
+            &path,
+            &fence,
+            "2026-01-01T00:00:00Z",
+            crate::engine::persistence::FENCE_LOCK_WAIT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_decision_chain_stops_at_a_replaced_fence() {
+        // A plain fence with no marker reaches its successor, unconfirmed.
+        let (_tmp, b) = backend();
+        for name in ["a", "b"] {
+            make_session(&b, name);
+        }
+        fence(&b, "a", "b", false);
+        assert_eq!(hops_to(&b, "a", "b"), Reach::Unconfirmed);
+
+        // A replaced fence reaches nothing: the run it names isn't a
+        // successor, so a decision it makes isn't read as one's.
+        let (_tmp, b) = backend();
+        for name in ["a", "b"] {
+            make_session(&b, name);
+        }
+        fence(&b, "a", "b", true);
+        assert_eq!(hops_to(&b, "a", "b"), Reach::No);
+
+        // Nor does a walk through one further on.
+        let (_tmp, b) = backend();
+        for name in ["a", "b", "c"] {
+            make_session(&b, name);
+        }
+        fence(&b, "a", "b", false);
+        fence(&b, "b", "c", true);
+        assert_eq!(hops_to(&b, "a", "b"), Reach::Unconfirmed);
+        assert_eq!(hops_to(&b, "a", "c"), Reach::No);
+        assert_eq!(hops_to(&b, "b", "c"), Reach::No);
+    }
 }

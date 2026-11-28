@@ -1022,9 +1022,16 @@ pub struct SessionSupersededError {
 
 impl std::fmt::Display for SessionSupersededError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A fence marked `replaced` was written by the close of a run another
+        // run replaced, not by a supersede.
+        let how = if self.fence.replaced {
+            "replaced"
+        } else {
+            "superseded"
+        };
         write!(
             f,
-            "session '{}' was superseded by '{}' (session_superseded), so nothing was written; \
+            "session '{}' was {how} by '{}' (session_superseded), so nothing was written; \
              continue as '{}'",
             self.session, self.fence.by, self.fence.by
         )
@@ -1063,7 +1070,16 @@ fn refuse_if_fenced(path: &Path, content: &str, payload: &EventPayload) -> anyho
 /// fences this process off (`crate::session::fence_state::check`). A
 /// `context_read` passes, as it does [`refuse_if_fenced`]: it records a
 /// read, and reads of a session keep working wherever they run from.
-fn refuse_if_rebound(path: &Path, content: &str, payload: &EventPayload) -> anyhow::Result<()> {
+///
+/// Only `content`'s first line is read; `path` names the log whose first
+/// read this process recorded, and is never opened. The cloud backend asks
+/// it of the bucket's copy of a run it closes, as [`append_close`] asks it
+/// of a local log.
+pub(crate) fn refuse_if_rebound(
+    path: &Path,
+    content: &str,
+    payload: &EventPayload,
+) -> anyhow::Result<()> {
     if matches!(payload, EventPayload::ContextRead { .. }) {
         return Ok(());
     }
@@ -1121,6 +1137,288 @@ pub fn append_supersede_fence(
     };
     write_event_line(path, &event, tail.unterminated)?;
     Ok(FenceOutcome::Fenced { seq: tail.next_seq })
+}
+
+/// The fault-injection seam of `koto init --replaces`, for the binary's
+/// tests: a debug build reads it, a release build never does, so it is not
+/// a setting. Unset, nothing changes. [`append_close`] stops at
+/// `torn-close`, having written half of what it owed.
+pub(crate) const REPLACE_FAULT_ENV: &str = "KOTO_TEST_REPLACE_FAULT";
+
+/// What [`append_close`] closes a replaced run's log with.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Close {
+    /// Events owed ahead of the cancel, in order: a stopped runner's settle
+    /// events and `pool_released` for each pool queue left. The caller works
+    /// them out from the log; they are written as given.
+    pub side_events: Vec<EventPayload>,
+    /// Whether the run is owed a cancel. False for a run already in a
+    /// terminal state, which gets the fence only.
+    pub cancel: bool,
+    /// The fence naming the replacement. It is written with `replaced`
+    /// set, whatever this copy holds.
+    pub fence: SupersedeFence,
+}
+
+/// What [`append_close`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CloseOutcome {
+    /// Every line owed went in, in one write. `commits` holds each event
+    /// written with what its commit read, in order, for the after-commit
+    /// steps; it is empty when nothing was owed. `torn_backup` is where the
+    /// log was kept before a torn last line was trimmed.
+    Closed {
+        commits: Vec<(EventPayload, CommitInfo)>,
+        torn_backup: Option<std::path::PathBuf>,
+    },
+    /// The log holds a fence other than this close's own replaced fence.
+    /// Nothing was written.
+    FencedByOther(SupersedeFence),
+    /// The append lock was still held elsewhere when the wait ran out.
+    /// Nothing was written.
+    Unavailable,
+}
+
+/// Close the replaced run whose log is at `path`: append the events
+/// `close` owes, the cancel and the replaced fence in one write and one
+/// sync, under the log's append lock, waited for at most `wait`. The caller
+/// holds the run's manifest lock and runs the after-commit steps for each of
+/// the returned commits once it has released it.
+///
+/// What is owed is worked out from the bytes read under the lock, so a
+/// re-run writes only what an earlier, interrupted one didn't. The cancel
+/// is skipped when the last event that set where the run stands is already
+/// a cancel; a cancel that a rewind followed doesn't count. The fence is
+/// skipped when the log already holds it. The close may write past its own
+/// replaced fence, never past any other.
+///
+/// A last line with no newline that doesn't parse is a write cut short. It
+/// is trimmed, with the log as it was kept beside it as
+/// `<log>.seq<N>-torn.bak`, and the close is written in its place. A last
+/// line that ends in a newline and doesn't parse is refused, with nothing
+/// written.
+pub(crate) fn append_close(
+    path: &Path,
+    close: &Close,
+    timestamp: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<CloseOutcome> {
+    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
+        return Ok(CloseOutcome::Unavailable);
+    };
+    let (tail, torn) = prepare_close(path)?;
+    let fence = SupersedeFence {
+        replaced: true,
+        ..close.fence.clone()
+    };
+    let fenced = superseded_by_in_log(&tail.content);
+    if let Some(existing) = &fenced {
+        let ours = existing.replaced
+            && existing.by == fence.by
+            && existing.by_session_id == fence.by_session_id;
+        if !ours {
+            return Ok(CloseOutcome::FencedByOther(existing.clone()));
+        }
+    }
+    refuse_if_rebound(path, &tail.content, &fence.to_payload())?;
+    // A whole-binding move that still owes its later parts would be
+    // stranded by the fence: its next part is an append the fence refuses.
+    // A log this close already fenced is a re-run, and owes nothing new.
+    if fenced.is_none() {
+        let run = extract_session_id_from_path(path);
+        if let Some(m) = crate::session::rebind_fence::move_unfinished_in_log(&run, &tail.content) {
+            return Err(m.into());
+        }
+    }
+    let payloads = close_payloads(&tail.content, close, &fence)?;
+    if payloads.is_empty() && torn.is_none() {
+        return Ok(CloseOutcome::Closed {
+            commits: Vec::new(),
+            torn_backup: None,
+        });
+    }
+
+    let mut buf = String::new();
+    if tail.unterminated {
+        buf.push('\n');
+    }
+    let mut commits = Vec::with_capacity(payloads.len());
+    let mut prior_log = tail.content;
+    for (i, payload) in payloads.into_iter().enumerate() {
+        let event = Event {
+            seq: tail.next_seq + i as u64,
+            timestamp: timestamp.to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let line = serde_json::to_string(&event)
+            .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
+        buf.push_str(&line);
+        buf.push('\n');
+        // The first line follows the newline an unterminated log was owed.
+        let sep = if i == 0 && tail.unterminated {
+            "\n"
+        } else {
+            ""
+        };
+        let next_prior = format!("{prior_log}{sep}{line}\n");
+        commits.push((
+            event.payload,
+            CommitInfo {
+                seq: event.seq,
+                prior_log,
+            },
+        ));
+        prior_log = next_prior;
+    }
+
+    if cfg!(debug_assertions) && std::env::var(REPLACE_FAULT_ENV).as_deref() == Ok("torn-close") {
+        tear_close(path, &buf);
+    }
+    let torn_backup = match torn {
+        Some(torn) => {
+            let backup = write_backup(path, &torn.log, tail.next_seq, "torn")?;
+            rewrite_tail(path, torn.offset, &buf, "torn")?;
+            eprintln!(
+                "warning: the last line of {} was cut short partway through a write; trimmed \
+                 it. The log as it was is kept at {}",
+                path.display(),
+                backup.display()
+            );
+            Some(backup)
+        }
+        None => {
+            append_bytes(path, &buf)?;
+            None
+        }
+    };
+    Ok(CloseOutcome::Closed {
+        commits,
+        torn_backup,
+    })
+}
+
+/// The `torn-close` fault point: append the first half of `buf`, cut inside
+/// a line so the log ends in a write cut short, and stop as a killed
+/// process would.
+fn tear_close(path: &Path, buf: &str) -> ! {
+    let mut cut = buf.len() / 2;
+    if buf[..cut].ends_with('\n') {
+        cut = cut.saturating_sub(2);
+    }
+    while !buf.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let _ = append_bytes(path, &buf[..cut]);
+    eprintln!("{REPLACE_FAULT_ENV}: stopping at torn-close");
+    crate::exit::crash(86)
+}
+
+/// The events [`append_close`] owes the log whose bytes are `content`, in
+/// the order they go in: the side events, the cancel unless the run already
+/// stands cancelled, then `fence` unless the log holds it. The cloud
+/// backend works out the lines it puts in a bucket copy with it too.
+pub(crate) fn close_payloads(
+    content: &str,
+    close: &Close,
+    fence: &SupersedeFence,
+) -> anyhow::Result<Vec<EventPayload>> {
+    let (_, events) = parse_state_log(content.as_bytes())?;
+    let mut out = close.side_events.clone();
+    let stands_cancelled = crate::session::inventory::last_standing_event(&events)
+        .is_some_and(|e| matches!(e.payload, EventPayload::WorkflowCancelled { .. }));
+    if close.cancel && !stands_cancelled {
+        let state = derive_state_from_log(&events).ok_or_else(|| {
+            EngineError::StateFileCorrupted(
+                "cannot derive the current state, so the run was not closed".to_string(),
+            )
+        })?;
+        out.push(EventPayload::WorkflowCancelled {
+            state,
+            reason: format!("replaced by {}", fence.by),
+            replaced_by: Some(fence.by.clone()),
+            replaced_by_session_id: Some(fence.by_session_id.clone()),
+        });
+    }
+    if superseded_by_in_log(content).is_none() {
+        out.push(fence.to_payload());
+    }
+    Ok(out)
+}
+
+/// A last line [`prepare_close`] will trim: it starts at byte `offset` of
+/// `log`, the log's bytes as read.
+struct TornTail {
+    offset: usize,
+    log: String,
+}
+
+/// [`prepare_append`] for [`append_close`]: the same read, header check
+/// and merged-line split, except that a torn last line is not refused. It
+/// comes back as the log's bytes without that line, with where the line
+/// starts, and nothing is written for it yet.
+fn prepare_close(path: &Path) -> anyhow::Result<(AppendTail, Option<TornTail>)> {
+    let content = read_for_append(path)?;
+    let refused = plan_append::<StateFileHeader>(&content, path).err();
+    let Some(err) = refused else {
+        return Ok((tail_for_append::<StateFileHeader>(path, content)?, None));
+    };
+    let Some(offset) = torn_tail_offset(&content) else {
+        return Err(err);
+    };
+    let next_seq = match plan_append::<StateFileHeader>(&content[..offset], path) {
+        Ok(AppendPlan {
+            next_seq,
+            merged: None,
+            ..
+        }) => next_seq,
+        _ => return Err(err),
+    };
+    let tail = AppendTail {
+        next_seq,
+        content: content[..offset].to_string(),
+        unterminated: false,
+    };
+    Ok((
+        tail,
+        Some(TornTail {
+            offset,
+            log: content,
+        }),
+    ))
+}
+
+/// Where the last line of `content` starts when it is a write cut short:
+/// it has no newline, it isn't the header, and it doesn't parse, as one
+/// value or as several written together.
+fn torn_tail_offset(content: &str) -> Option<usize> {
+    if content.ends_with('\n') {
+        return None;
+    }
+    let offset = content.rfind('\n')? + 1;
+    let line = content[offset..].trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut values = serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>();
+    if values.all(|v| v.is_ok()) {
+        return None;
+    }
+    Some(offset)
+}
+
+/// Append `bytes` to the log at `path` in one write, and sync it.
+fn append_bytes(path: &Path, bytes: &str) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    file.write_all(bytes.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write events to {}: {}", path.display(), e))?;
+    file.sync_data()
+        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+    Ok(())
 }
 
 /// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
@@ -1348,23 +1646,29 @@ struct AppendTail {
 /// Merged events whose seqs don't follow, or whose line before can't be
 /// read, are refused and left as they are.
 fn prepare_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
-                path.display()
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "failed to read state file {}: {}",
-                path.display(),
-                e
-            ))
-        }
-    };
+    let content = read_for_append(path)?;
+    tail_for_append::<H>(path, content)
+}
 
+/// The read [`prepare_append`] starts with: the log's bytes, or an error
+/// naming a log that doesn't exist.
+fn read_for_append(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "state file {} does not exist, so nothing was appended; a session's log is written when the session is created, never by an append",
+            path.display()
+        )),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to read state file {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// The rest of [`prepare_append`], on the bytes it read.
+fn tail_for_append<H: LogHeader>(path: &Path, content: String) -> anyhow::Result<AppendTail> {
     let AppendPlan {
         next_seq,
         unterminated,
@@ -1423,8 +1727,8 @@ fn split_merged_last_line(
     }
 
     let first_seq = pieces[0].1.seq;
-    let backup = write_backup(path, content, first_seq)?;
-    rewrite_tail(path, offset, &tail)?;
+    let backup = write_backup(path, content, first_seq, "merged")?;
+    rewrite_tail(path, offset, &tail, "merged")?;
     let mut split = String::with_capacity(offset + tail.len());
     split.push_str(&content[..offset]);
     split.push_str(&tail);
@@ -1441,9 +1745,15 @@ fn split_merged_last_line(
     Ok(split)
 }
 
-/// Write `content` to a new file beside `log`, named for `first_seq`, and
-/// sync it. Never overwrites: a name already taken gets a numeric suffix.
-fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std::path::PathBuf> {
+/// Write `content` to a new file beside `log`, named for `first_seq` and
+/// the repair it is kept for (`kind`: `merged` or `torn`), and sync it.
+/// Never overwrites: a name already taken gets a numeric suffix.
+fn write_backup(
+    log: &Path,
+    content: &str,
+    first_seq: u64,
+    kind: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     let name = log
         .file_name()
         .and_then(|n| n.to_str())
@@ -1454,7 +1764,7 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
         } else {
             format!(".{n}")
         };
-        let backup = log.with_file_name(format!("{name}.seq{first_seq}-merged{suffix}.bak"));
+        let backup = log.with_file_name(format!("{name}.seq{first_seq}-{kind}{suffix}.bak"));
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -1466,11 +1776,16 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
+                let repair = if kind == "torn" {
+                    "trimming a torn last line"
+                } else {
+                    "splitting a merged line"
+                };
                 return Err(anyhow::anyhow!(
-                    "failed to create backup {} before splitting a merged line: {}",
+                    "failed to create backup {} before {repair}: {}",
                     backup.display(),
                     e
-                ))
+                ));
             }
         };
         file.write_all(content.as_bytes())
@@ -1487,8 +1802,9 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
 
 /// Write `tail` over the file at `path` from byte `offset` on, in one write,
 /// cut the file to end where `tail` does, and sync it. The file keeps its
-/// inode, mode and every byte before `offset`.
-fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
+/// inode, mode and every byte before `offset`. `kind` (`merged` or `torn`)
+/// names the repair in the error.
+fn rewrite_tail(path: &Path, offset: usize, tail: &str, kind: &str) -> anyhow::Result<()> {
     use std::io::{Seek, SeekFrom};
     let mut file = OpenOptions::new()
         .write(true)
@@ -1499,5 +1815,364 @@ fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
         .and_then(|_| file.write_all(tail.as_bytes()))
         .and_then(|()| file.set_len(end))
         .and_then(|()| file.sync_data())
-        .map_err(|e| anyhow::anyhow!("failed to split the last line of {}: {}", path.display(), e))
+        .map_err(|e| {
+            let what = if kind == "torn" {
+                "trim the torn last line"
+            } else {
+                "split the last line"
+            };
+            anyhow::anyhow!("failed to {what} of {}: {}", path.display(), e)
+        })
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use crate::engine::types::SupersedeActor;
+    use std::time::Duration;
+
+    const HEADER: &str = r#"{"schema_version":1,"workflow":"wf","template_hash":"abc","created_at":"2025-01-01T00:00:00Z"}"#;
+    const TS: &str = "2026-01-01T00:00:00Z";
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// The log of a run `old` standing in `work`, in a directory of `dir`.
+    fn started_log(dir: &Path) -> std::path::PathBuf {
+        let session = dir.join("old");
+        std::fs::create_dir_all(&session).unwrap();
+        let log = session.join("koto-old.state.jsonl");
+        std::fs::write(&log, format!("{HEADER}\n")).unwrap();
+        let to_work = EventPayload::Transitioned {
+            from: None,
+            to: "work".to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        };
+        append_event(&log, &to_work, TS).unwrap();
+        log
+    }
+
+    fn close() -> Close {
+        Close {
+            side_events: Vec::new(),
+            cancel: true,
+            fence: SupersedeFence {
+                by: "new".to_string(),
+                by_session_id: "id-new".to_string(),
+                actor: SupersedeActor::default(),
+                at: TS.to_string(),
+                replaced: true,
+            },
+        }
+    }
+
+    /// The backups beside `log`, by name.
+    fn backups(log: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(log.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn closed(
+        outcome: CloseOutcome,
+    ) -> (Vec<(EventPayload, CommitInfo)>, Option<std::path::PathBuf>) {
+        match outcome {
+            CloseOutcome::Closed {
+                commits,
+                torn_backup,
+            } => (commits, torn_backup),
+            other => panic!("expected the close to be written, got {other:?}"),
+        }
+    }
+
+    /// A last line that ends in a newline and doesn't parse isn't a write
+    /// cut short: the close refuses it and writes nothing.
+    #[test]
+    fn append_close_refuses_a_terminated_unparseable_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        let mut bytes = std::fs::read_to_string(&log).unwrap();
+        bytes.push_str("{\"seq\":2,\"timest\n");
+        std::fs::write(&log, &bytes).unwrap();
+
+        let err = append_close(&log, &close(), TS, WAIT).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse last event line"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            bytes,
+            "nothing was written"
+        );
+        assert!(backups(&log).is_empty(), "{:?}", backups(&log));
+    }
+
+    /// A last line cut short partway through a write is trimmed, with the
+    /// log as it was kept in a `torn` backup, and the close goes in its
+    /// place. The log reads cleanly after, and a later append lands.
+    #[test]
+    fn append_close_trims_a_torn_last_line_with_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        let mut bytes = std::fs::read_to_string(&log).unwrap();
+        bytes.push_str(r#"{"seq":2,"timestamp":"2026-01-01T00:00:00Z","type":"intent_upd"#);
+        std::fs::write(&log, &bytes).unwrap();
+
+        let (commits, torn_backup) = closed(append_close(&log, &close(), TS, WAIT).unwrap());
+        let backup = torn_backup.expect("a torn backup");
+        assert_eq!(
+            backup.file_name().unwrap().to_string_lossy(),
+            "koto-old.state.jsonl.seq2-torn.bak"
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), bytes);
+        assert_eq!(backups(&log), vec!["koto-old.state.jsonl.seq2-torn.bak"]);
+
+        let seqs: Vec<u64> = commits.iter().map(|(_, c)| c.seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+        match &commits[0].0 {
+            EventPayload::WorkflowCancelled {
+                state,
+                reason,
+                replaced_by,
+                replaced_by_session_id,
+            } => {
+                assert_eq!(state, "work");
+                assert_eq!(reason, "replaced by new");
+                assert_eq!(replaced_by.as_deref(), Some("new"));
+                assert_eq!(replaced_by_session_id.as_deref(), Some("id-new"));
+            }
+            other => panic!("expected a cancel first, got {other:?}"),
+        }
+
+        let (_, events) = read_events(&log).unwrap();
+        assert_eq!(events.len(), 3);
+        let fence = superseded_by(&events).expect("a fence");
+        assert!(fence.replaced);
+        assert_eq!(fence.by, "new");
+        assert!(std::fs::read_to_string(&log).unwrap().ends_with('\n'));
+
+        let read = EventPayload::ContextRead {
+            key: "record/a".to_string(),
+            reader: "cli".to_string(),
+            state: "work".to_string(),
+            present: true,
+            hash: None,
+            access: None,
+            gate: None,
+            session: None,
+        };
+        assert_eq!(append_event(&log, &read, TS).unwrap(), 4);
+    }
+
+    /// The close writes its side events, the cancel and the fence once; a
+    /// re-run with nothing owed writes nothing, and each commit's prior log
+    /// is the log up to its own line.
+    #[test]
+    fn append_close_writes_only_what_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        let mut first = close();
+        first.side_events = vec![EventPayload::IntentUpdated {
+            intent: "side".to_string(),
+        }];
+
+        let (commits, torn_backup) = closed(append_close(&log, &first, TS, WAIT).unwrap());
+        assert_eq!(torn_backup, None);
+        let types: Vec<&str> = commits.iter().map(|(p, _)| p.type_name()).collect();
+        assert_eq!(
+            types,
+            vec!["intent_updated", "workflow_cancelled", "session_superseded"]
+        );
+        let after = std::fs::read_to_string(&log).unwrap();
+        for (_, commit) in &commits {
+            assert!(after.starts_with(&commit.prior_log));
+            assert_eq!(last_seq(&commit.prior_log), Some(commit.seq - 1));
+        }
+
+        let (commits, _) = closed(append_close(&log, &close(), TS, WAIT).unwrap());
+        assert!(commits.is_empty(), "{commits:?}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), after);
+        assert!(backups(&log).is_empty());
+    }
+
+    /// A cancel that a rewind followed doesn't count: the close writes a
+    /// fresh one. A run owed no cancel gets the fence only.
+    #[test]
+    fn append_close_cancels_a_rewound_run_again_and_fences_a_finished_one_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        let cancel = EventPayload::WorkflowCancelled {
+            state: "work".to_string(),
+            reason: "cancelled by user".to_string(),
+            replaced_by: None,
+            replaced_by_session_id: None,
+        };
+        let rewind = EventPayload::Rewound {
+            from: "work".to_string(),
+            to: "work".to_string(),
+            rationale: None,
+        };
+        append_event(&log, &cancel, TS).unwrap();
+        append_event(&log, &rewind, TS).unwrap();
+        let (commits, _) = closed(append_close(&log, &close(), TS, WAIT).unwrap());
+        let types: Vec<&str> = commits.iter().map(|(p, _)| p.type_name()).collect();
+        assert_eq!(types, vec!["workflow_cancelled", "session_superseded"]);
+
+        let other = tempfile::tempdir().unwrap();
+        let log = started_log(other.path());
+        let mut finished = close();
+        finished.cancel = false;
+        let (commits, _) = closed(append_close(&log, &finished, TS, WAIT).unwrap());
+        let types: Vec<&str> = commits.iter().map(|(p, _)| p.type_name()).collect();
+        assert_eq!(types, vec!["session_superseded"]);
+    }
+
+    /// A log fenced by anything but this close's own replaced fence, a
+    /// plain supersede fence naming the same successor included, is left
+    /// as it is.
+    #[test]
+    fn append_close_refuses_a_log_fenced_by_another_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        let plain = SupersedeFence {
+            replaced: false,
+            ..close().fence
+        };
+        append_supersede_fence(&log, &plain, TS, WAIT).unwrap();
+        let before = std::fs::read_to_string(&log).unwrap();
+
+        let outcome = append_close(&log, &close(), TS, WAIT).unwrap();
+        assert_eq!(outcome, CloseOutcome::FencedByOther(plain));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+    }
+
+    /// A whole-binding move recorded in the header after this process first
+    /// read the log refuses the close, with nothing written.
+    #[test]
+    fn append_close_refuses_a_log_rebound_after_its_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = started_log(dir.path());
+        crate::session::fence_state::note_read(&log, 0);
+        let content = std::fs::read_to_string(&log).unwrap();
+        let (first, rest) = content.split_once('\n').unwrap();
+        let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+        let new = dir.path().join("ws").join("new");
+        header["execution_dir"] = serde_json::json!(new);
+        header["origin"] = serde_json::json!({
+            "anchor": new,
+            "store": {"kind": "local", "base": dir.path()},
+            "anchor_epoch": 1,
+            "whole_epoch": 1,
+            "retired_anchors": [dir.path().join("ws").join("old")],
+        });
+        std::fs::write(&log, format!("{header}\n{rest}")).unwrap();
+        let before = std::fs::read(&log).unwrap();
+
+        let err =
+            crate::session::fence_state::with_cwd(&new, || append_close(&log, &close(), TS, WAIT))
+                .unwrap_err();
+        let rebound = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::session::rebind_fence::SessionRebound>())
+            .unwrap_or_else(|| panic!("not session_rebound: {err:#}"));
+        assert!(!rebound.from_retired, "{err:#}");
+        assert_eq!(std::fs::read(&log).unwrap(), before, "nothing was written");
+    }
+
+    /// The log of `old` after a whole-binding move from a directory that
+    /// no longer exists to `anchor`, at epoch 1: the move event, and a
+    /// header recording it, whose `whole_parts_owed` field (the mark a
+    /// whole move's commit writes) is set when `owed` is. `torn` leaves the
+    /// header at epoch 0, as a commit stopped between its event and its
+    /// header does.
+    fn moved_log(dir: &Path, anchor: &Path, owed: bool, torn: bool) -> std::path::PathBuf {
+        let session = dir.join("old");
+        std::fs::create_dir_all(&session).unwrap();
+        let log = session.join("koto-old.state.jsonl");
+        let mut origin = serde_json::json!({
+            "anchor": anchor,
+            "store": {"kind": "local", "base": dir},
+        });
+        if !torn {
+            origin["anchor_epoch"] = 1.into();
+            origin["whole_epoch"] = 1.into();
+            origin["retired_anchors"] = serde_json::json!(["/koto-test-gone/old"]);
+            if owed {
+                origin["whole_parts_owed"] = true.into();
+            }
+        }
+        let execution_dir = if torn {
+            serde_json::json!("/koto-test-gone/old")
+        } else {
+            serde_json::json!(anchor)
+        };
+        let header = serde_json::json!({
+            "schema_version": 1, "workflow": "wf", "template_hash": "abc",
+            "created_at": "2025-01-01T00:00:00Z",
+            "execution_dir": execution_dir,
+            "origin": origin,
+        });
+        std::fs::write(&log, format!("{header}\n")).unwrap();
+        let to_work = EventPayload::Transitioned {
+            from: None,
+            to: "work".to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        };
+        append_event(&log, &to_work, TS).unwrap();
+        let moved = EventPayload::ExecutionAnchorReboundWhole(crate::engine::types::WholeRebound {
+            from: Some("/koto-test-gone/old".into()),
+            to: anchor.to_path_buf(),
+            whole: true,
+            epoch: Some(1),
+        });
+        append_event(&log, &moved, TS).unwrap();
+        log
+    }
+
+    #[test]
+    fn append_close_refuses_rebind_incomplete_while_a_whole_move_owes_its_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, true, false);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let e = crate::session::fence_state::with_cwd(&anchor, || {
+            append_close(&log, &close(), TS, WAIT)
+        })
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("rebind_incomplete"), "{e:#}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+
+        // The same log with the mark clear closes.
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, false, false);
+        crate::session::fence_state::with_cwd(&anchor, || append_close(&log, &close(), TS, WAIT))
+            .unwrap();
+    }
+
+    #[test]
+    fn append_close_refuses_rebind_incomplete_for_a_torn_whole_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("a");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let log = moved_log(dir.path(), &anchor, false, true);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let e = crate::session::fence_state::with_cwd(&anchor, || {
+            append_close(&log, &close(), TS, WAIT)
+        })
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("rebind_incomplete"), "{e:#}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+    }
 }

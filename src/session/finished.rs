@@ -65,6 +65,13 @@ pub struct FinishedRecord {
     pub finished_at: String,
     /// `terminal` or `parent`.
     pub removed_by: String,
+    /// The run that replaced the session (`koto init --replaces` or `koto
+    /// session replace`), from the `by` of its log's fence marked
+    /// `replaced`. Absent for a session nothing replaced, so its record
+    /// reads and writes as it always has, and a record written before the
+    /// field existed parses with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 /// The records directory of the store whose session directories sit
@@ -261,6 +268,7 @@ mod tests {
             truncated: false,
             finished_at: "2026-10-12T00:00:00.000Z".to_string(),
             removed_by: REMOVED_BY_TERMINAL.to_string(),
+            replaced_by: None,
         }
     }
 
@@ -338,5 +346,26 @@ mod tests {
         assert!(read(&base, "b").is_err());
         // A listing skips what doesn't read.
         assert!(list(&base).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_record_without_replaced_by_reads_and_writes_back_unchanged() {
+        // A record as koto wrote it before `replaced_by` existed, and as it
+        // still writes one for a session nothing replaced.
+        let old = concat!(
+            r#"{"v":1,"name":"old","session_id":"id-1","execution_dir":"/work/project","#,
+            r#""state":"done","status":"terminal","failure":false,"#,
+            r#""result":{"status":"success","summary":"done"},"#,
+            r#""finished_at":"2026-10-12T00:00:00.000Z","removed_by":"terminal"}"#
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(finished_dir(base)).unwrap();
+        std::fs::write(record_path(base, "old"), old).unwrap();
+        let got = read(base, "old").unwrap().unwrap();
+        assert_eq!(got, record("old"));
+        write(base, &got).unwrap();
+        let back = std::fs::read_to_string(record_path(base, "old")).unwrap();
+        assert_eq!(back, old);
     }
 }

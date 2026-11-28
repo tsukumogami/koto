@@ -151,6 +151,12 @@ events:
       reason:
         type: string
         required: true
+      replaced_by:
+        type: string
+        required: false
+      replaced_by_session_id:
+        type: string
+        required: false
 
   gate_override_recorded:
     tier: 1
@@ -538,6 +544,26 @@ events:
         required: true
       machine_name:
         type: string
+        required: false
+
+  session_superseded:
+    tier: 2
+    fields:
+      by:
+        type: string
+        required: true
+      by_session_id:
+        type: string
+        required: true
+      actor:
+        type: object
+        required: true
+      at:
+        type: string
+        required: true
+        format: rfc3339
+      replaced:
+        type: boolean
         required: false
 
   environment_adopted:
@@ -1397,6 +1423,13 @@ Records explicit workflow cancellation.
 |-------|------|----------|-------------|
 | `state` | string | Yes | State the workflow was in when cancelled. |
 | `reason` | string | Yes | Human-readable cancellation reason. |
+| `replaced_by` | string | No | The run that replaced this one, on the cancel `koto init <new> --replaces <old>` or `koto session replace <old> --by <new>` writes. Absent on every other cancel. |
+| `replaced_by_session_id` | string | No | The replacing run's `session_id`, as its header records it. Present only beside `replaced_by`. |
+
+A replace writes this cancel in the same append as a `session_superseded` fence
+marked `replaced` (see [`session_superseded`](#session_superseded)), and its
+`reason` reads `replaced by <new>`. A run already standing cancelled, or one that
+finished in a terminal state, gets the fence without a second cancel.
 
 ---
 
@@ -2375,6 +2408,52 @@ It refuses an anchor's close session as a source. For an imported anchor,
 this event is its last activity until its own agent session writes again,
 and with its observed marker gone, the anchor closes once the idle period
 has passed since it.
+
+---
+
+#### `session_superseded`
+
+The fence another session puts in this session's log. Two commands write it:
+`koto init <succ> --continues <pred> --supersede`, which takes `<pred>`'s work
+over and continues it, and the close of a replaced run, which
+`koto init <new> --template <path> --replaces <old>` and
+`koto session replace <old> --by <new>` make and which marks the fence
+`replaced`.
+
+```json
+{
+  "type": "session_superseded",
+  "payload": {
+    "by": "deploy-r2",
+    "by_session_id": "9f2e5c1a",
+    "actor": {"claude_session": "c-1", "host": "build-1", "user": "dev"},
+    "at": "2026-11-27T10:00:04.512Z",
+    "replaced": true
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `by` | string | Yes | The session that superseded or replaced this one. |
+| `by_session_id` | string | Yes | That session's `session_id`, as its header records it. |
+| `actor` | object | Yes | Who ran the command: `claude_session` (`CLAUDE_CODE_SESSION_ID`), `host` and `user` (`USER`, else `LOGNAME`), each absent when the environment didn't say. May be `{}`. |
+| `at` | string | Yes | When the fence was written, RFC 3339 UTC. |
+| `replaced` | boolean | No | `true` when `by` replaced this run rather than continuing it. Absent on a plain supersede fence, so such a fence reads as it always has. |
+
+From this event on, koto refuses every write to the session except a
+`context_read` record, with `session_superseded`, and its reads keep working.
+State derivation ignores the event. A log holding more than one fence is read by
+its first.
+
+A fence marked `replaced` comes right after the replace's `workflow_cancelled`
+(carrying `replaced_by` and `replaced_by_session_id`), in the same append, unless
+the run already stood cancelled or had finished. Under `--abandon-tick` with a
+tick in flight, events recording a second stop of the run's background runner
+can follow the fence; nothing else is appended after it. `koto status` on such a
+run reports `replaced_by`, and reads a run that stands cancelled as terminal with
+`status: "cancelled"`. A koto release older than the field reads the fence as a
+plain supersede and still refuses writes past it.
 
 ---
 

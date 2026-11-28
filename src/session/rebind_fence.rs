@@ -20,6 +20,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::engine::types::{Event, EventPayload, StateFileHeader};
+
 /// A write refused by a rebind's fence.
 #[derive(Debug)]
 pub struct SessionRebound {
@@ -55,6 +57,88 @@ impl fmt::Display for SessionRebound {
 }
 
 impl std::error::Error for SessionRebound {}
+
+/// A whole-binding move of `name` to `anchor`, committed at `epoch`, that
+/// hasn't finished its later parts: it's running, or it stopped part way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveUnfinished {
+    /// The session moved.
+    pub name: String,
+    /// The anchor the move binds the session to.
+    pub anchor: PathBuf,
+    /// The `origin.anchor_epoch` the move commits, `0` for a session with
+    /// no origin.
+    pub epoch: u64,
+}
+
+impl fmt::Display for MoveUnfinished {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "rebind_incomplete: '{name}' was moved whole to {anchor} (epoch {epoch}), and the \
+             move hasn't finished its later parts (the held-by links, the publish location and \
+             the command environment): it's still running, or it stopped part way. Finish it by \
+             running `koto session rebind {name} --whole` again from {anchor}, with the \
+             KOTO_ANCHOR of the agent taking the run over, then run this command again",
+            name = self.name,
+            anchor = self.anchor.display(),
+            epoch = self.epoch,
+        )
+    }
+}
+
+impl std::error::Error for MoveUnfinished {}
+
+/// `Some` when the log whose header is `header` and events `events` records
+/// a whole-binding move that still owes its later parts: the mark its
+/// commit set (`origin.whole_parts_owed`), or a commit torn between its
+/// event and its header.
+pub fn move_unfinished(
+    name: &str,
+    header: &StateFileHeader,
+    events: &[Event],
+) -> Option<MoveUnfinished> {
+    if let Some(o) = header.origin.as_ref().filter(|o| o.whole_parts_owed) {
+        return Some(MoveUnfinished {
+            name: name.to_string(),
+            anchor: o.anchor.clone(),
+            epoch: o.whole_epoch,
+        });
+    }
+    // The last rebind, plain or whole: a whole one whose header wasn't
+    // rewritten is a torn commit, as the move itself reads it when it runs
+    // again. With an origin, the event carries the epoch one above the
+    // header's; without one, the header doesn't name the event's target.
+    let last = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::ExecutionAnchorRebound { .. } => Some(None),
+        EventPayload::ExecutionAnchorReboundWhole(w) => Some(Some(w)),
+        _ => None,
+    })??;
+    if !last.whole {
+        return None;
+    }
+    let torn = match header.origin.as_ref() {
+        Some(o) => last.epoch == Some(o.anchor_epoch + 1),
+        None => header.execution_dir.as_deref() != Some(last.to.as_path()),
+    };
+    torn.then(|| MoveUnfinished {
+        name: name.to_string(),
+        anchor: last.to.clone(),
+        epoch: last.epoch.unwrap_or(0),
+    })
+}
+
+/// [`move_unfinished`] over a whole log's text, its header line and then
+/// its events. A header that doesn't parse owes nothing here; an event line
+/// that doesn't parse is skipped.
+pub fn move_unfinished_in_log(name: &str, content: &str) -> Option<MoveUnfinished> {
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let header: StateFileHeader = serde_json::from_str(lines.next()?.trim()).ok()?;
+    let events: Vec<Event> = lines
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    move_unfinished(name, &header, &events)
+}
 
 /// What a header line records of the fence.
 #[derive(Debug, Default, PartialEq, Eq)]

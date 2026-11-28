@@ -549,6 +549,8 @@ fn emit_workflow_cancelled(exec: &RespawnExecution<'_>, reason: &str) -> Result<
     let payload = EventPayload::WorkflowCancelled {
         state: "request_store.respawn".to_string(),
         reason: reason.to_string(),
+        replaced_by: None,
+        replaced_by_session_id: None,
     };
     let timestamp = format_rfc3339_millis(exec.now);
     append_to_requester(exec, &payload, &timestamp, "WorkflowCancelled")
