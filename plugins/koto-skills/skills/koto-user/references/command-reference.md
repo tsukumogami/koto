@@ -966,7 +966,7 @@ Which refusal you are repairing matters. On the same host, `execution_anchor_unr
 
 `--whole` is for an agent session picking up a run another agent session drove. Run it from the new agent session, whose shells carry its `KOTO_ANCHOR`. One call moves the whole binding to the caller, under the session's `tick.lock` held exclusive:
 
-- the execution directory and origin anchor, as above, plus `origin.whole_epoch` set to the new `anchor_epoch`;
+- the execution directory and origin anchor, as above, plus `origin.whole_epoch` set to the new `anchor_epoch` and `origin.whole_parts_owed`, set to `true` at the commit and cleared by the move's last write;
 - the held-by links: the caller's anchor becomes the only one;
 - the stored `/workflows` publish location, which is dropped, so the next commit publishes to `KOTO_WORKFLOWS_DIR` or the caller's Claude Code session folder;
 - the recorded command environment, replaced with the caller's `PATH`, `HOME` and `XDG_CONFIG_HOME` (a session with no record yet is left to adopt one on its next tick).
@@ -987,7 +987,7 @@ Which refusal you are repairing matters. On the same host, `execution_anchor_unr
 | `publish_location` | `dropped`: whether a stored location was removed. |
 | `environment` | `rerecorded`: whether the record was replaced. `changed`: the variables whose recorded value changed, by name. |
 
-Each part is logged before it's made: `execution_anchor_rebound` with `whole: true` and `epoch`, then `held_by_rebound`, `publish_location_dropped` and `environment_rerecorded`. A move stopped part way finishes when you run the same command again, with no part made twice. Run again after a complete move, it changes nothing (`rebound: false`, `added: null`, `removed: []`, `dropped: false`, `rerecorded: false`) unless your environment differs from the record.
+Each part is logged before it's made: `execution_anchor_rebound` with `whole: true` and `epoch`, then `held_by_rebound`, `publish_location_dropped` and `environment_rerecorded`. A move stopped part way finishes when you run the same command again, with no part made twice; one stopped after its commit keeps `origin.whole_parts_owed` in the header until then. Run again after a complete move, it changes nothing (`rebound: false`, `added: null`, `removed: []`, `dropped: false`, `rerecorded: false`) unless your environment differs from the record.
 
 `--wait <secs>` (10 by default, only with `--whole`) bounds the wait for a tick in flight, retried every 50 ms; `--wait 0` refuses at once. Moves get no priority over ticks, so a session ticked back to back can keep the move out until `--wait` runs out; run it again.
 
@@ -1001,7 +1001,7 @@ Refusals print `{"error": {"code", "message"}, "command": "session rebind"}` on 
 | `session_busy` | 1 | A tick still held `tick.lock` when `--wait` ran out | Retry, or give `--wait` more seconds |
 | `rebind_cross_host` | 2 | Cloud backend: another machine uploaded the session's `version.json` last | Don't move it here; take it over with `koto session import`, then move the copy |
 
-A move that a rebind elsewhere overtook fails on stderr with `session_rebound:`, exit 1. Once a move has landed, every process that read the session before it, and every process under a retired anchor that is outside the new one or deeper than it, is refused with `session_rebound` on both backends; the move's own process isn't. Every host that touches a session moved this way needs this koto release or later: an older koto that rewrites the header drops `whole_epoch`, and the fence goes with it.
+A move that a rebind elsewhere overtook fails on stderr with `session_rebound:`, exit 1. Once a move has landed, every process that read the session before it, and every process under a retired anchor that is outside the new one or deeper than it, is refused with `session_rebound` on both backends; the move's own process isn't. Under the cloud backend, a move whose last push fails exits non-zero and asks you to run it again. Every host that touches a session moved this way needs this koto release or later: an older koto that rewrites the header drops `whole_epoch`, and the fence goes with it; it drops `whole_parts_owed` too.
 
 ---
 

@@ -277,7 +277,7 @@ A plain `koto session rebind` refuses a missing target directory, a file, or an 
 | `rebind_cross_host` | 2 | Cloud backend only: the bucket's `version.json` for the session was last uploaded by another machine. The message names both machines and `koto session import`, which is how a session moves between machines. |
 | `background_run_in_flight` | 2 | A `background: true` run of the session is in flight on this machine; the error adds `run_id`. Keep ticking until its result is delivered, or cancel it, then move. |
 
-`--workspace` refuses first, with `workspace_read_only`, and `session_migrated` keeps its flat shape. A move stopped part way by a crash or a failed write exits non-zero; running the same command again finishes it.
+`--workspace` refuses first, with `workspace_read_only`, and `session_migrated` keeps its flat shape. A move stopped part way by a crash or a failed write exits non-zero; running the same command again finishes it. Under the cloud backend that includes a failed last push, the one that clears `origin.whole_parts_owed`: the move exits non-zero and says to run it again.
 
 **`session_rebound`** is the fence a rebind leaves behind, and it reaches other commands, not only rebind. Every message starts `session_rebound:` and names the anchor the session is bound to now; nothing was written. `koto next` reports it as the structured code above, exit 2. Other verbs fail non-zero with it on stderr. It fires in these cases:
 

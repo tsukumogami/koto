@@ -673,6 +673,7 @@ pub(crate) fn origin_record(
         anchor_epoch: 0,
         retired_anchors: Vec::new(),
         whole_epoch: 0,
+        whole_parts_owed: false,
     })
 }
 

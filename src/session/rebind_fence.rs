@@ -328,6 +328,7 @@ mod tests {
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
             whole_epoch: 0,
+            whole_parts_owed: false,
         };
         advance(&mut origin, Some(Path::new("/a")), Path::new("/b"));
         assert_eq!(origin.anchor_epoch, 1);

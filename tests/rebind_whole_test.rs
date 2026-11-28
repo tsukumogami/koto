@@ -1345,6 +1345,63 @@ fn a_whole_rebind_run_again_after_it_finished_changes_nothing() {
     held.assert_moved("after the second run");
 }
 
+/// A move stopped right after its last step exits with the crash code, and
+/// running it again finishes with every part logged once and no mark left.
+#[test]
+fn a_whole_rebind_stopped_after_its_finish_step_runs_again_with_no_part_twice() {
+    let held = Held::new();
+    let mut cmd = held.mover();
+    cmd.env(FAULT_ENV, "after-finish");
+    let out = run(cmd);
+    assert_eq!(
+        out.code,
+        Some(86),
+        "the move didn't stop after its finish step: {}",
+        out.describe()
+    );
+
+    let out = run(held.mover());
+    assert_eq!(out.code, Some(0), "run again: {}", out.describe());
+    held.assert_moved("after the move ran again");
+    let rebound = payloads(&held.log(), "held_by_rebound");
+    assert_eq!(rebound.len(), 1, "held_by_rebound events: {rebound:?}");
+    let h = header(&held.log());
+    assert!(
+        h["origin"].get("whole_parts_owed").is_none(),
+        "the finished move left the mark: {h}"
+    );
+}
+
+/// A move stopped right after its commit leaves `origin.whole_parts_owed`
+/// set in the header, and running it again finishes and removes it.
+#[test]
+fn a_whole_rebind_stopped_after_its_commit_keeps_the_parts_owed_mark_until_run_again() {
+    let held = Held::new();
+    let mut cmd = held.mover();
+    cmd.env(FAULT_ENV, "after-commit");
+    let out = run(cmd);
+    assert_eq!(
+        out.code,
+        Some(86),
+        "the move didn't stop after its commit: {}",
+        out.describe()
+    );
+    let h = header(&held.log());
+    assert_eq!(
+        h["origin"]["whole_parts_owed"], true,
+        "the stopped move's header doesn't say its parts are owed: {h}"
+    );
+
+    let out = run(held.mover());
+    assert_eq!(out.code, Some(0), "run again: {}", out.describe());
+    held.assert_moved("after the move ran again");
+    let h = header(&held.log());
+    assert!(
+        h["origin"].get("whole_parts_owed").is_none(),
+        "the finished move left the mark: {h}"
+    );
+}
+
 #[test]
 fn a_whole_rebind_works_on_a_child_session() {
     let host = Host::new();

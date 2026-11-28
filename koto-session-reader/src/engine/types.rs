@@ -251,6 +251,13 @@ pub struct SessionOrigin {
     /// is also under. A session without it keeps the plain rebind's fence.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub whole_epoch: u64,
+    /// Set by a whole-binding move's commit and cleared by its last write,
+    /// once the held-by links, the publish location and the command
+    /// environment are moved. A move that stopped after its commit leaves it
+    /// set until the move is run again. Omitted when false; an older koto
+    /// drops it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_parts_owed: bool,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -5088,6 +5095,37 @@ mod tests {
         let json = r#"{"schema_version":1,"workflow":"old-wf","template_hash":"abc","created_at":"2026-01-01T00:00:00Z"}"#;
         let parsed: StateFileHeader = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.session_id, "");
+    }
+
+    /// The origin keeps `whole_parts_owed` through a read and a write when
+    /// it is true, and writes no such key when it is false or absent.
+    #[test]
+    fn session_origin_keeps_whole_parts_owed_and_omits_it_when_false() {
+        let with = |owed: &str| {
+            format!(
+                r#"{{"schema_version":1,"workflow":"wf","template_hash":"h","created_at":"t","origin":{{"anchor":"/a","store":{{"kind":"local","base":"/s"}},"anchor_epoch":1,"whole_epoch":1{owed}}}}}"#
+            )
+        };
+        let written = |json: &str| -> serde_json::Value {
+            let parsed: StateFileHeader = serde_json::from_str(json).unwrap();
+            serde_json::to_value(&parsed).unwrap()
+        };
+
+        let v = written(&with(r#","whole_parts_owed":true"#));
+        assert_eq!(
+            v["origin"]["whole_parts_owed"], true,
+            "the mark was dropped on write: {v}"
+        );
+        assert_eq!(v["origin"]["whole_epoch"], 1, "{v}");
+
+        for owed in [r#","whole_parts_owed":false"#, ""] {
+            let v = written(&with(owed));
+            assert!(
+                v["origin"].get("whole_parts_owed").is_none(),
+                "a false mark was written: {v}"
+            );
+            assert_eq!(v["origin"]["whole_epoch"], 1, "{v}");
+        }
     }
 
     #[test]

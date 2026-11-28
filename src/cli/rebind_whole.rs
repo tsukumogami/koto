@@ -17,6 +17,12 @@
 //! before it is made, so a move stopped part way finishes when run again
 //! and no part happens twice: every event carries the epoch the move
 //! committed, and a re-run reads only the events after its move's own.
+//!
+//! The commit also sets `origin.whole_parts_owed` in the header, and the
+//! move's last write clears it once every part is done, so a move stopped
+//! after its commit stays marked until it is run again. Under the cloud
+//! backend that clear is pushed strictly: a move whose last push fails exits
+//! non-zero and asks to be run again, and the re-run pushes it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -247,7 +253,8 @@ fn canonical_target(name: &str, to: Option<&str>) -> Result<PathBuf> {
 /// read, as this machine's, so a host that pushed before the move refuses
 /// its next flush as `session_rebound` before any of its writes go up. The
 /// context is then carried to the session's home when the move changed it,
-/// as a plain rebind carries it.
+/// as a plain rebind carries it. A move whose last push ([`finish_move`])
+/// fails stops before both, and the re-run makes them.
 fn move_cloud(
     backend: &Backend,
     cloud: &crate::session::cloud::CloudBackend,
@@ -339,6 +346,7 @@ fn move_cloud(
         )?;
         drop_publish_location(backend, name, since, logged_epoch, &mut report)?;
         rerecord_environment(backend, name, since, logged_epoch, &mut report)?;
+        finish_move(backend, name)?;
         Ok(())
     })?;
 
@@ -519,7 +527,8 @@ fn moved_log(
 
 /// `h` as a whole-binding move to `target` leaves it: bound to `target`,
 /// whose anchor it records, the epoch one up with the anchor left retired,
-/// and that epoch as `whole_epoch`. A header with no origin gets the new
+/// that epoch as `whole_epoch`, and `whole_parts_owed` set until
+/// [`finish_move`] clears it. A header with no origin gets the new
 /// `execution_dir` alone.
 fn move_header(mut h: StateFileHeader, target: &Path) -> StateFileHeader {
     let from = h.execution_dir.clone();
@@ -528,6 +537,7 @@ fn move_header(mut h: StateFileHeader, target: &Path) -> StateFileHeader {
         origin.anchor = target.to_path_buf();
         crate::session::rebind_fence::advance(origin, Some(&left), target);
         origin.whole_epoch = origin.anchor_epoch;
+        origin.whole_parts_owed = true;
     }
     h.execution_dir = Some(target.to_path_buf());
     h
@@ -662,6 +672,7 @@ fn move_local(
         )?;
         drop_publish_location(backend, name, since, logged_epoch, &mut report)?;
         rerecord_environment(backend, name, since, logged_epoch, &mut report)?;
+        finish_move(backend, name)?;
         Ok(())
     })?;
 
@@ -1012,6 +1023,51 @@ fn rerecord_environment(
     Ok(())
 }
 
+/// The move's last step: clear `origin.whole_parts_owed`, which the commit
+/// set, now that the held-by links, the publish location and the command
+/// environment are moved. A re-run of a finished move finds it clear and
+/// writes nothing. The header is read from this host's copy, which the
+/// move's own writes left current.
+///
+/// Under the cloud backend the clear's own push is best-effort, so the
+/// state file is then pushed strictly whenever this host's copy isn't the
+/// one its sync stamp says the bucket holds
+/// ([`crate::session::cloud::CloudBackend::state_unpushed`]), whether or not
+/// this run cleared the mark: a re-run after a refused push finds the mark
+/// clear here and still set in the bucket. A copy the bucket already holds
+/// makes no request. A strict push that fails stops the move with an error
+/// asking for it to be run again.
+fn finish_move(backend: &Backend, name: &str) -> Result<()> {
+    let (header, _) = backend.read_events_local(name)?;
+    if header.origin.as_ref().is_some_and(|o| o.whole_parts_owed) {
+        backend.rewrite_header(name, &|mut h| {
+            if let Some(o) = h.origin.as_mut() {
+                o.whole_parts_owed = false;
+            }
+            h
+        })?;
+        crash_at("after-finish");
+    }
+    let Some(cloud) = backend.as_cloud() else {
+        return Ok(());
+    };
+    if !cloud.state_unpushed(name) {
+        return Ok(());
+    }
+    cloud.ensure_pushed(name).map_err(|e| {
+        let e = match e {
+            crate::session::SessionError::Other(e) => e,
+            e => anyhow::Error::from(e),
+        };
+        let why = format!("{e:#}");
+        e.context(format!(
+            "the move of session '{name}' is done on this machine, but its copy couldn't be \
+             pushed to the bucket, whose copy may still say the move's parts are owed ({why}); \
+             run the move again: `koto session rebind {name} --whole`"
+        ))
+    })
+}
+
 /// Take `name`'s `tick.lock` exclusive, asking every [`POLL`] until `wait`
 /// has passed, and say whether it had to wait. Past `wait` the move refuses
 /// with `session_busy`, exit 1, having written nothing. A lock file a
@@ -1126,6 +1182,7 @@ mod tests {
             anchor_epoch,
             retired_anchors: vec![],
             whole_epoch,
+            whole_parts_owed: false,
         });
         h
     }
