@@ -255,6 +255,7 @@ impl SessionBackend for LocalBackend {
         validate_session_id(id)?;
         let dir = self.base_dir.join(id);
         if dir.exists() {
+            crate::telemetry::before_session_removal(&dir);
             fs::remove_dir_all(&dir)?;
         }
         Ok(())

@@ -455,6 +455,10 @@ impl DeciderPort for CliDeciderPort<'_> {
                 return ConsultReply::Skipped;
             }
         }
+        // Queued session records go out before the provider is called, and
+        // before the clock starts, so the latency recorded is the
+        // provider's alone.
+        crate::telemetry::flush();
         let started = Instant::now();
         let answer = self.decider.decide(&request);
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -722,6 +726,60 @@ d
             template_state: ts,
             fields: &fields,
         })
+    }
+
+    /// A provider that notes how many records the sink had received when
+    /// it was called, then answers.
+    #[cfg(unix)]
+    struct Watching {
+        sink: Arc<crate::telemetry::sink_fixture::SinkFixture>,
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[cfg(unix)]
+    impl Decider for Watching {
+        fn provider(&self) -> &str {
+            "test"
+        }
+
+        fn decide(
+            &self,
+            _req: &DecisionRequest,
+        ) -> Result<DecisionResponse, crate::decider::types::DeciderError> {
+            self.seen.lock().unwrap().push(self.sink.received());
+            Ok(answer())
+        }
+    }
+
+    /// Flush point: a consultation sends what is queued before the
+    /// provider is called.
+    #[cfg(unix)]
+    #[test]
+    fn decider_flush_precedes_provider_call() {
+        // The sink goes in after the session exists, so nothing the setup
+        // journals is queued.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = session(tmp.path(), "sess-uuid-1");
+        let sink = Arc::new(crate::telemetry::sink_fixture::SinkFixture::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tpl = compiled();
+        let settings = default_endpoint_settings();
+        let mut p = CliDeciderPort::new(
+            &backend,
+            &backend,
+            "wf",
+            Box::new(Watching {
+                sink: Arc::clone(&sink),
+                seen: Arc::clone(&seen),
+            }),
+            DeciderPolicy::from_settings(&settings),
+            settings.endpoint_origin(),
+            Box::new(|s: &str| s.to_string()),
+            false,
+        );
+        sink.queue(3);
+        assert!(matches!(consult(&mut p, &tpl), ConsultReply::Consulted(_)));
+        assert_eq!(*seen.lock().unwrap(), vec![3]);
     }
 
     #[test]

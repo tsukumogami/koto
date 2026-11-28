@@ -26,12 +26,13 @@ path = "junit.xml"
 # local and CI runs serialize the same tests.
 [test-groups]
 
-# The three wall-clock tests in cloud_read_cost_test time a run against the
-# cloud backend stand-in and compare it with a local run (koto#499). Beside
-# other test processes, and under coverage instrumentation, a busy runner
-# pushes them over their bound. `threads-required = "num-cpus"` makes each one
-# take every test slot, so it runs with nothing else beside it. It is still
-# never retried.
+# One wall-clock test in cloud_read_cost_test times a run against the cloud
+# backend stand-in and compares it with a local run (koto#499). Beside other
+# test processes, and under coverage instrumentation, a busy runner pushes it
+# over its bound. `threads-required = "num-cpus"` makes it take every test
+# slot, so it runs with nothing else beside it. It is still never retried.
+# The file's other two timed tests count requests now and need no slot of
+# their own.
 [[profile.default.overrides]]
-filter = 'binary(=cloud_read_cost_test) & (test(=a_forty_read_action_on_the_cloud_backend_is_within_twice_local) | test(=a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing) | test(=a_hub_select_over_its_workers_checks_each_session_once))'
+filter = 'binary(=cloud_read_cost_test) & test(=a_forty_read_action_on_the_cloud_backend_is_within_twice_local)'
 threads-required = "num-cpus"

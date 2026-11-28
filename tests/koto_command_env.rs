@@ -128,6 +128,41 @@ fn every_test_builds_its_koto_command_through_the_helper() {
 
 /// The probe that [`a_cloud_backend_in_the_environment_never_reaches_the_helpers_commands`]
 /// runs in a child of this binary. Elsewhere it does nothing.
+/// The stub-sink harness is the one place a test gets a koto command that
+/// can reach an event sink, and koto finds a sink through `HOME` alone. So
+/// the harness must set `HOME` on every command it builds, to its scratch
+/// home: a command that inherited another `HOME` would look for a sink
+/// there. Its command builder is read here, and it must set the variable
+/// from the harness's own home and build the command through the helper.
+#[test]
+fn the_stub_sink_harness_always_sets_home_on_its_commands() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/event_sink.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = text
+        .find("pub fn koto(&self) -> assert_cmd::Command {")
+        .expect("the harness has a koto command builder");
+    let body = &text[start..];
+    let body = &body[..body.find("\n    }\n").expect("the builder ends")];
+    assert!(
+        body.contains("crate::koto_command::koto()"),
+        "the harness builds its command outside the helper:\n{body}"
+    );
+    assert!(
+        body.contains(".env(\"HOME\", &self.home)"),
+        "the harness's koto command doesn't set HOME to its scratch home:\n{body}"
+    );
+    assert!(
+        !body.contains("env_remove(\"HOME\")"),
+        "the harness's koto command unsets HOME:\n{body}"
+    );
+    // No other function in the harness builds a command.
+    assert_eq!(
+        text.matches("koto_command::").count(),
+        1,
+        "the harness builds a koto command in more than one place"
+    );
+}
+
 #[test]
 fn probe_runs_koto_under_an_inherited_cloud_backend() {
     if std::env::var_os(PROBE).is_none() {

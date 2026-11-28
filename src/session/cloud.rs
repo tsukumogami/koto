@@ -1947,6 +1947,25 @@ impl CloudBackend {
         Stamp::load(&self.local.session_dir(id)).filter(|s| s.state_key == self.state_key(id))
     }
 
+    /// Whether this host's copy of `id`'s state file may hold a write the
+    /// bucket lacks: the local file isn't the bytes this host's stamp
+    /// records, or there is no stamp that can be read for `id`'s current
+    /// state key. A missing or unreadable local file counts as differing
+    /// too. Reads local files only and makes no request, so a caller can
+    /// push strictly when this says so and skip the PUT otherwise.
+    ///
+    /// A best-effort push that failed leaves the stamp on the bytes before
+    /// the write, and a pull that kept the local copy over a bucket copy
+    /// differing only by its header leaves the stamp on the bucket's bytes;
+    /// both read as unpushed here.
+    pub(crate) fn state_unpushed(&self, id: &str) -> bool {
+        let Some(stamp) = self.stamp(id) else {
+            return true;
+        };
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        !std::fs::read(path).is_ok_and(|bytes| stamp.matches(&bytes))
+    }
+
     /// The id of the tick this process runs under, read from the ticked
     /// session's directory; `None` outside a tick.
     fn current_tick(&self) -> Option<String> {
@@ -7896,6 +7915,7 @@ impl CloudBackend {
             anchor_epoch: 0,
             retired_anchors: Vec::new(),
             whole_epoch: 0,
+            whole_parts_owed: false,
         });
         header.command_environment = Some(crate::engine::command_env::record_from_process(false).0);
 
@@ -9651,6 +9671,7 @@ pub(crate) mod test_support {
                 anchor_epoch: 0,
                 retired_anchors: Vec::new(),
                 whole_epoch: 0,
+                whole_parts_owed: false,
             }),
             execution_dir,
             session_id: String::new(),

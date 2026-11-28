@@ -1982,6 +1982,11 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
     let bound = Duration::from_millis(200);
     set_lock_wait_for_test(bound);
     let holder = hold_journal_lock(&journal);
+    // Each write reports how long it took and the lock wait it was
+    // allowed. Whether a write may wait is read from the allowance, never
+    // from the clock: on a slow host a write that doesn't wait can still
+    // take longer than one that does.
+    take_lock_waits_for_test();
     let next = || {
         let started = Instant::now();
         response(
@@ -1993,14 +1998,19 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
             "d",
             None,
         );
-        started.elapsed()
+        (started.elapsed(), take_lock_waits_for_test())
     };
 
-    let first = next();
+    let (first, allowed) = next();
     assert!(first >= bound, "{first:?}");
+    assert_eq!(allowed, vec![bound]);
     assert!(gave_up());
-    let second = next();
-    assert!(second < bound / 4, "{second:?}");
+    let (_, allowed) = next();
+    assert_eq!(
+        allowed,
+        vec![Duration::ZERO],
+        "the second write may not wait"
+    );
     drop(holder);
 
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
@@ -2012,8 +2022,8 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
     );
 
     // The lock is free: the single try takes it, and clears the state.
-    let third = next();
-    assert!(third < bound / 4, "{third:?}");
+    let (_, allowed) = next();
+    assert_eq!(allowed, vec![Duration::ZERO]);
     assert_eq!(response_records(&f.journal()).len(), 1);
     assert_eq!(warnings_for_test().len(), 1);
     assert!(!gave_up());
@@ -2031,6 +2041,9 @@ fn a_write_that_takes_the_lock_restores_the_full_wait() {
     let journal = f.home.join(JOURNAL_FILE);
     let bound = Duration::from_millis(150);
     set_lock_wait_for_test(bound);
+    // As in the test above, whether a write may wait is read from the lock
+    // wait it was allowed, not from how long it took.
+    take_lock_waits_for_test();
     let next = || {
         let started = Instant::now();
         response(
@@ -2042,33 +2055,40 @@ fn a_write_that_takes_the_lock_restores_the_full_wait() {
             "d",
             None,
         );
-        started.elapsed()
+        (started.elapsed(), take_lock_waits_for_test())
     };
 
     // A stall: the write gives up at its bound.
     let holder = hold_journal_lock(&journal);
-    let stalled = next();
+    let (stalled, allowed) = next();
     drop(holder);
     assert!(stalled >= bound, "{stalled:?}");
+    assert_eq!(allowed, vec![bound]);
     assert!(gave_up());
 
-    // The stall passes: a write takes the lock and clears the state.
-    let free = next();
-    assert!(free < bound / 2, "{free:?}");
+    // The stall passes: a write takes the lock on its one try and clears
+    // the state.
+    let (_, allowed) = next();
+    assert_eq!(allowed, vec![Duration::ZERO]);
     assert!(!gave_up());
     assert_eq!(response_records(&f.journal()).len(), 1);
 
-    // The next contended write waits its full bound again, and gets the
-    // lock once it is released within that bound.
+    // The next contended write is allowed its full bound again, and gets
+    // the lock once it is released within that bound. The bound here is
+    // long, so a host that is slow to run the releasing thread can't turn
+    // a wait that should succeed into one that runs out.
+    let long = Duration::from_secs(60);
+    set_lock_wait_for_test(long);
     let holder = hold_journal_lock(&journal);
+    let pause = Duration::from_millis(50);
     let release = std::thread::spawn(move || {
-        std::thread::sleep(bound / 3);
+        std::thread::sleep(pause);
         drop(holder);
     });
-    let contended = next();
+    let (contended, allowed) = next();
     release.join().unwrap();
-    assert!(contended >= bound / 3, "{contended:?}");
-    assert!(contended < bound * 2, "{contended:?}");
+    assert_eq!(allowed, vec![long], "the full wait is back");
+    assert!(contended >= pause, "{contended:?}");
     assert_eq!(response_records(&f.journal()).len(), 2);
     assert!(!gave_up());
     // The one warning, from the stall.
@@ -6288,4 +6308,48 @@ fn a_code_review_round_of_the_longest_values_fits_one_line_per_record() {
     for line in lines {
         assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
     }
+}
+
+/// With `run_journal.enabled` off, a session's hooks write nothing to the
+/// journal: no file, no lock, no warning. The sidecar is still written,
+/// and turning the journal back on resumes with the next record.
+#[test]
+fn a_disabled_journal_is_never_written_and_the_sidecar_still_is() {
+    let f = Fixture::new();
+    set_journal_enabled_for_test(false);
+    f.init("off", header("off", "off-id", None), Some("a"));
+    f.backend
+        .append_event(
+            "off",
+            &transitioned(Some("a"), "b"),
+            &crate::engine::types::now_iso8601(),
+        )
+        .unwrap();
+    // The journal's directory may not exist at all: nothing created it.
+    let names: Vec<String> = std::fs::read_dir(&f.home)
+        .map(|dir| {
+            dir.map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("_run_journal"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(names.is_empty(), "{names:?}");
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+    assert_eq!(batches_for_test(), (0, 0));
+    assert_eq!(
+        sidecar::read(&f.backend.session_dir("off")).and_then(|s| s.run_id),
+        Some("off-id".to_string())
+    );
+
+    set_journal_enabled_for_test(true);
+    f.backend
+        .append_event(
+            "off",
+            &transitioned(Some("b"), "c"),
+            &crate::engine::types::now_iso8601(),
+        )
+        .unwrap();
+    let j = f.journal();
+    assert_eq!(kinds(&j), vec!["state_entered"]);
+    assert_eq!(j[0]["koto.state"], "c");
 }

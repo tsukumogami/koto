@@ -403,7 +403,8 @@ fn default_request_leg_cap() -> u32 {
     256
 }
 
-/// Run journal rotation and retention (`src/telemetry/rotate.rs`).
+/// The `[run_journal]` table: whether the run journal is written at all,
+/// and its rotation and retention (`src/telemetry/rotate.rs`).
 ///
 /// Rotation is off by default: with `rotate_bytes` at 0 the journal is
 /// never moved, whatever its size. A non-zero bound makes the append that
@@ -411,8 +412,13 @@ fn default_request_leg_cap() -> u32 {
 /// `_run_journal.NNNNNNNNNN.jsonl` name first. Rotated files older than
 /// `retain_days` are removed at a later rotation unless a reader's position
 /// file, refreshed within `reader_stale_days`, still needs them.
+///
+/// `enabled` is on by default. Set to `false`, koto writes no record to the
+/// journal at all; nothing else about a session changes.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RunJournalConfig {
+    #[serde(default = "default_run_journal_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_run_journal_rotate_bytes")]
     pub rotate_bytes: u64,
     #[serde(default = "default_run_journal_retain_days")]
@@ -424,6 +430,7 @@ pub struct RunJournalConfig {
 impl Default for RunJournalConfig {
     fn default() -> Self {
         Self {
+            enabled: default_run_journal_enabled(),
             rotate_bytes: default_run_journal_rotate_bytes(),
             retain_days: default_run_journal_retain_days(),
             reader_stale_days: default_run_journal_reader_stale_days(),
@@ -431,6 +438,9 @@ impl Default for RunJournalConfig {
     }
 }
 
+fn default_run_journal_enabled() -> bool {
+    true
+}
 fn default_run_journal_rotate_bytes() -> u64 {
     0
 }
@@ -560,6 +570,7 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         }
         "request_store.request_leg_cap" => Some(config.request_store.request_leg_cap.to_string()),
         "workflows.native" => Some(config.workflows.native.to_string()),
+        "run_journal.enabled" => Some(config.run_journal.enabled.to_string()),
         "run_journal.rotate_bytes" => Some(config.run_journal.rotate_bytes.to_string()),
         "run_journal.retain_days" => Some(config.run_journal.retain_days.to_string()),
         "run_journal.reader_stale_days" => Some(config.run_journal.reader_stale_days.to_string()),
@@ -682,6 +693,16 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
             let rs_table = rs.as_table_mut().ok_or("request_store is not a table")?;
             rs_table.insert(field.to_string(), toml::Value::Integer(parsed));
+        }
+        "run_journal.enabled" => {
+            let parsed: bool = value
+                .parse()
+                .map_err(|_| format!("value for {} must be true or false (got {})", key, value))?;
+            let rj = table
+                .entry("run_journal")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let rj_table = rj.as_table_mut().ok_or("run_journal is not a table")?;
+            rj_table.insert("enabled".to_string(), toml::Value::Boolean(parsed));
         }
         "run_journal.rotate_bytes"
         | "run_journal.retain_days"
@@ -838,7 +859,8 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
-        "run_journal.rotate_bytes"
+        "run_journal.enabled"
+        | "run_journal.rotate_bytes"
         | "run_journal.retain_days"
         | "run_journal.reader_stale_days" => {
             let field = key.strip_prefix("run_journal.").unwrap();
@@ -925,6 +947,7 @@ pub const ALL_KEYS: &[&str] = &[
     "request_store.request_leg_append_cap",
     "request_store.request_leg_cap",
     "workflows.native",
+    "run_journal.enabled",
     "run_journal.rotate_bytes",
     "run_journal.retain_days",
     "run_journal.reader_stale_days",
@@ -1367,6 +1390,46 @@ mod tests {
             assert!(unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
             assert!(!unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
         }
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(cfg.run_journal, RunJournalConfig::default());
+    }
+
+    #[test]
+    fn test_run_journal_enabled_defaults_on_and_round_trips() {
+        assert!(ALL_KEYS.contains(&"run_journal.enabled"));
+        let config = KotoConfig::default();
+        assert!(config.run_journal.enabled);
+        assert_eq!(
+            get_value(&config, "run_journal.enabled"),
+            Some("true".to_string())
+        );
+        // A [run_journal] table that names other keys leaves it on.
+        let cfg: KotoConfig = toml::from_str("[run_journal]\nretain_days = 7\n").unwrap();
+        assert!(cfg.run_journal.enabled);
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "run_journal.enabled", "false").unwrap();
+        assert_eq!(doc["run_journal"]["enabled"].as_bool(), Some(false));
+        let cfg: KotoConfig = doc.clone().try_into().unwrap();
+        assert!(!cfg.run_journal.enabled);
+        assert_eq!(
+            get_value(&cfg, "run_journal.enabled"),
+            Some("false".to_string())
+        );
+        // The other keys keep their defaults.
+        assert_eq!(cfg.run_journal.rotate_bytes, 0);
+
+        for bad in ["0", "no", "False", ""] {
+            let err = set_value_in_toml(&mut doc, "run_journal.enabled", bad).unwrap_err();
+            assert!(err.contains("true or false"), "{err}");
+        }
+        assert_eq!(doc["run_journal"]["enabled"].as_bool(), Some(false));
+
+        set_value_in_toml(&mut doc, "run_journal.enabled", "true").unwrap();
+        let cfg: KotoConfig = doc.clone().try_into().unwrap();
+        assert!(cfg.run_journal.enabled);
+        assert!(unset_value_in_toml(&mut doc, "run_journal.enabled").unwrap());
+        assert!(!unset_value_in_toml(&mut doc, "run_journal.enabled").unwrap());
         let cfg: KotoConfig = doc.try_into().unwrap();
         assert_eq!(cfg.run_journal, RunJournalConfig::default());
     }

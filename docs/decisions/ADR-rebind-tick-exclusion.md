@@ -55,6 +55,8 @@ On the cloud backend, `--whole` creates the session directory before it takes `t
 
 Every host that touches a session moved with `--whole` needs this release or later. An older build that rewrites the header drops `whole_epoch`, and the strengthened fence turns off with it: a stale process of the new build then passes the whole-binding rule.
 
+A `--whole` commit also sets `origin.whole_parts_owed`, which the move's last write clears, so a move that stopped after its commit shows in the header until it's run again. An older build that rewrites the header drops this mark too.
+
 Three details of how the tick takes the lock and moves its writes aren't in the points above. The cloud backend's tick id used to be written by `begin_tick` before the tick's first read. Moving that write behind the anchor check would have let the first read find the previous tick's id in `cloud-tick.id` and count its stamp as already checked. So the tick now picks its id in memory at the old point, every read uses it, and `begin_tick` writes that same id once the anchor check passes. A refused tick leaves no `cloud-tick.id` behind. A cloud session that the tick's first read has just pulled had no directory when the lock was first tried, so the lock is offered again right after that read. And when `tick.lock` can't be opened or taken for a reason other than another holder (an unreadable directory, say), the tick runs without it, as ticks did before the lock existed. It doesn't refuse. The exclusion this decision promises holds only while the lock can be taken.
 
 ## Rationale

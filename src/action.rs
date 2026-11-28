@@ -371,7 +371,7 @@ const GROUP_EXIT_WAIT: Duration = Duration::from_secs(5);
 /// that window. A zombie still counts as present until it is reaped, which
 /// happens as soon as it is orphaned to init; the bound keeps a host that
 /// never reaps from holding the tick.
-fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
+pub(crate) fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {
         // SAFETY: signal 0 only checks that the group exists.
@@ -464,6 +464,13 @@ pub fn run_shell_command(
     timeout_secs: u32,
     env: &CommandEnv,
 ) -> CommandOutput {
+    // Send the session records queued so far before anything else, so what
+    // led up to the command is out even if the command runs long. The
+    // command's time limit is measured from the spawn below, after the
+    // flush has returned, so no flush ever sits inside it. With nothing
+    // queued, or no sink, this returns at once.
+    crate::telemetry::flush();
+
     let timeout = if timeout_secs == 0 {
         Duration::from_secs(DEFAULT_TIMEOUT_SECS)
     } else {

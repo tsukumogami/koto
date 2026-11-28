@@ -1587,6 +1587,297 @@ Done.
         }
     }
 
+    /// The file this host keeps its sync stamp of a session in, in the
+    /// session's local directory.
+    const STAMP_FILE: &str = "cloud-sync.json";
+
+    /// The log `text` with `origin.whole_parts_owed` set in its header. The
+    /// event lines are kept byte for byte, so the two logs differ by their
+    /// header alone.
+    fn with_parts_owed(text: &str) -> String {
+        let (head, rest) = text.split_once('\n').expect("the log has no event");
+        let mut header: Value = serde_json::from_str(head).unwrap();
+        header["origin"]["whole_parts_owed"] = json!(true);
+        format!("{}\n{rest}", serde_json::to_string(&header).unwrap())
+    }
+
+    /// Whether the header of `text` carries `origin.whole_parts_owed`.
+    fn owes_parts(text: &str) -> bool {
+        header_of(text)["origin"].get("whole_parts_owed").is_some()
+    }
+
+    impl Moving {
+        /// The path of this host's sync stamp of [`NAME`].
+        fn stamp_path(&self) -> PathBuf {
+            self.m.session_dir(NAME).join(STAMP_FILE)
+        }
+
+        /// How many PUTs of the session's state file the bucket received
+        /// since its requests were last cleared.
+        fn state_puts(&self) -> usize {
+            let key = self.state_key();
+            self.s3
+                .requests()
+                .iter()
+                .filter(|r| r.method == "PUT" && r.key == key)
+                .count()
+        }
+
+        /// After a finished move, leave the session as a host whose clear
+        /// of the mark never reached the bucket leaves it: the bucket's
+        /// header still carries `origin.whole_parts_owed`, this host's sync
+        /// stamp names the bucket's bytes, and this host's copy is the same
+        /// log under a header without the mark.
+        fn owe_parts_in_the_bucket_only(&self) {
+            use sha2::{Digest, Sha256};
+
+            let cleared = self.remote();
+            assert!(
+                !owes_parts(&cleared),
+                "setup: the finished move left the mark in the bucket: {}",
+                header_of(&cleared)
+            );
+            let owed = with_parts_owed(&cleared);
+            self.s3.put(&self.state_key(), owed.as_bytes());
+            std::fs::write(self.m.state_path(NAME), &cleared).unwrap();
+
+            let path = self.stamp_path();
+            let mut stamp: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                stamp["state_key"],
+                self.state_key().as_str(),
+                "setup: the stamp is for another key: {stamp}"
+            );
+            stamp["state_etag"] = json!(self.s3.etag_of(&self.state_key()).unwrap());
+            stamp["state_len"] = json!(owed.len());
+            stamp["state_sha256"] = json!(hex::encode(Sha256::digest(owed.as_bytes())));
+            stamp["verified_tick"] = Value::Null;
+            std::fs::write(&path, serde_json::to_vec(&stamp).unwrap()).unwrap();
+            let _ = std::fs::remove_file(self.m.session_dir(NAME).join("cloud-check.json"));
+        }
+
+        /// The move from `new`, spawned to wait at `point` until the
+        /// returned hold file is removed; it has reached `point` when this
+        /// returns.
+        fn mover_held_at(&self, point: &str) -> (std::process::Child, PathBuf) {
+            let hold = self.m.root.join("hold");
+            let envs = [
+                ("KOTO_ANCHOR", self.new_anchor.as_str()),
+                ("XDG_CONFIG_HOME", s(&self.xdg_new)),
+                ("KOTO_WORKFLOWS_DIR", s(&self.wf_new)),
+                ("KOTO_TEST_REBIND_HOLD", s(&hold)),
+                ("KOTO_TEST_REBIND_HOLD_AT", point),
+            ];
+            let mut mover = self
+                .m
+                .cmd(&self.new, &envs, &["session", "rebind", NAME, "--whole"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            let bound = std::time::Duration::from_secs(60);
+            while !hold.exists() {
+                if mover.try_wait().unwrap().is_some() {
+                    let out = mover.wait_with_output().unwrap();
+                    panic!(
+                        "the move exited before its hold point: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                if started.elapsed() > bound {
+                    let _ = mover.kill();
+                    panic!("the move didn't reach its hold point within {bound:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            (mover, hold)
+        }
+    }
+
+    /// Wait for the spawned `mover`, killed after 60 seconds.
+    fn finish_mover(mut mover: std::process::Child) -> std::process::Output {
+        let started = std::time::Instant::now();
+        let bound = std::time::Duration::from_secs(60);
+        while mover.try_wait().unwrap().is_none() {
+            if started.elapsed() > bound {
+                let _ = mover.kill();
+                panic!("the move didn't finish within {bound:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        mover.wait_with_output().unwrap()
+    }
+
+    /// A cloud move stopped right after its commit leaves
+    /// `origin.whole_parts_owed` in the bucket's header and this host's, and
+    /// running it again finishes and removes it from both.
+    #[test]
+    fn a_cloud_whole_rebind_stopped_after_its_commit_keeps_the_parts_owed_mark_until_run_again() {
+        let mv = Moving::new();
+        let run = mv.mover(&mv.new, &[(FAULT_ENV, "after-commit")], &[]);
+        assert_eq!(run.code, Some(86), "{}", run.describe());
+        let remote = header_of(&mv.remote());
+        assert_eq!(
+            remote["origin"]["whole_parts_owed"], true,
+            "the bucket's header doesn't say the move's parts are owed: {remote}"
+        );
+        let local = mv.m.header(NAME);
+        assert_eq!(
+            local["origin"]["whole_parts_owed"], true,
+            "this host's header doesn't say the move's parts are owed: {local}"
+        );
+
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "the move run again: {}", run.describe());
+        mv.assert_moved("after the move ran again");
+        assert!(
+            !owes_parts(&mv.remote()),
+            "the bucket's header kept the mark: {}",
+            header_of(&mv.remote())
+        );
+        assert!(
+            !owes_parts(&mv.m.local_text(NAME)),
+            "this host's header kept the mark: {}",
+            mv.m.header(NAME)
+        );
+    }
+
+    /// A cloud move whose push of the cleared mark fails exits non-zero,
+    /// asking for the move to be run again, with the mark still in the
+    /// bucket; running it again pushes the clear.
+    #[test]
+    fn a_cloud_whole_rebind_whose_last_push_fails_exits_non_zero_and_a_rerun_clears_the_mark() {
+        let mv = Moving::new();
+        // Every state push before the move's last one is done at this
+        // point; from here on the bucket refuses the state file only.
+        let (mover, hold) = mv.mover_held_at("after-environment");
+        mv.s3.fail("PUT", &mv.state_key(), 500);
+        std::fs::remove_file(&hold).unwrap();
+        let out = finish_mover(mover);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            !out.status.success(),
+            "the move exited 0 with its last push refused: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("run the move again"),
+            "the failed move doesn't ask to be run again: {text}"
+        );
+        let remote = header_of(&mv.remote());
+        assert_eq!(
+            remote["origin"]["whole_parts_owed"], true,
+            "the bucket's header lost the mark the refused push carried: {remote}"
+        );
+        let local = mv.m.header(NAME);
+        assert!(
+            local["origin"].get("whole_parts_owed").is_none(),
+            "this host's header kept the mark: {local}"
+        );
+
+        mv.s3.clear_faults();
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "the move run again: {}", run.describe());
+        mv.assert_moved("after the move ran again");
+        assert!(
+            !owes_parts(&mv.remote()),
+            "the run again didn't push the clear: {}",
+            header_of(&mv.remote())
+        );
+    }
+
+    /// A move run again on a host whose copy is ahead of the bucket's by
+    /// the cleared mark alone pushes that copy, and exits non-zero while
+    /// the bucket refuses the push.
+    #[test]
+    fn a_cloud_whole_rebind_run_again_on_a_host_ahead_of_the_bucket_pushes_the_cleared_mark() {
+        let mv = Moving::new();
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "setup: the move: {}", run.describe());
+        mv.owe_parts_in_the_bucket_only();
+
+        mv.s3.fail("PUT", &mv.state_key(), 500);
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(
+            !run.ok(),
+            "the move exited 0 with this host's clear not in the bucket: {}",
+            run.describe()
+        );
+        assert!(
+            format!("{}{}", run.stdout, run.stderr)
+                .to_lowercase()
+                .contains("run the move again"),
+            "the failed move doesn't ask to be run again: {}",
+            run.describe()
+        );
+        assert!(
+            owes_parts(&mv.remote()),
+            "the bucket lost the mark through a refused push"
+        );
+
+        mv.s3.clear_faults();
+        mv.s3.clear_requests();
+        let run = mv.mover(&mv.new, &[], &[]);
+        assert!(run.ok(), "the move run again: {}", run.describe());
+        assert!(
+            mv.state_puts() > 0,
+            "the run again didn't push this host's copy: {:?}",
+            mv.s3.requests()
+        );
+        assert!(
+            !owes_parts(&mv.remote()),
+            "the bucket's header kept the mark: {}",
+            header_of(&mv.remote())
+        );
+        mv.assert_moved("after the move ran again");
+    }
+
+    /// A move run again with no readable sync stamp for the session on this
+    /// host (none at all, one that doesn't parse, or one that can't be read
+    /// or rewritten) pushes this host's copy rather than skip the push.
+    #[test]
+    fn a_cloud_whole_rebind_with_no_readable_sync_stamp_pushes_the_cleared_mark() {
+        for case in ["missing", "unparsable", "a directory"] {
+            let mv = Moving::new();
+            let run = mv.mover(&mv.new, &[], &[]);
+            assert!(run.ok(), "{case}: setup: the move: {}", run.describe());
+            mv.owe_parts_in_the_bucket_only();
+            let stamp = mv.stamp_path();
+            std::fs::remove_file(&stamp).unwrap();
+            match case {
+                "missing" => {}
+                "unparsable" => std::fs::write(&stamp, b"{not json").unwrap(),
+                _ => {
+                    // A directory in the stamp's place: no read of it
+                    // succeeds and no write replaces it.
+                    std::fs::create_dir(&stamp).unwrap();
+                    std::fs::write(stamp.join("kept"), b"").unwrap();
+                }
+            }
+
+            mv.s3.clear_requests();
+            let run = mv.mover(&mv.new, &[], &[]);
+            assert!(run.ok(), "{case}: the move run again: {}", run.describe());
+            assert!(
+                mv.state_puts() > 0,
+                "{case}: the run again skipped the push: {:?}",
+                mv.s3.requests()
+            );
+            assert!(
+                !owes_parts(&mv.remote()),
+                "{case}: the bucket's header kept the mark: {}",
+                header_of(&mv.remote())
+            );
+            mv.assert_moved(case);
+        }
+    }
+
     #[test]
     fn a_cloud_whole_rebind_run_from_the_old_directory_finishes_its_later_parts() {
         // The mover reads the session at the old anchor, then retires it:

@@ -295,7 +295,7 @@
 //!
 //! A batch holding an identity record is flushed to disk; a batch of
 //! relayed or response records alone isn't, and is made durable by the next
-//! flush (see [`write`]).
+//! flush (see [`write_within`]).
 //!
 //! ## Files
 //!
@@ -305,14 +305,66 @@
 //! and the driver last recorded for it (see `sidecar`). Neither is session
 //! state. Cloud sync and `koto session import` carry neither: they move the
 //! state log, version, template and context files only.
+//!
+//! ## The sent copy
+//!
+//! Every hook hands its records to `emit`, which also queues a stamped
+//! copy of each for an event sink, an optional program at a fixed path
+//! under the user's home. `queue` holds the copies and sends them, `sink`
+//! finds the program and makes one call, and `carry` keeps the count of
+//! records that were dropped, in `telemetry.json` in the session directory,
+//! and hands it to a later flush to send out. With no sink installed none
+//! of it runs past one cached check. The journal's bytes are the same
+//! either way.
 
+#[cfg(unix)]
+mod carry;
 mod context_reads;
 pub(crate) mod driver;
+mod emit;
 mod fixture;
 mod pairing;
 #[cfg(unix)]
+mod queue;
+#[cfg(unix)]
 pub(crate) mod rotate;
 pub(crate) mod sidecar;
+#[cfg(unix)]
+mod sink;
+
+/// Where there is no event sink to run, nothing is queued and a flush does
+/// nothing.
+#[cfg(not(unix))]
+mod queue {
+    pub(crate) fn active() -> bool {
+        false
+    }
+    pub(crate) fn push(_session_dir: &std::path::Path, _lines: Vec<String>, _oversize: u64) {}
+    pub fn flush() {}
+}
+
+pub use queue::flush;
+
+/// Called just before a session directory is removed, with that directory:
+/// moves the session's count of undelivered records to its store's orphan
+/// count, so it still goes out with a later flush (see `carry`). A session
+/// with no such count costs one `lstat`.
+#[cfg(unix)]
+pub(crate) fn before_session_removal(session_dir: &Path) {
+    carry::orphan(session_dir);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn before_session_removal(_session_dir: &Path) {}
+
+// The stub sink the sender's unit tests install, shared with the
+// integration tests. Declared in this file so the path is read from this
+// directory.
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/event_sink_stub.rs"]
+mod event_sink_stub;
+#[cfg(all(test, unix))]
+pub(crate) mod sink_fixture;
 
 use std::path::Path;
 
@@ -339,7 +391,7 @@ const FORMAT_VERSION: u64 = 1;
 /// The record kinds that describe a session's identity and progress. A
 /// batch holding one is flushed to disk; the kinds relayed from check,
 /// decider and override events, and `response`, never are on their own
-/// (see [`write`]).
+/// (see [`write_within`]).
 const IDENTITY_KINDS: &[&str] = &[
     "session_started",
     "state_entered",
@@ -419,6 +471,11 @@ impl Record {
     /// disk with the batch that carries them.
     fn is_identity(&self) -> bool {
         IDENTITY_KINDS.contains(&self.kind())
+    }
+
+    /// The value of field `key`, when the record has it.
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
     }
 
     fn to_line(&self) -> String {
@@ -501,6 +558,29 @@ pub(crate) fn set_lock_wait_for_test(wait: std::time::Duration) {
     TEST_LOCK_WAIT.with(|c| c.set(wait));
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCK_WAITS: std::cell::RefCell<Vec<std::time::Duration>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Note the lock wait a write on this thread was allowed, so a test can
+/// tell a write that may wait from one that may not without timing it.
+#[cfg(test)]
+fn note_lock_wait(wait: std::time::Duration) {
+    TEST_LOCK_WAITS.with(|c| c.borrow_mut().push(wait));
+}
+
+#[cfg(not(test))]
+fn note_lock_wait(_wait: std::time::Duration) {}
+
+/// The lock wait each write on this thread was allowed, in order, since the
+/// last call; the list is emptied.
+#[cfg(test)]
+pub(crate) fn take_lock_waits_for_test() -> Vec<std::time::Duration> {
+    TEST_LOCK_WAITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// Count one written batch, and whether the append reported a flush.
 #[cfg(test)]
 fn count_batch(flushed: bool) {
@@ -554,6 +634,12 @@ pub(crate) fn reset_for_test() {
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
     TEST_BATCHES.with(|c| c.set((0, 0)));
     TEST_LOCK_WAIT.with(|c| c.set(JOURNAL_LOCK_WAIT));
+    JOURNAL_ENABLED.with(|e| e.set(true));
+    #[cfg(unix)]
+    {
+        queue::reset_for_test();
+        sink::set_sink_for_test(None);
+    }
 }
 
 /// Lower (or restore) this thread's line cap.
@@ -568,28 +654,46 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
     TEST_WARNINGS.with(|w| w.borrow().clone())
 }
 
-/// Append `records` in order to the journal under `root`, as one batch: one
-/// lock, one write per line. A record over the line cap is skipped with a
-/// warning and the rest are still written.
-///
-/// The lock is waited for at most [`journal_lock_wait`] ([`JOURNAL_LOCK_WAIT`]
-/// outside tests). A lock still held after that is a failed write like any
-/// other: the batch is skipped with the one warning and this returns
-/// normally, so a writer that stopped while holding the lock can't hang the
-/// command. That includes the terminal tick, whose cleanup runs after its
-/// `terminal` record. After one write has given up, later writes in the
-/// process don't wait until one takes the lock again (see [`GAVE_UP`]).
-///
-/// The batch is flushed to disk only when it holds an identity record
-/// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
-/// events, and `response` records, are never flushed on their own: a flush
-/// takes milliseconds, and a blocked tick writes several. They reach the
-/// kernel at once, so a process that dies loses none of them, and the next
-/// identity record's flush (a state entry, a terminal, a cancel) makes them
-/// durable with it, since a flush covers the whole file. Only an OS crash
-/// or power loss before then can lose them.
-fn write(root: &Path, records: &[Record]) {
-    write_within(root, records, journal_lock_wait())
+/// The `[run_journal]` table of user config, resolved once per process and
+/// shared by the write path and the rotation settings. A config that can't
+/// be read leaves the defaults: the journal on, rotation off.
+#[cfg(not(test))]
+pub(crate) fn journal_config() -> &'static crate::config::RunJournalConfig {
+    static CONFIG: std::sync::OnceLock<crate::config::RunJournalConfig> =
+        std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        crate::config::resolve::load_config()
+            .map(|c| c.run_journal)
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the journal is written at all: `run_journal.enabled`, on unless
+/// user config turns it off. Off, a hook's records have no journal root
+/// (`emit::destination`), so the journal file, its lock and its directory
+/// are never touched, and nothing is warned about. The session sidecars are
+/// still kept, and the records are still built and queued when a sender is
+/// active, so turning the journal off changes no other file.
+#[cfg(not(test))]
+fn journal_enabled() -> bool {
+    journal_config().enabled
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's `run_journal.enabled`, on unless a test turns it off.
+    static JOURNAL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+fn journal_enabled() -> bool {
+    JOURNAL_ENABLED.with(|e| e.get())
+}
+
+/// Turn this thread's journal on or off, as `run_journal.enabled` would.
+#[cfg(test)]
+pub(crate) fn set_journal_enabled_for_test(enabled: bool) {
+    JOURNAL_ENABLED.with(|e| e.set(enabled));
 }
 
 /// How long a journal write waits for the journal's lock before its batch
@@ -637,10 +741,40 @@ fn journal_lock_wait() -> std::time::Duration {
     TEST_LOCK_WAIT.with(|c| c.get())
 }
 
-/// [`write`], waiting at most `lock_wait` for the journal's lock, or not at
-/// all once an earlier write in this process has given up on it. A lock
-/// still held after that is a failed write: one warning, and the batch is
-/// skipped.
+/// [`write_within`] with the usual lock wait, for the unit tests that write
+/// a batch directly.
+#[cfg(test)]
+fn write(root: &Path, records: &[Record]) {
+    write_within(root, records, journal_lock_wait())
+}
+
+/// Append `records` in order to the journal under `root`, as one batch: one
+/// lock, one write per line. A record over the line cap is skipped with a
+/// warning and the rest are still written.
+///
+/// The lock is waited for at most `lock_wait`, which is
+/// [`journal_lock_wait`] ([`JOURNAL_LOCK_WAIT`] outside tests) for every
+/// caller but a `koto status` response, or not at all once an earlier write
+/// in this process has given up on it. A lock still held after that is a
+/// failed write like any other: the batch is skipped with the one warning
+/// and this returns normally, so a writer that stopped while holding the
+/// lock can't hang the command. That includes the terminal tick, whose
+/// cleanup runs after its `terminal` record. After one write has given up,
+/// later writes in the process don't wait until one takes the lock again
+/// (see [`GAVE_UP`]).
+///
+/// The batch is flushed to disk only when it holds an identity record
+/// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
+/// events, and `response` records, are never flushed on their own: a flush
+/// takes milliseconds, and a blocked tick writes several. They reach the
+/// kernel at once, so a process that dies loses none of them, and the next
+/// identity record's flush (a state entry, a terminal, a cancel) makes them
+/// durable with it, since a flush covers the whole file. Only an OS crash
+/// or power loss before then can lose them.
+///
+/// Called by `emit` alone, and only with a journal root: a store with no
+/// journal, or `run_journal.enabled` set to false, never gets here (see
+/// `emit::destination`).
 fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration) {
     if records.is_empty() {
         return;
@@ -677,6 +811,7 @@ fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration)
     } else {
         lock_wait
     };
+    note_lock_wait(lock_wait);
     // The batch goes to one file whole: a rotation happens before it or
     // after it, never between two of its lines. The lock wait covers the
     // whole append, the fresh file's lock after a rotation included, but
@@ -1867,7 +2002,7 @@ pub(crate) fn after_init(
     header: &StateFileHeader,
     initial_events: &[Event],
 ) {
-    let Some(root) = journal_root else {
+    let Some(journal_root) = emit::destination(journal_root) else {
         return;
     };
     let run_id = lineage::run_id(backend, header);
@@ -1885,8 +2020,9 @@ pub(crate) fn after_init(
             .filter_map(|e| record_for(&e.payload, session, header, run_id.as_deref())),
     );
     let template = child_run_template(backend, header);
+    let session_dir = backend.session_dir(session);
     let _ = sidecar::write(
-        &backend.session_dir(session),
+        &session_dir,
         &sidecar::Sidecar {
             run_id,
             driver,
@@ -1894,7 +2030,17 @@ pub(crate) fn after_init(
             run_template_hash: template.hash,
         },
     );
-    write(root, &records);
+    // After the sidecar, so a child's run template is cached before the
+    // stamps look it up.
+    emit::emit(
+        &emit::EmitCtx {
+            journal_root,
+            session_dir: &session_dir,
+            run_template: emit::run_template(backend, session, header),
+        },
+        &records,
+        journal_lock_wait(),
+    );
 }
 
 /// Journal a payload `append_event` has just committed to `session`'s log.
@@ -1923,7 +2069,7 @@ pub(crate) fn after_init(
 /// `commit`'s `seq` as `koto.seq` and the visit the event belongs to as
 /// `koto.visit.seq`. The header comes from `commit`'s copy of the
 /// log, so nothing is read again. A commit's records are written as one
-/// batch, flushed only when it holds an identity record (see [`write`]).
+/// batch, flushed only when it holds an identity record (see [`write_within`]).
 /// `journal_root` is the store's journal home; `None` writes nothing.
 pub(crate) fn after_commit(
     journal_root: Option<&Path>,
@@ -1932,7 +2078,7 @@ pub(crate) fn after_commit(
     payload: &EventPayload,
     commit: &CommitInfo,
 ) {
-    let Some(root) = journal_root else {
+    let Some(journal_root) = emit::destination(journal_root) else {
         return;
     };
     let session_dir = backend.session_dir(session);
@@ -2014,7 +2160,15 @@ pub(crate) fn after_commit(
         records.extend(relayed_records);
         records.extend(paired(payload, &relay, &commit.prior_log));
     }
-    write(root, &records);
+    emit::emit(
+        &emit::EmitCtx {
+            journal_root,
+            session_dir: &session_dir,
+            run_template: emit::run_template(backend, session, &header),
+        },
+        &records,
+        journal_lock_wait(),
+    );
     // The cache moves only after the journal write, so a crash between the
     // two repeats the `driver_seen` on the next command rather than losing
     // it. A write that failed (and warned) is not retried: the cache moves
@@ -2050,16 +2204,22 @@ pub(crate) fn terminal(
     header: &StateFileHeader,
     final_state: &str,
 ) {
-    let Some(root) = journal_root else {
+    let Some(journal_root) = emit::destination(journal_root) else {
         return;
     };
-    let run_id = cached_run_id(backend, &backend.session_dir(session), header);
-    write(
-        root,
+    let session_dir = backend.session_dir(session);
+    let run_id = cached_run_id(backend, &session_dir, header);
+    emit::emit(
+        &emit::EmitCtx {
+            journal_root,
+            session_dir: &session_dir,
+            run_template: emit::run_template(backend, session, header),
+        },
         &[
             Record::new("terminal", session, &header.session_id, run_id.as_deref())
                 .name("koto.terminal", Some(final_state)),
         ],
+        journal_lock_wait(),
     );
 }
 
@@ -2148,7 +2308,7 @@ pub(crate) fn response(
     details: Option<&str>,
 ) {
     use crate::engine::persistence::{current_visit, last_seq};
-    let Some(root) = journal_root else {
+    let Some(journal_root) = emit::destination(journal_root) else {
         return;
     };
     let session_dir = backend.session_dir(session);
@@ -2194,8 +2354,12 @@ pub(crate) fn response(
         ResponseSource::Status => RESPONSE_LOCK_WAIT.min(journal_lock_wait()),
         ResponseSource::Next => journal_lock_wait(),
     };
-    write_within(
-        root,
+    emit::emit(
+        &emit::EmitCtx {
+            journal_root,
+            session_dir: &session_dir,
+            run_template: emit::run_template(backend, session, &header),
+        },
         &[response_record(&relay, state, source, directive, details)],
         lock_wait,
     );
@@ -2221,7 +2385,7 @@ pub(crate) fn imported(
     current_state: Option<&str>,
     imported_from: &str,
 ) {
-    let Some(root) = journal_root else {
+    let Some(journal_root) = emit::destination(journal_root) else {
         return;
     };
     let run_id = Some(header.session_id.clone()).filter(|v| is_id(v));
@@ -2246,15 +2410,24 @@ pub(crate) fn imported(
     }
     // An imported session is its own run, so its header answers for the
     // run template and the sidecar caches none.
+    let session_dir = backend.session_dir(session);
     let _ = sidecar::write(
-        &backend.session_dir(session),
+        &session_dir,
         &sidecar::Sidecar {
             run_id,
             driver,
             ..sidecar::Sidecar::default()
         },
     );
-    write(root, &records);
+    emit::emit(
+        &emit::EmitCtx {
+            journal_root,
+            session_dir: &session_dir,
+            run_template: emit::run_template(backend, session, header),
+        },
+        &records,
+        journal_lock_wait(),
+    );
 }
 
 #[cfg(test)]

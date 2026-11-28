@@ -1216,6 +1216,27 @@ To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
 way can't be rebuilt once the sessions they describe are gone.
 
+### Turning the journal off
+
+The journal is written by default. To stop koto writing it, set the
+`enabled` key of the `[run_journal]` table to `false` in user config:
+
+```bash
+koto config set run_journal.enabled false --user
+```
+
+With the key off, no koto command writes a record: the journal file isn't
+created, an existing one isn't appended to, and its lock isn't taken.
+Lines already in the file stay as they are. Nothing else about a session
+changes: its state log, its context and its `run-journal.json` sidecar are
+written as before. Setting the key back to `true`, or unsetting it, resumes
+writing with the next record; records for the time it was off are not
+written later.
+
+Like the rotation settings below, the key is read from user config only.
+`koto config set` refuses it without `--user`, and a project's
+`.koto/config.toml` can't turn the journal off.
+
 ### Rotation
 
 Rotation is off by default, and stays off by default until the journal's
@@ -1347,6 +1368,119 @@ koto config set run_journal.reader_stale_days 90 --user
 With no positions recorded, the retention bound alone decides. A reader that
 records no position and stays away longer than the bound misses the files
 removed in the meantime.
+
+## Sent copy
+
+koto can also hand each record to an event sink as it is written: a
+separate program a host may install. With none installed, nothing below
+happens: koto looks for the program once per process and does no more.
+
+The sink is the file `event-sink` in `.local/libexec/fleet` under the home
+directory. koto runs it only when it is a regular file, not a symlink,
+that the current user owns, with an execute bit and no write bit for group
+or others, and when every directory from it up to `/` is owned by the user
+or by root and writable by nobody else. A file that fails any of these is
+never run, and nothing says so. Setting `FLEET_EVENT_SINK=off` in the
+environment turns sending off; koto reads no other value of that variable,
+and no variable can point it at another program.
+
+koto calls the sink as `event-sink send --scope koto-journal`, with one
+record per line on stdin and at most 200 records a call. It reads the exit
+status and nothing else: 0 is posted, 4 is posted with some records
+invalid, 2 means sending is off, 3 means the records were dropped, and 1 or
+any other code is a failed call. The sink runs from `/`, with no stdout or
+stderr, and with an environment cleared to `HOME`, `PATH`, `TMPDIR`,
+`LANG`, `LC_ALL`, `LC_CTYPE`, `CLAUDE_CODE_SESSION_ID`, `NIWA_DISPATCH_ID`
+and `NIWA_WORKSPACE`, each only when it is set.
+
+### What the copy carries
+
+The sink gets the records the journal gets, with the same kinds, fields and
+values, in the same order. The copy is the journal's line with up to three
+fields added at its end, which the journal's own line never carries:
+
+| Field | On | Value |
+|-------|----|-------|
+| `koto.run.template.name` | every kind | The template name of the run's root session, when it has one. |
+| `koto.run.template.hash` | every kind | The template hash of the run's root session, when it has one. |
+| `koto.check.outcome` | `check_rule` | The outcome of the `check_evaluated` the rule belongs to. In the journal only the `check_evaluated` carries it. |
+
+A run's template is its root session's: a child session's records name the
+template the run was started as, not the child's own.
+`koto session identity` prints the same two values. Each is left out when
+it can't be resolved.
+
+A `context_reads` record is never sent. A copy longer than the line cap
+isn't sent either, and is counted as dropped.
+
+The journal and the sent copy are independent. Turning the journal off (see
+[Turning the journal off](#turning-the-journal-off)) doesn't stop the
+sending, and a store with no journal still sends.
+
+### When records are sent
+
+Records are queued in the koto process and sent at fixed points, so a long
+command doesn't hold them until it ends:
+
+- before koto starts the command of a gate or a default action;
+- before it calls a decider;
+- before it waits: between a polling gate's or a polling action's runs,
+  in each wait of `koto request`, and while waiting on another tick's
+  decider lock;
+- on the terminal tick, after the `terminal` record and before the session
+  directory can be removed;
+- when the process exits, however it exits.
+
+A point with nothing queued makes no call. One flush sends everything
+queued under a single deadline, and takes at most 3.0 seconds. A call
+still running at the deadline is ended by killing the sink's process
+group, and that stops later calls for the process (see below), so a sink
+that hangs delays a command by one deadline, not one per point. A sink
+that is slow but always answers in time is different: it adds its own time
+at every point that has records to send. A gate's or an action's time
+limit starts only after the flush ahead of it has returned, so the sink
+never eats into it. Nothing about the sink changes a command's output or
+exit status, and koto prints no warning about it.
+
+After one call exits 3, has to be killed or can't be started, the process
+makes no more calls and counts every later record as dropped. After an
+exit 2 it makes no more calls and counts nothing. A call that exits 1, or
+with a code outside the list above, loses its own records, which are
+counted as dropped, and the calls after it go on.
+
+A call is started only when at least 2.0 seconds are left before the
+flush's deadline. Records a flush has no time left to send are counted as
+dropped without a call being made, and the next flush sends as usual.
+
+### Dropped records
+
+A record that was queued and not delivered is counted against its session,
+in `telemetry.json` in the session directory: `{"dropped": N}`. The file is
+replaced by rename, mode 0600, under a lock held on `telemetry.lock` beside
+it. A session that never drops a record has neither file.
+
+The count goes out with the first call of a later flush. Before that call,
+koto takes the count of every session it has records for, writing 0 back
+under the lock, and adds `--carry N` to the call with the sum. Only the
+first call of a flush carries. Because the count is zeroed as it is taken,
+two koto processes working on one session never carry the same count. If
+that call isn't posted (exit 0 or 4), the taken counts are given back,
+with the call's own records added, and the next flush carries them.
+
+A session directory can be removed while it still holds a count, by the
+tick that reaches a terminal state, by `koto session cleanup` or by
+`koto session prune`. Just before the directory goes, its count moves to
+`_telemetry_orphans.json` in the directory that holds the store's session
+directories, under `_telemetry_orphans.lock`. The next flush from any
+session of that store carries it out with the others.
+
+All four files are koto's own bookkeeping and stay on the host: cloud sync
+and `koto session import` don't carry them. The counts are a floor, not an
+exact figure. A count whose lock can't be taken within 50 ms is left out
+of that change, and a koto process that stops between taking a count and
+sending it loses it. koto never hands one count to two calls. A sink that
+had already acted on a call koto then had to kill will be sent that carry
+again by the next flush.
 
 ## Reading the journal
 

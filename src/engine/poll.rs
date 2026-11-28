@@ -158,6 +158,10 @@ pub fn settle<G, E>(
         let Some(earliest) = schedulable.iter().map(|(_, due)| *due).min() else {
             break;
         };
+        // Before the wait: send the session records queued so far. The
+        // wait is worked out after the flush returns, so a slow flush
+        // shortens the sleep and the next run still starts when it is due.
+        crate::telemetry::flush();
         let wait = earliest
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -268,6 +272,64 @@ mod tests {
             output,
             ..Default::default()
         }
+    }
+
+    /// Flush point: a polling gate's wait sends what is queued before it
+    /// sleeps. The gate isn't due for an hour. A second thread raises
+    /// the shutdown flag once the sink has the records, which ends the wait
+    /// from inside its sleep, so the gate never runs again and the records
+    /// can only have gone out before that sleep began. A flush placed after
+    /// the sleep would never run: the watcher gives up, the wait ends, and
+    /// the count below is 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_polling_wait_sends_queued_records_before_it_sleeps() {
+        let sink = crate::telemetry::sink_fixture::SinkFixture::new();
+        let mut gate: Gate =
+            serde_json::from_value(serde_json::json!({"type": "command", "command": "true"}))
+                .unwrap();
+        gate.poll = Some(PollSpec {
+            interval_secs: 3600,
+            timeout_secs: 86_400,
+            hold_secs: 7200,
+            pending_exit_code: 75,
+        });
+        let gates = BTreeMap::from([("ci".to_string(), gate)]);
+        let mut results = BTreeMap::from([(
+            "ci".to_string(),
+            result(
+                GateOutcome::Failed,
+                serde_json::json!({"exit_code": 75, "error": ""}),
+            ),
+        )]);
+        let shutdown = AtomicBool::new(false);
+        let reruns = std::sync::atomic::AtomicUsize::new(0);
+        let evaluate =
+            |_: &BTreeMap<String, Gate>| -> Result<BTreeMap<String, StructuredGateResult>, ()> {
+                reruns.fetch_add(1, Ordering::Relaxed);
+                Err(())
+            };
+        sink.queue(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let give_up = std::time::Instant::now() + Duration::from_secs(300);
+                while sink.received() < 2 && std::time::Instant::now() < give_up {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                shutdown.store(true, Ordering::Relaxed);
+            });
+            settle(
+                &mut results,
+                &gates,
+                &[],
+                "ci",
+                SystemTime::now(),
+                &evaluate,
+                &shutdown,
+            );
+        });
+        assert_eq!(sink.received(), 2);
+        assert_eq!(reruns.load(Ordering::Relaxed), 0, "the gate was not due");
     }
 
     #[test]
