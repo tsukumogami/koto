@@ -218,7 +218,7 @@ It isn't `--replace-terminal`, which reuses a finished session's own name. `--re
 
 The command works in six steps:
 
-1. **Check.** Everything that can refuse runs first, with nothing written: the names, a call from inside `<old>`'s own tick or one of its background actions, `<old>` existing and being a run rather than an agent session's record, `<old>` not being `<new>`, `<old>` not fenced by another session, `<new>` not being some other session, and `<new>`'s template and variables.
+1. **Check.** Everything that can refuse runs first, with nothing written: the names, a call from inside `<old>`'s own tick or one of its background actions, `<old>` existing and being a run rather than an agent session's record, `<old>` not being `<new>`, `<old>` not fenced by another session, `<old>` not moved away from this process by `koto session rebind --whole`, `<new>` not being some other session, and `<new>`'s template and variables.
 2. **Lock.** koto takes `<old>`'s `tick.lock` exclusive. Every `koto next` of `<old>` holds that lock while it runs, so a tick in flight finishes first. koto waits for it at most `--wait` seconds (10 by default; `0` asks once), then refuses `session_busy`, exit 1, with nothing written.
 3. **Stop.** koto stops `<old>`'s background runner and leaves its pool queues, as `koto cancel` does. The events that record the stop go into the close.
 4. **Create.** koto creates `<new>` and writes its `koto/replaces` key, `{"v":1,"session":"<old>","session_id":"<old's id>"}`, naming `<old>` by name and session id. Like every key under `koto/`, it's koto's own (see [The reserved `koto/` area](#the-reserved-koto-area)), and a later `--carry` never copies it.
@@ -250,14 +250,14 @@ The command works in six steps:
 | `nested_invocation` | 2 | The command ran inside `<old>`'s own tick (`KOTO_TICK_SESSION`) or one of its background actions (`KOTO_BACKGROUND_OF`), even under `--abandon-tick`. |
 | `session_not_found` | 2 | No session is named `<old>`. |
 | `superseded_by`, `session_replaced` | 2 | `<old>` is already superseded or replaced by another session, or plainly superseded by `<new>`. The body carries `newest`, `actor`, and `superseded_by` or `replaced_by`. |
+| `session_rebound` | 2 | `<old>`'s whole binding was moved with `koto session rebind --whole`, and this process runs from a directory the move retired or read `<old>` before the move. Refused before the lock: no runner is stopped and `<new>` isn't created. |
 | `session_exists` | 2 | `<new>` exists and holds no `koto/replaces` key naming `<old>`. |
 | `session_busy` | 1 | A tick still held `<old>`'s `tick.lock` when `--wait` ran out. The body carries `details.waited_for_ms`. |
 | `invalid_fence` | 2 | Cloud backend: the bucket's copy of `<old>` holds a fence naming a session koto doesn't accept. |
-| `session_rebound` | 2 | `<old>`'s whole binding was moved with `koto session rebind --whole` since this process read it. `<new>` exists; `<old>` wasn't closed. |
 | `fence_unavailable` | 3 | `<old>`'s log stayed locked for 10 seconds, or the bucket refused or failed the close. Run the command again. |
 | `persistence_error` | 3 | A read or write failed. If `<new>`'s key couldn't be written, remove `<new>` with `koto cancel <new> --cleanup` and run the command again. |
 
-Refusals before the lock write nothing. A fence another session put on `<old>` between the checks and the close, or a `session_rebound`, leaves `<new>` created and `<old>` open; remove `<new>` with `koto cancel <new> --cleanup` if it isn't wanted.
+Refusals before the lock write nothing. A fence another session put on `<old>` between the checks and the close, or a `koto session rebind --whole` of `<old>` made in that window (`session_rebound`, refused again at the close), leaves `<new>` created and `<old>` open; remove `<new>` with `koto cancel <new> --cleanup` if it isn't wanted.
 
 ### next
 
@@ -1149,10 +1149,10 @@ Refusals print `{"error": {"code", "message", ...}, "command": "session replace"
 | `nested_invocation` | 2 | The command ran inside `<old>`'s own tick (`KOTO_TICK_SESSION`) or one of its background actions (`KOTO_BACKGROUND_OF`). |
 | `session_not_found` | 2 | `<old>` or `<new>` doesn't exist. To create `<new>` and close `<old>` in one step, use `koto init --replaces`. |
 | `superseded_by`, `session_replaced` | 2 | Another session already superseded or replaced `<old>`, or `<old>` was superseded by `<new>` through a plain `--supersede`. Also when another session fences `<old>` between the checks and the close. |
+| `session_rebound` | 2 | `<old>`'s whole binding was moved with `koto session rebind --whole`, and this process runs from a directory the move retired or read `<old>` before the move. Refused before the lock, with `<old>`'s runner left running and `<new>` untouched; a move made between the checks and the close is refused at the close, and `<old>` wasn't closed. |
 | `session_exists` | 2 | `<new>`'s `koto/replaces` key names a run other than `<old>`. |
 | `session_busy` | 1 | A tick still held `<old>`'s `tick.lock` when `--wait` ran out. |
 | `invalid_fence` | 2 | Cloud backend: the bucket's copy of `<old>` holds a fence naming a session koto doesn't accept. |
-| `session_rebound` | 2 | `<old>`'s whole binding was moved with `koto session rebind --whole` since this process read it; `<old>` wasn't closed. |
 | `fence_unavailable`, `persistence_error` | 3 | `<old>`'s log stayed locked by another writer, the bucket refused or failed the close's conditional PUT, or a read or write failed. Run the command again. |
 
 Every refusal before the lock writes nothing. A close stopped part way finishes when you run the same command again. Under the cloud backend the command closes the bucket's copy of `<old>` in one conditional PUT and then this host's copy, as [Replacing a run](#replacing-a-run) describes for `koto init --replaces`.

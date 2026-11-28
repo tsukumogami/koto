@@ -8,8 +8,10 @@
 //!    written: the names, a call from inside OLD's own tick or background
 //!    action (`nested_invocation`), OLD existing and being a run, OLD not
 //!    being NEW (`self`), OLD's fence (`superseded_by`, `session_replaced`),
-//!    NEW not being some other session (`session_exists`), and for a NEW
-//!    still to be created, the template's compile and its variables.
+//!    a whole-binding move of OLD that fences this process off
+//!    (`session_rebound`), NEW not being some other session
+//!    (`session_exists`), and for a NEW still to be created, the template's
+//!    compile and its variables.
 //! 2. **Lock.** OLD's `tick.lock` is taken exclusive, waited for at most
 //!    `--wait` seconds (10 by default). Still held then refuses
 //!    `session_busy`, exit 1, nothing written. With `--abandon-tick` the
@@ -249,6 +251,48 @@ fn refuse_fenced(
     refuse(front, code, message, super::EXIT_CALLER_ERROR, extra)
 }
 
+/// Refuse `session_rebound`, with nothing written, when a whole-binding
+/// move recorded in OLD's `header` fences this process off from OLD: it
+/// runs from a directory the move retired, or it read OLD before the move.
+/// It's the check `koto next` makes, run before the lock so such a process
+/// takes no lock, stops no runner and creates no NEW; the close repeats it
+/// for a move made after this.
+///
+/// Under the cloud backend `header` is the bucket's copy. This host's copy
+/// is read first, for the epoch the read records: a check with no earlier
+/// read would record the bucket's epoch as this process's first read of
+/// OLD, and a host whose copy predates the move would then pass the epoch
+/// rule here and at the close.
+fn refuse_rebound_before_the_lock(
+    backend: &Backend,
+    front: Front,
+    old: &str,
+    header: &StateFileHeader,
+) {
+    if header.origin.as_ref().is_none_or(|o| o.whole_epoch == 0) {
+        return;
+    }
+    if backend.as_cloud().is_some() {
+        // Read for the epoch it records alone; a host with no copy of OLD
+        // has none to record, and the retired-directory rule still applies.
+        let _ = backend.read_events_local(old);
+    }
+    let path = backend
+        .session_dir(old)
+        .join(crate::session::state_file_name(old));
+    let line = serde_json::to_string(header).unwrap_or_default();
+    if let Err(rebound) = crate::session::fence_state::check(old, &path, &line) {
+        let p = front.prefix();
+        refuse(
+            front,
+            "session_rebound",
+            format!("{p}: {rebound}"),
+            super::EXIT_CALLER_ERROR,
+            serde_json::Value::Null,
+        );
+    }
+}
+
 /// The value of NEW's [`REPLACES_KEY`], `None` when it holds none.
 fn read_replaces(backend: &Backend, name: &str) -> std::result::Result<Option<Replaces>, String> {
     let store: &dyn ContextStore = backend;
@@ -441,6 +485,7 @@ fn close_and_replace(backend: &Backend, job: &Replace<'_>) -> Result<()> {
         Some(f) => refuse_fenced(backend, front, old, name, &f, nothing),
         None => false,
     };
+    refuse_rebound_before_the_lock(backend, front, old, &old_header);
     if new_exists {
         let ours = match read_replaces(backend, name) {
             Ok(Some(r)) => r.session == old && r.session_id == old_id,
