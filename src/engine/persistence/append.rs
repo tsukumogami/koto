@@ -2109,6 +2109,15 @@ mod close_tests {
             "origin": origin,
         });
         std::fs::write(&log, format!("{header}\n")).unwrap();
+        let to_work = EventPayload::Transitioned {
+            from: None,
+            to: "work".to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        };
+        append_event(&log, &to_work, TS).unwrap();
         let moved = EventPayload::ExecutionAnchorReboundWhole(crate::engine::types::WholeRebound {
             from: Some("/koto-test-gone/old".into()),
             to: anchor.to_path_buf(),
